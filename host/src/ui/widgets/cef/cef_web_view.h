@@ -41,6 +41,16 @@ public:
     // CEF renders in-process — it has no worker-side embed to attach to, so the
     // panel opens the current wizard site's URL via open() instead of attach().
     bool usesWorkerEmbed() const override;
+
+    // Browser-chrome navigation (URL bar / refresh / back-forward), driven on the
+    // GL/UI thread == TID_UI.
+    void reload(AppState& st) override;
+    void goBack(AppState& st) override;
+    void goForward(AppState& st) override;
+    bool canGoBack() const override;
+    bool canGoForward() const override;
+    bool hasNavChrome() const override { return true; }
+
     // Hand the live CEF session to the worker: visit the per-site request
     // context's cookie jar and stage it via browser_session_import so headless
     // Playwright (browser_fetch/download) reuses the sign-in. GL/UI thread.

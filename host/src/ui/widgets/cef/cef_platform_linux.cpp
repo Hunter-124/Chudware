@@ -29,6 +29,11 @@ std::string helper_path() {
 }
 
 std::string cache_root() {
+    // AI_CAD_CEF_CACHE_ROOT lets a --cef-shot diagnostic run alongside the live
+    // app: the process singleton is keyed on root_cache_path, so a distinct dir
+    // dodges "CefInitialize FAILED / Opening in existing browser session".
+    if (const char* ov = std::getenv("AI_CAD_CEF_CACHE_ROOT"); ov && ov[0])
+        return std::string(ov);
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
         return std::string(xdg) + "/ai-cad/cef_cache";
     if (const char* home = std::getenv("HOME"); home && home[0])

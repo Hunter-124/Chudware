@@ -46,6 +46,16 @@ bool pump_if_due();
 void note_browser_opened();
 void note_browser_closed();
 
+// Browser-creation-in-flight refcount. CefBrowserHost::CreateBrowser is async:
+// it returns true immediately but OnAfterCreated fires only after several message-
+// loop iterations. In that window g_live_browsers is still 0, and the external-
+// pump deadline model can starve the loop mid-creation → OnAfterCreated never
+// fires → the panel hangs on "Loading" forever (root cause of the vendor-browser
+// bug). Bracket the CreateBrowser call with these so pump_if_due pumps EVERY frame
+// until the browser is created (note_browser_opened) or the create fails.
+void note_browser_creating();        // just before CreateBrowser
+void note_browser_create_failed();   // CreateBrowser returned false (no OnAfterCreated will come)
+
 // Browser process only, at app exit, after all CefWebViews are destroyed.
 void shutdown();
 

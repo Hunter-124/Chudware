@@ -22,7 +22,7 @@ bool        plmOk(const core::RpcResult& r, std::string& hint);
 std::string plmReason(const core::RpcResult& r);   // the machine reason code ("" if none/ok)
 
 enum class PlmPage {
-    Overview, Files, History, Releases, Planning, Issues, Team, Settings
+    Overview, Files, History, Releases, Planning, Issues, Team, Git, Settings
 };
 
 // ---- cached row shapes (parsed from the plm_* envelopes) ----------------------
@@ -46,6 +46,32 @@ struct PlmIssueRow {
 
 struct PlmMilestoneRow {
     std::string id, title, status, due;
+};
+
+// ---- Git tab row shapes (parsed from the git_* envelopes) ---------------------
+
+struct PlmGitFileRow {
+    std::string path, xy;             // xy = porcelain-v2 status code ("??" untracked)
+    bool staged = false, unstaged = false, untracked = false;
+};
+
+struct PlmGitCommitRow {
+    std::string hash, author, date, subject;
+};
+
+struct PlmGitBranchRow {
+    std::string name;
+    bool current = false, remote = false;
+};
+
+struct PlmGitRemoteRow {
+    std::string name, url;
+};
+
+// One shape reused for both pull requests and issues (number + title + state).
+struct PlmGitRefRow {
+    int number = 0;
+    std::string title, state, author, branch;
 };
 
 struct PlmOverview {
@@ -91,6 +117,28 @@ struct PlmHubState {
     int         setGen = -1; bool setLoading = false; std::string setErr;
     std::string partPrefix, aiMode;
 
+    // git (Git page) — real git / GitHub client
+    int         gitGen = -1; bool gitLoading = false; std::string gitErr;
+    bool        gitIsRepo = false; bool gitMissing = false;
+    std::string gitBranch, gitUpstream;
+    int         gitAhead = 0, gitBehind = 0; bool gitClean = true;
+    std::vector<PlmGitFileRow>    gitFiles;
+    std::vector<PlmGitCommitRow>  gitLog;
+    int         gitTotalCommits = 0, gitCommits24h = 0;
+    std::vector<PlmGitBranchRow>  gitBranches;
+    std::vector<PlmGitRemoteRow>  gitRemotes;
+    std::vector<std::string>      gitTree;           // tracked files (code browser)
+    std::string gitSelectedFile, gitFileContent;     // selected file + its content
+    bool        gitFileTruncated = false;
+    // GitHub (gh) side
+    bool        ghAuthed = false; std::string ghUser;
+    std::string ghRepoName, ghRepoOwner, ghRepoVis, ghRepoUrl;
+    std::vector<PlmGitRefRow>     gitPrs, gitIssues;
+    // transient sign-in flow
+    std::string ghLoginCode, ghLoginUrl;
+    char        gitCommitMsg[512] = {};
+    char        gitNewBranch[128] = {};
+
     // transient action state / input buffers
     char        checkpointMsg[256] = {};
     bool        busy = false;             // a mutation is in flight
@@ -113,7 +161,9 @@ extern PlmHubState g_plmHub;
 // ---- shared widgets (defined in plm_workspace.cpp) ----------------------------
 
 void plmRowPill(bool sel = false, float rows = 1.0f);
-void plmSectionHeader(const char* label);
+// Accent title with an optional atlas icon lined up to its left. No underline —
+// matches the icon+title header used by the glass sub-panels (plmPanelBegin).
+void plmSectionHeader(const char* label, const char* icon = nullptr);
 void plmEmptyState(const char* icon, const char* msg, const char* sub = nullptr);
 void plmSpinner(const char* prefix);
 void plmError(const std::string& msg);
@@ -129,6 +179,7 @@ void        plmEnsureItems(AppState& st);
 void        plmEnsureHistory(AppState& st);
 void        plmEnsurePlanning(AppState& st);
 void        plmEnsureSettings(AppState& st);
+void        plmEnsureGit(AppState& st);
 // convenience: build the {"path": …} param object for the current project.
 
 // ---- page bodies (defined in plm_pages.cpp) -----------------------------------
@@ -140,6 +191,7 @@ void plmDrawReleasesPage(AppState& st);
 void plmDrawPlanningPage(AppState& st);
 void plmDrawIssuesPage(AppState& st);
 void plmDrawTeamPage(AppState& st);
+void plmDrawGitPage(AppState& st);
 void plmDrawSettingsPage(AppState& st);
 
 }  // namespace ui

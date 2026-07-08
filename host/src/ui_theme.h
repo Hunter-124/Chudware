@@ -262,6 +262,14 @@ void popGlassChildStyle();
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
                         bool stripe = false, bool selected = false, float washAlpha = 0.42f);
 
+// The "liquid glass" tinted card wash: frosted glassBackground() base plus a top-bright ->
+// bottom-faint vertical gradient in `tint` (palette float[3], RGB 0..1). This is the exact
+// style used for PLM Task/Issue/Milestone cards (see plmCardBegin/plmCardEnd in plm_pages.cpp)
+// factored out here so any panel in the program can reuse the same background. `topAlpha` is
+// the wash alpha at the top edge; the bottom edge fades to `topAlpha * bottomAlphaScale`.
+void glassCardWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+                   const float tint[3], float topAlpha, float bottomAlphaScale = 0.30f);
+
 // Paint a row pill at the current cursor (full content width). Call immediately BEFORE the row's
 // widgets so the pill sits behind text/icons.
 void glassRowAtCursor(float rounding = 4.0f, bool stripe = false, bool selected = false,

@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -33,6 +35,14 @@
 #include "include/cef_display_handler.h"
 #include "include/cef_request_context.h"
 #include "include/cef_request_context_handler.h"  // complete type for CreateContext(nullptr)
+#include "include/cef_request_handler.h"           // resource-load failure diagnostics
+#include "include/cef_resource_request_handler.h"
+#include "include/cef_request.h"
+#include "include/cef_response.h"
+#include "include/cef_devtools_message_observer.h" // copy-out: read getSelection() result
+#include "include/cef_parser.h"                     // CefParseJSON
+#include "include/cef_registration.h"
+#include "include/cef_version.h"                     // CHROME_VERSION_* for Sec-CH-UA
 #include "include/wrapper/cef_helpers.h"   // CEF_REQUIRE_UI_THREAD
 
 // NOTE: do NOT include core/app_state.h here — CEF's net-error headers define
@@ -41,6 +51,7 @@
 #include "cef_app.h"
 #include "cef_platform.h"
 #include "cef_rpc_bridge.h"
+#include "cef_trace_file.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -61,9 +72,11 @@ bool cefTrace() {
 }
 #define CEF_TRACE(...)                                                    \
     do {                                                                 \
+        char _tb[512];                                                   \
+        std::snprintf(_tb, sizeof(_tb), "[cef-trace] " __VA_ARGS__);     \
+        ::ui::cef::trace_file_line(_tb);                                 \
         if (::ui::cefTrace()) {                                           \
-            std::fprintf(stderr, "[cef-trace] " __VA_ARGS__);            \
-            std::fprintf(stderr, "\n");                                  \
+            std::fprintf(stderr, "%s\n", _tb);                          \
             std::fflush(stderr);                                         \
         }                                                                \
     } while (0)
@@ -131,6 +144,22 @@ std::string slug(const std::string& site) {
     }
     size_t a = s.find_first_not_of('-'), b = s.find_last_not_of('-');
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+
+// WARM PERSISTENT PROFILE: one stable on-disk profile shared by EVERY vendor and
+// every app run. Under --single-process only the FIRST CefRequestContext is ever
+// created (vendor switches reuse it via LoadURL — see openOrNavigate), so the old
+// per-vendor cache dirs were already collapsed to one de-facto jar, and a raw-URL
+// open passed "" == an in-memory context wiped on every restart. Consolidating to a
+// single persistent dir means Google / Cloudflare / reCAPTCHA cookies + history
+// accumulate across sessions, which lifts the challenge trust score on repeat
+// visits (a pristine empty profile scores near zero — a big reason first-time
+// reCAPTCHA/Turnstile fail in-app). Cookies stay domain-scoped so vendors never
+// collide. AI_CAD_CEF_PROFILE_DIR overrides the location (tests / throwaway runs).
+std::string warm_profile_dir() {
+    if (const char* ov = std::getenv("AI_CAD_CEF_PROFILE_DIR"); ov && ov[0])
+        return ov;
+    return cef_platform::cache_root() + "/_warm_profile";
 }
 
 // URL-path fragments that mean "still in an auth flow" — mirrors
@@ -203,6 +232,18 @@ struct CefWebView::Shared {
     std::vector<unsigned char> bgra;   // latest PET_VIEW frame, paintW*paintH*4 BGRA
     int  paintW = 0, paintH = 0;       // size CEF actually painted (OnPaint)
     bool dirty  = false;
+
+    // OSR POPUP layer (HTML <select> dropdowns, autofill lists). In windowless
+    // mode CEF paints these as a SEPARATE PET_POPUP element with its own buffer +
+    // an OnPopupSize rect (in view px); the main view underneath does NOT contain
+    // them. Dropping PET_POPUP (the old behaviour) made every native dropdown
+    // invisible/dead. We keep the popup buffer + rect here and composite it over
+    // the main texture in draw(). Guarded by mtx.
+    std::vector<unsigned char> popupBgra;
+    int  popupW = 0, popupH = 0;       // size of the last PET_POPUP paint
+    int  popupX = 0, popupY = 0;       // OnPopupSize origin, in view pixels
+    bool popupShown = false;           // OnPopupShow(true/false)
+    bool popupDirty = false;
     // Requested view size (what draw() wants; GetViewRect returns this). Kept
     // separate from paintW/H so a resize can't feed back into itself.
     int  reqW = 1280, reqH = 800;
@@ -211,6 +252,29 @@ struct CefWebView::Shared {
     std::string url, loginState = "unknown", lastError;
     bool active = false, starting = false, detached = false;
     bool startedAtAuth = false;        // opened on a sign-in URL → detect redirect-away
+    // URL requested via open() during the async window between createBrowser() and
+    // OnAfterCreated (browser_ still null). OnAfterCreated LoadURLs it so we never
+    // fire a SECOND createBrowser — which under --single-process re-inits Blink in a
+    // new renderer thread and SIGTRAPs (InitializeWtf). Guarded by mtx.
+    std::string pendingNav;
+
+    // COPY-OUT bridge (mirror of the Ctrl+V paste bridge). Chromium's own
+    // clipboard here is the headless-Ozone in-memory stub (OSR has no native
+    // window), so a page Ctrl+C never reaches the OS clipboard — nothing to
+    // paste into another app. On Ctrl+C we ask the page for its selection via
+    // CDP Runtime.evaluate; the async result lands in OnDevToolsMethodResult,
+    // which stashes the text here for draw() to push to the HOST clipboard on
+    // the GL thread. copyMsgId matches the reply to our query. Guarded by mtx.
+    std::string pendingClipboardOut;
+    int copyMsgId = -1;
+
+    // One-shot, fired from Client::OnBeforeClose once the outgoing browser's
+    // teardown actually completes. open() defers creating the next browser (a new
+    // per-site CefRequestContext == a new StoragePartition == a new renderer
+    // process) until this fires — see closeBrowser()'s comment for why firing
+    // CreateBrowser right after the async CloseBrowser races the old process's
+    // teardown under --single-process.
+    std::function<void()> onFullyClosed;
 };
 
 // ---- Client: the CEF-refcounted handler (owned by CefRefPtr only) ------------
@@ -218,7 +282,10 @@ class CefWebView::Client : public CefClient,
                            public CefRenderHandler,
                            public CefLifeSpanHandler,
                            public CefLoadHandler,
-                           public CefDisplayHandler {
+                           public CefDisplayHandler,
+                           public CefRequestHandler,
+                           public CefResourceRequestHandler,
+                           public CefDevToolsMessageObserver {
 public:
     explicit Client(std::shared_ptr<Shared> s) : s_(std::move(s)) {}
 
@@ -229,6 +296,29 @@ public:
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler>     GetLoadHandler() override     { return this; }
     CefRefPtr<CefDisplayHandler>  GetDisplayHandler() override  { return this; }
+    CefRefPtr<CefRequestHandler>  GetRequestHandler() override  { return this; }
+
+    // CRITICAL: returning a non-null CefResourceRequestHandler here makes CEF wrap
+    // EVERY request in a mojo URLLoader proxy — and that proxy mishandles the
+    // 302-redirect + cross-origin CORS hop that anti-bot challenge scripts all do
+    // (Cloudflare Turnstile's api.js -> /v0/b/<hash>/api.js, Google reCAPTCHA,
+    // Cloudflare's /cdn-cgi/challenge-platform/ jsd), failing them with
+    // net::ERR_INVALID_ARGUMENT (-4). Proven by A/B --cef-shot: with a handler the
+    // Turnstile/challenge scripts die at -4 and Cloudflare login pages loop; with
+    // nullptr they load and execute. The handler only ever existed to log failures
+    // (OnResourceLoadComplete) — a diagnostic that was silently breaking every
+    // challenge-gated vendor login. So default to nullptr (challenges work) and
+    // only opt back into the proxy under an EXPLICIT, dedicated env var. Do NOT
+    // gate this on cefTrace() — that flag is default-ON, which would silently
+    // reinstate the breakage for every normal run. AI_CAD_CEF_RESOURCE_HANDLER=1
+    // re-enables the sub-resource failure logging when we're deliberately
+    // diagnosing (and knowingly accept that challenge scripts break in that run).
+    CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+        CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
+        bool, bool, const CefString&, bool&) override {
+        const char* v = std::getenv("AI_CAD_CEF_RESOURCE_HANDLER");
+        return (v && v[0] == '1') ? this : nullptr;
+    }
 
     // CefRenderHandler
     void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
@@ -238,14 +328,33 @@ public:
     }
     void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                  const void* buffer, int width, int height) override {
-        if (type != PET_VIEW) return;   // PET_POPUP (<select>) is a follow-up commit
+        const size_t n = static_cast<size_t>(width) * height * 4;
+        if (type == PET_POPUP) {
+            // <select> dropdown / autofill layer — keep it, composite in draw().
+            std::lock_guard<std::mutex> lk(s_->mtx);
+            s_->popupBgra.assign(static_cast<const unsigned char*>(buffer),
+                                 static_cast<const unsigned char*>(buffer) + n);
+            s_->popupW = width; s_->popupH = height; s_->popupDirty = true;
+            return;
+        }
+        if (type != PET_VIEW) return;
         if (!tracedFirstPaint_) { tracedFirstPaint_ = true; CEF_TRACE("OnPaint FIRST %dx%d", width, height); }
         std::lock_guard<std::mutex> lk(s_->mtx);
-        const size_t n = static_cast<size_t>(width) * height * 4;
         s_->bgra.assign(static_cast<const unsigned char*>(buffer),
                         static_cast<const unsigned char*>(buffer) + n);
         s_->paintW = width; s_->paintH = height; s_->dirty = true;
         if (!s_->active) { s_->active = true; s_->starting = false; }
+    }
+    // OSR popup geometry/visibility (the <select> dropdown layer).
+    void OnPopupShow(CefRefPtr<CefBrowser>, bool show) override {
+        std::lock_guard<std::mutex> lk(s_->mtx);
+        s_->popupShown = show;
+        if (!show) { s_->popupW = s_->popupH = 0; s_->popupDirty = true; }
+    }
+    void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) override {
+        std::lock_guard<std::mutex> lk(s_->mtx);
+        s_->popupX = rect.x; s_->popupY = rect.y;
+        s_->popupW = rect.width; s_->popupH = rect.height;
     }
 
     // CefLifeSpanHandler
@@ -253,16 +362,136 @@ public:
         browser_ = browser;
         cef::note_browser_opened();   // frame loop pumps every frame while alive
         CEF_TRACE("OnAfterCreated (browser id=%d)", browser ? browser->GetIdentifier() : -1);
+        // Copy-out: observe CDP replies so a Ctrl+C selection query can come back.
+        if (browser) devtoolsReg_ = browser->GetHost()->AddDevToolsMessageObserver(this);
+        // Order matters: align UA client-hints and inject the fingerprint patches
+        // BEFORE draining pendingNav, or the first vendor page loads with the raw
+        // "Chromium"-only Sec-CH-UA (the obvious-CEF tell).
+        applyUaClientHints(browser);
+        injectStealthScript(browser);
+        // Drain any navigation requested while the create was in flight.
+        std::string pending;
+        { std::lock_guard<std::mutex> lk(s_->mtx); pending.swap(s_->pendingNav); }
+        if (!pending.empty() && browser) {
+            CEF_TRACE("OnAfterCreated: draining pendingNav → LoadURL %s", pending.c_str());
+            browser->GetMainFrame()->LoadURL(pending);
+        }
+    }
+
+    // ANTI-DETECTION: install the document-start fingerprint patches (mirrors
+    // services/browser/stealth.INIT_SCRIPT) via the SAME CDP mechanism the
+    // Playwright path uses — Page.addScriptToEvaluateOnNewDocument runs before any
+    // page script on EVERY navigation, so bot-walls see window.chrome, a plausible
+    // plugin list, a multi-entry navigator.languages, and webdriver=false. The
+    // --disable-blink-features=AutomationControlled flag already flips webdriver;
+    // this re-asserts it defensively and fills the tells a flag can't.
+    void injectStealthScript(CefRefPtr<CefBrowser> browser) {
+        if (!browser) return;
+        static const char* kStealth =
+            "(() => {"
+            "  const patch=(fn)=>{try{fn();}catch(e){}};"
+            "  patch(()=>{ if(!window.chrome) window.chrome={runtime:{}}; });"
+            "  patch(()=>{ Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']}); });"
+            "  patch(()=>{"
+            "    if(navigator.plugins&&navigator.plugins.length) return;"
+            "    const mk=(name)=>({name,description:'Portable Document Format',"
+            "                       filename:'internal-pdf-viewer',length:1});"
+            "    const plugins=[mk('PDF Viewer'),mk('Chrome PDF Viewer'),mk('Chromium PDF Viewer')];"
+            "    Object.defineProperty(navigator,'plugins',{get:()=>plugins});"
+            "    Object.defineProperty(navigator,'mimeTypes',"
+            "                          {get:()=>[{type:'application/pdf',suffixes:'pdf'}]});"
+            "  });"
+            "  patch(()=>{ if(navigator.webdriver)"
+            "    Object.defineProperty(navigator,'webdriver',{get:()=>false}); });"
+            // navigator.deviceMemory: real Chrome HARD-CAPS this at 8 (privacy);
+            // CEF leaks the host's true RAM (we saw 32), an impossible value that
+            // flags us as a non-standard build. Clamp to the max a real Chrome
+            // would ever report — consistency, not mimicry.
+            "  patch(()=>{ if(navigator.deviceMemory>8)"
+            "    Object.defineProperty(navigator,'deviceMemory',{get:()=>8}); });"
+            // NB: NO WebGL vendor/renderer spoof (mirror stealth.py). A
+            // getParameter override is itself a tell (toString ≠ "[native
+            // code]") and claiming an Intel GPU while the canvas rasterises via
+            // SwiftShader is a canvas-readback inconsistency — worse than the
+            // honest software string. Consistency over mimicry.
+            "})();";
+        CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+        params->SetString("source", kStealth);
+        browser->GetHost()->ExecuteDevToolsMethod(
+            /*message_id=*/0, "Page.addScriptToEvaluateOnNewDocument", params);
+        CEF_TRACE("injectStealthScript: addScriptToEvaluateOnNewDocument sent");
+    }
+
+    // ANTI-DETECTION (Sec-CH-UA): CEF's native User-Agent header is a genuine
+    // "Chrome/149.0.0.0" string, but its Sec-CH-UA client hints advertise only
+    // "Chromium" + "Not)A;Brand" — MISSING the "Google Chrome" brand that a real
+    // Chrome sends. That contradiction (UA says Chrome, hints say only Chromium)
+    // is the single most obvious "this is CEF, not a browser" tell. Fix it the
+    // same way the Playwright path does (stealth.cdp_ua_override_params): send
+    // Network.setUserAgentOverride with the full brand list. We keep CEF's own
+    // REDUCED UA (Chrome/<major>.0.0.0 — do NOT regress to a full version string)
+    // and derive every version from CHROME_VERSION_* so it never drifts from the
+    // bundled binary. NB: this is consistency, not mimicry — we assert the brands
+    // real Chrome built from this same Chromium would send.
+    void applyUaClientHints(CefRefPtr<CefBrowser> browser) {
+        if (!browser) return;
+        const std::string major = std::to_string(CHROME_VERSION_MAJOR);
+        const std::string full  = major + "." + std::to_string(CHROME_VERSION_MINOR) +
+                                  "." + std::to_string(CHROME_VERSION_BUILD) +
+                                  "." + std::to_string(CHROME_VERSION_PATCH);
+        const std::string reducedUa =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/" + major + ".0.0.0 Safari/537.36";
+
+        auto brand = [](const char* name, const std::string& ver) {
+            CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
+            d->SetString("brand", name);
+            d->SetString("version", ver);
+            return d;
+        };
+        CefRefPtr<CefListValue> brands = CefListValue::Create();
+        brands->SetDictionary(0, brand("Chromium", major));
+        brands->SetDictionary(1, brand("Google Chrome", major));
+        brands->SetDictionary(2, brand("Not)A;Brand", "24"));
+        CefRefPtr<CefListValue> fullList = CefListValue::Create();
+        fullList->SetDictionary(0, brand("Chromium", full));
+        fullList->SetDictionary(1, brand("Google Chrome", full));
+        fullList->SetDictionary(2, brand("Not)A;Brand", "24.0.0.0"));
+
+        CefRefPtr<CefDictionaryValue> meta = CefDictionaryValue::Create();
+        meta->SetList("brands", brands);
+        meta->SetList("fullVersionList", fullList);
+        meta->SetString("fullVersion", full);
+        meta->SetString("platform", "Linux");
+        meta->SetString("platformVersion", "");
+        meta->SetString("architecture", "x86");
+        meta->SetString("model", "");
+        meta->SetBool("mobile", false);
+        meta->SetString("bitness", "64");
+        meta->SetBool("wow64", false);
+
+        CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+        params->SetString("userAgent", reducedUa);
+        params->SetString("acceptLanguage", "en-US,en");   // unweighted; CDP adds q
+        params->SetString("platform", "Linux x86_64");
+        params->SetDictionary("userAgentMetadata", meta);
+        browser->GetHost()->ExecuteDevToolsMethod(
+            /*message_id=*/0, "Network.setUserAgentOverride", params);
+        CEF_TRACE("applyUaClientHints: Sec-CH-UA brands aligned (Chrome %s)", major.c_str());
     }
     void OnBeforeClose(CefRefPtr<CefBrowser>) override {
         browser_ = nullptr;
         cef::note_browser_closed();
+        std::function<void()> cb;
+        { std::lock_guard<std::mutex> lk(s_->mtx); cb.swap(s_->onFullyClosed); }
+        if (cb) cb();   // safe to CreateBrowser here: OnBeforeClose runs on TID_UI
     }
     // Keep popups (target=_blank etc.) in-frame: block the OS window, navigate the
     // main frame instead — the embedded panel has nowhere to put a second window.
     bool OnBeforePopup(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>, int /*popup_id*/,
                        const CefString& target_url, const CefString& /*target_frame_name*/,
-                       WindowOpenDisposition, bool, const CefPopupFeatures&, CefWindowInfo&,
+                       CefLifeSpanHandler::WindowOpenDisposition, bool,
+                       const CefPopupFeatures&, CefWindowInfo&,
                        CefRefPtr<CefClient>&, CefBrowserSettings&, CefRefPtr<CefDictionaryValue>&,
                        bool*) override {
         if (browser && !target_url.empty()) browser->GetMainFrame()->LoadURL(target_url);
@@ -300,6 +529,54 @@ public:
         if (frame->IsMain()) refreshLoginState(url);
     }
 
+    // DIAGNOSTICS (unconditional to stderr — one user run must yield the data;
+    // NOT gated on AI_CAD_CEF_TRACE). "Security verification failed to load" is a
+    // functional failure of the challenge widget, and its cause shows up as
+    // either a page console error or a failed sub-resource fetch. Capture both so
+    // we can tell detection (resources 200 then the widget bails) from a load
+    // failure (4xx / blocked / net error on the recaptcha/turnstile/hcaptcha
+    // domain) without guessing.
+    bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
+                          const CefString& message, const CefString& source,
+                          int line) override {
+        if (cefTrace())
+            std::fprintf(stderr, "[cef-console] sev=%d %s (%s:%d)\n", (int)level,
+                         message.ToString().c_str(), source.ToString().c_str(), line);
+        return false;   // do not suppress default handling
+    }
+    // CefResourceRequestHandler
+    void OnResourceLoadComplete(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                                CefRefPtr<CefRequest> request,
+                                CefRefPtr<CefResponse> response,
+                                URLRequestStatus status,
+                                int64_t /*received_content_length*/) override {
+        if (!cefTrace()) return;
+        const int http = response ? response->GetStatus() : -1;
+        if (status == UR_SUCCESS && http < 400) return;   // only log failures
+        std::fprintf(stderr, "[cef-net] FAIL status=%d http=%d err=%d %s\n", (int)status,
+                     http, response ? (int)response->GetError() : 0,
+                     request ? request->GetURL().ToString().c_str() : "?");
+    }
+    // CefDevToolsMessageObserver — copy-out reply: pull window.getSelection()
+    // out of the Runtime.evaluate result and hand it to the GL thread.
+    void OnDevToolsMethodResult(CefRefPtr<CefBrowser>, int message_id, bool success,
+                                const void* result, size_t result_size) override {
+        int want;
+        { std::lock_guard<std::mutex> lk(s_->mtx); want = s_->copyMsgId; }
+        if (!success || message_id != want || !result || result_size == 0) return;
+        std::string json(static_cast<const char*>(result), result_size);
+        CefRefPtr<CefValue> v = CefParseJSON(json, JSON_PARSER_RFC);
+        if (!v || v->GetType() != VTYPE_DICTIONARY) return;
+        CefRefPtr<CefDictionaryValue> d = v->GetDictionary();
+        if (!d || !d->HasKey("result")) return;
+        CefRefPtr<CefDictionaryValue> r = d->GetDictionary("result");
+        if (!r || !r->HasKey("value")) return;
+        const std::string text = r->GetString("value").ToString();
+        std::lock_guard<std::mutex> lk(s_->mtx);
+        s_->copyMsgId = -1;
+        if (!text.empty()) s_->pendingClipboardOut = text;
+    }
+
 private:
     void refreshLoginState(const CefString& cefUrl) {
         const std::string url = cefUrl.ToString();
@@ -307,18 +584,20 @@ private:
         s_->url = url;
         if (isAuthUrl(url)) {
             s_->loginState = "login_page";
-        } else if (s_->startedAtAuth) {
-            // Left the sign-in URL for a normal page → probably signed in. Heuristic
-            // hint for the chip only; the authoritative signed-in check stays
-            // server-side (profiles.has_login) until cookie interop lands.
-            s_->loginState = "logged_in";
         } else {
-            s_->loginState = "unknown";
+            // We deliberately do NOT infer "logged_in" from the URL. "Left the
+            // sign-in page" is indistinguishable from an SSO/consent redirect or a
+            // homepage bounce (false-positive skip), and modal logins never touch a
+            // sign-in URL at all (false-negative miss). The user confirms sign-in
+            // explicitly via the "I'm signed in" button; only that stamps the
+            // server-side login. Chip stays neutral while they browse.
+            s_->loginState = "browsing";
         }
     }
 
     std::shared_ptr<Shared> s_;
     CefRefPtr<CefBrowser> browser_;   // set in OnAfterCreated (CEF/UI thread)
+    CefRefPtr<CefRegistration> devtoolsReg_;  // keeps the DevTools observer alive
     bool tracedFirstPaint_ = false;   // AI_CAD_CEF_TRACE: log only the first OnPaint
     IMPLEMENT_REFCOUNTING(Client);
 };
@@ -332,6 +611,8 @@ struct CefWebView::Impl {
     // GL-thread-owned texture.
     unsigned tex = 0;
     int texW = 0, texH = 0;
+    unsigned popupTex = 0;           // OSR <select> dropdown layer (composited over tex)
+    int popupTexW = 0, popupTexH = 0;
     bool focused = false;
     bool invalidatedOnce_ = false;   // AI_CAD_CEF_TRACE: log the first paint kick only
 
@@ -339,6 +620,14 @@ struct CefWebView::Impl {
         CEF_TRACE("createBrowser url=%s cache=%s onUiThread=%d",
                   url.c_str(), cacheDir.c_str(), (int)CefCurrentlyOn(TID_UI));
         CEF_REQUIRE_UI_THREAD();   // CreateBrowser is TID_UI-affine (loud if a future change breaks it)
+        // NB: the UA client-hints override (setUserAgentOverride) applies at the
+        // browser level and covers the first page regardless of timing. The
+        // addScriptToEvaluateOnNewDocument patches (deviceMemory cap) register in
+        // OnAfterCreated, so they catch the SECOND+ document (vendor login always
+        // navigates onward) but may miss the very first landing page. That was NOT
+        // worth rerouting the load-bearing create path through about:blank —
+        // a regression there breaks ALL vendor loading (a far bigger deal than the
+        // minor deviceMemory tell). Keep the proven create-with-url path.
         { std::lock_guard<std::mutex> lk(s->mtx); s->startedAtAuth = startedAtAuth; }
         client = new Client(s);
 
@@ -356,19 +645,77 @@ struct CefWebView::Impl {
             ctx = CefRequestContext::CreateContext(rc, nullptr);
             CEF_TRACE("per-site request context %s", ctx ? "created" : "NULL (CreateContext failed)");
         }
+        // Pump every frame until OnAfterCreated fires — CreateBrowser is async and
+        // the deadline pump can starve the create window, wedging OnAfterCreated and
+        // hanging the panel on "Loading". Paired with note_browser_opened (success)
+        // / note_browser_create_failed (below) which settle this counter.
+        cef::note_browser_creating();
         const bool ok =
             CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr, ctx);
         CEF_TRACE("CreateBrowser returned %d", (int)ok);
+        if (!ok) cef::note_browser_create_failed();
     }
 
-    void closeBrowser() {
-        if (client && client->browser())
+    // Open `url`, REUSING the existing browser if one is already live.
+    //
+    // CRASH FIX (coredump-confirmed, SIGTRAP in RenderProcessHostImpl::
+    // GetProcessHostForSiteInstance, PID 9723 + 16517, both during the SECOND
+    // browser creation on a vendor switch): each vendor site was given its own
+    // CefRequestContext with a distinct cache_path == a distinct StoragePartition,
+    // which Chromium always assigns its OWN renderer process. Under --single-process
+    // (this box's multi-process-ICU-handoff fallback, see cef_app.cpp) only ONE
+    // renderer process may ever exist, so the second distinct context hits a fatal
+    // CHECK — regardless of teardown sequencing (the earlier close/create deferral
+    // did NOT help: the identical crash recurred after it shipped). The fix is to
+    // never create a second browser: reuse the live one and LoadURL the new site.
+    // Cross-domain navigation stays in the one process because single-process
+    // disables site isolation, so this structurally cannot hit that CHECK. The
+    // first context's cookie jar is reused for every vendor — cookies are
+    // domain-scoped so vendors don't collide, and exportSession stages the live
+    // per-domain jar into Playwright, which is where real per-vendor persistence
+    // lives (CEF's jar is transient staging; see cache_root()).
+    void openOrNavigate(const std::string& url, const std::string& cacheDir,
+                        bool startedAtAuth) {
+        CEF_REQUIRE_UI_THREAD();
+        if (client && client->browser()) {
+            { std::lock_guard<std::mutex> lk(s->mtx); s->startedAtAuth = startedAtAuth; }
+            CEF_TRACE("openOrNavigate: reuse live browser → LoadURL %s", url.c_str());
+            client->browser()->GetMainFrame()->LoadURL(url);
+            return;
+        }
+        if (client) {
+            // createBrowser is in flight (browser_ not set until OnAfterCreated).
+            // Stash the URL — OnAfterCreated navigates to it — instead of creating a
+            // SECOND browser (fatal under --single-process; see pendingNav).
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->startedAtAuth = startedAtAuth;
+            s->pendingNav = url;
+            CEF_TRACE("openOrNavigate: create in flight → queue pendingNav %s", url.c_str());
+            return;
+        }
+        createBrowser(url, cacheDir, startedAtAuth);
+    }
+
+    // Async CloseBrowser (force). Actual teardown completes later, when
+    // Client::OnBeforeClose fires and clears browser_. Used only for full wizard
+    // teardown / widget destruction — vendor SWITCHES no longer close+recreate
+    // (see openOrNavigate). `then` (a one-shot fired from OnBeforeClose) is retained
+    // for callers that must sequence work after teardown; the switch path no longer
+    // uses it.
+    void closeBrowser(std::function<void()> then = nullptr) {
+        if (client && client->browser()) {
+            { std::lock_guard<std::mutex> lk(s->mtx); s->onFullyClosed = std::move(then); }
             client->browser()->GetHost()->CloseBrowser(/*force=*/true);
+        } else if (then) {
+            then();   // nothing was open — safe to proceed immediately
+        }
         client = nullptr;
     }
 
     void freeTexture() {
         if (tex) { glDeleteTextures(1, &tex); tex = 0; }
+        if (popupTex) { glDeleteTextures(1, &popupTex); popupTex = 0; }
+        popupTexW = popupTexH = 0;
         texW = texH = 0;
     }
 };
@@ -386,44 +733,60 @@ CefWebView::~CefWebView() {
 }
 
 void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
-    close(st);
+    impl_->pendingUrlReq.clear();
+    impl_->invalidatedOnce_ = false;
+    Impl* impl = impl_.get();
     auto& s = *impl_->s;
-    { std::lock_guard<std::mutex> lk(s.mtx); s.lastError.clear(); s.starting = true; }
-
-    if (isUrl) {
-        impl_->createBrowser(siteOrUrl, /*cacheDir=*/"", isAuthUrl(siteOrUrl));
+    {
         std::lock_guard<std::mutex> lk(s.mtx);
-        s.url = siteOrUrl;
-        return;
+        s.active = false; s.starting = true;
+        s.url.clear(); s.loginState = "unknown"; s.startedAtAuth = false;
+        s.lastError.clear();
+        s.bgra.clear(); s.paintW = s.paintH = 0; s.dirty = false;
     }
 
-    // Vendor key → resolve its sign-in URL + per-site cache dir over the worker
-    // RPC (reuses embed.start_url_for_site + profiles.profile_dir). The callback
-    // runs on the GL/UI thread (same drain as the screencast frame callbacks), so
-    // CreateBrowser there is TID_UI-safe.
-    const std::string req = siteOrUrl;
-    impl_->pendingUrlReq = req;
-    Impl* impl = impl_.get();
-    CEF_TRACE("open(site=%s) → rpc browser_start_url…", siteOrUrl.c_str());
-    cef::rpc_start_url(st, siteOrUrl, [impl, req](bool ok, const std::string& url,
-                                                  const std::string& /*plwCacheDir*/,
-                                                  const std::string& err) {
-        CEF_TRACE("rpc_start_url cb ok=%d url=%s err=%s onUiThread=%d",
-                  (int)ok, url.c_str(), err.c_str(), (int)CefCurrentlyOn(TID_UI));
-        if (impl->s->detached || impl->pendingUrlReq != req) { CEF_TRACE("… stale/closed, drop"); return; }
-        if (!ok || url.empty()) {
+    AppState* stp = &st;   // AppState outlives every RPC/callback (app-lifetime object)
+    auto doOpen = [impl, stp, siteOrUrl, isUrl]() {
+        if (isUrl) {
+            // Warm shared profile even for raw URLs (was "" == in-memory/no persist).
+            impl->openOrNavigate(siteOrUrl, warm_profile_dir(), isAuthUrl(siteOrUrl));
             std::lock_guard<std::mutex> lk(impl->s->mtx);
-            impl->s->starting = false;
-            impl->s->lastError = err.empty() ? "no sign-in URL for this vendor" : err;
+            impl->s->url = siteOrUrl;
             return;
         }
-        // Per-site cache under CEF's own root (NOT the Playwright dir the RPC
-        // returns — cookie interop is deferred; see cache_root()).
-        const std::string cacheDir = cef_platform::cache_root() + "/" + slug(req);
-        impl->createBrowser(url, cacheDir, isAuthUrl(url));
-        std::lock_guard<std::mutex> lk(impl->s->mtx);
-        impl->s->url = url;
-    });
+
+        // Vendor key → resolve its sign-in URL + per-site cache dir over the worker
+        // RPC (reuses embed.start_url_for_site + profiles.profile_dir). The callback
+        // runs on the GL/UI thread (same drain as the screencast frame callbacks), so
+        // CreateBrowser / LoadURL there is TID_UI-safe.
+        const std::string req = siteOrUrl;
+        impl->pendingUrlReq = req;
+        CEF_TRACE("open(site=%s) → rpc browser_start_url…", siteOrUrl.c_str());
+        cef::rpc_start_url(*stp, siteOrUrl, [impl, req](bool ok, const std::string& url,
+                                                        const std::string& /*plwCacheDir*/,
+                                                        const std::string& err) {
+            CEF_TRACE("rpc_start_url cb ok=%d url=%s err=%s onUiThread=%d",
+                      (int)ok, url.c_str(), err.c_str(), (int)CefCurrentlyOn(TID_UI));
+            if (impl->s->detached || impl->pendingUrlReq != req) { CEF_TRACE("… stale/closed, drop"); return; }
+            if (!ok || url.empty()) {
+                std::lock_guard<std::mutex> lk(impl->s->mtx);
+                impl->s->starting = false;
+                impl->s->lastError = err.empty() ? "no sign-in URL for this vendor" : err;
+                return;
+            }
+            // One warm, persistent, shared profile for every vendor (see
+            // warm_profile_dir) — accumulates challenge cookies across sessions.
+            impl->openOrNavigate(url, warm_profile_dir(), isAuthUrl(url));
+            std::lock_guard<std::mutex> lk(impl->s->mtx);
+            impl->s->url = url;
+        });
+    };
+
+    // Reuse the live browser (LoadURL) on a vendor switch instead of close+recreate:
+    // a second per-site CefRequestContext would demand a second renderer process and
+    // crash under --single-process. open() runs on the GL/UI thread (== TID_UI under
+    // the external pump), so doOpen's CreateBrowser/LoadURL calls are thread-safe.
+    doOpen();
 }
 
 void CefWebView::attach(AppState& st, const std::string& embedId) {
@@ -436,13 +799,25 @@ void CefWebView::attach(AppState& st, const std::string& embedId) {
 void CefWebView::close(AppState& /*st*/) {
     impl_->pendingUrlReq.clear();
     impl_->invalidatedOnce_ = false;   // next open() kicks its own first paint
-    impl_->closeBrowser();
+    // CRASH FIX (coredump PID 47211: SIGTRAP in InProcessRendererThread →
+    // InitializeBlink/InitializeWtf while the main thread is in ~CefBrowser). Under
+    // --single-process, Blink/WTF initialises exactly ONCE per process; tearing the
+    // browser down and creating another re-runs InitializeWtf in a fresh renderer
+    // thread → fatal CHECK. Vendor SWITCHES already reuse the one browser (LoadURL);
+    // the only remaining close+recreate was close()→next open(). So DON'T close:
+    // keep the single browser alive for the whole process, just park it on
+    // about:blank and mark inactive (stops frame uploads). Real teardown happens
+    // only in ~CefWebView — the WizardState (and thus this widget) is a
+    // function-static, so that runs at process exit where re-init can't happen.
+    if (impl_->client && impl_->client->browser())
+        impl_->client->browser()->GetMainFrame()->LoadURL("about:blank");
     auto& s = *impl_->s;
     std::lock_guard<std::mutex> lk(s.mtx);
     s.active = s.starting = false;
     s.url.clear();
     s.loginState = "unknown";
     s.startedAtAuth = false;
+    s.pendingNav.clear();
     s.bgra.clear();
     s.paintW = s.paintH = 0;
     s.dirty = false;
@@ -519,9 +894,15 @@ void CefWebView::forwardInput(ImVec2 img0, float scale, ImVec2 imgSize) {
         if (ImGui::IsMouseClicked((ImGuiMouseButton)b)) {
             if (hovered) {
                 impl_->focused = true;
+                // CEF OSR routes keyboard to the renderer's focused frame ONLY after
+                // SetFocus(true) — without it the page displays but form fields never
+                // accept typing / caret (the "can't interact" bug). Assert focus on
+                // the click that grabs it, drop it when the user clicks away.
+                host->SetFocus(true);
                 host->SendMouseClickEvent(me, kBtn[b], /*mouseUp=*/false, 1);
             } else {
                 impl_->focused = false;
+                host->SetFocus(false);
             }
         }
         if (hovered && ImGui::IsMouseReleased((ImGuiMouseButton)b))
@@ -547,14 +928,49 @@ void CefWebView::forwardInput(ImVec2 img0, float scale, ImVec2 imgSize) {
         e.type = KEYEVENT_KEYUP;      host->SendKeyEvent(e);
     };
 
-    // Ctrl/Cmd shortcuts (copy/paste/cut/select-all/undo/redo) — send the VK so the
-    // Chrome runtime performs the native clipboard action; suppress text below.
+    // Ctrl/Cmd shortcuts (copy/cut/select-all/undo/redo) — send the VK so the
+    // Chrome runtime performs the native action; suppress text below.
+    //
+    // PASTE (Ctrl+V) is special-cased: Chromium's own clipboard here is the
+    // headless Ozone in-memory stub (OSR has no native window), so the VK path
+    // can only paste what was copied inside a page — never from another app.
+    // Pinning --ozone-platform=x11 to bridge it corrupted the heap on paste
+    // (coredump PID 56925, "malloc(): corrupted top size"). Instead read the
+    // HOST clipboard (ImGui → GLFW → native Wayland/X11, safe) and inject it
+    // via CDP Input.insertText, which types into whatever has focus exactly
+    // like a real paste — Chromium's clipboard is never touched.
     const bool cmd = io.KeyCtrl || io.KeySuper;
     if (cmd) {
-        for (ImGuiKey k : {ImGuiKey_A, ImGuiKey_C, ImGuiKey_V, ImGuiKey_X,
+        for (ImGuiKey k : {ImGuiKey_A, ImGuiKey_C, ImGuiKey_X,
                            ImGuiKey_Z, ImGuiKey_Y})
             if (ImGui::IsKeyPressed(k, false))
                 if (int vk = vkForCtrlLetter(k)) sendVK(vk);
+        // Copy-OUT bridge (mirror of paste): the VK above copies into Chromium's
+        // in-memory stub clipboard, which never reaches the OS. Also ask the page
+        // for its current selection; OnDevToolsMethodResult writes it to the HOST
+        // clipboard so it can be pasted into other apps. Cut (X) copies too.
+        if (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+            CefRefPtr<CefDictionaryValue> ev = CefDictionaryValue::Create();
+            ev->SetString("expression",
+                          "(window.getSelection?window.getSelection().toString():'')");
+            ev->SetBool("returnByValue", true);
+            int id = host->ExecuteDevToolsMethod(0, "Runtime.evaluate", ev);
+            if (id > 0) { std::lock_guard<std::mutex> lk(impl_->s->mtx); impl_->s->copyMsgId = id; }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            const char* clip = ImGui::GetClipboardText();
+            if (clip && clip[0]) {
+                CefRefPtr<CefDictionaryValue> p = CefDictionaryValue::Create();
+                p->SetString("text", clip);
+                host->ExecuteDevToolsMethod(0, "Input.insertText", p);
+                CEF_TRACE("paste: Input.insertText %d bytes", (int)std::strlen(clip));
+            } else {
+                // Host clipboard empty — fall back to the in-page stub paste so
+                // page-internal copy → paste still works.
+                if (int vk = vkForCtrlLetter(ImGuiKey_V)) sendVK(vk);
+            }
+        }
     } else {
         // Printable text as CHAR events (correct Unicode + IME composition).
         for (int i = 0; i < io.InputQueueCharacters.Size; ++i) {
@@ -610,10 +1026,13 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
     // stuck in __lll_lock_wait, every CEF callback that wants s.mtx wedged behind
     // it). So we only flip a flag here and call WasResized() after the lock drops.
     bool haveTex = false, starting = false, active = false, needResize = false;
-    std::string lastError;
+    bool popupShown = false;
+    int  popupX = 0, popupY = 0, popupW = 0, popupH = 0;
+    std::string lastError, clipOut;
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         starting = s.starting; active = s.active; lastError = s.lastError;
+        clipOut.swap(s.pendingClipboardOut);   // copy-out: page selection → host clipboard
         const int nw = (int)avail.x, nh = (int)avail.y;
         if (nw != s.reqW || nh != s.reqH) {
             s.reqW = nw; s.reqH = nh;
@@ -636,8 +1055,33 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
             }
             s.dirty = false;
         }
+        // Upload the <select> popup layer too (same BGRA→GL path).
+        if (s.popupDirty && s.popupW > 0 && s.popupH > 0 && !s.popupBgra.empty()) {
+            if (!impl_->popupTex) glGenTextures(1, &impl_->popupTex);
+            glBindTexture(GL_TEXTURE_2D, impl_->popupTex);
+            if (s.popupW != impl_->popupTexW || s.popupH != impl_->popupTexH) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s.popupW, s.popupH, 0,
+                             GL_BGRA, GL_UNSIGNED_BYTE, s.popupBgra.data());
+                impl_->popupTexW = s.popupW; impl_->popupTexH = s.popupH;
+            } else {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.popupW, s.popupH,
+                                GL_BGRA, GL_UNSIGNED_BYTE, s.popupBgra.data());
+            }
+            s.popupDirty = false;
+        }
+        popupShown = s.popupShown && s.popupW > 0 && s.popupH > 0;
+        popupX = s.popupX; popupY = s.popupY; popupW = s.popupW; popupH = s.popupH;
         haveTex = impl_->tex && impl_->texW > 0 && impl_->texH > 0;
     }
+
+    // Copy-out: push the page selection to the host (GLFW) clipboard on the GL
+    // thread. ImGui's clipboard is GL-thread-only, so it can't run in the CEF
+    // callback — draw() is the safe place.
+    if (!clipOut.empty()) ImGui::SetClipboardText(clipOut.c_str());
 
     // CEF host call OUTSIDE the lock (see above): safe now that s.mtx is dropped.
     const bool haveBrowser = impl_->client && impl_->client->browser();
@@ -695,9 +1139,41 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
         dl->AddRect(img0, ImVec2(img0.x + imgSize.x, img0.y + imgSize.y),
                     Palette::toU32(palette.accentMid), 2.0f * uc, 0, 1.5f * uc);
 
+    // Composite the <select> dropdown / autofill popup ON TOP of the page, mapped
+    // from view pixels through the same letterbox scale so it lands over its
+    // control. Input still flows through forwardInput → CEF, which drives the
+    // popup selection; we only need to draw its pixels (the main view doesn't
+    // contain them in OSR mode).
+    if (popupShown && impl_->popupTex && impl_->popupTexW > 0) {
+        const ImVec2 pp0(img0.x + popupX * scale, img0.y + popupY * scale);
+        const ImVec2 pp1(pp0.x + popupW * scale, pp0.y + popupH * scale);
+        dl->AddImage((ImTextureID)(intptr_t)impl_->popupTex, pp0, pp1);
+        dl->AddRect(pp0, pp1, Palette::toU32(palette.textDisabled), 0.0f, 0, 1.0f);
+    }
+
     ImGui::SetCursorScreenPos(p0);
     ImGui::Dummy(avail);
     return true;
+}
+
+// ---- browser-chrome navigation (GL/UI thread == TID_UI) ----------------------
+// The panel calls these from draw(), which runs on the GL thread; under the
+// external message pump that IS TID_UI, so the CefBrowser calls are thread-safe
+// (same contract as openOrNavigate's LoadURL).
+void CefWebView::reload(AppState&) {
+    if (impl_->client && impl_->client->browser()) impl_->client->browser()->Reload();
+}
+void CefWebView::goBack(AppState&) {
+    if (impl_->client && impl_->client->browser()) impl_->client->browser()->GoBack();
+}
+void CefWebView::goForward(AppState&) {
+    if (impl_->client && impl_->client->browser()) impl_->client->browser()->GoForward();
+}
+bool CefWebView::canGoBack() const {
+    return impl_->client && impl_->client->browser() && impl_->client->browser()->CanGoBack();
+}
+bool CefWebView::canGoForward() const {
+    return impl_->client && impl_->client->browser() && impl_->client->browser()->CanGoForward();
 }
 
 // ---- accessors (small benign races on std::string across threads) ------------

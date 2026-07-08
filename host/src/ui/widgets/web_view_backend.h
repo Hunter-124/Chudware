@@ -70,6 +70,19 @@ public:
         if (done) done(true);
     }
 
+    // Browser-chrome navigation (URL bar / refresh / back / forward). The panel
+    // shows these controls only when the backend supports them; the default is an
+    // inert stub so the screencast backend (worker-driven) is unaffected. CEF
+    // overrides them to drive the in-process browser. navigate() takes a full URL.
+    virtual void navigate(AppState& st, const std::string& url) { open(st, url, /*isUrl=*/true); }
+    virtual void reload(AppState& st) { (void)st; }
+    virtual void goBack(AppState& st) { (void)st; }
+    virtual void goForward(AppState& st) { (void)st; }
+    virtual bool canGoBack() const { return false; }
+    virtual bool canGoForward() const { return false; }
+    // True when this backend exposes the URL-bar / back-forward chrome above.
+    virtual bool hasNavChrome() const { return false; }
+
     // True when the backend adopts the login wizard's worker-side embed via
     // attach(embed_id) (the ScreencastWebView default). CEF renders in-process and
     // has no worker embed, so it returns false and the panel drives it with

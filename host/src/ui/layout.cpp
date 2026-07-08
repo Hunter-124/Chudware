@@ -342,7 +342,7 @@ void drawLeftPane(AppState& st,
     // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
     // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
     const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
-    const float defW = (ecadWs ? 400.0f : 360.0f) * panelSc;
+    const float defW = (ecadWs ? 360.0f : 320.0f) * panelSc;
     const float maxW = std::max(minW + 40.0f * S,
                                 std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
     const float winH = s_anim.tick(s_collapsed, colH);

@@ -456,6 +456,22 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding) {
     glassBackground(dl, mn, mx, rounding, 1.0f);
 }
 
+void glassCardWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+                   const float tint[3], float topAlpha, float bottomAlphaScale) {
+    const float rnd = rounding * ui::uiScale;
+    glassBackground(dl, mn, mx, rounding);   // frosted translucent base + shine
+    const ImU32 top = ImGui::GetColorU32(ImVec4(tint[0], tint[1], tint[2], topAlpha));
+    const ImU32 bot = ImGui::GetColorU32(ImVec4(tint[0], tint[1], tint[2], topAlpha * bottomAlphaScale));
+    // The wash must cover the FULL rounded card (corners included): a rounded base
+    // (owns every corner at the faint bottom colour), a rounded-top strip so the top
+    // corners get the bright colour, then a full-width vertical fade in the interior.
+    dl->AddRectFilled(mn, mx, bot, rnd);
+    dl->AddRectFilled(mn, ImVec2(mx.x, mn.y + rnd), top, rnd, ImDrawFlags_RoundCornersTop);
+    if (mx.y - rnd > mn.y + rnd)
+        dl->AddRectFilledMultiColor(ImVec2(mn.x, mn.y + rnd), ImVec2(mx.x, mx.y - rnd),
+                                    top, top, bot, bot);
+}
+
 void pushGlassTooltipStyle() {
     const float s = uiScale;
     // Suppress ImGui's native PopupBg rect fill so glassBackground() layers are not double-filled.

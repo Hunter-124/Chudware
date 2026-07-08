@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -43,11 +46,13 @@ void accentButtonColors() {
 // Each list card gets a translucent liquid-glass background tinted by the item's
 // standing. Only tasks/open-tasks have a real "priority"; the other lists map to
 // their natural status colour (severity, lifecycle, scope), which reads the same.
+// blue / yellow / red — low / med / high, per Hunter's explicit mapping (not the
+// generic accent/dim/warn scheme used elsewhere in the hub).
+const float kPriorityLow[4] = {0.420f, 0.620f, 0.960f, 1.0f};
 const float* plmTintPriority(const std::string& pr) {
-    if (pr == "p0") return palette.statusErr;    // critical
-    if (pr == "p1") return palette.statusWarn;   // high
-    if (pr == "p3") return palette.textDisabled; // low
-    return palette.accent;                        // p2 / med / default
+    if (pr == "p0" || pr == "p1") return palette.statusErr;  // critical / high -> red
+    if (pr == "p3") return kPriorityLow;                     // low -> blue
+    return palette.statusWarn;                                // p2 / med / default -> yellow
 }
 const float* plmTintSeverity(const std::string& sev) {
     if (sev == "critical" || sev == "high") return palette.statusErr;
@@ -110,19 +115,10 @@ bool plmCardEnd(float gap = 3.0f) {
     ImVec2 mn = ImGui::GetWindowPos();
     ImVec2 sz = ImGui::GetWindowSize();
     ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
-    const float rnd = 6.0f * S;
+    (void)S;
     dl->ChannelsSetCurrent(0);                 // background, under the content
-    ui::glassBackground(dl, mn, mx, 6.0f);     // frosted translucent base + shine
-    const ImU32 top = ImGui::GetColorU32(ImVec4(cs.r, cs.g, cs.b, cs.a));
-    const ImU32 bot = ImGui::GetColorU32(ImVec4(cs.r, cs.g, cs.b, cs.a * 0.30f));
-    // The wash must cover the FULL rounded card (corners included): a rounded base
-    // (owns every corner at the faint bottom colour), a rounded-top strip so the top
-    // corners get the bright colour, then a full-width vertical fade in the interior.
-    dl->AddRectFilled(mn, mx, bot, rnd);
-    dl->AddRectFilled(mn, ImVec2(mx.x, mn.y + rnd), top, rnd, ImDrawFlags_RoundCornersTop);
-    if (mx.y - rnd > mn.y + rnd)
-        dl->AddRectFilledMultiColor(ImVec2(mn.x, mn.y + rnd), ImVec2(mx.x, mx.y - rnd),
-                                    top, top, bot, bot);
+    const float tint[3] = {cs.r, cs.g, cs.b};
+    ui::glassCardWash(dl, mn, mx, 6.0f, tint, cs.a);   // shared liquid-glass card style
     dl->ChannelsMerge();
 
     bool clicked = ImGui::IsWindowHovered() &&
@@ -344,6 +340,7 @@ void plmDrawOverviewPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureOverview(st);
+    plmEnsureGit(st);        // so Recent activity can fold in git commits
 
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
 
@@ -390,7 +387,7 @@ void plmDrawOverviewPage(AppState& st) {
         }
     };
     auto bodyRecent = [&]() {
-        if (ov.recent.empty()) { dimText("No history yet."); return; }
+        if (ov.recent.empty() && H.gitLog.empty()) { dimText("No activity yet."); return; }
         for (const auto& e : ov.recent) {
             ImGui::PushID(e.commit.c_str());
             plmCardBegin("##act", false, 8.0f, 3.0f,
@@ -402,6 +399,17 @@ void plmDrawOverviewPage(AppState& st) {
             plmCardEnd();
             ImGui::PopID();
         }
+        // Git activity — the most recent commits from the working repo.
+        for (size_t i = 0; i < H.gitLog.size() && i < 6; ++i) {
+            const auto& c = H.gitLog[i];
+            ImGui::PushID(("g" + c.hash).c_str());
+            plmCardBegin("##gact", false, 8.0f, 3.0f, palette.accent, 0.12f);
+            plmItemTitle(c.subject);
+            dimText("commit %s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
+                    c.author.c_str(), c.date.c_str());
+            plmCardEnd();
+            ImGui::PopID();
+        }
     };
     auto bodyTasks = [&]() {
         if (ov.tasks.empty()) {
@@ -409,9 +417,9 @@ void plmDrawOverviewPage(AppState& st) {
         } else {
             for (const auto& t : ov.tasks) {
                 ImGui::PushID(t.id.c_str());
-                plmCardBegin("##ovt", false, 8.0f, 3.0f, plmTintPriority(t.priority), 0.20f);
+                plmCardBegin("##ovt", false, 8.0f, 6.0f, plmTintPriority(t.priority), 0.32f);
                 plmItemTitle(t.title);          // wraps long titles instead of clipping
-                priorityDot(t.priority);        // right-pinned on the title line
+                priorityDot(t.priority);        // hover tooltip naming the priority
                 plmCardEnd();
                 ImGui::PopID();
             }
@@ -900,10 +908,32 @@ void doRelease(AppState& st, const std::string& itemId, bool confirm) {
 }
 }  // namespace
 
+// Shared git-activity list: recent commits as liquid-glass cards. Reused by the
+// Releases panel and anywhere else that surfaces working-repo activity.
+static void drawGitActivity(AppState& st, size_t limit) {
+    (void)st;
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    if (H.gitLog.empty()) return;
+    plmSectionHeader("Git activity", "git");
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    for (size_t i = 0; i < H.gitLog.size() && i < limit; ++i) {
+        const auto& c = H.gitLog[i];
+        ImGui::PushID(("rel_g" + c.hash).c_str());
+        plmCardBegin("##relg", false, 8.0f, 4.0f, palette.accent, 0.12f);
+        plmItemTitle(c.subject);
+        dimText("commit %s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
+                c.author.c_str(), c.date.c_str());
+        plmCardEnd();
+        ImGui::PopID();
+    }
+}
+
 void plmDrawReleasesPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureItems(st);
+    plmEnsureGit(st);        // so releases can surface git activity too
 
     plmSectionHeader("Releases", "ok_badge");
     dimText("Stamp the next revision and freeze the design.");
@@ -914,11 +944,15 @@ void plmDrawReleasesPage(AppState& st) {
     ImGui::BeginChild("##rel_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
     if (!H.itemsErr.empty()) { plmError(H.itemsErr); ImGui::EndChild(); return; }
-    if (H.items.empty()) {
+    if (H.items.empty() && H.gitLog.empty()) {
         plmEmptyState("(#)", "Nothing to release yet",
                       "Add a design or document, then release it here.");
         ImGui::EndChild();
         return;
+    }
+    if (H.items.empty()) {
+        dimText("No documents to release yet.");
+        ImGui::Dummy(ImVec2(0, 6 * S));
     }
 
     for (const auto& it : H.items) {
@@ -972,6 +1006,7 @@ void plmDrawReleasesPage(AppState& st) {
         plmCardEnd();
         ImGui::PopID();
     }
+    if (!H.gitLog.empty()) { ImGui::Dummy(ImVec2(0, 8 * S)); drawGitActivity(st, 10); }
     ImGui::EndChild();
 }
 
@@ -1299,31 +1334,17 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
     return changed;
 }
 
-// A small filled priority dot, right-aligned to the card's bottom-right corner.
-// p0 = red, p1 = orange/warn, p2 = neutral dim, p3 = faint. Hover shows the label.
+// Priority is conveyed by the card's own background tint (blue/yellow/red — see
+// plmTintPriority), not a dot drawn over the title — the dot used to sit on top of
+// wrapped title text. This just supplies the hover tooltip naming the priority;
+// call it while the card's child window is still current (before plmCardEnd) so
+// IsWindowHovered() covers the whole card, not a corner pixel.
 void priorityDot(const std::string& pr) {
-    const float S = ui::uiScale;
+    if (!ImGui::IsWindowHovered()) return;
     std::string p = pr.empty() ? "p2" : pr;
-    const float* c = palette.textDim;
-    float a = 0.9f;
-    if (p == "p0")      { c = palette.statusErr;  }
-    else if (p == "p1") { c = palette.statusWarn; }
-    else if (p == "p3") { c = palette.textDisabled; a = 0.7f; }
-    // Draw a real filled circle — the ● glyph isn't in the font atlas (rendered
-    // as a '?'), so paint it directly on the draw-list.
-    const float r = 4.5f * S;
-    const float rowH = ImGui::GetFrameHeight();   // match the copy-text field height
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - 14 * S);
-    ImVec2 o = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(r * 2, rowH));
-    ImVec2 ctr(o.x + r, o.y + rowH * 0.5f);
-    ImGui::GetWindowDrawList()->AddCircleFilled(
-        ctr, r, ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a)), 16);
-    if (ImGui::IsItemHovered()) {
-        const char* word = p == "p0" ? "critical" : p == "p1" ? "high"
-                         : p == "p3" ? "low" : "med";
-        ImGui::SetTooltip("priority: %s", word);
-    }
+    const char* word = p == "p0" ? "critical" : p == "p1" ? "high"
+                     : p == "p3" ? "low" : "med";
+    ImGui::SetTooltip("priority: %s", word);
 }
 
 static std::string s_selTask;     // selected kanban task (reveals its controls)
@@ -1468,6 +1489,7 @@ void plmDrawPlanningPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsurePlanning(st);
+    plmEnsureGit(st);        // fold GitHub issues into the Issues panel below
 
     if (!H.planErr.empty()) plmError(H.planErr);
 
@@ -1508,6 +1530,36 @@ void plmDrawPlanningPage(AppState& st) {
             return plmSeverityRank(a->severity) < plmSeverityRank(b->severity);
         });
     for (const auto* is : issueView) drawIssueRow(st, *is);
+    // GitHub issues (read-only) — surfaced here once the project's git repo is
+    // connected. "Make plan" converts one into a native, linkable task.
+    if (!H.gitIssues.empty()) {
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextUnformatted("From GitHub");
+        ImGui::PopStyleColor();
+        for (const auto& gi : H.gitIssues) {
+            ImGui::PushID(("ghi" + std::to_string(gi.number)).c_str());
+            plmCardBegin("##ghis", false, 8.0f, 3.0f, palette.accent, 0.14f);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("#%d", gi.number);
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            plmItemTitle(gi.title, nullptr, /*alignFrame=*/true);
+            plmActionRowBegin();
+            accentButtonColors();
+            if (ImGui::SmallButton("Make plan")) {
+                planCall(st, "create", "task", {{"title", gi.title}});
+                st.toast(ui::ToastLevel::Success, "Added a task from this GitHub issue");
+            }
+            ImGui::PopStyleColor(2);
+            plmActionRowEnd();
+            plmCardEnd();
+            ImGui::PopID();
+        }
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
     plmPanelEnd();
@@ -1619,13 +1671,13 @@ void plmDrawPlanningPage(AppState& st) {
             const auto& t = *tp;
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
-            plmCardBegin("##task", sel, 8.0f, 3.0f, plmTintPriority(t.priority), 0.22f);
+            plmCardBegin("##task", sel, 8.0f, 6.0f, plmTintPriority(t.priority), 0.32f);
 
             // Title wraps to the card width so the card auto-grows (AutoResizeY) to
             // fit a long title instead of clipping it to one line.
             plmItemTitle(t.title);
-            // Priority dot — always visible, right-pinned on the title's line (info,
-            // not a control), so an unselected card still shows its priority.
+            // Priority is the card's background tint; hovering anywhere on the card
+            // names it in a tooltip instead of drawing a dot over the title.
             priorityDot(t.priority);
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
@@ -1753,6 +1805,407 @@ void plmDrawIssuesPage(AppState& st) {
         ImGui::Spacing();
         ImGui::PopID();
     }
+}
+
+// ---- Git tab ------------------------------------------------------------------
+//
+// A real git / GitHub client (unlike the vault pages, git vocabulary is
+// deliberate here). Big code/files panel top-left (~2/3 x 2/3), a right column
+// of GitHub panels, and a bottom band with changes + commit + history.
+
+// Run a git mutation RPC, then refresh + toast. Bumps generation on success.
+static void gitCall(AppState& st, const char* method, nlohmann::json extra,
+                    std::string okMsg) {
+    auto& H = g_plmHub;
+    if (H.busy) return;
+    H.busy = true;
+    nlohmann::json p = pathParam(st);
+    if (extra.is_object())
+        for (auto it = extra.begin(); it != extra.end(); ++it) p[it.key()] = it.value();
+    st.rpc.call(method, p, [&st, okMsg](const core::RpcResult& r) {
+        g_plmHub.busy = false;
+        std::string h;
+        if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
+        if (!okMsg.empty()) st.toast(ui::ToastLevel::Success, okMsg);
+        plmInvalidate();
+    });
+}
+
+// Load one tracked file's committed content into the code viewer.
+static void gitOpenFile(AppState& st, const std::string& file) {
+    auto& H = g_plmHub;
+    H.gitSelectedFile = file;
+    H.gitFileContent = "(loading…)";
+    nlohmann::json p = pathParam(st);
+    p["file"] = file;
+    st.rpc.call("git_show", p, [](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        std::string h;
+        if (!plmOk(r, h)) { H.gitFileContent = "(could not read file: " + h + ")"; return; }
+        H.gitFileContent = r.result.value("content", std::string());
+        H.gitFileTruncated = r.result.value("truncated", false);
+    });
+}
+
+void plmDrawGitPage(AppState& st) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    const float gap = 8.0f * S;
+    plmEnsureGit(st);
+
+    // Degraded states: no git binary, or not a repo yet.
+    if (H.gitMissing) {
+        plmSectionHeader("Git", "git");
+        plmEmptyState("[ x ]", "Git is not installed",
+                      "Install git to track this project's code here.");
+        return;
+    }
+    if (!H.gitIsRepo && !H.gitLoading) {
+        plmSectionHeader("Git", "git");
+        plmEmptyState("[ + ]", "Not a git repository",
+                      "This folder isn't tracked by git yet.");
+        const float bw = 220 * S;
+        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - bw) * 0.5f);
+        if (!H.busy && plmGlassButton("##gitinit", "Initialize repository", "git", true, bw))
+            gitCall(st, "git_init", nullptr, "Initialized a git repository");
+        return;
+    }
+
+    // Outer breathing room against the page's own edges — the fill-width/height
+    // panels below butt up against these on all four sides, which is what makes
+    // them read as flush-against-the-window instead of properly inset.
+    const float pageL = 6 * S, pageR = 6 * S, pageT = 6 * S, pageB = 6 * S;
+    ImGui::Dummy(ImVec2(0, pageT));
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pageL);
+    const ImVec2 avail0 = ImGui::GetContentRegionAvail();
+    const ImVec2 avail  = ImVec2(avail0.x - pageR, avail0.y - pageB);
+    const float topH    = avail.y * 0.62f;                 // main band = top ~2/3
+    const float bottomH = avail.y - topH - gap;            // changes + history
+    const float mainW   = avail.x * 0.72f;                 // code panel = left ~3/4; right column stays narrow
+
+    // Fixed-height frosted-glass panel (unlike plmPanelBegin's AutoResizeY, so fill-
+    // height scroll children inside — History, the code viewer — actually get height).
+    // Outer panels never scroll — they scale to their given size. Only the inner
+    // content views (file list, code, branch/PR lists, changes, history log) carry
+    // scrollbars for their overflow.
+    auto gpanel = [&](const char* id, const char* title, const char* icon, ImVec2 sz) {
+        ui::pushGlassChildStyle(10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(13 * S, 6 * S));
+        ImGui::BeginChild(id, sz, ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        if (title) { plmSectionHeader(title, icon); ImGui::Dummy(ImVec2(0, 1 * S)); }
+    };
+    auto gpanelEnd = [&]() {
+        ImGui::EndChild();
+        ImGui::PopStyleVar();       // WindowPadding
+        ui::popGlassChildStyle();
+    };
+
+    // ---- top band: code browser (left 2/3) + GitHub column (right 1/3) --------
+    gpanel("##git_main", nullptr, nullptr, ImVec2(mainW, topH));  // no title — stretches to top
+    {
+        const float innerH  = ImGui::GetContentRegionAvail().y;
+        const float listW   = ImGui::GetContentRegionAvail().x * 0.36f;
+        const ImVec2 panelTop = ImGui::GetCursorScreenPos();  // top of the file-explorer column
+
+        // Centered icon+"Code" header above the file tree (matches the icon+title
+        // treatment every other glass panel uses via plmSectionHeader).
+        float headerRowH;
+        {
+            const float hIconSz = ImGui::GetTextLineHeight();
+            const char* label = "Code";
+            const float textW = ImGui::CalcTextSize(label).x;
+            const float unitW = hIconSz + 6 * S + textW;
+            headerRowH = ImGui::GetFrameHeight();
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            float startX = p0.x + (listW - unitW) * 0.5f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float cy = p0.y + headerRowH * 0.5f;
+            ui::drawIconGlass(dl, "body_folder", ImVec2(startX + hIconSz * 0.5f, cy),
+                              hIconSz, Palette::toU32(palette.accent), 0);
+            dl->AddText(ImVec2(startX + hIconSz + 6 * S,
+                       p0.y + (headerRowH - ImGui::GetTextLineHeight()) * 0.5f),
+                       Palette::toU32(palette.accent), label);
+            ImGui::Dummy(ImVec2(0, headerRowH));
+        }
+        ImGui::Dummy(ImVec2(0, 3 * S));
+
+        // File/folder tree: a real explorer with folder + file icons and glass row
+        // pills. Built fresh each frame from the flat tracked-file list.
+        const float headerH = headerRowH + 6 * S;  // icon+text row + spacing
+        ui::pushGlassChildStyle(8.0f);
+        ImGui::BeginChild("##git_files", ImVec2(listW, innerH - headerH), ImGuiChildFlags_Borders);
+        ui::popGlassChildStyle();
+        if (H.gitTree.empty()) {
+            dimText(H.gitLoading ? "Loading\xe2\x80\xa6" : "No tracked files yet.");
+        } else {
+            struct Node { std::map<std::string, Node> dirs; std::vector<std::string> files; };
+            Node root;
+            for (const auto& path : H.gitTree) {
+                Node* cur = &root;
+                size_t start = 0;
+                for (;;) {
+                    size_t slash = path.find('/', start);
+                    if (slash == std::string::npos) { cur->files.push_back(path.substr(start)); break; }
+                    cur = &cur->dirs[path.substr(start, slash - start)];
+                    start = slash + 1;
+                }
+            }
+            static std::set<std::string> s_open;   // expanded folders (full path + '/')
+            // Icons shrink and cycle through a hue per nesting level, so depth reads
+            // at a glance instead of every row looking identical.
+            const float kDepthColors[4][4] = {
+                {palette.accent[0], palette.accent[1], palette.accent[2], 1.0f},
+                {palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f},
+                {palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f},
+                {0.420f, 0.620f, 0.960f, 1.0f},
+            };
+            auto iconSzForDepth = [&](int depth) {
+                return std::max(9.0f * S, 15.0f * S - depth * 1.6f * S);
+            };
+            auto iconColForDepth = [&](int depth) {
+                return Palette::toU32(kDepthColors[depth % 4]);
+            };
+            std::function<void(const Node&, const std::string&, int)> draw =
+                [&](const Node& n, const std::string& prefix, int depth) {
+                for (const auto& kv : n.dirs) {
+                    const std::string full = prefix + kv.first + "/";
+                    bool open = s_open.count(full) > 0;
+                    ImGui::PushID(full.c_str());
+                    const float rowH = ImGui::GetTextLineHeight() + 6 * S;
+                    const float w = ImGui::GetContentRegionAvail().x;
+                    ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    if (ImGui::InvisibleButton("##d", ImVec2(w, rowH))) {
+                        if (open) s_open.erase(full); else s_open.insert(full);
+                        open = !open;
+                    }
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    // Every row carries the liquid-glass wash; it darkens on hover.
+                    ui::glassCardWash(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 5 * S,
+                                      palette.accent, ImGui::IsItemHovered() ? 0.24f : 0.10f, 0.3f);
+                    float x = p0.x + depth * 13 * S + 4 * S;
+                    const float cy = p0.y + rowH * 0.5f;
+                    const ImU32 chev = Palette::toU32(palette.textDim);
+                    if (open) dl->AddTriangleFilled(ImVec2(x, cy - 3 * S), ImVec2(x + 6 * S, cy - 3 * S), ImVec2(x + 3 * S, cy + 3 * S), chev);
+                    else      dl->AddTriangleFilled(ImVec2(x, cy - 3 * S), ImVec2(x + 6 * S, cy), ImVec2(x, cy + 3 * S), chev);
+                    x += 11 * S;
+                    // Icon centered horizontally and vertically in its box; size and
+                    // color both step with nesting depth.
+                    const float iconSz = iconSzForDepth(depth);
+                    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, cy), iconSz, iconColForDepth(depth), 0);
+                    x += iconSz + 8 * S;
+                    dl->AddText(ImVec2(x, p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f), Palette::toU32(palette.text), kv.first.c_str());
+                    ImGui::PopID();
+                    if (open) draw(kv.second, full, depth + 1);
+                }
+                for (const auto& name : n.files) {
+                    const std::string full = prefix + name;
+                    const bool sel = (H.gitSelectedFile == full);
+                    ImGui::PushID(full.c_str());
+                    const float rowH = ImGui::GetTextLineHeight() + 6 * S;
+                    const float w = ImGui::GetContentRegionAvail().x;
+                    ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    if (ImGui::InvisibleButton("##f", ImVec2(w, rowH))) gitOpenFile(st, full);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    // Always-on wash; darker when selected, mid on hover.
+                    const float fa = sel ? 0.36f : (ImGui::IsItemHovered() ? 0.24f : 0.10f);
+                    ui::glassCardWash(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 5 * S,
+                                      palette.accent, fa, 0.3f);
+                    float x = p0.x + depth * 13 * S + 4 * S + 11 * S;  // align past the chevron gutter
+                    const float iconSz = iconSzForDepth(depth);
+                    const ImU32 ic = sel ? Palette::toU32(palette.accent) : iconColForDepth(depth);
+                    // Icon centered horizontally and vertically in its box; size and
+                    // color both step with nesting depth (selected files stay accent).
+                    ui::drawIconGlass(dl, "new_doc", ImVec2(x + iconSz * 0.5f, p0.y + rowH * 0.5f), iconSz, ic, 0);
+                    x += iconSz + 8 * S;
+                    dl->AddText(ImVec2(x, p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f),
+                                sel ? Palette::toU32(palette.text) : Palette::toU32(palette.textDim), name.c_str());
+                    ImGui::PopID();
+                }
+            };
+            draw(root, "", 0);
+            // Auto-open the first README if nothing is selected yet
+            if (H.gitSelectedFile.empty()) {
+                for (const auto& name : root.files) {
+                    if (name.find("README") == 0 || name.find("readme") == 0) {
+                        gitOpenFile(st, name);
+                        break;
+                    }
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        // File content viewer — spans the full column height (from the top of the
+        // file explorer down to its bottom), not just alongside the tree below the
+        // "Code" header, so top/bottom padding match.
+        ImGui::SetCursorScreenPos(ImVec2(panelTop.x + listW + gap, panelTop.y));
+        ui::pushGlassChildStyle(8.0f);
+        ImGui::BeginChild("##git_code", ImVec2(0, innerH), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        ui::popGlassChildStyle();
+        if (H.gitSelectedFile.empty()) {
+            dimText("Select a file to view its contents.");
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.accent[0],
+                palette.accent[1], palette.accent[2], 1.0f));
+            ImGui::TextUnformatted(H.gitSelectedFile.c_str());
+            ImGui::PopStyleColor();
+            if (H.gitFileTruncated) { ImGui::SameLine(); dimText("(truncated)"); }
+            ImGui::Separator();
+            ImGui::TextUnformatted(H.gitFileContent.c_str());
+        }
+        ImGui::EndChild();
+    }
+    gpanelEnd();
+
+    ImGui::SameLine(0, gap);
+
+    // ---- right column: Repository / Pull requests ----------------------------
+    // The column itself never scrolls: the two panels fill the band exactly.
+    // Explicit width (avail.x - mainW - gap) rather than 0 so its right edge lands
+    // pageR short of the true page edge, matching the outer margin everywhere else.
+    const float sideW = avail.x - mainW - gap;
+    ImGui::BeginChild("##git_side", ImVec2(sideW, topH), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    {
+        // Size Repository to fit its content (header + up to 4 info lines + one
+        // signed-in/sign-in-button line) instead of a generous fixed height — a
+        // shorter Repository panel frees more of the column for Pull requests.
+        const float lineH  = ImGui::GetTextLineHeightWithSpacing();
+        const float repoH  = 6 * S * 2                       // gpanel top+bottom padding
+                            + ImGui::GetFrameHeight() + 1 * S // header row + its Dummy
+                            + 4 * lineH                       // branch / upstream / repo / commits
+                            + 3 * S                           // spacer before auth line
+                            + ImGui::GetFrameHeight();        // signed-in text / sign-in button
+        const float prH    = topH - repoH - gap;
+        gpanel("##git_repo", "Repository", "git", ImVec2(0, repoH));
+        if (!H.gitBranch.empty()) {
+            ImGui::AlignTextToFramePadding();
+            dimText("On");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.accent[0],
+                palette.accent[1], palette.accent[2], 1.0f));
+            ImGui::TextUnformatted(H.gitBranch.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!H.gitUpstream.empty())
+            dimText("%s  \xc2\xb7  %d ahead, %d behind", H.gitUpstream.c_str(),
+                    H.gitAhead, H.gitBehind);
+        if (!H.ghRepoName.empty())
+            dimText("%s/%s  (%s)", H.ghRepoOwner.c_str(), H.ghRepoName.c_str(),
+                    H.ghRepoVis.c_str());
+        dimText("%d commits  \xc2\xb7  %d in the last 24h", H.gitTotalCommits, H.gitCommits24h);
+        ImGui::Dummy(ImVec2(0, 3 * S));
+        if (H.ghAuthed) {
+            dimText("Signed in as %s", H.ghUser.c_str());
+        } else {
+            if (!H.busy && plmGlassButton("##ghsignin", "Sign in with GitHub", "team", true))
+                st.rpc.call("git_gh_auth_login", pathParam(st),
+                            [&st](const core::RpcResult& r) {
+                    std::string h;
+                    if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
+                    g_plmHub.ghLoginCode = r.result.value("code", std::string());
+                    g_plmHub.ghLoginUrl  = r.result.value("url", std::string());
+                    st.toast(ui::ToastLevel::Info, "Opening your browser to sign in\xe2\x80\xa6");
+                });
+            if (!H.ghLoginCode.empty()) {
+                ImGui::TextUnformatted(H.ghLoginCode.c_str());
+                dimText("%s", H.ghLoginUrl.c_str());
+            }
+        }
+        gpanelEnd();
+        ImGui::Dummy(ImVec2(0, gap));
+
+        // Pull requests. (GitHub issues live on the Planning tab's Issues panel —
+        // once git is initialized they surface there, not here.)
+        gpanel("##git_prs", "Pull requests", "plan_board", ImVec2(0, prH));
+        ImGui::BeginChild("##git_prlist", ImVec2(0, 0), ImGuiChildFlags_None);
+        if (H.gitPrs.empty()) dimText(H.ghAuthed ? "No open pull requests." : "Sign in to see pull requests.");
+        for (const auto& pr : H.gitPrs) dimText("#%d  %s", pr.number, pr.title.c_str());
+        ImGui::EndChild();
+        gpanelEnd();
+    }
+    ImGui::EndChild();
+
+    ImGui::Dummy(ImVec2(0, gap));
+
+    // ---- bottom band: Changes + commit (left) | History (right) ---------------
+    const float halfW = (avail.x - gap) * 0.5f;
+    gpanel("##git_changes", "Changes", "activity", ImVec2(halfW, bottomH));
+    {
+        // Reserve the commit box + button row at the bottom; the change list fills
+        // the rest and scrolls.
+        const float commitH = ImGui::GetFrameHeight() * 2 + 14 * S;
+        const float listH = std::max(30.0f * S, ImGui::GetContentRegionAvail().y - commitH);
+        ImGui::BeginChild("##git_changed", ImVec2(0, listH), ImGuiChildFlags_None);
+        if (H.gitClean) {
+            dimText("Working tree clean — nothing to commit.");
+        } else {
+            for (const auto& f : H.gitFiles) {
+                ImGui::PushID(f.path.c_str());
+                bool staged = f.staged;
+                if (ImGui::Checkbox("##stage", &staged))
+                    gitCall(st, staged ? "git_stage" : "git_unstage",
+                            {{"files", nlohmann::json::array({f.path})}}, "");
+                ImGui::SameLine();
+                const float* col = f.untracked ? palette.accent
+                                 : f.staged ? palette.statusOk : palette.statusWarn;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 0.95f));
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(f.untracked ? "A" : f.staged ? "M" : "M");
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(f.path.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##commitmsg", "commit message\xe2\x80\xa6",
+                                 H.gitCommitMsg, sizeof(H.gitCommitMsg));
+        ImGui::Dummy(ImVec2(0, 2 * S));
+        if (!H.busy && plmGlassButton("##commit", "Commit", "save", true)) {
+            if (H.gitCommitMsg[0]) {
+                gitCall(st, "git_commit",
+                        {{"message", std::string(H.gitCommitMsg)}, {"stage_all", false}},
+                        "Committed");
+                H.gitCommitMsg[0] = '\0';
+            } else {
+                st.toast(ui::ToastLevel::Error, "Enter a commit message first");
+            }
+        }
+        ImGui::SameLine();
+        if (!H.busy && plmGlassButton("##push", "Push", nullptr))
+            gitCall(st, "git_push", {{"set_upstream", H.gitUpstream.empty()}}, "Pushed");
+        ImGui::SameLine();
+        if (!H.busy && plmGlassButton("##pull", "Pull", nullptr))
+            gitCall(st, "git_pull", nullptr, "Pulled");
+        ImGui::SameLine();
+        if (!H.busy && plmGlassButton("##fetch", "Fetch", nullptr))
+            gitCall(st, "git_fetch", nullptr, "Fetched");
+    }
+    gpanelEnd();
+
+    ImGui::SameLine(0, gap);
+
+    gpanel("##git_hist", "History", "history", ImVec2(avail.x - halfW - gap, bottomH));
+    {
+        ImGui::BeginChild("##git_log", ImVec2(0, 0), ImGuiChildFlags_None);
+        if (H.gitLog.empty()) dimText(H.gitLoading ? "Loading\xe2\x80\xa6" : "No commits yet.");
+        for (const auto& c : H.gitLog) {
+            ImGui::PushID(c.hash.c_str());
+            plmCardBegin("##gc", false, 9.0f, 5.0f, palette.accent, 0.13f);
+            plmItemTitle(c.subject);          // wraps long commit subjects
+            dimText("%s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
+                    c.author.c_str(), c.date.c_str());
+            plmCardEnd();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+    gpanelEnd();
 }
 
 }  // namespace ui

@@ -91,6 +91,35 @@ PlmMilestoneRow parseMilestone(const nlohmann::json& m) {
     return r;
 }
 
+PlmGitFileRow parseGitFile(const nlohmann::json& f) {
+    PlmGitFileRow r;
+    r.path      = getStr(f, "path");
+    r.xy        = getStr(f, "xy");
+    r.staged    = f.value("staged", false);
+    r.unstaged  = f.value("unstaged", false);
+    r.untracked = f.value("untracked", false);
+    return r;
+}
+
+PlmGitCommitRow parseGitCommit(const nlohmann::json& c) {
+    PlmGitCommitRow r;
+    r.hash    = getStr(c, "hash");
+    r.author  = getStr(c, "author");
+    r.date    = getStr(c, "date");
+    r.subject = getStr(c, "subject");
+    return r;
+}
+
+PlmGitRefRow parseGitRef(const nlohmann::json& x) {
+    PlmGitRefRow r;
+    r.number = x.value("number", 0);
+    r.title  = getStr(x, "title");
+    r.state  = getStr(x, "state");
+    r.author = getStr(x, "author");
+    r.branch = getStr(x, "branch");
+    return r;
+}
+
 }  // namespace
 
 bool plmOk(const core::RpcResult& r, std::string& hint) {
@@ -238,6 +267,115 @@ void plmEnsureSettings(AppState& st) {
         H.setErr.clear();
         H.partPrefix = getStr(r.result, "part_number_prefix");
         H.aiMode     = getStr(r.result, "ai_mode");
+    });
+}
+
+void plmEnsureGit(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.gitLoading || H.gitGen == H.generation) return;
+    H.gitLoading = true;
+    H.gitGen = H.generation;  // fan out; each callback fills its own slice
+
+    // git status — branch, ahead/behind, changed files, is-repo/missing state.
+    st.rpc.call("git_status", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        std::string h;
+        if (plmOk(r, h)) {
+            H.gitIsRepo = true; H.gitMissing = false; H.gitErr.clear();
+            H.gitBranch   = getStr(r.result, "branch");
+            H.gitUpstream = getStr(r.result, "upstream");
+            H.gitAhead    = r.result.value("ahead", 0);
+            H.gitBehind   = r.result.value("behind", 0);
+            H.gitClean    = r.result.value("clean", true);
+            H.gitFiles.clear();
+            if (auto f = r.result.find("files"); f != r.result.end() && f->is_array())
+                for (const auto& row : *f) H.gitFiles.push_back(parseGitFile(row));
+        } else {
+            std::string reason = plmReason(r);
+            H.gitMissing = (reason == "git_missing");
+            H.gitIsRepo  = false;
+            H.gitErr     = h;
+        }
+        H.gitLoading = false;
+    });
+
+    st.rpc.call("git_log", [&]{ nlohmann::json p = pathParam(st); p["limit"] = 60; return p; }(),
+                [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) return;
+        H.gitLog.clear();
+        if (auto c = r.result.find("commits"); c != r.result.end() && c->is_array())
+            for (const auto& row : *c) H.gitLog.push_back(parseGitCommit(row));
+        H.gitTotalCommits = r.result.value("total_commits", 0);
+        H.gitCommits24h   = r.result.value("commits_24h", 0);
+    });
+
+    st.rpc.call("git_branches", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) return;
+        H.gitBranches.clear();
+        if (auto b = r.result.find("branches"); b != r.result.end() && b->is_array())
+            for (const auto& row : *b) {
+                PlmGitBranchRow br;
+                br.name    = getStr(row, "name");
+                br.current = row.value("current", false);
+                br.remote  = row.value("remote", false);
+                H.gitBranches.push_back(br);
+            }
+    });
+
+    st.rpc.call("git_remotes", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) return;
+        H.gitRemotes.clear();
+        if (auto rm = r.result.find("remotes"); rm != r.result.end() && rm->is_array())
+            for (const auto& row : *rm) {
+                PlmGitRemoteRow re;
+                re.name = getStr(row, "name");
+                re.url  = getStr(row, "url");
+                H.gitRemotes.push_back(re);
+            }
+    });
+
+    st.rpc.call("git_tree", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) return;
+        H.gitTree.clear();
+        if (auto f = r.result.find("files"); f != r.result.end() && f->is_array())
+            for (const auto& row : *f) if (row.is_string()) H.gitTree.push_back(row.get<std::string>());
+    });
+
+    // GitHub side (gh) — auth, repo, PRs, issues. All degrade quietly.
+    st.rpc.call("git_gh_auth_status", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) { H.ghAuthed = false; return; }
+        H.ghAuthed = r.result.value("authed", false);
+        H.ghUser   = getStr(r.result, "user");
+    });
+
+    st.rpc.call("git_repo_info", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) { H.ghRepoName.clear(); return; }
+        H.ghRepoName  = getStr(r.result, "name");
+        H.ghRepoOwner = getStr(r.result, "owner");
+        H.ghRepoVis   = getStr(r.result, "visibility");
+        H.ghRepoUrl   = getStr(r.result, "url");
+    });
+
+    st.rpc.call("git_pr_list", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) { H.gitPrs.clear(); return; }
+        H.gitPrs.clear();
+        if (auto p = r.result.find("prs"); p != r.result.end() && p->is_array())
+            for (const auto& row : *p) H.gitPrs.push_back(parseGitRef(row));
+    });
+
+    st.rpc.call("git_issue_list", pathParam(st), [](const core::RpcResult& r) {
+        auto& H = g_plmHub; std::string h;
+        if (!plmOk(r, h)) { H.gitIssues.clear(); return; }
+        H.gitIssues.clear();
+        if (auto i = r.result.find("issues"); i != r.result.end() && i->is_array())
+            for (const auto& row : *i) H.gitIssues.push_back(parseGitRef(row));
     });
 }
 

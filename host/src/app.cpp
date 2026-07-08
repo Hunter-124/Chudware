@@ -776,6 +776,9 @@ static bool saveAllDirtyForQuit(AppState& st) {
     return allSaved;
 }
 
+// TEMP DIAGNOSTIC: forward decl for the vendor-wizard headless repro in run_gui.
+namespace ui { namespace parts { void startLoginWizard(AppState&, const std::string&); } }
+
 int run_gui(const char* screenshotPath, const char* openPath) {
     const bool shot = screenshotPath != nullptr;
 #ifndef _WIN32
@@ -1515,6 +1518,20 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     if (shot && shotMode && std::strcmp(shotMode, "reveng") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
     }
+    // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless verification.
+    if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PLM;
+        const char* pg = std::getenv("AI_CAD_PLM_PAGE");
+        if (pg && std::strcmp(pg, "planning") == 0) ui::plmSelectPlanningPage();
+        else if (pg && std::strcmp(pg, "overview") == 0) ui::plmSelectOverviewPage();
+        else if (pg && std::strcmp(pg, "files") == 0) ui::plmSelectFilesPage();
+        else ui::plmSelectGitPage();
+        if (st.plmProjectDir.empty()) {
+            std::error_code ec;
+            auto cwd = std::filesystem::current_path(ec);
+            st.plmProjectDir = ec ? std::string(".") : cwd.string();
+        }
+    }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -1820,6 +1837,18 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         glfwPollEvents();
 #ifdef AI_CAD_ENABLE_CEF
         ui::cef::pump_if_due();   // drive CEF's message loop when its deadline is due
+        {
+            static const char* dbgVendor = std::getenv("AI_CAD_DEBUG_CEF_VENDOR");
+            static long dbgFrame = 0;
+            if (dbgVendor && dbgVendor[0]) {
+                ++dbgFrame;
+                if (dbgFrame == 120) {
+                    st.activeWorkspace = AppState::Workspace::PartsLibrary;
+                    ui::parts::startLoginWizard(st, dbgVendor);
+                }
+                if (dbgFrame == 6000) break;
+            }
+        }
 #endif
 
         // Borderless-window chrome: drag / edge-resize / double-click-maximize off the same

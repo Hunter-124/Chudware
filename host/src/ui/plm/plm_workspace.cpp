@@ -22,6 +22,7 @@
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
+#include "ui/file_dialog.h"
 #include "ui/icons.h"
 #include "ui_theme.h"
 
@@ -59,7 +60,8 @@ void plmSectionHeader(const char* label, const char* icon) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
-    ImGui::Spacing();
+    // No trailing Spacing() here — callers add exactly the gap they want (or none),
+    // instead of every title carrying an extra baked-in ItemSpacing underneath it.
 }
 
 void plmEmptyState(const char* icon, const char* msg, const char* sub) {
@@ -154,6 +156,7 @@ static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
     {PlmPage::Planning, "Planning", "plan_board"},
+    {PlmPage::Git,      "Git",      "git"},
     {PlmPage::Settings, "Settings", "settings"},
 };
 
@@ -166,10 +169,10 @@ static void drawNavButton(const RailItem& r, int badge) {
     ImGui::PushID((int)r.page);
     const bool sel = (g_plmHub.page == r.page);
 
-    const float h       = ImGui::GetFrameHeight() * 1.5f;
-    const float iconSz  = 17 * S;
-    const float padX    = 14 * S;
-    const float iconGap = 8 * S;
+    const float h       = ImGui::GetFrameHeight() * 1.16f;
+    const float iconSz  = 15 * S;
+    const float padX    = 10 * S;
+    const float iconGap = 7 * S;
     const float textW   = ImGui::CalcTextSize(r.label).x;
 
     // Badge pill metrics — its own background + extra right padding from the edge.
@@ -237,13 +240,60 @@ static void drawNavButton(const RailItem& r, int badge) {
     ImGui::PopID();
 }
 
+// A right-aligned, nav-styled action button showing the CURRENT project folder
+// name (Files icon). Click → native folder picker to switch the active PLM
+// folder. Same size/style/baseline as the rail buttons; never "selected".
+static void drawNavFolderButton(AppState& st, float rowStartX, float fullW) {
+    const float S = ui::uiScale;
+    std::string name = plmProjectName(st);
+    if (name.empty()) name = "Open folder\xe2\x80\xa6";
+
+    const float h       = ImGui::GetFrameHeight() * 1.16f;
+    const float iconSz  = 15 * S;
+    const float padX    = 10 * S;
+    const float iconGap = 7 * S;
+    const float textW   = ImGui::CalcTextSize(name.c_str()).x;
+    const float w       = padX + iconSz + iconGap + textW + padX;
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(rowStartX + fullW - w);   // pin to the strip's right edge
+    ImGui::PushID("plm_folder_btn");
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + w, p0.y + h);
+    if (ImGui::InvisibleButton("##folder", ImVec2(w, h))) {
+        std::string abs = ui::openFolderDialog();
+        if (!abs.empty()) { st.plmProjectDir = abs; plmInvalidate(); }
+    }
+    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float rnd = 9.0f * S;
+
+    // Frosted base like the rail buttons; a clean full-button wash on hover/press
+    // (no accent top-strip — that read as a glitchy bar across the top edge).
+    ui::glassBackground(dl, p0, p1, 9.0f);
+    if (hov)
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.text[0], palette.text[1], palette.text[2], held ? 0.12f : 0.06f)), rnd);
+    const ImU32 tcu = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+    float x = p0.x + padX;
+    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
+                      iconSz, tcu, 0);
+    x += iconSz + iconGap;
+    ImVec2 ts = ImGui::CalcTextSize(name.c_str());
+    dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), tcu, name.c_str());
+    if (hov) ImGui::SetTooltip("Change the active project folder");
+    ImGui::PopID();
+}
+
 // Horizontal PROJECT nav strip above the page body (replaces the old side rail —
-// frees the dead vertical column). Just the nav buttons — the "PROJECT <name>"
-// label was dropped so the strip sits at the very top and the page gets its space.
+// frees the dead vertical column). Rail buttons on the left; a right-aligned
+// folder button (current project folder name) on the right.
 static void drawTopNav(AppState& st) {
     const float S = ui::uiScale;
-    (void)st;
-    const float gap = 8 * S;
+    const float rowStartX = ImGui::GetCursorPosX();
+    const float fullW     = ImGui::GetContentRegionAvail().x;
+    const float gap = 6 * S;
     for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
         if (i) ImGui::SameLine(0, gap);
         int badge = 0;
@@ -251,6 +301,7 @@ static void drawTopNav(AppState& st) {
         if (kRail[i].page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
         drawNavButton(kRail[i], badge);
     }
+    drawNavFolderButton(st, rowStartX, fullW);
 }
 
 // ---- onboarding (no project resolvable) ---------------------------------------
@@ -276,6 +327,11 @@ static void drawOnboarding(AppState& st) {
 
 // ---- public entry point -------------------------------------------------------
 
+void plmSelectGitPage() { g_plmHub.page = PlmPage::Git; }
+void plmSelectPlanningPage() { g_plmHub.page = PlmPage::Planning; }
+void plmSelectOverviewPage() { g_plmHub.page = PlmPage::Overview; }
+void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
+
 void drawPlmWorkspace(AppState& st) {
     const float S = ui::uiScale;
 
@@ -298,23 +354,27 @@ void drawPlmWorkspace(AppState& st) {
 
     // Outer margin so neither the nav nor the page hugs the main window border.
     const float M = 10.0f * S;
-    ImGui::Dummy(ImVec2(0, M));   // top margin
-    ImGui::Indent(M);            // left margin
+    ImGui::Dummy(ImVec2(0, 3 * S));  // tighter top margin — nav sits closer to the box top
+    ImGui::Indent(M);                // left margin
 
     // Horizontal PROJECT nav above the page views (was a left side rail).
     drawTopNav(st);
-    ImGui::Dummy(ImVec2(0, 8 * S));
+    ImGui::Dummy(ImVec2(0, 2 * S));  // tighter gap between nav and page body
 
     // One generous, uniform content margin for every page body — so the Overview,
     // Planning band, Team & Sync and the board all share the same left edge instead
     // of each element hugging the border by a different amount.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24 * S, 14 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * S, 6 * S));
     // -M width/height leaves a matching right + bottom margin from the window edge.
     // The page body itself never scrolls — overflow lives in each page's inner
     // item-list children (kanban columns, Files/History/Releases lists, etc.).
     ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
+    // Tighter vertical rhythm across every page body (Hunter: "we NEED vertical
+    // compression"). Keep the horizontal item spacing; only squeeze the y gap.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * S));
     switch (g_plmHub.page) {
         case PlmPage::Overview: plmDrawOverviewPage(st); break;
         case PlmPage::Files:    plmDrawFilesPage(st);    break;
@@ -323,8 +383,10 @@ void drawPlmWorkspace(AppState& st) {
         case PlmPage::Planning: plmDrawPlanningPage(st); break;
         case PlmPage::Issues:   plmDrawIssuesPage(st);   break;
         case PlmPage::Team:     plmDrawTeamPage(st);     break;
+        case PlmPage::Git:      plmDrawGitPage(st);      break;
         case PlmPage::Settings: plmDrawSettingsPage(st); break;
     }
+    ImGui::PopStyleVar();  // ItemSpacing
     ImGui::EndChild();
     ImGui::Unindent(M);
 }

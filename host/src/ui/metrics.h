@@ -45,7 +45,7 @@ inline float titleFramePadX() { return px(14.0f); }
 inline float titleFramePadY() { return px(12.0f); }
 
 // ---- pinned Copilot column default/min width (PIXELS; consumed by legacy_chat drawAIPanel) -----
-inline float dockRightTarget() { return px(300.0f); }
+inline float dockRightTarget() { return px(340.0f); }
 inline float dockRightMin()    { return px(200.0f); }
 
 // ---- overlay pills / chips (viewport HUD, sketch overlays, legend, view_selector tooltips) ------

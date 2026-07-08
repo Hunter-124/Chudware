@@ -30,6 +30,13 @@ std::atomic<long long> g_pump_due{-1};
 // deadline model starves OSR during load); at 0 it pumps only on the deadline.
 std::atomic<int> g_live_browsers{0};
 
+// Browsers whose CreateBrowser has been issued but whose OnAfterCreated has not
+// yet fired. CreateBrowser is async and needs several message-loop pumps to reach
+// OnAfterCreated; the deadline model can under-pump that window and wedge creation
+// (no OnAfterCreated → g_live_browsers never rises → permanent "Loading"). While
+// > 0 we pump every frame, exactly like a live browser.
+std::atomic<int> g_creating{0};
+
 long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -66,6 +73,19 @@ public:
         // GPU-process surface CEF can't present in windowless mode).
         cmd->AppendSwitch("disable-gpu-compositing");
         cmd->AppendSwitch("disable-vulkan");
+        // CRASH FIX (coredump-confirmed, SIGTRAP in gl::init::CreateGLContext):
+        // --disable-gpu-compositing does NOT stop the GPU service from trying a
+        // REAL context for shared-image/canvas work (SharedImageStub::Initialize
+        // still calls GpuChannelManager::GetSharedContextState on demand). On
+        // this NVIDIA+Wayland box that real EGL context creation fails (ANGLE
+        // "eglMakeCurrent failed with 0x00003000") and the failure isn't
+        // recovered — the GPU thread hits a fatal CHECK and the whole process
+        // dies with SIGTRAP the moment a real page (not a trivial test page)
+        // triggers EstablishGpuChannel. Force the software (SwiftShader) GL
+        // backend up front so CreateGLContext never probes the real NVIDIA
+        // driver at all.
+        cmd->AppendSwitchWithValue("use-gl", "angle");
+        cmd->AppendSwitchWithValue("use-angle", "swiftshader");
         // Linux: the zygote's fd-passing breaks ICU/resource loading for the
         // separate-helper layout ("Invalid file descriptor to ICU data
         // received"). Disable it so each subprocess loads resources from disk.
@@ -84,8 +104,55 @@ public:
         // once the subprocess ICU hand-off is fixed for this distro.
         if (const char* sp = std::getenv("AI_CAD_CEF_SINGLE_PROCESS"); !(sp && sp[0] == '0'))
             cmd->AppendSwitch("single-process");
-        // TODO(cef): match the stealth profile — UA/lang are set per-browser via
-        // CefBrowserSettings/RequestContext, not here.
+        // ANTI-DETECTION (mirror services/browser/stealth.launch_args): vendor
+        // login pages run bot-walls (Cloudflare/Turnstile) that reject anything
+        // that looks automated. These flags remove the cheap automation tells:
+        //   AutomationControlled → flips navigator.webdriver to false (the #1 tell)
+        //   no-first-run / no-default-browser-check / disable-infobars → no
+        //     "Chrome is being controlled by automated software" banner or
+        //     first-run state that fingerprinters key on.
+        // The document-start JS patches (window.chrome, plugins, languages) are
+        // injected per-browser via CDP in cef_web_view.cpp. NOTE: the software
+        // (SwiftShader) WebGL vendor is a residual tell we cannot remove without
+        // reintroducing the NVIDIA GPU-thread crash (see use-angle above); strict
+        // walls may still trip on it.
+        // CLIPBOARD: DO NOT pin --ozone-platform=x11. It was tried as an OS
+        // clipboard bridge (the default headless Ozone clipboard is an in-memory
+        // stub) and CRASHED: pasting corrupted the heap ("malloc(): corrupted
+        // top size", coredump PID 56925) — the X11 Ozone clipboard path is not
+        // safe in this windowless single-process setup. External paste is
+        // bridged at the app layer instead: cef_web_view.cpp intercepts Ctrl+V,
+        // reads the host (GLFW/Wayland) clipboard, and injects the text via CDP
+        // Input.insertText, bypassing Chromium's clipboard entirely.
+        cmd->AppendSwitch("disable-blink-features=AutomationControlled");
+        cmd->AppendSwitch("no-first-run");
+        cmd->AppendSwitch("no-default-browser-check");
+        cmd->AppendSwitch("disable-infobars");
+        // NB: NO explicit q-values — Chromium adds the ;q weight to the HTTP
+        // Accept-Language header itself, and derives navigator.languages from this
+        // list. Passing "en-US,en;q=0.9" leaks the malformed entry "en;q=0.9" into
+        // navigator.languages (a fingerprint tell). "en-US,en" → languages
+        // ["en-US","en"] + header "en-US,en;q=0.9". (Mirrors stealth._CDP_ACCEPT_LANGUAGE.)
+        if (!cmd->HasSwitch("accept-lang"))
+            cmd->AppendSwitchWithValue("accept-lang", "en-US,en");
+        // EXPERIMENT HOOK: AI_CAD_CEF_EXTRA_SWITCHES="a=1;b;c=2" appends extra
+        // Chromium switches (';'-separated, 'key' or 'key=value') so flag
+        // hypotheses can be tested against the --cef-shot repro without a rebuild.
+        if (const char* extra = std::getenv("AI_CAD_CEF_EXTRA_SWITCHES")) {
+            std::string s(extra), tok;
+            std::size_t i = 0;
+            while (i <= s.size()) {
+                if (i == s.size() || s[i] == ';') {
+                    if (!tok.empty()) {
+                        const auto eq = tok.find('=');
+                        if (eq == std::string::npos) cmd->AppendSwitch(tok);
+                        else cmd->AppendSwitchWithValue(tok.substr(0, eq), tok.substr(eq + 1));
+                    }
+                    tok.clear();
+                } else tok += s[i];
+                ++i;
+            }
+        }
     }
 
     void OnScheduleMessagePumpWork(int64_t delay_ms) override {
@@ -93,6 +160,24 @@ public:
         // deadline; the GLFW frame loop calls cef::do_message_loop_work() when due
         // (and glfwPostEmptyEvent wakes an idle loop). See cef::pump_due_in_ms().
         schedule_pump(delay_ms);
+    }
+
+    // CRASH FIX (coredump-confirmed, SIGTRAP in RenderProcessHostImpl::
+    // GetProcessHostForSiteInstance via ProcessSingletonNotificationCallbackImpl →
+    // StartupBrowserCreator → WebContentsImpl::CreateWithOpener, PID 18704): CEF 149
+    // runs on the Chrome runtime, which holds a process-singleton lock keyed on
+    // root_cache_path. When something (an OAuth/external-protocol navigation during
+    // a vendor login, or the user re-launching AI-CAD) rendezvouses a second launch
+    // into this instance, CEF's DEFAULT relaunch behavior "creates a new default
+    // styled Chrome window" — a brand-new top-level WebContents, i.e. a second
+    // renderer process, which is fatal under --single-process. Returning true here
+    // suppresses that default entirely: we never want a second Chrome window in an
+    // embedded OSR app. The forwarded command line is dropped (there is nowhere in
+    // the embedded UI to honor a new-window request); the live login view keeps its
+    // page. This is on the browser-process UI thread.
+    bool OnAlreadyRunningAppRelaunch(CefRefPtr<CefCommandLine> /*command_line*/,
+                                     const CefString& /*current_directory*/) override {
+        return true;   // handled — do NOT open a new Chrome window (would crash)
     }
 
     IMPLEMENT_REFCOUNTING(AiCadApp);
@@ -135,6 +220,11 @@ bool initialize() {
     // separate. This tree is CEF's own (NOT the Playwright profiles) until the
     // cookie-interop pass — see cef_platform::cache_root().
     CefString(&settings.root_cache_path) = cef_platform::cache_root();
+    // Keep CEF's DEFAULT user agent (a genuine "Chrome/149… Safari/537.36" string
+    // with no Headless/CEF token) — a hand-rolled UA that doesn't match the native
+    // Sec-CH-UA client hints is a WORSE tell than the default. Only pin the
+    // language list so Accept-Language + navigator.languages stay consistent.
+    CefString(&settings.accept_language_list) = "en-US,en";  // no q-values (see accept-lang note)
     cef_platform::configure_settings(settings);
 
     if (!g_app) g_app = new AiCadApp();
@@ -155,7 +245,17 @@ bool initialize() {
 
 bool initialized() { return g_initialized; }
 
-void note_browser_opened() { g_live_browsers.fetch_add(1, std::memory_order_relaxed); }
+void note_browser_creating() { g_creating.fetch_add(1, std::memory_order_relaxed); }
+
+void note_browser_create_failed() {
+    int prev = g_creating.fetch_sub(1, std::memory_order_relaxed);
+    if (prev <= 0) g_creating.store(0, std::memory_order_relaxed);
+}
+
+void note_browser_opened() {
+    g_live_browsers.fetch_add(1, std::memory_order_relaxed);
+    note_browser_create_failed();   // creation settled: hand off from g_creating to g_live_browsers
+}
 void note_browser_closed() {
     int prev = g_live_browsers.fetch_sub(1, std::memory_order_relaxed);
     if (prev <= 0) g_live_browsers.store(0, std::memory_order_relaxed);  // never negative
@@ -173,8 +273,12 @@ bool pump_if_due() {
     // on OnScheduleMessagePumpWork firing. When fully idle (no browser, no pending
     // deadline) we skip the call so a closed-panel app isn't needlessly poked.
     const bool anyLive    = g_live_browsers.load(std::memory_order_relaxed) > 0;
+    const bool creating   = g_creating.load(std::memory_order_relaxed) > 0;
     const bool createPend = g_pump_due.load(std::memory_order_relaxed) >= 0;
-    if (!anyLive && !createPend) return false;
+    // Pump every frame while a browser is live OR a CreateBrowser is in flight
+    // (OnAfterCreated pending) — the latter closes the starvation window that left
+    // the vendor panel on "Loading" forever. Otherwise pump only on CEF's deadline.
+    if (!anyLive && !creating && !createPend) return false;
     g_pump_due.store(-1, std::memory_order_relaxed);  // CEF reschedules the next
     CefDoMessageLoopWork();
     return true;

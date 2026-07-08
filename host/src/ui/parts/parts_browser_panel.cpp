@@ -19,9 +19,21 @@
 #include "ui_theme.h"
 
 #include "ui/widgets/web_view_backend.h"
+#include "ui/widgets/cef/cef_trace_file.h"
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
+
+// Route [wizard] diagnostics to both stderr and the CEF trace file (stderr lands
+// on a socket after the GUI re-execs, so the file is what survives a live repro).
+#define WIZ_TRACE(...)                                              \
+    do {                                                            \
+        char _wb[512];                                              \
+        std::snprintf(_wb, sizeof(_wb), "[wizard] " __VA_ARGS__);   \
+        ::ui::cef::trace_file_line(_wb);                            \
+        std::fprintf(stderr, "%s\n", _wb);                         \
+        std::fflush(stderr);                                        \
+    } while (0)
 
 namespace ui {
 namespace parts {
@@ -64,6 +76,10 @@ struct WizardState {
     bool   loadTimedOut = false;
     std::string setupError;   // embed backend failed — rendered in-panel
     std::string setupHint;
+    // Editable URL bar (CEF nav chrome). Mirrors web->url() while the field is
+    // idle; while the user is typing we leave their text alone until Enter.
+    char urlBuf[1024] = {0};
+    bool urlEditing   = false;
 };
 
 // How long a vendor page may sit without its first paint before we call it stalled.
@@ -88,10 +104,14 @@ void openWizardSite(AppState& st, const std::string& embedId) {
     w.loggedInSince = 0.0;
     w.siteOpenedAt  = ImGui::GetTime();   // arm the load watchdog
     w.loadTimedOut  = false;
+    WIZ_TRACE("openWizardSite site='%s' embed='%s' workerEmbed=%d",
+              w.currentSite.c_str(), embedId.c_str(), (int)w.web->usesWorkerEmbed());
     if (w.web->usesWorkerEmbed())
         w.web->attach(st, embedId);
     else if (!w.currentSite.empty())
         w.web->open(st, w.currentSite, /*isUrl=*/false);
+    else
+        WIZ_TRACE("openWizardSite: NO currentSite — nothing opened");
 }
 
 // Re-open the current site's page in-place (Retry after a stall / load error).
@@ -193,14 +213,16 @@ void pollWizardStatus(AppState& st) {
     });
 }
 
-void wizardNext(AppState& st, bool skip) {
+void wizardNext(AppState& st, bool skip, bool assertLoggedIn = false) {
     auto& w = W();
     if (w.actionPending) return;
     w.actionPending = true;
-    // The GUI's live classification decides logged_in in client mode (the worker
-    // never sees the in-process browser). Sent along so wizard_next records the
-    // site as done vs skipped correctly.
-    const bool loggedIn = !skip && w.web->loginState() == "logged_in";
+    // In client mode the worker never sees the in-process browser, so the GUI is
+    // authoritative for "did the user sign in?". The "I'm signed in" button passes
+    // assertLoggedIn — the user's own confirmation, which the URL heuristic can't
+    // reliably reproduce — so wizard_next records this site as done (not skipped)
+    // and stamps the server-side login.
+    const bool loggedIn = !skip && assertLoggedIn;
     auto send = [&st, skip, loggedIn]() {
         st.rpc.call("login_wizard_next",
                     nlohmann::json{{"skip", skip}, {"logged_in", loggedIn}},
@@ -234,20 +256,24 @@ void wizardNext(AppState& st, bool skip) {
 }
 
 // Login-state chip: borderRow-style pill, colored by state.
+// Chip label + role for a login state — shared by the chip renderer and the
+// top-bar layout (which needs the width to reserve space).
+const char* chipLabel(const std::string& state, const float*& role) {
+    role = palette.textDisabled;
+    if (state == "logged_in")   { role = palette.statusOk;   return "Signed in"; }
+    if (state == "login_page")  { role = palette.statusWarn; return "Login page"; }
+    if (state == "challenge")   { role = palette.statusErr;
+                                  return "Challenge — solve it here"; }
+    // "browsing" (user is signed-in-or-not, just looking around) shows NO chip —
+    // it was a wide hint box that overlapped/hid the URL bar. Empty → not drawn.
+    return "";
+}
+
 void loginStateChip(const std::string& state) {
     const float sc = ui::uiScale;
-    const float* role = palette.textDisabled;
-    const char*  txt  = "Loading";
-    if (state == "logged_in") {
-        role = palette.statusOk;
-        txt  = "Signed in";
-    } else if (state == "login_page") {
-        role = palette.statusWarn;
-        txt  = "Login page";
-    } else if (state == "challenge") {
-        role = palette.statusErr;
-        txt  = "Challenge — solve it here";
-    }
+    const float* role = nullptr;
+    const char*  txt  = chipLabel(state, role);
+    if (!txt || !txt[0]) return;   // no chip for neutral states
     ImDrawList* dl  = ImGui::GetWindowDrawList();
     const ImVec2 ts = ImGui::CalcTextSize(txt);
     const ImVec2 p  = ImGui::GetCursorScreenPos();
@@ -276,6 +302,8 @@ bool browserPanelActive() {
 
 void startLoginWizard(AppState& st, const std::string& site) {
     auto& w = W();
+    WIZ_TRACE("startLoginWizard(site='%s') entry (starting=%d active=%d)",
+              site.c_str(), (int)w.starting, (int)w.active);
     if (w.starting || w.active) return;
     w.starting                 = true;
     w.singleSite               = !site.empty();
@@ -289,10 +317,18 @@ void startLoginWizard(AppState& st, const std::string& site) {
     // never see the user's sign-in). client mode = bookkeeping-only wizard.
     if (!w.web->usesWorkerEmbed()) p["mode"] = "client";
 
+    WIZ_TRACE("login_wizard_start sent (site='%s' clientMode=%d)",
+              site.c_str(), (int)!w.web->usesWorkerEmbed());
     st.rpc.call("login_wizard_start", p, [&st, site](const core::RpcResult& r) {
         auto& w    = W();
         w.starting = false;
         const bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+        WIZ_TRACE("login_wizard_start cb: transport_ok=%d ok=%d reason='%s' "
+                  "current_site='%s' embed='%s'",
+                  (int)r.ok, (int)ok,
+                  (r.ok && r.result.is_object()) ? r.result.value("reason", std::string()).c_str()
+                                                 : r.err.c_str(),
+                  jstr(r.result, "current_site").c_str(), jstr(r.result, "embed_id").c_str());
         if (!ok) {
             std::string reason = r.ok && r.result.is_object()
                                      ? r.result.value("reason", std::string())
@@ -374,21 +410,12 @@ void drawBrowserPanel(AppState& st) {
     if (w.active && !w.statusPending && ImGui::GetTime() - w.lastStatusAt > 2.0)
         pollWizardStatus(st);
 
-    // Client-driven auto-advance (in-process CEF backend): the worker cannot
-    // observe this browser, so when the login chip has read "logged_in" for a
-    // short stability window (multi-hop OAuth redirects settle), the GUI itself
-    // exports the session and advances — same UX the worker-side classify loop
-    // used to give. The chip only reads logged_in after the page LEFT a
-    // sign-in URL it started on, so homepage false-positives can't fire this.
-    if (w.active && !w.web->usesWorkerEmbed() && !w.actionPending) {
-        if (w.web->loginState() == "logged_in") {
-            if (w.loggedInSince == 0.0) w.loggedInSince = ImGui::GetTime();
-            else if (ImGui::GetTime() - w.loggedInSince > 1.5)
-                wizardNext(st, /*skip=*/false);
-        } else {
-            w.loggedInSince = 0.0;
-        }
-    }
+    // NO client-side auto-advance. The in-process browser cannot reliably tell
+    // "signed in" from a redirect: inferring logged_in from leaving a sign-in URL
+    // skipped providers that merely bounced through an SSO/consent page, and never
+    // fired for vendors (e.g. McMaster) whose login is a modal on a normal URL.
+    // The user drives it with the explicit "I'm signed in" button, which asserts
+    // the sign-in authoritatively (see wizardNext).
 
     // Load watchdog (in-process backend): if the page hasn't painted its first
     // frame within kLoadTimeoutSec and there's no explicit load error, treat it
@@ -403,32 +430,46 @@ void drawBrowserPanel(AppState& st) {
                      " is taking too long to load — check your connection, then Retry or Skip.");
     }
 
-    // ---- top bar (28dp): title + step, chip, clipped URL, right-aligned actions ----------
-    const float barH = 28.0f * sc;
+    // ---- top bar (30dp): title/step, back-fwd-reload, editable URL, chip, actions -------
+    // Every item is vertically centered in the bar by setting its Y from its own
+    // height (text, small buttons and the URL input have different heights), so the
+    // row reads as one clean, centered strip instead of a ragged baseline.
+    const float barH = 30.0f * sc;
     ImGui::BeginChild("##wiz_bar", ImVec2(0, barH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     {
         const float availW = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosY((barH - ImGui::GetFrameHeight() * 0.8f) * 0.5f - 1.0f * sc);
-
-        // Right-aligned buttons first (compute reserved width).
-        const bool showSkipNext = w.active && !w.singleSite;
-        float btnW  = 0.0f;
-        auto bsz    = [&](const char* t) {
+        const float fh = ImGui::GetFrameHeight();       // URL input height
+        const float th = ImGui::GetTextLineHeight();     // text / small-button height
+        auto vcenter   = [&](float h) { ImGui::SetCursorPosY((barH - h) * 0.5f); };
+        auto bsz       = [&](const char* t) {
             return ImGui::CalcTextSize(t).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         };
-        // Retry appears once a load has stalled or errored (in-process backend).
-        const bool showRetry = !w.web->usesWorkerEmbed() &&
-                               (w.loadTimedOut || !w.web->lastError().empty());
-        if (showSkipNext) btnW += bsz("Skip") + bsz("Next") + 8.0f * sc;
-        if (showRetry)    btnW += bsz("Retry") + 4.0f * sc;
-        btnW += bsz("Close") + 4.0f * sc;
+
+        // Reserve the right cluster (login chip + action buttons) up front so the
+        // URL field can flex into whatever's left.
+        // "I'm signed in" is the user's explicit sign-in confirmation — the only
+        // authoritative signal in client mode, shown for every active step
+        // (including single-site, which has no auto-advance). "Skip" only makes
+        // sense with more than one site left to move past.
+        const bool showConfirm = w.active;
+        const bool showSkip     = w.active && !w.singleSite;
+        const bool showRetry    = !w.web->usesWorkerEmbed() &&
+                                  (w.loadTimedOut || !w.web->lastError().empty());
+        const float* chipRole = nullptr;
+        const char*  chipTxt  = chipLabel(w.web->loginState(), chipRole);
+        const bool   showChip = chipTxt && chipTxt[0];
+        const float  chipW    = showChip ? ImGui::CalcTextSize(chipTxt).x + 14.0f * sc : 0.0f;
+        float rightW = showChip ? chipW + 10.0f * sc : 0.0f;
+        if (showSkip)    rightW += bsz("Skip") + 4.0f * sc;
+        if (showConfirm) rightW += bsz("I'm signed in") + 4.0f * sc;
+        if (showRetry)   rightW += bsz("Retry") + 4.0f * sc;
+        rightW += bsz("Close") + 4.0f * sc;
 
         // Title.
         if (S().fonts && S().fonts->medium) ImGui::PushFont(S().fonts->medium);
-        std::string title = "Vendor sign-in";
-        if (!w.currentSite.empty()) title += " — " + vendorLabel(w.currentSite);
-        ImGui::TextUnformatted(title.c_str());
+        vcenter(ImGui::GetTextLineHeight());
+        ImGui::TextUnformatted("Vendor sign-in");
         if (S().fonts && S().fonts->medium) ImGui::PopFont();
 
         // Step K/N.
@@ -437,45 +478,86 @@ void drawBrowserPanel(AppState& st) {
             const int total = doneN + (int)w.remaining.size();
             if (total > 0) {
                 ImGui::SameLine(0.0f, 8.0f * sc);
+                vcenter(th);
                 ImGui::TextDisabled("step %d/%d", std::min(doneN + 1, total), total);
             }
         }
 
-        // Login-state chip.
-        ImGui::SameLine(0.0f, 10.0f * sc);
-        loginStateChip(w.web->loginState());
+        // Back / Forward / Reload + editable URL (in-process CEF only).
+        if (w.web->hasNavChrome()) {
+            ImGui::SameLine(0.0f, 12.0f * sc);
+            vcenter(th);
+            ImGui::BeginDisabled(!w.web->canGoBack());
+            if (ImGui::SmallButton("<")) w.web->goBack(st);
+            ImGui::EndDisabled();
+            ImGui::SameLine(0.0f, 2.0f * sc); vcenter(th);
+            ImGui::BeginDisabled(!w.web->canGoForward());
+            if (ImGui::SmallButton(">")) w.web->goForward(st);
+            ImGui::EndDisabled();
+            ImGui::SameLine(0.0f, 2.0f * sc); vcenter(th);
+            if (ImGui::SmallButton("Reload")) w.web->reload(st);
 
-        // Clipped dim URL (fills the gap up to the buttons).
-        const std::string& u = w.web->url();
-        if (!u.empty()) {
-            ImGui::SameLine(0.0f, 10.0f * sc);
-            const float urlW =
-                availW - ImGui::GetCursorPosX() - btnW - 12.0f * sc;
-            if (urlW > 30.0f * sc) {
-                const ImVec2 p = ImGui::GetCursorScreenPos();
-                ImGui::GetWindowDrawList()->PushClipRect(
-                    p, ImVec2(p.x + urlW, p.y + barH), true);
-                ImGui::TextDisabled("%s", u.c_str());
-                ImGui::GetWindowDrawList()->PopClipRect();
+            // URL field flexes into the gap before the right cluster.
+            ImGui::SameLine(0.0f, 8.0f * sc);
+            const float urlW = availW - ImGui::GetCursorPosX() - rightW - 8.0f * sc;
+            if (urlW > 60.0f * sc) {
+                if (!w.urlEditing)   // mirror the live URL while the user isn't typing
+                    std::snprintf(w.urlBuf, sizeof(w.urlBuf), "%s", w.web->url().c_str());
+                vcenter(fh);
+                ImGui::SetNextItemWidth(urlW);
+                const bool submit = ImGui::InputText(
+                    "##wiz_url", w.urlBuf, sizeof(w.urlBuf),
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                w.urlEditing = ImGui::IsItemActive();
+                if (submit && w.urlBuf[0]) {
+                    w.web->navigate(st, w.urlBuf);
+                    w.urlEditing = false;
+                }
+            }
+        } else {
+            // Screencast backend: no nav chrome — show the clipped dim URL as before.
+            const std::string& u = w.web->url();
+            if (!u.empty()) {
+                ImGui::SameLine(0.0f, 10.0f * sc);
+                const float urlW = availW - ImGui::GetCursorPosX() - rightW - 8.0f * sc;
+                if (urlW > 30.0f * sc) {
+                    vcenter(th);
+                    const ImVec2 p = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->PushClipRect(
+                        p, ImVec2(p.x + urlW, p.y + barH), true);
+                    ImGui::TextDisabled("%s", u.c_str());
+                    ImGui::GetWindowDrawList()->PopClipRect();
+                }
             }
         }
 
-        // Buttons.
+        // Right cluster: login chip + action buttons, right-aligned.
         ImGui::SameLine();
-        ImGui::SetCursorPosX(availW - btnW);
-        if (showSkipNext) {
+        ImGui::SetCursorPosX(availW - rightW);
+        if (showChip) {
+            vcenter(th + 4.0f * sc);
+            loginStateChip(w.web->loginState());
+            ImGui::SameLine(0.0f, 10.0f * sc);
+        }
+        if (showSkip) {
+            vcenter(th);
             if (ImGui::SmallButton(w.actionPending ? "..." : "Skip") && !w.actionPending)
                 wizardNext(st, /*skip=*/true);
             ImGui::SameLine(0.0f, 4.0f * sc);
-            if (ImGui::SmallButton("Next") && !w.actionPending)
-                wizardNext(st, /*skip=*/false);
+        }
+        if (showConfirm) {
+            vcenter(th);
+            if (ImGui::SmallButton("I'm signed in") && !w.actionPending)
+                wizardNext(st, /*skip=*/false, /*assertLoggedIn=*/true);
             ImGui::SameLine(0.0f, 4.0f * sc);
         }
         if (showRetry) {
+            vcenter(th);
             if (ImGui::SmallButton("Retry"))
                 retryCurrentSite(st);
             ImGui::SameLine(0.0f, 4.0f * sc);
         }
+        vcenter(th);
         if (ImGui::SmallButton("Close")) {
             closeWizard(st, /*sendStop=*/true);
             ImGui::EndChild();

@@ -19,6 +19,14 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
+#include "include/cef_display_handler.h"
+#include "include/cef_request_handler.h"
+#include "include/cef_resource_request_handler.h"
+#include "include/cef_request.h"
+#include "include/cef_response.h"
+#include "include/cef_callback.h"
+#include "include/cef_version.h"   // CHROME_VERSION_* for Sec-CH-UA alignment
+#include <cstdio>
 
 #include "stb_image_write.h"  // implementation lives in stb_impl.cpp (linked into AI-CAD)
 
@@ -30,13 +38,17 @@ namespace {
 class ShotClient : public CefClient,
                    public CefRenderHandler,
                    public CefLifeSpanHandler,
-                   public CefLoadHandler {
+                   public CefLoadHandler,
+                   public CefDisplayHandler,
+                   public CefRequestHandler,
+                   public CefResourceRequestHandler {
 public:
     ShotClient(int w, int h) : w_(w), h_(h) {}
 
     int  width() const { return w_; }
     int  height() const { return h_; }
     bool loaded() const { return load_end_; }
+    void reset_loaded() { load_end_ = false; }
     bool painted() const { return !bgra_.empty(); }
     CefRefPtr<CefBrowser> browser() const { return browser_; }
     const std::vector<unsigned char>& bgra() const { return bgra_; }
@@ -45,6 +57,82 @@ public:
     CefRefPtr<CefRenderHandler>   GetRenderHandler() override   { return this; }
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler>     GetLoadHandler() override     { return this; }
+    CefRefPtr<CefDisplayHandler>  GetDisplayHandler() override  { return this; }
+    CefRefPtr<CefRequestHandler>  GetRequestHandler() override  { return this; }
+    CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+        CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
+        bool, bool, const CefString&, bool&) override {
+        // DIAGNOSTIC A/B: AI_CAD_CEF_NO_RRH=1 returns nullptr so the request
+        // takes the default network-service path with NO app resource handler.
+        // Isolates whether returning a passive handler is what breaks challenge
+        // (Turnstile/reCAPTCHA) sub-resources with ERR_INVALID_ARGUMENT.
+        if (const char* v = std::getenv("AI_CAD_CEF_NO_RRH"); v && v[0] == '1')
+            return nullptr;
+        return this;
+    }
+    // Dump the outgoing header map + fetch mode for challenge requests, so we can
+    // compare against what a working headless Chromium sends (Referer / Sec-Fetch).
+    ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                                     CefRefPtr<CefRequest> request,
+                                     CefRefPtr<CefCallback>) override {
+        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
+            const std::string u = request->GetURL().ToString();
+            if (u.find("turnstile") != std::string::npos ||
+                u.find("challenge-platform") != std::string::npos) {
+                CefRequest::HeaderMap hm; request->GetHeaderMap(hm);
+                std::fprintf(stderr, "[cef-req] flags=%d %s\n", request->GetFlags(), u.c_str());
+                std::fprintf(stderr, "[cef-req]   Referrer=%s policy=%d\n",
+                             request->GetReferrerURL().ToString().c_str(),
+                             (int)request->GetReferrerPolicy());
+                for (auto& kv : hm)
+                    std::fprintf(stderr, "[cef-req]   %s: %s\n",
+                                 kv.first.ToString().c_str(), kv.second.ToString().c_str());
+            }
+        }
+        return RV_CONTINUE;
+    }
+    void OnResourceRedirect(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                            CefRefPtr<CefRequest> request, CefRefPtr<CefResponse> response,
+                            CefString& new_url) override {
+        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1' && request) {
+            const std::string u = request->GetURL().ToString();
+            if (u.find("turnstile") != std::string::npos)
+                std::fprintf(stderr, "[cef-redir] %d %s -> %s\n",
+                             response ? response->GetStatus() : -1, u.c_str(),
+                             new_url.ToString().c_str());
+        }
+    }
+    // Log every non-analytics request + all failures so a --cef-shot reveals
+    // whether the challenge (Turnstile) script is even fetched in the CEF runtime.
+    void OnResourceLoadComplete(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                                CefRefPtr<CefRequest> request,
+                                CefRefPtr<CefResponse> response,
+                                URLRequestStatus status, int64_t) override {
+        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); !(v && v[0] == '1')) return;
+        const std::string u = request ? request->GetURL().ToString() : "?";
+        const int http = response ? response->GetStatus() : -1;
+        const bool interesting = u.find("cloudflare") != std::string::npos ||
+                                 u.find("turnstile")  != std::string::npos ||
+                                 u.find("challenge")  != std::string::npos ||
+                                 u.find("recaptcha")  != std::string::npos ||
+                                 status != UR_SUCCESS || http >= 400;
+        const int err = response ? (int)response->GetError() : 0;
+        if (interesting)
+            std::fprintf(stderr, "[cef-net] status=%d http=%d err=%d %s\n",
+                         (int)status, http, err, u.c_str());
+    }
+
+    // Console capture — AI_CAD_CEF_SHOT_CONSOLE=1 dumps page console to stderr so
+    // a --cef-shot of a challenge page reveals why a widget (e.g. Cloudflare
+    // Turnstile) fails to initialise in the CEF single-process/OSR runtime.
+    bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
+                          const CefString& message, const CefString& source,
+                          int line) override {
+        if (const char* v = std::getenv("AI_CAD_CEF_SHOT_CONSOLE"); v && v[0] == '1')
+            std::fprintf(stderr, "[cef-console] sev=%d %s (%s:%d)\n", (int)level,
+                         message.ToString().c_str(), source.ToString().c_str(), line);
+        return false;
+    }
 
     // CefRenderHandler
     void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
@@ -60,7 +148,50 @@ public:
     }
 
     // CefLifeSpanHandler
-    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override { browser_ = browser; }
+    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+        browser_ = browser;
+        // Mirror the interactive path's anti-detection so --cef-shot reflects the
+        // real wire fingerprint: align Sec-CH-UA brands (add "Google Chrome") and
+        // cap deviceMemory. Keeps CEF's reduced UA; versions from CHROME_VERSION_*.
+        if (!browser) return;
+        const std::string major = std::to_string(CHROME_VERSION_MAJOR);
+        const std::string full  = major + "." + std::to_string(CHROME_VERSION_MINOR) +
+                                  "." + std::to_string(CHROME_VERSION_BUILD) +
+                                  "." + std::to_string(CHROME_VERSION_PATCH);
+        const std::string reducedUa =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/" + major + ".0.0.0 Safari/537.36";
+        auto brand = [](const char* n, const std::string& v) {
+            CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
+            d->SetString("brand", n); d->SetString("version", v); return d;
+        };
+        CefRefPtr<CefListValue> brands = CefListValue::Create();
+        brands->SetDictionary(0, brand("Chromium", major));
+        brands->SetDictionary(1, brand("Google Chrome", major));
+        brands->SetDictionary(2, brand("Not)A;Brand", "24"));
+        CefRefPtr<CefListValue> fullList = CefListValue::Create();
+        fullList->SetDictionary(0, brand("Chromium", full));
+        fullList->SetDictionary(1, brand("Google Chrome", full));
+        fullList->SetDictionary(2, brand("Not)A;Brand", "24.0.0.0"));
+        CefRefPtr<CefDictionaryValue> meta = CefDictionaryValue::Create();
+        meta->SetList("brands", brands); meta->SetList("fullVersionList", fullList);
+        meta->SetString("fullVersion", full); meta->SetString("platform", "Linux");
+        meta->SetString("platformVersion", ""); meta->SetString("architecture", "x86");
+        meta->SetString("model", ""); meta->SetBool("mobile", false);
+        meta->SetString("bitness", "64"); meta->SetBool("wow64", false);
+        CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+        params->SetString("userAgent", reducedUa);
+        params->SetString("acceptLanguage", "en-US,en");
+        params->SetString("platform", "Linux x86_64");
+        params->SetDictionary("userAgentMetadata", meta);
+        browser->GetHost()->ExecuteDevToolsMethod(0, "Network.setUserAgentOverride", params);
+        static const char* kCap =
+            "(()=>{try{if(navigator.deviceMemory>8)"
+            "Object.defineProperty(navigator,'deviceMemory',{get:()=>8});}catch(e){}})();";
+        CefRefPtr<CefDictionaryValue> sp = CefDictionaryValue::Create();
+        sp->SetString("source", kCap);
+        browser->GetHost()->ExecuteDevToolsMethod(0, "Page.addScriptToEvaluateOnNewDocument", sp);
+    }
 
     // CefLoadHandler
     void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int) override {
@@ -122,6 +253,15 @@ bool render_url_to_png(const std::string& url, int w, int h, const std::string& 
         client->browser()->GetHost()->Invalidate(PET_VIEW);
     for (int i = 0; i < 60 && !client->painted(); ++i) pump(20);
     pump(300);  // let late paints (fonts/images) land
+    // Challenge pages (Cloudflare Turnstile etc.) run JS/worker challenges for
+    // several seconds after load; give them time so the console + final PNG show
+    // the settled widget state. AI_CAD_CEF_SHOT_SETTLE_MS overrides.
+    if (const char* s = std::getenv("AI_CAD_CEF_SHOT_SETTLE_MS")) {
+        int ms = std::atoi(s);
+        while (ms > 0) { const int chunk = ms > 500 ? 500 : ms; pump(chunk); ms -= chunk; }
+        if (client->browser()) client->browser()->GetHost()->Invalidate(PET_VIEW);
+        pump(300);
+    }
 
     bool ok = false;
     if (client->painted()) {

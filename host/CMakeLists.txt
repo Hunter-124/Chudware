@@ -173,6 +173,9 @@ add_executable(AI-CAD
   src/ui/ai/ai_workspace.cpp
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
   src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels
+  src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
+  src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay
+  src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp

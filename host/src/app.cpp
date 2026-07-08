@@ -1538,6 +1538,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // We set a flag and inject in the parts workspace first-frame path.
         st.wantPartsShot = true;
     }
+    // AI_CAD_SHOT=reveng_capture: RE-19 capture suite — webcam widget + coverage ring +
+    // image gallery rendered with stub camera (no device required). Opens RE workspace on
+    // Capture stage so the full panel renders headlessly (generic frame capture picks it up).
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_capture") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+    }
     // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless verification.
     if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PLM;

@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+// RE-19: GalleryImage is defined in image_gallery.h; included below to avoid
+// a circular dependency (image_gallery.h must NOT include reveng_internal.h).
+#include "image_gallery.h"
+
 namespace ui {
 namespace reveng {
 
@@ -43,6 +47,10 @@ struct RevEngState {
     bool listedOnce = false;
     double lastListT = -100.0;
     std::string listErr;            // sticky; empty when healthy
+
+    // RE-19: per-session image gallery (resets when selected session changes).
+    std::vector<GalleryImage> galleryImages;
+    int gallerySession = -1;        // selected index when gallery was last reset
 };
 
 RevEngState& S();

@@ -23,6 +23,9 @@
 
 #include "reveng_internal.h"
 #include "dim_review.h"  // RE-22: drawDimReviewPanel / drawDeviationPanel
+// RE-ANCHOR(RE-19): capture suite — webcam + gallery wired into Capture stage
+#include "webcam_capture.h"
+#include "image_gallery.h"
 
 namespace ui {
 namespace reveng {
@@ -287,6 +290,16 @@ void drawRevEngWorkspace(AppState& st) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     const float bodyH = avail.y - stepperH;
 
+    // RE-19: reset gallery when selected session changes
+    {
+        RevEngState& s = S();
+        if (s.selected != s.gallerySession) {
+            galleryFreeTextures(s.galleryImages);
+            s.galleryImages.clear();
+            s.gallerySession = s.selected;
+        }
+    }
+
     // ---- upper body: rail | center | properties ----
     ImGui::BeginChild("##reveng_body", ImVec2(0, bodyH), ImGuiChildFlags_None);
     {
@@ -327,7 +340,30 @@ void drawRevEngWorkspace(AppState& st) {
                 std::snprintf(title, sizeof(title), "%s — %s",
                               kStageLabels[(int)s.stage],
                               s.sessions[s.selected].name.c_str());
-                drawCenteredEmptyState(title, stageBlurb(s.stage));
+                // RE-ANCHOR(RE-19): Capture stage shows the live webcam + gallery;
+                // other stages keep the blurb empty-state.
+                if (s.stage == Stage::Capture) {
+                    ImGui::TextUnformatted(title);
+                    ImGui::Separator();
+                    // Webcam capture widget (stub camera works headless)
+                    const std::string& sid = s.sessions[s.selected].session_id;
+                    drawWebcamCapture(st, sid, /*session_dir=*/".");
+                    ImGui::Spacing();
+                    // Image gallery / dropzone
+                    std::vector<std::string> dropped;
+                    galleryLoadPendingThumbs(s.galleryImages);
+                    drawImageGallery(st, sid, s.galleryImages, dropped);
+                    // Fire async reveng_add_images for drag-dropped files
+                    if (!dropped.empty() && !sid.empty()) {
+                        nlohmann::json args;
+                        args["session_id"] = sid;
+                        args["paths"] = nlohmann::json(dropped);
+                        st.rpc.call("reveng_add_images", args,
+                                    [](const core::RpcResult&){});
+                    }
+                } else {
+                    drawCenteredEmptyState(title, stageBlurb(s.stage));
+                }
             }
         }
         ImGui::EndChild();

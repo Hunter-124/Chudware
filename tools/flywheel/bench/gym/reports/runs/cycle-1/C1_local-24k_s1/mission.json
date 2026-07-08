@@ -1,9 +1,10 @@
 {
-  "status": "running",
-  "phase": "plan",
+  "status": "failed",
+  "phase": "specify",
   "phases_completed": [
     "intake"
   ],
   "findings": [],
-  "stop_reason": ""
+  "stop_reason": "specify_incomplete",
+  "mode": "real"
 }

@@ -1,17 +1,8 @@
 [
   {
-    "failure_class": "tool_misuse",
-    "detail": "used measure_part for AC2 but check tool is fit_report",
-    "evidence_seqs": [
-      4
-    ],
-    "evidence": [
-      {
-        "seq": 4,
-        "kind": "tool_call",
-        "actor": "feature_modeler",
-        "why": "verification used a tool != criterion's declared check tool"
-      }
-    ]
+    "failure_class": "incoherent_geometry",
+    "detail": "acceptance criteria failed: AC1, AC2, AC3, AC4",
+    "evidence_seqs": [],
+    "evidence": []
   }
 ]

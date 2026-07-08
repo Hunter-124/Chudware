@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "failure_class": "incoherent_geometry",
+    "detail": "acceptance criteria failed: AC1, AC2, AC3, AC4",
+    "evidence_seqs": [],
+    "evidence": []
+  }
+]

@@ -957,25 +957,33 @@ def draw_curve_helix(d, cell, p):
 
 @icon("thread")
 def draw_thread(d, cell, p):
-    """Threaded shaft: a vertical shank cut with slanted V-thread grooves (Thread Wizard)."""
+    """Screw thread: a bold shaft whose two edges are SAWTOOTH thread teeth, with a flat
+    head on top. Reads as a threaded fastener even at 20 px (dense hatching mushes out)."""
     s = cell * SS
     lw = stroke_width(cell)
-    x0, x1 = s*0.36, s*0.64            # shank sides
-    ytop, ybot = s*0.20, s*0.80
-    # Ghost cylinder body: crown ellipse, two vertical sides, rounded bottom.
-    d.ellipse([x0, s*0.13, x1, s*0.25], fill=_rgba(p.accent, 42), outline=p.stroke, width=lw)
-    d.line([(x0, s*0.19), (x0, ybot)], fill=p.stroke, width=lw)
-    d.line([(x1, s*0.19), (x1, ybot)], fill=p.stroke, width=lw)
-    d.arc([x0, s*0.74, x1, s*0.86], start=0, end=180, fill=p.stroke, width=lw)   # rounded tip
-    # Thread crest lines — slanted downhill (the classic screw-thread hatching), in accent.
-    for i in range(5):
-        y = s*0.30 + i*s*0.105
-        d.line([(x0, y), (x1, y - s*0.075)], fill=p.accent, width=lw)
-    # A couple of thread tips jutting past the right silhouette so it reads as a real thread.
-    for i in range(5):
-        y = s*0.30 + i*s*0.105
-        d.line([(x1, y - s*0.075), (x1 + s*0.045, y - s*0.095)],
-               fill=_rgba(p.stroke, 150), width=max(1, lw // 2))
+    cx = s * 0.50
+    xnl, xnr = s*0.46, s*0.54       # neck (valley) x, left/right
+    xcl, xcr = s*0.34, s*0.66       # crest (peak) x, left/right — teeth stick well out
+    ytop, ybot = s*0.30, s*0.80     # threaded shaft span (below the head)
+    n = 4                            # thread teeth per side
+    half = (ybot - ytop) / (2 * n)
+    # Flat fastener head + a short neck so it reads "bolt", not "spring".
+    d.rectangle([s*0.28, s*0.13, s*0.72, s*0.26], fill=_rgba(p.accent, 70), outline=p.stroke, width=lw)
+    d.line([(cx, s*0.26), (cx, ytop)], fill=p.stroke, width=lw)
+    # Build a SOLID serrated silhouette: a triangle-wave down the right edge, a pointed
+    # lead-in tip, then a triangle-wave back up the left edge. Filled so the sawtooth thread
+    # crests ARE the outline — legible even at 20 px.
+    right = []
+    for i in range(2 * n + 1):
+        y = ytop + i * half
+        right.append((xcr if i % 2 == 1 else xnr, y))
+    left = []
+    for i in range(2 * n, -1, -1):
+        y = ytop + i * half
+        left.append((xcl if i % 2 == 1 else xnl, y))
+    poly = right + [(cx, ybot + s*0.08)] + left    # pointed tip between the two edges
+    d.polygon(poly, fill=_rgba(p.accent, 95))
+    d.line(poly + [poly[0]], fill=p.stroke, width=lw)
 
 @icon("combine")
 def draw_combine(d, cell, p):
@@ -2124,9 +2132,11 @@ def draw_new_doc(d, cell, p):
 
 @icon("undo")
 def draw_undo(d, cell, p):
-    """Bold single-tone counter-clockwise circular arrow (T-G18 regen)."""
+    """Line-art counter-clockwise circular arrow. Uses the SAME 1x stroke as the neighbouring
+    toolbar glyphs (save/open/new_doc) so undo/redo read as thin line icons, not the old bold
+    double-weight arrows Hunter asked to drop."""
     s = cell * SS
-    lw = int(stroke_width(cell) * 2.1)
+    lw = stroke_width(cell)
     cx, cy = s*0.52, s*0.52
     r = s*0.31
     arc_segment(d, cx, cy, r, 182, 360, p.accent, lw)
@@ -2135,9 +2145,9 @@ def draw_undo(d, cell, p):
 
 @icon("redo")
 def draw_redo(d, cell, p):
-    """Bold single-tone clockwise circular arrow (T-G18 regen)."""
+    """Line-art clockwise circular arrow — 1x stroke to match the other toolbar glyphs (see draw_undo)."""
     s = cell * SS
-    lw = int(stroke_width(cell) * 2.1)
+    lw = stroke_width(cell)
     cx, cy = s*0.48, s*0.52
     r = s*0.31
     arc_segment(d, cx, cy, r, 180, 358, p.accent, lw)

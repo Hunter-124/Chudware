@@ -75,7 +75,9 @@ add_executable(AI-CAD
   src/render/aicm_loader.cpp
   src/render/id_pass.cpp
   src/render/overlays.cpp
-  src/render/splat_renderer.cpp  # RE-28: 3DGS splat renderer
+  src/render/splat_renderer.cpp     # RE-28: 3DGS splat renderer
+  src/render/re_points.cpp          # RE-21: sparse point-cloud + camera-frusta overlay (GL)
+  src/render/re_points_fixture.cpp  # RE-21: GL-free fixture builder (also linked by ctest)
   src/core/selection.cpp
   # --- end C15 ---
   # --- C16: feature tree + doc mirror ---
@@ -293,6 +295,21 @@ add_test(NAME test_splat_renderer
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/splat_tiny.ply"
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-28 ---
+
+# --- RE-21: sparse point-cloud + frusta fixture geometry test (no GL context) ---
+# Links only re_points_fixture.cpp (GL-free) + the test driver — no glad/GLFW needed.
+add_executable(test_re_points
+  src/render/re_points_fixture.cpp
+  tests/test_re_points.cpp)
+target_include_directories(test_re_points PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
+set_target_properties(test_re_points PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_re_points
+  COMMAND test_re_points
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end RE-21 ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD

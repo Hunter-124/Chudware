@@ -10,6 +10,7 @@
 // RE-19: GalleryImage is defined in image_gallery.h; included below to avoid
 // a circular dependency (image_gallery.h must NOT include reveng_internal.h).
 #include "image_gallery.h"
+#include "render/re_points.h"  // RE-21: sparse point-cloud + frusta overlay
 
 namespace ui {
 namespace reveng {
@@ -39,6 +40,24 @@ struct SessionSummary {
     std::string status;   // capturing|reconstructing|modeling|review|done|error
     bool approximate = false;
     int images = 0;
+};
+
+// RE-21: Reconstruct-stage progress event (mirrors aicad.reveng_events/1 subset).
+// Drained by feedRevEngEvent() in app.cpp via the orch event journal; events arrive
+// async and are applied on the GL thread only (no mutex — GL-thread-only singleton).
+struct RevEngEvent {
+    std::string kind;     // "reconstruct_progress" | "reconstruct_done" | "reconstruct_error"
+    int         pct  = 0; // 0..100 for progress events
+    std::string msg;      // human-readable detail / error
+};
+
+// RE-21: Reconstruct stage live state — driven by RevEngEvent drain.
+struct ReconstructState {
+    bool     active   = false;  // true while a reconstruction job is running
+    int      pct      = 0;      // 0..100
+    std::string phase;          // e.g. "sparse", "dense", "mesh"
+    std::string err;            // sticky error; empty when healthy
+    bool     done     = false;
 };
 
 // File-static store for the whole workspace. Async-load bookkeeping mirrors the parts /
@@ -72,9 +91,24 @@ struct RevEngState {
     std::string datasheetPath;
     std::string datasheetErr;
     bool datasheetPending = false;
+
+    // RE-21: Reconstruct stage.
+    ReconstructState recon;
+
+    // RE-21: GL overlay — point cloud + camera frusta. Owned here so it persists across frames.
+    // NOTE: splat preview (SplatRenderer) now available via RE-28 on master; wire to S().rePoints
+    // from drawReconstructStage() after RE-28's SplatRenderer is also added to RevEngState.
+    render::RePoints rePoints;
+
+    // RE-21: Canned fixture loaded flag (true once buildCannedSparseFixture has been applied).
+    bool cannedFixtureLoaded = false;
 };
 
 RevEngState& S();
+
+// RE-21: Apply one aicad.reveng_events/1 event to the singleton state.
+// Called from the app.cpp orch event drain — GL thread only, no mutex.
+void feedRevEngEvent(const RevEngEvent& ev);
 
 }  // namespace reveng
 }  // namespace ui

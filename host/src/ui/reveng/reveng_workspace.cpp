@@ -40,6 +40,26 @@ RevEngState& S() {
     return s;
 }
 
+// RE-21: Apply a reveng event to the singleton (GL-thread only, called from app.cpp drain).
+void feedRevEngEvent(const RevEngEvent& ev) {
+    RevEngState& s = S();
+    if (ev.kind == "reconstruct_progress") {
+        s.recon.active = true;
+        s.recon.done   = false;
+        s.recon.err.clear();
+        s.recon.pct    = ev.pct;
+        s.recon.phase  = ev.msg;
+    } else if (ev.kind == "reconstruct_done") {
+        s.recon.active = false;
+        s.recon.done   = true;
+        s.recon.pct    = 100;
+        s.recon.err.clear();
+    } else if (ev.kind == "reconstruct_error") {
+        s.recon.active = false;
+        s.recon.err    = ev.msg.empty() ? "Unknown reconstruction error" : ev.msg;
+    }
+}
+
 // ---- async loaders -------------------------------------------------------------
 
 static void loadSessions(AppState& st, bool force = false) {
@@ -142,6 +162,131 @@ static const char* stageBlurb(Stage stg) {
             return "Attach the result to the parts hub, export a bundle, or print a scale mat.";
     }
     return "";
+}
+
+// RE-21: Reconstruct stage center panel — progress stepper + point-cloud overlay note.
+// The GL overlay (rePoints) is drawn by the caller (drawRevEngWorkspace) via beginOverlay /
+// endOverlay AFTER ImGui rendering; this panel draws the ImGui progress UI only.
+// Splat preview: blocked on RE-28 merge into master — stub present, not wired.
+static void drawReconstructStage(AppState& /*st*/) {
+    const float sc = ui::uiScale;
+    RevEngState& s = S();
+
+    // Lazy-load canned sparse fixture into the RePoints overlay on first entry.
+    if (!s.cannedFixtureLoaded) {
+        s.cannedFixtureLoaded = true;
+        std::vector<render::SparsePoint>   pts;
+        std::vector<render::CameraFrustum> frusta;
+        render::buildCannedSparseFixture(pts, frusta);
+        s.rePoints.setCloud(pts);
+        s.rePoints.setFrusta(frusta);
+    }
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::Dummy(ImVec2(0, avail.y * 0.18f));
+
+    // Title.
+    {
+        const char* title = "Reconstruct";
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+        const ImVec2 ts = ImGui::CalcTextSize(title);
+        ImGui::SetCursorPosX((avail.x - ts.x) * 0.5f);
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
+    }
+    ImGui::Dummy(ImVec2(0, 10 * sc));
+
+    // ---- Sub-stage stepper: Sparse → Dense → Mesh ----------------------------
+    // Three steps mirroring contracts/reveng.md §3.2 (COLMAP sparse → OpenMVS dense → mesh).
+    const char* kSubSteps[]  = { "Sparse", "Dense", "Mesh" };
+    const int   kNSub        = 3;
+    // Determine which sub-step we're on from pct (0-33 / 34-66 / 67-100).
+    int activeStep = 0;
+    if (s.recon.pct >= 67) activeStep = 2;
+    else if (s.recon.pct >= 34) activeStep = 1;
+    const bool reconRunning = s.recon.active;
+    const bool reconDone    = s.recon.done;
+
+    // Centre the stepper row.
+    const float stepW = 80.0f * sc;
+    const float arrowW = 16.0f * sc;
+    const float totalStepW = kNSub * stepW + (kNSub - 1) * arrowW;
+    ImGui::SetCursorPosX((avail.x - totalStepW) * 0.5f);
+    for (int i = 0; i < kNSub; ++i) {
+        if (i > 0) {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::TextDisabled(" > ");
+            ImGui::SameLine(0.0f, 0.0f);
+        }
+        const bool stepDone   = reconDone || (reconRunning && i < activeStep);
+        const bool stepActive = reconRunning && i == activeStep;
+        if (stepDone) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(0.18f, 0.65f, 0.30f, 0.85f));  // green done
+        } else if (stepActive) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImGui::GetStyleColorVec4(ImGuiCol_Button));
+        }
+        ImGui::PushID(i);
+        ImGui::Button(kSubSteps[i], ImVec2(stepW, 0));
+        ImGui::PopID();
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy(ImVec2(0, 14 * sc));
+
+    // ---- Progress bar --------------------------------------------------------
+    if (reconRunning || reconDone) {
+        const float barW = std::min(avail.x * 0.6f, 360.0f * sc);
+        ImGui::SetCursorPosX((avail.x - barW) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.9f));
+        char overlay[32];
+        std::snprintf(overlay, sizeof(overlay), "%d%%", s.recon.pct);
+        ImGui::ProgressBar((float)s.recon.pct / 100.0f, ImVec2(barW, 0), overlay);
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 6 * sc));
+        if (!s.recon.phase.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            const ImVec2 ps = ImGui::CalcTextSize(s.recon.phase.c_str());
+            ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
+            ImGui::TextUnformatted(s.recon.phase.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // ---- Error state ---------------------------------------------------------
+    if (!s.recon.err.empty()) {
+        ImGui::Dummy(ImVec2(0, 8 * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.25f, 0.25f, 1.0f));
+        ImGui::TextWrapped("Error: %s", s.recon.err.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // ---- Idle hint (no job running) ------------------------------------------
+    if (!reconRunning && !reconDone && s.recon.err.empty()) {
+        ImGui::Dummy(ImVec2(0, 8 * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        const char* hint =
+            "Point cloud and camera frusta render in the viewport.\n"
+            "Run Reconstruct from the ribbon to start sparse → dense → mesh.\n"
+            "Splat preview: available after RE-28 merge.";
+        const char* p = hint;
+        while (p && *p) {
+            const char* nl = std::strchr(p, '\n');
+            const char* end = nl ? nl : p + std::strlen(p);
+            const ImVec2 ls = ImGui::CalcTextSize(p, end);
+            ImGui::SetCursorPosX((avail.x - ls.x) * 0.5f);
+            ImGui::TextUnformatted(p, end);
+            if (!nl) break;
+            p = nl + 1;
+        }
+        ImGui::PopStyleColor();
+    }
 }
 
 static void drawCenteredEmptyState(const char* title, const char* body) {
@@ -391,6 +536,11 @@ void drawRevEngWorkspace(AppState& st) {
             } else if (s.stage == Stage::Source) {
                 // RE-ANCHOR(reveng): RE-30 — sources panel (mode-specific entry widgets).
                 drawSourcesPanel(st);
+            } else if (s.stage == Stage::Reconstruct) {
+                // RE-ANCHOR(reveng): RE-21 — reconstruct stage: sub-stage stepper + progress bar.
+                // The GL point-cloud + frusta overlay is drawn in drawRevEngWorkspace() below via
+                // beginOverlay/endOverlay AFTER ImGui rendering so it composites over the viewport.
+                drawReconstructStage(st);
             } else if (s.stage == Stage::Review) {
                 // RE-22: dim-review + deviation panels.
                 const float sc2 = ui::uiScale;

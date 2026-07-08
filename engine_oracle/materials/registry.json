@@ -26,6 +26,34 @@
         "url": null
       }
     },
+    "steel_4130": {
+      "name": "Chromoly steel (AISI 4130, normalized)",
+      "category": "metal",
+      "aliases": [
+        "4130",
+        "4130 steel",
+        "aisi 4130",
+        "chromoly",
+        "chromoly steel",
+        "chrome moly",
+        "25crmo4"
+      ],
+      "mechanical": {
+        "E_mpa": 205000,
+        "nu": 0.29,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 435,
+        "ultimate_mpa": 670,
+        "endurance_mpa": 340
+      },
+      "provenance": {
+        "source": "ASM Metals Reference / MMPDS nominal, AISI 4130 normalized (first-party compilation)",
+        "source_type": "first_party",
+        "license": "first-party compilation",
+        "url": null
+      },
+      "condition": "normalized"
+    },
     "stainless_304": {
       "name": "Stainless 304",
       "category": "metal",

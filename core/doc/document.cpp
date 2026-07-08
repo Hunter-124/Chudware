@@ -6220,6 +6220,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // standard coarse series through M24. A self-contained table keeps the
                 // thread feature in the geom/doc layer without a new catalog link dep.
                 struct MThread { const char* size; double major; double pitch; };
+                // ISO 261 metric COARSE pitch series (major Ø mm, pitch mm), M1.6..M24.
                 static const MThread kMetric[] = {
                     {"M1.6", 1.6, 0.35}, {"M2", 2.0, 0.40}, {"M2.5", 2.5, 0.45},
                     {"M3", 3.0, 0.50},   {"M4", 4.0, 0.70}, {"M5", 5.0, 0.80},
@@ -6228,18 +6229,67 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     {"M18", 18.0, 2.50}, {"M20", 20.0, 2.50}, {"M22", 22.0, 2.50},
                     {"M24", 24.0, 3.00},
                 };
+                // ASME B1.1 Unified inch series — major Ø + pitch already in MM
+                // (major_in * 25.4; pitch = 25.4 / TPI). Both UNC (coarse) and UNF (fine)
+                // for the common #-number and fractional sizes. Match by the exact SAE
+                // designation string ("1/4-20", "#10-32", "1/2-13", ...). The numbers are
+                // cross-checked against research_thread_spec (ASME B1.1).
+                static const MThread kUnified[] = {
+                    // # number sizes (major = (0.060 + 0.013*num) in)
+                    {"#0-80", 1.524, 0.31750}, {"#1-64", 1.854, 0.39688},
+                    {"#2-56", 2.184, 0.45357}, {"#3-48", 2.515, 0.52917},
+                    {"#4-40", 2.845, 0.63500}, {"#5-40", 3.175, 0.63500},
+                    {"#6-32", 3.505, 0.79375}, {"#8-32", 4.166, 0.79375},
+                    {"#10-24", 4.826, 1.05833}, {"#10-32", 4.826, 0.79375},
+                    {"#12-24", 5.486, 1.05833}, {"#12-28", 5.486, 0.90714},
+                    // fractional UNC
+                    {"1/4-20", 6.350, 1.27000},  {"5/16-18", 7.938, 1.41111},
+                    {"3/8-16", 9.525, 1.58750},  {"7/16-14", 11.113, 1.81429},
+                    {"1/2-13", 12.700, 1.95385}, {"9/16-12", 14.288, 2.11667},
+                    {"5/8-11", 15.875, 2.30909}, {"3/4-10", 19.050, 2.54000},
+                    {"7/8-9", 22.225, 2.82222},  {"1-8", 25.400, 3.17500},
+                    // fractional UNF
+                    {"1/4-28", 6.350, 0.90714},  {"5/16-24", 7.938, 1.05833},
+                    {"3/8-24", 9.525, 1.05833},  {"7/16-20", 11.113, 1.27000},
+                    {"1/2-20", 12.700, 1.27000}, {"9/16-18", 14.288, 1.41111},
+                    {"5/8-18", 15.875, 1.41111}, {"3/4-16", 19.050, 1.58750},
+                    {"7/8-14", 22.225, 1.81429}, {"1-12", 25.400, 2.11667},
+                };
                 double major_dia = 0.0, pitch = 0.0;
                 if (feat.contains("size") && feat.at("size").is_string()) {
                     std::string sz = feat.at("size").get<std::string>();
-                    // Canonicalize: trim, uppercase the leading m.
+                    // Strip whitespace + a trailing " UNC"/" UNF"/" UN" series tag so
+                    // "1/4-20 UNC" and "1/4-20" both match. Canonicalize a leading 'm'.
+                    {
+                        size_t sp = sz.find(' ');
+                        if (sp != std::string::npos) sz = sz.substr(0, sp);
+                    }
                     if (!sz.empty() && (sz[0] == 'm')) sz[0] = 'M';
                     bool found = false;
+                    // Metric FINE: "M8x1", "M10X1.25" — major from the M-number, pitch
+                    // given after the x. Handles any metric fine callout without a table.
+                    if (!found && !sz.empty() && sz[0] == 'M') {
+                        size_t xp = sz.find_first_of("xX");
+                        if (xp != std::string::npos) {
+                            try {
+                                double maj = std::stod(sz.substr(1, xp - 1));
+                                double pit = std::stod(sz.substr(xp + 1));
+                                if (maj > 0.0 && pit > 0.0) {
+                                    major_dia = maj; pitch = pit; found = true;
+                                }
+                            } catch (...) { /* fall through to table match */ }
+                        }
+                    }
                     for (const MThread& m : kMetric)
-                        if (sz == m.size) { major_dia = m.major; pitch = m.pitch; found = true; break; }
+                        if (!found && sz == m.size) { major_dia = m.major; pitch = m.pitch; found = true; break; }
+                    for (const MThread& m : kUnified)
+                        if (!found && sz == m.size) { major_dia = m.major; pitch = m.pitch; found = true; break; }
                     if (!found)
                         throw std::runtime_error(
                             "thread: unknown size '" + sz + "' — use an ISO metric size "
-                            "(M1.6..M24 coarse) or pass major_dia + pitch directly");
+                            "(M1.6..M24 coarse, or fine e.g. M8x1), a Unified inch size "
+                            "(e.g. \"1/4-20\", \"#10-32\", \"1/2-13 UNC\"), or pass "
+                            "major_dia + pitch directly");
                 } else {
                     if (!feat.contains("major_dia") && !feat.contains("pitch"))
                         throw std::runtime_error(
@@ -6263,7 +6313,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const bool lefthand = (handed == "left" || handed == "lh" || handed == "left_hand");
                 const std::string style = feat.value("style", std::string("external"));
                 const bool internal = (style == "internal" || style == "tapped" || style == "bore");
-                const std::string tmode = feat.value("mode", std::string("cut"));
+                // Thread FORM (cross-section): "v"/"iso"/"unified"/"metric" -> 60° V
+                // (default); "acme" -> 29° trapezoid; "trap"/"trapezoidal" -> metric 30°
+                // trapezoidal; "square". Accepts `form` or `profile`.
+                ::geom::ThreadForm tform = ::geom::ThreadForm::V60;
+                {
+                    std::string fs = feat.contains("form") ? feat.value("form", std::string())
+                                   : feat.value("profile", std::string());
+                    for (auto& c : fs) c = static_cast<char>(std::tolower(c));
+                    if (fs == "acme") tform = ::geom::ThreadForm::ACME;
+                    else if (fs == "trap" || fs == "trapezoidal" || fs == "metric_trap")
+                        tform = ::geom::ThreadForm::TRAP;
+                    else if (fs == "square" || fs == "sq") tform = ::geom::ThreadForm::SQUARE;
+                    // else V60 (also for "v", "iso", "unified", "un", "metric", "", unknown)
+                }
+
+                std::string tmode = feat.value("mode", std::string("cut"));
+                // RAISED / EXTRUDE thread: fuse a helical ridge instead of cutting a
+                // groove. In this mode the selected cylinder is the ROOT (minor) Ø and the
+                // thread grows OUTWARD to the nominal major. Aliases: add/extrude/raised/
+                // boss/external_raised -> raised geometry (the boolean mode is still "cut"
+                // vs "cosmetic" for the run path below).
+                bool raised = false;
+                if (tmode == "add" || tmode == "extrude" || tmode == "raised" ||
+                    tmode == "raise" || tmode == "boss" || tmode == "protrude" ||
+                    tmode == "proud") {
+                    raised = true;
+                    tmode = "cut";  // real-geometry path (fuse selected via `raised`)
+                }
                 const double turns_cap =
                     feat.contains("turns") ? num_or_expr(feat.at("turns"), env) : 0.0;
 
@@ -6326,7 +6403,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                     ::geom::ThreadResult tr = ::geom::cut_thread(
                         body, axis_loc, axis_dir, cyl_radius, pitch, major_dia, length,
-                        starts, lefthand, internal, turns_cap);
+                        starts, lefthand, internal, raised, turns_cap, tform);
                     if (tr.shape.IsNull())
                         throw std::runtime_error(
                             tr.warning.empty() ? std::string("thread: produced an empty shape")

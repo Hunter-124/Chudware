@@ -183,7 +183,12 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
             # Category-routed live catalog merge, restricted to the node's sites.
             vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
             try:
-                cat_records = _search(vendor_query, domain="catalog", limit=limit)
+                # Restrict the live fan-out to the category's fitting vendors so a
+                # query never fetches from a vendor that can't stock it (no
+                # McMaster for microcontrollers). The prefix filter below stays as
+                # a belt-and-braces guard.
+                cat_records = _search(vendor_query, domain="catalog", limit=limit,
+                                      sites=route_sites)
             except Exception:  # noqa: BLE001 — live layer optional
                 cat_records = []
             prefixes = tuple(f"catalog:{s}::" for s in route_sites)

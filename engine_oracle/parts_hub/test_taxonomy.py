@@ -44,7 +44,7 @@ class TestRealTaxonomyFile:
         doc = tax.load_taxonomy()
         assert doc["version"] == 1
         assert isinstance(doc["categories"], list)
-        assert len(doc["categories"]) == 18, "product catalog defines 18 top folders (17 part folders + vendors)"
+        assert len(doc["categories"]) == 19, "product catalog defines 19 top folders (17 part folders + vendors + custom_fab)"
 
     def test_ids_unique_and_dotted(self):
         doc = tax.load_taxonomy()
@@ -244,7 +244,7 @@ class TestMatchFacets:
 class TestGuiTree:
     def test_roots(self):
         roots = tax.flat_tree_for_gui()
-        assert len(roots) == 18
+        assert len(roots) == 19
         for node in roots:
             for key in ("id", "label", "icon", "description", "facets", "children"):
                 assert key in node
@@ -295,3 +295,79 @@ class TestFallback:
         assert tax.get_node("fastener") is not None
         assert tax.route("fastener")["domains"] == ["fastener"]
         assert tax.effective_facets("fastener") == []
+
+
+# ---------------------------------------------------------------------------
+# Category → vendor routing integrity (Parts Library V2, 2026-07-08)
+# ---------------------------------------------------------------------------
+
+def test_every_routed_site_is_a_registered_adapter():
+    """Every ``sites`` entry in taxonomy.json must be a real registered adapter.
+
+    Guards against silent routing failures like the ``digikey_web`` typo, where
+    the data *looked* correct but DigiKey was never actually searched for
+    electronics because no adapter registers under that key.
+    """
+    import importlib
+    import sys
+    from services.browser import adapters as browser_adapters
+
+    # Test-isolation guard: sibling suites (e.g. test_amazon_parser) call
+    # importlib.reload() on the adapters package, which resets its registry to {}
+    # without re-running each cached submodule's register(), leaving all_adapters()
+    # partial for whichever test runs next. Re-import every adapter submodule so its
+    # module-level ``ADAPTER = register(...)`` re-runs before we read the registry.
+    for _name in list(sys.modules):
+        _short = _name.rsplit(".", 1)[-1]
+        if (_name.startswith("services.browser.adapters.") and not _short.startswith("test_")
+                and hasattr(sys.modules[_name], "ADAPTER")):
+            importlib.reload(sys.modules[_name])
+    registered = {a.key for a in browser_adapters.all_adapters()}
+
+    doc = tax.load_taxonomy()
+    referenced: set[str] = set()
+
+    def _walk(node: dict) -> None:
+        for s in node.get("sites") or []:
+            referenced.add(s)
+        for child in node.get("children") or []:
+            _walk(child)
+
+    for cat in doc["categories"]:
+        _walk(cat)
+
+    unknown = sorted(referenced - registered)
+    assert not unknown, f"taxonomy.json routes to unregistered adapter keys: {unknown}"
+
+
+def test_routed_search_only_fetches_fitting_vendors(monkeypatch):
+    """A category-routed live search must only make requests to the routed
+    vendors — an electronics query never fetches McMaster or a metals house,
+    a metals query never fetches DigiKey. We assert on which sites are actually
+    FETCHED (the request that could get a user rate-limited), not on results.
+    """
+    import services.browser.session as bsession
+    from engine_oracle import parts_hub
+
+    fetched: list[str] = []
+
+    def _fake_fetch(url, site, **kwargs):
+        fetched.append(site)
+        return {"ok": True, "status": 200, "content": "<html></html>",
+                "session_profile_used": site}
+
+    monkeypatch.setattr(bsession, "browser_fetch", _fake_fetch)
+
+    # Electronics allow-list → only electronics vendors fetched.
+    fetched.clear()
+    parts_hub.search("resistor", domain="catalog", limit=20,
+                     sites=["digikey", "lcsc", "snapeda"])
+    assert set(fetched) <= {"digikey", "lcsc", "snapeda"}, fetched
+    assert "mcmaster" not in fetched and "onlinemetals" not in fetched
+
+    # Metals allow-list → only metals vendors fetched, never DigiKey.
+    fetched.clear()
+    parts_hub.search("6061 tube", domain="catalog", limit=20,
+                     sites=["onlinemetals", "metalsdepot"])
+    assert set(fetched) <= {"onlinemetals", "metalsdepot"}, fetched
+    assert "digikey" not in fetched and "lcsc" not in fetched

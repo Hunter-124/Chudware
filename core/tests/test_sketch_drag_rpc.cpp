@@ -57,7 +57,142 @@ double radius_of(const json& entities, const std::string& id) {
     return -1.0;
 }
 
+json line(const char* id, double x1, double y1, double x2, double y2) {
+    return json{{"id", id}, {"type", "line"}, {"construction", false},
+                {"p1", json::array({x1, y1})}, {"p2", json::array({x2, y2})}};
+}
+// Find a line's [p1,p2] in an enter/drag `entities` array.
+json line_pts(const json& entities, const std::string& id) {
+    if (entities.is_array())
+        for (const auto& e : entities)
+            if (e.value("id", std::string()) == id) return json::array({e.value("p1", json()), e.value("p2", json())});
+    return json();
+}
+// Constraint type by id from an enter response's constraint list (empty if dropped/absent).
+std::string cons_type(const json& enter, const std::string& id) {
+    const json& cs = enter.contains("constraints") ? enter.at("constraints") : json::array();
+    if (cs.is_array())
+        for (const auto& c : cs)
+            if (c.value("id", std::string()) == id) return c.value("type", std::string());
+    return std::string();
+}
+
+// Build a fresh part with a sketch: horizontal line e1 [0,0]->[10,0] + a `horizontal` relation c1
+// on it, plus a reference circle so the selection has >1 entity. Returns {doc_id, fid}.
+std::pair<std::string, std::string> make_hline_sketch() {
+    json nr = doc_new("part", "RotHV");
+    std::string doc_id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "S"},
+                 {"params", {{"entities", json::array({line("e1", 0, 0, 10, 0),
+                                                       circle("e2", 20, 0, 3)})},
+                             {"constraints", json::array({rel("c1", "horizontal", {"e1"})})}}},
+                 {"refs", {{"plane", "plane.top"}}}}}}});
+    json resp = doc_apply_ops(doc_id, -1, ops, false);
+    std::string fid = resp.at("id_map").at("$0").get<std::string>();
+    return {doc_id, fid};
+}
+json rotate_op(const char* fid, double cx, double cy, double angle) {
+    return json{{"op", "sketch_rotate"}, {"sketch", fid},
+                {"entities", json::array({"e1", "e2"})},
+                {"cx", cx}, {"cy", cy}, {"angle", angle}, {"copy", false}};
+}
+
+// Segment length of a line id in an enter `entities` array.
+double seg_len(const json& entities, const std::string& id) {
+    if (!entities.is_array()) return -1.0;
+    for (const auto& e : entities)
+        if (e.value("id", std::string()) == id) {
+            const auto& p1 = e.at("p1"); const auto& p2 = e.at("p2");
+            return std::hypot(p2[0].get<double>() - p1[0].get<double>(),
+                              p2[1].get<double>() - p1[1].get<double>());
+        }
+    return -1.0;
+}
+// p1 of a line id.
+std::pair<double, double> p1_of(const json& entities, const std::string& id) {
+    for (const auto& e : entities)
+        if (e.value("id", std::string()) == id)
+            return {e.at("p1")[0].get<double>(), e.at("p1")[1].get<double>()};
+    return {0, 0};
+}
+
+// Build a realistic 80x80 square anchored at the ORIGIN (corner e1.p1 coincident to origin, as the
+// rectangle tool emits), fully defined by 4 coincident corners + H/V on all sides + 2 dims.
+std::pair<std::string, std::string> make_square_at_origin() {
+    json nr = doc_new("part", "RotSquare");
+    std::string doc_id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "S"},
+                 {"params", {{"entities", json::array({
+                     line("e1", 0, 0, 80, 0), line("e2", 80, 0, 80, 80),
+                     line("e3", 80, 80, 0, 80), line("e4", 0, 80, 0, 0)})},
+                  {"constraints", json::array({
+                     rel("c1", "coincident", {"e1.p2", "e2.p1"}),
+                     rel("c2", "coincident", {"e2.p2", "e3.p1"}),
+                     rel("c3", "coincident", {"e3.p2", "e4.p1"}),
+                     rel("c4", "coincident", {"e4.p2", "e1.p1"}),
+                     rel("c5", "horizontal", {"e1"}), rel("c6", "horizontal", {"e3"}),
+                     rel("c7", "vertical", {"e2"}),   rel("c8", "vertical", {"e4"}),
+                     rel("c9", "coincident", {"e1.p1", "origin"}),   // realistic anchor (straddles moved set)
+                     json{{"id","c10"},{"type","distance"},{"refs",{"e1.p1","e1.p2"}},{"value",{{"value",80.0}}}},
+                     json{{"id","c11"},{"type","distance"},{"refs",{"e2.p1","e2.p2"}},{"value",{{"value",80.0}}}}})}}},
+                 {"refs", {{"plane", "plane.top"}}}}}}});
+    json resp = doc_apply_ops(doc_id, -1, ops, false);
+    return {doc_id, resp.at("id_map").at("$0").get<std::string>()};
+}
+
 }  // namespace
+
+// REPRODUCTION: a fully-defined 80x80 square anchored at the origin, rotated 30deg. The four
+// corners must stay a RIGID square — side lengths AND the diagonal preserved (a sheared rhombus
+// keeps side lengths but breaks the diagonal, so we assert the diagonal too).
+TEST_CASE("sketch_rotate keeps an origin-anchored square rigid (sides + diagonal preserved)") {
+    auto [doc_id, fid] = make_square_at_origin();
+    json before = doc_sketch_enter(doc_id, fid);
+    REQUIRE(seg_len(before.at("entities"), "e1") == doctest::Approx(80.0));
+
+    json rot = json{{"op", "sketch_rotate"}, {"sketch", fid},
+                    {"entities", json::array({"e1", "e2", "e3", "e4"})},
+                    {"cx", 40.0}, {"cy", 40.0}, {"angle", 30.0}, {"copy", false}};
+    doc_apply_ops(doc_id, -1, json::array({rot}), false);
+    json after = doc_sketch_enter(doc_id, fid);
+    const json& ents = after.at("entities");
+    for (const char* id : {"e1", "e2", "e3", "e4"})
+        CHECK_MESSAGE(seg_len(ents, id) == doctest::Approx(80.0).epsilon(1e-3),
+                      "side " << id << " length changed (distorted): " << seg_len(ents, id));
+    // Diagonal between opposite corners e1.p1 and e3.p1 must remain 80*sqrt(2) (rhombus breaks this).
+    auto a = p1_of(ents, "e1"); auto b = p1_of(ents, "e3");
+    double diag = std::hypot(b.first - a.first, b.second - a.second);
+    CHECK_MESSAGE(diag == doctest::Approx(80.0 * std::sqrt(2.0)).epsilon(1e-3),
+                  "diagonal changed (square sheared into a rhombus): " << diag);
+}
+
+TEST_CASE("sketch_rotate 90deg swaps a horizontal relation to vertical + rotates geometry") {
+    auto [doc_id, fid] = make_hline_sketch();
+    doc_apply_ops(doc_id, -1, json::array({rotate_op(fid.c_str(), 0, 0, 90.0)}), false);
+    json enter = doc_sketch_enter(doc_id, fid);
+    CHECK(cons_type(enter, "c1") == "vertical");           // H became V at 90deg
+    json p = line_pts(enter.at("entities"), "e1");         // [0,0]-[10,0] -> [0,0]-[0,10]
+    CHECK(p[1][0].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(p[1][1].get<double>() == doctest::Approx(10.0).epsilon(1e-6));
+}
+
+TEST_CASE("sketch_rotate 45deg drops a horizontal relation (non-axis angle)") {
+    auto [doc_id, fid] = make_hline_sketch();
+    doc_apply_ops(doc_id, -1, json::array({rotate_op(fid.c_str(), 0, 0, 45.0)}), false);
+    json enter = doc_sketch_enter(doc_id, fid);
+    CHECK(cons_type(enter, "c1").empty());                 // dropped
+}
+
+TEST_CASE("sketch_rotate 180deg keeps a horizontal relation") {
+    auto [doc_id, fid] = make_hline_sketch();
+    doc_apply_ops(doc_id, -1, json::array({rotate_op(fid.c_str(), 0, 0, 180.0)}), false);
+    json enter = doc_sketch_enter(doc_id, fid);
+    CHECK(cons_type(enter, "c1") == "horizontal");         // axis preserved
+}
 
 TEST_CASE("circle rim drag resizes the radius through the doc_sketch_drag RPC") {
     const double R0 = 10.0;

@@ -2,7 +2,7 @@
 
 The browser fallback for DigiKey (digikey.com) parts search — DISTINCT from
 the Nexar/DigiKey API path in engine_oracle.parts_providers, which is the
-preferred route when API credentials exist. This adapter scrapes the public
+preferred route when API credentials exist. This adapter browses the public
 website under the user's own saved browser session instead: search returns
 part cards with price/stock; `acquire` returns a structured price/stock
 record plus datasheet + ECAD (symbol/footprint) links for ecad_find_part.

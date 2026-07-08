@@ -1,8 +1,8 @@
 """engine_oracle/parts_hub/product_media.py — product-media harvest (sourcing §2b).
 
 When the user accepts the ``reverse_engineer`` fallback from ``match_model``, the
-RE suite should open already loaded with everything scrapable about the product.
-:func:`harvest_product_media` is that scrape step: it fetches the product page
+RE suite should open already loaded with everything fetchable about the product.
+:func:`harvest_product_media` is that fetch step: it fetches the product page
 under the user's own persistent browser session (never importing Playwright
 directly — always via :mod:`services.browser.session`) and collects EVERY
 candidate image (gallery ``<img src>``/``srcset``, ``og:image``, JSON-LD Product

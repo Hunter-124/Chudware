@@ -1467,6 +1467,129 @@ void op_sketch_move(json& doc, const json& op, std::size_t idx, IdGen& gen, json
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
 }
 
+// Entity id owning a constraint ref token ("e3" -> "e3", "e3.p1" -> "e3").
+static std::string ref_entity_id(const std::string& ref) {
+    auto dot = ref.find('.');
+    return dot == std::string::npos ? ref : ref.substr(0, dot);
+}
+
+// Rotate a selection of sketch entities about (cx, cy) by 'angle' degrees. Translation-style
+// counterpart of op_sketch_move. Because horizontal/vertical relations are axis-aligned, a
+// rotation whose net angle is not a multiple of 90 breaks them; we therefore rewrite the
+// horizontal/vertical constraints whose refs lie WHOLLY inside the rotated set:
+//   ~0 / 180 deg -> keep unchanged   |   90 / 270 deg -> swap horizontal<->vertical
+//   any other    -> drop (the GUI diffs before/after to report what was removed).
+// Constraints straddling rotated + fixed geometry are left for the solver to reconcile.
+void op_sketch_rotate(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
+        throw OpError("invalid_op", "sketch_rotate requires a non-empty 'entities' id list");
+    if (!op.contains("cx") || !op["cx"].is_number())
+        throw OpError("invalid_op", "sketch_rotate requires a numeric 'cx'");
+    if (!op.contains("cy") || !op["cy"].is_number())
+        throw OpError("invalid_op", "sketch_rotate requires a numeric 'cy'");
+    if (!op.contains("angle") || !op["angle"].is_number())
+        throw OpError("invalid_op", "sketch_rotate requires a numeric 'angle' (degrees)");
+    double cx = op["cx"].get<double>(), cy = op["cy"].get<double>();
+    double angle = op["angle"].get<double>();
+    bool copy_flag = false;
+    if (op.contains("copy")) {
+        if (!op["copy"].is_boolean()) throw OpError("invalid_op", "sketch_rotate 'copy' must be a bool");
+        copy_flag = op["copy"].get<bool>();
+    }
+    std::vector<std::string> source_ids;
+    for (const json& e_id : op["entities"]) {
+        json* ent = find_sketch_entity(sk, e_id.get<std::string>());
+        if (!ent)
+            throw OpError("invalid_op", "sketch_rotate: entity '" + e_id.get<std::string>() + "' not found");
+        if (!kMpSupported.count(ent->value("type", std::string())))
+            unsupported_entity(idx, "sketch_rotate", ent->value("type", std::string()));
+        source_ids.push_back(e_id.get<std::string>());
+    }
+
+    if (copy_flag) {
+        json& ents = sk["params"]["entities"];
+        std::vector<std::string> new_ids;
+        for (const std::string& sid : source_ids) {
+            json* ent = find_sketch_entity(sk, sid);
+            bool construction = ent->value("construction", false);
+            json geom = rotate_entity(geom_view(*ent), cx, cy, angle);
+            std::string neid = gen.next("e");
+            new_ids.push_back(neid);
+            ents.push_back(stamp_entity(geom, neid, construction));
+        }
+        id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+        for (std::size_t k = 1; k < new_ids.size(); ++k)
+            id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+        return;
+    }
+
+    // In-place rotate the geometry of every selected entity.
+    for (const std::string& sid : source_ids) {
+        json* ent = find_sketch_entity(sk, sid);
+        json rotated = rotate_entity(geom_view(*ent), cx, cy, angle);
+        for (auto it = rotated.begin(); it != rotated.end(); ++it) (*ent)[it.key()] = it.value();
+    }
+
+    // Rewrite horizontal/vertical relations wholly inside the rotated set.
+    double na = std::fmod(std::fmod(angle, 360.0) + 360.0, 360.0);  // normalize to [0,360)
+    const double eps = 1e-6;
+    bool is180 = std::fabs(na - 180.0) < eps || na < eps || std::fabs(na - 360.0) < eps;
+    bool is90 = std::fabs(na - 90.0) < eps || std::fabs(na - 270.0) < eps;
+    std::set<std::string> moved(source_ids.begin(), source_ids.end());
+    if (!is180 && sk["params"].contains("constraints") && sk["params"]["constraints"].is_array()) {
+        json& cons = sk["params"]["constraints"];
+        json kept = json::array();
+        // Whole-line horizontal/vertical locks being retired at a non-axis angle. We can't keep
+        // them (the line is no longer axis-aligned) and simply dropping them leaves the shape
+        // FLOPPY (under-defined) so the solver shears it on re-solve. Instead we record each line's
+        // original orientation and, below, re-impose the SAME relative rigidity with rotation-
+        // invariant parallel/perpendicular relations against a reference line — so a rotated square
+        // stays a rigid square (size + right angles preserved), just free to spin (1 DOF).
+        std::vector<std::pair<std::string, bool>> oriented;   // (line_id, wasHorizontal)
+        for (json& c : cons) {
+            const std::string ctype = c.value("type", std::string());
+            bool hv = (ctype == "horizontal" || ctype == "vertical");
+            bool wholly_inside = hv && c.contains("refs") && c["refs"].is_array() && !c["refs"].empty();
+            if (wholly_inside)
+                for (const auto& r : c["refs"])
+                    if (!moved.count(ref_entity_id(r.get<std::string>()))) { wholly_inside = false; break; }
+            if (hv && wholly_inside) {
+                if (is90) {                       // swap horizontal <-> vertical (still axis-aligned)
+                    c["type"] = (ctype == "horizontal") ? "vertical" : "horizontal";
+                    kept.push_back(c);
+                } else {
+                    // Non-axis angle: retire this lock. If it's a whole-line h/v (refs == [line_id]),
+                    // remember the line so we can re-impose parallel/perp rigidity below. Two-point
+                    // h/v forms (point alignment) can't be preserved this way — just drop them.
+                    if (c["refs"].size() == 1) {
+                        std::string eid = ref_entity_id(c["refs"][0].get<std::string>());
+                        json* le = find_sketch_entity(sk, eid);
+                        if (le && le->value("type", std::string()) == "line")
+                            oriented.push_back({eid, ctype == "horizontal"});
+                    }
+                }
+            } else {
+                kept.push_back(c);
+            }
+        }
+        // Re-impose rigidity: pin every other retired line's orientation relative to the first
+        // (parallel if it had the same orientation, perpendicular if opposite). N locks -> N-1
+        // relative constraints, leaving one global spin DOF — shape-preserving, never distorting.
+        if (oriented.size() >= 2) {
+            const std::string& refLine = oriented.front().first;
+            const bool refH = oriented.front().second;
+            for (std::size_t i = 1; i < oriented.size(); ++i) {
+                const char* rtype = (oriented[i].second == refH) ? "parallel" : "perpendicular";
+                kept.push_back({{"id", gen.next("c")}, {"type", rtype},
+                                {"refs", json::array({refLine, oriented[i].first})}});
+            }
+        }
+        cons = kept;
+    }
+    id_map["$" + std::to_string(idx)] = source_ids.empty() ? std::string() : source_ids[0];
+}
+
 // Dispatch one op against the working doc.
 // ----------------------------------------------------------------- assembly ops
 // Port of engine/doc/ops.py::_op_asm_* (component + mate vocabulary). IdGen mints
@@ -2469,6 +2592,7 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "sketch_mirror_entities")     op_sketch_mirror_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_pattern_entities")    op_sketch_pattern_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_move")                op_sketch_move(doc, op, idx, gen, id_map);
+    else if (k == "sketch_rotate")              op_sketch_rotate(doc, op, idx, gen, id_map);
     else if (k.rfind("asm_", 0) == 0 &&
              doc.value("schema", std::string()) != "aicad.asm/1")
         // G4 guard — asm_* ops on a PART document used to "succeed" by writing a

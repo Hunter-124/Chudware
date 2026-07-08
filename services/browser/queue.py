@@ -1,4 +1,4 @@
-"""services/browser/queue.py — background scrape/download queue (T-X4).
+"""services/browser/queue.py — background fetch/download queue (T-X4).
 
 A persistent, thread-safe job queue for vendor searches + CAD model downloads
 that run in a daemon background thread inside the MCP server process.  Each job

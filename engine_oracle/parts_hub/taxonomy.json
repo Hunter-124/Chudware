@@ -788,6 +788,9 @@
           "id": "structural_stock.extrusions_tslot",
           "label": "T-Slot Extrusions",
           "description": "Aluminum T-slot framing extrusion (80/20 style).",
+          "sites": [
+            "8020"
+          ],
           "query_terms": [
             "t-slot extrusion",
             "aluminum extrusion"
@@ -891,7 +894,8 @@
       "sites": [
         "mcmaster",
         "grainger",
-        "amazon"
+        "amazon",
+        "servocity"
       ],
       "children": [
         {
@@ -1067,7 +1071,9 @@
         "amazon",
         "harborfreight",
         "tractorsupply",
-        "homedepot"
+        "homedepot",
+        "servocity",
+        "pololu"
       ],
       "children": [
         {
@@ -1535,7 +1541,7 @@
       ],
       "sites": [
         "lcsc",
-        "digikey_web",
+        "digikey",
         "snapeda",
         "jlcpcb",
         "amazon",
@@ -1547,7 +1553,8 @@
         "datasheet4u",
         "ultralibrarian",
         "componentsearchengine",
-        "cadenas"
+        "cadenas",
+        "pololu"
       ],
       "children": [
         {
@@ -2428,7 +2435,9 @@
         "orientalmotor",
         "anaheimautomation",
         "grainger",
-        "amazon"
+        "amazon",
+        "pololu",
+        "servocity"
       ],
       "query_terms": [
         "motor"
@@ -2616,7 +2625,7 @@
       "sites": [
         "meanwell",
         "cui",
-        "digikey_web",
+        "digikey",
         "futureelectronics",
         "amazon"
       ],
@@ -2662,7 +2671,7 @@
       ],
       "sites": [
         "batteryspace",
-        "digikey_web",
+        "digikey",
         "amazon"
       ],
       "query_terms": [
@@ -2807,7 +2816,7 @@
         "electromech"
       ],
       "sites": [
-        "digikey_web",
+        "digikey",
         "cui",
         "futureelectronics",
         "componentsearchengine",
@@ -3150,6 +3159,65 @@
               ]
             }
           ]
+        }
+      ]
+    },
+    {
+      "id": "custom_fab",
+      "label": "Custom Fabrication",
+      "icon": "cat_custom_fab",
+      "description": "Instant-quote cut / machine / print services that quote YOUR uploaded geometry (DXF for laser/waterjet, STEP for CNC/3D-print), NOT a stock catalog. These are NOT reachable via part_search (there is nothing to search) — see contracts/fabrication_services.md and the planned fab_* RPC family. Listed here so the GUI can surface the category; routing uses the fab_services list below, never the search-adapter 'sites' field.",
+      "domains": [
+        "custom_fab"
+      ],
+      "sites": [],
+      "query_terms": [],
+      "facets": [],
+      "fab_services": [
+        "sendcutsend",
+        "oshcut",
+        "xometry",
+        "fictiv"
+      ],
+      "children": [
+        {
+          "id": "custom_fab.laser_waterjet",
+          "label": "Laser / Waterjet Cut",
+          "description": "Flat-pattern cutting from sheet stock; upload a DXF flat pattern (note: DXF export is currently a gap, see contracts/fabrication_services.md).",
+          "fab_services": [
+            "sendcutsend",
+            "oshcut"
+          ],
+          "children": []
+        },
+        {
+          "id": "custom_fab.cnc_machining",
+          "label": "CNC Machining",
+          "description": "3-axis+ milling / turning from a STEP solid.",
+          "fab_services": [
+            "xometry",
+            "fictiv"
+          ],
+          "children": []
+        },
+        {
+          "id": "custom_fab.sheet_bending",
+          "label": "Sheet Metal Forming",
+          "description": "Cut-and-bend sheet parts (frame brackets, gussets).",
+          "fab_services": [
+            "sendcutsend",
+            "oshcut"
+          ],
+          "children": []
+        },
+        {
+          "id": "custom_fab.printing_3d",
+          "label": "3D Printing",
+          "description": "FDM / SLA / SLS from a STEP or STL.",
+          "fab_services": [
+            "xometry"
+          ],
+          "children": []
         }
       ]
     }

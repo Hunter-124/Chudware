@@ -80,15 +80,37 @@ class MisumiAdapter:
 
         # Results are embedded in the Next.js __NEXT_DATA__ JSON blob at
         # props.pageProps.hawksearchKeywordSearchResponse.Results (live 2026-07-07).
+        # MISUMI routes generic keyword queries ("bearing", "shaft") to this flat
+        # keyword-result list, but routes more specific / category-shaped queries
+        # ("aluminum extrusion", "hex bolt m5") to a CATEGORY LANDING response
+        # (props.pageProps.npnlCategoryResponse / cmsCategoryResponse) that carries
+        # no flat product list — the user is meant to drill into a subcategory on
+        # site. We detect that case and surface it honestly rather than returning a
+        # bare [] that a caller can't distinguish from "site broke". (Live 2026-07-08.)
         m = _NEXT_DATA_RE.search(content)
         if not m:
             return []
         try:
-            data = json.loads(m.group("json"))
-            results = (data["props"]["pageProps"]
-                       ["hawksearchKeywordSearchResponse"]["Results"])
+            page_props = json.loads(m.group("json"))["props"]["pageProps"]
         except (ValueError, KeyError, TypeError):
             return []
+        kw = page_props.get("hawksearchKeywordSearchResponse")
+        if not isinstance(kw, dict) or "Results" not in kw:
+            # Category-landing response (or an unknown shape): no flat product list.
+            if any(k in page_props for k in ("npnlCategoryResponse", "cmsCategoryResponse",
+                                             "npnlCategoryData")):
+                return [{
+                    "ok": False,
+                    "reason": "category_landing",
+                    "site": SITE,
+                    "hint": (f"MISUMI routed '{query}' to a category page rather than a "
+                             f"flat product list. Try a more specific part term (e.g. a "
+                             f"series code or a single keyword like 'shaft'), or browse "
+                             f"the category on site."),
+                    "source_url": url,
+                }]
+            return []
+        results = kw["Results"]
         if not isinstance(results, list):
             return []
 

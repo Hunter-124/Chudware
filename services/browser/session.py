@@ -33,6 +33,8 @@ retrying.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -87,6 +89,25 @@ def _import_sync_playwright() -> Callable[[], Any]:
     return sync_playwright
 
 
+def _off_loop(fn: Callable[..., dict], *args: Any, **kwargs: Any) -> dict:
+    """Run a Playwright-Sync-API body without a running asyncio loop.
+
+    Playwright's Sync API refuses to start inside a live asyncio event loop
+    ("Please use the Async API instead"), which is exactly the context the MCP
+    servers (parts_hub / vendors_health) run in — every ``browser_fetch`` from
+    there used to blow up and degrade to ``browser_fetch_failed``. When a loop
+    IS running on this thread we hand the sync body to a fresh worker thread
+    (which has no loop of its own) and block on its result; when no loop is
+    running (CLI, tests, plain sync callers) we just call it inline.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn(*args, **kwargs)  # no loop on this thread — safe to run inline
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(fn, *args, **kwargs).result()
+
+
 def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
                   _sync_playwright: Callable[[], Any] | None = None) -> dict:
     """Open a HEADED browser window for the user to sign into ``site``.
@@ -104,7 +125,8 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _browser_login_locked(site, timeout=timeout, sync_playwright=sync_playwright)
+        return _off_loop(_browser_login_locked, site, timeout=timeout,
+                         sync_playwright=sync_playwright)
     finally:
         lock.release()
 
@@ -196,17 +218,23 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _browser_fetch_locked(url, site, nav_timeout=nav_timeout,
-                                     render_settle=render_settle, min_interval=min_interval,
-                                     sync_playwright=sync_playwright)
+        return _off_loop(_browser_fetch_locked, url, site, nav_timeout=nav_timeout,
+                         render_settle=render_settle, min_interval=min_interval,
+                         sync_playwright=sync_playwright)
     finally:
         lock.release()
 
 
 def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_settle: float,
                           min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
-    ratelimit.wait(site, min_interval=min_interval)
+    ceiling = ratelimit.reserve_request(site)
+    if ceiling is not None:
+        return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
+                             f"already made the maximum allowed fetches (a runaway-loop guard). "
+                             f"Nothing was fetched.")
+    ratelimit.wait(site, min_interval=min_interval, url=url)
     profile_path = profiles.profile_dir(site)
+    status: int | None = None
     try:
         try:
             with sync_playwright() as pw:
@@ -239,7 +267,9 @@ def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_set
         except Exception as exc:  # noqa: BLE001
             return fail("browser_fetch_failed", str(exc))
     finally:
-        ratelimit.mark_hit(site)
+        # Drives inter-request spacing AND 429/403 exponential backoff off the
+        # real status (None on error/challenge → clears any backoff, keeps spacing).
+        ratelimit.note_result(site, status)
 
     # A captcha/2FA interstitial is NOT real content. Headless has no human to hand
     # off to, so abort — never return the challenge page as a success, never retry or
@@ -289,16 +319,22 @@ def browser_download(url: str, site: str, dest: Path, *, nav_timeout: float = DE
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _browser_download_locked(url, site, dest, nav_timeout=nav_timeout,
-                                        min_interval=min_interval, sync_playwright=sync_playwright)
+        return _off_loop(_browser_download_locked, url, site, dest, nav_timeout=nav_timeout,
+                         min_interval=min_interval, sync_playwright=sync_playwright)
     finally:
         lock.release()
 
 
 def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: float,
                              min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
-    ratelimit.wait(site, min_interval=min_interval)
+    ceiling = ratelimit.reserve_request(site)
+    if ceiling is not None:
+        return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
+                             f"already made the maximum allowed fetches (a runaway-loop guard). "
+                             f"Nothing was downloaded.")
+    ratelimit.wait(site, min_interval=min_interval, url=url)
     profile_path = profiles.profile_dir(site)
+    status: int | None = None
     try:
         try:
             with sync_playwright() as pw:
@@ -318,7 +354,7 @@ def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: fl
         except Exception as exc:  # noqa: BLE001
             return fail("browser_download_failed", str(exc))
     finally:
-        ratelimit.mark_hit(site)
+        ratelimit.note_result(site, status)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(body)

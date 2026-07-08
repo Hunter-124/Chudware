@@ -414,7 +414,7 @@ def score_candidate(rec: dict, *, facets: dict, defs: list[dict],
         reasons.append("placeable geometry available")
     elif relevant and str(rec.get("part_id", "")).startswith("catalog:"):
         score += 0.2
-        reasons.append("downloadable via scrape queue")
+        reasons.append("downloadable via fetch queue")
     if not relevant:
         reasons.append("low relevance to requested specs")
     return round(score, 4), "; ".join(reasons)

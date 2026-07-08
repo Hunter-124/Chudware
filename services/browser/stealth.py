@@ -1,10 +1,13 @@
-"""services/browser/stealth.py — anti-detection hardening for the untrusted browser.
+"""services/browser/stealth.py — consistent-fingerprint hardening for the user's browser.
 
-Goal: our headless Chromium (login wizard + scraping) should look like an
-ordinary desktop Chrome so vendors don't flag, rate-limit, or block the *user's*
-account. We do NOT bypass captchas/Cloudflare — see :mod:`.challenge`; this
-module only removes the gratuitous "I am automation" tells that a normal browser
-never emits.
+Goal: the user's headless Chromium (login wizard + page fetches) should present
+the same ordinary-desktop-Chrome fingerprint it presents in their headed login
+window, so the *user's own* session isn't flagged, rate-limited, or blocked just
+for running headless. This module genuinely adjusts fingerprint values — it does
+NOT alter nothing. What it does NOT do: solve captchas/Cloudflare (see
+:mod:`.challenge`, always handed back to the user). It only removes the
+gratuitous "I am automation" tells that a normal browser never emits; reducing
+those tells is not the same as defeating a site's bot-wall.
 
 The governing principle is **consistency, not mimicry**. An inconsistent
 fingerprint (UA header says Chrome but ``navigator.webdriver`` is true, or
@@ -15,7 +18,7 @@ derived from the REAL bundled Chromium at its REAL version, with only the
 GPU/plugin set that would disagree with the rest of the client state.
 
 Applied identically to both browser surfaces so they share one fingerprint:
-  * scraping — :mod:`.session` (browser_fetch / browser_login / browser_download)
+  * page fetches — :mod:`.session` (browser_fetch / browser_login / browser_download)
   * interactive login wizard — :mod:`.embed`
 
 Empirically verified on Chromium 149 (2026-07-07): with the launch flag +

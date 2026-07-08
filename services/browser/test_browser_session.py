@@ -155,6 +155,46 @@ def test_ratelimit_survives_reload_via_metadata(browser_mods):
     assert ratelimit.seconds_until_ready("siteA", min_interval=1000.0) > 0.0
 
 
+def test_backoff_escalates_on_429_and_resets_on_ok(browser_mods):
+    _profiles, ratelimit, _session = browser_mods
+    ratelimit.note_result("siteB", 429)
+    first = ratelimit.seconds_until_ready("siteB", min_interval=0.0)
+    assert first >= ratelimit.BACKOFF_BASE_S - 1.0
+    ratelimit.note_result("siteB", 429)              # consecutive → doubles
+    second = ratelimit.seconds_until_ready("siteB", min_interval=0.0)
+    assert second > first
+    ratelimit.note_result("siteB", 200)              # clean fetch clears backoff
+    assert ratelimit.seconds_until_ready("siteB", min_interval=0.0) == 0.0
+
+
+def test_backoff_is_capped(browser_mods):
+    _profiles, ratelimit, _session = browser_mods
+    for _ in range(20):
+        ratelimit.note_result("siteC", 403)
+    assert ratelimit.seconds_until_ready("siteC", min_interval=0.0) <= ratelimit.BACKOFF_MAX_S + 1.0
+
+
+def test_session_ceiling_trips_after_max_per_site(browser_mods):
+    _profiles, ratelimit, _session = browser_mods
+    monkey_max = ratelimit.MAX_REQ_PER_SITE
+    ratelimit.reset_session_counts()
+    for _ in range(monkey_max):
+        assert ratelimit.reserve_request("siteD") is None
+    assert ratelimit.reserve_request("siteD") == "request_ceiling_site"
+
+
+def test_crawl_delay_cached_and_used(browser_mods):
+    _profiles, ratelimit, _session = browser_mods
+    # Stub the network read: publish a 7s crawl-delay for the host.
+    ratelimit._fetch_robots_crawl_delay = lambda host: 7.0  # type: ignore[assignment]
+    d = ratelimit.crawl_delay("siteE", "https://siteE.example/search?q=x")
+    assert d == 7.0
+    # A 3s min_interval is overridden by the longer published crawl-delay.
+    ratelimit.mark_hit("siteE")
+    assert ratelimit.seconds_until_ready("siteE", min_interval=3.0,
+                                         url="https://siteE.example/x") > 3.5
+
+
 # --- session: browser_login -----------------------------------------------------
 
 def test_browser_login_creates_profile_and_metadata(browser_mods):
@@ -260,7 +300,7 @@ def test_browser_fetch_rate_limits_between_calls(browser_mods, monkeypatch):
 
     calls = []
     monkeypatch.setattr(ratelimit, "wait",
-                        lambda site, *, min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S:
+                        lambda site, *, min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S, url=None:
                         calls.append((site, min_interval)))
 
     session.browser_fetch("https://grabcad.com/a", "grabcad", _sync_playwright=fake_factory,

@@ -44,6 +44,10 @@ class BrowserCatalogAdapter:
     def __init__(self, source_adapter: SourceAdapter):
         self._adapter = source_adapter
         self._site = source_adapter.key
+        #: Public vendor site key (e.g. "digikey", "mcmaster") — lets the hub
+        #: restrict a routed search to only the vendors that fit a category
+        #: without reaching into a private attribute.
+        self.site = source_adapter.key
         self.provider_id = f"browser_{self._site}"
         self._cache: dict[str, dict] = {}
 

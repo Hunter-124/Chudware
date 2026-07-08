@@ -35,9 +35,13 @@ def register_provider(provider: object) -> None:
 def search(query: str, *,
            domain: str | list[str] | None = None,
            filters: dict | None = None,
-           limit: int = 20) -> list[dict]:
-    """Full-text search across all indexed providers. Returns ranked PartRecord dicts."""
-    return _get_hub().search(query, domain=domain, filters=filters, limit=limit)
+           limit: int = 20,
+           sites: list[str] | None = None) -> list[dict]:
+    """Full-text search across all indexed providers. Returns ranked PartRecord dicts.
+
+    ``sites`` restricts the live vendor fan-out to a category's fitting vendors
+    (taxonomy routing) — see :meth:`PartsHub.search`."""
+    return _get_hub().search(query, domain=domain, filters=filters, limit=limit, sites=sites)
 
 
 def get(part_id: str) -> dict | None:

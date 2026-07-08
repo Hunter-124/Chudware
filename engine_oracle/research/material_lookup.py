@@ -84,6 +84,16 @@ def material_lookup(material: str, property: Optional[str] = None) -> dict:
         return fail("offline",
                     f"{material!r} is not in the bundled registry and offline mode blocks a live "
                     "lookup. Add it to engine/materials/registry.json or disable offline_mode.")
+    # Opt-in structured web lookup (OFF by default). When enabled via
+    # AI_CAD_ENABLE_MATERIAL_WEB it returns parsed, cited property values for the
+    # named alloy from a reachable materials-info site (MakeItFrom); disabled it
+    # returns fail() with zero network I/O, so we fall straight through to the
+    # cited web_search candidates below. Owner-directed opt-in — see that module
+    # and contracts/license_debt.md row 17. Never bypasses bot-walls (MatWeb).
+    from .material_web_lookup import material_web_lookup
+    web = material_web_lookup(material, property)
+    if web.get("ok"):
+        return web
     # Online: hand back cited candidate sources to fetch_page — never fabricate a value.
     from .web_search import web_search
     q = f"{material} {property or 'material mechanical properties'}".strip()

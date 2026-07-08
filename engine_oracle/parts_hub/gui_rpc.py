@@ -2,7 +2,7 @@
 
 The desktop workspace speaks a flat item/category/vendor vocabulary (name, vendor,
 part_number, price_usd, …) rather than the PartRecord envelope, and needs a few
-verbs the MCP surface exposes only to agents (vendor login, the scrape queue).
+verbs the MCP surface exposes only to agents (vendor login, the fetch queue).
 This module adapts :mod:`engine_oracle.parts_hub` + :mod:`services.browser` into
 that vocabulary. Registered append-only from :mod:`.worker_rpc`.
 
@@ -253,7 +253,12 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
             # the node's query_terms appended to the vendor query.
             vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
             try:
-                cat_records = _search(vendor_query, domain="catalog", limit=limit)
+                # Restrict the live fan-out to the category's fitting vendors so
+                # we never fetch from a vendor that can't stock this category
+                # (e.g. no DigiKey for metal stock). The prefix filter below is
+                # kept as a belt-and-braces guard.
+                cat_records = _search(vendor_query, domain="catalog", limit=limit,
+                                      sites=route_sites)
             except Exception:  # noqa: BLE001 — live layer optional
                 cat_records = []
             prefixes = tuple(f"catalog:{s}::" for s in route_sites)
@@ -357,7 +362,7 @@ def _parts_queue_status(params: dict, _emit: Callable) -> dict:
 
 
 def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
-    """Import a finished scrape-queue artifact (STEP/IGES) as a new editable doc."""
+    """Import a finished fetch-queue artifact (STEP/IGES) as a new editable doc."""
     try:
         from engine_oracle.parts_hub.place import _place_import_file
         path = str((params or {}).get("artifact_path", "")).strip()

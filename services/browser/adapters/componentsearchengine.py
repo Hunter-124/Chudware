@@ -6,9 +6,13 @@ manufacturer part number (MPN). Search/browse is public; downloading the library
 archive requires the user's own free account. `acquire` lands the ECAD archive
 (zip) or 3D model (STEP) with provenance for ecad_find_part / ecad_place_symbol.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in Component Search Engine session (T-X6 gates the real
-per-source integration tests behind an env flag).
+Search results are a public HTML <table class="search-results-table">: each
+row is <tr id="row-N" data-uid=...> whose part-number cell holds
+<a href="/part-view/<mpn>/<manufacturer>" class="part-number">MPN</a> followed
+by <span class="grey-text">Manufacturer</span> and a
+<span class="td-description">Description</span>. The MODEL download is gated
+behind the user's own free account, but the listing itself is public — a
+"Sign In" header link is not a login wall.
 """
 from __future__ import annotations
 
@@ -31,11 +35,15 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Log in to download', 'id="id_username"', 'class="login-form"',
                        'Sign up to download', 'Please login or register')
-# Best-effort: result cards link to /part-view/<mpn>/<manufacturer>.
+# Each result row links to /part-view/<mpn>/<manufacturer> via an <a class="part-number">;
+# the manufacturer follows in a <span class="grey-text">.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*part-title[^"]*"[^>]+href="(?P<href>/part-view/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
-_MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
+    r'<a[^>]+href="(?P<href>/part-view/[^"?#]+)"[^>]*class="[^"]*part-number[^"]*"[^>]*>'
+    r'(?P<title>.*?)</a>'
+    r'(?:\s*<span[^>]*class="[^"]*grey-text[^"]*"[^>]*>(?P<mfr>[^<]*)</span>)?',
+    re.IGNORECASE | re.DOTALL)
+# On a part-view page the manufacturer still shows in a grey-text span.
+_MFR_RE = re.compile(r'<span[^>]*class="[^"]*grey-text[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a part page's ECAD/3D download link (zip archive or STEP model).
 _DOWNLOAD_RE = re.compile(
@@ -59,14 +67,20 @@ class ComponentSearchEngineAdapter:
             return [login_required(SITE, url)]
         hits = []
         for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            mfr_match = _MFR_RE.search(card)
-            hits.append({
-                "title": _strip_tags(card),
+            title = _strip_tags(m.group("title"))
+            if not title:
+                continue
+            mfr = (m.group("mfr") or "").strip() or None
+            hit = {
+                "title": title,
                 "url": BASE_URL + m.group("href"),
                 "site": SITE,
-                "manufacturer": mfr_match.group("mfr").strip() if mfr_match else None,
-            })
+                "part_number": title,
+                "kind": "ecad_model",
+            }
+            if mfr:
+                hit["manufacturer"] = mfr
+            hits.append(hit)
         return hits
 
     def acquire(self, result: dict) -> dict:

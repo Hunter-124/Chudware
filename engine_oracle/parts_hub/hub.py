@@ -127,11 +127,20 @@ class PartsHub:
     def search(self, query: str, *,
                domain: str | list[str] | None = None,
                filters: dict | None = None,
-               limit: int = 20) -> list[dict]:
+               limit: int = 20,
+               sites: list[str] | None = None) -> list[dict]:
         """Full-text search. Returns ranked PartRecord dicts.
 
         ``domain`` accepts a single domain string or a list of domains
         (taxonomy routing, Parts Library V2) — semantics otherwise unchanged.
+
+        ``sites`` is an optional vendor allow-list for the LIVE fan-out: when
+        given, only live providers whose ``site`` is in the list are queried.
+        This is how taxonomy routing keeps a query on the vendors that fit its
+        category (contracts/parts.md §6.3) — an electronics search never touches
+        McMaster or a metals house, a metals search never touches DigiKey — so a
+        query only ever spends a fetch against a vendor that could plausibly
+        stock it. ``None`` preserves the prior behavior (all matching providers).
 
         Primary: FTS5 index over all indexable providers.
         Fallback: when the index returns no results AND domain matches a live
@@ -144,6 +153,7 @@ class PartsHub:
         if results:
             return _dedupe_related(results)
         domains = [domain] if isinstance(domain, str) else list(domain or [])
+        site_allow = set(sites) if sites else None
         # Fallback to live providers when the index has no hits.
         live_results: list[dict] = []
         for provider in self._registry.providers():
@@ -153,6 +163,12 @@ class PartsHub:
             pdomain = getattr(provider, "domain", None)
             if domains and pdomain and pdomain not in domains:
                 continue
+            # Category routing: skip vendors that don't serve this category, so
+            # we never make the request in the first place (not fetch-then-drop).
+            if site_allow is not None:
+                psite = getattr(provider, "site", None)
+                if psite is not None and psite not in site_allow:
+                    continue
             if callable(getattr(provider, "search", None)):
                 try:
                     hits = provider.search(query, domain=domain, filters=filters)

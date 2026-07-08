@@ -23,9 +23,41 @@ import threading
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP(
-    "AI-CAD",
-    instructions=(
+# Profile selects how much scaffolding the server exposes + how prescriptive its instructions
+# are. `full` (default) is the supervised experience tuned for small local models: the long
+# how-to instructions plus the DAG/mission/buildgraph/foreman/ledger/workspace orchestration
+# families. `lite` is for capable models (e.g. mythos) that drive themselves: it keeps EVERY
+# capability + calculator + sourcing helper but drops the orchestration/supervision families
+# and swaps in a short, non-prescriptive instruction block, so the model runs freer and we
+# don't spend input tokens on a workflow it won't follow.  Switch with AICAD_MCP_PROFILE=lite.
+_PROFILE = os.environ.get("AICAD_MCP_PROFILE", "full").strip().lower()
+_LITE = _PROFILE == "lite"
+
+_LITE_INSTRUCTIONS = (
+    "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the desktop "
+    "app). You are the design brain and you drive yourself — these tools are helpers, not a "
+    "script; call whatever you need, in whatever order the task wants, and skip what you don't.\n"
+    "ENTRY: call cad_guide() for the engine's op vocabulary + worked examples, and "
+    "cad_guide(topic) for depth on a subsystem (simulation, review, gsl, cam, ecad, parts, "
+    "sourcing, cost, piping, hydraulic, firmware, structural, sketch3d, reverse, deliverables, "
+    "requirements, tolerance_stackup, …). Don't recall op syntax from memory — cad_guide has it.\n"
+    "CONVENTIONS THAT MATTER: address geometry in PLAIN WORDS ('the top face', 'the vertical "
+    "edges', 'the largest round face') — never face numbers or raw coordinates. Build with the "
+    "feature a person would use (sketch+revolve for round bodies, loft for blended shapes). "
+    "Touching sketch endpoints auto-coincide on every edit, so profiles close on their own. "
+    "render_part() SEES the annotated result; describe_part()/describe_sketch()/describe_scene() "
+    "are the text-only read when you have no vision.\n"
+    "LOOK IT UP, DON'T RECALL: use research_* for any load-bearing number (materials, sections, "
+    "threads, unit conversions) — never type one from memory.\n"
+    "STANDARD PARTS FIRST for hardware: part_search/part_source → part_place before custom "
+    "geometry. Calculators (feeds_speeds, tap_drill, fit_calc, stackup_analyze, gear/bearing "
+    "checks, struct_*), verification (verify_battery, design_review, check_*), and deliverables "
+    "(make_report/drawing/presentation) are all available — reach for them when they help.\n"
+    "BE ECONOMICAL: model, check what actually needs checking, and deliver. Don't over-verify, "
+    "don't narrate every step, and keep outputs tight — no busywork, no redundant re-renders."
+)
+
+_FULL_INSTRUCTIONS = (
         "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the "
         "desktop app). You are the design brain.\n"
         "START by calling cad_guide() — it returns the engine's modeling op vocabulary and "
@@ -130,7 +162,11 @@ mcp = FastMCP(
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
         "regen_diagnose(document_json) runs the same diagnosis on any failed doc directly.\n"
         "ECAD (schematic/PCB) tools are also available (ecad_*)."
-    ),
+)
+
+mcp = FastMCP(
+    "AI-CAD",
+    instructions=_LITE_INSTRUCTIONS if _LITE else _FULL_INSTRUCTIONS,
 )
 
 # Tool registry (contracts/providers.md §6): tag every tool with {family, risk} and enforce
@@ -275,52 +311,61 @@ register_regen_tools(mcp)
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
 from mcp_server.code_compliance_tools import register_code_compliance_tools
 register_code_compliance_tools(mcp)
-# DAG orchestrator MCP tools (T-A4): dag_plan / dag_run / dag_status / dag_approve / dag_abort.
-# These five tools expose the services/dag executor to MCP clients so a model or UI can
-# start/resume/inspect/gate DAG missions without a bespoke integration layer.
-from services.dag.mcp_tools import register_dag_tools
-register_dag_tools(mcp)
-# DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
-# Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
-# into the persisted graph sidecar, and resumes via executor.resume().
-from services.dag.mcp_tools import register_dag_replan_tools
-register_dag_replan_tools(mcp)
-# Mission pipeline (T-W19): mission_start / mission_status / replan_request.
-# The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
-# ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
-# ledger stage_log (what mission control + the GUI consume); replan_request routes
-# an aicad.replan/1 request per contract §17.  The in-app path is
-# services.agent.loop.run_mission.
-from services.mcp.mission_tools import register_mission_tools
-register_mission_tools(mcp)
+# ---------------------------------------------------------------------------
+# Orchestration / supervision families — the DAG supervisor, mission phase
+# machine, build-order planner, foreman, ledger, and workspace lease registry.
+# These are the "pre-designed plans / workflows" scaffolding tuned for small
+# local models. The `lite` profile omits them so a capable self-driving model
+# runs unconstrained (all real capabilities above stay registered).
+# ---------------------------------------------------------------------------
+if not _LITE:
+    # DAG orchestrator MCP tools (T-A4): dag_plan / dag_run / dag_status / dag_approve / dag_abort.
+    # These five tools expose the services/dag executor to MCP clients so a model or UI can
+    # start/resume/inspect/gate DAG missions without a bespoke integration layer.
+    from services.dag.mcp_tools import register_dag_tools
+    register_dag_tools(mcp)
+    # DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
+    # Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
+    # into the persisted graph sidecar, and resumes via executor.resume().
+    from services.dag.mcp_tools import register_dag_replan_tools
+    register_dag_replan_tools(mcp)
+    # Mission pipeline (T-W19): mission_start / mission_status / replan_request.
+    # The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
+    # ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
+    # ledger stage_log (what mission control + the GUI consume); replan_request routes
+    # an aicad.replan/1 request per contract §17.  The in-app path is
+    # services.agent.loop.run_mission.
+    from services.mcp.mission_tools import register_mission_tools
+    register_mission_tools(mcp)
+    # Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
+    # ledger_get / ledger_note let any agent role read or write the design ledger without
+    # holding the full chat history — the anti-context-loss mechanism for 24k local models.
+    # ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
+    from services.mcp.ledger_tools import register_ledger_tools
+    register_ledger_tools(_reg.view(mcp, "ledger"))
+    # Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
+    # LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
+    # with prerequisite edges; validator findings are aicad.advisory/1 items.
+    # ready_nodes() surface for T-W16 multi-doc fan-out.
+    from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
+    register_buildgraph_tools(mcp)
+    # Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
+    # advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
+    # the in-app loop.py + dag node runner already run the foreman automatically. advise is
+    # risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
+    from services.mcp.advisor_tools import register_advisor_tools
+    register_advisor_tools(_reg.view(mcp, "advisor"))
+    # Workspace (T-W16, Pillar 20 §2.14): multi-doc lease registry + per-doc event streams.
+    # workspace_status / workspace_doc_events are risk-class READ (named in _READ_EXACT);
+    # no write-lease required to poll status.
+    from services.mcp.workspace_tools import register_workspace_tools
+    register_workspace_tools(_reg.view(mcp, "workspace"))
+
 # Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
-# card per contracts/narration.md — never a raw JSON dump.
+# card per contracts/narration.md — never a raw JSON dump.  On-demand helper (kept in lite).
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
-# Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
-# ledger_get / ledger_note let any agent role read or write the design ledger without
-# holding the full chat history — the anti-context-loss mechanism for 24k local models.
-# ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
-from services.mcp.ledger_tools import register_ledger_tools
-register_ledger_tools(_reg.view(mcp, "ledger"))
-# Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
-# LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
-# with prerequisite edges; validator findings are aicad.advisory/1 items.
-# ready_nodes() surface for T-W16 multi-doc fan-out.
-from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
-register_buildgraph_tools(mcp)
-# Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
-# advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
-# the in-app loop.py + dag node runner already run the foreman automatically. advise is
-# risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
-from services.mcp.advisor_tools import register_advisor_tools
-register_advisor_tools(_reg.view(mcp, "advisor"))
-# Workspace (T-W16, Pillar 20 §2.14): multi-doc lease registry + per-doc event streams.
-# workspace_status / workspace_doc_events are risk-class READ (named in _READ_EXACT);
-# no write-lease required to poll status.
-from services.mcp.workspace_tools import register_workspace_tools
-register_workspace_tools(_reg.view(mcp, "workspace"))
 # Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
 # hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
 # — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses

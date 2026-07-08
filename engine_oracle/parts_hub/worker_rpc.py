@@ -63,7 +63,7 @@ WORKER_METHODS: dict[str, Callable] = {
 }
 
 # GUI-shaped methods for the Parts Library workspace (host/src/ui/parts/) —
-# categories, filtered search, vendor login/status, scrape queue, thumbnails.
+# categories, filtered search, vendor login/status, fetch queue, thumbnails.
 try:
     from engine_oracle.parts_hub.gui_rpc import GUI_WORKER_METHODS as _GUI_METHODS
     WORKER_METHODS.update(_GUI_METHODS)

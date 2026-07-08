@@ -474,8 +474,8 @@ class EmbedManager:
     async def _open_session(self, s: EmbedSession, start_url: str, *, headless: bool) -> None:
         pw = await self._ensure_pw()
         profile_path = profiles.profile_dir(s.profile_name)
-        # Shared anti-detection identity (see services/browser/stealth.py) — the
-        # scraping path and this wizard present ONE consistent fingerprint.
+        # Shared consistent-fingerprint identity (see services/browser/stealth.py) —
+        # the page-fetch path and this wizard present ONE consistent fingerprint.
         s.chromium_version = await stealth.chromium_version_async(pw)
         s.user_agent = stealth.user_agent(s.chromium_version)
         s.context = await pw.chromium.launch_persistent_context(

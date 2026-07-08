@@ -30,7 +30,10 @@ CANARY_QUERIES: dict[str, str] = {
     "amazon": "608zz bearing",
     "jlcpcb": "0603 resistor 10k",
     "pcbway": "2 layer pcb prototype",
-    "misumi": "linear shaft 8mm",
+    # Generic single keywords route MISUMI to its flat keyword-result list;
+    # multi-word/specific queries route to a category landing page with no flat
+    # product list (see misumi.py), so the canary uses a plain keyword.
+    "misumi": "bearing",
     "lcsc": "0603 resistor 10k",
     "digikey": "atmega328p",
     "snapeda": "usb-c connector",
@@ -45,6 +48,10 @@ CANARY_QUERIES: dict[str, str] = {
     "tractorsupply": "hitch pin",
     "onlinemetals": "6061 round tube",
     "metalsdepot": "steel angle",
+    # student-robotics / rover-scale wave (2026-07-08)
+    "servocity": "gearmotor",
+    "pololu": "gearmotor",
+    "8020": "1010 t-slot",
 }
 
 #: Failure reasons that mean "provision a login", not "the adapter is broken".

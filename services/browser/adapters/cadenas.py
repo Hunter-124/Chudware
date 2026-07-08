@@ -5,16 +5,20 @@ thousands of manufacturer catalogs — the STEP/native geometry only emerges aft
 driving a JavaScript part configurator (and usually a login). This v1 CANNOT drive
 that interactive configurator headlessly, so it is HONEST about the limitation:
 
-- `search` best-effort parses result cards if the (often JS-rendered) markup is
-  present, so callers still get candidate part links.
+- `search` parses the server-rendered result grid: each product is an
+  `<a class="gridCardBody" href="/en/digitaltwin/...">` card carrying a
+  `.part-nn-name` id, a `.text` human title, a `img.nodeImage` thumbnail and a
+  `img.supplierImage title="<Manufacturer>"`. Manufacturer/directory index cards
+  (`/en/cad-bim-library/manufacturer/...`) are also surfaced as candidate links.
 - `acquire` does NOT attempt to fake a download: it degrades to login_required
   (or terms_confirmation_required) because the actual STEP artifact is gated
   behind interactive configuration this adapter cannot perform. When and if a
   configurator-driving capability lands, this is the seam to upgrade.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified against
-a live CADENAS session (T-X6 gates the real per-source integration tests behind
-an env flag).
+NOTE: the search selectors were verified 2026-07-08 against a saved live
+3dfindit.com results page (query "bearing", HTTP 200). The product data is
+present in the initial HTML (no __NEXT_DATA__; the JSON-LD block is only site
+metadata) as `.gridCardBody` cards inside the `resultNodes` grid.
 """
 from __future__ import annotations
 
@@ -40,16 +44,31 @@ _TERMS_SUMMARY = (
 
 _LOGIN_WALL_MARKERS = ('Please log in', 'id="id_username"', 'class="login-form"',
                        'Sign in to download', 'Login required')
-# Best-effort: 3Dfindit result cards link to /en/component/<id> or /en/details/....
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*result-card[^"]*"[^>]+href="(?P<href>/en/(?:component|details)/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
-_MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
-                     re.IGNORECASE)
+# Server-rendered result grid: each hit is <a class="gridCardBody" href="...">...</a>.
+# Product cards link to /en/digitaltwin/<slug>?path=...; manufacturer/directory
+# index cards link to /en/cad-bim-library/manufacturer/<slug>. Both are useful
+# candidate links.
+_CARD_RE = re.compile(
+    r'<a\b[^>]*class="[^"]*gridCardBody[^"]*"[^>]*href="(?P<href>/en/[^"?#]+(?:\?[^"]*)?)"[^>]*>'
+    r'(?P<card>.*?)</a>', re.IGNORECASE | re.DOTALL)
+# Human-friendly title inside a product card, then the machine part-id fallback.
+_TEXT_RE = re.compile(r'<div[^>]*class="[^"]*\btext\b[^"]*"[^>]*>(?P<t>.*?)</div>',
+                      re.IGNORECASE | re.DOTALL)
+_NNNAME_RE = re.compile(r'<div[^>]*class="[^"]*part-nn-name[^"]*"[^>]*>(?P<t>.*?)</div>',
+                        re.IGNORECASE | re.DOTALL)
+_THUMB_RE = re.compile(r'<img[^>]*class="[^"]*nodeImage[^"]*"[^>]*src="(?P<src>[^"]+)"',
+                       re.IGNORECASE)
+_SUPPLIER_RE = re.compile(r'<img[^>]*class="[^"]*supplierImage[^"]*"[^>]*title="(?P<mfr>[^"]+)"',
+                          re.IGNORECASE)
 
 
 def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+    # Drop <mark> search-highlight and any other markup, unescape common entities.
+    text = re.sub(r"<[^>]+>", "", text)
+    for a, b in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                 ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")):
+        text = text.replace(a, b)
+    return text.strip()
 
 
 class CadenasAdapter:
@@ -64,15 +83,39 @@ class CadenasAdapter:
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
         hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            mfr_match = _MFR_RE.search(card)
-            hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+        for m in _CARD_RE.finditer(content):
+            href = m.group("href")
+            card = m.group("card")
+            is_product = "/digitaltwin/" in href
+            # Title: human .text for products, else the machine part-id, else slug.
+            title = ""
+            tm = _TEXT_RE.search(card) or _NNNAME_RE.search(card)
+            if tm:
+                title = _strip_tags(tm.group("t"))
+            if not title:
+                # Manufacturer/directory index cards carry their name as plain text.
+                title = _strip_tags(card)
+            if not title:
+                title = href.rsplit("/", 1)[-1].split("?", 1)[0]
+
+            hit = {
+                "title": title,
+                "url": BASE_URL + href,
                 "site": SITE,
-                "manufacturer": mfr_match.group("mfr").strip() if mfr_match else None,
-            })
+                "kind": "part" if is_product else "catalog",
+            }
+            thumb = _THUMB_RE.search(card)
+            if thumb:
+                hit["thumbnail"] = _strip_tags(thumb.group("src"))
+            sup = _SUPPLIER_RE.search(card)
+            if sup:
+                hit["manufacturer"] = _strip_tags(sup.group("mfr"))
+            nn = _NNNAME_RE.search(card)
+            if nn:
+                pn = _strip_tags(nn.group("t"))
+                if pn:
+                    hit["part_number"] = pn
+            hits.append(hit)
         return hits
 
     def acquire(self, result: dict) -> dict:

@@ -5,7 +5,10 @@ is public; per-part CAD (STEP) downloads sit behind the user's own THK
 account. `acquire` lands the STEP model with provenance for part_search /
 part_place.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
+NOTE: search() is verified against a saved real THK site-search page (the
+"popfind" widget renders result cards as <div class="_item"> with a
+<div class="_title"><a href=...> and a sibling <div class="_thumbnail">).
+The acquire() download markers remain a best-effort shape, not verified
 against a live logged-in THK session (T-X6 gates the real per-source
 integration tests behind an env flag).
 """
@@ -28,10 +31,16 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Log in to THK', 'id="loginForm"', 'class="login-form"',
                        'Please sign in to download')
-# Best-effort: search result cards link to a product detail page.
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/us/en/products/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+# THK site search is served by the "popfind" widget: results live in
+# <div class="_item"> cards, each with a <div class="_title"><a href=...>Title</a>.
+# Hrefs are already absolute https URLs; the thumbnail sits in a sibling
+# <div class="_thumbnail"><a><img src=...>.
+_ITEM_SPLIT_RE = re.compile(r'<div class="_item"', re.IGNORECASE)
+_TITLE_RE = re.compile(
+    r'<div class="_title">\s*<a[^>]+href="(?P<href>https?://[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL)
+_THUMB_RE = re.compile(r'<div class="_thumbnail">.*?<img[^>]+src="(?P<src>[^"]+)"',
+                       re.IGNORECASE | re.DOTALL)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
 # Best-effort: a product page's native CAD download link (STEP model or zip).
@@ -55,15 +64,25 @@ class ThkAdapter:
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
         hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            mfr_match = _MFR_RE.search(card)
-            hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+        # THK search results are popfind "_item" cards; split on them and pull
+        # the title anchor (absolute href) + optional thumbnail from each card.
+        for card in _ITEM_SPLIT_RE.split(content)[1:]:
+            tm = _TITLE_RE.search(card)
+            if not tm:
+                continue
+            title = _strip_tags(tm.group("title"))
+            if not title:
+                continue
+            hit = {
+                "title": title,
+                "url": tm.group("href"),
                 "site": SITE,
-                "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "THK",
-            })
+                "manufacturer": "THK",
+            }
+            thumb = _THUMB_RE.search(card)
+            if thumb:
+                hit["thumbnail"] = thumb.group("src")
+            hits.append(hit)
         return hits
 
     def acquire(self, result: dict) -> dict:

@@ -219,3 +219,8 @@ from . import (maxon, orientalmotor, anaheimautomation,  # motors  # noqa: E402,
                thk, hiwin, thomson, igus,  # motion control
                applerubber, marcorubber, globaloring,  # seals/gaskets
                meanwell, cui, batteryspace)  # power supplies / batteries
+# Wave 5 (2026-07-08): student-robotics / rover-scale sourcing — structural +
+# motion components sized for hobby robotics, small gearmotors/controllers with
+# real spec sheets, and T-slot aluminum extrusion.
+from . import (servocity, pololu,  # robotics structural + motion / gearmotors  # noqa: E402,F401
+               eightytwenty)  # 80/20 T-slot extrusion (bot-walled — degrades honestly)

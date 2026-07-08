@@ -175,7 +175,12 @@ never raises.
 | DuckDuckGo HTML | public endpoint | network | zero-key fallback |
 
 **Hard rules (legal pass):** never wire an agent to MatWeb / MakeItFrom / Matmatch /
-McMaster-Carr (all prohibit programmatic access). **AGPL never in-process** (e.g.
+McMaster-Carr (all prohibit programmatic access). _(Exception, owner-directed 2026-07-08:
+an OPT-IN, off-by-default, rate-limited, no-bot-wall-bypass point-lookup path exists at
+`engine_oracle/research/material_web_lookup.py` — tracked as an accepted-risk override in
+`contracts/license_debt.md` row 17. MatWeb itself stays unreachable there: it serves a
+CAPTCHA and we never bypass bot-walls. The default automated path remains the first-party
+`material_lookup`.)_ **AGPL never in-process** (e.g.
 PyMuPDF / pymupdf4llm — a later PDF helper must isolate or avoid). GPL/MPL subprocess
 only. No API key committed to code — keys come from config/env.
 

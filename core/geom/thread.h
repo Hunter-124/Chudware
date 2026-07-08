@@ -35,6 +35,15 @@ struct ThreadResult {
     std::string warning;      // non-empty on a fall-back (and some best-effort notes)
 };
 
+// Thread cross-section FORM. The cut/raised geometry is otherwise identical — only the
+// swept profile (flank angle, thread depth, crest/root flats) changes.
+enum class ThreadForm {
+    V60,    // ISO 68-1 / ASME B1.1 unified 60° V (metric + SAE) — the default.
+    ACME,   // ASME B1.5 trapezoidal 29° included, depth 0.5·P (power/lead screws).
+    TRAP,   // ISO 2904 metric trapezoidal 30° included, depth 0.5·P.
+    SQUARE, // square thread — 0° flanks, depth 0.5·P (efficient power transmission).
+};
+
 // Cut a helical ISO-60° thread into `body` along the cylindrical face whose axis is
 // (axis_loc, axis_dir) and outer/bore radius is `cyl_radius`.
 //   pitch       axial advance per turn (mm).
@@ -45,6 +54,12 @@ struct ThreadResult {
 //   lefthand    left-hand helix when true.
 //   internal    true = thread a bore (cut OUTWARD into the wall); false = external
 //               shaft thread (cut INWARD).
+//   raised      false (default) = CUT a V-groove (subtract material, the classic
+//               machined thread). true = ADD/EXTRUDE a raised helical ridge (fuse
+//               material — a cast/moulded/3D-printed external thread, a lead-screw
+//               or worm ridge). In raised mode the swept coil is FUSED onto the body
+//               and the validity check requires the volume to INCREASE, mirroring the
+//               cut path's fall-back contract in reverse.
 //   turns_cap   hard cap on the number of helical turns swept (robustness — a huge
 //               length/tiny pitch would otherwise sweep thousands of turns and hang).
 //
@@ -52,6 +67,7 @@ struct ThreadResult {
 ThreadResult cut_thread(const TopoDS_Shape& body, const gp_Pnt& axis_loc,
                         const gp_Dir& axis_dir, double cyl_radius, double pitch,
                         double major_dia, double length, int starts, bool lefthand,
-                        bool internal, double turns_cap);
+                        bool internal, bool raised, double turns_cap,
+                        ThreadForm form = ThreadForm::V60);
 
 }  // namespace geom

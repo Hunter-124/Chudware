@@ -101,6 +101,8 @@ CONTRACT_NAMES: list[str] = [
     "vendor_globe", "browser_panel", "filter_funnel", "health_check",
     # ---- PLM Project Hub (append-only): planning/collaboration glyphs ----
     "plan_board", "issue_bug", "milestone_flag", "team",
+    # ---- PLM Git tab (append-only) ----
+    "git",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3460,6 +3462,29 @@ def draw_plan_board(d, cell, p):
     card(0.655, 0.825, 0.28, 0.40, accent=True)
 
 
+@icon("git")
+def draw_git(d, cell, p):
+    """Git branch glyph: a trunk node forking to a branch node (three nodes)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    r = s * 0.085
+    # trunk (left column): two nodes joined vertically
+    tx = s * 0.32
+    top = (tx, s * 0.24)
+    bot = (tx, s * 0.76)
+    # branch node (right column, mid height)
+    bx, by = s * 0.68, s * 0.42
+    # trunk line
+    d.line([top, bot], fill=p.stroke, width=lw)
+    # fork: from a point on the trunk up-and-over to the branch node
+    fork = (tx, s * 0.50)
+    polyline(d, [fork, (tx, by), (bx, by)], p.accent, lw)
+    # nodes
+    filled_circle(d, top[0], top[1], r, p.stroke)
+    filled_circle(d, bot[0], bot[1], r, p.stroke)
+    filled_circle(d, bx, by, r, p.accent)
+
+
 @icon("issue_bug")
 def draw_issue_bug(d, cell, p):
     """A bug — the 'issue' glyph: rounded body, head, antennae and legs."""
@@ -3527,6 +3552,54 @@ CELL_SIZES = [32, 20]
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE / "icons"
 
+# ---------------------------------------------------------------------------
+# Rendered-tile protection.
+#
+# These cells are NOT the flat SDF glyphs this script draws — they are real
+# model screenshots baked in by scripts/icon_pipeline.py (--render) and the CAM
+# toolpath renderer. A plain `python make_icons.py` full-atlas regen would glyph
+# over them and silently roll back curated art (bit us 2026-07-07 via b004f801).
+#
+# So main() preserves the existing rendered pixels by name: after drawing the
+# glyph atlas it pastes each rendered cell back from the CURRENT committed atlas.
+# To intentionally reset these to glyphs, set MAKE_ICONS_NO_PRESERVE=1 (then
+# re-render via icon_pipeline.py). Any name starting with "cam_" is treated as
+# rendered too, so new toolpath tiles are protected automatically.
+RENDERED_RECIPE_NAMES: set[str] = {
+    "appr_brass", "appr_dark", "appr_default", "appr_metal", "appr_plastic",
+    "appr_steel", "chamfer", "circular_pattern", "combine", "curve_helix",
+    "draft", "extrude_boss", "extrude_cut", "fillet", "intersect",
+    "linear_pattern", "loft", "loft_cut", "mirror", "revolve_boss",
+    "revolve_cut", "rib", "shell", "sm_base_flange", "sm_flat_pattern",
+    "stock", "subtract", "sweep", "sweep_cut",
+}
+
+
+def _is_rendered_name(name: str) -> bool:
+    return name in RENDERED_RECIPE_NAMES or name.startswith("cam_")
+
+
+def _preserve_rendered_tiles(atlas: Image.Image, cell_map: dict,
+                             old_atlas_path: Path, old_json_path: Path) -> int:
+    """Paste rendered (non-glyph) tiles back from the existing committed atlas so
+    a full glyph regen never clobbers curated model screenshots. Returns count."""
+    if not (old_atlas_path.exists() and old_json_path.exists()):
+        return 0
+    old_cells = json.loads(old_json_path.read_text(encoding="utf-8")).get("cell", {})
+    old_img = Image.open(old_atlas_path).convert("RGBA")
+    n = 0
+    for key, c in cell_map.items():
+        name = key.rsplit("@", 1)[0]
+        if not _is_rendered_name(name):
+            continue
+        oc = old_cells.get(key)
+        if not oc or oc["w"] != c["w"] or oc["h"] != c["h"]:
+            continue  # new/resized cell — nothing curated to preserve
+        tile = old_img.crop((oc["x"], oc["y"], oc["x"] + oc["w"], oc["y"] + oc["h"]))
+        atlas.paste(tile, (c["x"], c["y"]))
+        n += 1
+    return n
+
 
 def _render_icon(name: str, cell: int, palette: Palette) -> Image.Image:
     s = cell * SS
@@ -3592,6 +3665,19 @@ def main():
     # verify layouts identical
     assert dark_map == light_map, "Layout mismatch between dark and light atlases!"
     atlas_w, atlas_h = dark_atlas.size
+
+    # Non-destructive: keep curated model-screenshot / CAM tiles (see
+    # RENDERED_RECIPE_NAMES) instead of glyph-ing over them. Override with
+    # MAKE_ICONS_NO_PRESERVE=1 to force a pure glyph atlas.
+    if os.environ.get("MAKE_ICONS_NO_PRESERVE") == "1":
+        print("  MAKE_ICONS_NO_PRESERVE=1 -> rendered tiles NOT preserved (pure glyph regen)")
+    else:
+        pd = _preserve_rendered_tiles(dark_atlas, dark_map,
+                                      OUT_DIR / "atlas_dark.png", OUT_DIR / "atlas.json")
+        pl = _preserve_rendered_tiles(light_atlas, light_map,
+                                      OUT_DIR / "atlas_light.png", OUT_DIR / "atlas.json")
+        print(f"  preserved {pd} dark / {pl} light rendered tiles "
+              f"(recipe+cam_*); re-render via scripts/icon_pipeline.py --render")
 
     dark_atlas.save(OUT_DIR / "atlas_dark.png")
     light_atlas.save(OUT_DIR / "atlas_light.png")

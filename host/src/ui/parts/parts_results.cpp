@@ -32,6 +32,18 @@ static void itemActions(AppState& st, const PartsItem& item) {
         if (ImGui::SmallButton("Reverse-engineer"))
             sendToReverseEngineering(st, item);
     }
+    // RE-32: "Reverse Engineer → Generate 3D model" — one-click internet-research
+    // + parametric build for any part that has metadata but no placeable 3D model.
+    // Hidden for parts that are already placeable (have a model attached).
+    if (!item.placeable) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Generate 3D model"))
+            generateModelFromLibrary(st, item);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Reverse Engineer \xe2\x86\x92 Generate 3D model\n"
+                              "Pulls specs from the internet and builds a parametric\n"
+                              "model, then attaches it to this part so you can place it.");
+    }
 }
 
 static void itemTooltipAt(const PartsItem& item, bool hovered) {

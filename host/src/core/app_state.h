@@ -526,6 +526,7 @@ struct AppState {
     bool treeShotDone = false; // guard so doc smoke runs exactly once
     bool wantEquations = false;   // AI_CAD_SHOT=equations: open the Equations editor + seed two globals
     bool equationsShotDone = false; // guard so the equations seed runs exactly once
+    bool wantPartsShot = false;   // AI_CAD_SHOT=parts: Parts Library with a seeded no-model result (RE-32)
 
     // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)

@@ -251,6 +251,33 @@ void drawRevEngWorkspace(AppState& st) {
     // Kick / refresh the async session list (throttled, non-blocking).
     loadSessions(st);
 
+    // RE-ANCHOR(reveng/RE-32): consume a session_id seeded from outside (e.g. the
+    // Parts Library "Generate 3D model" action, which calls reveng_make_part_from_library
+    // and stores the returned session_id here so the rail can auto-select it).
+    // We try to match on the freshly-loaded session list; if the list hasn't arrived yet
+    // we leave the id in place and it will be consumed on the next frame once the list
+    // has populated. Clear the id once consumed (or if no match — avoids a sticky stale
+    // selection across unrelated workspace visits).
+    if (!st.pendingRevengSessionId.empty()) {
+        RevEngState& s = S();
+        if (s.listedOnce) {
+            const std::string want = st.pendingRevengSessionId;
+            st.pendingRevengSessionId.clear();
+            for (int i = 0; i < (int)s.sessions.size(); ++i) {
+                if (s.sessions[i].session_id == want) {
+                    s.selected = i;
+                    break;
+                }
+            }
+            // If the session hasn't appeared yet (backend still building), force a fresh
+            // list load on the next poll interval so it surfaces promptly.
+            if (s.selected < 0 || s.selected >= (int)s.sessions.size() ||
+                s.sessions[s.selected].session_id != want) {
+                s.lastListT = -100.0;   // expire throttle → next loadSessions fires immediately
+            }
+        }
+    }
+
     const float sc = ui::uiScale;
     const float railW = 240.0f * sc;
     const float propW = 260.0f * sc;

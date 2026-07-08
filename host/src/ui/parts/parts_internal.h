@@ -204,6 +204,10 @@ void pollQueue(AppState& st);
 void queueDownload(AppState& st, const PartsItem& item);
 void insertItem(AppState& st, const PartsItem& item);
 void sendToReverseEngineering(AppState& st, const PartsItem& item);
+// RE-32: one-click "Generate 3D model" for metadata-only (no-model) parts.
+// Calls reveng_make_part_from_library async (seed→internet research→build→attach).
+// Hidden/disabled for parts that already have a model (item.placeable == true).
+void generateModelFromLibrary(AppState& st, const PartsItem& item);
 void startVendorLogin(AppState& st, VendorEntry& v);
 void saveApiCreds(AppState& st, ApiProvider& a);
 

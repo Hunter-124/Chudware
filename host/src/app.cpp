@@ -1528,6 +1528,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Force the Review stage so the center panel shows dim-review + deviation.
         ui::reveng::S().stage = ui::reveng::Stage::Review;
     }
+    // AI_CAD_SHOT=parts: open the Parts Library workspace with a synthetic no-model
+    // result row so the "Generate 3D model" action (RE-32) is visible in the shot.
+    // Seeds S().results with one metadata-only item (placeable=false) so itemActions
+    // renders the button without needing the worker to be running.
+    if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PartsLibrary;
+        // Seed a synthetic no-model result via the parts state after first frame.
+        // We set a flag and inject in the parts workspace first-frame path.
+        st.wantPartsShot = true;
+    }
     // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless verification.
     if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::PLM;

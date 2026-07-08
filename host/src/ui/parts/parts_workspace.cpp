@@ -368,6 +368,47 @@ void sendToReverseEngineering(AppState& st, const PartsItem& item) {
     });
 }
 
+// RE-32: async one-call "Generate 3D model" for a metadata-only part.
+// Calls reveng_make_part_from_library (RE-33 backend: seed→internet
+// research→build parametric→attach→placeable), then switches to the RE
+// workspace so the seeded session is visible immediately. NEVER a sync call in
+// a draw path (GL-freeze history). Hidden for parts that already have a model.
+void generateModelFromLibrary(AppState& st, const PartsItem& item) {
+    nlohmann::json p;
+    p["part_ref"] = item.id;
+    if (!item.partNumber.empty())  p["part_number"] = item.partNumber;
+    // Research seed: same heuristic as sendToReverseEngineering.
+    const auto up = item.id.find("::http");
+    std::string query;
+    if (up != std::string::npos)       query = item.id.substr(up + 2);
+    else if (!item.partNumber.empty()) query = item.partNumber;
+    else                               query = item.name;
+    if (!query.empty()) p["query"] = query;
+
+    st.rpc.call("reveng_make_part_from_library", p,
+                [&st, name = item.name](const core::RpcResult& r) {
+        bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+        if (ok) {
+            st.pendingRevengSessionId = r.result.value("session_id", "");
+            st.activeWorkspace = AppState::Workspace::ReverseEng;
+            st.toast(ui::ToastLevel::Success, "Generating 3D model for " + name + "…");
+        } else {
+            std::string why = r.ok
+                ? r.result.value("reason", std::string("generate failed"))
+                : r.err;
+            std::string hint = r.ok ? r.result.value("hint", "") : "";
+            st.toast(ui::ToastLevel::Error,
+                     "Generate model failed: " + why +
+                         (hint.empty() ? "" : ("  (" + hint + ")")));
+        }
+    });
+    // Optimistically switch to RE workspace so the user sees the session rail
+    // populate as the backend responds (session_id applied in callback above;
+    // on failure we stay on RE with an error toast).
+    st.activeWorkspace = AppState::Workspace::ReverseEng;
+    st.toast(ui::ToastLevel::Info, "Requesting 3D model for " + item.name + "…");
+}
+
 void startVendorLogin(AppState& st, VendorEntry& v) {
     v.loginInProgress = true;
     nlohmann::json p;
@@ -438,6 +479,28 @@ void drawPartsLibraryWorkspace(AppState& st) {
             loadTaxonomy(st);   // falls back to loadCategories on method-missing
             loadVendors(st);
             pollQueue(st);
+        }
+        // RE-32 / AI_CAD_SHOT=parts: seed a synthetic no-model result so the
+        // "Generate 3D model" button is visible in the headless screenshot without
+        // needing the worker to be running. The item has placeable=false so all
+        // action buttons (including "Generate 3D model") render on hover.
+        if (st.wantPartsShot) {
+            st.wantPartsShot = false;
+            PartsItem demo;
+            demo.id          = "catalog:mcmaster::https://www.mcmaster.com/91251A542/";
+            demo.name        = "Socket Head Cap Screw M8×30 (demo)";
+            demo.vendor      = "McMaster-Carr";
+            demo.partNumber  = "91251A542";
+            demo.description = "Class 12.9 alloy steel, black-oxide finish";
+            demo.material    = "Alloy Steel";
+            demo.domain      = "fastener";
+            demo.source      = "live";
+            demo.priceUsd    = 0.18;
+            demo.unit        = "ea";
+            demo.downloaded  = false;
+            demo.placeable   = false;   // no 3D model → "Generate 3D model" button shows
+            S().results.push_back(std::move(demo));
+            S().searchDone  = true;
         }
     }
     // Re-try if worker came up after first frame.

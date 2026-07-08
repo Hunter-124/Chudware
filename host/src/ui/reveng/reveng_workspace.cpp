@@ -1,9 +1,13 @@
 // Reverse Engineering workspace — full-viewport body for the "Reverse Eng" title-bar tab.
 // Honest scan -> mesh -> AI -> parametric pipeline shell (contracts/reveng.md). Layout:
 //   left  : session rail (list_reveng_sessions, ASYNC) + New Session affordance
-//   center: stage-driven empty-states for the selected session (or a first-run welcome)
+//   center: stage-driven empty-states / sources panel for the selected session
 //   right : session properties (honesty tier, artifacts, scale) — read-only for the shell
-//   bottom: the six-stage stepper (Capture · Scale · Reconstruct · Model · Review · Deliver)
+//   bottom: ADAPTIVE stage stepper (stages depend on source lane — RE-30)
+//
+// RE-30: Source-mode selector (Scan / Datasheet / Web+Part# / From Parts Library) added.
+//   Doc lanes (Datasheet, Web) omit Scale + Reconstruct — stepper shows Source→Model→Review→Deliver.
+//   Scan keeps the full Source→Scale→Reconstruct→Model→Review→Deliver sequence.
 //
 // GL-thread only. The session rail loads via ASYNC st.rpc.call — NEVER a sync worker call in
 // a draw path (known freeze bug). If the reveng MCP tools are not registered yet the list
@@ -22,10 +26,11 @@
 #include "ui_theme.h"
 
 #include "reveng_internal.h"
-#include "dim_review.h"  // RE-22: drawDimReviewPanel / drawDeviationPanel
+#include "dim_review.h"     // RE-22: drawDimReviewPanel / drawDeviationPanel
 // RE-ANCHOR(RE-19): capture suite — webcam + gallery wired into Capture stage
 #include "webcam_capture.h"
 #include "image_gallery.h"
+#include "sources_panel.h"  // RE-30: drawSourcesPanel
 
 namespace ui {
 namespace reveng {
@@ -37,9 +42,6 @@ RevEngState& S() {
 
 // ---- async loaders -------------------------------------------------------------
 
-// Refresh the session rail. Throttled (>=4s between polls) and guarded against overlapping
-// in-flight calls. Tolerates the reveng MCP family not being registered yet — a transport
-// error or {ok:false} just sets a sticky, human-readable listErr and leaves sessions empty.
 static void loadSessions(AppState& st, bool force = false) {
     if (!st.workerStarted) return;
     RevEngState& s = S();
@@ -58,7 +60,6 @@ static void loadSessions(AppState& st, bool force = false) {
             return;
         }
         if (!r.result.is_object() || !r.result.value("ok", false)) {
-            // reveng tools not registered yet, or an honest failure envelope.
             st2.listErr = r.result.is_object()
                               ? r.result.value("reason", std::string("Reverse Eng tools unavailable"))
                               : std::string("Reverse Eng tools unavailable");
@@ -81,25 +82,50 @@ static void loadSessions(AppState& st, bool force = false) {
                 st2.sessions.push_back(std::move(ss));
             }
         }
-        // Clamp selection to the refreshed list.
         if (st2.selected >= (int)st2.sessions.size()) st2.selected = -1;
     });
 }
 
+// ---- adaptive stepper helpers --------------------------------------------------
+
+// Returns the ordered list of stages for the current source mode.
+// Doc lanes (Datasheet, Web, FromLibrary) skip Scale + Reconstruct.
+static std::vector<Stage> activeStagePipeline(SourceMode mode) {
+    if (mode == SourceMode::Scan) {
+        return { Stage::Source, Stage::Scale, Stage::Reconstruct,
+                 Stage::Model, Stage::Review, Stage::Deliver };
+    }
+    // Datasheet, Web, FromLibrary → doc lane: omit Scale + Reconstruct.
+    return { Stage::Source, Stage::Model, Stage::Review, Stage::Deliver };
+}
+
+static const char* stageName(Stage s) {
+    switch (s) {
+        case Stage::Source:      return "Source";
+        case Stage::Scale:       return "Scale";
+        case Stage::Reconstruct: return "Reconstruct";
+        case Stage::Model:       return "Model";
+        case Stage::Review:      return "Review";
+        case Stage::Deliver:     return "Deliver";
+    }
+    return "?";
+}
+
+// Clamp the active stage to the pipeline permitted by the current source mode.
+static void clampStageToPipeline(RevEngState& s) {
+    auto pipeline = activeStagePipeline(s.sourceMode);
+    for (const Stage& st : pipeline)
+        if (st == s.stage) return;
+    s.stage = pipeline.front();
+}
+
 // ---- small drawing helpers -----------------------------------------------------
 
-static const char* kStageLabels[kStageCount] = {
-    "Capture", "Scale", "Reconstruct", "Model", "Review", "Deliver",
-};
-
-// Center empty-state copy per stage — describes what the stage will do, honestly noting
-// the shell is not yet wired to the pipeline.
 static const char* stageBlurb(Stage stg) {
     switch (stg) {
-        case Stage::Capture:
-            return "Add photos, a video, a datasheet, or a live webcam capture to start a\n"
-                   "reverse-engineering session. The pipeline never claims direct\n"
-                   "scan->parametric — single-photo tiers are tagged approximate.";
+        case Stage::Source:
+            return "Choose a source lane: scan photos/video, ingest a datasheet,\n"
+                   "look up a part number on the web, or seed from the parts library.";
         case Stage::Scale:
             return "Set real-world scale from an ArUco mat, two picked points, or a known\n"
                    "dimension. Scale must be confirmed before reconstruction runs.";
@@ -121,7 +147,6 @@ static const char* stageBlurb(Stage stg) {
 static void drawCenteredEmptyState(const char* title, const char* body) {
     const float sc = ui::uiScale;
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    // Rough vertical centering.
     ImGui::Dummy(ImVec2(0, avail.y * 0.32f));
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.accent[0], palette.accent[1],
@@ -132,7 +157,6 @@ static void drawCenteredEmptyState(const char* title, const char* body) {
         ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 6 * sc));
-    // Body: center each line.
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const char* p = body;
     while (p && *p) {
@@ -186,7 +210,7 @@ static void drawSessionRail(AppState& st, float w) {
     ImGui::EndChild();
 }
 
-// Right properties column — read-only summary for the selected session.
+// Right properties column.
 static void drawProperties(AppState& st, float w) {
     (void)st;
     const float sc = ui::uiScale;
@@ -226,7 +250,41 @@ static void drawProperties(AppState& st, float w) {
     ImGui::EndChild();
 }
 
-// Bottom stage stepper.
+// RE-30: Source-mode selector — drawn at the top of the center panel.
+// Returns true if the mode changed (caller should clamp stage).
+static bool drawSourceModeSelector(RevEngState& s) {
+    const float sc = ui::uiScale;
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Source:");
+    ImGui::SameLine();
+
+    struct ModeEntry { SourceMode mode; const char* label; const char* tip; };
+    static const ModeEntry kModes[4] = {
+        { SourceMode::Scan,        "Scan",        "Photos / video / webcam \xe2\x86\x92 Scale \xe2\x86\x92 Reconstruct \xe2\x86\x92 Model" },
+        { SourceMode::Datasheet,   "Datasheet",   "Local PDF/spec \xe2\x86\x92 Model  (no Scale / Reconstruct)" },
+        { SourceMode::Web,         "Web / Part#", "Part number or URL \xe2\x86\x92 Research \xe2\x86\x92 Model" },
+        { SourceMode::FromLibrary, "From Library","Seeded from the Parts Library \xe2\x80\x94 auto-routed" },
+    };
+
+    bool changed = false;
+    for (int i = 0; i < 4; ++i) {
+        if (i > 0) ImGui::SameLine(0.0f, 4.0f * sc);
+        const bool active = (s.sourceMode == kModes[i].mode);
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+        }
+        if (ImGui::Button(kModes[i].label)) {
+            if (!active) { s.sourceMode = kModes[i].mode; changed = true; }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kModes[i].tip);
+        if (active) ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+    return changed;
+}
+
+// RE-30: Adaptive bottom stepper — only shows stages relevant to the active source mode.
 static void drawStepper(AppState& st) {
     (void)st;
     const float sc = ui::uiScale;
@@ -235,14 +293,17 @@ static void drawStepper(AppState& st) {
     ImGui::PopStyleVar();
 
     RevEngState& s = S();
-    for (int i = 0; i < kStageCount; ++i) {
+    auto pipeline = activeStagePipeline(s.sourceMode);
+
+    for (int i = 0; i < (int)pipeline.size(); ++i) {
         if (i > 0) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); }
-        const bool active = ((int)s.stage == i);
+        const Stage stg = pipeline[i];
+        const bool active = (s.stage == stg);
         if (active) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(palette.accent[0], palette.accent[1],
-                                                          palette.accent[2], 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
         }
-        if (ImGui::Button(kStageLabels[i])) s.stage = (Stage)i;
+        if (ImGui::Button(stageName(stg))) s.stage = stg;
         if (active) ImGui::PopStyleColor();
     }
     ImGui::EndChild();
@@ -251,7 +312,6 @@ static void drawStepper(AppState& st) {
 // ---- entry point ---------------------------------------------------------------
 
 void drawRevEngWorkspace(AppState& st) {
-    // Kick / refresh the async session list (throttled, non-blocking).
     loadSessions(st);
 
     // RE-ANCHOR(reveng/RE-32): consume a session_id seeded from outside (e.g. the
@@ -300,6 +360,8 @@ void drawRevEngWorkspace(AppState& st) {
         }
     }
 
+    RevEngState& s = S();
+
     // ---- upper body: rail | center | properties ----
     ImGui::BeginChild("##reveng_body", ImVec2(0, bodyH), ImGuiChildFlags_None);
     {
@@ -314,56 +376,38 @@ void drawRevEngWorkspace(AppState& st) {
         ImGui::BeginChild("##reveng_center", ImVec2(midW, 0), ImGuiChildFlags_Border);
         ImGui::PopStyleVar();
         {
-            RevEngState& s = S();
+            // RE-30: source-mode selector always visible at top of center panel.
+            if (drawSourceModeSelector(s)) {
+                clampStageToPipeline(s);
+            }
+            ImGui::Separator();
+
             if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
                 drawCenteredEmptyState(
                     "Reverse Engineering",
                     "Turn photos, scans, or a datasheet into an editable parametric model.\n"
                     "Start a session from the ribbon, or select one from the rail.\n"
                     "Pipeline: scan -> mesh -> AI -> parametric (mesh-body fallback).");
+            } else if (s.stage == Stage::Source) {
+                // RE-ANCHOR(reveng): RE-30 — sources panel (mode-specific entry widgets).
+                drawSourcesPanel(st);
             } else if (s.stage == Stage::Review) {
-                // RE-ANCHOR(reveng): RE-22 — dim-review + deviation panels replace the
-                // generic empty-state for the Review stage.
+                // RE-22: dim-review + deviation panels.
                 const float sc2 = ui::uiScale;
                 const float halfH = (ImGui::GetContentRegionAvail().y - 12.0f * sc2) * 0.5f;
-                // Top half: dimension-confirm review table.
                 ImGui::BeginChild("##reveng_dimreview", ImVec2(0, halfH), ImGuiChildFlags_None);
                 reveng::drawDimReviewPanel(st);
                 ImGui::EndChild();
                 ImGui::Dummy(ImVec2(0, 6.0f * sc2));
-                // Bottom half: deviation heat summary.
                 ImGui::BeginChild("##reveng_deviation", ImVec2(0, 0), ImGuiChildFlags_None);
                 reveng::drawDeviationPanel(st);
                 ImGui::EndChild();
             } else {
                 char title[128];
                 std::snprintf(title, sizeof(title), "%s — %s",
-                              kStageLabels[(int)s.stage],
+                              stageName(s.stage),
                               s.sessions[s.selected].name.c_str());
-                // RE-ANCHOR(RE-19): Capture stage shows the live webcam + gallery;
-                // other stages keep the blurb empty-state.
-                if (s.stage == Stage::Capture) {
-                    ImGui::TextUnformatted(title);
-                    ImGui::Separator();
-                    // Webcam capture widget (stub camera works headless)
-                    const std::string& sid = s.sessions[s.selected].session_id;
-                    drawWebcamCapture(st, sid, /*session_dir=*/".");
-                    ImGui::Spacing();
-                    // Image gallery / dropzone
-                    std::vector<std::string> dropped;
-                    galleryLoadPendingThumbs(s.galleryImages);
-                    drawImageGallery(st, sid, s.galleryImages, dropped);
-                    // Fire async reveng_add_images for drag-dropped files
-                    if (!dropped.empty() && !sid.empty()) {
-                        nlohmann::json args;
-                        args["session_id"] = sid;
-                        args["paths"] = nlohmann::json(dropped);
-                        st.rpc.call("reveng_add_images", args,
-                                    [](const core::RpcResult&){});
-                    }
-                } else {
-                    drawCenteredEmptyState(title, stageBlurb(s.stage));
-                }
+                drawCenteredEmptyState(title, stageBlurb(s.stage));
             }
         }
         ImGui::EndChild();
@@ -373,7 +417,7 @@ void drawRevEngWorkspace(AppState& st) {
     }
     ImGui::EndChild();
 
-    // ---- bottom: stage stepper ----
+    // ---- bottom: adaptive stage stepper ----
     drawStepper(st);
 }
 

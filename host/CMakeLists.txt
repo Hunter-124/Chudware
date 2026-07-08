@@ -177,6 +177,7 @@ add_executable(AI-CAD
   src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
   src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
+  src/ui/reveng/sources_panel.cpp    # RE-30 source-mode entry panel (Scan/Datasheet/Web/Library)
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp

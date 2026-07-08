@@ -1157,11 +1157,15 @@ ScenarioRunner::ScenarioRunner(ActivityPanel& activityPanel)
     : activityPanel(activityPanel) {}
 ScenarioRunner::~ScenarioRunner() = default;
 
-// RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat). Self-contained, mirrors the appearance
-// scenario's self-reading single-capture shape (no AppState want-flag). Loads the canned gaussian
-// .ply fixture and draws it through the real render::SplatRenderer as camera-facing billboards into
-// the backbuffer, then captures once. Purpose: prove the loader + GL draw path don't crash. The
-// camera is built here (not from st.renderer) so the splats frame regardless of the empty document.
+// RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat). Self-contained: loads the canned gaussian
+// .ply fixture and draws it through the real render::SplatRenderer into its OWN offscreen FBO, reads
+// it back, and writes the PNG directly — the iconpipe drain pattern (see runIconPipe lines ~1040).
+//
+// Why an own FBO and not the backbuffer: this runner is called from tick() BEFORE ImGui::NewFrame
+// and the frame's own glClear, so anything drawn to the default framebuffer here is wiped before the
+// backbuffer capture in endFrame(). Rendering to a private FBO + glReadPixels sidesteps that AND the
+// swap/present path entirely, so it completes headless in one synchronous tick (no settle frames).
+// Purpose: prove the loader + the real GL billboard/blend draw path run without crashing headless.
 void ScenarioRunner::runRevengSplat(AppState& st) {
     if (!rsInit) {
         rsInit = true;
@@ -1169,53 +1173,85 @@ void ScenarioRunner::runRevengSplat(AppState& st) {
         rsWant = st.shot && sm && std::strcmp(sm, "reveng_splat") == 0;
     }
     if (!(rsWant && st.workerStarted && !rsDone && st.frame >= 5)) return;
-    if (!rsDirReady) {
-        rsDirReady = true;
-        const char* repo = std::getenv("AI_CAD_REPO");
-        std::string base = repo ? std::string(repo) : std::string(".");
-        rsSavePath = base + "/scratch/reveng_splat_shots";
-        std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
-        // Load the committed fixture (host/tests/fixtures/splat_tiny.ply, repo-relative).
-        rsRenderer = std::make_unique<render::SplatRenderer>();
-        std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
-        std::string err;
-        rsLoaded = rsRenderer->load(plyPath, err);
-        std::printf("reveng_splat: load %s ok=%d count=%zu%s%s\n", plyPath.c_str(),
-                    (int)rsLoaded, rsLoaded ? rsRenderer->count() : 0,
-                    rsLoaded ? "" : " err=", rsLoaded ? "" : err.c_str());
-        std::fflush(stdout);
-    }
 
-    // Draw the splats into the currently-bound (default) framebuffer over the full viewport.
-    if (rsRenderer && rsLoaded) {
-        GLint vp[4] = {0, 0, 0, 0};
-        glGetIntegerv(GL_VIEWPORT, vp);
-        int vw = vp[2] > 0 ? vp[2] : 1280, vh = vp[3] > 0 ? vp[3] : 720;
-        // Build a camera framing the fixture (centered ~z=7.5, spanning z in [-5,20]).
+    const char* repo = std::getenv("AI_CAD_REPO");
+    std::string base = repo ? std::string(repo) : std::string(".");
+    rsSavePath = base + "/scratch/reveng_splat_shots";
+    std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
+
+    // Load the committed fixture (host/tests/fixtures/splat_tiny.ply, repo-relative).
+    rsRenderer = std::make_unique<render::SplatRenderer>();
+    std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
+    std::string err;
+    rsLoaded = rsRenderer->load(plyPath, err);
+    std::printf("reveng_splat: load %s ok=%d count=%zu%s%s\n", plyPath.c_str(),
+                (int)rsLoaded, rsLoaded ? rsRenderer->count() : 0,
+                rsLoaded ? "" : " err=", rsLoaded ? "" : err.c_str());
+    std::fflush(stdout);
+
+    const int W = 640, H = 480;
+
+    // Private offscreen FBO: color (RGBA8) + depth (SplatRenderer::draw enables GL_DEPTH_TEST).
+    GLuint fbo = 0, colorTex = 0, depthRbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGenTextures(1, &colorTex);
+    glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
+    glGenRenderbuffers(1, &depthRbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, depthRbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, W, H);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRbo);
+    GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+    std::vector<unsigned char> rgba(W * H * 4, 0);
+    size_t opaque = 0;
+    if (fbStatus == GL_FRAMEBUFFER_COMPLETE) {
+        glViewport(0, 0, W, H);
+        glClearColor(0.10f, 0.11f, 0.13f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Camera framing the fixture (gaussians span z in [-5,20], centered ~7.5).
         Vec3 center{0.0f, 0.0f, 7.5f};
-        Vec3 eye{25.0f, 20.0f, 40.0f};
+        Vec3 eye{22.0f, 18.0f, 38.0f};
         Vec3 up{0.0f, 0.0f, 1.0f};
-        float aspect = vh > 0 ? (float)vw / (float)vh : 1.0f;
+        float aspect = (float)W / (float)H;
         Mat4 proj = perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
         Mat4 view = lookAt(eye, center, up);
         Renderer::CameraXform cam;
         cam.mvp = mul(proj, view);
-        cam.eye = eye;
-        cam.center = center;
-        cam.radius = 20.0f;
-        cam.ssWidth = vw; cam.ssHeight = vh;
-        rsRenderer->draw(cam);  // real SplatRenderer GL draw path (billboards + back-to-front blend)
-    }
+        cam.eye = eye; cam.center = center; cam.radius = 20.0f;
+        cam.ssWidth = W; cam.ssHeight = H;
+        rsRenderer->draw(cam);  // real SplatRenderer path: billboards + back-to-front alpha blend
 
-    // Single capture after a couple of settle frames.
-    const int kSettle = 3;
-    if (rsSettle == 0 && rsCapture.empty()) { rsSettle = kSettle; return; }
-    if (rsSettle > 0) { --rsSettle; return; }
-    if (rsCapture.empty()) {
-        rsCapture = rsSavePath + "/reveng_splat_01.png";
-        std::printf("reveng_splat: capturing %s\n", rsCapture.c_str());
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        for (size_t i = 3; i < rgba.size(); i += 4) if (rgba[i] > 8) ++opaque;
+    } else {
+        std::printf("reveng_splat: FBO incomplete (0x%x) — cannot render\n", fbStatus);
         std::fflush(stdout);
     }
+
+    // Restore the default framebuffer so the normal frame loop is unaffected.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &colorTex);
+    glDeleteRenderbuffers(1, &depthRbo);
+
+    // glReadPixels is bottom-up; flip to top-down for the PNG.
+    std::vector<unsigned char> flip(W * H * 4);
+    for (int y = 0; y < H; ++y)
+        std::memcpy(&flip[(size_t)(H - 1 - y) * W * 4], &rgba[(size_t)y * W * 4], (size_t)W * 4);
+
+    rsCapture = rsSavePath + "/reveng_splat_01.png";
+    stbi_write_png(rsCapture.c_str(), W, H, 4, flip.data(), W * 4);
+    std::printf("reveng_splat: wrote %s (%dx%d, %zu opaque px, %zu gaussians)\n",
+                rsCapture.c_str(), W, H, opaque, rsLoaded ? rsRenderer->count() : 0);
+    std::fflush(stdout);
+
+    rsDone = true;  // one-tick drain complete; frame loop exits at the generic shot gate (frame 6)
 }
 
 // Appearance scenario (AI_CAD_SHOT=appearance). Same frame-driven step machine + kSettle
@@ -1901,18 +1937,11 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return apDone ? FrameAction::Break : FrameAction::Continue;
     }
 
-    // RE-28 reveng_splat scenario: single backbuffer capture (mirrored to --ui-screenshot target).
+    // RE-28 reveng_splat scenario: the PNG is rendered + written in tick() (own-FBO drain, like
+    // iconpipe), so endFrame only needs to break the loop once the drain has completed. No
+    // backbuffer capture here — the splat frame lives in a private FBO, never the default one.
     if (rsWant) {
         ++st.frame;
-        if (!rsCapture.empty()) {
-            std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
-            writeBackbufferPng(rsCapture.c_str(), dw, dh, screenshotPath);
-            std::printf("reveng_splat screenshot -> %s (%dx%d)\n", rsCapture.c_str(), dw, dh);
-            std::fflush(stdout);
-            rsCapture.clear();
-            rsDone = true;
-        }
-        glfwSwapBuffers(st.win);
         return rsDone ? FrameAction::Break : FrameAction::Continue;
     }
 

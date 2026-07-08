@@ -173,6 +173,30 @@ void freeIcons() {
     gAtlas.loaded = false;
 }
 
+// Icon aliases: names referenced by the ribbon/toolbar that have no dedicated atlas cell borrow a
+// semantically-close existing glyph, so nothing ever falls to the magenta placeholder. This table
+// is the single source of truth for those fallbacks; the atlas-coverage guard (assets/test_icons.py)
+// treats an aliased name as "covered". Prefer adding a real rendered tile (scripts/icon_pipeline.py)
+// over a permanent alias — replace the entry here once the dedicated glyph lands.
+const char* resolveIconAlias(const char* name) {
+    if (!name) return name;
+    struct Alias { const char* from; const char* to; };
+    static const Alias kAliases[] = {
+        {"rotate_ent",          "pattern_circ_ent"},  // TODO: dedicated rotate-entities glyph
+        {"stock",               "cat_stock_metal"},   // Manufacture▸Stock — reuse the metal-block tile
+        // (Features▸Thread now has its own atlas glyph "thread" — interim cam_thread_mill alias removed.)
+        {"name_group_features", "folder_new"},         // group selected features into a named folder
+        {"new_part",            "part"},
+        {"open_part",           "open"},
+        {"appr_steel",          "appr_metal"},         // appearance metals share the polished-metal render
+        {"appr_brass",          "appr_metal"},
+        {"appr_dark",           "appr_metal"},
+    };
+    for (const Alias& a : kAliases)
+        if (std::strcmp(name, a.from) == 0) return a.to;
+    return name;
+}
+
 IconUV getIcon(const char* name, int size) {
     IconUV out;
 
@@ -186,6 +210,8 @@ IconUV getIcon(const char* name, int size) {
         out.texId = (ImTextureID)(intptr_t)gAtlas.texPlaceholder;
         return out;
     }
+
+    name = resolveIconAlias(name);
 
     // Key = "name@32" or "name@20"
     char key[128];
@@ -230,6 +256,7 @@ bool hasIconSdf(const char* name) {
 
 void drawIconGlass(ImDrawList* dl, const char* name, ImVec2 center, float sizePx, ImU32 col,
                     ImU32 haloCol) {
+    name = resolveIconAlias(name);
     if (icons_sdf::draw(dl, name, center, sizePx, col, haloCol)) return;
 
     // Fallback: no SDF glyph (multi-color raster icon) — plain atlas draw, no halo. Cell-size

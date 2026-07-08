@@ -292,6 +292,16 @@ def _nid_fn(nnx: int, nny: int):
     return nid
 
 
+def _set_lines(ids) -> list:
+    """CalculiX rejects a data line with more than 16 comma-separated entries
+    (splitline error 201). NSET / node-*SURFACE data therefore must be wrapped to
+    <=16 ids per line — a single ", ".join() overflows the moment a face carries
+    more than 16 nodes (e.g. a full end face at ny=nz=4 → 25 nodes). Return one
+    formatted line per chunk of 16."""
+    ids = list(ids)
+    return [", ".join(str(n) for n in ids[i:i + 16]) for i in range(0, len(ids), 16)]
+
+
 def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
                           T_hot: float, T_cold: float,
                           nx: int = 40, ny: int = 3, nz: int = 3) -> dict:
@@ -306,9 +316,9 @@ def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
     mid = [nid(imid, j, k) for k in range(nnz) for j in range(nny)]
     lines = list(node_lines) + list(elem_lines)
     lines += [
-        "*NSET, NSET=NHOT", ", ".join(str(n) for n in hot),
-        "*NSET, NSET=NCOLD", ", ".join(str(n) for n in cold),
-        "*NSET, NSET=NMID", ", ".join(str(n) for n in mid),
+        "*NSET, NSET=NHOT", *_set_lines(hot),
+        "*NSET, NSET=NCOLD", *_set_lines(cold),
+        "*NSET, NSET=NMID", *_set_lines(mid),
         "*MATERIAL, NAME=MAT",
         "*CONDUCTIVITY", f"{k_cond:.6f}",
         "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
@@ -338,8 +348,8 @@ def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
     per = P / len(tip)
     lines = list(node_lines) + list(elem_lines)
     lines += [
-        "*NSET, NSET=NFIX", ", ".join(str(n) for n in fixed),
-        "*NSET, NSET=NTIP", ", ".join(str(n) for n in tip),
+        "*NSET, NSET=NFIX", *_set_lines(fixed),
+        "*NSET, NSET=NTIP", *_set_lines(tip),
         "*MATERIAL, NAME=MAT",
         "*ELASTIC", f"{E:.1f}, {nu:.3f}",
         "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
@@ -416,13 +426,15 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
     upper_top = [n_per + nid(i, j, nz) for j in range(nny) for i in range(nnx)]
 
     lines = list(lower_nodes) + lower_elems + upper_nodes + upper_elems
-    lines += ["*NSET, NSET=NBASE", ", ".join(str(n) for n in base)]
+    lines += ["*NSET, NSET=NBASE", *_set_lines(base)]
     # Master (independent): element-face surface on the lower block top (S2 = 5678 face).
     lines.append("*SURFACE, NAME=SLOWTOP, TYPE=ELEMENT")
     lines += [f"{e}, S2" for e in top_elem_faces]
     # Slave (dependent): node surface on the upper block bottom.
     lines.append("*SURFACE, NAME=SUPBOT, TYPE=NODE")
-    lines.append(", ".join(str(n) for n in upper_bot))
+    # A node *SURFACE takes exactly ONE node per line (CalculiX: "only one entry per
+    # line allowed" — unlike *NSET which permits 16). Do NOT wrap these at 16.
+    lines += [str(n) for n in upper_bot]
     lines += [
         "*MATERIAL, NAME=MAT",
         "*ELASTIC", f"{E:.1f}, {nu:.3f}",
@@ -433,9 +445,19 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
         f"{E * 10.0:.1f}",
         "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE",
         "SUPBOT, SLOWTOP",
-        "*BOUNDARY", "NBASE, 1, 3, 0.0",
-        "*STEP, NLGEOM",
-        "*STATIC", "0.1, 1.0",
+    ]
+    # The upper block is restrained ONLY in z by the contact — its in-plane (x,y)
+    # translation and z-rotation are unconstrained rigid-body modes, so the nonlinear
+    # solve diverges ("increment size smaller than minimum"). Pin the contact-interface
+    # nodes in x,y: for a frictionless uniaxial compression coupon they don't slide, so
+    # this removes the spurious modes without stiffening the z (compression) response.
+    lines += ["*NSET, NSET=NUPB", *_set_lines(upper_bot)]
+    lines += [
+        "*BOUNDARY", "NBASE, 1, 3, 0.0", "NUPB, 1, 2, 0.0",
+        "*STEP, NLGEOM, INC=100",
+        # Automatic incrementation with a low floor lets ccx cut back through the
+        # initial contact-engagement transient instead of failing at a fixed step.
+        "*STATIC", "0.05, 1.0, 1e-6, 0.25",
         "*CLOAD",
     ]
     per = pressure * (L * b) / len(upper_top)

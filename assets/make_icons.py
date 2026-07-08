@@ -103,6 +103,8 @@ CONTRACT_NAMES: list[str] = [
     "plan_board", "issue_bug", "milestone_flag", "team",
     # ---- PLM Git tab (append-only) ----
     "git",
+    # ---- Thread Wizard (append-only): Features tab thread-cut feature ----
+    "thread",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -952,6 +954,28 @@ def draw_curve_helix(d, cell, p):
               fill=p.accent, width=lw)
         d.arc([s*0.25, s*(y+0.02), s*0.75, s*(y+0.20)], start=180, end=360,
               fill=p.accent, width=lw)
+
+@icon("thread")
+def draw_thread(d, cell, p):
+    """Threaded shaft: a vertical shank cut with slanted V-thread grooves (Thread Wizard)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, x1 = s*0.36, s*0.64            # shank sides
+    ytop, ybot = s*0.20, s*0.80
+    # Ghost cylinder body: crown ellipse, two vertical sides, rounded bottom.
+    d.ellipse([x0, s*0.13, x1, s*0.25], fill=_rgba(p.accent, 42), outline=p.stroke, width=lw)
+    d.line([(x0, s*0.19), (x0, ybot)], fill=p.stroke, width=lw)
+    d.line([(x1, s*0.19), (x1, ybot)], fill=p.stroke, width=lw)
+    d.arc([x0, s*0.74, x1, s*0.86], start=0, end=180, fill=p.stroke, width=lw)   # rounded tip
+    # Thread crest lines — slanted downhill (the classic screw-thread hatching), in accent.
+    for i in range(5):
+        y = s*0.30 + i*s*0.105
+        d.line([(x0, y), (x1, y - s*0.075)], fill=p.accent, width=lw)
+    # A couple of thread tips jutting past the right silhouette so it reads as a real thread.
+    for i in range(5):
+        y = s*0.30 + i*s*0.105
+        d.line([(x1, y - s*0.075), (x1 + s*0.045, y - s*0.095)],
+               fill=_rgba(p.stroke, 150), width=max(1, lw // 2))
 
 @icon("combine")
 def draw_combine(d, cell, p):

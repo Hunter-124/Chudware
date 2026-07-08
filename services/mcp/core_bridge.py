@@ -120,11 +120,17 @@ def _lib_candidates() -> list[Path]:
         # No dist stage off-Windows: the .so is produced in a build dir (and copied next
         # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
         root = _repo_root()
+        # build-occt-linux is the FULL engine (OCCT + Netgen) the desktop app loads — it
+        # carries the FEA/CFD sim RPCs (sim_run_static etc., gated behind #ifdef
+        # AICAD_WITH_NETGEN in libaicad.cpp). It MUST come before the slim "build-linux"
+        # beachhead, which is OCCT/Netgen-free and silently lacks every sim + geometry RPC
+        # the MCP exposes (loading it makes run_fea_static report "solver unavailable" even
+        # though the UI works). See _warn_if_sim_missing below.
+        out.append(root / "core" / "build-occt-linux" / "bin" / name)
         # core/build-linux is the standard cmake --build target used by gate.sh and CI.
         # Added here to fix the "all-skip" incident where AI_CAD_LIBAICAD was required
         # even when the .so was already built at this well-known path (see issue #6).
         out.append(root / "core" / "build-linux" / "bin" / name)
-        out.append(root / "core" / "build-occt-linux" / "bin" / name)
         out.append(root / "host" / "build-linux" / "bin" / name)
     return out
 
@@ -203,7 +209,37 @@ def _load() -> ctypes.CDLL:
         ]
         dll.aicad_free.argtypes = [ctypes.c_char_p]
         _dll = dll
+        _warn_if_sim_missing(dll, lib_path)
         return _dll
+
+
+def _warn_if_sim_missing(dll: ctypes.CDLL, lib_path: Path) -> None:
+    """The MCP exposes OCCT/Netgen-dependent tools (run_fea_static/modal, CAD geometry).
+    A slim OCCT-free ``build-linux`` .so links + loads fine but silently lacks every sim
+    RPC, so the FEA tools report "solver unavailable" while the desktop app (which loads
+    the full ``build-occt-linux`` engine) works. Probe the FFI dispatcher once at load and
+    warn LOUDLY rather than let that misconfiguration masquerade as a solver bug.
+    """
+    try:
+        out = ctypes.c_char_p()
+        rc = dll.aicad_call(b"sim_run_static", b"{}", ctypes.byref(out))
+        raw = out.value.decode("utf-8", "replace") if out.value else ""
+        if out.value:
+            dll.aicad_free(out)
+        # "unknown method" (rc != 0) => the sim RPCs aren't compiled into this .so.
+        # A dispatched-but-invalid-study reply ("study must have ...") means sim IS present.
+        if rc != 0 and "unknown method" in raw:
+            sys.stderr.write(
+                "[core_bridge] WARNING: loaded a sim-less libaicad "
+                f"({lib_path}) — FEA/CFD RPCs (sim_run_static) are NOT compiled in. "
+                "This is the slim OCCT/Netgen-free build; the MCP will report the FEA "
+                "solver as unavailable. Stage the full build-occt-linux engine into "
+                "dist/AI-CAD (or set AI_CAD_LIBAICAD to it) and restart the server.\n"
+            )
+            sys.stderr.flush()
+    except Exception:
+        # A probe failure must never block engine loading — this is advisory only.
+        pass
 
 
 def available() -> bool:

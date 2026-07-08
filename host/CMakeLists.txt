@@ -243,6 +243,25 @@ add_test(NAME test_img_tex
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-08 ---
 
+# --- RE-07: CameraBackend platform abstraction (V4L2 / MF / stub) ---
+add_executable(test_camera_backend
+  src/platform/camera_stub.cpp
+  tests/test_camera_backend.cpp)
+if(NOT WIN32)
+  target_sources(test_camera_backend PRIVATE src/platform/camera_v4l2.cpp)
+else()
+  target_sources(test_camera_backend PRIVATE src/platform/camera_mf.cpp)
+endif()
+target_include_directories(test_camera_backend PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_camera_backend PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_camera_backend
+  COMMAND test_camera_backend
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# Real V4L2 smoke: ctest -R test_camera_backend with AICAD_TEST_CAMERA=1 env set externally
+# --- end RE-07 ---
+
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory

@@ -1530,6 +1530,24 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             }
         }
     }
+    // THREAD live-preview PROXY: a real helical thread cut is dominated by the many-turn
+    // boolean (a fine, long thread is ~7-10s — the fuzzy path). While the user is still
+    // tweaking the form in the PM we don't need the full run; we shorten the LENGTH to a
+    // few turns so the preview lands in ~1s, then restore the true length on commit (OK).
+    // NOTE: shortening the length (not capping `turns`) is what keeps it fast — a turns-cap
+    // truncates the coil MID-BODY, whose floating end cap forces the slow fuzzy boolean;
+    // a shorter COMPLETE thread overhangs cleanly and the fast exact boolean succeeds.
+    if (!committing_ && form_ && std::string(form_->type) == "thread") {
+        // `length` is emitted as {"value":N,"expr":...}; shrink the value for the proxy and
+        // drop any expr bind (a shortened preview can't honour the real expression).
+        constexpr double kPreviewThreadLen = 10.0;   // mm — a short but complete proxy run
+        if (params.contains("length") && params["length"].is_object() &&
+            params["length"].contains("value") && params["length"]["value"].is_number() &&
+            params["length"]["value"].get<double>() > kPreviewThreadLen) {
+            params["length"]["value"] = kPreviewThreadLen;
+            params["length"]["expr"]  = nullptr;
+        }
+    }
     feature["params"] = params;
     if (!refs.empty()) feature["refs"] = refs;
 }
@@ -2042,12 +2060,19 @@ void PropertyManager::commit(AppState& st) {
     }
     // The fillet/chamfer is already applied live in the session, so commit just flushes any pending
     // edit and closes — no un-suppress step is needed anymore.
-    if (dirty_ || !firstPreviewDone_) {
+    // Thread previews run at a SHORTENED proxy length for speed (buildOpFeature); the commit MUST
+    // rebuild at the true length even when nothing changed since the last preview, so `committing_`
+    // both suppresses the proxy shortening AND forces a final full-quality apply for the thread form.
+    committing_ = true;
+    const bool forceFullRebuild = form_ && std::string(form_->type) == "thread";
+    if (dirty_ || !firstPreviewDone_ || forceFullRebuild) {
         if (!applyPreview(st)) {
+            committing_ = false;
             st.addLog("[pm] OK blocked: preview/apply failed");
             return;
         }
     }
+    committing_ = false;
     if (!previewError_.empty()) {
         st.addLog("[pm] OK blocked: " + previewError_);
         return;

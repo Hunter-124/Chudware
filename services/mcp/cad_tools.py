@@ -1892,6 +1892,40 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  \u2022 sketch3d_to_ledger / sketch3d_from_ledger are DEPRECATED \u2014 the document\n"
             "    IS the persistence now; from_ledger migrates old payloads into features.\n"
         )
+    # RE-27: Reverse Engineering GUI workflow guide (cad_guide('reveng')).
+    # Distinct from cad_guide('reverse') which covers the engine-level STEP/mesh import path.
+    # This covers the GUI session pipeline: sources → scale → reconstruct → model → review → deliver.
+    if topic in ("reveng", "reverse_eng", "re_workflow", "scan_to_cad"):
+        return (
+            "REVERSE ENGINEERING WORKSPACE (GUI) — contracts/reveng.md\n"
+            "Pipeline: Source → Scale → Reconstruct → Model → Review → Deliver\n\n"
+            "START: 'Reverse Eng' title-bar tab. Start a session from the ribbon (New Session)\n"
+            "or select an existing one in the session rail (left column).\n\n"
+            "SOURCE LANE (Source stage) — pick one:\n"
+            "  Scan        photos / video / webcam → Scale → Reconstruct → Model\n"
+            "  Datasheet   local PDF/spec → Model  (skips Scale + Reconstruct)\n"
+            "  Web/Part#   part number or URL → research → Model  (skips Scale + Reconstruct)\n"
+            "  From Library seed from the Parts Library; auto-routed to Scan or Datasheet\n\n"
+            "SCALE (Scan lane only): ArUco Mat / Two Points / Known Dim.\n"
+            "  Scale must be confirmed before reconstruction runs.\n\n"
+            "RECONSTRUCT (Scan lane only): Sparse → Dense → Mesh pipeline (COLMAP + OpenMVS).\n"
+            "  After completion a 3D Gaussian Splat preview renders in the viewport.\n"
+            "  MCP tool (when wired): reveng_reconstruct(session_id)\n\n"
+            "MODEL: Fit Primitives → AI Model → Mesh Body fallback.\n"
+            "  Honesty tier: approximate sessions are tagged [approx] in the rail.\n"
+            "  Engine-level RE (STEP/mesh → editable feature tree): cad_guide('reverse').\n\n"
+            "REVIEW (RE-22): Dimension-confirm table + deviation heat-map (mesh vs B-rep).\n"
+            "  MCP tools: confirm_dimensions(session_id), describe_results(session_id)\n\n"
+            "DELIVER: Export bundle / Add to Parts Hub / Print scale mat.\n\n"
+            "SHOT MODES for headless verification:\n"
+            "  AI_CAD_SHOT=reveng          full workspace shell\n"
+            "  AI_CAD_SHOT=reveng_capture  Source/capture stage (RE-19 panels)\n"
+            "  AI_CAD_SHOT=reveng_recon    Reconstruct stage + splat indicator (RE-27)\n"
+            "  AI_CAD_SHOT=reveng_review   Review stage with canned dim payload (RE-22)\n"
+            "  AI_CAD_SHOT=reveng_splat    standalone SplatRenderer draw into own FBO (RE-28)\n\n"
+            "See also: cad_guide('reverse') for the engine import path, "
+            "cad_guide('parts') for the Parts Hub integration.\n"
+        )
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -1899,10 +1933,10 @@ def cad_guide_text(topic: str = "overview") -> str:
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
-            f"cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
-            f"sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, regen, "
-            f"code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, sketch3d; "
-            f"or a feature cheatsheet: {avail}")
+            f"cam, narration, parts, reverse, reveng, deliverables, requirements, dag, verify, "
+            f"interaction, sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, "
+            f"regen, code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, "
+            f"sketch3d; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register

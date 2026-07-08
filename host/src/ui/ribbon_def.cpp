@@ -646,9 +646,29 @@ static const RibbonCmd kCmds[] = {
 
     // RE-ANCHOR(reveng): tab "Reverse Eng" ribbon rows — RE-03 appends shell; RE-27 polishes.
     // Session · Sources · Scale · Reconstruct · Model · Deliver groups (contracts/reveng.md).
-    { "reveng_new",         "New Session",    "new_part",       "Reverse Eng", "Session",    true,  nullptr, false },
-    { "reveng_open",        "Open Session",   "open_part",      "Reverse Eng", "Session",    false, nullptr, false },
-    { "reveng_from_library","From Library",   "insert_component","Reverse Eng", "Session",   false, nullptr, false },
+    { "reveng_new",          "New Session",    "new_part",        "Reverse Eng", "Session",     true,  nullptr, false },
+    { "reveng_open",         "Open Session",   "open_part",       "Reverse Eng", "Session",     false, nullptr, false },
+    { "reveng_from_library", "From Library",   "insert_component","Reverse Eng", "Session",     false, nullptr, false },
+    // Sources group — photos / video / webcam / datasheet ingest lanes (RE-19 / RE-30).
+    { "reveng_add_photos",   "Add Photos",     "new_part",        "Reverse Eng", "Sources",     true,  nullptr, false },
+    { "reveng_add_video",    "Add Video",      "sweep",           "Reverse Eng", "Sources",     false, nullptr, false },
+    { "reveng_webcam",       "Webcam",         "measure",         "Reverse Eng", "Sources",     false, nullptr, false },
+    { "reveng_datasheet",    "Datasheet",      "open_part",       "Reverse Eng", "Sources",     false, nullptr, false },
+    // Scale group — ArUco mat / two-point pick / known dimension (contracts/reveng.md §3.1).
+    { "reveng_scale_aruco",  "ArUco Mat",      "smart_dim",       "Reverse Eng", "Scale",       true,  nullptr, false },
+    { "reveng_scale_points", "Two Points",     "eval_measure",    "Reverse Eng", "Scale",       false, nullptr, false },
+    { "reveng_scale_known",  "Known Dim",      "measure",         "Reverse Eng", "Scale",       false, nullptr, false },
+    // Reconstruct group — sparse → dense → mesh + 3DGS splat view (RE-21 / RE-28 / RE-27).
+    { "reveng_reconstruct",  "Reconstruct",    "dwg_rebuild",     "Reverse Eng", "Reconstruct", true,  nullptr, false },
+    { "reveng_splat_view",   "Splat View",     "mesh",            "Reverse Eng", "Reconstruct", false, nullptr, false },
+    // Model group — fit primitives, AI-driven model, mesh-body fallback (contracts/reveng.md §4).
+    { "reveng_fit",          "Fit Primitives", "fillet",          "Reverse Eng", "Model",       true,  nullptr, false },
+    { "reveng_ai_model",     "AI Model",       "new_part",        "Reverse Eng", "Model",       false, nullptr, false },
+    { "reveng_mesh_body",    "Mesh Body",      "sim_mesh",        "Reverse Eng", "Model",       false, nullptr, false },
+    // Deliver group — export bundle / add to Parts Hub / print scale mat.
+    { "reveng_export",       "Export",         "dwg_export_pdf",  "Reverse Eng", "Deliver",     true,  nullptr, false },
+    { "reveng_to_parts",     "Add to Parts",   "insert_component","Reverse Eng", "Deliver",     false, nullptr, false },
+    { "reveng_print_mat",    "Print Scale Mat","make_drawing",    "Reverse Eng", "Deliver",     false, nullptr, false },
 };
 // clang-format on
 

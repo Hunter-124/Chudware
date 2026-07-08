@@ -60,6 +60,19 @@ void feedRevEngEvent(const RevEngEvent& ev) {
     }
 }
 
+// RE-27: seed the canned splat fixture (for shot modes / headless verification).
+void seedSplatFixture() {
+    RevEngState& s = S();
+    if (s.splatLoaded) return;
+    s.splatLoaded = true;
+    const char* repo = std::getenv("AI_CAD_REPO");
+    std::string base = repo ? std::string(repo) : std::string(".");
+    std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
+    std::string err;
+    if (!s.splat.load(plyPath, err))
+        std::fprintf(stderr, "reveng seedSplatFixture: %s\n", err.c_str());
+}
+
 // ---- async loaders -------------------------------------------------------------
 
 static void loadSessions(AppState& st, bool force = false) {
@@ -167,7 +180,8 @@ static const char* stageBlurb(Stage stg) {
 // RE-21: Reconstruct stage center panel — progress stepper + point-cloud overlay note.
 // The GL overlay (rePoints) is drawn by the caller (drawRevEngWorkspace) via beginOverlay /
 // endOverlay AFTER ImGui rendering; this panel draws the ImGui progress UI only.
-// Splat preview: blocked on RE-28 merge into master — stub present, not wired.
+// RE-27: splat preview — when recon.done (or splatLoaded is already set), the RevEngState
+// singleton owns a SplatRenderer that app.cpp's GL section calls after ImGui renders.
 static void drawReconstructStage(AppState& /*st*/) {
     const float sc = ui::uiScale;
     RevEngState& s = S();
@@ -180,6 +194,19 @@ static void drawReconstructStage(AppState& /*st*/) {
         render::buildCannedSparseFixture(pts, frusta);
         s.rePoints.setCloud(pts);
         s.rePoints.setFrusta(frusta);
+    }
+
+    // RE-27: load the canned splat .ply once reconstruction is done (or first entry if already done).
+    // GL-safe: SplatRenderer::load() is CPU-only (GL resources are lazily created on first draw()).
+    if (!s.splatLoaded && s.recon.done) {
+        s.splatLoaded = true;  // mark before load so we don't retry on failure
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
+        std::string err;
+        if (!s.splat.load(plyPath, err)) {
+            std::fprintf(stderr, "reveng splat load failed: %s\n", err.c_str());
+        }
     }
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -267,14 +294,27 @@ static void drawReconstructStage(AppState& /*st*/) {
         ImGui::PopStyleColor();
     }
 
+    // ---- Splat loaded indicator (RE-27: SplatRenderer wired) -------------------
+    if (s.splatLoaded && s.splat.hasSplats()) {
+        ImGui::Dummy(ImVec2(0, 6 * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 0.55f, 1.0f));
+        char splatInfo[80];
+        std::snprintf(splatInfo, sizeof(splatInfo),
+                      "3DGS splat preview: %zu gaussians", s.splat.count());
+        const ImVec2 si = ImGui::CalcTextSize(splatInfo);
+        ImGui::SetCursorPosX((avail.x - si.x) * 0.5f);
+        ImGui::TextUnformatted(splatInfo);
+        ImGui::PopStyleColor();
+    }
+
     // ---- Idle hint (no job running) ------------------------------------------
     if (!reconRunning && !reconDone && s.recon.err.empty()) {
         ImGui::Dummy(ImVec2(0, 8 * sc));
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         const char* hint =
             "Point cloud and camera frusta render in the viewport.\n"
-            "Run Reconstruct from the ribbon to start sparse → dense → mesh.\n"
-            "Splat preview: available after RE-28 merge.";
+            "Run Reconstruct from the ribbon to start sparse \xe2\x86\x92 dense \xe2\x86\x92 mesh.\n"
+            "3DGS splat preview available once reconstruction completes.";
         const char* p = hint;
         while (p && *p) {
             const char* nl = std::strchr(p, '\n');

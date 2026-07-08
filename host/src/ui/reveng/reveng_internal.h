@@ -10,7 +10,8 @@
 // RE-19: GalleryImage is defined in image_gallery.h; included below to avoid
 // a circular dependency (image_gallery.h must NOT include reveng_internal.h).
 #include "image_gallery.h"
-#include "render/re_points.h"  // RE-21: sparse point-cloud + frusta overlay
+#include "render/re_points.h"       // RE-21: sparse point-cloud + frusta overlay
+#include "render/splat_renderer.h"  // RE-28: 3DGS splat renderer (wired RE-27)
 
 namespace ui {
 namespace reveng {
@@ -96,9 +97,13 @@ struct RevEngState {
     ReconstructState recon;
 
     // RE-21: GL overlay — point cloud + camera frusta. Owned here so it persists across frames.
-    // NOTE: splat preview (SplatRenderer) now available via RE-28 on master; wire to S().rePoints
-    // from drawReconstructStage() after RE-28's SplatRenderer is also added to RevEngState.
     render::RePoints rePoints;
+
+    // RE-28 (wired RE-27): 3DGS splat renderer. Loaded with a canned .ply fixture when
+    // Stage::Reconstruct is entered and recon.done is true (or in the reveng_splat shot mode).
+    // draw() is a no-op until a cloud is loaded; safe to call every frame.
+    render::SplatRenderer splat;
+    bool splatLoaded = false;   // true once load() has been attempted for this session
 
     // RE-21: Canned fixture loaded flag (true once buildCannedSparseFixture has been applied).
     bool cannedFixtureLoaded = false;
@@ -109,6 +114,10 @@ RevEngState& S();
 // RE-21: Apply one aicad.reveng_events/1 event to the singleton state.
 // Called from the app.cpp orch event drain — GL thread only, no mutex.
 void feedRevEngEvent(const RevEngEvent& ev);
+
+// RE-27: Seed the splat renderer with the canned fixture (for shot modes that need it without
+// waiting for a real reconstruction job). CPU-only; GL resources are lazily built on first draw.
+void seedSplatFixture();
 
 }  // namespace reveng
 }  // namespace ui

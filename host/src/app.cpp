@@ -38,6 +38,7 @@
 
 #include "render/id_pass.h"
 #include "render/overlays.h"
+#include "render/splat_renderer.h"  // RE-27: splat GL draw in reveng reconstruct stage
 
 #include "core/app_state.h"
 
@@ -1527,6 +1528,24 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::reveng::seedCannedDimPayload();
         // Force the Review stage so the center panel shows dim-review + deviation.
         ui::reveng::S().stage = ui::reveng::Stage::Review;
+    }
+    // AI_CAD_SHOT=reveng_capture: open RE workspace on the Source stage (RE-19 capture suite
+    // + webcam widget + image gallery) for headless visual verification of RE-19 panels.
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_capture") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        ui::reveng::S().stage = ui::reveng::Stage::Source;
+    }
+    // AI_CAD_SHOT=reveng_recon: open RE workspace on the Reconstruct stage with the canned
+    // sparse fixture + recon.done seeded; shows sub-stage stepper + splat indicator (RE-21/RE-27).
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_recon") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        {
+            ui::reveng::RevEngState& rs = ui::reveng::S();
+            rs.stage      = ui::reveng::Stage::Reconstruct;
+            rs.recon.done = true;
+            rs.recon.pct  = 100;
+        }
+        ui::reveng::seedSplatFixture();
     }
     // AI_CAD_SHOT=parts: open the Parts Library workspace with a synthetic no-model
     // result row so the "Generate 3D model" action (RE-32) is visible in the shot.
@@ -3470,6 +3489,34 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                      ui::palette.windowBg[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // RE-27: Splat GL overlay — draw 3DGS splat over the RE Reconstruct panel when
+        // splatLoaded. Runs after ImGui to composite over the workspace (same overlay pattern
+        // as re_points). Guard: ReverseEng workspace + Reconstruct stage + splat ready.
+        {
+            ui::reveng::RevEngState& rs = ui::reveng::S();
+            if (st.activeWorkspace == AppState::Workspace::ReverseEng &&
+                rs.stage == ui::reveng::Stage::Reconstruct &&
+                rs.splatLoaded && rs.splat.hasSplats()) {
+                // Lazily build a neutral CameraXform (no live camera in 2D workspace mode).
+                // We just want the billboard draw to run and composite into the overlay area.
+                Renderer::CameraXform splatCam;
+                splatCam.ssWidth  = dw;
+                splatCam.ssHeight = dh;
+                // Use a fixed look-at that frames the fixture: eye behind/above, looking at origin.
+                Vec3 eye{22.0f, 18.0f, 38.0f};
+                Vec3 center{0.0f, 0.0f, 7.5f};
+                Vec3 up{0.0f, 0.0f, 1.0f};
+                float aspect = dh > 0 ? (float)dw / (float)dh : 1.0f;
+                Mat4 proj = perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
+                Mat4 view = lookAt(eye, center, up);
+                splatCam.mvp    = mul(proj, view);
+                splatCam.eye    = eye;
+                splatCam.center = center;
+                splatCam.radius = 20.0f;
+                rs.splat.draw(splatCam);
+            }
+        }
 
         // Scripted-scenario per-step captures + frame-loop control (m1/sketch/asm/fea/evalmass/
         // activity): endFrame() writes any pending step screenshot from the backbuffer, mirrors

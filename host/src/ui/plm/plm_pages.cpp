@@ -1980,10 +1980,14 @@ void plmDrawGitPage(AppState& st) {
                         open = !open;
                     }
                     ImDrawList* dl = ImGui::GetWindowDrawList();
-                    // Every row carries the liquid-glass wash; it darkens on hover.
-                    ui::glassCardWash(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 5 * S,
+                    // Each row's pill starts at its own indent so the wash steps
+                    // inward with nesting — depth reads at a glance instead of every
+                    // background spanning the full column width. Folders keep the
+                    // accent wash; it darkens on hover.
+                    const float indent = depth * 13 * S;
+                    ui::glassCardWash(dl, ImVec2(p0.x + indent, p0.y), ImVec2(p0.x + w, p0.y + rowH), 5 * S,
                                       palette.accent, ImGui::IsItemHovered() ? 0.24f : 0.10f, 0.3f);
-                    float x = p0.x + depth * 13 * S + 4 * S;
+                    float x = p0.x + indent + 4 * S;
                     const float cy = p0.y + rowH * 0.5f;
                     const ImU32 chev = Palette::toU32(palette.textDim);
                     if (open) dl->AddTriangleFilled(ImVec2(x, cy - 3 * S), ImVec2(x + 6 * S, cy - 3 * S), ImVec2(x + 3 * S, cy + 3 * S), chev);
@@ -2007,11 +2011,16 @@ void plmDrawGitPage(AppState& st) {
                     ImVec2 p0 = ImGui::GetCursorScreenPos();
                     if (ImGui::InvisibleButton("##f", ImVec2(w, rowH))) gitOpenFile(st, full);
                     ImDrawList* dl = ImGui::GetWindowDrawList();
-                    // Always-on wash; darker when selected, mid on hover.
+                    // Files sit one gutter further in than their folder (past the
+                    // chevron), so their pill is inset further still — the hierarchy
+                    // is legible from the backgrounds alone. Files carry a distinct
+                    // cool-steel wash (vs folders' accent); selected files go accent.
+                    static const float kFileWash[3] = {0.58f, 0.66f, 0.80f};
                     const float fa = sel ? 0.36f : (ImGui::IsItemHovered() ? 0.24f : 0.10f);
-                    ui::glassCardWash(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 5 * S,
-                                      palette.accent, fa, 0.3f);
-                    float x = p0.x + depth * 13 * S + 4 * S + 11 * S;  // align past the chevron gutter
+                    const float indent = depth * 13 * S + 11 * S;  // align past the chevron gutter
+                    ui::glassCardWash(dl, ImVec2(p0.x + indent, p0.y), ImVec2(p0.x + w, p0.y + rowH), 5 * S,
+                                      sel ? palette.accent : kFileWash, fa, 0.3f);
+                    float x = p0.x + indent + 4 * S;
                     const float iconSz = iconSzForDepth(depth);
                     const ImU32 ic = sel ? Palette::toU32(palette.accent) : iconColForDepth(depth);
                     // Icon centered horizontally and vertically in its box; size and
@@ -2066,20 +2075,35 @@ void plmDrawGitPage(AppState& st) {
     // Explicit width (avail.x - mainW - gap) rather than 0 so its right edge lands
     // pageR short of the true page edge, matching the outer margin everywhere else.
     const float sideW = avail.x - mainW - gap;
+    // Zero padding so Repository (repoH) + gap + Pull requests (prH) fill topH
+    // exactly — otherwise the default child padding pushes the Pull-requests panel
+    // past the bottom and it clips short of the Code box's lower edge.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::BeginChild("##git_side", ImVec2(sideW, topH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     {
-        // Size Repository to fit its content (header + up to 4 info lines + one
-        // signed-in/sign-in-button line) instead of a generous fixed height — a
-        // shorter Repository panel frees more of the column for Pull requests.
+        // Size Repository to fit its content exactly. The first info line ("On
+        // <branch>") is frame-padded, so it takes a frame height, not a text line —
+        // budgeting it as a plain line is what left the last line clipping out the
+        // bottom. Tight top/bottom padding (4*S) plus the honest per-line math frees
+        // the vertical room the box already had.
         const float lineH  = ImGui::GetTextLineHeightWithSpacing();
-        const float repoH  = 6 * S * 2                       // gpanel top+bottom padding
-                            + ImGui::GetFrameHeight() + 1 * S // header row + its Dummy
-                            + 4 * lineH                       // branch / upstream / repo / commits
+        const float repoPad = 4 * S;
+        const float repoH  = repoPad * 2                     // panel top+bottom padding
+                            + ImGui::GetFrameHeight() + 2 * S // header row + its spacer
+                            + ImGui::GetFrameHeight()         // "On <branch>" (frame-padded)
+                            + 3 * lineH                       // upstream / repo / commits
                             + 3 * S                           // spacer before auth line
                             + ImGui::GetFrameHeight();        // signed-in text / sign-in button
         const float prH    = topH - repoH - gap;
-        gpanel("##git_repo", "Repository", "git", ImVec2(0, repoH));
+        // Repository panel drawn inline (not via gpanel) so it can carry the tighter
+        // padding + a shorter header than the other glass panels.
+        ui::pushGlassChildStyle(10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(13 * S, repoPad));
+        ImGui::BeginChild("##git_repo", ImVec2(0, repoH), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        plmSectionHeader("Repository", "git");
+        ImGui::Dummy(ImVec2(0, 2 * S));
         if (!H.gitBranch.empty()) {
             ImGui::AlignTextToFramePadding();
             dimText("On");
@@ -2114,7 +2138,9 @@ void plmDrawGitPage(AppState& st) {
                 dimText("%s", H.ghLoginUrl.c_str());
             }
         }
-        gpanelEnd();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();       // WindowPadding
+        ui::popGlassChildStyle();
         ImGui::Dummy(ImVec2(0, gap));
 
         // Pull requests. (GitHub issues live on the Planning tab's Issues panel —
@@ -2127,10 +2153,15 @@ void plmDrawGitPage(AppState& st) {
         gpanelEnd();
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();           // git_side WindowPadding
 
     ImGui::Dummy(ImVec2(0, gap));
 
     // ---- bottom band: Changes + commit (left) | History (right) ---------------
+    // Re-apply the page's left inset — the bottom band starts a fresh line, whose
+    // cursor resets to x=0, so without this the Changes panel's left edge sits
+    // pageL short of the Code box above it instead of flush under it.
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pageL);
     const float halfW = (avail.x - gap) * 0.5f;
     gpanel("##git_changes", "Changes", "activity", ImVec2(halfW, bottomH));
     {

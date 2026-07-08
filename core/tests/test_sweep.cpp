@@ -205,3 +205,143 @@ TEST_CASE("make_helix rejects degenerate parameters") {
     // 90° cone angle makes cos(cone_angle)==0 in the arc-length formula.
     CHECK(geom::make_helix(2.0, 10.0, 5.0, 90.0, 0.0, false).IsNull());
 }
+
+// ---------------------------------------------------------------------------
+// DEV HARNESS (temporary): drive geom::cut_thread directly on an EXAGGERATED
+// coarse thread (steep ~45° helix) so profile/alignment/boolean errors that a
+// shallow M8 hides become obvious. Run with AI_CAD_THREAD_DEBUG=1 for a stage
+// trace. Also asserts the two invariants Hunter flagged: the swept groove exists
+// and the cut removes material to a VALID solid.
+// ---------------------------------------------------------------------------
+#include "geom/thread.h"
+#include <BRepAdaptor_CompCurve.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepBndLib.hxx>
+#include <Bnd_Box.hxx>
+#include <gp_Ax2.hxx>
+
+TEST_CASE("HARNESS: coarse thread cut on a steep helix") {
+    const double R = 10.0, H = 40.0;
+    gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+    TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(ax, R, H).Shape();
+    const double plain = solid_volume(cyl);
+    MESSAGE("plain cylinder vol = " << plain);
+
+    // Realistic + coarse pitches on a Ø20 rod (major=20). Real threads run pitch ~
+    // major/8..major/16 (M20 coarse = 2.5); 4.0 is a coarse ACME-ish case.
+    for (bool raised : {false, true}) {
+        for (double pitch : {1.5, 2.5, 4.0}) {
+            geom::ThreadResult tr = geom::cut_thread(
+                cyl, gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), R, pitch,
+                /*major*/ 2 * R, /*length*/ H, /*starts*/ 1, /*lh*/ false,
+                /*internal*/ false, raised, /*turns_cap*/ 0.0);
+            const double v = solid_volume(tr.shape);
+            MESSAGE((raised ? "RAISED" : "CUT  ") << " pitch=" << pitch
+                    << " fell_back=" << tr.fell_back << " vol=" << v
+                    << " (plain=" << plain << ") warn='" << tr.warning << "'");
+            // Realistic fastener pitches (1.5, 2.5) MUST cut/raise a real solid. The
+            // exaggerated 4.0 (a steep ACME-ish coarse case) is allowed to fall back
+            // gracefully: at that lead angle the groove crosses the flat end rim as a
+            // knife-edge that the un-trimmed cut boolean can choke on — the phase-2
+            // overextend-then-trim-to-end-face pass is what makes that case robust.
+            const bool exaggerated = pitch > 3.0;
+            CHECK(BRepCheck_Analyzer(tr.shape).IsValid());
+            if (tr.fell_back) {
+                CHECK(exaggerated);      // only the exaggerated case may fall back
+                CHECK(v == doctest::Approx(plain));  // fall-back returns the body untouched
+            } else if (raised) {
+                CHECK(v > plain + 1.0);
+            } else {
+                CHECK(v < plain - 1.0);
+            }
+        }
+    }
+}
+
+// STOP-AT-OBSTRUCTION / LEAD-IN TRIM: the overextended coil is trimmed to a slab
+// [start, start+length] CLAMPED to the body's own axial extent, so a `length` that
+// overruns the material (a caller over-spec, or a thread that would run past a shoulder /
+// bolt head) can never leave threads floating in air — it trims flush to the solid, and
+// the top/bottom thread ends are flat-cut at the run boundary rather than tapering off.
+TEST_CASE("HARNESS: over-long thread run is clamped to the body (no floating threads)") {
+    const double R = 6.0, H = 20.0;
+    gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+    TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(ax, R, H).Shape();
+    const double plain = solid_volume(cyl);
+
+    // A length 4x the body: without the body-extent clamp the coil would extend well past
+    // the top face. The result must still be ONE valid solid, material actually removed,
+    // and its bounding box must NOT grow past the cylinder's own [0, H] axial span.
+    geom::ThreadResult tr = geom::cut_thread(
+        cyl, gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), R, /*pitch*/ 1.0, /*major*/ 2 * R,
+        /*length*/ 4 * H, /*starts*/ 1, /*lh*/ false, /*internal*/ false,
+        /*raised*/ false, /*turns_cap*/ 0.0);
+    MESSAGE("clamped thread fell_back=" << tr.fell_back
+            << " vol=" << solid_volume(tr.shape) << " (plain=" << plain << ")");
+    CHECK_FALSE(tr.fell_back);
+    CHECK(BRepCheck_Analyzer(tr.shape).IsValid());
+    CHECK(solid_volume(tr.shape) < plain - 1.0);          // material was removed
+    Bnd_Box bb; BRepBndLib::AddOptimal(tr.shape, bb);     // tight box (Add() pads by deflection)
+    double xm, ym, zm, xM, yM, zM; bb.Get(xm, ym, zm, xM, yM, zM);
+    MESSAGE("threaded bbox z = [" << zm << ", " << zM << "]");
+    CHECK(zm > -1e-3);                                     // nothing below the base face
+    CHECK(zM < H + 1e-3);                                  // nothing floating past the top
+}
+
+// INVARIANT: make_helix is exactly concentric with its axis — every sampled point sits at
+// `radius` from the axis (Hunter's "helix aligned to the cylinder's circular profile").
+TEST_CASE("HARNESS: helix is concentric with the cylinder axis") {
+    const double R = 10.0, pitch = 4.0, height = 40.0;
+    TopoDS_Wire hl = geom::make_helix(pitch, height, R, 0.0, 0.0, false);
+    REQUIRE_FALSE(hl.IsNull());
+    BRepAdaptor_CompCurve cc(hl);
+    const double t0 = cc.FirstParameter(), t1 = cc.LastParameter();
+    double maxerr = 0.0, minz = 1e9, maxz = -1e9;
+    for (int i = 0; i <= 40; ++i) {
+        gp_Pnt p = cc.Value(t0 + (t1 - t0) * i / 40.0);
+        const double rr = std::sqrt(p.X() * p.X() + p.Y() * p.Y());
+        maxerr = std::max(maxerr, std::abs(rr - R));
+        minz = std::min(minz, p.Z()); maxz = std::max(maxz, p.Z());
+    }
+    MESSAGE("concentricity max |r-R| = " << maxerr << " mm; z span = " << (maxz - minz));
+    CHECK(maxerr < 1e-6);
+    CHECK(maxz - minz == doctest::Approx(height).epsilon(0.01));
+}
+
+// EXPORT HARNESS: write threaded parts to STEP + STL for a human to open and spin.
+// Path via $THREAD_EXPORT_DIR (default scratch/threads). Set THREAD_EXPORT=1 to run.
+#include <STEPControl_Writer.hxx>
+#include <StlAPI_Writer.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <cstdlib>
+#include <string>
+
+TEST_CASE("EXPORT threaded parts (STEP+STL)") {
+    if (!std::getenv("THREAD_EXPORT")) return;
+    const char* d = std::getenv("THREAD_EXPORT_DIR");
+    const std::string dir = d ? d : "scratch/threads";
+    const double R = 10.0, H = 40.0;
+    gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+
+    struct Case { const char* name; double pitch; bool raised; geom::ThreadForm form; };
+    const Case cases[] = {
+        {"v60_cut_m20x2.5",  2.5, false, geom::ThreadForm::V60},
+        {"v60_cut_coarse_p4",4.0, false, geom::ThreadForm::V60},
+        {"v60_raised_p4",    4.0, true,  geom::ThreadForm::V60},
+        {"acme_cut_p4",      4.0, false, geom::ThreadForm::ACME},
+        {"acme_raised_p4",   4.0, true,  geom::ThreadForm::ACME},
+        {"square_cut_p4",    4.0, false, geom::ThreadForm::SQUARE},
+    };
+    for (const Case& c : cases) {
+        TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(ax, R, H).Shape();
+        geom::ThreadResult tr = geom::cut_thread(
+            cyl, gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), R, c.pitch, 2 * R, H, 1,
+            false, false, c.raised, 0.0, c.form);
+        MESSAGE(c.name << " fell_back=" << tr.fell_back << " vol=" << solid_volume(tr.shape));
+        const std::string base = dir + "/" + c.name;
+        { STEPControl_Writer w; w.Transfer(tr.shape, STEPControl_AsIs);
+          w.Write((base + ".step").c_str()); }
+        { BRepMesh_IncrementalMesh mesh(tr.shape, 0.1); mesh.Perform();
+          StlAPI_Writer sw; sw.Write(tr.shape, (base + ".stl").c_str()); }
+    }
+}

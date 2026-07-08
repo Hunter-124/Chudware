@@ -176,11 +176,13 @@ TopoDS_Shape helical_bool(const TopoDS_Shape& body, const TopoDS_Shape& tool, bo
             TopoDS_Shape r;
             if (raised) {
                 BRepAlgoAPI_Fuse op(body, tool);
+                op.SetRunParallel(Standard_True);   // OCCT BOP is single-threaded by default
                 if (f > 0.0) op.SetFuzzyValue(f);
                 op.Build();
                 if (op.IsDone()) r = op.Shape();
             } else {
                 BRepAlgoAPI_Cut op(body, tool);
+                op.SetRunParallel(Standard_True);
                 if (f > 0.0) op.SetFuzzyValue(f);
                 op.Build();
                 if (op.IsDone()) r = op.Shape();

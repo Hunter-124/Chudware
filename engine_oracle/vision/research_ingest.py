@@ -31,22 +31,76 @@ from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Seam imports — all optional; graceful degradation if absent
+#
+# ORDERING-SAFE PATTERN
+# =====================
+# engine_oracle.research is a *package* whose members (web_search, fetch_page,
+# datasheet_fetch) are also importable as sub-modules.  Python caches them at
+# sys.modules["engine_oracle.research.X"] the first time any code touches them.
+#
+# A plain ``from engine_oracle.research import X as _X`` therefore binds _X to
+# the *sub-module object* already in sys.modules, not to the attribute on
+# whatever the test installs at sys.modules["engine_oracle.research"].  This
+# makes the monkeypatch invisible after the first real import regardless of
+# module-deletion tricks.
+#
+# Additionally, Python's package machinery sets the submodule as an attribute on
+# the parent package object, so even ``from engine_oracle.vision import
+# research_ingest`` can return a stale module object if engine_oracle.vision is
+# still cached.
+#
+# Solution: resolve the three callables *lazily at call time* via sys.modules,
+# using stable module-level sentinel names (_web_search, _fetch_page,
+# _datasheet_fetch) that tests can override with monkeypatch.setattr(ri, ...).
+# The sentinels are set to None here; _resolve_research_fn() does the actual
+# lookup at first call, going through sys.modules["engine_oracle.research"] so a
+# test replacement is always honoured.
 # ---------------------------------------------------------------------------
 
-try:
-    from engine_oracle.research import web_search as _web_search
-except Exception:
-    _web_search = None  # type: ignore[assignment]
+import sys as _sys
 
-try:
-    from engine_oracle.research import fetch_page as _fetch_page
-except Exception:
-    _fetch_page = None  # type: ignore[assignment]
+# _UNSET sentinel: distinguishes "not yet resolved" from "explicitly None / offline".
+# At module import these are _UNSET.  _get_research_fn() resolves through
+# sys.modules["engine_oracle.research"] at call time (so test fakes always win).
+# Tests that want to simulate offline mode set the attribute to None explicitly
+# (monkeypatch.setattr(ri, "_web_search", None)), which _get_research_fn honours
+# by returning None without attempting a sys.modules lookup.
+_UNSET = object()
 
-try:
-    from engine_oracle.research import datasheet_fetch as _datasheet_fetch
-except Exception:
-    _datasheet_fetch = None  # type: ignore[assignment]
+_web_search    = _UNSET  # type: ignore[assignment]
+_fetch_page    = _UNSET  # type: ignore[assignment]
+_datasheet_fetch = _UNSET  # type: ignore[assignment]
+
+
+def _get_research_fn(name: str):
+    """Return the named callable from the research seam, or None if unavailable.
+
+    Lookup order:
+    1. Module-level attribute ``_<name>``:
+       - If callable  → return it (monkeypatch.setattr or a prior resolved value).
+       - If None      → return None (test/caller explicitly disabled this seam).
+       - If _UNSET    → fall through to sys.modules resolution below.
+    2. ``sys.modules["engine_oracle.research"]`` (respects test fakes inserted via
+       monkeypatch.setitem, which replace the whole package entry and therefore
+       shadow any cached sub-module at ``engine_oracle.research.<name>``).
+    3. Fresh importlib import (production first-call path).
+    """
+    val = globals().get(f"_{name}", _UNSET)
+    if val is not _UNSET:
+        # Explicitly set (callable mock OR None/offline). Honour it directly.
+        return val if callable(val) else None
+    # _UNSET: resolve through sys.modules so test fakes shadow real sub-modules.
+    try:
+        pkg = _sys.modules.get("engine_oracle.research")
+        if pkg is None:
+            import importlib as _il
+            pkg = _il.import_module("engine_oracle.research")
+        fn = getattr(pkg, name, None)
+        if callable(fn):
+            return fn
+    except Exception:
+        pass
+    return None
 
 try:
     from engine_oracle.spec_sheet_matcher import normalize_mpn
@@ -251,10 +305,12 @@ def _fetch_url(url: str, datasheet_dir: Path) -> dict:
     text = ""
     pdf_path: Optional[str] = None
 
-    if _looks_like_pdf_url(url) and _datasheet_fetch is not None:
+    _df = _get_research_fn("datasheet_fetch")
+    _fp = _get_research_fn("fetch_page")
+    if _looks_like_pdf_url(url) and _df is not None:
         # Try to fetch as a PDF datasheet
         try:
-            result = _datasheet_fetch(url, tier="datasheet")
+            result = _df(url, tier="datasheet")
             if isinstance(result, str):
                 result = json.loads(result)
             if result.get("ok") or result.get("content"):
@@ -266,9 +322,9 @@ def _fetch_url(url: str, datasheet_dir: Path) -> dict:
                     pdf_path = result["local_path"]
         except Exception:
             pass
-    elif _fetch_page is not None:
+    elif _fp is not None:
         try:
-            result = _fetch_page(url, tier="datasheet")
+            result = _fp(url, tier="datasheet")
             if isinstance(result, str):
                 result = json.loads(result)
             text = result.get("content", "")
@@ -300,11 +356,12 @@ def _run_web_search(
     """Run a web search and fetch top results for datasheets."""
     out: dict = {"sources": [], "texts": [], "pdf_paths": [], "mpns": []}
 
-    if _web_search is None:
+    _ws = _get_research_fn("web_search")
+    if _ws is None:
         return out
 
     try:
-        results = _web_search(query, max_results=max_results)
+        results = _ws(query, max_results=max_results)
         if isinstance(results, str):
             results = json.loads(results)
     except Exception:

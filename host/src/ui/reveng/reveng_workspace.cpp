@@ -370,13 +370,56 @@ static void drawSessionRail(AppState& st, float w) {
     ImGui::Separator();
 
     RevEngState& s = S();
+
+    // New-session creator: name field + "New Session" button. Calls reveng_start_session
+    // async, then auto-selects the returned id (via st.pendingRevengSessionId) and lands on
+    // the Source stage so the upload / link entry widgets are immediately visible.
+    {
+        const bool canCreate = st.workerStarted && !s.newSessionPending;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputTextWithHint("##reveng_new_name", "Name (optional)",
+                                 s.newNameBuf, sizeof(s.newNameBuf));
+        if (!canCreate) ImGui::BeginDisabled();
+        if (ImGui::Button(s.newSessionPending ? "Creating\xe2\x80\xa6" : "+ New Session",
+                          ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+            s.newSessionPending = true;
+            s.newSessionErr.clear();
+            nlohmann::json params = nlohmann::json::object();
+            if (s.newNameBuf[0] != '\0') params["name"] = std::string(s.newNameBuf);
+            st.rpc.call("reveng_start_session", params, [&st](const core::RpcResult& r) {
+                RevEngState& s2 = S();
+                s2.newSessionPending = false;
+                if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                    s2.newSessionErr = r.ok && r.result.is_object()
+                                           ? r.result.value("reason", std::string("create failed"))
+                                           : (r.err.empty() ? std::string("worker unreachable") : r.err);
+                    return;
+                }
+                s2.newSessionErr.clear();
+                s2.newNameBuf[0] = '\0';
+                s2.stage = Stage::Source;            // land on Source so entry widgets show
+                s2.lastListT = -100.0;               // expire throttle → refresh now
+                st.pendingRevengSessionId = r.result.value("session_id", std::string());
+            });
+        }
+        if (!canCreate) ImGui::EndDisabled();
+        if (!st.workerStarted && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Worker not running");
+        if (!s.newSessionErr.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.35f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s", s.newSessionErr.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Separator();
+    }
+
     if (!st.workerStarted) {
         ImGui::TextDisabled("Worker not running.");
     } else if (s.sessions.empty()) {
         if (!s.listErr.empty())
             ImGui::TextWrapped("No sessions. %s", s.listErr.c_str());
         else
-            ImGui::TextDisabled("No sessions yet.\nStart one from the ribbon.");
+            ImGui::TextDisabled("No sessions yet.\nUse + New Session above.");
     } else {
         for (int i = 0; i < (int)s.sessions.size(); ++i) {
             const SessionSummary& ss = s.sessions[i];
@@ -384,7 +427,10 @@ static void drawSessionRail(AppState& st, float w) {
             const bool sel = (s.selected == i);
             std::string label = ss.name;
             if (ss.approximate) label += "  [approx]";
-            if (ImGui::Selectable(label.c_str(), sel)) s.selected = i;
+            if (ImGui::Selectable(label.c_str(), sel)) {
+                s.selected = i;
+                s.stage = Stage::Source;  // land on Source so entry widgets are visible
+            }
             if (!ss.status.empty()) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("%s", ss.status.c_str());
@@ -474,7 +520,8 @@ static void drawStepper(AppState& st) {
     (void)st;
     const float sc = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 6 * sc));
-    ImGui::BeginChild("##reveng_stepper", ImVec2(0, 40 * sc), ImGuiChildFlags_Border);
+    ImGui::BeginChild("##reveng_stepper", ImVec2(0, 40 * sc), ImGuiChildFlags_Border,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
 
     RevEngState& s = S();

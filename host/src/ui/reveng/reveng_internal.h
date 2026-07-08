@@ -71,6 +71,11 @@ struct RevEngState {
     // RE-30: active source lane (drives adaptive stepper + Sources panel).
     SourceMode sourceMode = SourceMode::Scan;
 
+    // New-session creation (rail affordance — RE UI polish).
+    char        newNameBuf[128] = {};
+    bool        newSessionPending = false;
+    std::string newSessionErr;      // sticky; empty when healthy
+
     // Async list bookkeeping.
     bool listPending = false;
     bool listedOnce = false;

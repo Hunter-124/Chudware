@@ -19,6 +19,7 @@
 #include "reveng_internal.h"
 #include "webcam_capture.h"   // RE-19: drawWebcamCapture
 #include "image_gallery.h"    // RE-19: drawImageGallery / galleryLoadPendingThumbs
+#include "../file_dialog.h"   // openFileDialog — visible "Add media" browse affordance
 
 namespace ui {
 namespace reveng {
@@ -104,6 +105,24 @@ static void drawScanEntry(AppState& st) {
 
     if (s.selected >= 0 && s.selected < (int)s.sessions.size()) {
         const std::string& sid = s.sessions[s.selected].session_id;
+
+        // Visible "add media" affordance — not everyone discovers drag-drop. Opens a native
+        // file picker and pushes the chosen image into the same reveng_add_images flow.
+        if (ImGui::Button("Add photo\xe2\x80\xa6") && !sid.empty()) {
+            std::string path = ui::openFileDialog(
+                "Images (*.png *.jpg *.jpeg *.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0"
+                "All files (*.*)\0*.*\0");
+            if (!path.empty()) {
+                nlohmann::json args;
+                args["session_id"] = sid;
+                args["paths"] = nlohmann::json::array({ path });
+                st.rpc.call("reveng_add_images", args, [](const core::RpcResult&){});
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("or drag images onto the gallery below");
+        ImGui::Spacing();
+
         // RE-19: live webcam capture widget (stub camera works headless).
         drawWebcamCapture(st, sid, /*session_dir=*/".");
         ImGui::Spacing();
@@ -162,6 +181,14 @@ static void drawDatasheetEntry(AppState& st) {
             ImGui::TextUnformatted(hint);
     }
     ImGui::EndChild();
+
+    // Visible browse affordance alongside drag-drop.
+    if (ImGui::Button("Browse\xe2\x80\xa6##ds")) {
+        std::string path = ui::openFileDialog(
+            "Spec sheet (*.pdf *.png *.jpg *.jpeg)\0*.pdf;*.png;*.jpg;*.jpeg\0"
+            "All files (*.*)\0*.*\0");
+        if (!path.empty()) kickDatasheetIngest(st, path);
+    }
 
     // Payload accept (ImGui internal DnD).
     if (ImGui::BeginDragDropTarget()) {

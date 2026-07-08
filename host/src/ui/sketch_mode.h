@@ -547,6 +547,11 @@ private:
                            const std::string& snap1 = "", const std::string& snap2 = "");
     // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
     int polySides_ = 6;
+    // Centerline: reuses the Line tool's click-collect/inference/snap path, but commits the segment
+    // as a construction line plus an exaggerated construction midpoint marker (there is no distinct
+    // engine "centerline" sketch entity). Set while arming Centerline; captured/restored across the
+    // Line commit's chain re-arm (mirrors polySides_) so continued segments stay centerlines.
+    bool centerline_ = false;
     // Star tool parameters (set while tool_ == SketchTool::Star).
     int   polyStarPoints_ = 5;    // number of tips (clamped 3..12)
     float polyStarRatio_  = 0.45f; // inner/outer radius ratio

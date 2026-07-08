@@ -25,7 +25,45 @@ from unittest.mock import patch
 # Lightweight stubs (mirrors test_mcp_freshness.py pattern)
 # ---------------------------------------------------------------------------
 
+def _build_fake_mcp_modules() -> dict:
+    """Build fake mcp package modules. Returns a dict suitable for patch.dict(sys.modules)."""
+    mcp_pkg = types.ModuleType("mcp")
+    server_mod = types.ModuleType("mcp.server")
+    fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
+
+    class _FakeFastMCP:
+        def __init__(self, name="", **kw):
+            self._tools: dict = {}
+
+        def tool(self):
+            def decorator(fn):
+                self._tools[fn.__name__] = fn
+                return fn
+            return decorator
+
+    fastmcp_mod.FastMCP = _FakeFastMCP
+    return {
+        "mcp": mcp_pkg,
+        "mcp.server": server_mod,
+        "mcp.server.fastmcp": fastmcp_mod,
+    }
+
+
+# Module-level stub dict for the fake mcp — populated once, reused by the
+# patcher so setUpClass/tearDownClass can install/remove without re-creating.
+_FAKE_MCP_MODULES: dict = _build_fake_mcp_modules()
+
+
 def _install_stubs():
+    """Install stubs needed to import reveng_tools at module scope.
+
+    The fake mcp modules are installed temporarily here so reveng_tools imports
+    cleanly; they are REMOVED from sys.modules immediately after the import
+    (see bottom of this block) and restored only for the duration of the test
+    class via setUpClass/tearDownClass.  This prevents leaking _FakeFastMCP
+    into later test modules (e.g. test_reveng_e2e_datasheet) that need the
+    real mcp.server.fastmcp.FastMCP with _tool_manager.
+    """
     # core_bridge stub
     cb_mod = types.ModuleType("mcp_server.core_bridge")
     cb_mod.available = lambda: False
@@ -33,26 +71,9 @@ def _install_stubs():
     sys.modules.setdefault("mcp_server.core_bridge", cb_mod)
     sys.modules.setdefault("core_bridge", cb_mod)
 
-    # mcp package stub
-    if "mcp" not in sys.modules:
-        mcp_pkg = types.ModuleType("mcp")
-        server_mod = types.ModuleType("mcp.server")
-        fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
-
-        class _FakeFastMCP:
-            def __init__(self, name="", **kw):
-                self._tools: dict = {}
-
-            def tool(self):
-                def decorator(fn):
-                    self._tools[fn.__name__] = fn
-                    return fn
-                return decorator
-
-        fastmcp_mod.FastMCP = _FakeFastMCP
-        sys.modules["mcp"] = mcp_pkg
-        sys.modules["mcp.server"] = server_mod
-        sys.modules["mcp.server.fastmcp"] = fastmcp_mod
+    # mcp package stub — installed temporarily; removed after import below
+    for key, mod in _FAKE_MCP_MODULES.items():
+        sys.modules.setdefault(key, mod)
 
     # cad_tools stub — only _dumps/_err needed
     if "mcp_server.cad_tools" not in sys.modules:
@@ -134,6 +155,11 @@ with (
 
     from services.mcp.reveng_tools import register_reveng_tools  # noqa: E402
 
+# Remove the fake mcp stubs from sys.modules now that reveng_tools is imported.
+# Tests restore them only for their own class lifetime via setUpClass/tearDownClass.
+for _key in list(_FAKE_MCP_MODULES):
+    sys.modules.pop(_key, None)
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -157,7 +183,30 @@ def _call(tools: dict, tool_name: str, **kwargs) -> dict:
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestRevengToolsRegistration(unittest.TestCase):
+class _FakeMCPTestBase(unittest.TestCase):
+    """Base class that installs _FAKE_MCP_MODULES for the test class lifetime.
+
+    All test classes in this module inherit from this base so _FakeFastMCP is
+    available during test execution but is NOT present in sys.modules between
+    test classes (or after this module's tests finish).  This prevents leaking
+    the fake into later test modules such as test_reveng_e2e_datasheet which
+    imports the *real* mcp.server.fastmcp.FastMCP (which has _tool_manager).
+    """
+
+    _mcp_patcher = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._mcp_patcher = patch.dict(sys.modules, _FAKE_MCP_MODULES)
+        cls._mcp_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._mcp_patcher is not None:
+            cls._mcp_patcher.stop()
+
+
+class TestRevengToolsRegistration(_FakeMCPTestBase):
 
     def setUp(self):
         self.tools = _build_tools()
@@ -189,7 +238,7 @@ class TestRevengToolsRegistration(unittest.TestCase):
         self.assertFalse(missing, f"Tools not registered: {missing}")
 
 
-class TestRevengSessionLifecycle(unittest.TestCase):
+class TestRevengSessionLifecycle(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -413,7 +462,7 @@ class TestRevengSessionLifecycle(unittest.TestCase):
         self.assertIn("session.json", names)
 
 
-class TestRevengStatusTool(unittest.TestCase):
+class TestRevengStatusTool(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -447,7 +496,7 @@ class TestRevengStatusTool(unittest.TestCase):
             self.assertIsInstance(v, bool)
 
 
-class TestRevengLongJobStubs(unittest.TestCase):
+class TestRevengLongJobStubs(_FakeMCPTestBase):
     """Long-job tools must return the honest backend_not_provisioned envelope."""
 
     def setUp(self):
@@ -515,7 +564,7 @@ class TestRevengLongJobStubs(unittest.TestCase):
         self._assert_not_provisioned(r)
 
 
-class TestRevengDeviationAndResult(unittest.TestCase):
+class TestRevengDeviationAndResult(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -540,7 +589,7 @@ class TestRevengDeviationAndResult(unittest.TestCase):
         self.assertIn("reason", r)
 
 
-class TestRevengPrintScaleMat(unittest.TestCase):
+class TestRevengPrintScaleMat(_FakeMCPTestBase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

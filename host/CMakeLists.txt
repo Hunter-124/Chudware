@@ -172,6 +172,7 @@ add_executable(AI-CAD
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/ai/ai_workspace.cpp
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
+  src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp
@@ -261,6 +262,16 @@ add_test(NAME test_camera_backend
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # Real V4L2 smoke: ctest -R test_camera_backend with AICAD_TEST_CAMERA=1 env set externally
 # --- end RE-07 ---
+
+# --- RE-22: dim-review accept/edit FSM unit test (no GL / imgui / rpc needed) ---
+add_executable(test_dim_review_fsm
+  tests/test_dim_review_fsm.cpp)
+set_target_properties(test_dim_review_fsm PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_dim_review_fsm
+  COMMAND test_dim_review_fsm
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end RE-22 ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD

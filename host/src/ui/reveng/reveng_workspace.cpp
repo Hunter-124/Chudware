@@ -22,6 +22,7 @@
 #include "ui_theme.h"
 
 #include "reveng_internal.h"
+#include "dim_review.h"  // RE-22: drawDimReviewPanel / drawDeviationPanel
 
 namespace ui {
 namespace reveng {
@@ -280,6 +281,20 @@ void drawRevEngWorkspace(AppState& st) {
                     "Turn photos, scans, or a datasheet into an editable parametric model.\n"
                     "Start a session from the ribbon, or select one from the rail.\n"
                     "Pipeline: scan -> mesh -> AI -> parametric (mesh-body fallback).");
+            } else if (s.stage == Stage::Review) {
+                // RE-ANCHOR(reveng): RE-22 — dim-review + deviation panels replace the
+                // generic empty-state for the Review stage.
+                const float sc2 = ui::uiScale;
+                const float halfH = (ImGui::GetContentRegionAvail().y - 12.0f * sc2) * 0.5f;
+                // Top half: dimension-confirm review table.
+                ImGui::BeginChild("##reveng_dimreview", ImVec2(0, halfH), ImGuiChildFlags_None);
+                reveng::drawDimReviewPanel(st);
+                ImGui::EndChild();
+                ImGui::Dummy(ImVec2(0, 6.0f * sc2));
+                // Bottom half: deviation heat summary.
+                ImGui::BeginChild("##reveng_deviation", ImVec2(0, 0), ImGuiChildFlags_None);
+                reveng::drawDeviationPanel(st);
+                ImGui::EndChild();
             } else {
                 char title[128];
                 std::snprintf(title, sizeof(title), "%s — %s",

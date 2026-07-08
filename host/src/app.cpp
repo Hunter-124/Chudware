@@ -54,6 +54,8 @@
 #include "ui/legacy_chat.h"
 #include "ui/ai/ai_workspace.h"   // AI workspace full-body hub (sessions + DAG + chat + settings)
 #include "ui/reveng/reveng_workspace.h"  // Reverse Engineering workspace full-body shell (RE-03)
+#include "ui/reveng/reveng_internal.h"   // RE-22: S() + Stage enum for shot seeding
+#include "ui/reveng/dim_review.h"        // RE-22 dimension-confirm review + deviation panels
 #include "ui/settings_modal.h"
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
@@ -1517,6 +1519,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // generic per-frame shot capture grabs it (no scenario state machine needed).
     if (shot && shotMode && std::strcmp(shotMode, "reveng") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+    }
+    // AI_CAD_SHOT=reveng_review: open the RE workspace on the Review stage with a canned
+    // confirm_dimensions payload + deviation result — headless visual verification of RE-22.
+    if (shot && shotMode && std::strcmp(shotMode, "reveng_review") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+        ui::reveng::seedCannedDimPayload();
+        // Force the Review stage so the center panel shows dim-review + deviation.
+        ui::reveng::S().stage = ui::reveng::Stage::Review;
     }
     // AI_CAD_SHOT=git: open the PLM hub on the new Git page for headless verification.
     if (shot && shotMode && std::strcmp(shotMode, "git") == 0) {

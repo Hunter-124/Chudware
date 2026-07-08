@@ -484,6 +484,78 @@ def _plm_draft(params: dict, _emit: Callable) -> dict:
     return _with_vault(params, run)
 
 
+# ---------------------------------------------------------------------------
+# Git tab — real git / GitHub client (services/plm/gitscm.py)
+#
+# Unlike the vault methods above, these are an EXPLICIT git surface for the PLM
+# "Git" GUI tab: git vocabulary is expected here. Each takes {"path": <folder>}
+# and any op-specific params; gitscm already returns the flat envelope, so these
+# wrappers just route. gitscm never raises and degrades to
+# {ok:false, reason:"git_missing"/"gh_missing"} when a binary is absent.
+# ---------------------------------------------------------------------------
+
+def _git_path(params: dict) -> str:
+    return str((params or {}).get("path", "") or "")
+
+
+def _git_rpc(params: dict, _emit: Callable, fn_name: str, *arg_keys) -> dict:
+    from services.plm import gitscm
+    path = _git_path(params)
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    fn = getattr(gitscm, fn_name)
+    kwargs = {}
+    for key, cast, default in arg_keys:
+        val = (params or {}).get(key, default)
+        kwargs[key] = cast(val) if val is not None else default
+    try:
+        return fn(path, **kwargs)
+    except Exception as e:  # noqa: BLE001 — never raise across the seam
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
+
+
+def _git_status(params, _emit):     return _git_rpc(params, _emit, "status")
+def _git_log(params, _emit):        return _git_rpc(params, _emit, "log", ("limit", int, 50), ("ref", str, ""))
+def _git_branches(params, _emit):   return _git_rpc(params, _emit, "branches")
+def _git_remotes(params, _emit):    return _git_rpc(params, _emit, "remotes")
+def _git_tree(params, _emit):       return _git_rpc(params, _emit, "tree", ("ref", str, "HEAD"))
+def _git_show(params, _emit):       return _git_rpc(params, _emit, "file_at", ("file", str, ""), ("ref", str, "HEAD"))
+def _git_diff(params, _emit):       return _git_rpc(params, _emit, "diff", ("file", str, ""), ("staged", bool, False))
+def _git_is_repo(params, _emit):    return _git_rpc(params, _emit, "is_repo")
+def _git_init(params, _emit):       return _git_rpc(params, _emit, "init")
+def _git_unstage(params, _emit):    return _git_rpc(params, _emit, "unstage", ("files", list, None))
+def _git_checkout(params, _emit):   return _git_rpc(params, _emit, "checkout_branch", ("name", str, ""))
+def _git_fetch(params, _emit):      return _git_rpc(params, _emit, "fetch", ("remote", str, ""))
+def _git_pull(params, _emit):       return _git_rpc(params, _emit, "pull")
+
+
+def _git_stage(params, _emit):
+    return _git_rpc(params, _emit, "stage", ("files", list, None))
+
+
+def _git_commit(params, _emit):
+    return _git_rpc(params, _emit, "commit", ("message", str, ""),
+                    ("stage_all", bool, False))
+
+
+def _git_push(params, _emit):
+    return _git_rpc(params, _emit, "push", ("set_upstream", bool, False))
+
+
+def _git_branch_create(params, _emit):
+    return _git_rpc(params, _emit, "create_branch", ("name", str, ""),
+                    ("checkout", bool, True))
+
+
+def _git_repo_info(params, _emit):  return _git_rpc(params, _emit, "repo_info")
+def _git_pr_list(params, _emit):    return _git_rpc(params, _emit, "pr_list", ("limit", int, 20))
+def _git_issue_list(params, _emit): return _git_rpc(params, _emit, "issue_list", ("limit", int, 20))
+def _git_gh_auth_status(params, _emit): return _git_rpc(params, _emit, "gh_auth_status")
+def _git_gh_auth_login(params, _emit):  return _git_rpc(params, _emit, "gh_auth_login", ("hostname", str, ""))
+
+
 WORKER_METHODS = {
     "plm_open": _plm_open,
     "plm_status": _plm_status,
@@ -507,4 +579,27 @@ WORKER_METHODS = {
     "plm_scheme_set": _plm_scheme_set,
     "plm_discard_draft": _plm_discard_draft,
     "plm_draft": _plm_draft,
+    # Git tab — real git / GitHub client
+    "git_status": _git_status,
+    "git_log": _git_log,
+    "git_branches": _git_branches,
+    "git_remotes": _git_remotes,
+    "git_tree": _git_tree,
+    "git_show": _git_show,
+    "git_diff": _git_diff,
+    "git_is_repo": _git_is_repo,
+    "git_init": _git_init,
+    "git_stage": _git_stage,
+    "git_unstage": _git_unstage,
+    "git_commit": _git_commit,
+    "git_push": _git_push,
+    "git_pull": _git_pull,
+    "git_fetch": _git_fetch,
+    "git_checkout": _git_checkout,
+    "git_branch_create": _git_branch_create,
+    "git_repo_info": _git_repo_info,
+    "git_pr_list": _git_pr_list,
+    "git_issue_list": _git_issue_list,
+    "git_gh_auth_status": _git_gh_auth_status,
+    "git_gh_auth_login": _git_gh_auth_login,
 }

@@ -26,21 +26,11 @@ class PhotogrammetryUnavailable(RuntimeError):
 
 
 def available_backend() -> Optional[str]:
-    """Return 'meshroom', 'colmap', 'pycolmap', or None — read from env at call time.
-
-    Priority: meshroom (env) > colmap (env) > pycolmap (in-process, RE-ANCHOR RE-09).
-    Existing subprocess paths are unchanged.
-    """
+    """Return 'meshroom', 'colmap', or None — read from env at call time."""
     if os.environ.get("MESHROOM_BIN"):
         return "meshroom"
     if os.environ.get("COLMAP_BIN"):
         return "colmap"
-    # RE-ANCHOR RE-09: pycolmap in-process backend
-    try:
-        import pycolmap  # type: ignore  # noqa: F401
-        return "pycolmap"
-    except ImportError:
-        pass
     return None
 
 

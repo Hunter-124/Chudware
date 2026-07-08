@@ -766,7 +766,17 @@ class EmbedManager:
             if self._wizard is not None:
                 return fail("wizard_active", "a login wizard is already running — "
                                              "login_wizard_stop it first")
+            explicit = bool(sites)
             site_list = list(sites) if sites else self._wizard_default_sites()
+            # Client mode (in-process CEF GUI) has no auto-advance to skip sites the
+            # user is already signed into, so it would re-open every vendor — even
+            # ones with a live cookie session — and make the user click through them.
+            # Filter the DEFAULT multi-site list down to vendors that still need a
+            # login (has_login stamp absent/false). Never filter an EXPLICIT
+            # single-vendor launch ("Sign in" on one row): the user asked for that
+            # site regardless of stamp.
+            if client_mode and not explicit:
+                site_list = [s for s in site_list if not profiles.has_login(s)]
             if not site_list:
                 return {"ok": True, "sites": [], "all_done": True,
                         "current_site": None, "embed_id": None}

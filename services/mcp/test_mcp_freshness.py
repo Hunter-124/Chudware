@@ -285,15 +285,6 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "mechanical": {
         "gear_check", "bearing_life",
     },
-    "reveng": {
-        "list_reveng_sessions", "get_reveng_session", "get_reveng_coverage",
-        "get_reveng_deviation", "describe_reveng_result", "reveng_status",
-        "reveng_start_session", "reveng_add_images", "reveng_add_video",
-        "reveng_ingest_datasheet", "reveng_set_scale",
-        "reveng_reconstruct", "reveng_single_photo", "reveng_fit_primitives",
-        "reveng_build_parametric", "reveng_attach_result", "reveng_print_scale_mat",
-        "import_scan_mesh", "export_reveng_bundle",
-    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -337,8 +328,6 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "interface_check": ["interface_check", "interface alignment", "cad_guide('design_review')"],
     "tolerance_stackup": ["stackup_analyze", "cad_guide('tolerance_stackup')", "tolerance_stackup"],
     "mechanical":    ["gear_check", "bearing_life", "mechanical"],
-    "reveng":        ["reveng_start_session", "list_reveng_sessions", "reveng_status",
-                      "reveng_reconstruct", "reveng", "reverse engineering"],
 }
 
 
@@ -510,7 +499,6 @@ class TestMCPFreshness(unittest.TestCase):
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
             "dag", "design_review", "ledger", "tolerance_stackup", "mechanical",
-            "reveng",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

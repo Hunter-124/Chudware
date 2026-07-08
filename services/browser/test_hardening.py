@@ -310,3 +310,7 @@ def test_stealth_init_script_covers_the_known_tells():
     js = stealth.INIT_SCRIPT
     for tell in ("webdriver", "chrome", "plugins", "languages"):
         assert tell in js
+    # We deliberately do NOT spoof WebGL — a getParameter override is itself a
+    # tell (toString + canvas-readback inconsistency). Guard against regressing
+    # by checking the WebGL enum constants never appear in the injected code.
+    assert "37445" not in js and "37446" not in js  # UNMASKED_VENDOR/RENDERER_WEBGL

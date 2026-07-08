@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope, register
+from . import download_dir, distributor_only, is_login_wall, provenance_envelope, register
 
 SITE = "boschrexroth"
 BASE_URL = "https://www.boschrexroth.com"
@@ -54,7 +54,7 @@ class BoschRexrothAdapter:
             return [result]
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+            return [distributor_only(SITE, url)]
         hits = []
         for m in _RESULT_RE.finditer(content):
             card = m.group("title")
@@ -77,7 +77,7 @@ class BoschRexrothAdapter:
             return page
         content = page.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
+            return distributor_only(SITE, url)
 
         match = _DOWNLOAD_RE.search(content)
         if not match:

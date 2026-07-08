@@ -23,6 +23,7 @@ freely but must not edit them. One owner per round per append-only file (see
 - `stepplus.md` — STEP+ persistence format (required entries, load order, save).
 - `events.md` — async event payloads (`sim_progress`, etc.).
 - `feature_params.md` — per-feature-type param/field tables (PM form order).
+- `reveng.md` — Reverse Engineering workspace (`aicad.reveng_session/1`, MCP tools, DAG templates).
 
 ## Agent-layer contracts (Pillar 20 / design pipeline)
 

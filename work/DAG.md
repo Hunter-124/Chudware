@@ -26,6 +26,10 @@ graph TD
     T_B4["T-B4: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup"]:::done
     T_B5["T-B5: Spec-sheet matching v2 - AI path from datasheet and integration demo"]:::done
   end
+  subgraph WS_BL["workstream BL"]
+    T_BL52["T-BL52: Reconcile HSS imperial takeoff designations with the mm section-geometry grammar"]:::todo
+    T_BL53["T-BL53: Discord bot /stats + /leaderboard — implement the git-derived stats/embed helpers in notify_discord.py"]:::review
+  end
   subgraph WS_C["workstream C"]
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
     T_C2["T-C2: Compile loop and pin-map header from ECAD netlist"]:::done
@@ -39,6 +43,27 @@ graph TD
     T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::done
     T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::done
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::done
+  end
+  subgraph WS_DP["workstream DP"]
+    T_DP1["T-DP1: Freeze design-pipeline contract (aicad.designpipe/1) + wire six stages into the phase machine"]:::done
+    T_DP10["T-DP10: Auto-mode workflow router + gym-based tuning loop"]:::done
+    T_DP11["T-DP11: GUI transparency panel — helpers / advisories / councils / delegation / tool calls"]:::done
+    T_DP12["T-DP12: GUI sub-agent model-preference settings + effort auto/advanced mode UI"]:::done
+    T_DP13["T-DP13: Multi-file agent view — watch N agents build N parts simultaneously"]:::done
+    T_DP14["T-DP14: Design-pipeline ↔ PLM wiring (stage checkpoints + rationale narrative)"]:::todo
+    T_DP15["T-DP15: Workspace-switching architecture — full-viewport workspaces + overlay-hosting workspaces"]:::done
+    T_DP16["T-DP16: AI-Agent workspace — full-screen comprehensive copilot (DAG + worker steering + session mgmt)"]:::todo
+    T_DP17["T-DP17: Interactive agent DAG / flowchart widget — clickable nodes to sub-agent detail"]:::done
+    T_DP18["T-DP18: AI time-remaining estimator — tokens/s x expected tokens per subtask"]:::done
+    T_DP19["T-DP19: Gym real-run interpreter fix — let the tuning loop produce real per-class gradients"]:::review
+    T_DP2["T-DP2: feature_architect role + functional-decomposition helpers + requirement-coverage checker"]:::done
+    T_DP3["T-DP3: geometry_designer role + proactive op-aware helper/calculator registry"]:::done
+    T_DP4["T-DP4: linkage_planner role + reference-integrity / datum / interface-consistency checkers"]:::done
+    T_DP5["T-DP5: Overseer audit-and-reroute loop + user-change → stage mapping"]:::done
+    T_DP6["T-DP6: Advisory expansion — every checker becomes a diagnostic advisor with a targeted fix + tool"]:::done
+    T_DP7["T-DP7: Sketch-completion + GSL-status-to-text + critical-dimension scheme helpers"]:::done
+    T_DP8["T-DP8: Council policy engine — per-stage, per-tier, diverse-model, configurable"]:::done
+    T_DP9["T-DP9: Hierarchical delegation (overseer-discretion recursion) + budget meter + kill-switch"]:::done
   end
   subgraph WS_E["workstream E"]
     T_E1["T-E1: Piping module scaffold + fitting catalog"]:::done
@@ -69,7 +94,7 @@ graph TD
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
-    T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
+    T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::doing
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
     T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::done
@@ -80,7 +105,11 @@ graph TD
     T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::done
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
     T_G20["T-G20: Surfaces tab audit - AI-driven test of every surface tool; fix or recommend scrap"]:::done
-    T_G21["T-G21: Vertical collapse for Feature Manager + Copilot columns (buttons stay at top)"]:::review
+    T_G21["T-G21: Vertical collapse for Feature Manager + Copilot columns (buttons stay at top)"]:::done
+    T_G22["T-G22: Settings consolidation + GUI dedupe - unified AI models/routing tab, single model-picker component, glass-token styling"]:::done
+    T_G23["T-G23: imgui chrome parity - port host's pinned glass FM column + SW-style ribbon into ui/imgui, delete docked layout"]:::done
+    T_G24["T-G24: GUI dead-weight cleanup + guardrails - delete stale app/, host reference-only policy, headless shot hardening"]:::done
+    T_G25["T-G25: Re-port host polish into imgui chrome - icon atlases, copilot tab cleanup, FM restyle, dark-mode fixes"]:::done
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
@@ -122,13 +151,54 @@ graph TD
     T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::done
   end
   subgraph WS_R["workstream R"]
-    T_R1["T-R1: PLM v1 - OSS survey + freeze contracts/plm.md (vault schema, lifecycle, lock/remote protocol)"]:::doing
-    T_R2["T-R2: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools"]:::todo
-    T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::todo
-    T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::todo
-    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::todo
+    T_R1["T-R1: PLM v1 - OSS survey + freeze contracts/plm.md (vault schema, lifecycle, lock/remote protocol)"]:::done
+    T_R2["T-R2: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools"]:::done
+    T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::done
+    T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::done
+    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::doing
     T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::todo
     T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::todo
+    T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::todo
+  end
+  subgraph WS_RE["workstream RE"]
+    RE_00["RE-00: Reveng contracts + schemas + DAG templates + anchors"]:::doing
+    RE_01["RE-01: reveng_session.py session manager"]:::todo
+    RE_02["RE-02: reveng_tools MCP skeleton + server registration"]:::todo
+    RE_03["RE-03: Reverse Eng workspace tab shell"]:::todo
+    RE_04["RE-04: frames.py video ingest + blur cull"]:::todo
+    RE_05["RE-05: scale mat PDF + ArUco scale solver"]:::todo
+    RE_06["RE-06: RE provisioning entries + reveng_status probe"]:::todo
+    RE_07["RE-07: webcam CameraBackend V4L2 + MF + stub"]:::todo
+    RE_08["RE-08: image decode + GL texture util"]:::todo
+    RE_09["RE-09: pycolmap sparse pipeline"]:::todo
+    RE_10["RE-10: feed-forward SfM fallback VGGT/MapAnything"]:::todo
+    RE_11["RE-11: dense backends OpenMVS + Brush subprocess"]:::todo
+    RE_12["RE-12: single-photo tier TripoSR/TRELLIS approximate"]:::todo
+    RE_13["RE-13: segment_fit Open3D primitive fitting"]:::todo
+    RE_14["RE-14: recon bridge fits → reverse_engineer hints"]:::todo
+    RE_15["RE-15: datasheet ingest via docling"]:::todo
+    RE_16["RE-16: deviation tool mesh vs B-rep"]:::todo
+    RE_17["RE-17: DAG missions wiring + EventJournal events"]:::todo
+    RE_18["RE-18: routing personas + cad_guide reveng section"]:::todo
+    RE_19["RE-19: GUI capture suite webcam + gallery + QR"]:::todo
+    RE_20["RE-20: synthetic bracket fixture generator"]:::todo
+    RE_21["RE-21: GUI reconstruct stage point cloud + splat preview"]:::todo
+    RE_22["RE-22: GUI dim-review + deviation view"]:::todo
+    RE_23["RE-23: Parts Library RE round-trip"]:::todo
+    RE_24["RE-24: E2E scan demo test"]:::todo
+    RE_25["RE-25: E2E datasheet demo bearing 6205"]:::todo
+    RE_26["RE-26: degradation matrix + license_debt updates"]:::todo
+    RE_27["RE-27: ribbon polish + icons + screenshots"]:::todo
+    RE_28["RE-28: 3DGS splat renderer"]:::todo
+  end
+  subgraph WS_SIM["workstream SIM"]
+    T_SIM1["T-SIM1: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end"]:::done
+    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::ready
+    T_SIM11["T-SIM11: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz"]:::ready
+    T_SIM2["T-SIM2: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport"]:::done
+    T_SIM3["T-SIM3: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish"]:::done
+    T_SIM4["T-SIM4: Solver validation depth - fatigue S-N anchor, FEA live bridge integration test, sim_audit extension"]:::done
+    T_SIM5["T-SIM5: OpenFOAM accurate-CFD integration - run_cfd_accurate live path with GPL2 subprocess isolation"]:::todo
   end
   subgraph WS_U["workstream U"]
     T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::done
@@ -158,19 +228,24 @@ graph TD
     T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::done
     T_W15["T-W15: Build-order DAG planner - part/feature dependency graph with deterministic validation (aicad.buildgraph/1)"]:::done
     T_W16["T-W16: Multi-document agent workspace - doc leases, parallel part fan-out, per-doc event streams"]:::done
-    T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::doing
+    T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::done
     T_W18["T-W18: PLM integration - agent milestone checkpoints, ledger-annotated history, change-request links (aicad.plmlink/1)"]:::done
     T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::done
     T_W2["T-W2: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health"]:::done
     T_W20["T-W20: MCP surface catch-up batch - register/document all Pillar 20 tools for external clients (deferred)"]:::todo
     T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::done
-    T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::doing
+    T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::done
     T_W23["T-W23: Council primitive + build-strategy council - seated deliberation with recorded dissents"]:::done
     T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::done
-    T_W25["T-W25: Design cognition ladder runtime - fresh-context rung executor, inter-rung validators, buildgraph compiler"]:::doing
-    T_W26["T-W26: Bundled local inference - llama.cpp packaged with the app + model auto-provisioning (Gemma/Qwen 4B class)"]:::todo
-    T_W27["T-W27: Design gym - graded challenge suite, failure taxonomy, assess-adjust-rerun tuning loop for local models"]:::todo
+    T_W25["T-W25: Design cognition ladder runtime - fresh-context rung executor, inter-rung validators, buildgraph compiler"]:::done
+    T_W26["T-W26: Bundled local inference - llama.cpp packaged with the app + model auto-provisioning (Gemma/Qwen 4B class)"]:::done
+    T_W27["T-W27: Design gym - graded challenge suite, failure taxonomy, assess-adjust-rerun tuning loop for local models"]:::done
+    T_W28["T-W28: Harness effort settings - tokenism/parallelization/deliberation levels in GUI with Simple/Advanced modes"]:::done
+    T_W29["T-W29: Local tokenmaxx bench - diffusion Gemma GPU backend vs Gemma 3n E4B / qwen3-4b parallel llama.cpp"]:::done
     T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::done
+    T_W30["T-W30: Execution-reality wiring - fix stubbed agent_fn, real tool-execution loop, honest verify gate; gym cycle 1 REAL mode"]:::done
+    T_W31["T-W31: Local runtime CUDA fix + tokenmaxx role mapping - ship GPU llama.cpp, reconcile pin, apply W29 role-model routing"]:::done
+    T_W32["T-W32: Tool-schema injection + run-scoped dispatcher — from honest 0.00 to real gym passes"]:::done
     T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::done
     T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::done
     T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::done
@@ -178,65 +253,77 @@ graph TD
     T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::done
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
   end
+  subgraph WS_WIN["workstream WIN"]
+    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::review
+    T_WIN2["T-WIN2: Windows packaging skeleton + bundled llama.cpp Windows seam"]:::todo
+  end
   subgraph WS_X["workstream X"]
-    T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::review
-    T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::doing
-    T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::todo
-    T_X4["T-X4: Datasheet and document acquisition - authenticated-browser fallback"]:::todo
-    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::todo
-    T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::todo
+    T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::done
+    T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::done
+    T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::done
+    T_X4["T-X4: Datasheet and document acquisition - authenticated-browser fallback"]:::done
+    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::doing
+    T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::review
+    T_X7["T-X7: Vendor adapter wave 2 - Amazon, McMaster-Carr, JLCPCB, PCBWay + manufacturing-service discovery"]:::done
+    T_X7b["T-X7b: Vendor wave-2 follow-ups — McMaster STEP import + structured price to bom_price seam"]:::todo
+    T_X8["T-X8: In-app visible browser login - headed session window launched from the app, profile capture, expiry re-login"]:::todo
+    T_X9["T-X9: In-app ordering - BOM to vendor carts, quote submission for manufactured parts, order tracking records"]:::todo
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::done
     T_BL02["T-BL02: Format interop track (reverse-engineering intake)"]:::doing
     T_BL03["T-BL03: Intake Gates 1-3 (process profiles, photo metrology, fit coupons)"]:::backlog
-    T_BL04["T-BL04: Fatigue + thermal + buckling + contact FEA (CalculiX)"]:::doing
+    T_BL04["T-BL04: Fatigue + thermal + buckling + contact FEA (CalculiX)"]:::done
     T_BL05["T-BL05: FPGA/HDL flow"]:::backlog
     T_BL06["T-BL06: Certified-tool escape hatch"]:::backlog
     T_BL07["T-BL07: Wire harness / cable design"]:::backlog
-    T_BL08["T-BL08: Tolerance stack-up analysis"]:::doing
-    T_BL09["T-BL09: Wire the requirements layer to the verify battery (req evidence auto-population)"]:::doing
+    T_BL08["T-BL08: Tolerance stack-up analysis"]:::done
+    T_BL09["T-BL09: Wire the requirements layer to the verify battery (req evidence auto-population)"]:::done
     T_BL10["T-BL10: SUPERSEDED by workstream R — PDM-lite (git-backed revisioning)"]:::backlog
     T_BL11["T-BL11: Docs + compliance generation"]:::backlog
     T_BL12["T-BL12: TraceParts + Werk24 paid tiers"]:::backlog
     T_BL13["T-BL13: Per-document glass accent + luminance-variance scrim boost"]:::backlog
     T_BL14["T-BL14: GNN adapter training for GO families + sw_fixtures STEP export"]:::backlog
     T_BL15["T-BL15: SUPERSEDED by workstream R — in-app document version control (Pillar 19)"]:::backlog
-    T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::doing
-    T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::doing
-    T_BL18["T-BL18: Gear/bearing life and AGMA tooth-strength checks"]:::doing
+    T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::done
+    T_BL16b["T-BL16b: GUI viewport playback/scrub for a simulate_motion trajectory"]:::doing
+    T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::done
+    T_BL18["T-BL18: Gear/bearing life and AGMA tooth-strength checks"]:::done
     T_BL19["T-BL19: Modeling-op combination battery - engine-level AI testing of feature tools and sequences"]:::done
     T_BL20["T-BL20: FEA/CFD V&V cross-validation - MacNeal-Harder/NAFEMS cases + CalculiX second opinion"]:::done
-    T_BL21["T-BL21: Hollow structural sections - model true wall voids (RHS/HSS) for mass/interference correctness"]:::doing
+    T_BL21["T-BL21: Hollow structural sections - model true wall voids (RHS/HSS) for mass/interference correctness"]:::done
     T_BL22["T-BL22: Wire dormant AI seams into the live loop - adapter routing/telemetry + regen_diagnose binding"]:::done
     T_BL23["T-BL23: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score"]:::done
-    T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::todo
+    T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::review
     T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::done
     T_BL26["T-BL26: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities"]:::done
-    T_BL27["T-BL27: Surfaces — surf_replace_face 'could not heal' unless the replacement splits the solid"]:::doing
+    T_BL27["T-BL27: Surfaces — surf_replace_face 'could not heal' unless the replacement splits the solid"]:::done
     T_BL28["T-BL28: Surfaces — ruled/fill/boundary forms feed body-edge picks the engine rejects (needs sketch refs)"]:::done
     T_BL29["T-BL29: Screenshot-icon recipes — remaining groups (revolve/sweep/loft, Pattern, Multi-body, Curves, Sheet Metal Create, Appearance Display, Manufacture, appr_glass/appr_paint)"]:::done
-    T_BL30["T-BL30: Engine — boolean fuse/cut/common of disjoint bodies silently succeeds; enforce the single-connected-solid invariant (issue"]:::doing
-    T_BL31["T-BL31: GUI round-2 walkthrough nits — dim-chip bleed live-confirm, load toast pinned over ribbon, empty Mass-Properties pills"]:::doing
-    T_BL32["T-BL32: docs/manual/contracts.md drift — missing license_debt.md row + document the new CAM scoring keys"]:::doing
-    T_BL33["T-BL33: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue"]:::review
-    T_BL34["T-BL34: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles"]:::doing
-    T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::doing
-    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::todo
-    T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::review
-    T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::doing
-    T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::review
-    T_BL40["T-BL40: Universal in-app elicitation UI — agents question the user inline (multiple choice, short answer, open-ended) via the interaction contract"]:::review
-    T_BL41["T-BL41: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations"]:::review
-    T_BL42["T-BL42: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable"]:::review
-    T_BL43["T-BL43: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch"]:::review
-    T_BL44["T-BL44: Sketch — spacebar orients the view normal to the active sketch plane"]:::review
-    T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::doing
-    T_BL46["T-BL46: Sketch — larger drag dead zone / element-drag priority so repositioning/resizing elements doesn't instantly pan the view"]:::review
-    T_BL47["T-BL47: DXF import — C++ core mirror (reach GUI/MCP import_part end-to-end)"]:::review
-    T_BL48["T-BL48: Wire ui/imgui interactive sketcher entry — dispatch sketch enter/edit/exit so active sketch editing works (unblocks T-BL41/44/46)"]:::doing
-    T_BL49["T-BL49: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)"]:::review
-    T_BL50["T-BL50: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims"]:::doing
+    T_BL30["T-BL30: Engine — boolean fuse/cut/common of disjoint bodies silently succeeds; enforce the single-connected-solid invariant (issue"]:::done
+    T_BL31["T-BL31: GUI round-2 walkthrough nits — dim-chip bleed live-confirm, load toast pinned over ribbon, empty Mass-Properties pills"]:::done
+    T_BL32["T-BL32: docs/manual/contracts.md drift — missing license_debt.md row + document the new CAM scoring keys"]:::done
+    T_BL33["T-BL33: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue"]:::done
+    T_BL34["T-BL34: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles"]:::review
+    T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::review
+    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::review
+    T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::done
+    T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::done
+    T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::done
+    T_BL40["T-BL40: Universal in-app elicitation UI — agents question the user inline (multiple choice, short answer, open-ended) via the interaction contract"]:::done
+    T_BL41["T-BL41: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations"]:::done
+    T_BL42["T-BL42: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable"]:::done
+    T_BL43["T-BL43: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch"]:::done
+    T_BL44["T-BL44: Sketch — spacebar orients the view normal to the active sketch plane"]:::done
+    T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::review
+    T_BL46["T-BL46: Sketch — larger drag dead zone / element-drag priority so repositioning/resizing elements doesn't instantly pan the view"]:::done
+    T_BL47["T-BL47: DXF import — C++ core mirror (reach GUI/MCP import_part end-to-end)"]:::done
+    T_BL48["T-BL48: Wire ui/imgui interactive sketcher entry — dispatch sketch enter/edit/exit so active sketch editing works (unblocks T-BL41/44/46)"]:::done
+    T_BL49["T-BL49: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)"]:::done
+    T_BL50["T-BL50: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims"]:::done
+    T_BL51["T-BL51: Associative Convert Entities — projected sketch references update when the source geometry changes"]:::todo
+    T_BL54["T-BL54: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe"]:::backlog
+    T_BL55["T-BL55: 3D sketcher P5 — advanced constraints + solver robustness"]:::backlog
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
@@ -245,6 +332,54 @@ graph TD
     T_S1["T-S1: Apply for vendor API keys"]:::todo
     T_S2["T-S2: Land the AI-experience lane (recon/GSL) uncommitted files"]:::done
   end
+  RE_00 --> RE_01
+  RE_01 --> RE_02
+  RE_00 --> RE_03
+  RE_00 --> RE_04
+  RE_00 --> RE_05
+  RE_00 --> RE_06
+  RE_00 --> RE_07
+  RE_00 --> RE_08
+  RE_01 --> RE_09
+  RE_06 --> RE_09
+  RE_09 --> RE_10
+  RE_09 --> RE_11
+  RE_06 --> RE_11
+  RE_06 --> RE_12
+  RE_01 --> RE_13
+  RE_13 --> RE_14
+  RE_01 --> RE_15
+  RE_06 --> RE_15
+  RE_01 --> RE_16
+  RE_02 --> RE_17
+  RE_09 --> RE_17
+  RE_11 --> RE_17
+  RE_13 --> RE_17
+  RE_15 --> RE_17
+  RE_00 --> RE_18
+  RE_03 --> RE_19
+  RE_07 --> RE_19
+  RE_08 --> RE_19
+  RE_00 --> RE_20
+  RE_03 --> RE_21
+  RE_17 --> RE_21
+  RE_28 --> RE_21
+  RE_03 --> RE_22
+  RE_16 --> RE_22
+  RE_02 --> RE_23
+  RE_17 --> RE_24
+  RE_14 --> RE_24
+  RE_20 --> RE_24
+  RE_05 --> RE_24
+  RE_17 --> RE_25
+  RE_15 --> RE_25
+  RE_06 --> RE_26
+  RE_11 --> RE_26
+  RE_12 --> RE_26
+  RE_19 --> RE_27
+  RE_21 --> RE_27
+  RE_22 --> RE_27
+  RE_00 --> RE_28
   T_S1 --> T_A1
   T_A1 --> T_A2
   T_A2 --> T_A3
@@ -262,10 +397,17 @@ graph TD
   T_H3 --> T_BL09
   T_H4 --> T_BL09
   T_A4 --> T_BL09
+  T_BL16 --> T_BL16b
   T_G15 --> T_BL29
   T_BL29 --> T_BL34
   T_BL48 --> T_BL44
   T_BL02 --> T_BL47
+  T_BL43 --> T_BL51
+  T_BL21 --> T_BL52
+  T_BL52 --> T_BL54
+  T_BL48 --> T_BL54
+  T_BL53 --> T_BL55
+  T_BL54 --> T_BL55
   T_C1 --> T_C2
   T_C2 --> T_C3
   T_C3 --> T_C4
@@ -275,6 +417,24 @@ graph TD
   T_D3 --> T_D4
   T_D4 --> T_D5
   T_B2 --> T_D5
+  T_DP2 --> T_DP10
+  T_DP3 --> T_DP10
+  T_DP4 --> T_DP10
+  T_DP8 --> T_DP10
+  T_DP6 --> T_DP11
+  T_DP9 --> T_DP12
+  T_DP1 --> T_DP14
+  T_R5 --> T_DP14
+  T_DP15 --> T_DP16
+  T_DP17 --> T_DP16
+  T_DP10 --> T_DP19
+  T_DP1 --> T_DP2
+  T_DP1 --> T_DP3
+  T_DP1 --> T_DP4
+  T_DP1 --> T_DP5
+  T_DP1 --> T_DP6
+  T_DP1 --> T_DP8
+  T_DP1 --> T_DP9
   T_INT --> T_E1
   T_E1 --> T_E2
   T_E2 --> T_E3
@@ -304,6 +464,8 @@ graph TD
   T_G19 --> T_G11
   T_G20 --> T_G11
   T_G21 --> T_G11
+  T_G23 --> T_G11
+  T_G25 --> T_G11
   T_G2 --> T_G12
   T_G7 --> T_G13
   T_G9 --> T_G14
@@ -315,6 +477,7 @@ graph TD
   T_G1 --> T_G2
   T_G9 --> T_G20
   T_G9 --> T_G21
+  T_G23 --> T_G25
   T_G2 --> T_G3
   T_G1 --> T_G4
   T_G1 --> T_G5
@@ -352,6 +515,8 @@ graph TD
   T_R5 --> T_R6
   T_R2 --> T_R7
   T_R4 --> T_R7
+  T_R7 --> T_R8
+  T_SIM1 --> T_SIM4
   T_G6 --> T_U1
   T_U1 --> T_U2
   T_P2 --> T_U2
@@ -390,16 +555,28 @@ graph TD
   T_W7 --> T_W25
   T_W25 --> T_W27
   T_W26 --> T_W27
+  T_G22 --> T_W28
+  T_W29 --> T_W31
+  T_W30 --> T_W31
+  T_W30 --> T_W32
   T_W3 --> T_W4
   T_W1 --> T_W5
   T_W1 --> T_W7
   T_W5 --> T_W8
   T_W4 --> T_W9
   T_W5 --> T_W9
+  T_WIN1 --> T_WIN2
   T_X1 --> T_X2
   T_X2 --> T_X3
   T_X2 --> T_X4
   T_X1 --> T_X5
   T_X3 --> T_X6
   T_X4 --> T_X6
+  T_X2 --> T_X7
+  T_X3 --> T_X7
+  T_X7 --> T_X7b
+  T_X1 --> T_X8
+  T_X5 --> T_X8
+  T_X7 --> T_X9
+  T_X8 --> T_X9
 ```

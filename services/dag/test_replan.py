@@ -300,6 +300,9 @@ def _template_path(name: str) -> _Path:
     "design_simulate_iterate.json",
     "ecad_firmware_emulate.json",
     "model_cam_post_cost.json",
+    "reveng_scan.json",
+    "reveng_datasheet.json",
+    "reveng_single_photo.json",
 ])
 def test_template_passes_validate_graph(template_file):
     path = _template_path(template_file)
@@ -313,6 +316,9 @@ def test_template_passes_validate_graph(template_file):
     "design_simulate_iterate.json",
     "ecad_firmware_emulate.json",
     "model_cam_post_cost.json",
+    "reveng_scan.json",
+    "reveng_datasheet.json",
+    "reveng_single_photo.json",
 ])
 def test_template_all_nodes_have_end_condition(template_file):
     """T-F12 style enforcement: all template nodes must declare end_condition."""
@@ -329,6 +335,9 @@ def test_template_all_nodes_have_end_condition(template_file):
     "design_simulate_iterate.json",
     "ecad_firmware_emulate.json",
     "model_cam_post_cost.json",
+    "reveng_scan.json",
+    "reveng_datasheet.json",
+    "reveng_single_photo.json",
 ])
 def test_template_has_at_least_one_back_edge(template_file):
     """Templates must have at least one retry back-edge (bounded retry semantics)."""

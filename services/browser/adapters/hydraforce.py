@@ -15,10 +15,11 @@ from __future__ import annotations
 import re
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope, register
+from . import download_dir, distributor_only, is_login_wall, provenance_envelope, register
 
 SITE = "hydraforce"
 BASE_URL = "https://www.hydraforce.com"
+DISTRIBUTORS_URL = "https://www.hydraforce.com/distributors/"  # sells via distributors, no account
 SEARCH_URL_TMPL = BASE_URL + "/en/us/search?q={query}"
 LICENSE_NOTE = (
     "HydraForce CAD models and datasheets are fetched under the user's own "
@@ -54,7 +55,7 @@ class HydraForceAdapter:
             return [result]
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+            return [distributor_only(SITE, url, distributors_url=DISTRIBUTORS_URL)]
         hits = []
         for m in _RESULT_RE.finditer(content):
             card = m.group("title")
@@ -77,7 +78,7 @@ class HydraForceAdapter:
             return page
         content = page.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
+            return distributor_only(SITE, url, distributors_url=DISTRIBUTORS_URL)
 
         match = _DOWNLOAD_RE.search(content)
         if not match:

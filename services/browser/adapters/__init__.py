@@ -68,8 +68,6 @@ _LOGIN_WIZARD_SITES: frozenset[str] = frozenset({
     # Wave 3/4 CAD-download-behind-login sites (STEP/IGES/symbol libs behind a
     # free account). Commerce/datasheet + open sources (freecadlibrary, gbstandards,
     # the datasheet DBs, materials/composites storefronts) are intentionally absent.
-    "boschrexroth",
-    "hydraforce",
     "parker",
     "ultralibrarian",
     "componentsearchengine",
@@ -78,9 +76,20 @@ _LOGIN_WIZARD_SITES: frozenset[str] = frozenset({
     "orientalmotor",
     "anaheimautomation",
     "thk",
-    "hiwin",
     "thomson",
     "igus",
+})
+
+# Distributor-only manufacturers: they publish CAD/datasheets but sell exclusively
+# through distributors and have NO individual customer accounts. Offering a "Sign
+# in" here is a dead end (confirmed by the user for all three). They are kept OUT of
+# _LOGIN_WIZARD_SITES so the wizard never proposes a login; if a fetch hits a wall,
+# the adapter returns :func:`distributor_only` (an informational result, not a login
+# prompt). CAD/datasheet fetches that are publicly reachable still proceed normally.
+_DISTRIBUTOR_ONLY_SITES: frozenset[str] = frozenset({
+    "boschrexroth",   # B2B only — no individual purchase
+    "hydraforce",     # sells through distributors
+    "hiwin",          # sells through distributors
 })
 
 
@@ -122,6 +131,26 @@ def login_required(site: str, url: str) -> dict:
         "proposal": f"Open a browser window for you to log into {site}.",
     }
     return {"ok": False, "reason": "login_required", "hint": question["prompt"], "ask_user": question}
+
+
+def distributor_only(site: str, url: str, *, distributors_url: str | None = None) -> dict:
+    """Honest degradation for manufacturers that sell ONLY through distributors and
+    have no individual customer accounts. Unlike :func:`login_required`, this offers
+    NO sign-in (there is nothing to sign into) — it's an informational envelope so a
+    caller can point the user at the distributor locator instead of a dead-end login
+    window. ``ask_user`` is omitted deliberately: no approval to collect."""
+    return {
+        "ok": False,
+        "reason": "distributor_only",
+        "hint": f"{site} sells through distributors — no individual account to sign into.",
+        "distributors_url": distributors_url,
+        "source_url": url,
+    }
+
+
+def distributor_only_sites() -> list[str]:
+    """Registered adapters that are distributor-only (no customer login exists)."""
+    return [a.key for a in all_adapters() if a.key in _DISTRIBUTOR_ONLY_SITES]
 
 
 def terms_confirmation_required(site: str, url: str, terms_summary: str) -> dict:

@@ -11,12 +11,15 @@
 // (run_gui constructs one runner per call, so init-once semantics hold).
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 struct AppState;
+
+namespace render { class SplatRenderer; }
 
 namespace ui {
 
@@ -39,8 +42,11 @@ public:
     // EvaluateDialogs are now PER-DOCUMENT — the scenarios resolve them from st.propertyManager /
     // st.evaluateDialogs (re-seated on the doc they create), so they are no longer passed here. The
     // SimManager is likewise per-document (st.simManager), so the FEA scenario resolves it too.
-    explicit ScenarioRunner(ActivityPanel& activityPanel)
-        : activityPanel(activityPanel) {}
+    // Ctor + dtor are BOTH out-of-line: rsRenderer is a unique_ptr to an incomplete type
+    // (render::SplatRenderer), so the compiler-generated cleanup (which the inline ctor's
+    // exception path also needs) must be emitted where that type is complete (scenarios.cpp).
+    explicit ScenarioRunner(ActivityPanel& activityPanel);
+    ~ScenarioRunner();
 
     // Advance the active scenario's step machine (no-op when no AI_CAD_SHOT scenario mode
     // is active). Call once per frame, before ImGui::NewFrame().
@@ -123,6 +129,17 @@ private:
     int ipIndex = 0, ipPx = 128;
     std::string ipOutDir;
     std::vector<nlohmann::json> ipRecipes;
+
+    // ---------- RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat) ----------
+    // Load a canned Gaussian-splat .ply fixture and draw it as camera-facing billboards into the
+    // backbuffer (real render::SplatRenderer draw path), then capture. Self-contained: reads
+    // AI_CAD_SHOT itself, no doc/worker geometry needed. Proves the loader + GL draw don't crash.
+    void runRevengSplat(AppState& st);
+    bool rsInit = false, rsWant = false, rsDone = false;
+    int rsSettle = 0;
+    std::string rsSavePath, rsCapture;
+    bool rsDirReady = false, rsLoaded = false;
+    std::unique_ptr<render::SplatRenderer> rsRenderer;
 
     // ---------- C22b activity scenario (AI_CAD_SHOT=activity) ----------
     int actStep = 0, actSettle = 0, actWaitFrames = 0;

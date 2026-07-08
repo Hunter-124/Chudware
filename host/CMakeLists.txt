@@ -75,6 +75,7 @@ add_executable(AI-CAD
   src/render/aicm_loader.cpp
   src/render/id_pass.cpp
   src/render/overlays.cpp
+  src/render/splat_renderer.cpp  # RE-28: 3DGS splat renderer
   src/core/selection.cpp
   # --- end C15 ---
   # --- C16: feature tree + doc mirror ---
@@ -275,6 +276,22 @@ add_test(NAME test_dim_review_fsm
   COMMAND test_dim_review_fsm
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-22 ---
+
+# --- RE-28: 3DGS splat loader + depth-sort test (pure-CPU, no GL context) ---
+add_executable(test_splat_renderer
+  tests/test_splat_renderer.cpp
+  src/render/splat_renderer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c)  # glad fn-ptr globals (GL never invoked here)
+target_include_directories(test_splat_renderer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
+set_target_properties(test_splat_renderer PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_splat_renderer
+  COMMAND test_splat_renderer
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/splat_tiny.ply"
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end RE-28 ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD

@@ -21,6 +21,7 @@
 
 #include "../core/app_state.h"
 #include "../renderer.h"  // T-G15 iconpipe: transparent thumbnail render + FBO readback
+#include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
 #include "../core/jobs.h"  // launchAgentRunV2 (C22b activity scenario)
 #include "activity_panel.h"
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
@@ -987,6 +988,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
     runIconPipe(st);
 
+    // ---------- RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat) ----------
+    runRevengSplat(st);
+
     // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
     runWorkspaces(st);
 
@@ -1146,6 +1150,72 @@ void ScenarioRunner::runIconPipe(AppState& st) {
     st.iconPipeShotDone = true;  // frees the frame loop to exit (see app.cpp shotFrame gate)
     std::printf("iconpipe: complete — %d icon(s) written to %s\n", ipIndex, ipOutDir.c_str());
     std::fflush(stdout);
+}
+
+// Out-of-line ctor + dtor (rsRenderer is a unique_ptr to render::SplatRenderer, complete only here).
+ScenarioRunner::ScenarioRunner(ActivityPanel& activityPanel)
+    : activityPanel(activityPanel) {}
+ScenarioRunner::~ScenarioRunner() = default;
+
+// RE-28 3DGS splat scenario (AI_CAD_SHOT=reveng_splat). Self-contained, mirrors the appearance
+// scenario's self-reading single-capture shape (no AppState want-flag). Loads the canned gaussian
+// .ply fixture and draws it through the real render::SplatRenderer as camera-facing billboards into
+// the backbuffer, then captures once. Purpose: prove the loader + GL draw path don't crash. The
+// camera is built here (not from st.renderer) so the splats frame regardless of the empty document.
+void ScenarioRunner::runRevengSplat(AppState& st) {
+    if (!rsInit) {
+        rsInit = true;
+        const char* sm = std::getenv("AI_CAD_SHOT");
+        rsWant = st.shot && sm && std::strcmp(sm, "reveng_splat") == 0;
+    }
+    if (!(rsWant && st.workerStarted && !rsDone && st.frame >= 5)) return;
+    if (!rsDirReady) {
+        rsDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        rsSavePath = base + "/scratch/reveng_splat_shots";
+        std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
+        // Load the committed fixture (host/tests/fixtures/splat_tiny.ply, repo-relative).
+        rsRenderer = std::make_unique<render::SplatRenderer>();
+        std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
+        std::string err;
+        rsLoaded = rsRenderer->load(plyPath, err);
+        std::printf("reveng_splat: load %s ok=%d count=%zu%s%s\n", plyPath.c_str(),
+                    (int)rsLoaded, rsLoaded ? rsRenderer->count() : 0,
+                    rsLoaded ? "" : " err=", rsLoaded ? "" : err.c_str());
+        std::fflush(stdout);
+    }
+
+    // Draw the splats into the currently-bound (default) framebuffer over the full viewport.
+    if (rsRenderer && rsLoaded) {
+        GLint vp[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_VIEWPORT, vp);
+        int vw = vp[2] > 0 ? vp[2] : 1280, vh = vp[3] > 0 ? vp[3] : 720;
+        // Build a camera framing the fixture (centered ~z=7.5, spanning z in [-5,20]).
+        Vec3 center{0.0f, 0.0f, 7.5f};
+        Vec3 eye{25.0f, 20.0f, 40.0f};
+        Vec3 up{0.0f, 0.0f, 1.0f};
+        float aspect = vh > 0 ? (float)vw / (float)vh : 1.0f;
+        Mat4 proj = perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
+        Mat4 view = lookAt(eye, center, up);
+        Renderer::CameraXform cam;
+        cam.mvp = mul(proj, view);
+        cam.eye = eye;
+        cam.center = center;
+        cam.radius = 20.0f;
+        cam.ssWidth = vw; cam.ssHeight = vh;
+        rsRenderer->draw(cam);  // real SplatRenderer GL draw path (billboards + back-to-front blend)
+    }
+
+    // Single capture after a couple of settle frames.
+    const int kSettle = 3;
+    if (rsSettle == 0 && rsCapture.empty()) { rsSettle = kSettle; return; }
+    if (rsSettle > 0) { --rsSettle; return; }
+    if (rsCapture.empty()) {
+        rsCapture = rsSavePath + "/reveng_splat_01.png";
+        std::printf("reveng_splat: capturing %s\n", rsCapture.c_str());
+        std::fflush(stdout);
+    }
 }
 
 // Appearance scenario (AI_CAD_SHOT=appearance). Same frame-driven step machine + kSettle
@@ -1829,6 +1899,21 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         glfwSwapBuffers(st.win);
         return apDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
+    // RE-28 reveng_splat scenario: single backbuffer capture (mirrored to --ui-screenshot target).
+    if (rsWant) {
+        ++st.frame;
+        if (!rsCapture.empty()) {
+            std::error_code ec; std::filesystem::create_directories(rsSavePath, ec);
+            writeBackbufferPng(rsCapture.c_str(), dw, dh, screenshotPath);
+            std::printf("reveng_splat screenshot -> %s (%dx%d)\n", rsCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            rsCapture.clear();
+            rsDone = true;
+        }
+        glfwSwapBuffers(st.win);
+        return rsDone ? FrameAction::Break : FrameAction::Continue;
     }
 
     // multidoc scenario: identical per-step capture mechanism. Wait for any async worker call

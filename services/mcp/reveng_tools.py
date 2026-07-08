@@ -1147,6 +1147,250 @@ def register_reveng_tools(mcp: FastMCP) -> None:
     # ── RE-29: web / part-number research lane ─────────────────────────────
     # RE-ANCHOR — additive insertion point for research-lane tools
 
+    # ── RE-33: one-call "make un-modeled part" orchestrator ────────────────
+
+    @mcp.tool()
+    def reveng_make_part_from_library(
+        part_ref: str,
+        part_number: Optional[str] = None,
+        query: Optional[str] = None,
+        auto_confirm_non_critical: bool = True,
+    ) -> str:
+        """One-call flow: seed → research → build → attach for a library part with no 3D model.
+
+        Composes the existing RE building blocks into a single backend call that
+        the GUI (RE-32) can trigger with one click:
+
+        1. ``reveng_start_session(part_ref=...)``  — seed from parts-hub entry
+        2. ``reveng_research_source(...)``          — pull specs / datasheet / images
+        3. Launch ``reveng_datasheet`` mission      — build parametric via mission runner
+        4. ``reveng_attach_result(...)``            — register model so ``part_place`` works
+
+        Honesty rules (contracts/reveng.md §0):
+        - Fit-critical dims still route through ``confirm_dimensions`` (intake ledger).
+          When unresolved the function returns ``pending_dims`` and leaves the session
+          resumable — it NEVER fabricates dimensions.
+        - Offline / tools-absent → honest ``{ok: false, reason, hint}`` envelope.
+        - ``auto_confirm_non_critical=True`` (default) auto-accepts clearly non-critical
+          dims (cosmetic / reference dims flagged by the mission); fit-critical dims are
+          always left for human confirmation regardless.
+
+        Args:
+            part_ref:                  Parts-hub ``part_id`` of the un-modeled entry.
+            part_number:               Manufacturer part number for the research lane.
+            query:                     Free-text fallback search (used when no MPN).
+            auto_confirm_non_critical: Pass through to mission; does NOT affect
+                                       fit-critical dim gates.
+
+        Returns
+        -------
+        ``{ok, session_id, part_ref, model_present, pending_dims?}``
+
+        ``ok=True, model_present=True``      — full pipeline succeeded; ``part_place`` works.
+        ``ok=True, model_present=False,      — mission ran but fit-critical dims are
+          pending_dims=[...]}``                unresolved; session is resumable.
+        ``{ok: false, reason, hint}``        — offline or tools absent; no traceback.
+        """
+        try:
+            # ── 1. Seed session from parts-hub entry ──────────────────────────
+            sid = _new_session_id()
+            label = f"RE {part_ref}"
+            session = _make_session(sid, label, part_ref)
+            _save_session(session)
+
+            # Best-effort: copy photos / datasheet from the parts-hub record
+            seeded: dict = {}
+            try:
+                from engine_oracle.parts_hub import get as _hub_get  # noqa: PLC0415
+                record = _hub_get(part_ref)
+                if record:
+                    meta = record.get("metadata") or {}
+                    photos = meta.get("photos") or []
+                    datasheet = meta.get("datasheet")
+                    if photos or datasheet:
+                        sess_dir = _session_path(sid)
+                        if photos:
+                            images_dir = sess_dir / "images"
+                            images_dir.mkdir(parents=True, exist_ok=True)
+                            import shutil as _sh  # noqa: PLC0415
+                            for p in photos:
+                                src = _Path(p).expanduser()
+                                if src.is_file():
+                                    _sh.copy2(str(src), str(images_dir / src.name))
+                                    seeded.setdefault("images", 0)
+                                    seeded["images"] += 1
+                            if seeded.get("images"):
+                                session["artifacts"]["images"] = seeded["images"]
+                                session["stages"]["capture"] = "done"
+                        if datasheet:
+                            ds_dir = sess_dir / "datasheet"
+                            ds_dir.mkdir(parents=True, exist_ok=True)
+                            src = _Path(datasheet).expanduser()
+                            if src.is_file():
+                                import shutil as _sh2  # noqa: PLC0415
+                                _sh2.copy2(str(src), str(ds_dir / src.name))
+                                seeded["datasheet"] = str(ds_dir / src.name)
+                        if seeded:
+                            session["provenance"].append({
+                                "step": "seeded_from_parts_hub",
+                                "part_ref": part_ref,
+                                "seeded": seeded,
+                                "ts": _now_iso(),
+                            })
+                            _save_session(session)
+            except Exception:
+                pass  # seeding is best-effort; never block flow
+
+            # ── 2. Research: pull specs / datasheet / images from internet ────
+            research_result: dict = {}
+            if part_number or query:
+                research_result = _research_ingest(
+                    session_id=sid,
+                    part_number=part_number,
+                    query=query,
+                )
+                if not research_result.get("ok"):
+                    # Offline or tools absent — honest envelope, leave session for retry
+                    return _dumps({
+                        "ok": False,
+                        "reason": research_result.get("reason", "research_failed"),
+                        "hint": research_result.get(
+                            "hint",
+                            "Check network connectivity or supply a local datasheet path.",
+                        ),
+                        "session_id": sid,
+                        "part_ref": part_ref,
+                    })
+                # Record provenance
+                s = _load_session(sid)
+                if s is not None:
+                    s.setdefault("provenance", []).append({
+                        "step": "research_source",
+                        "part_number": part_number,
+                        "query": query,
+                        "candidate_mpns": research_result.get("candidate_mpns", []),
+                        "sources_count": len(research_result.get("sources", [])),
+                        "ts": _now_iso(),
+                    })
+                    s.setdefault("stages", {})["datasheet"] = "done"
+                    _save_session(s)
+
+            # ── 3. Launch reveng_datasheet mission ────────────────────────────
+            #
+            # The mission DAG runs: ingest → MPN fast-path → dimension_confirm gate
+            # → model → deliver.  Fit-critical dim gates are declared autonomy:"approve"
+            # in the template; they PAUSE the run and surface pending_dims to the caller.
+            # Non-critical dims are auto-confirmed when auto_confirm_non_critical=True.
+            #
+            # When the dense/mesh backend is not provisioned the mission runner
+            # returns a descriptive result (not an exception); we surface it honestly.
+            mission_result: dict = {}
+            try:
+                mission_result = _launch_reveng_mission(
+                    sid,
+                    "reveng_datasheet",
+                    _DATASHEET_NODE_STAGE,
+                    autonomy_default="auto" if auto_confirm_non_critical else "approve",
+                )
+            except Exception as e:  # noqa: BLE001
+                # Mission runner absent (test env without DAG executor)
+                mission_result = {
+                    "ok": False,
+                    "reason": "mission_runner_unavailable",
+                    "hint": str(e),
+                }
+
+            # ── Detect pending fit-critical dims ──────────────────────────────
+            pending_dims = mission_result.get("pending_dims") or []
+            interrupted = mission_result.get("interrupted") or (
+                mission_result.get("status") == "interrupted"
+            )
+
+            if interrupted or pending_dims:
+                # Return resumable result — do NOT attach; caller must confirm dims first
+                return _dumps({
+                    "ok": True,
+                    "session_id": sid,
+                    "part_ref": part_ref,
+                    "model_present": False,
+                    "pending_dims": pending_dims,
+                    "hint": (
+                        "Fit-critical dimensions require confirmation. "
+                        "Resolve via confirm_dimensions then call reveng_attach_result."
+                    ),
+                    "mission_status": mission_result.get("status"),
+                })
+
+            if not mission_result.get("ok", True):
+                # Mission failed for a non-dim reason (backend not provisioned, etc.)
+                return _dumps({
+                    "ok": False,
+                    "reason": mission_result.get("reason", "mission_failed"),
+                    "hint": mission_result.get("hint", ""),
+                    "session_id": sid,
+                    "part_ref": part_ref,
+                    "model_present": False,
+                })
+
+            # ── 4. Attach result → register in parts-hub ─────────────────────
+            s2 = _load_session(sid)
+            if s2 is None:
+                return _dumps({
+                    "ok": False,
+                    "reason": f"session {sid!r} disappeared after mission",
+                    "session_id": sid,
+                    "part_ref": part_ref,
+                })
+
+            s2["part_ref"] = part_ref
+            s2["provenance"].append({
+                "step": "attach_result",
+                "part_ref": part_ref,
+                "ts": _now_iso(),
+            })
+            _save_session(s2)
+
+            artifacts = s2.get("artifacts", {})
+            doc_id = artifacts.get("doc_id")
+            mesh_path = artifacts.get("mesh_path")
+            geometry_ref = doc_id or mesh_path
+
+            # Write sidecar so RevengResultAdapter can serve this PartRecord
+            sidecar = {
+                "schema": "aicad.reveng_result/1",
+                "session_id": sid,
+                "part_ref": part_ref,
+                "name": s2.get("name", part_ref),
+                "doc_id": doc_id,
+                "mesh_path": mesh_path,
+                "attached_at": _now_iso(),
+            }
+            sidecar_path = _session_path(sid) / "reveng_result.json"
+            sidecar_path.write_text(_json.dumps(sidecar, indent=2))
+
+            # Register live adapter into parts-hub singleton (idempotent)
+            try:
+                from engine_oracle.parts_hub import register_provider as _reg_provider  # noqa: PLC0415
+                from engine_oracle.parts_hub.adapters.reveng_result_adapter import (  # noqa: PLC0415
+                    RevengResultAdapter,
+                )
+                _reg_provider(RevengResultAdapter())
+            except Exception:
+                pass  # best-effort
+
+            model_present = bool(geometry_ref)
+            return _dumps({
+                "ok": True,
+                "session_id": sid,
+                "part_ref": part_ref,
+                "model_present": model_present,
+                "geometry_ref": geometry_ref,
+                "research_mpns": research_result.get("candidate_mpns", []),
+            })
+
+        except Exception as e:
+            return _err(e)
+
     @mcp.tool()
     def reveng_research_source(
         session_id: str,

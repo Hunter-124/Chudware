@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -184,20 +185,31 @@ void fmRowStripeReset() {
     // below read g_fmPal — without this they'd render with a stale (or first-frame zero) palette.
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &fmSurf() : nullptr);
 }
-FmRowRect fmRowPill(bool selected) {
+FmRowRect fmRowPill(bool selected, const float* tint) {
     // polish(G2): 6dp horizontal gives icons breathing room from the left edge; 4dp vertical gives
     // text more vertical breathing without making rows too tall.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                         ImVec2(6.0f * ui::uiScale, 4.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
+    const float S = ui::uiScale;
     const float rowH = ImGui::GetFrameHeight();
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
     float availW = ImGui::GetContentRegionAvail().x;
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Frosted glass base + alternating stripe ONLY — selection is now the glow border below (never
+    // the old blue accent card/vertical bar), so it composites correctly over the color wash too.
     const float wash = selected ? 0.42f : 0.26f;
-    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 3.5f,
-                           (s_fmStripeIdx++ % 2) == 0, selected, wash);
+    ui::glassRowBackground(dl, rowMin, rowMax, 3.5f, (s_fmStripeIdx++ % 2) == 0, false, wash);
+    // Layers-style color wash, bounded to the inset pill: a section/element `tint` when supplied,
+    // else the neutral app accent so every row shares the same tinted-background language. Glow
+    // border marks selection, dyed the same color.
+    const float* eff = tint ? tint : ui::palette.accent;   // accent is float[4]; wash reads [0..2]
+    const float strength = tint ? (selected ? 0.34f : 0.20f) : (selected ? 0.22f : 0.11f);
+    // Same outer rect as the frosted base — coloredRowWash self-insets by the identical 2dp, so the
+    // two stay perfectly concentric (no early-ending corner seam).
+    ui::coloredRowWash(dl, rowMin, rowMax, 3.5f, eff, strength, selected);
     return {rowMin, rowMax};
 }
 void fmRowPillEnd(const FmRowRect& r, bool selected) {
@@ -444,6 +456,68 @@ void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback
     treeIconInArrowSlot(rowPos, name, fallback, alpha);
 }
 void fmSectionDivider(const char* label) { treeSectionDivider(label); }
+
+// Collapsible section header — the same centered-label + hairline look as treeSectionDivider, but the
+// WHOLE row is a toggle and an end-of-line chevron shows the open/closed state (mirrors the PCB
+// Manager "Add copper layer" affordance: a control pinned at the right edge with the right hairline
+// cut short to clear it). Toggles *open; returns *open. `rightClicked`, if given, reports a
+// right-click on the row so the caller can raise a context menu (e.g. the filename's Appearance...).
+bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked) {
+    const auto& pal = fmPalette();
+    const float S = ui::uiScale;
+    const float chev = 18.0f * S;                     // end-of-line chevron hit box
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float  w = ImGui::GetContentRegionAvail().x;
+    float  lineH = ImGui::GetTextLineHeight();
+    const float rowH = std::max(lineH + 4.0f * S, chev + 2.0f * S);
+    ImVec2 tsz = ImGui::CalcTextSize(label);
+    float  textX = p.x + (w - tsz.x) * 0.5f;
+    float  textY = p.y + (rowH - lineH) * 0.5f;
+    float  cy = p.y + rowH * 0.5f;
+    const float chevX = p.x + w - chev;
+    const float rightLineEnd = chevX - 8.0f * S;      // cut the right hairline short of the chevron
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Full-row invisible toggle FIRST so the label/hairlines/chevron paint on top of its hit rect.
+    ImGui::PushID(label);
+    ImGui::SetCursorScreenPos(p);
+    const bool clicked = ImGui::InvisibleButton("##sec_toggle", ImVec2(w, rowH));
+    const bool hov = ImGui::IsItemHovered();
+    if (clicked) *open = !*open;
+    if (rightClicked) *rightClicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+    if (hov)   // faint wash to signal the whole row is interactive
+        ui::glassRowBackground(dl, p, ImVec2(p.x + w, p.y + rowH), 3.0f, false, false, 0.16f);
+
+    ImU32 lineCol = ui::Palette::toU32(pal.border);
+    if (textX > p.x + 4.0f * S) {
+        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy),
+                    lineCol, std::max(1.0f, 1.0f * S));
+        const float rStart = textX + tsz.x + 6.0f * S;
+        if (rStart < rightLineEnd)
+            dl->AddLine(ImVec2(rStart, cy), ImVec2(rightLineEnd, cy), lineCol,
+                        std::max(1.0f, 1.0f * S));
+    }
+    dl->AddText(ImVec2(textX, textY),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(pal.treeSection[0], pal.treeSection[1],
+                                                      pal.treeSection[2], pal.treeSection[3])),
+                label);
+
+    // Chevron: pointing down when open, right when closed. Hand-drawn filled triangle.
+    const ImVec2 cc(chevX + chev * 0.5f, cy);
+    const float a = chev * 0.24f;
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary);
+    if (*open)
+        dl->AddTriangleFilled(ImVec2(cc.x - a, cc.y - a * 0.6f), ImVec2(cc.x + a, cc.y - a * 0.6f),
+                              ImVec2(cc.x, cc.y + a * 0.7f), ink);
+    else
+        dl->AddTriangleFilled(ImVec2(cc.x - a * 0.6f, cc.y - a), ImVec2(cc.x - a * 0.6f, cc.y + a),
+                              ImVec2(cc.x + a * 0.7f, cc.y), ink);
+    ImGui::PopID();
+
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
+    ImGui::Dummy(ImVec2(w, rowH));
+    return *open;
+}
 
 // Section divider carrying a small square "+" button pinned at the right edge. The right hairline is
 // cut short so it stops before the button (leaving a clean gap) instead of running under it. Returns
@@ -1483,6 +1557,11 @@ static ImU32 categoryColor(const std::string& type, bool isCut) {
         return IM_COL32(175, 120, 205, 190);  // soft purple (multi-body boolean)
     return IM_COL32(120, 130, 148, 140);      // grey (unknown)
 }
+// RGB (0..1) view of categoryColor for the coloredRowWash tint. Alpha is ignored (the wash owns it).
+static void categoryColorRGB(const std::string& type, bool isCut, float out[3]) {
+    ImVec4 c = ImGui::ColorConvertU32ToFloat4(categoryColor(type, isCut));
+    out[0] = c.x; out[1] = c.y; out[2] = c.z;
+}
 
 // ---- C20b: assembly tree (components + Mates folder) ----
 // Renders an aicad.asm/1 doc: each component as a "(f)"-fixed-marked row (SolidWorks), then a
@@ -1928,6 +2007,134 @@ static void doOpenDoc(AppState& st) {
     }
 }
 
+// Features section header — centered "Features" label + hairlines, the collapse chevron pinned at
+// the far right, and TWO small right-aligned icon buttons (Add Folder, then Name & group) sitting
+// just left of the chevron. They carry 2x a single button's right-indent (two buttons) mirroring the
+// chevron's own inset, per Hunter's spec. Returns the (possibly toggled) open state; sets
+// *addFolder / *nameGroup on the frame their button is clicked. addEn/ngEn gray the buttons out.
+static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder, bool* nameGroup) {
+    const auto& pal = fmPalette();
+    const float S = ui::uiScale;
+    const float chev = 18.0f * S;
+    const float btn = 18.0f * S;
+    const float bgap = 3.0f * S;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float rowH = std::max(lineH + 4.0f * S, chev + 2.0f * S);
+    const ImVec2 tsz = ImGui::CalcTextSize("Features");
+    const float cy = p.y + rowH * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ImGui::PushID("fm_features_hdr");
+    // Whole-row collapse toggle FIRST; the two buttons + chevron are submitted on top and consume
+    // their own clicks (SetNextItemAllowOverlap lets the later items receive them).
+    ImGui::SetCursorScreenPos(p);
+    ImGui::SetNextItemAllowOverlap();
+    const bool rowClicked = ImGui::InvisibleButton("##feat_toggle", ImVec2(w, rowH));
+    const bool rowHov = ImGui::IsItemHovered();
+    if (rowClicked) *open = !*open;
+    if (rowHov) ui::glassRowBackground(dl, p, ImVec2(p.x + w, p.y + rowH), 3.0f, false, false, 0.16f);
+
+    // Right-edge controls: [Add Folder][Name & group] then the collapse chevron.
+    const float chevX = p.x + w - chev;
+    const float ngX = chevX - bgap - btn;
+    const float addX = ngX - bgap - btn;
+
+    // Centered label + hairlines (right hairline stops before the button cluster).
+    const float textX = p.x + (w - tsz.x) * 0.5f;
+    const float textY = p.y + (rowH - lineH) * 0.5f;
+    const ImU32 lineCol = ui::Palette::toU32(pal.border);
+    if (textX > p.x + 4.0f * S) {
+        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy), lineCol, std::max(1.0f, 1.0f * S));
+        const float rStart = textX + tsz.x + 6.0f * S;
+        const float rEnd = addX - 8.0f * S;
+        if (rStart < rEnd) dl->AddLine(ImVec2(rStart, cy), ImVec2(rEnd, cy), lineCol, std::max(1.0f, 1.0f * S));
+    }
+    dl->AddText(ImVec2(textX, textY),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(pal.treeSection[0], pal.treeSection[1],
+                                                      pal.treeSection[2], pal.treeSection[3])),
+                "Features");
+
+    // Small glass-pill icon button helper (drawn atop the row toggle).
+    auto iconBtn = [&](float x, const char* iconName, bool enabled, const char* tip) -> bool {
+        const ImVec2 bMin(x, p.y + (rowH - btn) * 0.5f), bMax(bMin.x + btn, bMin.y + btn);
+        ImGui::SetCursorScreenPos(bMin);
+        ImGui::SetNextItemAllowOverlap();
+        const bool clicked = enabled && ImGui::InvisibleButton(iconName, ImVec2(btn, btn));
+        const bool hov = enabled && ImGui::IsItemHovered();
+        if (hov) ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, 0.40f);
+        const ImVec2 bc((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
+        const ImU32 col = enabled ? ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary)
+                                  : ImGui::ColorConvertFloat4ToU32(ImVec4(0.55f, 0.55f, 0.55f, 0.5f));
+        ui::drawIconGlass(dl, iconName, bc, btn * 0.42f, col, fmHalo(fmSurf()));
+        if (hov && tip) ImGui::SetTooltip("%s", tip);
+        return clicked;
+    };
+    if (addFolder)
+        *addFolder = iconBtn(addX, "folder_new", addEn, "Add Folder\n(group the selected features)");
+    if (nameGroup)
+        *nameGroup = iconBtn(ngX, "name_group_features", ngEn,
+                             "Name & group features\n(auto-name every feature and sort into folders)");
+
+    // Collapse chevron (down = open, right = closed).
+    const ImVec2 cc(chevX + chev * 0.5f, cy);
+    const float a = chev * 0.24f;
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary);
+    if (*open)
+        dl->AddTriangleFilled(ImVec2(cc.x - a, cc.y - a * 0.6f), ImVec2(cc.x + a, cc.y - a * 0.6f),
+                              ImVec2(cc.x, cc.y + a * 0.7f), ink);
+    else
+        dl->AddTriangleFilled(ImVec2(cc.x - a * 0.6f, cc.y - a), ImVec2(cc.x - a * 0.6f, cc.y + a),
+                              ImVec2(cc.x + a * 0.7f, cc.y), ink);
+    ImGui::PopID();
+
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
+    ImGui::Dummy(ImVec2(w, rowH));
+    return *open;
+}
+
+// Group the currently-selected feature(s) into a new folder. Folder is a display-only tag (set_folder
+// op), so a CONTIGUOUS selection becomes one folder block at the first selected feature's position
+// with zero reordering — geometry is never touched. (Non-contiguous grouping that would need a
+// history reorder is gated behind a geometry-invariance check, added separately.)
+static void createFolderFromSelection(AppState& st) {
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return;
+    auto feat = tree.find("features");
+    if (feat == tree.end() || !feat->is_array()) return;
+
+    // Selected fids = primary + multi-select, kept in history (array) order.
+    std::unordered_set<std::string> sel = s_multiSel;
+    if (!st.selectedFeatureId.empty()) sel.insert(st.selectedFeatureId);
+
+    std::vector<std::string> members;
+    std::unordered_set<std::string> existingFolders;
+    for (const auto& f : *feat) {
+        if (!f.is_object()) continue;
+        const std::string fid = jfld(f, "id");
+        const std::string fl = jfld(f, "folder");
+        if (!fl.empty()) existingFolders.insert(fl);
+        if (sel.count(fid)) members.push_back(fid);
+    }
+    if (members.empty()) {
+        st.toast(ui::ToastLevel::Info, "Select one or more features to add to a folder");
+        return;
+    }
+    // Unique "Folder<N>" name.
+    std::string name;
+    for (int n = 1;; ++n) {
+        name = "Folder" + std::to_string(n);
+        if (!existingFolders.count(name)) break;
+    }
+    nlohmann::json ops = nlohmann::json::array();
+    for (const auto& fid : members)
+        ops.push_back({{"op", "set_folder"}, {"id", fid}, {"folder", name}});
+    applyTreeOps(st, ops, "add folder");
+    st.addLog("[tree] grouped " + std::to_string(members.size()) + " feature(s) into " + name);
+}
+
+
 // ---- "Name & group" — SolidWorks-style auto-naming + folder grouping ----
 // Renames every feature to a conventional per-type name ("Boss-Extrude1", "Fillet2", ...) and
 // sorts dress-up / pattern / reference / sketch features into folders. One batched op set, one
@@ -2080,6 +2287,21 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     // glassRowAtCursor is draw-only and does not advance the layout cursor. Without an explicit
     // row reservation the full-width filter InputText below was placed at the same Y and stole
     // clicks from undo/redo (and the rest of the toolbar).
+    // "Name & group" sits inline in the toolbar (between Save and Undo). It only applies to a part
+    // doc that actually has features; computed up here so the toolbar width/centering is stable.
+    bool isPart = st.docMirror.hasDoc() &&
+                  jfld(st.docMirror.tree(), "schema") != "aicad.asm/1";
+    int featCount = 0;
+    if (isPart) {
+        const nlohmann::json& tr = st.docMirror.tree();
+        auto fa = tr.find("features");
+        if (fa != tr.end() && fa->is_array()) featCount = (int)fa->size();
+    }
+    const bool canNameGroup = canDoc && isPart && featCount > 0;
+
+    // Name & group moved OUT of this toolbar down to the Features section header (fmFeaturesHeader),
+    // so the toolbar is now 6 buttons (new / new-asm / open / save / undo / redo).
+    (void)canNameGroup;
     const float bw = 24.0f * S, gap = 2.0f * S, nBtns = 6.0f;
     const float toolW = nBtns * bw + (nBtns - 1) * gap;
     ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
@@ -2135,38 +2357,6 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
     ImGui::Dummy(ImVec2(availW, 0));
 
-    // --- "Name & group" — auto-name features SolidWorks-style and sort into folders. ---
-    // Shown only for a part doc that actually has features (not assemblies / empty docs).
-    bool isPart = st.docMirror.hasDoc() &&
-                  jfld(st.docMirror.tree(), "schema") != "aicad.asm/1";
-    int featCount = 0;
-    if (isPart) {
-        const nlohmann::json& tr = st.docMirror.tree();
-        auto fa = tr.find("features");
-        if (fa != tr.end() && fa->is_array()) featCount = (int)fa->size();
-    }
-    if (isPart && featCount > 0) {
-        ImGui::Spacing();
-        bool can = canDoc;
-        if (!can) ImGui::BeginDisabled();
-        {
-            const float rowH = ImGui::GetFrameHeight();
-            ImVec2 rowMin = ImGui::GetCursorScreenPos();
-            float rowW = ImGui::GetContentRegionAvail().x;
-            ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin,
-                                   ImVec2(rowMin.x + rowW, rowMin.y + rowH),
-                                   3.5f, true, false, 0.28f);
-        }
-        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
-        if (ImGui::Button("Name & group features", ImVec2(-1, 0)) && can)
-            nameAndGroupFeatures(st);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Auto-name every feature (Boss-Extrude1, Fillet2, ...) and\n"
-                              "group dress-up / patterns / reference geometry into folders.");
-        if (!can) ImGui::EndDisabled();
-    }
-
     ImGui::Spacing();
     {
         const float filterH = ImGui::GetFrameHeight();
@@ -2218,18 +2408,18 @@ void drawFeatureTreeBody(AppState& st,
     // is gated on this so no op fires while an agent run is in flight.
     bool canDocTree = st.workerStarted && !st.job.running.load();
 
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(pal.text[0], pal.text[1], pal.text[2], pal.text[3]));
     {
-        ImGuiTreeNodeFlags rootFlags =
-            ImGuiTreeNodeFlags_DefaultOpen |
-            ImGuiTreeNodeFlags_SpanFullWidth |
-            ImGuiTreeNodeFlags_FramePadding;   // pill-height node (red-pen round-2)
-        FmRowRect rootRect = fmRowPill();
-        bool rootOpen = ImGui::TreeNodeEx(docName.c_str(), rootFlags);
-        fmRowPillEnd(rootRect);
+        // Filename / References / Features are three INDEPENDENT collapsible sections (Hunter):
+        // collapsing the filename hides only its equations/material/solid-bodies, leaving the
+        // References and Features sections in place. All three use the same section-header look.
+        const float kSecIndent = 8.0f * ui::uiScale;
+        static bool s_fileSecOpen = true;
+        static bool s_refSecOpen  = true;
+        static bool s_featSecOpen = true;
+        bool fileRightClicked = false;
+        fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
 
-        // C26: root-row "Appearance…" — sets the primary body's color (the common single-body
+        // C26: filename "Appearance…" — sets the primary body's color (the common single-body
         // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).
         // Routed through the DEFERRED applyTreeOps queue, like every other tree-originated op.
         {
@@ -2238,8 +2428,9 @@ void drawFeatureTreeBody(AppState& st,
             static float s_rootMetallic = 0.0f, s_rootRoughness = 0.5f;  // C32-A material
             static bool  s_openRootPicker = false;
             if (!isAsmDoc && st.docMirror.hasDoc()) {
+                if (fileRightClicked) ImGui::OpenPopup("##root_ctx");
                 pushTreePopupGlass();
-                if (ImGui::BeginPopupContextItem("##root_ctx")) {
+                if (ImGui::BeginPopup("##root_ctx")) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
                         s_rootMetallic = 0.0f; s_rootRoughness = 0.5f;
@@ -2269,8 +2460,8 @@ void drawFeatureTreeBody(AppState& st,
             }
         }
 
-        if (rootOpen) {
-            ImGui::PopStyleColor();  // text color
+        if (s_fileSecOpen) {
+            ImGui::Indent(kSecIndent);   // nest equations/material/bodies under the filename header
 
             // ---- fixed header nodes ----
             // Equations
@@ -2472,8 +2663,14 @@ void drawFeatureTreeBody(AppState& st,
                     }
                 }
             }
-            // Section rule: reference geometry (Origin + planes) follows.
-            treeSectionDivider("Reference");
+            ImGui::Unindent(kSecIndent);
+        }   // end filename section
+
+        // ---- References section (Origin + default planes) — its own collapse, independent of the
+        // filename above and the Features below. ----
+        fmSectionDividerCollapse("Reference", &s_refSecOpen);
+        if (s_refSecOpen) {
+            ImGui::Indent(kSecIndent);
 
             // Origin — expandable; the three default planes nest underneath (no duplicate flat list).
             // T-BL37: the Origin row body is now selectable (sets selectedFeatureId = "point.origin")
@@ -2591,15 +2788,14 @@ void drawFeatureTreeBody(AppState& st,
                             } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
                                 st.sketchMode->addPlaneDimRef(st, pi);
                             } else {
+                                // Row click = SELECT only (toggle). Visibility is owned solely by the
+                                // eye toggle (Hunter): clicking the row must not hide/show the plane.
                                 static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
-                                takePlaneControl();
                                 bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
-                                if (wasSel && planeShownEff) {
-                                    st.showPlane[pi] = false;
+                                if (wasSel) {
                                     st.planeEmphasis = -1;
                                     st.selectedFeatureId.clear();
                                 } else {
-                                    st.showPlane[pi] = true;
                                     st.planeEmphasis = pi;
                                     st.selection.clear();
                                     st.selectedFeatureId = kPlaneSelId[pi];
@@ -2616,7 +2812,27 @@ void drawFeatureTreeBody(AppState& st,
                 }
             }
 
-            treeSectionDivider("Features");
+            ImGui::Unindent(kSecIndent);
+        }   // end References section
+
+        // ---- Features section — its own collapse, now hosting Add Folder + Name & group. ----
+        {
+            const bool isPartDoc = tree.is_object() && jfld(tree, "schema") != "aicad.asm/1";
+            int fCount = 0;
+            if (isPartDoc) {
+                auto fa = tree.find("features");
+                if (fa != tree.end() && fa->is_array()) fCount = (int)fa->size();
+            }
+            const bool hasSel = !st.selectedFeatureId.empty() || !s_multiSel.empty();
+            const bool addEn = canDocTree && isPartDoc && hasSel;
+            const bool ngEn  = canDocTree && isPartDoc && fCount > 0;
+            bool addClicked = false, ngClicked = false;
+            fmFeaturesHeader(&s_featSecOpen, addEn, ngEn, &addClicked, &ngClicked);
+            if (addClicked) createFolderFromSelection(st);
+            if (ngClicked)  nameAndGroupFeatures(st);
+        }
+        if (s_featSecOpen) {
+            ImGui::Indent(kSecIndent);
 
             // ---- feature history ----
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
@@ -2811,22 +3027,20 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         // Readable row pill via shared glass helper (panel stays transparent).
-                        ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, sel,
+                        // Frosted glass base + stripe only (no selection glow here — the colored
+                        // wash below owns selection, matching the ecad Layers style).
+                        ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, false,
                                                sel ? 0.42f : 0.26f);
-                        // Category color strip: ~3px vertical bar on the far-left edge.
-                        // Colored by feature group (sketch/solid-add/solid-cut/dress-up/pattern/
-                        // datum/sheet-metal/weldment/surface) so each family is instantly scannable.
-                        // The selected card's accent bar (drawn below) overlaps it on selected rows —
-                        // the strip's first ~2 dp still shows through, but the accent bar dominates.
+                        // Color-coded row wash dyed the feature's CATEGORY color (sketch=blue,
+                        // solid-add=teal, cut=orange, dress-up=purple, pattern=cyan, datum=slate,
+                        // ...) — the same Layers-style tinted background used across the app.
+                        // Replaces the old 3px left color bar; selection is a glow border in-color.
                         {
                             const bool catIsCut = featureModeIsCut(&f);
-                            ImU32 catCol  = categoryColor(ftype, catIsCut);
-                            float catW    = 3.0f * S;
-                            float catInset = 2.0f * S;
-                            rowDl->AddRectFilled(
-                                ImVec2(rowMin.x,        rowMin.y + catInset),
-                                ImVec2(rowMin.x + catW, rowMax.y - catInset),
-                                catCol, 1.5f * S);
+                            float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint);
+                            // Same outer rect as the base — coloredRowWash self-insets to stay concentric.
+                            ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint,
+                                               sel ? 0.34f : 0.20f, sel);
                         }
                         if (suppressed)
                             rowDl->AddRectFilled(rowMin, rowMax,
@@ -3129,10 +3343,8 @@ void drawFeatureTreeBody(AppState& st,
                 }
             }
 
-            ImGui::TreePop();
-        } else {
-            ImGui::PopStyleColor();  // text color
-        }
+            ImGui::Unindent(kSecIndent);
+        }   // end Features section
     }
 
     if (!st.selectedFeatureId.empty() || !s_multiSel.empty()) {
@@ -3288,20 +3500,30 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
 // publishes the part it's working on to %APPDATA%\AI-CAD\handoff\ as a NATIVE .step+ doc plus a
 // tiny live.json {rev, step}. We open/refresh a single tab from it so the user watches the AI
 // build in the viewport. Loading the native .step+ (not bare STEP) brings the whole feature tree.
+// One published part the MCP currently has open, parsed from the handoff control file.
+struct HandoffDoc { std::string docId, step; long long rev = -1; };
+
 void pollAiCadHandoff(AppState& st) {
     if (!st.workerStarted) return;   // worker not up — nothing can open yet
     if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
     namespace fs = std::filesystem;
-    static const std::string ctrl = appdataDir() + "/AI-CAD/handoff/live.json";
+    const std::string dir = appdataDir() + "/AI-CAD/handoff/";
+    static const std::string ctrlNew = dir + "docs.json";   // multi-doc (one tab per open part)
+    static const std::string ctrlOld = dir + "live.json";   // legacy single-doc fallback
 
-    static long long shownRev   = -1;   // the rev currently drawn in the mirror tab
-    static long long pendingRev = -1;   // the latest rev the MCP published (may be deferred)
-    static std::string pendingStep;     // the .step+ that goes with pendingRev
+    // Per-doc_id rev already drawn on screen. "" keys the legacy single-mirror (no doc_id).
+    static std::map<std::string, long long> shownRev;
+    static std::map<std::string, HandoffDoc> pending;   // doc_id -> latest published, awaiting a safe moment
     static fs::file_time_type lastMtime{};
-
-    // 1) Cheaply pick up a newer control file. Only parse when its mtime advances; a published rev
-    //    is remembered as "pending" until it is SAFE to show (we may defer it, see step 3).
+    static std::string lastCtrl;   // which control file lastMtime belongs to (reset on a switch)
     std::error_code ec;
+
+    // 1) Cheaply pick up a newer control file (mtime-gated). Prefer docs.json; fall back to the
+    //    legacy live.json so an OLD MCP that only writes the single-doc file still mirrors.
+    const std::string ctrl = fs::exists(ctrlNew, ec) ? ctrlNew : ctrlOld;
+    if (ctrl != lastCtrl) { lastCtrl = ctrl; lastMtime = fs::file_time_type{}; }  // force a reparse
+    std::vector<HandoffDoc> published;   // the doc set the control file currently advertises
+    bool haveControl = false;
     if (fs::exists(ctrl, ec)) {
         fs::file_time_type mt = fs::last_write_time(ctrl, ec);
         if (!ec && mt != lastMtime) {
@@ -3309,72 +3531,150 @@ void pollAiCadHandoff(AppState& st) {
             nlohmann::json j;
             std::ifstream f(ctrl, std::ios::binary);
             if (f) { try { f >> j; } catch (...) { j = nlohmann::json{}; } }  // half-written: retry next change
-            const long long rev = j.value("rev", (long long)-1);
-            const std::string step = j.value("step", std::string());
-            if (rev > pendingRev && !step.empty() && fs::exists(step, ec)) {
-                pendingRev = rev;
-                pendingStep = step;
+            if (j.contains("docs") && j["docs"].is_array()) {
+                haveControl = true;
+                for (const auto& e : j["docs"]) {
+                    HandoffDoc hd;
+                    hd.docId = e.value("doc_id", std::string());
+                    hd.step  = e.value("step", std::string());
+                    hd.rev   = e.value("rev", (long long)-1);
+                    if (!hd.step.empty()) published.push_back(hd);
+                }
+            } else {
+                // Legacy shape {rev, step, doc_id} — a single mirror keyed by "".
+                HandoffDoc hd;
+                hd.docId = std::string();  // stable legacy key
+                hd.step  = j.value("step", std::string());
+                hd.rev   = j.value("rev", (long long)-1);
+                if (!hd.step.empty()) { haveControl = true; published.push_back(hd); }
             }
         }
     }
 
-    // 2) Nothing new to reveal.
-    if (pendingRev < 0 || pendingRev == shownRev) return;
+    // Fold freshly-published revs into `pending` (defer showing until safe, step 3).
+    for (const auto& hd : published) {
+        auto it = pending.find(hd.docId);
+        const long long already = (it != pending.end()) ? it->second.rev : shownRev.count(hd.docId) ? shownRev[hd.docId] : -1;
+        if (hd.rev > already && fs::exists(hd.step, ec)) pending[hd.docId] = hd;
+    }
+
+    // Removal: any mirror tab whose doc_id is no longer advertised gets closed (the AI closed that
+    // part). Only act when we actually parsed a fresh control file this frame, so a transient read
+    // miss never nukes tabs.
+    if (haveControl) {
+        std::set<std::string> live;
+        for (const auto& hd : published) live.insert(hd.docId);
+        for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+            if (st.docTabs[i].aiHandoff && !live.count(st.docTabs[i].handoffDocId)) {
+                shownRev.erase(st.docTabs[i].handoffDocId);
+                pending.erase(st.docTabs[i].handoffDocId);
+                st.closeDocTab(i);
+            }
+        }
+    }
+
+    // 2) Nothing pending to reveal.
+    if (pending.empty()) return;
 
     // 3) SAFETY GATES — defer rather than disrupt the user. The AI keeps building in its OWN engine
-    //    process; the on-screen mirror just catches up the moment it is safe, so user interaction
-    //    can never break the AI's work and the AI's refresh can never wreck the user's.
+    //    process; the on-screen mirror just catches up the moment it is safe.
     const bool userMidEdit =
         (st.sketchMode && st.sketchMode->active()) ||           // an open sketch
         (st.propertyManager && st.propertyManager->active());   // an open feature-edit (PM) form
-    int handoffIdx = -1;
-    for (int i = 0; i < (int)st.docTabs.size(); ++i)
-        if (st.docTabs[i].aiHandoff) { handoffIdx = i; break; }
+    const bool anyHandoffTab = [&]{
+        for (const auto& t : st.docTabs) if (t.aiHandoff) return true;
+        return false;
+    }();
 
-    const bool firstReveal = (handoffIdx < 0);
-    if (firstReveal) {
-        // No mirror tab yet — opening one makes it active (steals focus). Don't pop it over an
-        // in-progress edit; wait until the user finishes, then reveal.
-        if (userMidEdit) return;
-    } else {
-        // Mirror already exists — only refresh it while the user is actually looking at it and not
-        // mid-edit. If they switched to their own tab (or are editing), leave the update pending;
-        // it applies the next frame they return, so we never yank focus or cancel their edit.
-        if (handoffIdx != st.activeTab || userMidEdit) return;
-    }
+    // Apply each pending doc independently. Refresh an existing mirror in place; open a NEW part as
+    // its own tab. Anything we can't safely do now stays pending for a later frame.
+    std::vector<std::string> done;   // doc_ids fully applied this frame (remove from pending)
+    for (auto& [docId, hd] : pending) {
+        int idx = -1;
+        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+            if (st.docTabs[i].aiHandoff && st.docTabs[i].handoffDocId == docId) { idx = i; break; }
+        const bool firstReveal = (idx < 0);
 
-    // 4) Apply. Preserve the user's camera across the in-place refresh of the mirror tab so watching
-    //    the AI build doesn't reset their orbit/zoom each step.
-    const bool keepCam = (!firstReveal && handoffIdx == st.activeTab);
-    const float cy = st.yaw, cp = st.pitch, cz = st.zoom,
-                px = st.pan[0], py = st.pan[1], pz = st.pan[2];
+        if (firstReveal) {
+            // A brand-new part. Opening steals focus; don't pop it over an in-progress edit — wait.
+            if (userMidEdit) continue;
+            // The FIRST mirror ever opened may take focus (matches old behavior); later parts open in
+            // the background so a swarm doesn't yank the user around while they inspect one.
+            const bool takeFocus = !anyHandoffTab;
+            const int prevActive = st.activeTab;
+            const std::string prevActiveId =
+                (prevActive >= 0 && prevActive < (int)st.docTabs.size())
+                    ? st.docTabs[prevActive].docId : std::string();
 
-    // Close the prior mirror tab(s) (matched by the aiHandoff flag — robust to tab reorder/close),
-    // then open the freshly published .step+. Quiet: applyOpenedDoc must not toast every step.
-    for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
-        if (st.docTabs[i].aiHandoff) st.closeDocTab(i);
+            st.handoffQuietOpen = true;
+            const bool opened = featureTreeOpenPath(st, hd.step);
+            st.handoffQuietOpen = false;
 
-    st.handoffQuietOpen = true;
-    const bool opened = featureTreeOpenPath(st, pendingStep);
-    st.handoffQuietOpen = false;
+            if (opened && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+                const int newIdx = st.activeTab;              // applyOpenedDoc made the new tab active
+                st.docTabs[newIdx].aiHandoff = true;
+                st.docTabs[newIdx].handoffDocId = docId;
+                // DEDUPE (fixes the doubled-view bug): if any OTHER tab already mirrors this doc_id
+                // (a racing/stale open), close it so the part shows exactly once.
+                for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
+                    if (i != newIdx && st.docTabs[i].aiHandoff && st.docTabs[i].handoffDocId == docId)
+                        st.closeDocTab(i);
+                if (!takeFocus) {
+                    // Background open: return focus to the tab the user was on (re-find it by doc id,
+                    // since closeDocTab above may have shifted indices) and pulse the new tab.
+                    int back = -1;
+                    if (!prevActiveId.empty())
+                        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+                            if (st.docTabs[i].docId == prevActiveId) { back = i; break; }
+                    if (back >= 0) st.activeTab = back;
+                    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+                        if (st.docTabs[i].handoffDocId == docId) { st.docTabs[i].aiPulse = true; break; }
+                }
+                shownRev[docId] = hd.rev;
+                if (takeFocus)
+                    st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
+                done.push_back(docId);
+            } else if (!opened) {
+                // Open failed (e.g. an assembly the core's doc_open declines). Consume the rev so we
+                // don't retry every frame; a newer rev will still be attempted.
+                shownRev[docId] = hd.rev;
+                done.push_back(docId);
+            }
+            continue;
+        }
 
-    if (opened && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
-        st.docTabs[st.activeTab].aiHandoff = true;   // tag the just-opened tab as the mirror
-        if (keepCam) {
+        // Existing mirror — only refresh while the user is actually looking at it and not mid-edit.
+        // Otherwise leave it pending (pulse the tab so the user sees the AI is working there); it
+        // applies the next frame they return, never yanking focus.
+        if (idx != st.activeTab || userMidEdit) {
+            if (idx != st.activeTab) st.docTabs[idx].aiPulse = true;
+            continue;
+        }
+
+        // Preserve the user's camera across the in-place refresh so watching the build doesn't reset
+        // their orbit/zoom each step.
+        const float cy = st.yaw, cp = st.pitch, cz = st.zoom,
+                    px = st.pan[0], py = st.pan[1], pz = st.pan[2];
+        st.closeDocTab(idx);
+
+        st.handoffQuietOpen = true;
+        const bool opened = featureTreeOpenPath(st, hd.step);
+        st.handoffQuietOpen = false;
+
+        if (opened && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+            st.docTabs[st.activeTab].aiHandoff = true;
+            st.docTabs[st.activeTab].handoffDocId = docId;
+            st.docTabs[st.activeTab].aiPulse = false;   // user is viewing this refresh — no glow
             st.yaw = cy; st.pitch = cp; st.zoom = cz;
             st.pan[0] = px; st.pan[1] = py; st.pan[2] = pz;
-            st.zoomToBBoxRequested = false;          // keep our restored view; cancel the fresh-open auto-fit
+            st.zoomToBBoxRequested = false;                  // keep our restored view; cancel auto-fit
+            shownRev[docId] = hd.rev;
+        } else if (!opened) {
+            shownRev[docId] = hd.rev;
         }
-        shownRev = pendingRev;
-        if (firstReveal)
-            st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
-    } else if (!opened) {
-        // The open failed (e.g. the published doc is an assembly, which the C++ core's
-        // doc_open does not yet handle). Mark this rev as consumed so the poller does NOT
-        // retry it every frame — the failure was already logged quietly above. A NEWER rev
-        // (pendingRev > shownRev) will still be attempted when the MCP publishes one.
-        shownRev = pendingRev;
+        done.push_back(docId);
     }
+    for (const auto& id : done) pending.erase(id);
 }
 
 // Native "Open..." dialog -> open. Returns the opened path (for Recent), or "" on cancel/failure.

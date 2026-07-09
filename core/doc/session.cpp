@@ -2507,6 +2507,16 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
         json* f = find_feature(doc, op.value("id", std::string()));
         if (!f) throw OpError("invalid_op", "set_suppressed: no feature");
         (*f)["suppressed"] = op.value("value", false);
+    } else if (k == "set_folder") {
+        // FeatureManager folder grouping ("Add Folder" / "Name & group" / "Remove from folder").
+        // `folder` is a plain display-only tag on the feature (never affects geometry or rebuild);
+        // an empty/absent value clears it. Kept alongside the feature so it round-trips on save.
+        json* f = find_feature(doc, op.value("id", std::string()));
+        if (!f) throw OpError("invalid_op", "set_folder: no feature '" +
+                              op.value("id", std::string()) + "'");
+        const std::string folder = op.value("folder", std::string());
+        if (folder.empty()) f->erase("folder");
+        else (*f)["folder"] = folder;
     } else if (k == "rename") {
         json* f = find_feature(doc, op.value("id", std::string()));
         if (!f) throw OpError("invalid_op", "rename: no feature");

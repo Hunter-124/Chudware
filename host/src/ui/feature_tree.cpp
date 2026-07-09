@@ -1027,6 +1027,7 @@ struct RowCtx {
     int  ownerBodyCount = 0;        // for the tooltip
     std::vector<uint32_t> ownedBodies;  // AICM body ids this feature owns (per-row eye toggle)
     bool nested = false;            // a sketch child node (indented under its consumer)
+    bool expandable = false;        // has nested children (sketch/refs) → real collapse arrow
     bool canDoc = true;            // gates every mutating menu item + drag-reorder
     bool barAtEnd = true;          // hides "Roll to End" when already at the end
     std::string firstOwnedBody;    // body key for the per-row Appearance item ("b<n>")
@@ -1043,6 +1044,7 @@ struct RowResult {
     bool ctrlClicked = false;   // Ctrl+left-click (toggle multi-select)
     bool doubleClick = false;   // open the edit form
     bool hovered     = false;
+    bool open        = true;    // expandable row: is it expanded? (leaf rows: always true)
 };
 
 static RowResult featureRow(RowCtx& c, AppState& st) {
@@ -1104,11 +1106,16 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // row top — every label sat ~4dp too high inside the frame-height row pill, and the eye /
     // badge (centered on the node rect) rode up with it. With it the node IS pill-height and
     // ImGui centers the label via the pushed 4dp FramePadding.y.
+    // Expandable rows (a 3D body with a consumed sketch / nested refs) draw a REAL collapse arrow
+    // whose open/closed state ImGui persists per node id — the caller renders the children only when
+    // open. NoTreePushOnOpen keeps us in charge of the child indent (drawOneRow owns it), so there is
+    // no TreePop to balance. Leaf rows keep the arrow-slot icon trick (no arrow drawn).
     ImGuiTreeNodeFlags flags =
-        ImGuiTreeNodeFlags_Leaf |
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth |
         ImGuiTreeNodeFlags_FramePadding;
+    if (!c.expandable) flags |= ImGuiTreeNodeFlags_Leaf;
+    else flags |= ImGuiTreeNodeFlags_DefaultOpen;   // start expanded (was always-visible before)
 
     // Suppressed → dim. Rolled back → dim + italic-ish look (we cannot truly italicize a
     // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
@@ -1121,9 +1128,17 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                    fmSurf().textSecondary.z, a));
     }
 
-    // Label: dimmed-icon suppressed cue handled via the tree icon; keep a compact [S] too.
+    // Label: dimmed-icon suppressed cue handled via the tree icon; keep a compact [S] too. For an
+    // expandable row the arrow occupies the leading slot, so we pad the label with leading spaces
+    // sized to one icon width and paint the type icon into that gap (arrow → icon → text).
+    const float iconPx = std::min(16.0f * ui::uiScale, ImGui::GetFontSize());
     std::string label = c.name;
     if (c.suppressed) label += " [S]";
+    if (c.expandable) {
+        const float sw = ImGui::CalcTextSize(" ").x;
+        const int nsp = sw > 0.0f ? (int)std::ceil((iconPx + 5.0f * ui::uiScale) / sw) : 2;
+        label = std::string(std::max(1, nsp), ' ') + label;
+    }
     label += "##ft_" + fid;
 
     // polish(G2): match fmRowPill padding (6dp x, 4dp y) so featureRow height == pill height.
@@ -1133,8 +1148,20 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     ImVec2 rowPos = ImGui::GetCursorScreenPos();
-    ImGui::TreeNodeEx(label.c_str(), flags);
-    treeIconInArrowSlot(rowPos, c.iconName, c.iconFallback, iconAlpha);
+    const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
+    res.open = c.expandable ? nodeOpen : true;
+    if (c.expandable) {
+        // Paint the type icon just after the arrow (at the label-spacing start).
+        const float rowH = ImGui::GetItemRectSize().y;
+        ImVec2 ip(rowPos.x + ImGui::GetTreeNodeToLabelSpacing(), rowPos.y + (rowH - iconPx) * 0.5f);
+        ImDrawList* idl = ImGui::GetWindowDrawList();
+        IconUV iv = getIcon(c.iconName, 20);
+        if (iv.valid)
+            idl->AddImage(iv.texId, ip, ImVec2(ip.x + iconPx, ip.y + iconPx), iv.uv0, iv.uv1,
+                          IM_COL32(255, 255, 255, (int)(iconAlpha * 255.0f)));
+    } else {
+        treeIconInArrowSlot(rowPos, c.iconName, c.iconFallback, iconAlpha);
+    }
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
 
@@ -2036,25 +2063,22 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder,
     if (rowClicked) *open = !*open;
     if (rowHov) ui::glassRowBackground(dl, p, ImVec2(p.x + w, p.y + rowH), 3.0f, false, false, 0.16f);
 
-    // Right-edge controls: [Add Folder][Name & group] then the collapse chevron.
+    // Layout: the two folder buttons sit at the far LEFT, then the "Features" label just to their
+    // right, a hairline filling the gap, and the collapse chevron pinned far right (Hunter red-pen).
     const float chevX = p.x + w - chev;
-    const float ngX = chevX - bgap - btn;
-    const float addX = ngX - bgap - btn;
-
-    // Centered label + hairlines (right hairline stops before the button cluster).
-    const float textX = p.x + (w - tsz.x) * 0.5f;
+    const float addX = p.x + 4.0f * S;
+    const float ngX = addX + btn + bgap;
+    const float textX = ngX + btn + 8.0f * S;   // label starts right of the button cluster
     const float textY = p.y + (rowH - lineH) * 0.5f;
     const ImU32 lineCol = ui::Palette::toU32(pal.border);
-    if (textX > p.x + 4.0f * S) {
-        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy), lineCol, std::max(1.0f, 1.0f * S));
-        const float rStart = textX + tsz.x + 6.0f * S;
-        const float rEnd = addX - 8.0f * S;
-        if (rStart < rEnd) dl->AddLine(ImVec2(rStart, cy), ImVec2(rEnd, cy), lineCol, std::max(1.0f, 1.0f * S));
-    }
     dl->AddText(ImVec2(textX, textY),
                 ImGui::ColorConvertFloat4ToU32(ImVec4(pal.treeSection[0], pal.treeSection[1],
                                                       pal.treeSection[2], pal.treeSection[3])),
                 "Features");
+    // Hairline from just right of the label to just left of the chevron.
+    const float rStart = textX + tsz.x + 6.0f * S;
+    const float rEnd = chevX - 8.0f * S;
+    if (rStart < rEnd) dl->AddLine(ImVec2(rStart, cy), ImVec2(rEnd, cy), lineCol, std::max(1.0f, 1.0f * S));
 
     // Small glass-pill icon button helper (drawn atop the row toggle).
     auto iconBtn = [&](float x, const char* iconName, bool enabled, const char* tip) -> bool {
@@ -3000,14 +3024,16 @@ void drawFeatureTreeBody(AppState& st,
 
                     // ---- render one feature row (shared by flat + nested-sketch paths) ----
                     int rowIdx = 0;   // visual stripe index (stable across nesting)
-                    auto drawOneRow = [&](const nlohmann::json& f, bool nested) {
+                    // Returns whether the row is expanded (leaf/child rows always true) so the caller
+                    // renders consumed-sketch children only when the parent's arrow is open.
+                    auto drawOneRow = [&](const nlohmann::json& f, bool nested) -> bool {
                         std::string fid    = jfld(f, "id");
                         std::string fname  = jfld(f, "name");
                         std::string ftype  = jfld(f, "type");
                         if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
                         if (s_fmFilter[0] && !fm_icontains(fname.c_str(), s_fmFilter) &&
                             !fm_icontains(ftype.c_str(), s_fmFilter))
-                            return;
+                            return true;
 
                         // Nested-child indent wraps the WHOLE row (background pill + text + icon) so
                         // the tinted background steps in with the content, not just the glyphs
@@ -3111,6 +3137,8 @@ void drawFeatureTreeBody(AppState& st,
                         ctx.ownerBodyCount = bodyCount(fid);
                         ctx.ownedBodies = ownedBodies(fid);
                         ctx.nested = nested;
+                        // A top-level row with consumed-sketch children draws a real collapse arrow.
+                        ctx.expandable = !nested && childrenOf.count(fid) > 0;
                         ctx.canDoc = canDocTree;
                         ctx.barAtEnd = barAtEnd;
                         ctx.firstOwnedBody = firstBodyKey(fid);
@@ -3224,6 +3252,7 @@ void drawFeatureTreeBody(AppState& st,
                         }
 
                         if (nested) ImGui::Unindent(nestIndent);   // balance the whole-row indent
+                        return rr.open;
                     };
 
                     // fid the rollback bar currently sits AFTER (empty = end).
@@ -3273,11 +3302,12 @@ void drawFeatureTreeBody(AppState& st,
                         }
                         if (!openFolder.empty() && !folderOpen) continue;
 
-                        drawOneRow(f, /*nested=*/false);
+                        const bool rowOpen = drawOneRow(f, /*nested=*/false);
 
-                        // Nested-sketch children: render absorbed sketches indented under this row.
+                        // Nested-sketch children: render absorbed sketches indented under this row,
+                        // but only when the parent's collapse arrow is open (Hunter show/hide refs).
                         auto kids = childrenOf.find(fid);
-                        if (kids != childrenOf.end()) {
+                        if (rowOpen && kids != childrenOf.end()) {
                             for (const auto& skId : kids->second) {
                                 for (const auto& sf : *feat)
                                     if (sf.is_object() && jfld(sf, "id") == skId) {

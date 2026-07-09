@@ -1085,10 +1085,11 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
                     float thumbA, float thumbB, bool vertical, bool hovered,
                     const AdaptiveSurface& surf) {
     const float s = ui::uiScale;
-    // The thin track runs down the CENTER of the band; the pill is thicker than the track so it
-    // reads as a pill with the track line "extending out" past both of its rounded ends.
+    // A thin track runs down the CENTER of the band; the thumb is the SAME thickness as the track
+    // (no fatter oval bulge — Hunter's program-wide default), just a brighter, rounded segment of
+    // the same line so it reads as a minimal hairline scrollbar.
     const float trackThin = 2.0f * s;
-    const float pillThick = 6.0f * s;
+    const float pillThick = trackThin;
     const ImU32 trackCol = ImGui::ColorConvertFloat4ToU32(
         ImVec4(surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.16f));
     const ImU32 pillCol = ImGui::ColorConvertFloat4ToU32(

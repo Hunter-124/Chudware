@@ -41,6 +41,10 @@ static int  s_closeIdx   = -1;   // tab index to close, or -1
 // mutates docTabs mid-iteration. -1 = nothing requested this frame.
 enum class NewDocKind { None = -1, Part = 0, Assembly, Drawing, Schematic, PCB };
 static NewDocKind s_newDoc = NewDocKind::None;
+// Right-click tab menu: close every OTHER tab (keep this one), or close all. Deferred + applied
+// after the strip is drawn so they never mutate docTabs mid-iteration. -1 / false = nothing asked.
+static int  s_closeOthersIdx = -1;
+static bool s_closeAll = false;
 // Unsaved-changes prompt: the tab the user asked to close while it had unsaved edits.
 static int  s_confirmCloseIdx = -1;
 // Save-then-close: the tab to save and then close (the "Save" choice on the unsaved-changes prompt).
@@ -108,6 +112,20 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     bool switchClicked = ImGui::InvisibleButton("##tab", ImVec2(tabW, tabH));
     bool hovered = ImGui::IsItemHovered();
     bool middleClose = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+
+    // Right-click context menu (attaches to the ##tab item above). "Close Others" is the headline
+    // request; Close / Close All round it out. Actions are deferred via the same statics the ×/middle
+    // paths use so nothing mutates docTabs mid-draw.
+    if (ImGui::BeginPopupContextItem("##tabctx")) {
+        const int n = (int)st.docTabs.size();
+        if (ImGui::MenuItem("Close")) {
+            if (t.dirty) s_confirmCloseIdx = idx; else s_closeIdx = idx;
+        }
+        if (ImGui::MenuItem("Close Others", nullptr, false, n > 1)) s_closeOthersIdx = idx;
+        ImGui::Separator();
+        if (ImGui::MenuItem("Close All")) s_closeAll = true;
+        ImGui::EndPopup();
+    }
 
     // Glass pill: active = Regular material, inactive = UltraThin, hover lifts an inactive tab to
     // Thin (per-rect UV-projected live backdrop; glassBackground fallback when no backdrop is live).
@@ -217,21 +235,37 @@ static bool drawEdgeGlow(ImDrawList* dl, float edgeX, float y0, float y1, float 
     const auto& pal = ui::palette;
     const float tsec = (float)ImGui::GetTime();
     const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
-    const float innerX = fromRight ? (edgeX - glowW) : (edgeX + glowW);
     const float dir = fromRight ? 1.0f : -1.0f;   // mirror the flame travel so both lick inward
-    const int N = 18;
+    // Reserve a fully-OPAQUE rounded cap of width R hugging the very edge: this both (a) matches the
+    // 8dp rounded corners of the glass band so the glow doesn't poke square past them, and (b) makes
+    // the strip fully opaque a little BEFORE the edge so a trailing filename fades out under the glow
+    // instead of sharply clipping at the band boundary. The gradient runs over the flat span up to it.
+    const float R = 8.0f * s;
+    const float gspan = std::max(1.0f, glowW - R);
+    const float innerX = fromRight ? (edgeX - glowW) : (edgeX + glowW);   // faded end of the gradient
+    const float capInnerX = fromRight ? (edgeX - R) : (edgeX + R);        // where the solid cap starts
+    const int N = 16;
     for (int i = 0; i < N; ++i) {
-        const float e0 = (float)i / N, e1 = (float)(i + 1) / N, em = (e0 + e1) * 0.5f;  // 0 inner→1 edge
-        const float xa = innerX + dir * e0 * glowW;
-        const float xb = innerX + dir * e1 * glowW;
+        const float e0 = (float)i / N, e1 = (float)(i + 1) / N, em = (e0 + e1) * 0.5f;  // 0 inner→1 cap
+        const float xa = innerX + dir * e0 * gspan;
+        const float xb = innerX + dir * e1 * gspan;
         const float lo = std::min(xa, xb), hi = std::max(xa, xb);
         const float flick = 0.5f + 0.5f * std::sin(tsec * 3.4f + dir * em * 7.0f);
-        const float ramp = std::pow(em, 1.35f);                       // faint inner → solid edge
-        const float a = std::min(1.0f, (0.10f + 0.80f * ramp) * (0.70f + 0.30f * flick));
+        const float ramp = std::pow(em, 1.25f);                       // faint inner → opaque by the cap
+        const float a = std::min(1.0f, (0.12f + 0.98f * ramp) * (0.74f + 0.26f * flick));
         const float warm = 0.10f * ramp + 0.05f * flick;             // hue flicker warmer at the edge
         const float g = ag * (0.90f + 0.06f * std::sin(tsec * 1.7f + em * 4.0f));  // iridescent drift
         const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), g, ab, a));
         dl->AddRectFilled(ImVec2(lo, y0), ImVec2(hi, y1), col);
+    }
+    // Solid, edge-rounded cap — fully opaque so nothing shows through, corners matched to the band.
+    {
+        const float flick = 0.5f + 0.5f * std::sin(tsec * 3.4f + dir * 7.0f);
+        const float warm = 0.10f + 0.05f * flick;
+        const ImU32 cap = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), ag * 0.9f, ab, 1.0f));
+        const float lo = std::min(capInnerX, edgeX), hi = std::max(capInnerX, edgeX);
+        dl->AddRectFilled(ImVec2(lo, y0), ImVec2(hi, y1), cap, R,
+                          fromRight ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft);
     }
 
     char lbl[16];
@@ -545,8 +579,12 @@ float drawDocTabs(AppState& st, float availW) {
             const float t = (mx - laneL - thumbW * 0.5f) / std::max(1.0f, laneW - thumbW);
             s_scrollX = std::min(std::max(t, 0.0f), 1.0f) * maxScroll;
         }
-        ui::drawScrollPill(dl, ImVec2(laneL, bandT), ImVec2(laneR, bandT + bandH),
-                           thumbX, thumbX + thumbW, /*vertical=*/false, sbHov, surf);
+        // Nudge the bar UP a few px so it rides the top edge of the strip (Hunter: fine if it grazes
+        // the ribbon above). Drawn on the FOREGROUND list so it isn't clipped by this overlay window.
+        const float sbY = bandT - 5.0f * s;
+        ui::drawScrollPill(ImGui::GetForegroundDrawList(), ImVec2(laneL, sbY),
+                           ImVec2(laneR, sbY + bandH), thumbX, thumbX + thumbW,
+                           /*vertical=*/false, sbHov, surf);
     }
 
     // "+" New-Document button, pinned at the far right of the strip — opens the chooser popup (Wave 2).
@@ -623,6 +661,22 @@ float drawDocTabs(AppState& st, float availW) {
         s_saveCloseIdx = -1;
         TabSaveResult r = saveDocTab(st, idx, /*forceDialog=*/false);
         if (r != TabSaveResult::Cancelled && r != TabSaveResult::Failed) st.closeDocTab(idx);
+    } else if (s_closeOthersIdx >= 0) {
+        // Keep the clicked tab, close the rest. Make it active first so the close-index bookkeeping
+        // keeps it selected; skip dirty tabs so unsaved work is never silently discarded. Iterate
+        // high→low so removals only shift indices we've already passed.
+        const int keep = s_closeOthersIdx;
+        s_closeOthersIdx = -1;
+        if (keep < (int)st.docTabs.size()) st.switchToTab(keep);
+        for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+            if (i == keep) continue;
+            if (st.docTabs[i].dirty) continue;
+            st.closeDocTab(i);
+        }
+    } else if (s_closeAll) {
+        s_closeAll = false;
+        for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
+            if (!st.docTabs[i].dirty) st.closeDocTab(i);
     } else if (s_closeIdx >= 0) {
         st.closeDocTab(s_closeIdx);
         s_closeIdx = -1;

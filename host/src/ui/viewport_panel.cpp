@@ -1623,6 +1623,47 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // (The "Create New" chooser modal is hosted at app scope — ui::drawNewDocChooser — so it
         //  works regardless of which central document is forward.)
 
+        // ---- Move/Rotate Entities gizmo HUD (just under the file title, top-left of the viewport) ----
+        // A compact glass panel with a green check / red X to finish/cancel plus the live X/Y offset
+        // (Move) or an editable angle field (Rotate). Buttons/typed values route back to SketchMode,
+        // which the tool branch reads next frame (commit/cancel/setHudAngle).
+        if (sketch && sketch->active()) {
+            SketchMode::TransformHud h = sketch->transformHudState();
+            if (h.kind != 0) {
+                const float s = ui::uiScale;
+                ImGui::BeginChild("##gizmoHud", ImVec2(206 * s, 0),
+                                  ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY,
+                                  ImGuiWindowFlags_NoScrollbar);
+                ImGui::TextUnformatted(h.kind == 1 ? "Move Entities" : "Rotate Entities");
+                ImGui::Separator();
+                if (h.kind == 1) {
+                    ImGui::Text("\xCE\x94X  %8.3f mm", h.dx);
+                    ImGui::Text("\xCE\x94Y  %8.3f mm", h.dy);
+                } else {
+                    float ang = h.angle;
+                    ImGui::TextUnformatted("Angle");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(96 * s);
+                    if (ImGui::InputFloat("##gzAngle", &ang, 0.0f, 0.0f, "%.2f\xC2\xB0",
+                                          ImGuiInputTextFlags_EnterReturnsTrue))
+                        sketch->setHudAngle(ang);
+                    else if (ImGui::IsItemDeactivatedAfterEdit())
+                        sketch->setHudAngle(ang);
+                }
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.55f, 0.24f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.66f, 0.30f, 1.0f));
+                if (ImGui::Button("\xE2\x9C\x93 Finish", ImVec2(96 * s, 0))) sketch->commitTransform(st);
+                ImGui::PopStyleColor(2);
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.18f, 0.18f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.74f, 0.22f, 0.22f, 1.0f));
+                if (ImGui::Button("\xE2\x9C\x97 Cancel", ImVec2(96 * s, 0))) sketch->cancelTransform();
+                ImGui::PopStyleColor(2);
+                ImGui::EndChild();
+            }
+        }
+
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
             ImGui::Separator();
@@ -2941,6 +2982,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (fe > cr0.x && bx0 < fe + 10.0f * s) bx0 = fe + 10.0f * s;
             }
             float by0  = cr0.y + 6.0f * s;
+            // Drop the toolbar below the doc-tab file strip that overlays the top of the viewport, so
+            // the file display never clips over these buttons (Hunter). docTabBandBottom() is the
+            // strip's live bottom edge in screen space (-1 when no strip this frame).
+            {
+                const float dtb = ui::docTabBandBottom();
+                if (dtb > by0) by0 = dtb + 6.0f * s;
+            }
             float byi  = by0 + padY;
 
             ImVec2 mp = io.MousePos;
@@ -3457,19 +3505,35 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const float ts = ui::uiScale;
             // Anchor RIGHT of the pinned FeatureManager column — the old cr0-relative anchor put
             // the triad underneath the floating glass column (visual-review fix).
-            float hudLeft = cr0.x;
+            float targetLeft = cr0.x;
             {
                 const float e = ui::overlayColumnEdge(0);
                 if (e > cr0.x && e < cr1.x - 140.0f * ts) {
-                    // Only push the triad right of the FM column when the column is tall enough to
-                    // actually reach down to the triad row. A short or collapsed FM column doesn't
-                    // occlude the triad so we leave it at the far-left anchor (cr0.x).
-                    const float colH  = ui::overlayColumnHeight(0);
-                    const float triadRowY = (cr1.y - cr0.y) - 52.0f * ts;  // triad cy relative to viewport top
-                    const bool colReachesTriad = (colH > 0.0f) && (colH >= triadRowY);
-                    if (colReachesTriad) hudLeft = e;
+                    // Only push the triad right of the FM column when the column's CONTENT actually
+                    // reaches down to the triad's row (they would overlap). Otherwise there's room
+                    // underneath the column (below the tab's bottom-most element), so the triad tucks
+                    // to the far-left anchor (cr0.x). overlayColumnHeight(0) is the column's occupied
+                    // bottom as an absolute screen Y — republished per frame for whichever tab
+                    // (Explorer / Feature Manager / Configurations) is showing, so expanding or
+                    // collapsing a tab re-targets the triad.
+                    const float colBottomAbs = ui::overlayColumnHeight(0);
+                    const float triadTopAbs  = cr1.y - 90.0f * ts;   // triad box top (cy-52 - ~30 arm - margin)
+                    const bool colReachesTriad = (colBottomAbs > 0.0f) && (colBottomAbs >= triadTopAbs);
+                    if (colReachesTriad) targetLeft = e;
                 }
             }
+            // Ease the triad horizontally toward its target so opening/collapsing a manager tab (or
+            // the column growing past the triad's row) SLIDES it aside and back instead of snapping
+            // after a pause. Frame-rate-independent exponential smoothing; snap the last sub-pixel.
+            static float s_triadLeft = -1.0f;
+            if (s_triadLeft < 0.0f) s_triadLeft = targetLeft;   // first frame: place, don't slide in
+            {
+                const float dt = ImGui::GetIO().DeltaTime;
+                const float k  = 1.0f - std::exp(-12.0f * (dt > 0.0f ? dt : 1.0f / 60.0f));
+                s_triadLeft += (targetLeft - s_triadLeft) * k;
+                if (std::fabs(targetLeft - s_triadLeft) < 0.5f) s_triadLeft = targetLeft;
+            }
+            const float hudLeft = s_triadLeft;
             float cx = hudLeft + 52.0f * ts, cy = cr1.y - 52.0f * ts;
             float L = 30.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;

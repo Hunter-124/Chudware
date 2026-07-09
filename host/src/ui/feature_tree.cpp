@@ -1059,19 +1059,30 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
     // ---- inline rename editor (replaces the label while active) ----
     if (s_renamingId == fid) {
-        ImGui::SetNextItemWidth(-1);
+        // Inset the editor by 2dp and give it a frame whose height matches the row pill, so the box
+        // (and its selection highlight) fit WITHIN the background pill and the text stays vertically
+        // centered — the rename branch returns before the node's own FramePadding push, so without
+        // this it inherited ambient padding (text sank below the pill) and a -1 width spilled past
+        // the pill's rounded bounds (Hunter red-pen). FramePadding.y = 2dp → frame is 2dp shorter
+        // than the pill top+bottom, leaving a hair of margin so the highlight sits inside it.
+        const float S = ui::uiScale;
+        const float inset = 2.0f * S;
+        const ImVec2 cur = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(cur.x + inset, cur.y + inset));
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - inset * 2.0f);
         if (!ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f * S, 2.0f * S));
         ImGui::PushStyleColor(ImGuiCol_FrameBg,
             ImVec4(ui::palette.accentSoft[0], ui::palette.accentSoft[1],
                    ui::palette.accentSoft[2], 0.25f));
         ImGui::PushStyleColor(ImGuiCol_Border,
             ImVec4(ui::palette.accent[0], ui::palette.accent[1],
                    ui::palette.accent[2], 0.70f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * ui::uiScale);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f * S);
         bool commit = ImGui::InputText(("##rn_" + fid).c_str(), s_renameBuf, sizeof(s_renameBuf),
                                        ImGuiInputTextFlags_EnterReturnsTrue |
                                        ImGuiInputTextFlags_AutoSelectAll);
-        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(2);
         bool cancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
         bool deact  = ImGui::IsItemDeactivated();

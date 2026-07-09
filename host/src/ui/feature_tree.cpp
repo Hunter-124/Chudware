@@ -1048,7 +1048,8 @@ struct RowResult {
 static RowResult featureRow(RowCtx& c, AppState& st) {
     RowResult res;
     const std::string& fid = c.fid;
-    if (c.nested) ImGui::Indent(14.0f * ui::uiScale);   // #4.3: scaled sketch child indent
+    // Nested-child indent is now applied by drawOneRow AROUND the whole row (background pill
+    // included), not here — so the row background indents with the text+icon (Hunter task-4).
     // C37-E (item 6): suppressed/rolled-back rows get a faded icon (clearer than just the [S] tag).
     // The icon is drawn INTO the leaf node's arrow slot after TreeNodeEx (treeIconInArrowSlot) so
     // the label sits directly beside it instead of across a doubled icon+arrow gap.
@@ -1096,8 +1097,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                 }
             }
         }
-        if (c.nested) ImGui::Unindent(14.0f * ui::uiScale);   // #4.3: balanced with the scaled Indent
-        return res;
+        return res;   // (nested indent is owned by drawOneRow now)
     }
 
     // FramePadding flag (red-pen round-2): without it a TreeNodeEx is TEXT height drawn at the
@@ -1377,7 +1377,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // The status badge owns detailed status/error hover text. Keeping the row itself quiet avoids
     // tooltip cards covering selected rows while the user is trying to scan or drag the tree.
 
-    if (c.nested) ImGui::Unindent(14.0f * ui::uiScale);   // #4.3: balanced with the scaled Indent
+    // (nested indent is owned by drawOneRow now — no Unindent here)
     return res;
 }
 
@@ -3009,6 +3009,13 @@ void drawFeatureTreeBody(AppState& st,
                             !fm_icontains(ftype.c_str(), s_fmFilter))
                             return;
 
+                        // Nested-child indent wraps the WHOLE row (background pill + text + icon) so
+                        // the tinted background steps in with the content, not just the glyphs
+                        // (Hunter task-4). Indent shifts both GetCursorScreenPos and
+                        // GetContentRegionAvail, so the pill rect computed below is already inset.
+                        const float nestIndent = 14.0f * ui::uiScale;
+                        if (nested) ImGui::Indent(nestIndent);
+
                         FStatus fs;
                         { auto it = statusMap.find(fid); if (it != statusMap.end()) fs = it->second; }
                         bool suppressed = jftbool(f, "suppressed");
@@ -3215,6 +3222,8 @@ void drawFeatureTreeBody(AppState& st,
                                 s_lastClickTime = now;
                             }
                         }
+
+                        if (nested) ImGui::Unindent(nestIndent);   // balance the whole-row indent
                     };
 
                     // fid the rollback bar currently sits AFTER (empty = end).

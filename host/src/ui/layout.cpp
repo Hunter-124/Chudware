@@ -161,17 +161,13 @@ static bool drawManagerTabButton(const char* id,
     bool clicked = ImGui::InvisibleButton("##lp_tab", ImVec2(btn, btn));
     bool hovered = ImGui::IsItemHovered();
 
-    // Persistent subtle frosted pill on every rail tab; stronger when selected or hovered.
+    // Persistent frosted pill on every rail tab, PLUS the Layers-style colored gradient wash the
+    // rows/ribbon buttons use — stronger when selected or hovered. Selection is the glow border
+    // (coloredRowWash selected=true) — no left vertical accent bar (app-wide rule).
     const float wash = selected ? 0.40f : (hovered ? 0.32f : 0.20f);
-    ui::glassRowBackground(dl, p0, p1, 7.0f, false, selected, wash);
-
-    if (selected) {
-        dl->AddRectFilled(ImVec2(p0.x, p0.y + 6.0f * S),
-                          ImVec2(p0.x + 3.0f * S, p1.y - 6.0f * S),
-                          ui::Palette::toU32(pal.accent), 2.0f * S);
-        dl->AddRect(p0, p1, ui::Palette::toU32(pal.accentSoft), 7.0f * S, 0,
-                    std::max(1.0f, 1.0f * S));
-    }
+    ui::glassRowBackground(dl, p0, p1, 7.0f, false, /*selected*/false, wash);
+    const float tintStrength = selected ? 0.30f : (hovered ? 0.20f : 0.12f);
+    ui::coloredRowWash(dl, p0, p1, 7.0f, pal.accent, tintStrength, selected);
 
     // Liquid glass v2: rail-tab glyph tint tracks the pane's adaptive surface (max contrast
     // over the frosted backdrop) instead of the raw palette; PM-attention keeps the semantic
@@ -384,9 +380,11 @@ void drawLeftPane(AppState& st,
     const ImRect lpPaneRect(lpWp, ImVec2(lpWp.x + lpWs.x, lpWp.y + lpWs.y));
     // Let the viewport HUD (triad / model-info pill) dodge the pinned column (layout.h).
     publishOverlayColumnEdge(0, lpPaneRect.Max.x);
-    // Also publish the column height so the triad can decide whether the FM column reaches down
-    // to the triad row (tall column → anchor right of FM; short/collapsed → anchor at far left).
-    publishOverlayColumnHeight(0, lpWs.y);
+    // Publish the column's occupied BOTTOM as an absolute screen Y so the triad can decide whether
+    // the FM column reaches down to the triad row (content reaches down → anchor right of FM;
+    // short/collapsed → anchor at far left, underneath the column). Default = the whole window
+    // bottom; the Model pane overrides this below with the real content bottom (header + rows).
+    publishOverlayColumnHeight(0, lpWp.y + lpWs.y);
     const ui::AdaptiveSurface& surf =
         ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect, ui::GlassGroup::FeatureManager);
     const bool lpLive = ui::viewportBackdrop().valid();
@@ -401,18 +399,67 @@ void drawLeftPane(AppState& st,
     // styled to fill the full column width with the same glass row discipline.
     if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) {
         const float S = ui::uiScale;
-        ImGui::Dummy(ImVec2(0, 4.0f * S));
-        ImGui::PushFont(st.fonts.medium);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted("Simulation");
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
-        st.simManager->drawTreeBody(st);
+        // Explorer + Simulation Manager two-button rail — same chrome as the Electronics rail so
+        // every workspace column shares one navigation pattern (Hunter directive).
+        static int s_simTab = 1;   // 0 = Explorer, 1 = Simulation Manager
+        const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
+        const float erailRowH = erowPad + ebtn + erowPad;
+        const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();
+        const float  ePaneInnerW  = ImGui::GetContentRegionAvail().x;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::BeginChild("##sim_tabstrip", ImVec2(2.0f * ebtn + egap, erailRowH),
+                          ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::SetCursorPosY(erowPad);
+        ImGui::SetCursorPosX(0.0f);
+        if (drawManagerTabButton("simE", "body_folder", "E", "Explorer", s_simTab == 0, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_simTab = 0;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("simM", "history", "S", "Simulation Manager", s_simTab == 1, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
+            s_simTab = 1;
+        ImGui::EndChild();
+        {
+            const float railW = 2.0f * ebtn + egap;
+            const float hdrX = ePaneOrigin.x + railW + egap;
+            const float hdrW = ePaneInnerW - railW - egap;
+            const char* hdrTitle = s_simTab == 0 ? "Explorer" : "Simulation Manager";
+            const char* hdrIcon  = s_simTab == 0 ? "body_folder" : "ai_panel";
+            const ImVec2 saveLocal = ImGui::GetCursorPos();
+            ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
+            ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
+            ImGui::SetCursorPos(saveLocal);
+        }
+        {
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            const float sepY = ePaneOrigin.y + erailRowH - 0.5f;
+            pdl->AddLine(ImVec2(ePaneOrigin.x, sepY), ImVec2(ePaneOrigin.x + ePaneInnerW, sepY),
+                         ui::Palette::toU32(pal.glassBorder), 1.0f * S);
+        }
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        const float ebodyPad = 12.0f * S;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
+        const float eBodyTopY = ImGui::GetCursorScreenPos().y;
+        ImGui::BeginChild("##sim_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
+        if (s_simTab == 0) {
+            drawFileExplorerBody(st);
+        } else {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+            st.simManager->drawTreeBody(st);
+            ImGui::PopStyleVar();
+        }
+        const float eBodyContentH = ImGui::GetCursorPosY();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();   // ChildBg
+        ImGui::PopStyleColor();   // ImGuiCol_Text (surf.textPrimary)
+        // Republish this column's ACTUAL content bottom (absolute screen Y) so the orientation triad
+        // tucks under the column when the tree/explorer is short, and only dodges right when the
+        // content really reaches the triad's row — same behaviour as the Model FeatureManager column.
+        publishOverlayColumnHeight(0, eBodyTopY + eBodyContentH);
         ImGui::End();
         return;
     }
@@ -424,18 +471,65 @@ void drawLeftPane(AppState& st,
     // column on the right is untouched.
     if (st.activeWorkspace == AppState::Workspace::Manufacture) {
         const float S = ui::uiScale;
-        ImGui::Dummy(ImVec2(0, 4.0f * S));
-        ImGui::PushFont(st.fonts.medium);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted("CAM Manager");
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
-        ui::drawCamTreeBody(st);
+        // Explorer + Job Manager two-button rail — same chrome as the Electronics/Simulate rails.
+        static int s_camTab = 1;   // 0 = Explorer, 1 = Job Manager
+        const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
+        const float erailRowH = erowPad + ebtn + erowPad;
+        const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();
+        const float  ePaneInnerW  = ImGui::GetContentRegionAvail().x;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::BeginChild("##cam_tabstrip", ImVec2(2.0f * ebtn + egap, erailRowH),
+                          ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::SetCursorPosY(erowPad);
+        ImGui::SetCursorPosX(0.0f);
+        if (drawManagerTabButton("camE", "body_folder", "E", "Explorer", s_camTab == 0, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_camTab = 0;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("camM", "history", "J", "Job Manager", s_camTab == 1, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
+            s_camTab = 1;
+        ImGui::EndChild();
+        {
+            const float railW = 2.0f * ebtn + egap;
+            const float hdrX = ePaneOrigin.x + railW + egap;
+            const float hdrW = ePaneInnerW - railW - egap;
+            const char* hdrTitle = s_camTab == 0 ? "Explorer" : "Job Manager";
+            const char* hdrIcon  = s_camTab == 0 ? "body_folder" : "ai_panel";
+            const ImVec2 saveLocal = ImGui::GetCursorPos();
+            ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
+            ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
+            ImGui::SetCursorPos(saveLocal);
+        }
+        {
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            const float sepY = ePaneOrigin.y + erailRowH - 0.5f;
+            pdl->AddLine(ImVec2(ePaneOrigin.x, sepY), ImVec2(ePaneOrigin.x + ePaneInnerW, sepY),
+                         ui::Palette::toU32(pal.glassBorder), 1.0f * S);
+        }
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        const float ebodyPad = 12.0f * S;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
+        const float eBodyTopY = ImGui::GetCursorScreenPos().y;
+        ImGui::BeginChild("##cam_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
+        if (s_camTab == 0) {
+            drawFileExplorerBody(st);
+        } else {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+            ui::drawCamTreeBody(st);
+            ImGui::PopStyleVar();
+        }
+        const float eBodyContentH = ImGui::GetCursorPosY();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();   // ChildBg
+        ImGui::PopStyleColor();   // ImGuiCol_Text (surf.textPrimary)
+        // Republish the column's ACTUAL content bottom so the triad tucks underneath when short
+        // (mirrors the Model + Simulate columns).
+        publishOverlayColumnHeight(0, eBodyTopY + eBodyContentH);
         ImGui::End();
         return;
     }
@@ -512,6 +606,7 @@ void drawLeftPane(AppState& st,
         const float ebodyPad = 12.0f * S;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
+        const float eBodyTopY = ImGui::GetCursorScreenPos().y;
         ImGui::BeginChild("##ecad_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
         if (s_ecadTab == 0) {
             // Header chip is drawn up in the rail row (round-5b) — body starts at the file list.
@@ -519,10 +614,14 @@ void drawLeftPane(AppState& st,
         } else {
             ui::drawEcadManagerBody(st, surf, lpHalo);
         }
+        const float eBodyContentH = ImGui::GetCursorPosY();
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();   // ImGuiCol_ChildBg
         ImGui::PopStyleColor();   // ImGuiCol_Text (surf.textPrimary)
+        // Republish the column's ACTUAL content bottom so the triad tucks underneath when short
+        // (mirrors the Model / Simulate / Manufacture columns).
+        publishOverlayColumnHeight(0, eBodyTopY + eBodyContentH);
         ImGui::End();
         return;
     }
@@ -648,6 +747,19 @@ void drawLeftPane(AppState& st,
             const float chevLeftX  = lpPaneRect.Max.x - chevSz - 8.0f * S;
             const float rowCenterY = lpPaneRect.Min.y + 8.0f * S + chevSz * 0.5f;
             pm->drawChromeButtons(st, chevLeftX - 8.0f * S, rowCenterY);
+        } else {
+            // Pane title INLINE with the square tab buttons (Hunter): right-aligned in the header
+            // row, vertically centered on the button row, NO icon — the highlighted tab button
+            // already carries the glyph. Replaces the old centered header chip below the divider.
+            const char* paneTitle = "Feature Manager";
+            if (st.leftPaneTab == kLeftPaneExplorer)            paneTitle = "Explorer";
+            else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            const ImVec2 tsz = ImGui::CalcTextSize(paneTitle);
+            const float rightX = lpPaneRect.Max.x - chevSz - 16.0f * S;   // clear of the collapse chevron
+            const float tx = rightX - tsz.x;
+            const float ty = paneOrigin.y + railRowH * 0.5f - tsz.y * 0.5f;
+            pdl->AddText(ImVec2(tx, ty), ui::Palette::toU32(pal.text), paneTitle);
         }
 
         // Horizontal separator under the icon row, spanning the full pane width on the pane draw
@@ -661,19 +773,8 @@ void drawLeftPane(AppState& st,
         }
 
         // ---- active tab body ----
-        const char* title = "Feature Manager";
-        const char* titleIcon = "history";
-        if (st.leftPaneTab == kLeftPaneExplorer) {
-            title = "Explorer";
-            titleIcon = "body_folder";
-        } else if (st.leftPaneTab == kLeftPaneConfigurations) {
-            title = "Configurations";
-            titleIcon = "settings";
-        } else if (pmActive) {
-            // A live command form takes over the FeatureManager tab body -> label it as such.
-            title = "Property Manager";
-            titleIcon = "material";
-        }
+        // (The pane title now renders inline with the square tab buttons above — see the header
+        // row — so there is no separate centered header chip here anymore.)
 
         // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
         // overflows, ImGui reserves a vertical scrollbar on the right, which would make the right
@@ -687,20 +788,22 @@ void drawLeftPane(AppState& st,
         const float sbSize  = 8.0f * S;
         // Transparent body — row-level glass pills only; viewport shows through gaps.
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
+        // Tight top padding: the theme's default WindowPadding.y (~9dp) left a large dead gap between
+        // the divider under the square tab buttons and the pane-header title chip. 4dp reads snug.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(bodyPad, 4.0f * S));
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
         // Inset the scroll region above the bubble's rounded bottom edge so the last row (the
         // file strip's "(unsaved)" line / buttons) is never clipped by the corner radius
         // (visual-review fix).
-        ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
+        const float bodyTopScreenY = ImGui::GetCursorScreenPos().y;
+        // NoScrollbar: we replace ImGui's default bar with the custom pill-on-track scrollbar
+        // (ui::drawWindowPillScrollbarV) drawn just before EndChild, matching the doc-tab file strip.
+        ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar);
         const bool bodyIndented = s_bodyScrolled;
         if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
-        // Pane-header chip (wire request, explorer-restyle agent): ONE content-fitted glass pill
-        // — icon fully inside with even padding, icon+text centered on paneCenterX; the FM tab's
-        // "history" icon renders as a purpose-built line-art feature-tree glyph.
-        ui::fmPaneHeaderChip(st, title, titleIcon, paneCenterX);
-        ImGui::Separator();
+        // Title moved up into the tab-button row; the tree/body starts straight below the top
+        // divider under the buttons (no centered header chip, no extra separator here).
         switch (st.leftPaneTab) {
             case kLeftPaneExplorer:
                 // Wave 3: the workspace file browser (file_explorer.cpp).
@@ -733,8 +836,16 @@ void drawLeftPane(AppState& st,
                 break;
         }
         s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance
+        // Republish the FM column's ACTUAL content bottom (header + rows), overriding the full-window
+        // height stamped above — so the orientation triad only dodges right when the tree really
+        // reaches its row; otherwise the triad anchors at the far-left, underneath the column.
+        const float bodyContentH = ImGui::GetCursorPosY();   // child-local content extent
         if (bodyIndented) ImGui::Unindent(sbSize);
+        // Custom pill-on-track scrollbar (replaces the suppressed default bar) — same style as the
+        // doc-tab file strip. No-op unless the body overflows.
+        ui::drawWindowPillScrollbarV(surf);
         ImGui::EndChild();
+        publishOverlayColumnHeight(0, bodyTopScreenY + bodyContentH);   // absolute content bottom Y
         ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
         ImGui::PopStyleColor();  // ChildBg transparent
     }  // s_anim.bodyVisible()

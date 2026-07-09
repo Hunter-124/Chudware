@@ -532,12 +532,86 @@ void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bo
         dl->AddRectFilled(pillMin, pillMax, Palette::toU32(stripeCol), r);
     }
     if (selected) {
-        ImVec4 fill(p.accentSoft[0], p.accentSoft[1], p.accentSoft[2], 0.48f);
-        dl->AddRectFilled(pillMin, pillMax, ImGui::ColorConvertFloat4ToU32(fill), r);
-        dl->AddRect(pillMin, pillMax, Palette::toU32(p.accentMid), r, 0, std::max(1.0f, 1.0f * s));
-        dl->AddRectFilled(ImVec2(pillMin.x, pillMin.y + 3.0f * s),
-                          ImVec2(pillMin.x + 4.0f * s, pillMax.y - 3.0f * s),
-                          Palette::toU32(p.accent), 2.0f * s);
+        // Selection is now a thin GLOW BORDER (no fill slab, no left accent bar) — see
+        // glassSelectionGlow. A faint accent halo keeps the row legible without a heavy card.
+        glassSelectionGlow(dl, mn, mx, rounding, p.accent);   // outer rect; glow self-insets to match
+    }
+}
+
+void glassSelectionGlow(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, const float accent[4]) {
+    const float s = uiScale;
+    const float r = rounding * s;
+    // Self-inset by the SAME 2dp glassRowBackground/coloredRowWash use, so the glow border sits
+    // exactly on the pill edge (callers pass the identical OUTER rect to all three). Without this the
+    // glow sat 2px outside the frosted base and read as a doubled vertical edge on the left corner.
+    const float inset = 2.0f * s;
+    mn = ImVec2(mn.x + inset, mn.y + inset);
+    mx = ImVec2(mx.x - inset, mx.y - inset);
+    if (mx.x <= mn.x || mx.y <= mn.y) return;
+    // Crisp accent border on the pill edge.
+    float edge[4]; Palette::withAlpha(accent, edge, 0.92f);
+    dl->AddRect(mn, mx, Palette::toU32(edge), r, 0, std::max(1.0f, 1.3f * s));
+    // Soft glow = thin 1px rings stepping INWARD, each fainter. One px per ring (concentric radii
+    // r-1, r-2, …) so the rings tile without overlapping — the halo stays EVEN around the rounded
+    // corners instead of piling alpha onto the short corner arc (the old stacked wide strokes read
+    // as a heavy blob exactly where the curve starts). Inward (not outward) so it never bleeds into
+    // a neighbouring packed row.
+    const int rings = std::max(2, (int)std::lround(3.0f * s));
+    for (int i = 1; i <= rings; ++i) {
+        const float e = (float)i;
+        if (mx.x - e <= mn.x + e || mx.y - e <= mn.y + e) break;
+        float g[4]; Palette::withAlpha(accent, g, 0.16f * (float)(rings - i + 1) / (float)rings);
+        dl->AddRect(ImVec2(mn.x + e, mn.y + e), ImVec2(mx.x - e, mx.y - e),
+                    Palette::toU32(g), std::max(0.0f, r - e), 0, std::max(1.0f, 1.0f * s));
+    }
+}
+
+void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+                    const float tint[3], float strength, bool selected) {
+    const float s = uiScale;
+    const float rr = rounding * s;
+    // Self-inset by the SAME 2dp glassRowBackground uses, so the wash rect is always concentric with
+    // the frosted base drawn underneath it (callers pass the identical outer rect to both). This
+    // removes the seam where a non-nested corner of the base peeked out from under the wash.
+    const ImVec2 omn = mn, omx = mx;   // outer rect, handed to the glow (which self-insets)
+    const float inset = 2.0f * s;
+    mn = ImVec2(mn.x + inset, mn.y + inset);
+    mx = ImVec2(mx.x - inset, mx.y - inset);
+    if (mx.x <= mn.x || mx.y <= mn.y) return;
+
+    auto dye = [&](float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(tint[0], tint[1], tint[2], a));
+    };
+    // Translucent left->right tint over the frosted glass, bounded to the rounded pill: bright at
+    // the left edge (`strength`), fading to a faint right edge (~15% of strength, min 0.02).
+    const float aL = strength;
+    const float aR = std::max(0.02f, strength * 0.15f);
+    const float W  = mx.x - mn.x;
+    // Value of the linear aL->aR gradient at fractional x-position t (0=left, 1=right).
+    auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
+    // The rounded corner caps CANNOT carry a gradient (AddRectFilledMultiColor is square-cornered),
+    // so each cap is a flat fill whose color equals the gradient's value AT THE CAP'S INNER EDGE
+    // (x = mn+rr on the left, mx-rr on the right). The interior band then runs cap-to-cap using the
+    // same two boundary colors — so cap and band meet at an identical value with no bright flat
+    // block, which is what produced the hard vertical line at the corner (a Mach band).
+    const float tL = std::max(0.0f, std::min(1.0f, rr / W));
+    const float tR = std::max(0.0f, std::min(1.0f, (W - rr) / W));
+    const ImU32 cLcap = mixAt(tL);
+    const ImU32 cRcap = mixAt(tR);
+    const ImU32 cFaint = dye(aR);
+    // Faint tint fills the WHOLE rounded pill first (guarantees rounded corners everywhere).
+    dl->AddRectFilled(mn, mx, cFaint, rr);
+    if (mx.x - rr > mn.x + rr) {
+        dl->AddRectFilled(mn, ImVec2(mn.x + rr, mx.y), cLcap, rr, ImDrawFlags_RoundCornersLeft);
+        dl->AddRectFilled(ImVec2(mx.x - rr, mn.y), mx, cRcap, rr, ImDrawFlags_RoundCornersRight);
+        dl->AddRectFilledMultiColor(ImVec2(mn.x + rr, mn.y), ImVec2(mx.x - rr, mx.y),
+                                    cLcap, cRcap, cRcap, cLcap);
+    } else {
+        dl->AddRectFilled(mn, mx, dye(aL), rr);   // too narrow for caps+band: single bright fill
+    }
+    if (selected) {
+        const float glow[4] = {tint[0], tint[1], tint[2], 1.0f};
+        glassSelectionGlow(dl, omn, omx, rounding, glow);   // outer rect; glow self-insets to match
     }
 }
 
@@ -1002,6 +1076,74 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
     float borderCol[4];
     Palette::withAlpha(palette.glassBorder, borderCol, 0.75f * alpha);
     dl->AddRect(mn, mx, Palette::toU32(borderCol), r, 0, strokeW);
+}
+
+// "Pill on a hairline track" scrollbar — shared look for the doc-tab file strip and the
+// FeatureManager body (see ui_theme.h). A thin, low-alpha full-length track line with a thicker,
+// fully-rounded pill thumb riding on it. Pure draw; caller owns geometry + drag.
+void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackMax,
+                    float thumbA, float thumbB, bool vertical, bool hovered,
+                    const AdaptiveSurface& surf) {
+    const float s = ui::uiScale;
+    // The thin track runs down the CENTER of the band; the pill is thicker than the track so it
+    // reads as a pill with the track line "extending out" past both of its rounded ends.
+    const float trackThin = 2.0f * s;
+    const float pillThick = 6.0f * s;
+    const ImU32 trackCol = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.16f));
+    const ImU32 pillCol = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, hovered ? 0.58f : 0.34f));
+    if (vertical) {
+        const float cx = (trackMin.x + trackMax.x) * 0.5f;
+        dl->AddLine(ImVec2(cx, trackMin.y), ImVec2(cx, trackMax.y), trackCol, trackThin);
+        dl->AddRectFilled(ImVec2(cx - pillThick * 0.5f, thumbA),
+                          ImVec2(cx + pillThick * 0.5f, thumbB), pillCol, pillThick * 0.5f);
+    } else {
+        const float cy = (trackMin.y + trackMax.y) * 0.5f;
+        dl->AddLine(ImVec2(trackMin.x, cy), ImVec2(trackMax.x, cy), trackCol, trackThin);
+        dl->AddRectFilled(ImVec2(thumbA, cy - pillThick * 0.5f),
+                          ImVec2(thumbB, cy + pillThick * 0.5f), pillCol, pillThick * 0.5f);
+    }
+}
+
+// Custom vertical scrollbar for the current window/child (see ui_theme.h). Reads the live scroll
+// state, draws the pill overlay on the right edge, and drags to scroll. No-op if nothing overflows.
+void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
+    const float scrollMax = ImGui::GetScrollMaxY();
+    if (scrollMax <= 0.5f) return;   // fits — no bar (hidden entirely, not just faded)
+    const float s = ui::uiScale;
+    const ImVec2 wpos = ImGui::GetWindowPos();
+    const ImVec2 wsz = ImGui::GetWindowSize();
+    const float scrollY = ImGui::GetScrollY();
+    const float viewH = wsz.y;
+    const float contentH = viewH + scrollMax;
+
+    // Track hugs the right edge, inset a hair; a little top/bottom margin so the pill's rounded
+    // ends aren't flush with the window corners.
+    const float bandW = 10.0f * s;
+    const float margin = 3.0f * s;
+    const float trackX0 = wpos.x + wsz.x - bandW;
+    const float trackTop = wpos.y + margin;
+    const float trackBot = wpos.y + wsz.y - margin;
+    const float trackLen = trackBot - trackTop;
+
+    const float thumbLen = std::max(24.0f * s, trackLen * (viewH / contentH));
+    const float thumbTop = trackTop + (scrollY / scrollMax) * (trackLen - thumbLen);
+    const float thumbBot = thumbTop + thumbLen;
+
+    // Drag interaction — a fixed-position (screen-space) hit strip along the track, so it doesn't
+    // move with the scrolled content.
+    ImGui::SetCursorScreenPos(ImVec2(trackX0, trackTop));
+    ImGui::InvisibleButton("##pillscroll_v", ImVec2(bandW, trackLen));
+    const bool hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (ImGui::IsItemActive()) {
+        const float my = ImGui::GetIO().MousePos.y;
+        const float t = (my - trackTop - thumbLen * 0.5f) / std::max(1.0f, trackLen - thumbLen);
+        ImGui::SetScrollY(std::min(std::max(t, 0.0f), 1.0f) * scrollMax);
+    }
+    drawScrollPill(ImGui::GetWindowDrawList(), ImVec2(trackX0, trackTop),
+                   ImVec2(trackX0 + bandW, trackBot), thumbTop, thumbBot,
+                   /*vertical=*/true, hov, surf);
 }
 
 }  // namespace ui

@@ -630,6 +630,14 @@ static void flushPendingTreeOps(AppState& st) {
 static std::string s_renamingId;
 static char        s_renameBuf[128] = {0};
 
+// Empty folders created via "Add Folder" with no selection. Folders are display-only tags on
+// features (set_folder), so a folder with no members can't be derived from the tree — we keep the
+// blank ones here (session-only) and render them at the BOTTOM of the Features list as drop targets.
+// Once a feature is dragged in (tagged with the folder), it renders inline via the normal walk and we
+// drop it from this list. A pending drop requested by drag-and-drop this frame (fid → folder name).
+static std::vector<std::string> s_pendingFolders;
+static std::string s_dropFid, s_dropFolder;
+
 // C37-E: multi-selection (Ctrl+click). File-local; st.selectedFeatureId tracks the PRIMARY (last
 // clicked). Cleared on a plain click, on doc change (featureTreeResetTransient), and whenever the
 // selection is validated away. A row is "selected" if it is the primary OR in this set.
@@ -1160,6 +1168,13 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     ImVec2 rowPos = ImGui::GetCursorScreenPos();
     const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
+    // Drag source: drag a feature onto a folder header to file it into that folder. The click/drag
+    // threshold means a plain click still selects; only an actual drag starts this.
+    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
+        ImGui::SetDragDropPayload("FM_FEATURE", fid.c_str(), fid.size() + 1);
+        ImGui::Text("Move %s", c.name.c_str());
+        ImGui::EndDragDropSource();
+    }
     res.open = c.expandable ? nodeOpen : true;
     if (c.expandable) {
         // Paint the type icon just after the arrow (at the label-spacing start).
@@ -2107,7 +2122,9 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder,
         return clicked;
     };
     if (addFolder)
-        *addFolder = iconBtn(addX, "folder_new", addEn, "Add Folder\n(group the selected features)");
+        *addFolder = iconBtn(addX, "folder_new", addEn,
+                             "Add Folder\n(groups the selected features, or drops an empty folder to "
+                             "drag features into)");
     if (nameGroup)
         *nameGroup = iconBtn(ngX, "name_group_features", ngEn,
                              "Name & group features\n(auto-name every feature and sort into folders)");
@@ -2152,15 +2169,20 @@ static void createFolderFromSelection(AppState& st) {
         if (!fl.empty()) existingFolders.insert(fl);
         if (sel.count(fid)) members.push_back(fid);
     }
-    if (members.empty()) {
-        st.toast(ui::ToastLevel::Info, "Select one or more features to add to a folder");
-        return;
-    }
-    // Unique "Folder<N>" name.
+    // Unique "Folder<N>" name — unique across BOTH tagged folders and the blank pending ones.
     std::string name;
     for (int n = 1;; ++n) {
         name = "Folder" + std::to_string(n);
-        if (!existingFolders.count(name)) break;
+        if (!existingFolders.count(name) &&
+            std::find(s_pendingFolders.begin(), s_pendingFolders.end(), name) == s_pendingFolders.end())
+            break;
+    }
+    if (members.empty()) {
+        // Nothing selected → create an empty folder at the bottom (rendered from s_pendingFolders)
+        // that features can be dragged into.
+        s_pendingFolders.push_back(name);
+        st.toast(ui::ToastLevel::Info, "Added " + name + " — drag features into it");
+        return;
     }
     nlohmann::json ops = nlohmann::json::array();
     for (const auto& fid : members)
@@ -2421,6 +2443,20 @@ void drawFeatureTreeBody(AppState& st,
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &lpSurf : nullptr);
     const auto& pal = fmPalette();
     s_fmStripeIdx = 0;
+
+    // Apply a drag-and-drop "file into folder" requested last frame BEFORE we capture the tree below,
+    // so the rebuilt tree renders the feature under its new folder tag. Deferred here (not mid-walk)
+    // because applyTreeOps rebuilds the doc and would invalidate the walk's tree/features refs.
+    // NOTE: this only re-tags the feature (display grouping). Reordering model history so a folder's
+    // members become contiguous — only when geometry is unaffected — is still TODO (needs an engine
+    // shadow-eval; see work notes) and is intentionally NOT done here.
+    if (!s_dropFid.empty() && !s_dropFolder.empty()) {
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op", "set_folder"}, {"id", s_dropFid}, {"folder", s_dropFolder}});
+        applyTreeOps(st, ops, "move to folder");
+        s_dropFid.clear();
+        s_dropFolder.clear();
+    }
 
     // Compact vertical rhythm: the fixed header rows (Equations/Material/References/Origin/planes)
     // and the feature list inherit the theme's loose ItemSpacing.y (9dp), which read "double
@@ -2858,8 +2894,9 @@ void drawFeatureTreeBody(AppState& st,
                 auto fa = tree.find("features");
                 if (fa != tree.end() && fa->is_array()) fCount = (int)fa->size();
             }
-            const bool hasSel = !st.selectedFeatureId.empty() || !s_multiSel.empty();
-            const bool addEn = canDocTree && isPartDoc && hasSel;
+            // Add Folder no longer requires a selection: with features selected it groups them; with
+            // nothing selected it drops a blank folder at the bottom to drag features into (Hunter).
+            const bool addEn = canDocTree && isPartDoc;
             const bool ngEn  = canDocTree && isPartDoc && fCount > 0;
             bool addClicked = false, ngClicked = false;
             fmFeaturesHeader(&s_featSecOpen, addEn, ngEn, &addClicked, &ngClicked);
@@ -3306,6 +3343,15 @@ void drawFeatureTreeBody(AppState& st,
                                     ImGuiTreeNodeFlags_DefaultOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth |
                                     ImGuiTreeNodeFlags_FramePadding);
+                                // Drop target: dragging a feature here files it into this folder.
+                                if (ImGui::BeginDragDropTarget()) {
+                                    if (const ImGuiPayload* p =
+                                            ImGui::AcceptDragDropPayload("FM_FEATURE")) {
+                                        s_dropFid = (const char*)p->Data;
+                                        s_dropFolder = folder;
+                                    }
+                                    ImGui::EndDragDropTarget();
+                                }
                                 fmRowPillEnd(fldRect);
                                 ImGui::PopStyleVar();
                                 ImGui::PopStyleColor();
@@ -3334,6 +3380,47 @@ void drawFeatureTreeBody(AppState& st,
                             drawRollbackBarLine(st, canDocTree, barFid);
                     }
                     if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
+
+                    // ---- empty folders (Add Folder with no selection) render at the BOTTOM ----
+                    // Folders are display-only tags, so an empty one can't come from the tree; we keep
+                    // the blank ones in s_pendingFolders and show them here as drop targets. Once a
+                    // feature is filed into one it appears inline via the walk above, so we prune any
+                    // pending name that now has members.
+                    if (!s_pendingFolders.empty()) {
+                        std::set<std::string> tagged;
+                        for (const auto& f : *feat)
+                            if (f.is_object()) {
+                                std::string fl = jfld(f, "folder");
+                                if (!fl.empty()) tagged.insert(fl);
+                            }
+                        s_pendingFolders.erase(
+                            std::remove_if(s_pendingFolders.begin(), s_pendingFolders.end(),
+                                           [&](const std::string& pf) { return tagged.count(pf) > 0; }),
+                            s_pendingFolders.end());
+                        for (const auto& pf : s_pendingFolders) {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
+                            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(0, 4.0f * ui::uiScale));
+                            FmRowRect pRect = fmRowPill();
+                            treeIcon("body_folder", "[F]", 16.0f);
+                            ImGui::SameLine(0, 4 * ui::uiScale);
+                            ImGui::TreeNodeEx((pf + "  (empty)##pfld_" + pf).c_str(),
+                                ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_SpanFullWidth |
+                                ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                            if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload* p =
+                                        ImGui::AcceptDragDropPayload("FM_FEATURE")) {
+                                    s_dropFid = (const char*)p->Data;
+                                    s_dropFolder = pf;
+                                }
+                                ImGui::EndDragDropTarget();
+                            }
+                            fmRowPillEnd(pRect);
+                            ImGui::PopStyleVar();
+                            ImGui::PopStyleColor();
+                        }
+                    }
                     // Bar at the end → draw it after the last row.
                     if (barAtEnd)
                         drawRollbackBarLine(st, canDocTree, std::string());

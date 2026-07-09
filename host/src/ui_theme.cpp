@@ -1111,7 +1111,12 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
 // state, draws the pill overlay on the right edge, and drags to scroll. No-op if nothing overflows.
 void drawWindowPillScrollbarV(const AdaptiveSurface& surf) {
     const float scrollMax = ImGui::GetScrollMaxY();
-    if (scrollMax <= 0.5f) return;   // fits — no bar (hidden entirely, not just faded)
+    // Ignore sub-padding phantom overflow: a child with AlwaysUseWindowPadding + a fixed height can
+    // report a few px of ScrollMaxY even when the content visually fits (e.g. collapsed tree
+    // sections), which showed a spurious bar. Only show it for a real overflow bigger than the
+    // window's own bottom padding.
+    const float phantom = ImGui::GetStyle().WindowPadding.y + 4.0f * ui::uiScale;
+    if (scrollMax <= phantom) return;   // fits — no bar (hidden entirely, not just faded)
     const float s = ui::uiScale;
     const ImVec2 wpos = ImGui::GetWindowPos();
     const ImVec2 wsz = ImGui::GetWindowSize();

@@ -835,7 +835,10 @@ void drawLeftPane(AppState& st,
                 }
                 break;
         }
-        s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance
+        // Match drawWindowPillScrollbarV's phantom-overflow tolerance so the gutter indent is only
+        // reserved when a real bar actually shows (was: any sub-px overflow reserved the gutter).
+        s_bodyScrolled = ImGui::GetScrollMaxY() >
+                         (ImGui::GetStyle().WindowPadding.y + 4.0f * S);   // next frame's indent balance
         // Republish the FM column's ACTUAL content bottom (header + rows), overriding the full-window
         // height stamped above — so the orientation triad only dodges right when the tree really
         // reaches its row; otherwise the triad anchors at the far-left, underneath the column.

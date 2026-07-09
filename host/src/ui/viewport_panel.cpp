@@ -1714,8 +1714,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // spans the window width, so the lens shift below self-neutralizes (shift 0).
         ImGuiViewport* mainVp = ImGui::GetMainViewport();
         const float winTopY = ImGui::GetWindowPos().y;   // == dockspace top (central node fills it)
+        // Full-bleed height runs to the WINDOW bottom (== status-bar top), not the content-region
+        // bottom: the docked viewport's own WindowPadding.y inset cr1.y a few px above the window
+        // edge, leaving a thin strip of dead window background above the status bar (Hunter). The 3D
+        // image, the FBO (renderer.resize) and the projection all key off vh, so extending it keeps
+        // them consistent.
+        const float winBotY = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
         int vw = (int)mainVp->Size.x > 64 ? (int)mainVp->Size.x : 64;
-        int vh = (int)(cr1.y - winTopY) > 64 ? (int)(cr1.y - winTopY) : 64;
+        int vh = (int)(winBotY - winTopY) > 64 ? (int)(winBotY - winTopY) : 64;
         renderer.resize(vw, vh);
         // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
         // middle-drags to rotate (SolidWorks lets you orbit a sketch). s_sketchRotated latches that

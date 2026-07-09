@@ -54,8 +54,6 @@ static bool s_openChooser = false;
 // The strip never wraps. When the open tabs overflow the visible width we scroll them horizontally
 // and cap each overflowing edge with a "+N" indicator instead of hard-clipping the boundary tab.
 static float s_scrollX  = 0.0f;   // px of content hidden past the LEFT edge (0 = flush left)
-static float s_leftIndW = 0.0f;   // eased width of the left  "+N" indicator box (0 when none)
-static float s_rightIndW = 0.0f;  // eased width of the right "+N" indicator box (0 when none)
 
 // Forward decls (definitions below drawDocTabs, which calls them).
 void createNewDoc(AppState& st, int kindOrd);
@@ -206,59 +204,53 @@ static float measureTabW(const AppState::DocTab& t, float s) {
            padX * 0.5f;
 }
 
-// A "+N hidden files" indicator that caps an overflowing edge. Shares the file tab's glass-pill
-// shape, corner radius and height so the left/right caps read as a matched pair (the only difference
-// is the metaphor): the LEFT cap swaps the file icon for the "+N" count; the RIGHT cap wears an
-// iridescent, flame-like gradient that bleeds in from the right edge and organically consumes any
-// trailing tab text behind it, with the count sitting legibly inside the glow. Returns true if the
-// pill was clicked (caller pages the scroll toward that edge).
-static bool drawCountPill(AppState& st, ImDrawList* dl, const ImRect& rect,
-                          const ui::AdaptiveSurface& surf, int count, bool rightGlow, float s,
-                          const char* id) {
+// An ANIMATED iridescent flame glow capping an overflowing edge of the tab lane. Drawn OVER the
+// (clipped) tabs so it organically overtakes the trailing/leading filename under a moving light
+// effect rather than a hard cut or a dead box. Left and right are a matched pair — same look,
+// mirrored: `fromRight` bleeds in from the right edge; else from the left. The faded (inner) side is
+// transparent and the edge side is solid accent, with a travelling flame flicker + slow iridescent
+// hue drift (ImGui::GetTime, so it animates every frame). The "+N hidden" count floats legibly at
+// the glowing edge. Returns true when its paging hot-zone is clicked (caller pages toward that edge).
+static bool drawEdgeGlow(ImDrawList* dl, float edgeX, float y0, float y1, float glowW,
+                         bool fromRight, int count, const ui::AdaptiveSurface& surf, float s,
+                         const char* id) {
     const auto& pal = ui::palette;
-    const float r = 4.0f * s;
-    ImGui::PushID(id);
-    ImGui::SetCursorScreenPos(rect.Min);
-    const bool clicked = ImGui::InvisibleButton("##cap", rect.GetSize());
-    const bool hov = ImGui::IsItemHovered();
-    ImGui::PopID();
-
-    // Base glass pill — identical material to an inactive tab.
-    ui::glassPanel(dl, rect, hov ? ui::GlassLevel::Thin : ui::GlassLevel::UltraThin, 4.0f, surf);
+    const float tsec = (float)ImGui::GetTime();
+    const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
+    const float innerX = fromRight ? (edgeX - glowW) : (edgeX + glowW);
+    const float dir = fromRight ? 1.0f : -1.0f;   // mirror the flame travel so both lick inward
+    const int N = 18;
+    for (int i = 0; i < N; ++i) {
+        const float e0 = (float)i / N, e1 = (float)(i + 1) / N, em = (e0 + e1) * 0.5f;  // 0 inner→1 edge
+        const float xa = innerX + dir * e0 * glowW;
+        const float xb = innerX + dir * e1 * glowW;
+        const float lo = std::min(xa, xb), hi = std::max(xa, xb);
+        const float flick = 0.5f + 0.5f * std::sin(tsec * 3.4f + dir * em * 7.0f);
+        const float ramp = std::pow(em, 1.35f);                       // faint inner → solid edge
+        const float a = std::min(1.0f, (0.10f + 0.80f * ramp) * (0.70f + 0.30f * flick));
+        const float warm = 0.10f * ramp + 0.05f * flick;             // hue flicker warmer at the edge
+        const float g = ag * (0.90f + 0.06f * std::sin(tsec * 1.7f + em * 4.0f));  // iridescent drift
+        const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), g, ab, a));
+        dl->AddRectFilled(ImVec2(lo, y0), ImVec2(hi, y1), col);
+    }
 
     char lbl[16];
     std::snprintf(lbl, sizeof(lbl), "+%d", count < 0 ? 0 : count);
-    const ImU32 textCol = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
     const ImVec2 ts = ImGui::CalcTextSize(lbl);
-    const float cy = rect.Min.y + (rect.GetHeight() - ts.y) * 0.5f;
+    const float ty = y0 + (y1 - y0 - ts.y) * 0.5f;
+    const float tx = fromRight ? (edgeX - ts.x - 8.0f * s) : (edgeX + 8.0f * s);
+    dl->AddText(ImVec2(tx + 1.0f, ty + 1.0f), IM_COL32(0, 0, 0, 150), lbl);   // shadow for legibility
+    dl->AddText(ImVec2(tx, ty), ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lbl);
 
-    if (rightGlow) {
-        // Iridescent flame bleed from the right edge. Layered horizontal gradients (warm accent →
-        // transparent, right→left) so the trailing tab text behind it fades under a light effect
-        // rather than a hard cut. Alpha builds toward the right edge; the count rides on top.
-        const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
-        const int bands = 5;
-        const float w = rect.GetWidth();
-        for (int b = 0; b < bands; ++b) {
-            const float t0 = (float)b / bands, t1 = (float)(b + 1) / bands;
-            const float x0 = rect.Min.x + w * t0, x1 = rect.Min.x + w * t1;
-            // Iridescent shimmer: nudge the hue slightly warmer toward the edge for a flame feel.
-            const float warm = 0.10f * t1;
-            const ImU32 cl = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), ag, ab, 0.0f));
-            const ImU32 cr = ImGui::ColorConvertFloat4ToU32(
-                ImVec4(std::min(1.0f, ar + warm + 0.06f), ag * 0.92f, ab, 0.16f + 0.55f * t1));
-            dl->AddRectFilledMultiColor(ImVec2(x0, rect.Min.y), ImVec2(x1, rect.Max.y),
-                                        cl, cr, cr, cl);
-        }
-        // Count near the glowing edge.
-        dl->AddText(ImVec2(rect.Max.x - ts.x - 8.0f * s, cy), textCol, lbl);
-    } else {
-        // Left cap: "+N" sits where the file icon would, box styling otherwise identical.
-        dl->AddText(ImVec2(rect.Min.x + 10.0f * s, cy), textCol, lbl);
-    }
-
-    if (hov) ImGui::SetTooltip("%d more open document%s — click to reveal", count, count == 1 ? "" : "s");
-    (void)st;
+    // Paging hot-zone over the count (tabs allow overlap, so this later item wins its clicks).
+    const float zoneW = ts.x + 16.0f * s;
+    const float zx = fromRight ? (edgeX - zoneW) : edgeX;
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(ImVec2(zx, y0));
+    const bool clicked = ImGui::InvisibleButton("##pg", ImVec2(zoneW, y1 - y0));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%d more open document%s — click to reveal", count, count == 1 ? "" : "s");
+    ImGui::PopID();
     return clicked;
 }
 
@@ -514,47 +506,30 @@ float drawDocTabs(AppState& st, float availW) {
     const bool leftHidden  = overflow && s_scrollX > 0.5f;
     const bool rightHidden = overflow && s_scrollX < maxScroll - 0.5f;
 
-    // Ease each cap's width toward its target so it grows/shrinks smoothly as you scroll across the
-    // overflow threshold — the boundary box appears to animate down rather than pop. Fixed box wide
-    // enough for "+NN".
-    const float capW = 44.0f * s;
-    const float dt = ImGui::GetIO().DeltaTime;
-    const float k = std::min(1.0f, dt * 14.0f);   // ~exponential approach, frame-rate independent
-    s_leftIndW  += ((leftHidden  ? capW : 0.0f) - s_leftIndW)  * k;
-    s_rightIndW += ((rightHidden ? capW : 0.0f) - s_rightIndW) * k;
-    if (s_leftIndW  < 0.4f * s) s_leftIndW  = 0.0f;
-    if (s_rightIndW < 0.4f * s) s_rightIndW = 0.0f;
-
-    const float midL = laneL + s_leftIndW;
-    const float midR = laneR - s_rightIndW;
-
-    // Draw the tabs that fall FULLY inside the middle region; boundary/hidden tabs are represented by
-    // the caps (so nothing is hard-clipped mid-label). Count the hidden ones per side for the "+N".
+    // Draw the tabs clipped to the WHOLE lane; a partially-scrolled boundary tab stays drawn (the
+    // edge glow below fades it out organically instead of a hard cut or a dead box). Fully-off-lane
+    // tabs are skipped and tallied per side for the "+N hidden" count.
     int nLeft = 0, nRight = 0;
-    dl->PushClipRect(ImVec2(midL, bandT), ImVec2(std::max(midL, midR), bandB), true);
+    dl->PushClipRect(ImVec2(laneL, bandT), ImVec2(laneR, bandB), true);
     for (int i = 0; i < nTabs; ++i) {
         const float x = laneL + tabOff[i] - s_scrollX;   // screen x of this tab's left edge
         const float xr = x + tabWs[i];
-        if (xr <= midL + 0.5f)      { ++nLeft;  continue; }   // fully hidden to the left
-        if (x  >= midR - 0.5f)      { ++nRight; continue; }   // fully hidden to the right
-        if (x < midL - 0.5f)        { ++nLeft;  continue; }   // straddles left  → absorbed by cap
-        if (xr > midR + 0.5f)       { ++nRight; continue; }   // straddles right → absorbed by cap
-        drawOneTab(st, i, x, y0, barH, surf);
+        if (xr <= laneL + 0.5f) { ++nLeft;  continue; }   // fully hidden left of the lane
+        if (x  >= laneR - 0.5f) { ++nRight; continue; }   // fully hidden right of the lane
+        drawOneTab(st, i, x, y0, barH, surf);             // (partially) visible — clipped to the lane
     }
     dl->PopClipRect();
 
-    // Left cap: "+N" replacing the file icon; clicking pages the lane left.
-    if (s_leftIndW > 0.5f) {
-        const ImRect cap(ImVec2(laneL, y0), ImVec2(laneL + s_leftIndW, y0 + barH));
-        if (drawCountPill(st, dl, cap, surf, nLeft, /*rightGlow=*/false, s, "capL"))
-            s_scrollX = std::max(0.0f, s_scrollX - laneW * 0.8f);
-    }
-    // Right cap: glowing flame gradient consuming the trailing text; clicking pages the lane right.
-    if (s_rightIndW > 0.5f) {
-        const ImRect cap(ImVec2(laneR - s_rightIndW, y0), ImVec2(laneR, y0 + barH));
-        if (drawCountPill(st, dl, cap, surf, nRight, /*rightGlow=*/true, s, "capR"))
-            s_scrollX = std::min(maxScroll, s_scrollX + laneW * 0.8f);
-    }
+    // Animated iridescent flame glow over each overflowing edge — a matched, mirrored pair. It
+    // overtakes the trailing (right) / leading (left) filename under a moving light effect, with the
+    // "+N hidden" count floating at the glowing edge; clicking it pages the lane that way.
+    const float glowW = 56.0f * s;
+    if (leftHidden &&
+        drawEdgeGlow(dl, laneL, y0, y0 + barH, glowW, /*fromRight=*/false, nLeft, surf, s, "glowL"))
+        s_scrollX = std::max(0.0f, s_scrollX - laneW * 0.8f);
+    if (rightHidden &&
+        drawEdgeGlow(dl, laneR, y0, y0 + barH, glowW, /*fromRight=*/true, nRight, surf, s, "glowR"))
+        s_scrollX = std::min(maxScroll, s_scrollX + laneW * 0.8f);
 
     // Thin horizontal pill-on-track scrollbar overlaying the TOP edge of the lane — only when
     // overflowing. Shares ui::drawScrollPill with the FeatureManager body so the look matches.

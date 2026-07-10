@@ -100,7 +100,7 @@ graph TD
     T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::done
     T_FIN15["T-FIN15: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract"]:::done
     T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::done
-    T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::doing
+    T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::done
     T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::done
     T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::done
     T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::done

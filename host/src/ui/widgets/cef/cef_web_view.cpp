@@ -44,6 +44,7 @@
 #include "include/cef_registration.h"
 #include "include/cef_version.h"                     // CHROME_VERSION_* for Sec-CH-UA
 #include "include/wrapper/cef_helpers.h"   // CEF_REQUIRE_UI_THREAD
+#include "include/cef_task.h"               // CefPostTask / CefTask — hop onto TID_UI
 
 // NOTE: do NOT include core/app_state.h here — CEF's net-error headers define
 // ERR_NONE, which collides with app_state.h's enum. We only need st.rpc, reached
@@ -80,6 +81,23 @@ bool cefTrace() {
             std::fflush(stderr);                                         \
         }                                                                \
     } while (0)
+
+// Run a closure on the CEF browser-process UI thread. CefBrowserHost::CreateBrowser
+// is documented TID_UI-only ("can only be called on the browser process UI thread")
+// and CefRequestContext::CreateContext returns NULL off it — so the create path must
+// hop back to TID_UI when a caller lands off-thread (see openOrNavigate). TID_UI is
+// drained by our external message pump, so a posted task runs on the next pump tick.
+class UiClosureTask : public CefTask {
+public:
+    explicit UiClosureTask(std::function<void()> fn) : fn_(std::move(fn)) {}
+    void Execute() override { if (fn_) fn_(); }
+private:
+    std::function<void()> fn_;
+    IMPLEMENT_REFCOUNTING(UiClosureTask);
+};
+inline void post_to_ui(std::function<void()> fn) {
+    CefPostTask(TID_UI, new UiClosureTask(std::move(fn)));
+}
 
 // DIAGNOSTIC: capture the real reCAPTCHA / login network verdict. OFF by default
 // (opt-in AI_CAD_CEF_NETLOG=1) because it enables the CDP Network domain, which we
@@ -699,6 +717,25 @@ struct CefWebView::Impl {
     // lives (CEF's jar is transient staging; see cache_root()).
     void openOrNavigate(const std::string& url, const std::string& cacheDir,
                         bool startedAtAuth) {
+        // Marshal onto TID_UI when called off-thread. The original design assumed the
+        // rpc_start_url callback that drives open()→doOpen always ran on the GL/UI
+        // thread (== TID_UI under the external pump). Since the daemon-timeout IPC
+        // rework the worker RPC callback can instead complete on an IO/worker thread,
+        // and then createBrowser's CreateContext/CreateBrowser run off TID_UI —
+        // CreateContext returns NULL → CreateBrowser 0 → OnAfterCreated never fires →
+        // the panel hangs on "Loading" forever (root cause, confirmed in cef-trace:
+        // every onUiThread=1 create succeeds, every onUiThread=0 fails). Capture the
+        // shared state by value so the detached guard is safe even if the widget is
+        // torn down before the hop runs (same-thread with ~Impl, so no data race).
+        if (!CefCurrentlyOn(TID_UI)) {
+            auto st = s;
+            Impl* self = this;
+            post_to_ui([self, st, url, cacheDir, startedAtAuth]() {
+                if (st->detached) return;
+                self->openOrNavigate(url, cacheDir, startedAtAuth);
+            });
+            return;
+        }
         CEF_REQUIRE_UI_THREAD();
         if (client && client->browser()) {
             { std::lock_guard<std::mutex> lk(s->mtx); s->startedAtAuth = startedAtAuth; }

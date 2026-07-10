@@ -15,6 +15,8 @@
 #   4. engine + agent pytest   — only if a runtime venv / pytest is discoverable; SKIP with a
 #                                 clear reason if the Python runtime is not provisioned.
 #   5. host shot smoke         — AI_CAD_SHOT=m1 headless screenshot via xvfb-run.
+#   4.7 T-FIN25 sensor-node golden demo — sim/fw content smoke (scripts/demo_sensor_node.py);
+#                                 Renode/OpenFOAM-gated legs SKIP honestly via marker files.
 #   6. PASS/SKIP summary.
 #
 # SKIP semantics: OCCT-absent and venv-absent are environment SKIPs, not failures — the gate
@@ -705,6 +707,76 @@ stage_modeling() {
     fi
 }
 
+# ---- Stage 4.7: T-FIN25 sensor-node golden demo (sim/fw content smoke) ------
+# Default ON (bounded <5 min). Legs that need Renode/OpenFOAM write SKIP markers
+# when those binaries are absent — never fake a pass. Opt out with AICAD_SKIP_FIN25=1.
+# Fast dry thermal: AICAD_FIN25_THERMAL_DRY=1. Artifacts under $GATE_TMP/fin25/.
+stage_fin_content() {
+    echo "=== [4.7/6] T-FIN25 sensor-node golden demo ==="
+    if [ "${AICAD_SKIP_FIN25:-}" = "1" ]; then
+        record "fin25 golden demo   SKIP    AICAD_SKIP_FIN25=1"
+        echo "  SKIP: AICAD_SKIP_FIN25=1"
+        return 0
+    fi
+    if [ ! -f "$REPO/scripts/demo_sensor_node.py" ]; then
+        record "fin25 golden demo   SKIP    scripts/demo_sensor_node.py missing"
+        echo "  SKIP: demo script missing"
+        return 0
+    fi
+
+    local mcp_venv="$HOME/.local/share/AI-CAD/mcp-venv/bin/python"
+    local venv_py=""
+    if [ -x "$mcp_venv" ]; then
+        venv_py="$mcp_venv"
+    elif command -v python3 >/dev/null 2>&1; then
+        venv_py="python3"
+    else
+        record "fin25 golden demo   SKIP    no python3"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+
+    # Pin a sim-enabled engine when present (motion/thermal FEA); never invent one.
+    if [ -z "${AI_CAD_LIBAICAD:-}" ]; then
+        for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" \
+                    "$REPO/core/build-linux/bin/libaicad.so"; do
+            [ -f "$cand" ] && export AI_CAD_LIBAICAD="$cand" && break
+        done
+    fi
+
+    local out="${GATE_TMP}/fin25"
+    mkdir -p "$out"
+    export AICAD_FIN25_OUT="$out"
+    export AICAD_FIN25_MARKERS="$out/markers"
+    export AICAD_PROJECT_DIR="${AICAD_PROJECT_DIR:-$out/project}"
+
+    local rc=0
+    if ! PYTHONPATH="$REPO:${PYTHONPATH:-}" \
+            "$venv_py" "$REPO/scripts/demo_sensor_node.py" \
+            > "${GATE_TMP}/fin25.out" 2>&1; then
+        rc=$?
+    fi
+
+    # Summarise per-leg markers (PASS/FAIL/SKIP) for the gate line.
+    local n_pass=0 n_fail=0 n_skip=0
+    if [ -d "$out/markers" ]; then
+        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/fin25.out)"
+
+    if [ "$rc" -eq 0 ] && [ "$n_fail" = "0" ]; then
+        record "fin25 golden demo   PASS    $detail"
+        echo "  PASS ($detail)"
+    else
+        record "fin25 golden demo   FAIL    exit=$rc $detail"
+        echo "  FAIL: fin25 golden demo (see ${GATE_TMP}/fin25.out):"
+        tail -n 20 "${GATE_TMP}/fin25.out" | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 HOST_BUILD_OK=0
@@ -719,6 +791,7 @@ stage_appimage_smoke
 stage_pytest
 stage_vv
 stage_modeling
+stage_fin_content
 stage_ui_imgui
 stage_bench
 stage_perf

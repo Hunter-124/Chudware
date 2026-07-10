@@ -2,8 +2,8 @@
 id: T-FIN25
 title: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled
 workstream: FIN
-owner: unassigned
-status: todo
+owner: grok
+status: done
 branch: task/T-FIN25-e2e-golden-demo
 depends_on: [T-FIN3, T-FIN6, T-FIN9, T-FIN11, T-FIN17, T-FIN23, T-FIN24]
 lane: simulation
@@ -35,3 +35,6 @@ the sim/fw content smoke (fast paths only; OpenFOAM/renode-gated legs skip hones
 - Gate stage added; renode/OpenFOAM-dependent legs skip with honest markers when absent
 - Total gate cost bounded (<5 min for the fast path)
 - Demo doubles as the living worked example referenced from cad_guide
+
+## Progress log
+- 2026-07-10 20:38 UTC [grok] scripts/demo_sensor_node.py + gate stage_fin_content + docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Local run: 12 pass / 0 fail (fw_sim SKIP marker for Renode). Heatsink HS-TO220-CLIP-19 met 85 C Tj.

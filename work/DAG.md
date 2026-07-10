@@ -109,7 +109,7 @@ graph TD
     T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::done
     T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::done
     T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::done
-    T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::todo
+    T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::done
     T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
     T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::done
     T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::done

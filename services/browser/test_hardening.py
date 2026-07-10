@@ -113,6 +113,31 @@ def test_classifier_ignores_invisible_recaptcha_on_magento_catalog():
         html, "https://www.anaheimautomation.com/catalogsearch/result/?q=stepper") is None
 
 
+def test_classifier_ignores_passive_cf_challenge_platform_on_storefront():
+    # Cloudflare injects the passive `challenge-platform` script into ordinary
+    # BigCommerce/WooCommerce storefront pages (surpluscenter, baileyhydraulics
+    # live-probe 2026-07-10) with no interstitial shown. That script alone, on a
+    # 200-OK page full of real product cards, is library presence — not a wall.
+    html = (
+        '<html><body><ul class="productGrid">'
+        '<li class="product"><article class="card"><a href="/gear-pump/">Gear Pump</a>'
+        '</article></li></ul>'
+        '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1"></script>'
+        '</body></html>'
+    )
+    assert challenge.classify_challenge(
+        html, "https://www.surpluscenter.com/search.php?search_query=pump") is None
+
+
+def test_classifier_still_flags_cf_challenge_platform_with_interstitial():
+    # A REAL Cloudflare wall carries interstitial text alongside challenge-platform —
+    # the passive-script escape above must not swallow it.
+    html = ('<html><head><title>Just a moment...</title></head><body>'
+            '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1"></script>'
+            '</body></html>')
+    assert challenge.classify_challenge(html, "https://www.thomsonlinear.com/") == "captcha"
+
+
 def test_classifier_ignores_magento_refresh_captcha_module():
     # Magento ships `Magento_PaypalCaptcha/js/model/skipRefreshCaptcha.js`, whose name
     # contains the substring "refres·hCaptcha" — it must NOT false-match hCaptcha.

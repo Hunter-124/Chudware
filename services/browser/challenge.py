@@ -150,6 +150,16 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
         if (recaptcha_only and invisible_badge and "recaptcha/api2/bframe" not in hay
                 and not has_interstitial):
             return None
+        # Cloudflare injects the PASSIVE `challenge-platform` script into many
+        # ORDINARY pages (BigCommerce storefronts, WooCommerce shops, …) without ever
+        # showing an interstitial. That script ALONE — no "just a moment"/cf_chl_
+        # interstitial text, no other captcha markup — is library presence, not a
+        # wall (the CF analogue of the invisible reCAPTCHA badge above). A real CF
+        # challenge always carries interstitial text (_INTERSTITIAL_CF_MARKERS), which
+        # keeps has_interstitial True and still classifies below.
+        if (passive_widgets and not has_interstitial
+                and all(m == "challenge-platform" for m in hit_markers)):
+            return None
         # Login forms often embed Turnstile/reCAPTCHA widgets — not a full-page CF wall.
         if (_is_auth_url(u) and _login_form_on_page(hay) and not has_interstitial
                 and not substantive and passive_widgets):

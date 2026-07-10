@@ -1,5 +1,28 @@
 # GUI (ImGui desktop rewrite + viewport + framework-agnostic seam)
 
+> ⚠️ **STALE — the `ui/imgui` / `ui/abstract` (AI-CAD2) target below is RETIRED.** Per
+> `build.sh`, `host/` is the single cross-platform GUI target; `ui/imgui` no longer exists on
+> disk (verified 2026-07-10). Do NOT send agents to `ui/imgui`. For any real GUI change use the
+> **gui-orchestrator** skill (`.claude/skills/gui-orchestrator/SKILL.md`) and its dispatch
+> table. Real entry points now:
+> - Title bar / OS-border chips + workspace tabs: `host/src/ui/title_bar.cpp` (`drawTitleBar`,
+>   `drawChipAt`; procedural tab glyphs in `drawTbIcon`/`TbIcon`; workspace tabs also blit
+>   raster atlas tiles via a `rasterCell` field on `kTabs` — `ui::getIcon(cell,32)` +
+>   `AddImage`, glyph fallback).
+> - Ribbon tabs/buttons/groups: `host/src/ui/widgets/ribbon.cpp` (`drawRibbon`); command table
+>   `host/src/ui/ribbon_def.cpp`.
+> - Theme / liquid-glass helpers: `host/src/ui_theme.{h,cpp}` — `glassRowBackground`,
+>   `coloredRowWash`, `glassSelectionGlow`, `glassBackground` (title bar + ribbon share these
+>   for the gradient-glass + accent-wash look).
+> - Icons: procedural line-art `assets/make_icons.py`; engine-rendered raster tiles
+>   `scripts/icon_pipeline.py` (RECIPES) + `scripts/cam_toolpath_icons.py` (toolpaths) +
+>   `scripts/fea_result_icons.py` (deformed-FEA tile); atlas `assets/icons/atlas*.{png,json}`
+>   (`raster_only`); C++ loader `host/src/ui/icons.cpp` (`getIcon`). Ribbon/tree/tab icons all
+>   resolve by name, so replacing a glyph cell with a raster tile under the same name needs no
+>   C++ change.
+> The rest of this file describes the abandoned migration and is kept only for historical DAG
+> context.
+
 Scope: ui/imgui/**, ui/abstract/**, ui/viewport/** (modular GUI rewrite: framework-agnostic view-model/commands/panel-specs seam, ImGui desktop app, shared OpenGL pipeline scaffold)
 Contracts: docs/GUI_MIGRATION_DAG.md, docs/HANDOFF_GUI_OVERHAUL.md, docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md
 

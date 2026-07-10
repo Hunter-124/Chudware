@@ -13,7 +13,8 @@ struct AppState;
 namespace ui {
 
 // Draw the profiler window when st.showProfilerWindow is true (no-op otherwise). Call once per
-// frame from the main draw loop, alongside the other panels/dialogs.
+// frame from the main draw loop, alongside the other panels/dialogs. While open, also draws a
+// labeled live FPS counter (window header + top-right overlay).
 void drawProfilerWindow(AppState& st);
 
 }  // namespace ui

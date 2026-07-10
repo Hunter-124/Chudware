@@ -804,7 +804,28 @@ void ensureMeshLoader() {
     g_meshQuit = false;
     g_meshThread = std::thread(meshLoaderMain);
 }
+
+void stopMeshLoaderThread() {
+    if (!g_meshStarted) return;
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        g_meshQuit = true;
+        g_meshQueue.clear();
+    }
+    g_meshCv.notify_all();
+    if (g_meshThread.joinable()) g_meshThread.join();
+    g_meshStarted = false;
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        g_meshReady.clear();
+    }
+}
 }  // namespace
+
+// T-PERF3/10: join the loader before process exit. A joinable static std::thread
+// dtor calls std::terminate ("terminate called without an active exception") —
+// seen as a full-app crash when teardown races vendor-browser / CEF exit paths.
+void AppState::stopMeshLoader() { stopMeshLoaderThread(); }
 
 // Commit a parsed DocMesh onto the GL-side state (setMeshes / id-pass / pick caches).
 // Shared by the sync loadDocMesh path and drainMeshLoads. Requires GL context.

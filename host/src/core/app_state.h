@@ -1388,6 +1388,8 @@ struct AppState {
     // thread; no-ops empty paths.
     void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false);
     void drainMeshLoads();   // GL thread, once per frame
+    // Join the async mesh-loader thread (call once on run_gui teardown before exit).
+    void stopMeshLoader();
     uint64_t meshGen() const { return meshGen_.load(); }
 
     // Drop shaded mesh + pick GPU buffers when the active doc has no tessellation (empty model /

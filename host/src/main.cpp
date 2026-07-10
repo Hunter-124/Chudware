@@ -420,16 +420,19 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 #ifdef AI_CAD_ENABLE_CEF
-    // T-PERF10: CEF lazy init. Cold GUI launch no longer pays for CefInitialize
-    // (~hundreds of ms + threads) unless a web surface is opened. Headless CEF
-    // modes above still call initialize() themselves. Opt into the old eager path
-    // with AI_CAD_CEF_EARLY=1 (also useful if a platform needs CefInitialize
-    // before GLFW — see docs/SESSION_VERIFY). stash_args already ran above so a
-    // later initialize() still has a clean argv.
-    if (const char* early = std::getenv("AI_CAD_CEF_EARLY");
-        early && early[0] && early[0] != '0') {
-        ui::cef::initialize();
-    }
+    // GUI path always boots CEF here — before run_gui / GLFW. Chromium must own
+    // display + signal setup first; initializing after GLFW (true "lazy" first-
+    // web-surface) aborts on Linux vendor open (SIGABRT / joinable-thread
+    // terminate on the way out). Headless CEF modes above already returned.
+    // Experimental only: AI_CAD_CEF_LAZY=1 skips cold init (CefWebView::open
+    // still calls initialize()); do not use for vendor sign-in.
+    const bool cefLazy = [] {
+        const char* v = std::getenv("AI_CAD_CEF_LAZY");
+        return v && v[0] && v[0] != '0';
+    }();
+    // AI_CAD_CEF_EARLY=1 remains accepted as an alias for "eager" (no-op when
+    // lazy is unset). Prefer leaving both unset for the production path.
+    if (!cefLazy) ui::cef::initialize();
 #endif
     if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
         // Headless UI capture. An explicit output path is optional; when omitted (the common

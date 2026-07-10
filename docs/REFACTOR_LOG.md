@@ -1072,3 +1072,11 @@ path, field-eval SCLR AICMs, and sim overlay AICMs now publish via `aicm_handoff
 `/tmp/aicad_cpp_docs` / `aicad_overlay_*` files. `aicad_geom_occt` links
 `aicad_util` for overlay publish. Joint re-verify: lifecycle still 0→10→0 with
 0 new `/tmp/aicad_cpp_docs` files; m1 smoke no CEF init lines; profiler ~2k/2s.
+
+**2026-07-10 — joint-verify fixes (CEF eager + mesh join + FPS).** Vendor
+browser open crashed (`terminate called without an active exception` /
+`std::thread::~thread` on exit): CEF lazy-after-GLFW is not viable on this
+stack — restore eager `CefInitialize` before `run_gui` (opt-out
+`AI_CAD_CEF_LAZY=1` only). Join T-PERF3 mesh-loader thread on `run_gui`
+teardown. Performance profiler window shows labeled live FPS (header +
+top-right overlay) while open.

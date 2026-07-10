@@ -363,6 +363,22 @@ void drawProfilerWindow(AppState& st) {
         pushText(st.profilerRunning ? pal.statusOk : pal.textDim);
         ImGui::TextUnformatted(st.profilerRunning ? "  [running]" : "  [idle]");
         ImGui::PopStyleColor();
+        // Live GUI frame rate (ImGui Framerate) — labeled so Evaluate > Performance
+        // always shows FPS while this window is open (H-B1 joint verify).
+        {
+            const float fps = ImGui::GetIO().Framerate;
+            ImGui::SameLine(0, M::px(16));
+            pushText(pal.textDim);
+            ImGui::TextUnformatted("FPS");
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, M::px(6));
+            pushText(fps >= 45.f ? pal.statusOk : (fps >= 25.f ? pal.statusWarn : pal.statusErr));
+            ImGui::Text("%.1f", fps);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "GUI frames per second (ImGui). Not the sampling-profiler tick rate.");
+        }
         ImGui::Separator();
 
         // ---- controls ----
@@ -468,6 +484,34 @@ void drawProfilerWindow(AppState& st) {
     ImGui::End();
     ui::popGlassWindowStyle();
     st.showProfilerWindow = open;  // window close box drives the AppState flag
+
+    // Corner overlay — always-on-top labeled FPS while the Performance profiler
+    // window is open so drag/rebuild interactivity is visible without hunting
+    // the window header (H-B1).
+    if (st.showProfilerWindow) {
+        const ImGuiViewport* mvp = ImGui::GetMainViewport();
+        const float fps = ImGui::GetIO().Framerate;
+        const ImVec2 pad(M::px(12), M::px(12));
+        ImGui::SetNextWindowPos(
+            ImVec2(mvp->WorkPos.x + mvp->WorkSize.x - pad.x, mvp->WorkPos.y + pad.y),
+            ImGuiCond_Always, ImVec2(1.f, 0.f));
+        ImGui::SetNextWindowBgAlpha(0.72f);
+        const ImGuiWindowFlags flags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("##perf_fps_overlay", nullptr, flags)) {
+            pushText(pal.textDim);
+            ImGui::TextUnformatted("FPS");
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, M::px(6));
+            pushText(fps >= 45.f ? pal.statusOk : (fps >= 25.f ? pal.statusWarn : pal.statusErr));
+            ImGui::Text("%.1f", fps);
+            ImGui::PopStyleColor();
+        }
+        ImGui::End();
+    }
 }
 
 }  // namespace ui

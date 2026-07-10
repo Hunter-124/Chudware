@@ -800,7 +800,9 @@ CefWebView::~CefWebView() {
 }
 
 void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
-    // T-PERF10: first web surface pays for CefInitialize; cold launch skips it.
+    // Prefer cold-start initialize() in main (before GLFW). This is a safety
+    // net for AI_CAD_CEF_LAZY=1 / re-open after shutdown — late init after
+    // GLFW is unsupported for vendor sign-in on Linux.
     if (!cef::initialize()) {
         std::lock_guard<std::mutex> lk(impl_->s->mtx);
         impl_->s->starting = false;

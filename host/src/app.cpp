@@ -3649,6 +3649,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
     ui::destroyCursors();       // W1-B: free the GLFW standard cursors
     st.rpc.shutdown();          // C39: drop pending async calls + abort the in-flight one
+    st.stopMeshLoader();        // T-PERF3: join mesh thread before static dtors (avoid terminate)
     st.worker.stop();
     simClient.stop();  // C19: shut down the second worker process
 #ifdef AI_CAD_ENABLE_CEF

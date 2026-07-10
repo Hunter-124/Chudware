@@ -413,6 +413,35 @@ static nlohmann::json dimJson(const PMField& f) {
 
 // ---- open / close ---------------------------------------------------------
 
+// Index of `value` among a combo def's '|'-separated option values (-1 if absent).
+static int pmComboIndexOf(const PMFieldDef& d, const std::string& value) {
+    const std::string opts = d.comboOptions ? d.comboOptions : "";
+    int cur = 0; size_t start = 0;
+    while (start <= opts.size()) {
+        size_t bar = opts.find('|', start);
+        if (opts.substr(start, bar - start) == value) return cur;
+        ++cur;
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return -1;
+}
+
+// Thread auto-size: standard sizes the thread form's `size` combo offers, with the
+// nominal major Ø + coarse pitch (mm) used to match a picked cylinder's diameter.
+// Coarse-series only — fine variants share the major Ø, so the coarse default wins
+// (SolidWorks behaviour); the user can still switch to fine in the dropdown.
+struct PMThreadSize { const char* value; double major; double pitch; bool metric; };
+static const PMThreadSize kPmThreadSizes[] = {
+    {"M3", 3.0, 0.50, true},   {"M4", 4.0, 0.70, true},   {"M5", 5.0, 0.80, true},
+    {"M6", 6.0, 1.00, true},   {"M8", 8.0, 1.25, true},   {"M10", 10.0, 1.50, true},
+    {"M12", 12.0, 1.75, true}, {"M16", 16.0, 2.00, true}, {"M20", 20.0, 2.50, true},
+    {"M24", 24.0, 3.00, true},
+    {"#10-24", 4.826, 1.05833, false},  {"1/4-20", 6.350, 1.27000, false},
+    {"5/16-18", 7.938, 1.41111, false}, {"3/8-16", 9.525, 1.58750, false},
+    {"1/2-13", 12.700, 1.95385, false},
+};
+
 static void initField(PMField& f, const PMFieldDef& d, bool ips) {
     f.def = &d;
     switch (d.kind) {
@@ -483,6 +512,18 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
         initField(fields_[i], form->fields[i], ips_);
+
+    // Thread form in an IPS document defaults to an SAE size (1/4-20 UNC) instead of
+    // the metric first option; metric docs keep the M-series default (combo index 0).
+    if (ips_ && form_->type && std::string(form_->type) == "thread") {
+        for (auto& f : fields_) {
+            if (f.def->kind != PMFieldKind::Combo || std::strcmp(f.def->key, "size") != 0)
+                continue;
+            int idx = pmComboIndexOf(*f.def, "1/4-20");
+            if (idx >= 0) f.comboIndex = idx;
+            break;
+        }
+    }
 
     // If a mode/op combo exists, preselect it from the command (boss/cut split button; boolean
     // combine/subtract/intersect). Match mode_ against the combo's option VALUES so any N-way combo
@@ -1059,6 +1100,52 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind,
     well->picks.push_back(e);
     well->wellDangling = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
+
+    // THREAD AUTO-SIZE: picking a cylindrical face into the thread form's target well
+    // snaps the Size combo to the nearest standard thread for that diameter (a 5/16
+    // shaft → 5/16-18). The pick selector already carries the kernel-computed radius
+    // (GSL Stage 0), so no engine round-trip is needed. A shaft is compared against the
+    // MAJOR Ø (turned slightly undersize is expected); a bore (concavity=="bore")
+    // against the basic minor Ø. Sizes from the doc's unit system are preferred
+    // (SAE in IPS, metric in MMGS), falling back to the other family on a clear miss.
+    if (form_ && form_->type && std::string(form_->type) == "thread" &&
+        std::strcmp(well->def->key, "target_face") == 0 &&
+        selector.value("surf", std::string()) == "cylinder" &&
+        selector.contains("radius") && selector["radius"].is_number()) {
+        bool customSize = false;
+        for (const auto& f : fields_)
+            if (std::strcmp(f.def->key, "custom_size") == 0) customSize = f.checkValue;
+        if (!customSize) {
+            const double dia = 2.0 * selector["radius"].get<double>();
+            const bool bore = selector.value("concavity", std::string()) == "bore";
+            auto bestIn = [&](bool metric, const PMThreadSize*& hit, double& err) {
+                for (const auto& t : kPmThreadSizes) {
+                    if (t.metric != metric) continue;
+                    // Reference Ø this pick should measure near: major for a shaft,
+                    // ISO/UN basic minor (major − 1.0825·pitch) for a bore.
+                    const double ref = bore ? t.major - 1.0825 * t.pitch : t.major;
+                    const double d = std::abs(dia - ref);
+                    if (d < err) { err = d; hit = &t; }
+                }
+            };
+            const PMThreadSize* hit = nullptr; double err = 1e300;
+            bestIn(!ips_, hit, err);
+            // Accept within a band that covers undersize-turned shafts / drilled bores
+            // but rejects a clearly off-family diameter; else try the other family.
+            auto tol = [](const PMThreadSize& t) { return std::max(0.25, 0.05 * t.major); };
+            if (!hit || err > tol(*hit)) { hit = nullptr; err = 1e300; bestIn(ips_, hit, err); }
+            if (hit && err <= tol(*hit)) {
+                for (auto& f : fields_) {
+                    if (f.def->kind != PMFieldKind::Combo ||
+                        std::strcmp(f.def->key, "size") != 0) continue;
+                    int idx = pmComboIndexOf(*f.def, hit->value);
+                    if (idx >= 0) f.comboIndex = idx;
+                    break;
+                }
+            }
+        }
+    }
+
     advanceWellAfterFill(well);
     return true;
 }
@@ -1577,24 +1664,14 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             }
         }
     }
-    // THREAD live-preview PROXY: a real helical thread cut is dominated by the many-turn
-    // boolean (a fine, long thread is ~7-10s — the fuzzy path). While the user is still
-    // tweaking the form in the PM we don't need the full run; we shorten the LENGTH to a
-    // few turns so the preview lands in ~1s, then restore the true length on commit (OK).
-    // NOTE: shortening the length (not capping `turns`) is what keeps it fast — a turns-cap
-    // truncates the coil MID-BODY, whose floating end cap forces the slow fuzzy boolean;
-    // a shorter COMPLETE thread overhangs cleanly and the fast exact boolean succeeds.
-    if (!committing_ && form_ && std::string(form_->type) == "thread") {
-        // `length` is emitted as {"value":N,"expr":...}; shrink the value for the proxy and
-        // drop any expr bind (a shortened preview can't honour the real expression).
-        constexpr double kPreviewThreadLen = 10.0;   // mm — a short but complete proxy run
-        if (params.contains("length") && params["length"].is_object() &&
-            params["length"].contains("value") && params["length"]["value"].is_number() &&
-            params["length"]["value"].get<double>() > kPreviewThreadLen) {
-            params["length"]["value"] = kPreviewThreadLen;
-            params["length"]["expr"]  = nullptr;
-        }
-    }
+    // THREAD live-preview DRAFT: a real helical thread cut costs 1–3 s of intrinsic OCCT
+    // boolean (profiled floor), which is unusable per drag tick. While the form is still
+    // being tweaked we send params.preview=true; the engine's thread compiler then renders
+    // a CHEAP turned band (~ms) showing the exact start/length/flip extent instead of the
+    // helical geometry. commit() forces a full re-apply with committing_=true (flag
+    // suppressed), so real geometry always replaces the draft before the feature is kept.
+    if (!committing_ && form_ && std::string(form_->type) == "thread")
+        params["preview"] = true;
     feature["params"] = params;
     if (!refs.empty()) feature["refs"] = refs;
 }

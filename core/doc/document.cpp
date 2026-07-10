@@ -51,6 +51,9 @@
 #include <BRepGProp.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>  // thread draft-preview band tool
+#include <BRepAlgoAPI_Cut.hxx>           // thread draft-preview band boolean
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepTools.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -6686,6 +6689,52 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             "the end of the face, or the face has no axial extent");
                     axis_loc = cyl_loc.Translated(ad_v.Multiplied(s_start));
 
+                    // DRAFT PREVIEW (params.preview / draft = true): the GUI's live preview
+                    // path. The real helical boolean costs 1–3 s (the profiled OCCT floor),
+                    // which is unusable per-drag-tick. Instead show the thread's EXTENT as a
+                    // plain turned band — cylinder/plane booleans, ~ms — so start/flip/length
+                    // edits respond live. The PM re-applies WITHOUT the flag on OK, so real
+                    // geometry always replaces this before the feature is kept.
+                    const bool draft_preview =
+                        feat.value("preview", false) || feat.value("draft", false);
+                    if (draft_preview) {
+                        // Visual depth ≈ the V-thread cut depth, clamped so a mismatched
+                        // size can't eat the whole shaft.
+                        const double vd = std::min(0.6134 * pitch, 0.45 * cyl_radius);
+                        const gp_Ax2 band_ax(axis_loc, run_dir);
+                        TopoDS_Shape out;
+                        try {
+                            if (raised) {
+                                // Raised: band grows outward to the nominal major Ø.
+                                const double r = std::max(major_dia * 0.5, cyl_radius + 0.05);
+                                TopoDS_Shape tool =
+                                    BRepPrimAPI_MakeCylinder(band_ax, r, length).Shape();
+                                out = BRepAlgoAPI_Fuse(body, tool).Shape();
+                            } else if (internal) {
+                                // Bore: enlarge the hole over the band (solid tool — the
+                                // bore's void core intersects nothing extra).
+                                TopoDS_Shape tool = BRepPrimAPI_MakeCylinder(
+                                    band_ax, cyl_radius + vd, length).Shape();
+                                out = BRepAlgoAPI_Cut(body, tool).Shape();
+                            } else {
+                                // Shaft: turn the band down to the approximate minor Ø. The
+                                // tool is an ANNULUS (outer > shaft, inner = minor) so the
+                                // core of the shaft is untouched.
+                                TopoDS_Shape outer = BRepPrimAPI_MakeCylinder(
+                                    band_ax, cyl_radius + vd + 1.0, length).Shape();
+                                TopoDS_Shape inner = BRepPrimAPI_MakeCylinder(
+                                    band_ax, std::max(cyl_radius - vd, 1e-3), length).Shape();
+                                TopoDS_Shape ring = BRepAlgoAPI_Cut(outer, inner).Shape();
+                                out = BRepAlgoAPI_Cut(body, ring).Shape();
+                            }
+                        } catch (...) { out.Nullify(); }
+                        if (out.IsNull()) out = body;  // never break the preview chain
+                        consumed.insert(body_id);
+                        source_of[id] = body_id;
+                        results[id] = SolidResult{out};
+                        solid_order.push_back(id);
+                        st.ok = true;
+                    } else {
                     ::geom::ThreadResult tr = ::geom::cut_thread(
                         body, axis_loc, run_dir, cyl_radius, pitch, major_dia, length,
                         starts, lefthand, internal, raised, turns_cap, tform);
@@ -6701,6 +6750,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     results[id] = SolidResult{tr.shape};
                     solid_order.push_back(id);
                     st.ok = true;
+                    }
                 }
 
             } else if (type == "text") {

@@ -24,6 +24,9 @@ freely but must not edit them. One owner per round per append-only file (see
 - `events.md` — async event payloads (`sim_progress`, etc.).
 - `feature_params.md` — per-feature-type param/field tables (PM form order).
 - `reveng.md` — Reverse Engineering workspace (`aicad.reveng_session/1`, MCP tools, DAG templates).
+- `sim_handoff.md` — cross-sim handoff & verify envelopes (`aicad.simhandoff/1`): study
+  provenance refs, handoff (geometry + BCs/loads with units + provenance) and verify
+  (quantity/tolerance/verdict) shapes; executable form `services/mcp/simhandoff.py`.
 
 ## Agent-layer contracts (Pillar 20 / design pipeline)
 

@@ -962,53 +962,38 @@ RECIPES: dict[str, dict] = {
         accent(),
     ]},
 
-    # thread: a short cylindrical stud with several external thread grooves near the top,
-    # so it reads as "thread". Proven ws_parts technique: cylinder + thin revolve-cut rings
-    # around the Z axis. Steel appearance (threads read as hardware, not app teal).
-    # f1=circle sketch, f2=cylinder; f3/f5/f7=groove sketches + revolve-cuts.
+    # thread: a REAL helical thread CUT into a SOLID rod (screw / threaded rod), via the
+    # engine's one-op `thread` feature (document.cpp type=="thread"). Build a solid
+    # cylinder (extrude a circle), then add ONE thread feature that references the shank's
+    # lateral cylindrical face by a plain-language geom query and cuts a helical ISO-60°
+    # V-groove INWARD (mode:"cut").
+    #
+    # Sizing: in cut mode the cylinder IS the major/outer Ø and the V-groove is cut inward,
+    # so the body stays a SOLID metal rod with grooves in its surface — NOT a translucent
+    # coil/spring (which is what raised-mode's proud helix on a thin core looked like).
+    # Chunky rod Ø15 (radius 7.5) x 42 long ≈ 2.8:1, so it reads as a solid screw shaft.
+    # major_dia 15 == cylinder Ø; pitch 3.5 over the shank ≈ 12 clearly-slanted V-grooves,
+    # coarse enough to read at 32px. V60 form (default). turns cap keeps the boolean tame.
+    # target_face = {"of":"face","kind":"cylindrical","pick":"largest"} → the sole lateral
+    # cylinder of the extruded rod (resolve_face_sel geom-query path). Steel appearance so
+    # it reads as a threaded fastener, not app teal.
     "thread": {"yaw": 35, "pitch": 24, "steps": [
         *sketch_with_id([
-            {"type": "circle", "center": [0, 0], "radius": 10, "id": "sc1"},
+            {"type": "circle", "center": [0, 0], "radius": 7.5, "id": "sc1"},
         ], plane="plane.top", name="StudSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Stud",
-            "params": {"mode": "boss", "depth": dim(40)},
+            "params": {"mode": "boss", "depth": dim(42)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Four shallow ring grooves spaced up the shank (world-Z 12..30). Thin rect on
-        # plane.front revolved 360 about Z. Unique ids per sketch (doc-scoped).
-        *sketch_with_id([
-            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis1", "construction": True},
-            {"type": "line", "p1": [9, 12], "p2": [11, 12], "id": "t1a"},
-            {"type": "line", "p1": [11, 12], "p2": [11, 15], "id": "t1b"},
-            {"type": "line", "p1": [11, 15], "p2": [9, 15], "id": "t1c"},
-            {"type": "line", "p1": [9, 15], "p2": [9, 12], "id": "t1d"},
-        ], plane="plane.front", name="Thd1Sk", fid="f3"),
+        # ONE real helical thread CUT into the SOLID shank. The cylinder is the major/outer
+        # Ø (Ø15) and the V-groove is cut INWARD, keeping the body a continuous solid rod.
         {"op": "add_feature", "feature": {
-            "type": "revolve", "name": "Thd1",
-            "params": {"mode": "cut", "angle": dim(360)},
-            "refs": {"profile": [region("f3", 10, 13.5)], "axis": datum("axis.z")}}},
-        *sketch_with_id([
-            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis2", "construction": True},
-            {"type": "line", "p1": [9, 18], "p2": [11, 18], "id": "t2a"},
-            {"type": "line", "p1": [11, 18], "p2": [11, 21], "id": "t2b"},
-            {"type": "line", "p1": [11, 21], "p2": [9, 21], "id": "t2c"},
-            {"type": "line", "p1": [9, 21], "p2": [9, 18], "id": "t2d"},
-        ], plane="plane.front", name="Thd2Sk", fid="f5"),
-        {"op": "add_feature", "feature": {
-            "type": "revolve", "name": "Thd2",
-            "params": {"mode": "cut", "angle": dim(360)},
-            "refs": {"profile": [region("f5", 10, 19.5)], "axis": datum("axis.z")}}},
-        *sketch_with_id([
-            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis3", "construction": True},
-            {"type": "line", "p1": [9, 24], "p2": [11, 24], "id": "t3a"},
-            {"type": "line", "p1": [11, 24], "p2": [11, 27], "id": "t3b"},
-            {"type": "line", "p1": [11, 27], "p2": [9, 27], "id": "t3c"},
-            {"type": "line", "p1": [9, 27], "p2": [9, 24], "id": "t3d"},
-        ], plane="plane.front", name="Thd3Sk", fid="f7"),
-        {"op": "add_feature", "feature": {
-            "type": "revolve", "name": "Thd3",
-            "params": {"mode": "cut", "angle": dim(360)},
-            "refs": {"profile": [region("f7", 10, 25.5)], "axis": datum("axis.z")}}},
+            "type": "thread", "name": "Thread",
+            "params": {"major_dia": dim(15), "pitch": dim(3.5),
+                       "style": "external", "mode": "cut", "form": "v",
+                       "turns": dim(14)},
+            "refs": {"target_face": {"of": "face", "kind": "cylindrical",
+                                     "pick": "largest"}}}},
         # Metallic steel so it reads as a threaded fastener.
         {"op": "set_appearance", "id": "b1", "color": [0.70, 0.72, 0.75],
          "metallic": 0.9, "roughness": 0.35},

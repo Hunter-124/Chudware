@@ -344,19 +344,8 @@ static bool viewChip(const char* label, bool active) {
 // ---- DAG run catalog (persisted sidecars — the store dag_status reads) ----------
 
 static std::string runsDir() {
-#ifdef _WIN32
-    const char* ad = std::getenv("APPDATA");
-    return ad && *ad ? std::string(ad) + "\\AI-CAD\\runs" : std::string();
-#else
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    std::string base;
-    if (xdg && *xdg) base = xdg;
-    else {
-        const char* home = std::getenv("HOME");
-        base = std::string(home ? home : "") + "/.local/share";
-    }
-    return base + "/AI-CAD/runs";
-#endif
+    // appdataAppDir() applies the AI-CAD/Billet alias rule on both platforms.
+    return appdataAppDir() + "/runs";
 }
 
 static bool loadRunGraph(const DagRun& run);   // fwd

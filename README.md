@@ -1,4 +1,6 @@
-# ShopCraft (formerly AI-CAD)
+# Billet (formerly AI-CAD)
+
+The GUI binary is `Billet` (formerly `AI-CAD`); an `AI-CAD` symlink ships beside it for compatibility.
 
 A **SolidWorks-class parametric CAD application** — native C++ desktop app (ribbon UI,
 FeatureManager tree, constraint-solver sketcher) on the **OpenCASCADE** B-rep kernel, with an
@@ -37,7 +39,7 @@ One-time, per-machine setup:
 # 1. Build the code knowledge graph for your checkout (gitignored, regenerable)
 graphify .                               # once; `graphify hook install` keeps it fresh per-commit
 
-# 2. Register the ShopCraft CAD MCP server with your agent clients
+# 2. Register the Billet CAD MCP server with your agent clients
 python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.bat)
 python3 services/installer/setup_mcp_clients.py --detect  # verify what's wired where
 ```
@@ -70,16 +72,16 @@ Three things distinguish the architecture:
 - **GUI migration (workstream G, nearly done).** The modular `ui/imgui` + `ui/viewport` app
   (liquid-glass overlay design — full-bleed viewport, transparent floating columns) has
   absorbed the legacy `host/` GUI wave-by-wave; `host/` is deleted at T-G11 after the final
-  polish tasks land. New UI work goes in `ui/`, never `host/`. Rename compatibility (T-G3/T-G10):
-  `SHOPCRAFT_*` env vars canonical (`AI_CAD_*` still honored), binary `AI-CAD2` + `ShopCraft`
-  symlink, MCP id `shopcraft` (existing `ai-cad` preserved), existing `AI-CAD` appdata dirs
+  polish tasks land. New UI work goes in `ui/`, never `host/`. Rename compatibility (product is now **Billet**):
+  `BILLET_*` env vars canonical (`AI_CAD_*`/`AICAD_*` still honored), binary `Billet` + `AI-CAD`
+  symlink, MCP id `billet` (existing `ai-cad` preserved), existing `AI-CAD` appdata dirs
   keep working.
 
 ## How it works
 
 ```
             ┌────────────────────────────────────────────────────────────┐
-            │  ShopCraft (native C++ — ribbon UI, feature tree, sketcher) │
+            │  Billet (native C++ — ribbon UI, feature tree, sketcher)    │
  user / AI →│   viewport (GLFW+ImGui+GL)   copilot   MCP server ◀─────────┼── external agent
             │                    │ JSON-RPC over stdio                    │
             │                    ▼                                        │
@@ -171,7 +173,7 @@ $py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
 
 ## Where this is going
 
-ShopCraft is expanding into an **idea-to-production platform** — one prompt from concept
+Billet is expanding into an **idea-to-production platform** — one prompt from concept
 through mechanical design, electronics, firmware, structural checks, and priced BOM to a
 ready-to-order package. Decision records, in reading order:
 

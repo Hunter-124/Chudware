@@ -1,11 +1,11 @@
-"""Canonical filesystem locations for ShopCraft (formerly AI-CAD).
+"""Canonical filesystem locations for Billet (formerly AI-CAD).
 
-Everything the app produces or installs lives under ``%APPDATA%\\ShopCraft`` so the
+Everything the app produces or installs lives under ``%APPDATA%\\Billet`` so the
 shipped (non-sandboxed) binary and this dev environment converge on the same layout.
 
 Backward compatibility (T-G10, alias/read-both — no destructive migration): machines
 with an existing ``AI-CAD`` directory keep using it wholesale (see :func:`active_root`);
-fresh installs get ``ShopCraft``. The old directory is never moved or deleted
+fresh installs get ``Billet``. The old directory is never moved or deleted
 automatically — it may hold the active mcp-venv, config and chat history, and venvs do
 not survive relocation. Call :func:`data_roots` for both candidate paths when scanning.
 """
@@ -15,7 +15,7 @@ import os
 import re
 from pathlib import Path
 
-APP_NAME = "ShopCraft"
+APP_NAME = "Billet"
 APP_NAME_LEGACY = "AI-CAD"
 
 
@@ -31,7 +31,7 @@ def _base_dir() -> Path:
 
 
 def appdata_root() -> Path:
-    """Per-user data root for ShopCraft: ``%APPDATA%\\ShopCraft`` / ``~/.local/share/ShopCraft``.
+    """Per-user data root for Billet: ``%APPDATA%\\Billet`` / ``~/.local/share/Billet``.
 
     Matching the C++ convention (core/agent/paths.cpp). An explicit APPDATA env var
     always wins (tests use it to redirect).
@@ -56,7 +56,7 @@ def data_roots() -> list[Path]:
     """All candidate data root directories, new first, legacy second.
 
     Use when scanning for existing user data (config, models, parts library) so both
-    the new ShopCraft directory and the old AI-CAD directory are checked.
+    the new Billet directory and the old AI-CAD directory are checked.
     """
     return [appdata_root(), appdata_root_legacy()]
 
@@ -64,18 +64,18 @@ def data_roots() -> list[Path]:
 def active_root() -> Path:
     """The data root actually in use for this process.
 
-    Machines with an existing legacy ``AI-CAD`` directory (and no ``ShopCraft``
+    Machines with an existing legacy ``AI-CAD`` directory (and no ``Billet``
     directory yet) keep using the legacy directory for BOTH reads and writes — this
     avoids a split-brain where reads come from the old dir but new writes land in the
     new one, and keeps the live mcp-venv, config and caches working untouched.
-    Fresh installs (no legacy dir) get the new ``ShopCraft`` directory.
+    Fresh installs (no legacy dir) get the new ``Billet`` directory.
     """
     new = appdata_root()
     legacy = appdata_root_legacy()
     # Legacy wins whenever it exists and the new dir holds no REAL install
-    # (config.json marker) — a stray empty/cache-only ShopCraft dir created by one
+    # (config.json marker) — a stray empty/cache-only Billet dir created by one
     # process must not flip the root away from the live AI-CAD data (2026-07-04:
-    # exactly that split-brain put autosaves/handoff in a fresh ShopCraft dir
+    # exactly that split-brain put autosaves/handoff in a fresh Billet dir
     # while the venv/config stayed in AI-CAD).
     if legacy.exists() and not (new / "config.json").exists():
         return legacy
@@ -117,7 +117,7 @@ def model_dir(name: str) -> Path:
 
 
 def find_config() -> Path:
-    """Return the config.json path, preferring the new ShopCraft location but
+    """Return the config.json path, preferring the new Billet location but
     falling back to the legacy AI-CAD location if it exists there and not here."""
     new_cfg = ROOT / "config.json"
     if new_cfg.exists():

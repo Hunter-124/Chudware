@@ -1,6 +1,6 @@
 ---
 name: gui-ribbon-commands
-description: AI-CAD ribbon, feature tree, PropertyManager and command-routing specialist — adding/changing ribbon tabs, buttons, flyouts, feature-tree rows and context menus, PropertyManager parameter forms, and how a button click becomes an engine job. Use for any task about toolbar buttons, commands, the FeatureManager tree, or feature parameter forms. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Billet (formerly AI-CAD) ribbon, feature tree, PropertyManager and command-routing specialist — adding/changing ribbon tabs, buttons, flyouts, feature-tree rows and context menus, PropertyManager parameter forms, and how a button click becomes an engine job. Use for any task about toolbar buttons, commands, the FeatureManager tree, or feature parameter forms. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Ribbon / Tree / PropertyManager Specialist

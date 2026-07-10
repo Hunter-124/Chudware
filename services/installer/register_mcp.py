@@ -1,6 +1,6 @@
-"""Register ShopCraft (formerly AI-CAD) as an MCP server in the machine's Claude install(s).
+"""Register Billet (formerly AI-CAD) as an MCP server in the machine's Claude install(s).
 
-Adds a "shopcraft" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
+Adds a "billet" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
 in place on register — existing tooling references it — and removed on --unregister):
   * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json
   * Claude Code     : ~/.claude.json
@@ -22,7 +22,7 @@ from pathlib import Path
 
 from engine import paths
 
-SERVER_NAME = "shopcraft"
+SERVER_NAME = "billet"
 SERVER_NAME_LEGACY = "ai-cad"  # left in place on register; removed on --unregister
 
 

@@ -2015,8 +2015,10 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     // Multi-document: bind this open-refresh to the doc it targets so a tab switch before the async
     // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
     const std::string openDocId = st.docMirror.docId();
+    ++st.rebuildsInFlight;
     st.rpc.call("doc_rebuild", {{"doc_id", openDocId}},
         [&st, base, openDocId](const core::RpcResult& r) {
+            --st.rebuildsInFlight;
             if (st.docMirror.docId() != openDocId) {
                 st.addLog("[open] mesh refresh for " + openDocId + " ignored — active doc changed");
                 return;
@@ -3669,7 +3671,7 @@ void pollAiCadHandoff(AppState& st) {
     if (!st.workerStarted) return;   // worker not up — nothing can open yet
     if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
     namespace fs = std::filesystem;
-    const std::string dir = appdataDir() + "/AI-CAD/handoff/";
+    const std::string dir = appdataAppDir() + "/handoff/";
     static const std::string ctrlNew = dir + "docs.json";   // multi-doc (one tab per open part)
     static const std::string ctrlOld = dir + "live.json";   // legacy single-doc fallback
 

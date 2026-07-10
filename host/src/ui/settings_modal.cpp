@@ -497,11 +497,17 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::Dummy(ImVec2(0, 8 * sc));
                 ImGui::SeparatorText("Workspace");
                 ImGui::TextUnformatted("Workspace folder");
-                helpMarker("The File Explorer's root folder and the default save location. "
-                           "Leave empty to use Documents/AI-CAD. Applied and saved with the "
-                           "Apply button.");
+                // Truthful default label: defaultWorkspaceDir() applies the alias rule
+                // (existing Documents/AI-CAD wins, else Documents/Billet).
+                static const std::string s_wsDefault = defaultWorkspaceDir();
+                static const std::string s_wsHelp =
+                    "The File Explorer's root folder and the default save location. "
+                    "Leave empty to use " + s_wsDefault + ". Applied and saved with the "
+                    "Apply button.";
+                static const std::string s_wsHint = "(default: " + s_wsDefault + ")";
+                helpMarker(s_wsHelp.c_str());
                 ImGui::SetNextItemWidth(-110.0f * sc);
-                ImGui::InputTextWithHint("##wsdir", "(default: Documents/AI-CAD)",
+                ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
                                          s_wsBuf.data(), s_wsBuf.size());
                 ImGui::SameLine();
                 if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {

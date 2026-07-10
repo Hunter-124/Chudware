@@ -1783,7 +1783,7 @@ static void drawSessionsPanel(AppState& st, bool busy) {
 // Each conversation is its own tab. The ACTIVE conversation's messages live in st.chat; the
 // rest park in st.conversations[i].msgs. Persisted per document to chat_history.json.
 
-static std::string chatHistoryPath() { return appdataDir() + "/AI-CAD/chat_history.json"; }
+static std::string chatHistoryPath() { return appdataAppDir() + "/chat_history.json"; }
 
 // A stable key for the active document: the saved file path if any (survives restarts), else
 // the live doc id, else "scratch" (an unsaved, never-touched session).
@@ -1833,7 +1833,7 @@ void persistChatHistory(AppState& st) {
     }
     root[st.chatDocKey] = {{"active", st.activeConv}, {"conversations", convs}};
     try {
-        std::filesystem::create_directories(appdataDir() + "/AI-CAD");
+        std::filesystem::create_directories(appdataAppDir());
         std::ofstream out(chatHistoryPath());
         if (out) out << root.dump(1);
     } catch (...) {

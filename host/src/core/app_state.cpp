@@ -53,7 +53,45 @@ std::string appdataDir() {
     return ".";
 #endif
 }
-std::string configPath() { return appdataDir() + "/AI-CAD/config.json"; }
+// Billet deep-rename, alias/read-both rule (mirrors engine/paths.py active_root() and
+// core/agent/paths.cpp pick_app_dir() EXACTLY): a machine with an existing legacy AI-CAD
+// data dir keeps using it wholesale (it holds the live runtime venv/config — venvs do not
+// survive relocation) UNLESS the new Billet dir already holds a real install marker
+// (config.json); fresh installs get Billet. Never moves or deletes the old dir.
+std::string appdataAppDir() {
+    static const std::string cached = [] {
+        namespace fs = std::filesystem;
+        const fs::path base = appdataDir();
+        const fs::path legacy = base / "AI-CAD";
+        const fs::path neu = base / "Billet";
+        std::error_code ec;
+        std::string chosen = (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec))
+                                 ? legacy.string()
+                                 : neu.string();
+        std::fprintf(stderr, "[billet] data dir: %s\n", chosen.c_str());
+        return chosen;
+    }();
+    return cached;
+}
+std::string configPath() { return appdataAppDir() + "/config.json"; }
+
+// Default workspace dir under Documents — same alias rule: an existing Documents/AI-CAD
+// keeps being used; otherwise the default is Documents/Billet (created on first use by
+// the File Explorer). Falls back to the appdata base when no home/Documents resolves.
+std::string defaultWorkspaceDir() {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    const char* up = std::getenv("USERPROFILE");
+    const fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path(appdataDir());
+#else
+    const char* home = std::getenv("HOME");
+    const fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(appdataDir());
+#endif
+    std::error_code ec;
+    const fs::path legacy = base / "AI-CAD";
+    if (fs::exists(legacy, ec)) return legacy.string();
+    return (base / "Billet").string();
+}
 const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
 
 // User-provided Gemini key, seeded as the out-of-box default so the copilot works on first
@@ -311,7 +349,7 @@ void saveSettings(const Settings& s) {
         j["experimental"] = exp;
     }
     try {
-        std::filesystem::create_directories(appdataDir() + "/AI-CAD");
+        std::filesystem::create_directories(appdataAppDir());
         std::ofstream(configPath()) << j.dump(2);
     } catch (...) {
     }

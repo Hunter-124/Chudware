@@ -4,14 +4,14 @@ Makes a double-clicked file (or right-click -> Open with) open in Billet, and le
 as the default app. The native **.step+** document is the priority; the interchange formats Billet
 natively loads are added to "Open with" without hijacking the user's existing handlers for them.
 
-The user-facing identity is "Billet" (2026-07 rename wave); the executable is still named
-AI-CAD this wave, so the Open commands keep pointing at the AI-CAD binary. Register/unregister
+The executable is now named Billet (2026-07 deep rename); an AI-CAD compat symlink ships
+beside it for legacy scripts, and default_exe() falls back to the old name on stale builds. Register/unregister
 also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
 
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
 
-  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"AI-CAD.exe" "%1"`) + a
+  Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"Billet.exe" "%1"`) + a
            DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
            host/app.rc), the `.step+` extension defaulted to it, and every other extension wired
            into OpenWithProgids so Billet shows in "Open with".
@@ -48,7 +48,7 @@ LEGACY_MIME_ICON = "application-vnd.aicad.stepplus"
 LEGACY_DESKTOP_FILE = "ai-cad.desktop"
 LEGACY_MIME_PACKAGE = "ai-cad.xml"
 
-# Extensions AI-CAD owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
+# Extensions Billet owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
 # the rest are added to "Open with" only (so we never steal the user's STL/STEP viewer). `mime` is the
 # standard freedesktop type used in the Linux launcher's MimeType (None -> skip on Linux Open-with).
 ASSOCIATIONS = [
@@ -65,12 +65,20 @@ ASSOCIATIONS = [
 
 def default_exe() -> str:
     """Best-guess path to the executable for this platform (overridable with --exe).
-    Still the AI-CAD binary name — the Billet rename is user-facing identity only."""
+    Prefers the canonical Billet binary; falls back to the pre-rename AI-CAD name so
+    stale build dirs / the dist/AI-CAD Windows stage layout keep working."""
     repo = Path(__file__).resolve().parent.parent
     if sys.platform.startswith("win"):
-        return str(repo / "dist" / "AI-CAD" / "AI-CAD.exe")
-    # Linux/macOS: the host build output (the porter's `host/build-linux/bin/AI-CAD`).
-    return str(repo / "host" / "build-linux" / "bin" / "AI-CAD")
+        candidates = [repo / "dist" / "AI-CAD" / "Billet.exe",
+                      repo / "dist" / "AI-CAD" / "AI-CAD.exe"]
+    else:
+        # Linux/macOS: the host build output (host/build-linux/bin/Billet).
+        bindir = repo / "host" / "build-linux" / "bin"
+        candidates = [bindir / "Billet", bindir / "AI-CAD"]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
 
 
 # ----------------------------------------------------------------- Windows (pure plan + winreg apply)
@@ -195,7 +203,7 @@ def _winreg_delete_value(winreg, hive, subkey: str, name: str) -> None:
 
 def linux_desktop_entry(exe: str) -> str:
     """The .desktop launcher. MimeType lists the native type first, then the interchange types'
-    standard freedesktop MIME (so AI-CAD shows in Open-with for them); %f is the file to open."""
+    standard freedesktop MIME (so Billet shows in Open-with for them); %f is the file to open."""
     mimes = [MIME_NATIVE]
     for a in ASSOCIATIONS:
         if not a["native"] and a["mime"] and a["mime"] not in mimes:
@@ -333,7 +341,7 @@ def register(exe: str, unregister: bool = False, dry_run: bool = False) -> list[
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--exe", default=default_exe(), help="Path to the AI-CAD executable")
+    ap.add_argument("--exe", default=default_exe(), help="Path to the Billet executable")
     ap.add_argument("--unregister", action="store_true", help="Remove the associations")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")
     args = ap.parse_args(argv)

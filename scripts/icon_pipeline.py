@@ -58,13 +58,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _find_host_bin() -> Path:
-    """Locate the host GUI binary (AI-CAD). Checks Windows layout first, then Linux/Ninja."""
+    """Locate the host GUI binary (Billet, with AI-CAD fallback for stale build dirs).
+    Checks Windows layout first, then Linux/Ninja."""
     base = REPO / "host" / "build-linux" / "bin"
-    for c in (base / "Release" / "AI-CAD.exe", base / "AI-CAD.exe",
+    for c in (base / "Release" / "Billet.exe", base / "Billet.exe",
+              base / "Release" / "Billet", base / "Billet",
+              base / "Release" / "AI-CAD.exe", base / "AI-CAD.exe",
               base / "Release" / "AI-CAD", base / "AI-CAD"):
         if c.exists():
             return c
-    return base / "AI-CAD"  # default (nonexistent -> run_app prints a clear build hint)
+    return base / "Billet"  # default (nonexistent -> run_app prints a clear build hint)
 
 
 BIN = _find_host_bin()
@@ -945,7 +948,7 @@ def write_recipes(path: Path) -> None:
 def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> int:
     """Run the host GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
 
-    Targets host/build-linux/bin/AI-CAD (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
+    Targets host/build-linux/bin/Billet (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
     On Linux we wrap in xvfb-run (llvmpipe) for a deterministic, GPU-independent server; on
     Windows the desktop session supplies GL, so the exe runs directly. One invocation drains ALL
     recipes in a single tick.
@@ -953,7 +956,7 @@ def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> in
     if not BIN.exists():
         sys.exit(f"binary not found: {BIN} -- build the host GUI first:\n"
                  f"  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release\n"
-                 f"  ninja -C host/build-linux AI-CAD")
+                 f"  ninja -C host/build-linux Billet")
     RENDER_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({

@@ -2,17 +2,17 @@
 Type=Application
 Name=Billet
 Comment=AI-native parametric CAD
-Exec=AI-CAD %F
+Exec=Billet %F
 Icon=Billet
 Categories=Graphics;Engineering;
 Terminal=false
 # Must match the window class set via glfwWindowHintString(GLFW_X11_CLASS_NAME/…) in
 # host/src/app.cpp so the shell binds the live window to this entry (taskbar icon).
 StartupWMClass=Billet
-X-BinaryName=AI-CAD
-# NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja AI-CAD.
-# In the AppImage this is staged to usr/bin/AI-CAD and launched via AppRun.
-# For system installs, install host/build-linux/bin/AI-CAD to a PATH directory.
+X-BinaryName=Billet
+# NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja Billet.
+# In the AppImage this is staged to usr/bin/Billet and launched via AppRun.
+# For system installs, install host/build-linux/bin/Billet to a PATH directory.
 # ui/imgui (AI-CAD2) is retired; host/ is the single cross-platform GUI (see docs/PORT_LEDGER.md).
-# BRANDING NOTE: user-facing identity is "Billet" (2026-07 rename wave). The binary
-# stays AI-CAD this wave (deep rename deferred), so Exec/X-BinaryName keep the old name.
+# BRANDING NOTE: the binary is now Billet (2026-07 deep rename); an AI-CAD compat
+# symlink ships beside it in the build dir for legacy scripts/harnesses.

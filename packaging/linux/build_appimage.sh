@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Billet
-# host GUI (binary still named AI-CAD this rename wave).
+# host GUI (binary named Billet; an AI-CAD compat symlink ships beside it).
 # Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
 # (app/ Python packages + wheelhouse/ offline wheels) so the SAME bootstrap.cpp
 # findPayload()/provisionRuntime() logic that already runs on Windows also works unmodified
@@ -8,7 +8,7 @@
 #
 # Requires a prior build of the host GUI:
 #   cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
-#   ninja -C host/build-linux AI-CAD
+#   ninja -C host/build-linux Billet
 #
 # Usage:
 #   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--no-libaicad] [--keep-appdir]
@@ -41,11 +41,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-BIN="$REPO/host/build-linux/bin/AI-CAD"
+BIN="$REPO/host/build-linux/bin/Billet"
+# Stale build dirs may only have the old binary name; fall back so packaging still works.
+[ -e "$BIN" ] || BIN="$REPO/host/build-linux/bin/AI-CAD"
 if [ ! -x "$BIN" ]; then
     echo "error: $BIN not found — build it first:" >&2
     echo '  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release' >&2
-    echo '  ninja -C host/build-linux AI-CAD' >&2
+    echo '  ninja -C host/build-linux Billet' >&2
     exit 1
 fi
 
@@ -57,7 +59,8 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 
 echo "==> staging binary + resources"
-cp "$BIN" "$APPDIR/usr/bin/AI-CAD"
+cp "$BIN" "$APPDIR/usr/bin/Billet"
+ln -sf Billet "$APPDIR/usr/bin/AI-CAD"  # compat symlink for legacy launch paths
 if [ -d "$REPO/host/build-linux/bin/assets" ]; then
     cp -a "$REPO/host/build-linux/bin/assets" "$APPDIR/usr/bin/assets"
 fi
@@ -231,11 +234,11 @@ fi
 if [ -z "${AICAD_INSTANCE_KEY:-}" ]; then
     export AICAD_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"
 fi
-exec "$HERE/usr/bin/AI-CAD" "$@"
+exec "$HERE/usr/bin/Billet" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
-# User-facing identity is "Billet" (desktop entry + icon names); the staged binary
-# stays usr/bin/AI-CAD this rename wave, which the .desktop's Exec still points at.
+# The staged binary is usr/bin/Billet (with an AI-CAD compat symlink), matching the
+# .desktop's Exec=Billet.
 cp "$REPO/packaging/linux/Billet.desktop" "$APPDIR/Billet.desktop"
 cp "$REPO/assets/logo_icon.png" "$APPDIR/Billet.png"
 ln -sf Billet.png "$APPDIR/.DirIcon"

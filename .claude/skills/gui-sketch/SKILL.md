@@ -1,6 +1,6 @@
 ---
 name: gui-sketch
-description: AI-CAD sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
+description: Billet (formerly AI-CAD) sketcher UI specialist — the 2D constraint-solver sketch mode (tools, gestures, snapping, relations, smart dimensions, trim/offset/patterns) and the 3D free-space sketch mode. Use for any task about sketching UX, sketch entities, constraints/relations display, dimension labels, or sketch tool behavior. Workers dispatched by gui-orchestrator read this file first instead of searching the repo.
 ---
 
 # GUI Sketch Specialist
@@ -49,7 +49,7 @@ Before editing, grep *within this file* for the tool's cmd_id or label rather th
 
 ```bash
 ./build.sh
-AI_CAD_SHOT=sketch ./host/build-linux/bin/AI-CAD --ui-screenshot scratch/sketch_smoke.png
+AI_CAD_SHOT=sketch ./host/build-linux/bin/Billet --ui-screenshot scratch/sketch_smoke.png
 ```
 Smoke = "doesn't crash", not visual judgment. Never run git. Return files changed + a
 one-line user check, e.g. "enter a sketch, pick Slot > 3-point arc slot — rubber-band preview

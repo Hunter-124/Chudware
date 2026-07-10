@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -59,6 +60,11 @@ static bool        s_renameFocus = false;
 static std::string s_pendingDelete;    // path queued for the delete-confirm modal ("" = none)
 static std::string s_clipboardPath;    // Explorer copy/paste stash (a file path)
 static std::string s_pendingNewFolder; // a just-created folder to auto-enter inline-rename next frame
+// Recent-row existence cache: fs::exists per entry per frame is real filesystem traffic while the
+// Recent list is visible. Refresh at most every ~2s; a path not yet cached (a just-added recent)
+// is probed once on first sight, so a list change still paints correctly the same frame.
+static std::map<std::string, bool> s_recentExists;
+static double s_recentExistsAt = -1e9;
 
 // ---- known extensions ----------------------------------------------------
 // .step+ is our native part container; the rest are import/interop formats. ECAD/KiCad files open
@@ -117,18 +123,13 @@ static const char* fileIconFallback(const std::string& ext) {
 // ---- workspace resolution ------------------------------------------------
 void ensureWorkspaceDir(AppState& st) {
     if (st.workspaceDir.empty()) {
-        // Prefer the persisted setting, else <USERPROFILE>/Documents/AI-CAD, else appdata.
+        // Prefer the persisted setting, else the Documents default (an existing
+        // Documents/AI-CAD wins per the alias rule, otherwise Documents/Billet —
+        // see defaultWorkspaceDir() in app_state.cpp).
         if (!st.settings.workspaceDir.empty()) {
             st.workspaceDir = st.settings.workspaceDir;
         } else {
-#ifdef _WIN32
-            const char* up = std::getenv("USERPROFILE");
-            fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path(appdataDir());
-#else
-            const char* home = std::getenv("HOME");
-            fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(appdataDir());
-#endif
-            st.workspaceDir = (base / "AI-CAD").string();
+            st.workspaceDir = defaultWorkspaceDir();
         }
     }
     std::error_code ec;
@@ -399,12 +400,20 @@ static void drawRecentSection(AppState& st) {
     if (st.recentFiles.empty()) return;
     // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
     ui::fmSectionDivider("Recent");
+    if (ImGui::GetTime() - s_recentExistsAt > 2.0) {
+        s_recentExists.clear();
+        s_recentExistsAt = ImGui::GetTime();
+    }
     int idx = 0;
     for (const std::string& rp : st.recentFiles) {
         ImGui::PushID(idx++);
         fs::path p(rp);
-        std::error_code ec;
-        const bool exists = fs::exists(p, ec);
+        auto exIt = s_recentExists.find(rp);
+        if (exIt == s_recentExists.end()) {
+            std::error_code ec;
+            exIt = s_recentExists.emplace(rp, fs::exists(p, ec)).first;
+        }
+        const bool exists = exIt->second;
         const std::string ext = lowerExt(p);
         // Same FM leaf-row pattern as the tree's file rows; a missing file keeps a readable dim
         // state (dim text + faded icon), like the FM's hidden planes.

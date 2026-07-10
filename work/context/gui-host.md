@@ -18,7 +18,7 @@ Liquid-glass v2 overlay design (docs/GLASS_DESIGN_SPEC.md, HANDOFF_GUI_OVERHAUL.
 
 ## Debugging playbook
 - Build (serialized): `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"` (never run two builds against one dir concurrently)
-- Screenshot harness: `AI_CAD_SHOT=m1|sketch|appearance|fea|drawing|asm|multidoc AI_CAD_REPO="$PWD" host/build-linux/bin/AI-CAD --ui-screenshot out.png` (per-step PNGs in scratch/<scn>_shots/)
+- Screenshot harness: `AI_CAD_SHOT=m1|sketch|appearance|fea|drawing|asm|multidoc AI_CAD_REPO="$PWD" host/build-linux/bin/Billet --ui-screenshot out.png` (per-step PNGs in scratch/<scn>_shots/). Binary renamed from AI-CAD; an `AI-CAD` compat symlink remains in bin/.
 - Gotcha: FeatureManager input regression (commit 043e752 added NoBringToFrontOnFocus — fixed by removal); watch FM collapse pill edge-publish
 - Gotcha: viewport HUD clip + sketch overlay dodge columns via `overlayColumnEdge(0/1)` (safe-area inset to inter-column bounds)
 - Gotcha: PropertyManager tab removed — PM commands now nested inside FeatureManager tab (header text switches to "Property Manager" when active)

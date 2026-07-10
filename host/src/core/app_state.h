@@ -149,6 +149,10 @@ struct Settings {
 };
 
 std::string appdataDir();
+// The app data dir itself (base + "/AI-CAD" or "/Billet" per the alias rule); logs once.
+std::string appdataAppDir();
+// Default Documents workspace dir (Documents/AI-CAD if it exists, else Documents/Billet).
+std::string defaultWorkspaceDir();
 std::string configPath();
 void loadSettings(Settings& s);
 void saveSettings(const Settings& s);
@@ -979,6 +983,10 @@ struct AppState {
     std::vector<char> chatInput{std::vector<char>(2048, 0)};
     std::string modelInfo;
     std::string livePhase;        // what the agent is doing right now (viewport overlay)
+    // Async engine calls (doc_rebuild / eval_*) queued or undrained on st.rpc: while > 0 the
+    // mesh on screen may lag the model, so the viewport draws a small "Rebuilding..." chip.
+    // Bump at every st.rpc.call that mutates/evaluates the model; drop in its drain callback.
+    int rebuildsInFlight = 0;
     std::string buildErrSummary;  // last "Build code" failure, shown under the editor
     std::string buildErrFull;     // its full traceback, behind a Details toggle
     bool showBuildErr = false;
@@ -1209,7 +1217,7 @@ struct AppState {
     // GL thread. toast() and drawToasts() both take the lock.
     std::mutex toastsMtx;
     std::vector<ui::Toast> toasts;
-    // T-BL31 NEW-3: AI_CAD_SHOT=ribbon suppresses toasts (the ShopCraft on-load toast otherwise
+    // T-BL31 NEW-3: AI_CAD_SHOT=ribbon suppresses toasts (the Billet on-load toast otherwise
     // occludes leftmost ribbon groups in per-tab icon-verification captures); real usage is
     // unaffected since toasts still auto-dismiss there. See app.cpp wantRibbon setup.
     bool suppressToasts = false;

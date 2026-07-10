@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/gate.sh — the Linux build + test gate for AI-CAD.
+# scripts/gate.sh — the Linux build + test gate for Billet (formerly AI-CAD).
 #
 # Every DAG node must leave this gate green before close (see AGENTS.md swarm
 # rules + the plan file). It runs, in order:
@@ -8,7 +8,7 @@
 #   2. core CMake/Ninja build  — libaicad with -DAICAD_WITH_OCCT=ON + ctest. SKIPPED with a
 #                                 clear reason if the system OCCT cmake config is not found
 #                                 (the gate does NOT fail just because OCCT is absent on a box).
-#   2b. host GUI build         — cmake -S host -B host/build-linux + ninja AI-CAD.
+#   2b. host GUI build         — cmake -S host -B host/build-linux + ninja Billet.
 #                                 The ui/imgui / ui/abstract (AI-CAD2) app is retired;
 #                                 host/ is the single cross-platform GUI target.
 #   3. ctest                   — only if the core build succeeded; best-effort (SKIP if no tests).
@@ -159,11 +159,11 @@ stage_core_build() {
     CORE_BUILD_OK=1
 }
 
-# ---- Stage 2b: host GUI build (ninja AI-CAD) --------------------------------
+# ---- Stage 2b: host GUI build (ninja Billet) --------------------------------
 # ui/abstract is deleted (retired with ui/imgui in refactor(unify)). This stage
 # now builds the host/ GUI — the single cross-platform GUI target.
 stage_ui_abstract() {
-    echo "=== [2b/6] host GUI build (ninja AI-CAD) ==="
+    echo "=== [2b/6] host GUI build (ninja Billet) ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
         record "host build          SKIP    cmake or ninja not on PATH"
         echo "  SKIP: cmake/ninja missing"
@@ -176,13 +176,13 @@ stage_ui_abstract() {
         fail_fatal=1
         return 0
     fi
-    if ! ninja -C "$host_build" AI-CAD > /tmp/gate_host_build.out 2>&1; then
-        record "host build          FAIL    ninja AI-CAD (see /tmp/gate_host_build.out)"
+    if ! ninja -C "$host_build" Billet > /tmp/gate_host_build.out 2>&1; then
+        record "host build          FAIL    ninja Billet (see /tmp/gate_host_build.out)"
         echo "  FAIL: build"; tail -n 20 /tmp/gate_host_build.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    record "host build          PASS    host/build-linux/bin/AI-CAD built"
+    record "host build          PASS    host/build-linux/bin/Billet built"
     echo "  PASS"
     HOST_BUILD_OK=1
 }
@@ -266,7 +266,7 @@ stage_appimage_smoke() {
         return 0
     fi
     local img
-    img="$(ls "$out"/AI-CAD-*.AppImage 2>/dev/null | head -1)"
+    img="$(ls "$out"/Billet-*.AppImage "$out"/AI-CAD-*.AppImage 2>/dev/null | head -1)"
     if [ -z "$img" ]; then
         record "appimage smoke      WARN    build reported success but no .AppImage produced"
         echo "  WARN: no artifact"; return 0
@@ -355,9 +355,9 @@ stage_pytest() {
 
     # --- wire the engine .so if not already set ---
     local so_path="$REPO/core/build-linux/bin/libaicad.so"
-    # Accept SHOPCRAFT_LIBAICAD as alias for AI_CAD_LIBAICAD (T-G10 rename shim)
-    if [ -n "${SHOPCRAFT_LIBAICAD:-}" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
-        export AI_CAD_LIBAICAD="$SHOPCRAFT_LIBAICAD"
+    # Accept BILLET_LIBAICAD as alias for AI_CAD_LIBAICAD (T-G10 rename shim)
+    if [ -n "${BILLET_LIBAICAD:-}" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
+        export AI_CAD_LIBAICAD="$BILLET_LIBAICAD"
     fi
     if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$so_path" ]; then
         export AI_CAD_LIBAICAD="$so_path"
@@ -447,12 +447,12 @@ stage_pytest() {
 # ---- Stage 5: host GUI shot smoke (AI_CAD_SHOT=m1) -------------------------
 # ui/imgui (AI-CAD2) is retired. This stage runs the host GUI headless under
 # xvfb and verifies it renders a screenshot. The host binary is expected to
-# exist at host/build-linux/bin/AI-CAD (built by stage 2b above, or a prior
+# exist at host/build-linux/bin/Billet (built by stage 2b above, or a prior
 # cached build). Skips gracefully when the host build did not succeed or the
 # binary is absent.
 stage_ui_imgui() {
     echo "=== [5/6] host GUI shot smoke (AI_CAD_SHOT=m1) ==="
-    local bin="$REPO/host/build-linux/bin/AI-CAD"
+    local bin="$REPO/host/build-linux/bin/Billet"
     if [ ! -x "$bin" ]; then
         if [ "${HOST_BUILD_OK:-0}" -eq 1 ]; then
             record "host shot           FAIL    binary missing at $bin after successful build"
@@ -705,7 +705,7 @@ stage_perf
 
 echo
 echo "============================================================"
-echo "AI-CAD Linux gate — summary"
+echo "Billet Linux gate — summary"
 echo "============================================================"
 printf '  %s\n' "${SUMMARY[@]}"
 echo "------------------------------------------------------------"

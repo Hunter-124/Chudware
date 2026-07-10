@@ -45,10 +45,10 @@ bool dirExists(const std::string& p) {
 // Exported (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can
 // locate the per-user config.json the same way the runtime provisioner does.
 // T-G10 alias rule (mirrors engine/paths.py active_root()): keep an existing legacy
-// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get ShopCraft.
+// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get Billet.
 std::string appdataRoot() {
     const std::string base = env_or("APPDATA", "");
-    const std::string neu = base + "\\ShopCraft";
+    const std::string neu = base + "\\Billet";
     const std::string legacy = base + "\\AI-CAD";
     if (!dirExists(neu) && dirExists(legacy)) return legacy;
     return neu;
@@ -330,10 +330,10 @@ std::string shq(const std::string& s) {
 // (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can locate
 // the per-user config.json the same way the runtime provisioner does.
 // T-G10 alias rule (mirrors engine/paths.py active_root()): keep an existing legacy
-// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get ShopCraft.
+// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get Billet.
 std::string appdataRoot() {
     const auto pick = [](const fs::path& base) {
-        const fs::path neu = base / "ShopCraft";
+        const fs::path neu = base / "Billet";
         const fs::path legacy = base / "AI-CAD";
         std::error_code ec;
         if (!fs::exists(neu, ec) && fs::exists(legacy, ec)) return legacy.string();

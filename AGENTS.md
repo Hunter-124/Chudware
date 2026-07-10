@@ -1,14 +1,15 @@
-# AGENTS.md — ShopCraft (AI-CAD) repo navigation + ownership
+# AGENTS.md — Billet (formerly AI-CAD) repo navigation + ownership
 
-This is the canonical agent-navigation and ownership doc for the whole ShopCraft
-(formerly AI-CAD; see the T-G10 compatibility rules in README.md — `SHOPCRAFT_*`
-env vars canonical with `AI_CAD_*` honored, `shopcraft` MCP id with `ai-cad`
-preserved, legacy appdata dir honored) codebase. Read this first before any
+This is the canonical agent-navigation and ownership doc for the whole Billet
+(formerly AI-CAD, briefly ShopCraft; see the compatibility rules in README.md — `BILLET_*`
+env vars canonical with `AI_CAD_*`/`AICAD_*` honored, `billet` MCP id with `ai-cad`
+preserved, legacy appdata dir honored; binary `Billet` with an `AI-CAD` compat
+symlink) codebase. Read this first before any
 refactor work.
 
 ## Project
 
-ShopCraft is a parametric CAD application. The core geometry/document/solver/CAM
+Billet is a parametric CAD application. The core geometry/document/solver/CAM
 engine is a C++ library `libaicad` (under `core/`) that is strangling out a
 legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
 parity corpus until each Python module is flipped off and deleted. The desktop
@@ -18,7 +19,7 @@ GUI at `host/src/ui/`, ~52k LOC). The shared render pipeline lives in
 favor of a cross-platform `ui/imgui` + `ui/abstract` (AI-CAD2) shell; that
 direction was **reversed** — the `ui/imgui`/`ui/abstract` app is retired and
 `host/` is the single cross-platform GUI, building on Linux with GCC/Clang and
-on Windows with MSVC. Binary: `host/build-linux/bin/AI-CAD`.) The active refactor plan lives at
+on Windows with MSVC. Binary: `host/build-linux/bin/Billet`, with an `AI-CAD` compat symlink beside it.) The active refactor plan lives at
 `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
 and is the source of truth for the target layered layout and the per-phase DAG.
 
@@ -31,7 +32,7 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | Dir | Purpose (current) | Plan target |
 |-----|-------------------|-------------|
 | `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
-| `host/` | **The single GUI target.** Production C++ desktop host (~52k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC). Builds via `host/build-linux` → `host/build-linux/bin/AI-CAD`. (Was briefly removed in T-G11 (2026-07-06) in favor of `ui/imgui`; that was reversed — `host/` is the live GUI.) | Stays `host/`. |
+| `host/` | **The single GUI target.** Production C++ desktop host (~52k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC). Builds via `host/build-linux` → `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). (Was briefly removed in T-G11 (2026-07-06) in favor of `ui/imgui`; that was reversed — `host/` is the live GUI.) | Stays `host/`. |
 | `app/` | **Removed (T-G24, 2026-07-05).** Was a convenience symlink → `ui/imgui/`. Use `ui/imgui/` directly. Build output: `build/linux-app/`. | Deleted. |
 | `engine_oracle/` | Python parity oracle (frozen while `core/` catches up). Root `engine` symlink preserves imports. Deleted LAST (N6b). | Deleted N6b. |
 | `services/agent/` | Built-in agent loop (Python now → C++ later). Root `agent` symlink. | C++ at N5e. |
@@ -55,7 +56,7 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 - **`host/` is the SINGLE GUI target** — the production C++ desktop host
   (`host/src/ui/`, ~52k LOC), consuming the shared `ui/viewport/` (OpenGL render
   pipeline). It builds cross-platform (Linux GCC/Clang + Windows MSVC) →
-  `host/build-linux/bin/AI-CAD`. There is no second GUI tree: the `ui/imgui` +
+  `host/build-linux/bin/Billet` (`AI-CAD` compat symlink). There is no second GUI tree: the `ui/imgui` +
   `ui/abstract` (AI-CAD2) shell is retired and off `master`. (Historical: T-G11
   (2026-07-06) briefly deleted `host/` and made `ui/imgui` the sole target after
   de-duplicating the cross-platform build off `host/`; that direction was later

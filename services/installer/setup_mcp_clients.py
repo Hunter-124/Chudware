@@ -1,6 +1,6 @@
-"""Register the ShopCraft MCP server into every MCP-capable client on this machine.
+"""Register the Billet MCP server into every MCP-capable client on this machine.
 
-The server is registered under the new name ``shopcraft`` (formerly ``ai-cad``). Existing
+The server is registered under the new name ``billet`` (formerly ``ai-cad``). Existing
 ``ai-cad`` entries in client configs are left in place on normal registration so that
 tooling still referencing the old name continues to work; they are removed only on an
 explicit ``--unregister`` run.
@@ -20,7 +20,7 @@ are correct for it. Antigravity has no project-scoped config, so it is wired glo
 
 The writes are idempotent and non-destructive: existing servers in each file are preserved,
 each file is backed up (*.aicad-bak) before the first change, and re-running only rewrites a
-file when the "shopcraft" (or legacy "ai-cad") entry would actually change.
+file when the "billet" (or legacy "ai-cad") entry would actually change.
 
 Pure standard library on purpose -- it must run under any Python, including one without the
 engine's heavy dependencies installed.
@@ -44,7 +44,7 @@ import shutil
 import sys
 from pathlib import Path
 
-SERVER_NAME = "shopcraft"
+SERVER_NAME = "billet"
 SERVER_NAME_LEGACY = "ai-cad"
 
 

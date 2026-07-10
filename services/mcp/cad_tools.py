@@ -233,7 +233,7 @@ def _sanitize_output_path(path: str) -> str:
 # its doc sessions. To make the AI's part visible in the app's viewport, we publish it as a
 # native .step+ doc plus a tiny live.json {rev, step} into <appdata>/<app>/handoff/; the GUI
 # polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
-# <app> follows the T-G10 alias rule (ShopCraft, or the legacy AI-CAD dir when it already
+# <app> follows the T-G10 alias rule (Billet, or the legacy AI-CAD dir when it already
 # exists), matching platform::appdataRoot() so publisher and reader agree.
 _PUB: dict = {"rev": None, "docs": {}, "active": None}
 
@@ -247,7 +247,7 @@ def _handoff_dir() -> Path:
             # Match platform/paths_linux.cpp appdataDir() — the old tempdir fallback put
             # the handoff where the GUI never looked on Linux.
             base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    new_root = Path(base) / "ShopCraft"
+    new_root = Path(base) / "Billet"
     legacy_root = Path(base) / "AI-CAD"
     root = legacy_root if (not new_root.exists() and legacy_root.exists()) else new_root
     d = root / "handoff"
@@ -716,12 +716,20 @@ def _autosave_all_open() -> None:
 
 _AUTOSAVE_INTERVAL_S: float = float(os.environ.get("AI_CAD_AUTOSAVE_INTERVAL_S", "60") or 60)
 _PERIODIC_TIMER: list = [None]  # [Timer | None]  — list so it's mutable from inner scope
+# Generation token for the timer chain. start/stop each bump it; a tick only
+# reschedules while its captured generation is still current, so an in-flight tick
+# that fires across a stop/start cycle dies instead of re-arming an orphan chain
+# (the historical 12x "aicad-autosave" thread leak).
+_AUTOSAVE_GEN: list = [0]
 _AUTOSAVE_LATENCIES: list = []  # float seconds — rolling window of sweep durations
 _LATENCY_WINDOW = 100
 
 
-def _tick_autosave() -> None:
-    """Single timer tick: autosave all open docs, record latency, reschedule."""
+def _tick_autosave(gen: int) -> None:
+    """Single timer tick: autosave all open docs, record latency, reschedule.
+
+    gen: the _AUTOSAVE_GEN value this chain was armed with — reschedule only while
+    it is still current, so stopped/restarted chains can never stack."""
     import threading as _t  # local to avoid circular at module level
 
     t0 = time.perf_counter()
@@ -742,10 +750,11 @@ def _tick_autosave() -> None:
                 "autosave p95 %.1f ms exceeds 50 ms target — consider longer interval "
                 "or reducing open doc count", p95 * 1000)
 
-    # Reschedule only if interval > 0 and not stopped.
+    # Reschedule only if interval > 0 and this chain's generation is still current
+    # (stop/start bumps the generation, killing any in-flight tick's chain).
     interval = _AUTOSAVE_INTERVAL_S
-    if interval > 0:
-        timer = _t.Timer(interval, _tick_autosave)
+    if interval > 0 and gen == _AUTOSAVE_GEN[0]:
+        timer = _t.Timer(interval, _tick_autosave, args=(gen,))
         timer.daemon = True
         timer.name = "aicad-autosave"
         _PERIODIC_TIMER[0] = timer
@@ -769,18 +778,38 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     global _AUTOSAVE_INTERVAL_S
     if interval_s is not None:
         _AUTOSAVE_INTERVAL_S = float(interval_s)
-    stop_periodic_autosave()  # cancel any previous timer
+    stop_periodic_autosave()  # cancel any previous timer + orphan any in-flight tick
     if _AUTOSAVE_INTERVAL_S <= 0:
         return
-    timer = _t.Timer(_AUTOSAVE_INTERVAL_S, _tick_autosave)
+    _AUTOSAVE_GEN[0] += 1
+    gen = _AUTOSAVE_GEN[0]
+    _seed_autosave_revisions()
+    timer = _t.Timer(_AUTOSAVE_INTERVAL_S, _tick_autosave, args=(gen,))
     timer.daemon = True
     timer.name = "aicad-autosave"
     _PERIODIC_TIMER[0] = timer
     timer.start()
 
 
+def _seed_autosave_revisions() -> None:
+    """Baseline every currently-open doc's engine revision so the FIRST sweep skips
+    docs nobody has touched since the timer was armed (e.g. just-recovered docs whose
+    bytes are already on disk). Docs opened later still get one baseline autosave."""
+    try:
+        docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+    except Exception:  # noqa: BLE001 — seeding is an optimization, never fatal
+        return
+    for d in docs:
+        did = d.get("doc_id") if isinstance(d, dict) else None
+        rev = d.get("revision") if isinstance(d, dict) else None
+        if did and isinstance(rev, (int, float)) and did not in _AUTOSAVE_LAST_REV:
+            _AUTOSAVE_LAST_REV[did] = rev
+
+
 def stop_periodic_autosave() -> None:
-    """Cancel the periodic autosave timer (if running)."""
+    """Cancel the periodic autosave timer (if running).  Also bumps the generation
+    token so a tick already in flight (past its Timer, mid-sweep) cannot re-arm."""
+    _AUTOSAVE_GEN[0] += 1
     t = _PERIODIC_TIMER[0]
     if t is not None:
         t.cancel()

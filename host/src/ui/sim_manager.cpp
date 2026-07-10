@@ -283,7 +283,7 @@ std::string SimWell::label() const {
 // ---------------------------------------------------------------- materials (singleton)
 
 static std::string customMaterialsPath() {
-    return appdataDir() + "/AI-CAD/custom_materials.json";
+    return appdataAppDir() + "/custom_materials.json";
 }
 
 // Parse a {key:{name,E_mpa,nu,density_g_cm3,yield_mpa}} object file into `out` (custom flag tagged).
@@ -1581,7 +1581,7 @@ void SimManager::previewMesh(AppState& st, Study& s) {
     if (!st.docMirror.hasDoc()) return;
     // Export to STEP, mesh it (sim_mesh), then build a surface-element wireframe on the host so the
     // user can SEE the discretization the solve will run on (transparency) before committing minutes.
-    std::string stepPath = appdataDir() + "/AI-CAD/cache/sim_mesh_preview.step";
+    std::string stepPath = appdataAppDir() + "/cache/sim_mesh_preview.step";
     {
         nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
         std::string e;
@@ -2079,7 +2079,7 @@ void SimManager::runFatigue(AppState& st, Study& s) {
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
 
-    std::string stepPath = appdataDir() + "/AI-CAD/cache/sim_fatigue.step";
+    std::string stepPath = appdataAppDir() + "/cache/sim_fatigue.step";
     {
         nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
         std::string e;
@@ -2169,7 +2169,7 @@ void SimManager::runStaticOrModal(AppState& st, Study& s) {
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
 
-    std::string stepPath = appdataDir() + "/AI-CAD/cache/sim_study.step";
+    std::string stepPath = appdataAppDir() + "/cache/sim_study.step";
     {
         nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
         std::string e;
@@ -2253,7 +2253,7 @@ void SimManager::runFlow(AppState& st, Study& s) {
     if (!st.simClient) return;
     auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
-    std::string stlPath = appdataDir() + "/AI-CAD/cache/sim_flow.stl";
+    std::string stlPath = appdataAppDir() + "/cache/sim_flow.stl";
     nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stlPath}};
     std::string e;
     if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {

@@ -1,6 +1,6 @@
 ---
 name: gui-workspaces
-description: AI-CAD workspace-tab specialist — Parts Library, Assembly panels, CAM, ECAD, PLM, Reverse-Engineering, AI/Activity workspace, Drawing, Simulation manager, plus doc tabs, file explorer, console and status bar. Use for any task about one of these workspace tabs or auxiliary panels. Workers dispatched by gui-orchestrator read this file first, then work only in their own workspace's files.
+description: Billet (formerly AI-CAD) workspace-tab specialist — Parts Library, Assembly panels, CAM, ECAD, PLM, Reverse-Engineering, AI/Activity workspace, Drawing, Simulation manager, plus doc tabs, file explorer, console and status bar. Use for any task about one of these workspace tabs or auxiliary panels. Workers dispatched by gui-orchestrator read this file first, then work only in their own workspace's files.
 ---
 
 # GUI Workspaces Specialist
@@ -52,7 +52,7 @@ gains a major new flow).
 ## Build & verify
 
 `./build.sh` from repo root must compile. Headless smoke per workspace where one exists:
-`AI_CAD_SHOT=<asm|fea|flow|drawing|activity|workspaces|motion> ./host/build-linux/bin/AI-CAD
+`AI_CAD_SHOT=<asm|fea|flow|drawing|activity|workspaces|motion> ./host/build-linux/bin/Billet
 --ui-screenshot scratch/ws_smoke.png` — crash check only. Never run git. Return files changed
 + a one-line user check, e.g. "Parts Library > type in search — results stream while typing,
 filters stay responsive."

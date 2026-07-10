@@ -275,7 +275,7 @@ void ecadRedo(AppState& st) {
 void ecadExport(AppState& st, const char* kind) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
     std::error_code ec;
-    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
+    const std::string dir = appdataAppDir() + "/ecad_out";
     std::filesystem::create_directories(dir, ec);
     nlohmann::json res;
     if (!ecadCall(st, "ecad_export", {{"doc_id", st.ecadDocId}, {"kind", kind}, {"path", dir}}, res))
@@ -341,7 +341,7 @@ void ecadOpenDoc(AppState& st) {
 void ecadTo3d(AppState& st) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD board first"); return; }
     std::error_code ec;
-    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
+    const std::string dir = appdataAppDir() + "/ecad_out";
     std::filesystem::create_directories(dir, ec);
     const std::string step = dir + "/board.step";
     nlohmann::json res;
@@ -841,7 +841,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // v4: overlay layout — stale v3 entries carry docked flags/placements for the now-floating
     // FeatureManager/Copilot columns. The ini is ALSO the columns' width persistence (ImGui saves
     // floating windows' Pos/Size by name), so column width survives restarts with zero new code.
-    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v4.ini";
+    static std::string iniPath = appdataAppDir() + "/imgui_gui_v4.ini";
     io.IniFilename = shot ? nullptr : iniPath.c_str();
 
     float xs = 1.0f, ys = 1.0f;
@@ -1625,7 +1625,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // 8=Surfaces .. 11=Appearance 12=Manufacture) for headless per-tab verification.
     if (st.wantRibbon) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
-        // T-BL31 NEW-3: the ShopCraft on-load toast pins over the ribbon's top-left and occluded
+        // T-BL31 NEW-3: the Billet on-load toast pins over the ribbon's top-left and occluded
         // icon verification (weld_gusset, appr_mat_aluminum/steel in the T-G12 round-2 walkthrough).
         // Suppress toasts for per-tab ribbon captures by default; AI_CAD_SHOT_KEEPTOAST=1 re-enables
         // them (for verifying the toast's own position/theming against the ribbon).
@@ -1774,7 +1774,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Demo a 3-part fit-test: base plate, lid above it, peg through both (clash on the
         // peg). Populates the viewport parts panel + a chat card so --ui-screenshot shows the
         // assembly UI. A real color-coded render is shown if its cache PNG exists.
-        const std::string asmDir = appdataDir() + "/AI-CAD/cache/screenshot_asm/";
+        const std::string asmDir = appdataAppDir() + "/cache/screenshot_asm/";
         st.asmStl = asmDir + "screenshot_asm_assembly.stl";
         std::string sheet = asmDir + "screenshot_asm_grid.png";
         // Per-part STLs (generated once for the demo) so the viewport shows the bodies
@@ -2144,8 +2144,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     // mirror + mesh would be corrupted. The backgrounded doc picks up the fresh tree
                     // + mesh when its tab is reactivated (switchToTab re-activates + reloads).
                     const std::string rebuildDocId = st.docMirror.docId();
+                    ++st.rebuildsInFlight;
                     st.rpc.call("doc_rebuild", {{"doc_id", rebuildDocId}},
                         [&st, rebuildDocId](const core::RpcResult& r) {
+                            --st.rebuildsInFlight;
                             st.livePhase.clear();
                             if (st.docMirror.docId() != rebuildDocId) {
                                 st.addLog("[v2] doc_rebuild result for " + rebuildDocId +
@@ -2558,7 +2560,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     const int nBefore = before.contains("tree") && before["tree"].contains("symbols")
                                         ? (int)before["tree"]["symbols"].size() : -1;
                     std::error_code ec;
-                    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
+                    const std::string dir = appdataAppDir() + "/ecad_out";
                     std::filesystem::create_directories(dir, ec);
                     const std::string path = dir + "/roundtrip.ecad+";
                     nlohmann::json sres;

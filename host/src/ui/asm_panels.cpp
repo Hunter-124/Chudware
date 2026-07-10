@@ -242,7 +242,7 @@ namespace {
 std::string partsCacheDir() {
     // appdataDir() resolves %APPDATA% on Windows / XDG (~/.local/share) on POSIX; '/' is a
     // valid separator on both, so the cache path is correct cross-platform.
-    return appdataDir() + "/AI-CAD/cache/parts_library";
+    return appdataAppDir() + "/cache/parts_library";
 }
 std::string sanitizeToken(const std::string& s) {
     std::string out;
@@ -1113,8 +1113,10 @@ void AsmPanels::refreshInterference(AppState& st) {
     if (!st.docMirror.hasDoc()) { interferenceError_ = "No assembly open."; return; }
     interferencePending_ = true;
     const int gen = ++interferenceGen_;
+    ++st.rebuildsInFlight;
     st.rpc.call("eval_interference", {{"doc_id", st.docMirror.docId()}},
         [this, &st, gen](const core::RpcResult& r) {
+            --st.rebuildsInFlight;
             if (gen != interferenceGen_) return;
             interferencePending_ = false;
             if (!r.ok) {
@@ -1250,7 +1252,9 @@ void AsmPanels::refreshBom(AppState& st) {
     for (size_t i = 0; i < bomRows_.size(); ++i) {
         nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"body", ordinalForRow[i]}};
         ++bomPending_;
-        st.rpc.call("eval_mass", params, [this, gen, i](const core::RpcResult& r) {
+        ++st.rebuildsInFlight;
+        st.rpc.call("eval_mass", params, [this, &st, gen, i](const core::RpcResult& r) {
+            --st.rebuildsInFlight;
             if (gen != bomGen_) return;  // a newer refresh rebuilt the rows
             --bomPending_;
             if (r.ok && r.result.is_object() && !r.result.contains("code") &&

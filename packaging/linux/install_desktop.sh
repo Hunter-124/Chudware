@@ -6,21 +6,21 @@
 # entry's StartupWMClass=Billet binds the live window to it — so the taskbar icon
 # resolves even for a window launched outside the launcher.
 #
-# The binary is still named AI-CAD this rename wave (user-facing identity only),
-# so Exec keeps pointing at host/build-linux/bin/AI-CAD.
+# The binary is named Billet (deep rename); an AI-CAD compat symlink ships beside
+# it for legacy scripts, but Exec points at the canonical host/build-linux/bin/Billet.
 #
 # Usage:  packaging/linux/install_desktop.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$REPO/host/build-linux/bin/AI-CAD"
+BIN="$REPO/host/build-linux/bin/Billet"
 ICON_SRC="$REPO/assets/logo_icon.png"
 DOC_ICON_SRC="$REPO/assets/doc_icon.png"
 # freedesktop icon name for the native document MIME type (application/vnd.billet.stepplus,
 # registered by services/installer/setup_file_assoc.py): the MIME with '/' -> '-'.
 MIME_ICON_NAME="application-vnd.billet.stepplus"
 
-[ -x "$BIN" ] || { echo "error: binary not found/executable: $BIN"; echo "build it: cmake -S host -B host/build-linux && ninja -C host/build-linux AI-CAD"; exit 1; }
+[ -x "$BIN" ] || { echo "error: binary not found/executable: $BIN"; echo "build it: cmake -S host -B host/build-linux && ninja -C host/build-linux Billet"; exit 1; }
 [ -f "$ICON_SRC" ] || { echo "error: icon not found: $ICON_SRC"; exit 1; }
 
 APPS="$HOME/.local/share/applications"

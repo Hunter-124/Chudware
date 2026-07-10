@@ -1,9 +1,9 @@
 ---
 name: aicad-dev
-description: Generalist skill for ANY change to the AI-CAD/ShopCraft program in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
+description: Generalist skill for ANY change to the Billet program (formerly AI-CAD/ShopCraft) in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
 ---
 
-# AI-CAD Generalist Dev
+# Billet Generalist Dev (formerly AI-CAD)
 
 How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
 hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and
@@ -72,7 +72,7 @@ with `ai-cad` preserved.
 ./build.sh core         # C++ kernel only (linux-core preset; needs system OCCT)
 ./build.sh all          # core, then GUI
 ./build.sh clean        # wipe host/build-linux (core kept — OCCT reconfig is expensive)
-./host/build-linux/bin/AI-CAD                     # run the app
+./host/build-linux/bin/Billet                     # run the app
 scripts/gate.sh         # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
 python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
 python3 work/tools/work.py ready|board            # task board
@@ -83,7 +83,7 @@ stays green on an unprovisioned box. Engine+agent pytest runs as
 `<venv>/python -X utf8 -m pytest engine/doc agent -q` when the venv exists.
 Scripted GUI launches use `xvfb-run` automatically; set `AI_CAD_SHOT_HEADED=1` to see a real
 window. Headless scenario smoke: `AI_CAD_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
-./host/build-linux/bin/AI-CAD --ui-screenshot scratch/smoke.png` (crash check, not visual
+./host/build-linux/bin/Billet --ui-screenshot scratch/smoke.png` (crash check, not visual
 judgment).
 
 ## Rules that bind every change

@@ -40,7 +40,16 @@ bool dirExists(const std::string& p) {
     DWORD a = GetFileAttributesA(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
-std::string appdataRoot() { return env_or("APPDATA", "") + "\\AI-CAD"; }
+std::string appdataRoot() {
+    // Billet alias rule (mirrors engine/paths.py active_root()): an existing legacy
+    // AI-CAD dir wins (it holds the live runtime venv) unless the Billet dir already
+    // has a real install marker (config.json); fresh installs get Billet.
+    const std::string base = env_or("APPDATA", "");
+    const std::string legacy = base + "\\AI-CAD";
+    const std::string neu = base + "\\Billet";
+    if (dirExists(legacy) && !fileExists(neu + "\\config.json")) return legacy;
+    return neu;
+}
 
 std::string runCapture(const std::string& cmd) {
     std::string out;
@@ -310,13 +319,22 @@ std::string shq(const std::string& s) {
     o += "'";
     return o;
 }
-// XDG data root for the managed runtime/cache (mirrors %APPDATA%\AI-CAD on Windows).
+// XDG data root for the managed runtime/cache (mirrors %APPDATA% on Windows).
+// Billet alias rule (mirrors engine/paths.py active_root()): an existing legacy AI-CAD
+// dir wins (it holds the live runtime venv) unless the Billet dir already has a real
+// install marker (config.json); fresh installs get Billet.
 std::string appdataRoot() {
+    fs::path base;
     std::string xdg = env_or("XDG_DATA_HOME", "");
-    if (!xdg.empty()) return (fs::path(xdg) / "AI-CAD").string();
     std::string home = env_or("HOME", "");
-    if (!home.empty()) return (fs::path(home) / ".local" / "share" / "AI-CAD").string();
-    return "AI-CAD";
+    if (!xdg.empty()) base = fs::path(xdg);
+    else if (!home.empty()) base = fs::path(home) / ".local" / "share";
+    else base = fs::path(".");
+    const fs::path legacy = base / "AI-CAD";
+    const fs::path neu = base / "Billet";
+    std::error_code ec;
+    if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy.string();
+    return neu.string();
 }
 std::string runCapture(const std::string& cmd) {
     std::string out;

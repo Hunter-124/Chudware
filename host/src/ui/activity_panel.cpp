@@ -145,7 +145,7 @@ void ActivityPanel::refreshReplayList() {
 
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path runsDir = fs::path(appdataDir()) / "AI-CAD" / "cache" / "runs";
+    fs::path runsDir = fs::path(appdataAppDir()) / "cache" / "runs";
     if (!fs::is_directory(runsDir, ec)) return;
 
     struct Entry { std::string id; std::string jsonlPath; fs::file_time_type ft; };

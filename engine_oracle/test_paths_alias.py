@@ -1,7 +1,7 @@
 """T-G10 appdata alias rule (engine/paths.py active_root) — no destructive migration.
 
 Ratified approach (work/questions/T-G10.md): machines with an existing legacy
-``AI-CAD`` data dir keep using it wholesale; fresh installs get ``ShopCraft``;
+``AI-CAD`` data dir keep using it wholesale; fresh installs get ``Billet``;
 nothing is ever moved or deleted automatically (the legacy dir may hold a live
 venv, which does not survive relocation).
 """
@@ -26,8 +26,8 @@ def paths_mod(tmp_path, monkeypatch):
 
 def test_fresh_install_uses_shopcraft(paths_mod):
     paths, base = paths_mod
-    assert paths.ROOT == base / "ShopCraft"
-    assert paths.active_root().name == "ShopCraft"
+    assert paths.ROOT == base / "Billet"
+    assert paths.active_root().name == "Billet"
 
 
 def test_legacy_dir_present_wins(paths_mod):
@@ -36,26 +36,26 @@ def test_legacy_dir_present_wins(paths_mod):
     importlib.reload(paths)
     assert paths.ROOT == base / "AI-CAD"
     # Nothing was moved or created in the new location.
-    assert not (base / "ShopCraft").exists()
+    assert not (base / "Billet").exists()
     assert (base / "AI-CAD").exists()
 
 
 def test_both_dirs_present_legacy_wins_without_marker(paths_mod):
-    # Hardened 2026-07-04: a bare ShopCraft dir (no config.json install marker)
+    # Hardened 2026-07-04: a bare Billet dir (no config.json install marker)
     # must NOT steal the root from live legacy data — stray cache dirs happen.
     paths, base = paths_mod
     (base / "AI-CAD").mkdir()
-    (base / "ShopCraft").mkdir()
+    (base / "Billet").mkdir()
     importlib.reload(paths)
     assert paths.ROOT == base / "AI-CAD"
 
 def test_both_dirs_present_new_wins_with_marker(paths_mod):
     paths, base = paths_mod
     (base / "AI-CAD").mkdir()
-    (base / "ShopCraft").mkdir()
-    (base / "ShopCraft" / "config.json").write_text("{}")
+    (base / "Billet").mkdir()
+    (base / "Billet" / "config.json").write_text("{}")
     importlib.reload(paths)
-    assert paths.ROOT == base / "ShopCraft"
+    assert paths.ROOT == base / "Billet"
 
 def test_data_roots_order_and_legacy_never_deleted(paths_mod):
     paths, base = paths_mod
@@ -63,7 +63,7 @@ def test_data_roots_order_and_legacy_never_deleted(paths_mod):
     (base / "AI-CAD" / "config.json").write_text("{}")
     importlib.reload(paths)
     roots = paths.data_roots()
-    assert roots == [base / "ShopCraft", base / "AI-CAD"]
+    assert roots == [base / "Billet", base / "AI-CAD"]
     # find_config falls back to the legacy config when the new one is absent.
     assert paths.find_config() == base / "AI-CAD" / "config.json"
 

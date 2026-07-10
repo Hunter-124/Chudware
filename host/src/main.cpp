@@ -14,6 +14,7 @@
 #include <stb_image_write.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -59,8 +60,8 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
     char stamp[32];
     std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
-    std::string stackPath = base + "\\AI-CAD_crash_" + stamp + ".txt";
-    std::string dmpPath   = base + "\\AI-CAD_crash_" + stamp + ".dmp";
+    std::string stackPath = base + "\\Billet_crash_" + stamp + ".txt";
+    std::string dmpPath   = base + "\\Billet_crash_" + stamp + ".dmp";
 
     std::ofstream out(stackPath, std::ios::binary);
     auto emit = [&](const std::string& line) {
@@ -68,7 +69,7 @@ LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
         std::fprintf(stderr, "%s\n", line.c_str());
     };
     char hdr[128];
-    std::snprintf(hdr, sizeof(hdr), "AI-CAD CRASH  code=0x%08lX  addr=%p",
+    std::snprintf(hdr, sizeof(hdr), "Billet CRASH  code=0x%08lX  addr=%p",
                   ep->ExceptionRecord->ExceptionCode,
                   ep->ExceptionRecord->ExceptionAddress);
     emit(hdr);
@@ -155,6 +156,46 @@ void installCrashHandler() { SetUnhandledExceptionFilter(aicadCrashFilter); }
 #else
 void installCrashHandler() {}
 #endif
+
+#ifndef _WIN32
+// Declared extern "C" at namespace scope so it keeps external linkage even inside an
+// unnamed namespace (a plain `extern` in the function got internal linkage -> link error).
+extern "C" char** environ;
+#endif
+
+// ---- Billet env-var shim -------------------------------------------------------------------
+// BILLET_* is the canonical public env-var prefix (deep-rename); AI_CAD_* / AICAD_* remain the
+// internal transport read throughout the codebase. For every BILLET_X present in the
+// environment, set AI_CAD_X and AICAD_X when not already set, so a user exporting only the new
+// names reaches every legacy read site. Never overwrites an explicitly-set legacy var.
+void propagateBilletEnv() {
+#ifdef _WIN32
+    char** envp = _environ;
+#else
+    char** envp = environ;
+#endif
+    if (!envp) return;
+    constexpr const char* kPrefix = "BILLET_";
+    constexpr size_t kPrefixLen = 7;
+    for (char** e = envp; *e; ++e) {
+        const char* kv = *e;
+        if (std::strncmp(kv, kPrefix, kPrefixLen) != 0) continue;
+        const char* eq = std::strchr(kv, '=');
+        if (!eq) continue;
+        const std::string suffix(kv + kPrefixLen, static_cast<size_t>(eq - (kv + kPrefixLen)));
+        if (suffix.empty()) continue;
+        const std::string value(eq + 1);
+        for (const std::string& legacy : {"AI_CAD_" + suffix, "AICAD_" + suffix}) {
+            if (!std::getenv(legacy.c_str())) {
+#ifdef _WIN32
+                _putenv_s(legacy.c_str(), value.c_str());
+#else
+                setenv(legacy.c_str(), value.c_str(), 0);
+#endif
+            }
+        }
+    }
+}
 
 GLFWwindow* makeContext(int w, int h, bool visible) {
     if (!glfwInit()) {
@@ -305,6 +346,9 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 }
 
 int main(int argc, char** argv) {
+    // FIRST: mirror BILLET_* env vars onto the legacy AI_CAD_*/AICAD_* names every
+    // subsystem (and every child process we spawn) actually reads.
+    propagateBilletEnv();
 #ifdef AI_CAD_ENABLE_CEF
     // A separate subprocess executable (ai_cad_cef_helper) is configured via
     // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the

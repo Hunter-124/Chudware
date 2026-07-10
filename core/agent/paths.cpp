@@ -30,14 +30,14 @@ fs::path expand_home_roaming() {
 
 namespace {
 // T-G10 alias rule (mirrors engine/paths.py active_root()): a machine with an
-// existing legacy AI-CAD dir (and no ShopCraft dir yet) keeps using it wholesale;
-// fresh installs get ShopCraft. No destructive migration.
+// existing legacy AI-CAD dir (and no Billet dir yet) keeps using it wholesale;
+// fresh installs get Billet. No destructive migration.
 fs::path pick_app_dir(const fs::path& base) {
-    const fs::path neu = base / "ShopCraft";
+    const fs::path neu = base / "Billet";
     const fs::path legacy = base / "AI-CAD";
     std::error_code ec;
     // Legacy wins whenever it exists and the new dir holds no real install marker
-    // (config.json) — a stray cache-only ShopCraft dir must not flip the root
+    // (config.json) — a stray cache-only Billet dir must not flip the root
     // (mirrors engine/paths.py active_root(), hardened 2026-07-04).
     if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy;
     return neu;

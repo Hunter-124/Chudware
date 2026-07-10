@@ -906,8 +906,43 @@ def _default_probes(circuit: dict) -> list[str]:
     return probes
 
 
-def simulate(circuit: dict, study: dict) -> dict:
-    """Run the requested analyses on a Circuit dict; return sim.md §4 results."""
+def simulate(circuit: dict, study: dict, backend: str = "mna") -> dict:
+    """Run the requested analyses on a Circuit dict; return sim.md §4 results.
+
+    ``backend`` selects the solver (T-FIN14 backend seam):
+      * "mna"     -- the validated internal Python MNA solver (DEFAULT, deterministic)
+      * "ngspice" -- run through an installed ngspice binary (unlocks vendor
+                     .SUBCKT/.MODEL libraries). If ngspice is absent, or the study
+                     uses an analysis the subprocess backend does not support
+                     (four/mc/temp/noise/step), or the run fails, this degrades
+                     HONESTLY to the MNA solver and says so in result["backend_note"].
+      * "auto"    -- mna unless the circuit carries vendor .lib/.subckt attachments
+                     (circuit["includes"]/["xdevices"]) AND ngspice is installed.
+    Every result carries result["backend"] = the solver that actually ran.
+    """
+    from engine.sim import ngspice_backend as _ng  # local import; cheap, avoids cycles
+
+    choice, note = _ng.resolve_backend(backend, circuit, study)
+    if choice == "ngspice":
+        try:
+            result = _ng.simulate_ngspice(circuit, study)
+            result["backend"] = "ngspice"
+            if note:
+                result["backend_note"] = note
+            return result
+        except _ng.NgspiceError as e:
+            note = ((note + " ") if note else "") + \
+                f"ngspice run failed ({e}) — fell back to the internal MNA solver."
+    result = _simulate_mna(circuit, study)
+    result["backend"] = "mna"
+    if note:
+        result["backend_note"] = note
+        result.setdefault("log", []).append(f"backend: {note}")
+    return result
+
+
+def _simulate_mna(circuit: dict, study: dict) -> dict:
+    """The internal MNA solver path (the pre-T-FIN14 body of ``simulate``)."""
     t0 = time.perf_counter()
     options = dict(study.get("options", {}))
     probes = list(study.get("probes", []))
@@ -950,7 +985,7 @@ def simulate(circuit: dict, study: dict) -> dict:
         an = mc_entries[0]
         seed_default = int(study.get("seed", options.get("seed", 12345)))
         result["mc"] = analysis_ext.run_monte_carlo(
-            circuit, options, an, probes, log, simulate, seed_default)
+            circuit, options, an, probes, log, _simulate_mna, seed_default)
         result["convergence"]["mc"] = result["mc"].get("runs", 0) > 0
         # Run any remaining (non-mc) analyses on the nominal circuit too.
         rest = [a for a in inner_analyses if a.get("type") not in ("mc",)]
@@ -965,7 +1000,7 @@ def simulate(circuit: dict, study: dict) -> dict:
     if temp_entries:
         an = temp_entries[0]
         result["temp"] = analysis_ext.run_temp_sweep(
-            circuit, options, an, probes, log, simulate)
+            circuit, options, an, probes, log, _simulate_mna)
         result["convergence"]["temp"] = bool(result["temp"].get("points"))
         rest = [a for a in inner_analyses if a.get("type") not in ("temp",)]
         if rest:

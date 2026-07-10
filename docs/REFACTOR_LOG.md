@@ -1065,3 +1065,10 @@ ucontext leaf PC (no longer 100% self-time in `sample_handler`), ELF `.symtab`
 symbolization fallback; summary ticks/dropped diagnostics. Verified: shm lifecycle
 0→10→0, profile_modeling ~2.9k samples/3s with OCCT hotspots, m1 shot smoke PASS.
 **Deferred:** out-of-line content-addressed `embedded_brep` store (schema/PLM).
+
+**2026-07-10 — T-PERF10 AICM handoff coverage follow-up.** Cold-open step+ cache
+path, field-eval SCLR AICMs, and sim overlay AICMs now publish via `aicm_handoff`
+(same `aicm-shm://` consumer path as live rebuilds) instead of always writing
+`/tmp/aicad_cpp_docs` / `aicad_overlay_*` files. `aicad_geom_occt` links
+`aicad_util` for overlay publish. Joint re-verify: lifecycle still 0→10→0 with
+0 new `/tmp/aicad_cpp_docs` files; m1 smoke no CEF init lines; profiler ~2k/2s.

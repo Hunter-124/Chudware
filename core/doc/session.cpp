@@ -7885,22 +7885,23 @@ aicm::AicmBody field_tessellate(const TopoDS_Shape& shape, const std::string& na
     return ::geom::tessellate_body(shape, 1, name.empty() ? std::string("Body1") : name, color);
 }
 
-// Write the tessellated body + a single SCLR chunk to a fresh temp .aicm path; return it.
+// Write the tessellated body + a single SCLR chunk via aicm-shm handoff (file fallback).
 std::string field_write_temp_aicm(const aicm::AicmBody& body,
                                   const std::vector<uint8_t>& chunk) {
-    namespace fs = std::filesystem;
+    std::vector<std::vector<uint8_t>> extras;
+    extras.push_back(chunk);
+    std::vector<uint8_t> blob = aicm::write_aicm({body}, extras);
+    if (blob.empty())
+        throw OpError("invalid_op", "failed to encode field aicm",
+                      {{"reason", "aicm encode failed"}});
     static std::atomic<unsigned long long> seq{1};
     unsigned long long n = seq.fetch_add(1);
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "aicad-field-%llx-%llx.aicm",
-                  static_cast<unsigned long long>(
-                      reinterpret_cast<std::uintptr_t>(&body) & 0xffffffffULL),
-                  n);
-    fs::path tmp = fs::temp_directory_path() / buf;
-    if (!aicm::write_aicm_file(tmp.string(), {body}, {chunk}))
-        throw OpError("invalid_op", "failed to write field aicm to temp",
-                      {{"reason", "aicm write failed"}});
-    return tmp.string();
+    const std::string key = "field_" + std::to_string(n);
+    std::string uri = aicad::aicm_handoff::publish(key, blob);
+    if (uri.empty())
+        throw OpError("invalid_op", "failed to publish field aicm",
+                      {{"reason", "aicm publish failed"}});
+    return uri;
 }
 
 // Per-vertex unit normal from the body's flat nrm buffer (3*i..3*i+2), normalized like the
@@ -8910,16 +8911,14 @@ json doc_open(const std::string& path, bool as_solid) {
                     header.value("doc_hash", std::string()) == stepplus_doc_hash(stored.doc) &&
                     header.contains("response") && header["response"].is_object()) {
                     resp = header["response"];
-                    // Re-materialize the mesh to this session's temp aicm path at revision 0.
-                    std::filesystem::path ap = aicm_file(stored.doc_id, stored.revision);
-                    std::ofstream f(ap, std::ios::binary | std::ios::trunc);
-                    if (f) {
-                        f.write(ca->second.data(),
-                                static_cast<std::streamsize>(ca->second.size()));
-                        f.close();
+                    // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as
+                    // live rebuilds). Avoids /tmp/aicad_cpp_docs storm on cold open.
+                    std::vector<uint8_t> blob(ca->second.begin(), ca->second.end());
+                    std::string ap = publish_doc_aicm(stored.doc_id, stored.revision, blob);
+                    if (!ap.empty()) {
                         if (!resp.contains("tess") || !resp["tess"].is_object())
                             resp["tess"] = json::object();
-                        resp["tess"]["aicm_path"] = std::filesystem::absolute(ap).string();
+                        resp["tess"]["aicm_path"] = ap;
                     }
                     resp["revision"] = stored.revision;  // override the cached (save-time) revision
                     resp["tree"] = stored.doc;

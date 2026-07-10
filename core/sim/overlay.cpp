@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "geom/aicm.h"
+#include "util/aicm_handoff.h"
 
 namespace aicad::sim {
 
@@ -55,13 +56,14 @@ std::vector<double> surface_verts(const aicm::AicmBody& bt) {
     return out;
 }
 
-// Unique temp .aicm path (counter + temp dir; avoids any clock dependency).
-std::string temp_aicm_path() {
+// Publish overlay AICM via shared-mem handoff (file fallback inside publish).
+std::string publish_overlay_aicm(const aicm::AicmBody& bt,
+                                 const std::vector<std::vector<uint8_t>>& chunks) {
     static std::atomic<unsigned long long> seq{0};
     unsigned long long n = seq.fetch_add(1);
-    std::filesystem::path dir = std::filesystem::temp_directory_path();
-    std::filesystem::path p = dir / ("aicad_overlay_" + std::to_string(n) + ".aicm");
-    return p.string();
+    std::vector<uint8_t> blob = aicm::write_aicm({bt}, chunks);
+    if (blob.empty()) return {};
+    return aicad::aicm_handoff::publish("overlay_" + std::to_string(n), blob);
 }
 
 // double -> float vector (chunk payloads are float32, like the np.float32 cast in
@@ -473,9 +475,7 @@ std::string static_overlay(const std::string& step_path,
         chunks.push_back(aicm::scalar_chunk(1, "fos_tresca", to_f32(fos_tr), 0.0f, 5.0f));
         chunks.push_back(aicm::scalar_chunk(1, "fos_rankine", to_f32(fos_rk), 0.0f, 5.0f));
 
-        std::string path = temp_aicm_path();
-        if (!aicm::write_aicm_file(path, {bt}, chunks)) return std::string();
-        return std::filesystem::absolute(path).string();
+        return publish_overlay_aicm(bt, chunks);
     } catch (...) {
         return std::string();
     }
@@ -505,9 +505,7 @@ std::string fatigue_overlay(const std::string& step_path,
         chunks.push_back(aicm::scalar_chunk(1, "von_mises", to_f32(vm_s), 0.0f,
                                             static_cast<float>(field_max(vm_s))));
 
-        std::string path = temp_aicm_path();
-        if (!aicm::write_aicm_file(path, {bt}, chunks)) return std::string();
-        return std::filesystem::absolute(path).string();
+        return publish_overlay_aicm(bt, chunks);
     } catch (...) {
         return std::string();
     }
@@ -544,9 +542,7 @@ std::string modal_overlay(const std::string& step_path,
         chunks.push_back(
             aicm::disp_chunk(1, static_cast<float>(scale_hint), to_f32(dvec_s)));
 
-        std::string path = temp_aicm_path();
-        if (!aicm::write_aicm_file(path, {bt}, chunks)) return std::string();
-        return std::filesystem::absolute(path).string();
+        return publish_overlay_aicm(bt, chunks);
     } catch (...) {
         return std::string();
     }

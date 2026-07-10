@@ -645,6 +645,7 @@ if(AICAD_WITH_OCCT)
   # Eigen3::Eigen; nlohmann_json for the solved-entity dicts profile.cpp consumes.
   target_link_libraries(aicad_geom_occt PUBLIC
     aicad_geom
+    aicad_util   # aicm_handoff publish for sim/overlay AICM (T-PERF10)
     aicad_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo

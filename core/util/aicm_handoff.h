@@ -63,6 +63,11 @@ void release_older_than(const std::string& doc_id, long keep_rev);
 // Release every key for this document (all revisions). Call from doc_close.
 void release_doc(const std::string& doc_id);
 
+// Release every cached publish (all docs). Call from hostd process teardown so
+// kill/drain does not leave orphaned /dev/shm/aicad_* objects. atexit-registered
+// on first publish as a backstop for clean process exit.
+void release_all();
+
 // Sanitize doc_id + revision into a stable shm key (no path separators).
 std::string key_for(const std::string& doc_id, long revision);
 

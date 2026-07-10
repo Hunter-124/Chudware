@@ -2,6 +2,7 @@
 #include "util/aicm_handoff.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -269,8 +270,27 @@ std::string key_for(const std::string& doc_id, long revision) {
     return sanitize(doc_id) + "_r" + std::to_string(revision);
 }
 
+void release_all() {
+    std::vector<std::string> keys;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        keys.reserve(g_cache.size());
+        for (const auto& kv : g_cache) keys.push_back(kv.first);
+    }
+    for (const auto& k : keys) release(k);
+}
+
+namespace {
+void atexit_release_all() { release_all(); }
+std::once_flag g_atexit_once;
+void ensure_atexit_cleanup() {
+    std::call_once(g_atexit_once, [] { std::atexit(atexit_release_all); });
+}
+}  // namespace
+
 std::string publish(const std::string& key, const uint8_t* data, size_t n) {
     if (!data && n) return {};
+    ensure_atexit_cleanup();
     std::string uri = publish_shm(key, data, n);
     if (uri.empty()) uri = publish_file(key, data, n);
     if (uri.empty()) return {};

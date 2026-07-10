@@ -101,10 +101,10 @@ Machine: Linux host build. Prefer headed (`AI_CAD_SHOT_HEADED=1` or launch binar
 | I1 | Auto-coincide scope | Edit one entity in a large sketch | Coincident proposals don't full-scan forever | |
 | I2 | Fillet bisect | All-edge fillet that partially fails | Faster than O(E²) full rebuilds; sensible partial result | |
 | I3 | Unify skip | Fuse-heavy model | No obvious regression; compile not slower | |
-| I4 | **AICM shared-mem** | Edit a part; watch `/dev/shm/aicad_*` (or rebuild loop) | `tess.aicm_path` is `aicm-shm://…`; mesh still appears; no `/tmp/aicad_cpp_docs` storm; close doc frees shm | |
-| I5 | **CEF lazy** | Cold launch *without* opening Parts browser | No `[cef] calling CefInitialize` on stderr at startup; first open of vendor browser initializes CEF (or `AI_CAD_CEF_EARLY=1` restores old eager path) | |
+| I4 | **AICM shared-mem** | Edit a part; watch `/dev/shm/aicad_*` (or rebuild loop) | `tess.aicm_path` is `aicm-shm://…`; mesh still appears; no `/tmp/aicad_cpp_docs` storm; close doc frees shm | **agent PASS** 2026-07-10 joint — see J4; **you: mesh in viewport** |
+| I5 | **CEF lazy** | Cold launch *without* opening Parts browser | No `[cef] calling CefInitialize` on stderr at startup; first open of vendor browser initializes CEF (or `AI_CAD_CEF_EARLY=1` restores old eager path) | **agent PASS** cold m1/stderr; **you: first Parts/vendor open** |
 | I6 | Idle throttle | Leave app idle focused | CPU lower than full vsync spin | |
-| I7 | **Profiler** | `python3 tools/profile_modeling.py --workload fillet --seconds 3 --hz 1000` | ~thousands of samples (not ~76/10s); hot frames are OCCT/geom (not only `sample_handler`); names under `aicad!…` where unstripped | |
+| I7 | **Profiler** | `python3 tools/profile_modeling.py --workload fillet --seconds 3 --hz 1000` | ~thousands of samples (not ~76/10s); hot frames are OCCT/geom (not only `sample_handler`); names under `aicad!…` where unstripped | **PASS** (agent) ~2.9k/3s + ~2.0k/2s reconfirm; OCCT hotspots |
 | I8 | Scrape pool | Parts live search; type quickly | Old scrapes cancel; current query wins | |
 
 ---
@@ -113,13 +113,23 @@ Machine: Linux host build. Prefer headed (`AI_CAD_SHOT_HEADED=1` or launch binar
 
 | # | Command / check | Result |
 |---|-----------------|--------|
-| J1 | `./build.sh` (host) | **PASS** (incl. aicm_handoff + CEF lazy) |
-| J2 | `./build.sh core` + ctest aicm/prof/document/ops/sketch* | **PASS** |
+| J1 | `./build.sh` (host) + `cmake --build core/build-occt-linux` + `./build.sh stage` | **PASS** (joint re-verify 2026-07-10) |
+| J2 | ctest aicm/document/overlay/sketch* on build-occt-linux | **PASS** 12/12 |
 | J3 | `python3 scripts/check.py` | **PARTIAL** — pre-existing `feature_surface_audit` sketch3d ribbon FAIL (not from PERF) |
-| J4 | AICM shm lifecycle (agent) | **PASS** — path `aicm-shm://…`, mid=10 after 5 docs, after close=0 |
-| J5 | Profiler sample (agent) | **PASS** — ~2.9k samples / 3s @ 1 kHz; hotspots BRepGProp / tessellate / OCCT |
-| J6 | Headless `AI_CAD_SHOT=m1` smoke | **PASS** — scenario complete, PNG written |
+| J4 | AICM shm lifecycle (agent) | **PASS** — `aicm-shm:///aicad_doc-…_r1`; mid shm=10 after 5 boxed docs; after `doc_close` shm=0; **0 new** `/tmp/aicad_cpp_docs` files (cold-open/field/overlay also on handoff) |
+| J5 | Profiler sample (agent) | **PASS** — ~2.9k / 3s @ 1 kHz + reconfirm ~2.0k / 2s; hotspots OCCT/geom not `sample_handler` |
+| J6 | Headless `AI_CAD_SHOT=m1` smoke | **PASS** — scenario complete; stderr has **no** `[cef] calling CefInitialize` |
 | J7 | All T-PERF1..10 + deferred micro-items | **YES** (only remaining optional: out-of-line embedded_brep store — schema/PLM) |
+
+### Joint headed walk (you + agent) — mark Pass here
+
+| # | What you do | Expect | Pass? |
+|---|-------------|--------|-------|
+| H-I4 | Launch Billet; New Part → Box → Fillet; `watch -n0.5 'ls /dev/shm/aicad_* 2>/dev/null \| wc -l'` in a terminal | Mesh draws; shm count rises on rebuilds; close part → count drops | |
+| H-I5 | Cold launch from terminal (stderr visible); do **not** open Parts browser first | No CEF init lines at startup; open Parts/vendor browser → then see `[cef] calling CefInitialize` | |
+| H-A1 | PM extrude depth type-while-watch | UI stays live; mesh catches up | |
+| H-B1 | Sketch: drag a constrained point fast | ~60 fps UI; geometry may trail | |
+| H-I6 | Leave idle focused ~10s; check `top` on Billet | Idle CPU much lower than active orbit | |
 
 ### Still intentionally deferred (not phase blockers)
 

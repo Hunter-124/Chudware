@@ -227,6 +227,10 @@ public:
     bool save(WorkerClient& w, const std::string& path, std::string& err);
     bool open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid = false);
 
+    // T-PERF4: GL-thread adopt of a finished doc_open JSON (from AsyncRpc). Same post-conditions
+    // as open() on success. Returns false if the envelope is an error or missing doc_id.
+    bool adoptOpenResponse(const nlohmann::json& res, std::string& err);
+
     // Document tabs: re-point this mirror at an ALREADY-open worker document (the worker keeps
     // every doc alive in its registry). Issues a forced doc_rebuild for `docId` so the mirror
     // gets the new doc's tree/revision/owner_map AND a fresh tess.aicm_path; fills *aicmPath with
@@ -246,6 +250,17 @@ public:
     bool activateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
                         const std::string& cachedAicm, std::string& aicmPath,
                         bool& usedCache, std::string& err);
+
+    // T-PERF4: cheap-only tab repoint (doc_tree + cached AICM). Does NOT run a full rebuild.
+    // On cache miss / revision change returns false with err == "needs_rebuild" so the caller
+    // can queue async doc_rebuild. Other failures set a real error string.
+    bool tryActivateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
+                           const std::string& cachedAicm, std::string& aicmPath,
+                           bool& usedCache, std::string& err);
+
+    // T-PERF4: adopt a finished doc_rebuild JSON as activate() would (GL thread / drain).
+    bool adoptActivateResponse(const std::string& docId, const nlohmann::json& res,
+                               std::string& aicmPath, std::string& err);
 
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);

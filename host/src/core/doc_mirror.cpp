@@ -541,15 +541,11 @@ bool DocMirror::save(WorkerClient& w, const std::string& path, std::string& err)
     return true;
 }
 
-bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid) {
-    nlohmann::json res;
-    // Default (asSolid==false) keeps the request byte-identical to the historic {"path": path} shape;
-    // only when asSolid is set do we add the optional engine flag that sews a mesh import into a solid.
-    nlohmann::json params = {{"path", path}};
-    if (asSolid) params["as_solid"] = true;
-    if (!w.call("doc_open", params, res, err)) return false;
+bool DocMirror::adoptOpenResponse(const nlohmann::json& res, std::string& err) {
     if (res.contains("code")) { err = jstr(res, "message"); return false; }
-    docId_ = jstr(res, "doc_id");
+    const std::string id = jstr(res, "doc_id");
+    if (id.empty()) { err = "doc_open response missing doc_id"; return false; }
+    docId_ = id;
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
     // The doc_open response is a full ops-response: adopt the feature status / owner map /
@@ -582,6 +578,16 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err,
         lastOpenedDrawings_ = nlohmann::json::array();
     notify();
     return true;
+}
+
+bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid) {
+    nlohmann::json res;
+    // Default (asSolid==false) keeps the request byte-identical to the historic {"path": path} shape;
+    // only when asSolid is set do we add the optional engine flag that sews a mesh import into a solid.
+    nlohmann::json params = {{"path", path}};
+    if (asSolid) params["as_solid"] = true;
+    if (!w.call("doc_open", params, res, err)) return false;
+    return adoptOpenResponse(res, err);
 }
 
 bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
@@ -629,6 +635,8 @@ bool DocMirror::activateCached(WorkerClient& w, const std::string& docId, int ca
     aicmPath.clear();
     if (docId.empty()) { err = "empty doc id"; return false; }
     // No usable cache (never loaded, or the worker's mesh file is gone) -> full rebuild.
+    // T-PERF4: callers that can go async should treat err=="needs_rebuild" specially; we still
+    // fall back to sync activate() for headless/shot paths that need a blocking switch.
     if (cachedRevision < 0 || cachedAicm.empty() ||
         !std::filesystem::exists(std::filesystem::u8path(cachedAicm)))
         return activate(w, docId, aicmPath, err);
@@ -664,6 +672,87 @@ bool DocMirror::activateCached(WorkerClient& w, const std::string& docId, int ca
         refDatums_ = nlohmann::json::array();
     aicmPath = cachedAicm;
     usedCache = true;
+    notify();
+    return true;
+}
+
+// T-PERF4: cheap-only repoint. Returns true + usedCache when the parked mesh is still valid.
+// Returns false with err=="needs_rebuild" when a full doc_rebuild is required (no sync rebuild).
+// Other errors leave err as the transport/engine message.
+bool DocMirror::tryActivateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
+                                  const std::string& cachedAicm, std::string& aicmPath,
+                                  bool& usedCache, std::string& err) {
+    usedCache = false;
+    aicmPath.clear();
+    if (docId.empty()) { err = "empty doc id"; return false; }
+    if (cachedRevision < 0 || cachedAicm.empty() ||
+        !std::filesystem::exists(std::filesystem::u8path(cachedAicm))) {
+        err = "needs_rebuild";
+        return false;
+    }
+    nlohmann::json res;
+    if (!w.call("doc_tree", {{"doc_id", docId}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    if (jint(res, "revision") != cachedRevision) {
+        err = "needs_rebuild";
+        return false;
+    }
+    docId_ = docId;
+    revision_ = cachedRevision;
+    tree_ = (res.contains("tree") && res["tree"].is_object()) ? res["tree"] : nlohmann::json{};
+    featureStatus_ = {};
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
+        storeOwnerMap(res["rebuild"]["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("datums") && res["rebuild"]["datums"].is_array())
+        refDatums_ = res["rebuild"]["datums"];
+    else
+        refDatums_ = nlohmann::json::array();
+    aicmPath = cachedAicm;
+    usedCache = true;
+    notify();
+    return true;
+}
+
+// T-PERF4: adopt a finished doc_rebuild response (AsyncRpc) as activate() would.
+bool DocMirror::adoptActivateResponse(const std::string& docId, const nlohmann::json& res,
+                                      std::string& aicmPath, std::string& err) {
+    aicmPath.clear();
+    if (docId.empty()) { err = "empty doc id"; return false; }
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    docId_ = docId;
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    else tree_ = {};
+    featureStatus_ = {};
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else
+        refDatums_ = nlohmann::json::array();
+    if (res.contains("tess") && res["tess"].is_object())
+        aicmPath = jstr(res["tess"], "aicm_path");
+    cppParityProbe("rebuild_async", docId_, revision_, tree_, featureStatus_);
     notify();
     return true;
 }

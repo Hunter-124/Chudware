@@ -594,6 +594,7 @@ private:
     // Mesh-preview state (built by previewMesh from sim_mesh; drawn in the viewport while setting up).
     std::vector<float> meshPreviewSegs_;   // flat GL_LINES xyz pairs (surface element edges)
     std::string meshPreviewStudyId_;       // study the preview belongs to ("" = none)
+    bool meshPreviewPending_ = false;      // T-PERF4: sim_mesh async in flight
 
     // Flow-result line overlays (streamlines + velocity slices) parsed from the cached overlay AICM
     // and split into speed bands so drawSegments (flat-colour) can fake a speed colormap. Rebuilt when

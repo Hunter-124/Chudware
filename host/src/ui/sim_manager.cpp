@@ -1631,125 +1631,176 @@ void SimManager::clearMeshPreview() {
 
 void SimManager::previewMesh(AppState& st, Study& s) {
     if (!st.docMirror.hasDoc()) return;
-    // Export to STEP, mesh it (sim_mesh), then build a surface-element wireframe on the host so the
-    // user can SEE the discretization the solve will run on (transparency) before committing minutes.
-    std::string stepPath = appdataAppDir() + "/cache/sim_mesh_preview.step";
-    {
-        nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
-        std::string e;
-        if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
-            st.toast(ui::ToastLevel::Error, "Mesh preview: export failed");
-            return;
-        }
-        stepPath = r.value("path", stepPath);
-    }
-    nlohmann::json res, params = {{"step_path", stepPath}};
-    addMeshParams(params, s, s.meshOrder);
-    std::string err;
-    if (!st.worker.call("sim_mesh", params, res, err, 180000) || res.contains("code") ||
-        !res.value("ok", true)) {
-        // The mesher reports failure as {ok:false, error:...} (e.g. hex on a non-box part).
-        const std::string msg = res.contains("code") ? res.value("message", err)
-                                : res.contains("error") ? res.value("error", err)
-                                                        : err;
-        st.toast(ui::ToastLevel::Error, msg.empty() ? "Mesh preview: meshing failed" : msg);
-        st.addLog("[sim] sim_mesh failed: " + msg);
+    if (meshPreviewPending_) {
+        st.toast(ui::ToastLevel::Info, "Mesh preview already in progress…");
         return;
     }
-    s.nNodes = res.value("n_nodes", 0);
-    s.nElems = res.value("n_elems", 0);
-    const double minVol = res.value("min_tet_volume_mm3", 0.0);
-    const double edgeRatio = res.value("max_tet_edge_ratio", 0.0);
-    // Capture the professional quality metrics for the Mesh-form readout.
-    s.meshAspectMin = (float)res.value("aspect_min", 0.0);
-    s.meshAspectAvg = (float)res.value("aspect_avg", 0.0);
-    s.meshAspectMax = (float)res.value("aspect_max", 0.0);
-    s.meshJacobianMin = (float)res.value("jacobian_min", 0.0);
-    s.meshPctPoor = (float)res.value("pct_poor", 0.0);
-    s.meshAspectHist.clear();
-    if (res.contains("aspect_hist") && res["aspect_hist"].is_array())
-        for (const auto& b : res["aspect_hist"]) s.meshAspectHist.push_back((float)b.get<int>());
-    s.meshHasQuality = s.nElems > 0;
-    clearMeshPreview();
-    meshPreviewStudyId_ = s.id;
-    if (!res.contains("points") || !res.contains("tets") ||
-        !res["points"].is_array() || !res["tets"].is_array()) {
-        st.toast(ui::ToastLevel::Info, "Mesh: " + std::to_string(s.nNodes) + " nodes, " +
-                                       std::to_string(s.nElems) + " elements");
-        return;
-    }
-    const auto& P = res["points"];
-    const auto& T = res["tets"];
-    const int stride = res.value("nodes_per_elem", s.meshOrder == 2 ? 10 : 4);
-    const int nT = (stride > 0) ? (int)(T.size() / (size_t)stride) : 0;
-    // Cap the wireframe so a dense mesh can't tank the frame; the stats still surface regardless.
-    if (nT > 0 && nT <= 250000) {
-        auto elNode = [&](int e, int k) { return T[(size_t)e * (size_t)stride + k].get<int>(); };
-        std::unordered_set<uint64_t> seenEdge;
-        auto pt = [&](int i, float out[3]) {
-            out[0] = (float)P[(size_t)i * 3 + 0].get<double>();
-            out[1] = (float)P[(size_t)i * 3 + 1].get<double>();
-            out[2] = (float)P[(size_t)i * 3 + 2].get<double>();
-        };
-        auto edge = [&](int a, int b) {
-            if (a > b) std::swap(a, b);
-            uint64_t k = ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
-            if (!seenEdge.insert(k).second) return;
-            float pa[3], pb[3]; pt(a, pa); pt(b, pb);
-            meshPreviewSegs_.insert(meshPreviewSegs_.end(),
-                                    {pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]});
-        };
-        if (stride == 8) {
-            // hex8: 6 quad faces; a face owned by exactly one element is on the boundary.
-            static const int hexF[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
-                                           {2, 3, 7, 6}, {0, 3, 7, 4}, {1, 2, 6, 5}};
-            std::map<std::array<int, 4>, int> faceCount;
-            for (int e = 0; e < nT; ++e)
-                for (int f = 0; f < 6; ++f) {
-                    std::array<int, 4> q{elNode(e, hexF[f][0]), elNode(e, hexF[f][1]),
-                                         elNode(e, hexF[f][2]), elNode(e, hexF[f][3])};
-                    std::sort(q.begin(), q.end());
-                    faceCount[q]++;
+    // T-PERF4: export + sim_mesh are long (up to 180s). AsyncRpc keeps the UI live.
+    const std::string stepPath = appdataAppDir() + "/cache/sim_mesh_preview.step";
+    const std::string studyId = s.id;
+    const int meshOrder = s.meshOrder;
+    meshPreviewPending_ = true;
+    st.toast(ui::ToastLevel::Info, "Meshing… (UI stays interactive)");
+    ++st.rebuildsInFlight;
+    nlohmann::json exportParams = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
+    st.rpc.call(
+        "doc_export_step", std::move(exportParams),
+        [this, &st, studyId, meshOrder, stepPath](const core::RpcResult& r) {
+            if (!r.ok || (r.result.is_object() && r.result.contains("code"))) {
+                --st.rebuildsInFlight;
+                meshPreviewPending_ = false;
+                st.toast(ui::ToastLevel::Error, "Mesh preview: export failed");
+                return;
+            }
+            std::string path = r.result.value("path", stepPath);
+            nlohmann::json params = {{"step_path", path}};
+            Study* sp = nullptr;
+            for (auto& ss : studies_)
+                if (ss.id == studyId) {
+                    sp = &ss;
+                    break;
                 }
-            for (const auto& kv : faceCount)
-                if (kv.second == 1) {
-                    edge(kv.first[0], kv.first[1]);
-                    edge(kv.first[1], kv.first[2]);
-                    edge(kv.first[2], kv.first[3]);
-                    edge(kv.first[0], kv.first[3]);
-                }
-        } else {
-            // Surface triangles = tet faces owned by exactly one tet; draw their unique edges.
-            static const int fv[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
-            std::map<std::array<int, 3>, int> faceCount;
-            for (int e = 0; e < nT; ++e)
-                for (int f = 0; f < 4; ++f) {
-                    std::array<int, 3> tri{elNode(e, fv[f][0]), elNode(e, fv[f][1]),
-                                           elNode(e, fv[f][2])};
-                    std::sort(tri.begin(), tri.end());
-                    faceCount[tri]++;
-                }
-            for (const auto& kv : faceCount)
-                if (kv.second == 1) {
-                    edge(kv.first[0], kv.first[1]);
-                    edge(kv.first[1], kv.first[2]);
-                    edge(kv.first[0], kv.first[2]);
-                }
-        }
-    }
-    std::string msg = "Mesh: " + std::to_string(s.nNodes) + " nodes, " +
-                      std::to_string(s.nElems) + " elements";
-    if (edgeRatio > 0.0) {
-        char q[80];
-        std::snprintf(q, sizeof(q), " | worst edge ratio %.2f", edgeRatio);
-        msg += q;
-    }
-    if (minVol > 0.0) {
-        char q[80];
-        std::snprintf(q, sizeof(q), " | min volume %.3g mm3", minVol);
-        st.addLog(std::string("[sim] mesh quality: ") + q);
-    }
-    st.toast(ui::ToastLevel::Info, msg);
+            if (sp)
+                addMeshParams(params, *sp, meshOrder);
+            else
+                params["order"] = meshOrder;
+            st.rpc.call(
+                "sim_mesh", std::move(params),
+                [this, &st, studyId, meshOrder](const core::RpcResult& r2) {
+                    --st.rebuildsInFlight;
+                    meshPreviewPending_ = false;
+                    if (!r2.ok) {
+                        st.toast(ui::ToastLevel::Error, "Mesh preview: " + r2.err);
+                        st.addLog("[sim] sim_mesh failed: " + r2.err);
+                        return;
+                    }
+                    const auto& res = r2.result;
+                    if (res.contains("code") || !res.value("ok", true)) {
+                        const std::string msg =
+                            res.contains("code")
+                                ? res.value("message", std::string())
+                                : res.contains("error") ? res.value("error", std::string())
+                                                        : std::string("meshing failed");
+                        st.toast(ui::ToastLevel::Error,
+                                 msg.empty() ? "Mesh preview: meshing failed" : msg);
+                        st.addLog("[sim] sim_mesh failed: " + msg);
+                        return;
+                    }
+                    Study* s = nullptr;
+                    for (auto& ss : studies_)
+                        if (ss.id == studyId) {
+                            s = &ss;
+                            break;
+                        }
+                    if (!s) return;
+                    s->nNodes = res.value("n_nodes", 0);
+                    s->nElems = res.value("n_elems", 0);
+                    const double minVol = res.value("min_tet_volume_mm3", 0.0);
+                    const double edgeRatio = res.value("max_tet_edge_ratio", 0.0);
+                    s->meshAspectMin = (float)res.value("aspect_min", 0.0);
+                    s->meshAspectAvg = (float)res.value("aspect_avg", 0.0);
+                    s->meshAspectMax = (float)res.value("aspect_max", 0.0);
+                    s->meshJacobianMin = (float)res.value("jacobian_min", 0.0);
+                    s->meshPctPoor = (float)res.value("pct_poor", 0.0);
+                    s->meshAspectHist.clear();
+                    if (res.contains("aspect_hist") && res["aspect_hist"].is_array())
+                        for (const auto& b : res["aspect_hist"])
+                            s->meshAspectHist.push_back((float)b.get<int>());
+                    s->meshHasQuality = s->nElems > 0;
+                    clearMeshPreview();
+                    meshPreviewStudyId_ = s->id;
+                    if (!res.contains("points") || !res.contains("tets") ||
+                        !res["points"].is_array() || !res["tets"].is_array()) {
+                        st.toast(ui::ToastLevel::Info,
+                                 "Mesh: " + std::to_string(s->nNodes) + " nodes, " +
+                                     std::to_string(s->nElems) + " elements");
+                        return;
+                    }
+                    const auto& P = res["points"];
+                    const auto& T = res["tets"];
+                    const int stride =
+                        res.value("nodes_per_elem", meshOrder == 2 ? 10 : 4);
+                    const int nT =
+                        (stride > 0) ? (int)(T.size() / (size_t)stride) : 0;
+                    if (nT > 0 && nT <= 250000) {
+                        auto elNode = [&](int e, int k) {
+                            return T[(size_t)e * (size_t)stride + k].get<int>();
+                        };
+                        std::unordered_set<uint64_t> seenEdge;
+                        auto pt = [&](int i, float out[3]) {
+                            out[0] = (float)P[(size_t)i * 3 + 0].get<double>();
+                            out[1] = (float)P[(size_t)i * 3 + 1].get<double>();
+                            out[2] = (float)P[(size_t)i * 3 + 2].get<double>();
+                        };
+                        auto edge = [&](int a, int b) {
+                            if (a > b) std::swap(a, b);
+                            uint64_t k =
+                                ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+                            if (!seenEdge.insert(k).second) return;
+                            float pa[3], pb[3];
+                            pt(a, pa);
+                            pt(b, pb);
+                            meshPreviewSegs_.insert(
+                                meshPreviewSegs_.end(),
+                                {pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]});
+                        };
+                        if (stride == 8) {
+                            static const int hexF[6][4] = {
+                                {0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
+                                {2, 3, 7, 6}, {0, 3, 7, 4}, {1, 2, 6, 5}};
+                            std::map<std::array<int, 4>, int> faceCount;
+                            for (int e = 0; e < nT; ++e)
+                                for (int f = 0; f < 6; ++f) {
+                                    std::array<int, 4> q{
+                                        elNode(e, hexF[f][0]), elNode(e, hexF[f][1]),
+                                        elNode(e, hexF[f][2]), elNode(e, hexF[f][3])};
+                                    std::sort(q.begin(), q.end());
+                                    faceCount[q]++;
+                                }
+                            for (const auto& kv : faceCount)
+                                if (kv.second == 1) {
+                                    edge(kv.first[0], kv.first[1]);
+                                    edge(kv.first[1], kv.first[2]);
+                                    edge(kv.first[2], kv.first[3]);
+                                    edge(kv.first[0], kv.first[3]);
+                                }
+                        } else {
+                            static const int fv[4][3] = {
+                                {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+                            std::map<std::array<int, 3>, int> faceCount;
+                            for (int e = 0; e < nT; ++e)
+                                for (int f = 0; f < 4; ++f) {
+                                    std::array<int, 3> tri{elNode(e, fv[f][0]),
+                                                           elNode(e, fv[f][1]),
+                                                           elNode(e, fv[f][2])};
+                                    std::sort(tri.begin(), tri.end());
+                                    faceCount[tri]++;
+                                }
+                            for (const auto& kv : faceCount)
+                                if (kv.second == 1) {
+                                    edge(kv.first[0], kv.first[1]);
+                                    edge(kv.first[1], kv.first[2]);
+                                    edge(kv.first[0], kv.first[2]);
+                                }
+                        }
+                    }
+                    std::string msg = "Mesh: " + std::to_string(s->nNodes) + " nodes, " +
+                                      std::to_string(s->nElems) + " elements";
+                    if (edgeRatio > 0.0) {
+                        char q[80];
+                        std::snprintf(q, sizeof(q), " | worst edge ratio %.2f", edgeRatio);
+                        msg += q;
+                    }
+                    if (minVol > 0.0) {
+                        char q[80];
+                        std::snprintf(q, sizeof(q), " | min volume %.3g mm3", minVol);
+                        st.addLog(std::string("[sim] mesh quality: ") + q);
+                    }
+                    st.toast(ui::ToastLevel::Info, msg);
+                },
+                180000);
+        },
+        60000);
 }
 
 bool SimManager::hasMeshPreview(AppState& st) const {

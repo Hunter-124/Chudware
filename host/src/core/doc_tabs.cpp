@@ -264,20 +264,98 @@ void AppState::switchToTab(int idx) {
     DocTab& dst = docTabs[idx];
     ensureTabSession(dst);   // a never-activated tab gets its session on first switch-in
 
-    // 3) Re-point DocMirror at the destination doc (doc_rebuild → tree + revision + owner map +
-    //    fresh AICM mesh path). The worker still holds the doc, so this is a fast no-op-bump call.
-    //    activate() fires the mirror listener; suppress the tab-dirty marker around it (a switch is
-    //    not an edit and must not light the destination's unsaved marker). The leaving doc's value
-    //    state is already parked on its session (step 1); the destination's is restored below — NO
-    //    clearViewportForNewDoc, so the destination keeps its selection / hidden bodies / readouts.
+    // 3) Re-point DocMirror at the destination doc. Prefer the fast path (doc_tree + cached AICM).
+    //    T-PERF4: on cache miss, queue async doc_rebuild instead of blocking the GL thread on a
+    //    full re-tessellate. Keep-last-good mesh until the rebuild drains.
     suppressTabDirty = true;
     std::string aicmPath, err;
     bool usedCache = false;
-    // Scale: prefer the fast path — reuse the doc's cached mesh (cheap doc_tree, no re-tessellate)
-    // when its worker revision is unchanged since we last left it; activateCached falls back to the
-    // full rebuild otherwise. This keeps switching among many open parts O(doc_tree), not O(rebuild).
-    bool ok = docMirror.activateCached(worker, dst.docId, dst.session->cachedRevision,
-                                       dst.session->cachedAicmPath, aicmPath, usedCache, err);
+    bool ok = docMirror.tryActivateCached(worker, dst.docId, dst.session->cachedRevision,
+                                          dst.session->cachedAicmPath, aicmPath, usedCache, err);
+    if (!ok && err == "needs_rebuild") {
+        // Async rebuild path: finish the tab UI shell now, apply tree/mesh when rebuild drains.
+        const std::string rebuildDocId = dst.docId;
+        const int rebuildTabIdx = idx;
+        toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
+        ++rebuildsInFlight;
+        // Optimistic: select the tab so the strip highlights; keep prior mesh until ready.
+        activeTab = idx;
+        if (activeWorkspace != Workspace::Model && activeWorkspace != Workspace::Simulate &&
+            activeWorkspace != Workspace::Manufacture)
+            activeWorkspace = Workspace::Model;
+        reseatActiveSubsystems(dst.session.get());
+        restoreDocState(*dst.session);
+        ui::featureTreeResetTransient();
+        zoomToBBoxRequested = false;
+        suppressTabDirty = false;
+        rpc.call("doc_rebuild", nlohmann::json{{"doc_id", rebuildDocId}},
+                 [this, rebuildDocId, rebuildTabIdx](const core::RpcResult& r) {
+                     --rebuildsInFlight;
+                     if (rebuildTabIdx < 0 || rebuildTabIdx >= (int)docTabs.size() ||
+                         docTabs[rebuildTabIdx].docId != rebuildDocId) {
+                         addLog("[tabs] async rebuild for " + rebuildDocId +
+                                " ignored — tab closed/changed");
+                         return;
+                     }
+                     if (activeTab != rebuildTabIdx) {
+                         // User switched away — still update that tab's session cache when possible.
+                         addLog("[tabs] async rebuild for " + rebuildDocId +
+                                " completed off-screen");
+                     }
+                     std::string aicm, e2;
+                     if (!r.ok) {
+                         toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
+                         return;
+                     }
+                     // Only adopt into the live mirror if this tab is still active.
+                     if (activeTab == rebuildTabIdx) {
+                         suppressTabDirty = true;
+                         if (!docMirror.adoptActivateResponse(rebuildDocId, r.result, aicm, e2)) {
+                             suppressTabDirty = false;
+                             toast(ui::ToastLevel::Error, "Couldn't switch document: " + e2);
+                             return;
+                         }
+                         suppressTabDirty = false;
+                         DocTab& d = docTabs[rebuildTabIdx];
+                         d.isAssembly = docMirror.tree().is_object() &&
+                                        (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
+                         d.title = docTitle(docMirror.tree(), d.isAssembly);
+                         if (!aicm.empty()) {
+                             std::string lerr;
+                             if (!loadDocMesh(aicm, lerr) && !lerr.empty())
+                                 addLog("[tabs] loadDocMesh on switch: " + lerr);
+                         } else {
+                             unloadDocMesh();
+                         }
+                         d.session->cachedAicmPath = aicm;
+                         d.session->cachedRevision = docMirror.revision();
+                         selection.mutableItems() = std::move(d.session->selItems);
+                         d.session->selItems.clear();
+                         hover = d.session->hover;
+                         pickStatus = std::move(d.session->pickStatus);
+                         if (d.camValid) {
+                             yaw = d.yaw; pitch = d.pitch; zoom = d.zoom;
+                             pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
+                         }
+                         if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
+                         else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
+                             ribbonTab = RT_Features;
+                     } else {
+                         // Park mesh path on the session so the next switch can use the fast path.
+                         std::string aicmPark;
+                         if (r.result.contains("tess") && r.result["tess"].is_object())
+                             aicmPark = r.result["tess"].value("aicm_path", std::string());
+                         if (!aicmPark.empty() && docTabs[rebuildTabIdx].session) {
+                             docTabs[rebuildTabIdx].session->cachedAicmPath = aicmPark;
+                             if (r.result.contains("revision") &&
+                                 r.result["revision"].is_number_integer())
+                                 docTabs[rebuildTabIdx].session->cachedRevision =
+                                     r.result["revision"].get<int>();
+                         }
+                     }
+                 }, 120000);
+        return;
+    }
     suppressTabDirty = false;
 
     if (!ok) {

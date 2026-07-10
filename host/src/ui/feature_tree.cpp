@@ -1949,23 +1949,39 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
         if (path.empty()) return;  // canceled
     }
 
-    std::string err;
-    if (st.docMirror.save(st.worker, path, err)) {
-        s_docPath = path;
-        // Multi-document: a successful save clears the active tab's unsaved marker and records the
-        // path so the tab tooltip / future Save reuses it.
-        st.clearActiveTabDirty();
-        if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
-            st.docTabs[st.activeTab].path = path;
-        // doc_save embeds this part's open drawings into the .step+, so any Drawing tabs sourced from
-        // it are now persisted too — clear their unsaved markers.
-        st.clearDrawingDirtyForSource(st.docMirror.docId());
-        st.addLog("[doc] saved: " + path);
-        st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(path));
-    } else {
-        st.addLog("[err] save: " + err);
-        st.toast(ui::ToastLevel::Error, "Save failed: " + err);
-    }
+    // T-PERF4: never block GL on doc_save (large STEP+ embeds drawings + cache).
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    const std::string docId = st.docMirror.docId();
+    const std::string pathCopy = path;
+    st.toast(ui::ToastLevel::Info, "Saving " + pathBaseName(pathCopy) + "…");
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_save",
+                nlohmann::json{{"doc_id", docId}, {"path", pathCopy}},
+                [&st, pathCopy, docId](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (st.docMirror.docId() != docId) {
+                        st.addLog("[doc] save for " + docId + " ignored — active doc changed");
+                        return;
+                    }
+                    if (!r.ok) {
+                        st.addLog("[err] save: " + r.err);
+                        st.toast(ui::ToastLevel::Error, "Save failed: " + r.err);
+                        return;
+                    }
+                    if (r.result.is_object() && r.result.contains("code")) {
+                        std::string msg = jfld(r.result, "message");
+                        st.addLog("[err] save: " + msg);
+                        st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+                        return;
+                    }
+                    s_docPath = pathCopy;
+                    st.clearActiveTabDirty();
+                    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+                        st.docTabs[st.activeTab].path = pathCopy;
+                    st.clearDrawingDirtyForSource(docId);
+                    st.addLog("[doc] saved: " + pathCopy);
+                    st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(pathCopy));
+                }, 120000);
 }
 
 // Apply a JUST-OPENED document (DocMirror::open already succeeded, so the mirror holds the new
@@ -2079,6 +2095,7 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
 }
 
 // Native-dialog Open: pick a .step+ file, open it in the worker, apply it.
+// T-PERF4: doc_open runs on AsyncRpc so STEP import never freezes the GL thread.
 static void doOpenDoc(AppState& st) {
     if (fileDialogsDisabled()) {
         st.toast(ui::ToastLevel::Info,
@@ -2094,13 +2111,30 @@ static void doOpenDoc(AppState& st) {
         if (choice < 0) return;        // canceled
         asSolid = (choice == 1);
     }
-    std::string err;
-    if (st.docMirror.open(st.worker, path, err, asSolid)) {
-        applyOpenedDoc(st, path);
-    } else {
-        st.addLog("[err] open: " + err);
-        st.toast(ui::ToastLevel::Error, "Open failed: " + err);
+    if (!st.workerStarted) {
+        st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
+        return;
     }
+    nlohmann::json params = {{"path", path}};
+    if (asSolid) params["as_solid"] = true;
+    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "…");
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_open", std::move(params),
+                [&st, path](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (!r.ok) {
+                        st.addLog("[err] open: " + r.err);
+                        st.toast(ui::ToastLevel::Error, "Open failed: " + r.err);
+                        return;
+                    }
+                    std::string err;
+                    if (!st.docMirror.adoptOpenResponse(r.result, err)) {
+                        st.addLog("[err] open: " + err);
+                        st.toast(ui::ToastLevel::Error, "Open failed: " + err);
+                        return;
+                    }
+                    applyOpenedDoc(st, path);
+                }, 120000);
 }
 
 // Features section header — centered "Features" label + hairlines, the collapse chevron pinned at

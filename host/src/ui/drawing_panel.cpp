@@ -393,6 +393,51 @@ static bool drawCall(AppState& st, const char* method, const nlohmann::json& par
     return false;
 }
 
+// T-PERF4: async drawing RPC for HLR-heavy ops (add/scale view). Keeps UI live; absorbs on drain.
+static void drawCallAsync(AppState& st, const char* method, nlohmann::json params,
+                          const char* label, bool needFit = false) {
+    if (!st.workerStarted) {
+        st.toast(ui::ToastLevel::Error, std::string(label) + " failed: worker not started");
+        return;
+    }
+    const std::string methodS = method;
+    const std::string labelS = label;
+    const int tabIdx = st.activeTab;
+    const std::string drawingId =
+        (tabIdx >= 0 && tabIdx < (int)st.docTabs.size()) ? st.docTabs[tabIdx].drawingDocId
+                                                         : std::string();
+    st.toast(ui::ToastLevel::Info, labelS + "…");
+    ++st.rebuildsInFlight;
+    st.rpc.call(methodS, std::move(params),
+                [&st, methodS, labelS, tabIdx, drawingId, needFit](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size() ||
+                        st.docTabs[tabIdx].drawingDocId != drawingId) {
+                        st.addLog("[draw] " + methodS + " ignored — drawing tab changed");
+                        return;
+                    }
+                    auto& tab = st.docTabs[tabIdx];
+                    if (!r.ok) {
+                        st.addLog("[draw] " + methodS + " failed: " + r.err);
+                        st.toast(ui::ToastLevel::Error, labelS + " failed: " + r.err);
+                        return;
+                    }
+                    if (!r.result.is_object() || r.result.contains("code")) {
+                        std::string msg = r.result.is_object()
+                                              ? djstr(r.result, "message")
+                                              : std::string("engine error");
+                        st.addLog("[draw] " + methodS + " failed: " + msg);
+                        st.toast(ui::ToastLevel::Error,
+                                 labelS + " failed: " + (msg.empty() ? "engine error" : msg));
+                        return;
+                    }
+                    absorbDrawingResult(st, tab, r.result);
+                    if (needFit) tab.drawNeedFit = true;
+                    st.addLog("[draw] " + methodS + " ok");
+                },
+                120000);
+}
+
 // Clear every modal drawing tool + its in-progress stage (called when arming a new tool).
 static void disarmDrawTools(AppState::DocTab& tab) {
     tab.dimToolActive = false; tab.dimStage = 0; tab.dimViewId.clear();
@@ -472,26 +517,17 @@ static void removeView(AppState& st, AppState::DocTab& tab, const std::string& v
 // Set a view's scale (drawing_set_view {scale}) — re-projects this view at the new scale.
 static void commitViewScale(AppState& st, AppState::DocTab& tab, const std::string& viewId,
                             double scale) {
-    nlohmann::json res;
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"scale", scale}};
-    if (drawCall(st, "drawing_set_view", params, res, "Scale view")) {
-        st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
-        st.addLog("[draw] scaled view " + viewId);
-    }
+    // HLR re-project can be multi-second — async (T-PERF4).
+    drawCallAsync(st, "drawing_set_view", std::move(params), "Scale view");
 }
 
 static void addStdView(AppState& st, AppState::DocTab& tab, const char* type, const char* orient,
                        double px, double py) {
-    nlohmann::json res;
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"type", type}, {"orientation", orient},
                              {"position", nlohmann::json::array({px, py})}};
-    if (drawCall(st, "drawing_add_view", params, res, "Add view")) {
-        st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
-        tab.drawNeedFit = true;
-        st.addLog(std::string("[draw] added ") + type + " " + orient + " view");
-    }
+    // HLR for a new view is the expensive path — async (T-PERF4).
+    drawCallAsync(st, "drawing_add_view", std::move(params), "Add view", /*needFit=*/true);
 }
 
 // Auto-dimension the clicked view (overall envelope + per-circle diameter callouts).

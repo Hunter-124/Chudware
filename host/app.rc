@@ -8,6 +8,10 @@
 
 // The lowest-numbered ICON resource is what Explorer uses for the .exe.
 1 ICON "assets/app.ico"
+// Second icon group: the branded DOCUMENT icon. File associations point their
+// DefaultIcon at "<exe>,1" (zero-based icon-group index -> this group), so
+// .step+ etc. show the doc page icon while the exe keeps the app tile above.
+2 ICON "assets/doc.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    1,0,0,0

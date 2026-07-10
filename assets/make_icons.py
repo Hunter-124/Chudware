@@ -259,6 +259,70 @@ def iso_box(d, cx, cy, r, stroke, lw):
     polyline(d, [cm, b], stroke, lw)
 
 
+def _iso_pts(cx, cy, r):
+    """The 7 canonical isometric-cube silhouette points (2:1 projection).
+    Mirrors assets/make_logo.py so the atlas glyphs match the brand mark."""
+    w, h = r, r * 0.5
+    return {
+        "top": (cx, cy - 2 * h), "rt": (cx + w, cy - h), "lt": (cx - w, cy - h),
+        "c": (cx, cy), "rb": (cx + w, cy + h), "lb": (cx - w, cy + h),
+        "bot": (cx, cy + 2 * h),
+    }
+
+
+def brand_cube(d, cx, cy, r, p, lw, notch=True, accent=True, spark=None):
+    """The AI-CAD brand mark in atlas line-art: isometric cube (2:1 projection)
+    with a cubic corner notch boolean-cut out of the top corner and, optionally,
+    a 4-point spark seated in the notch ("star", or "diamond" for tiny cells).
+    notch=False draws the plain cube in the same style (assembly sub-bodies)."""
+    pt = _iso_pts(cx, cy, r)
+    top_fill = _rgba(p.accent, 72) if accent else _rgba(p.stroke, 40)
+    if notch:
+        # notch sub-cube seated at the top corner (half the edge length)
+        q = _iso_pts(cx, cy - r + r * 0.5, r * 0.5)
+        # top face, flat accent fill, minus the notched quarter
+        d.polygon([pt["lt"], q["lt"], q["c"], q["rt"], pt["rt"], pt["c"]], fill=top_fill)
+    else:
+        d.polygon([pt["lt"], pt["top"], pt["rt"], pt["c"]], fill=top_fill)
+    # left / right faces — faint, matching the shaded_prism idiom
+    d.polygon([pt["lt"], pt["c"], pt["bot"], pt["lb"]], fill=_rgba(p.stroke, 30))
+    d.polygon([pt["rt"], pt["c"], pt["bot"], pt["rb"]], fill=_rgba(p.stroke, 46))
+    if notch:
+        # notch interior faces — fainter still, reads as material removed
+        d.polygon([q["lt"], q["top"], q["rt"], q["c"]], fill=_rgba(p.accent, 26))
+        d.polygon([q["lt"], q["c"], q["bot"], q["lb"]], fill=_rgba(p.stroke, 14))
+        d.polygon([q["rt"], q["c"], q["bot"], q["rb"]], fill=_rgba(p.stroke, 20))
+    # outer edges: hexagon silhouette minus the notched corner + interior edges
+    edges = [(pt["rt"], pt["rb"]), (pt["rb"], pt["bot"]), (pt["bot"], pt["lb"]),
+             (pt["lb"], pt["lt"]), (pt["lt"], pt["c"]), (pt["c"], pt["rt"]),
+             (pt["c"], pt["bot"])]
+    if notch:
+        edges += [(pt["lt"], q["lt"]), (q["rt"], pt["rt"])]
+    else:
+        edges += [(pt["lt"], pt["top"]), (pt["top"], pt["rt"])]
+    for a, b in edges:
+        d.line([a, b], fill=p.stroke, width=lw)
+    if notch:
+        # the "AI cut" edges get the accent, slightly thinner
+        nlw = max(1, int(lw * 0.66))
+        for a, b in [(q["lt"], q["c"]), (q["c"], q["rt"]), (q["c"], q["bot"]),
+                     (q["lt"], q["lb"]), (q["rt"], q["rb"]), (q["lb"], q["bot"]),
+                     (q["rb"], q["bot"]), (q["lt"], q["top"]), (q["rt"], q["top"])]:
+            d.line([a, b], fill=p.accent, width=nlw)
+    if spark:
+        sx, sy = cx, cy - r * 0.52          # seated at the notch center
+        sr = r * 0.34
+        if spark == "star":
+            pts = []
+            for i in range(8):
+                ang = i * math.pi / 4 - math.pi / 2
+                rad = sr if i % 2 == 0 else sr * 0.35
+                pts.append((sx + rad * math.cos(ang), sy + rad * math.sin(ang)))
+        else:  # "diamond" — simplified so it doesn't smear at 20 px
+            pts = [(sx, sy - sr), (sx + sr * 0.6, sy), (sx, sy + sr), (sx - sr * 0.6, sy)]
+        d.polygon(pts, fill=p.stroke)
+
+
 def diagonal_box(d, x0, y0, x1, y1, stroke, lw):
     """MISSING placeholder — rectangle with diagonal cross."""
     d.rectangle([x0, y0, x1, y1], outline=stroke, width=lw)
@@ -353,30 +417,28 @@ def _s(cell, frac):
 
 @icon("app")
 def draw_app(d, cell, p):
-    """Isometric cube — the AI-CAD app icon glyph."""
-    c = cell * SS / 2
-    r = _s(cell, 0.30)
-    lw = stroke_width(cell)
-    iso_box(d, c, c, r, p.accent, lw)
+    """The AI-CAD brand mark: iso cube, corner notch, spark in the notch."""
+    s = cell * SS
+    brand_cube(d, s * 0.5, s * 0.5, s * 0.36, p, stroke_width(cell),
+               spark="star" if cell > 20 else "diamond")
 
 @icon("part")
 def draw_part(d, cell, p):
-    """Shaded generic solid body."""
+    """Single solid body echoing the brand cube: corner-notch, no spark."""
     s = cell * SS
-    shaded_prism(d, s, s*0.20, s*0.34, s*0.47, s*0.37, s*0.15, s*0.11, p, accent=True)
-    d.line([(s*0.25, s*0.50), (s*0.62, s*0.50)], fill=_rgba(p.stroke, 120),
-           width=max(1, stroke_width(cell)//2))
+    brand_cube(d, s * 0.5, s * 0.5, s * 0.33, p, stroke_width(cell))
 
 @icon("assembly")
 def draw_assembly(d, cell, p):
-    """Three small shaded parts mated together."""
+    """Three mated bodies; the main one carries the brand corner-notch."""
     s = cell * SS
-    lw = stroke_width(cell)
-    shaded_prism(d, s, s*0.38, s*0.18, s*0.22, s*0.18, s*0.07, s*0.05, p, accent=True)
-    shaded_prism(d, s, s*0.14, s*0.52, s*0.20, s*0.16, s*0.06, s*0.05, p)
-    shaded_prism(d, s, s*0.58, s*0.54, s*0.20, s*0.16, s*0.06, s*0.05, p)
-    d.line([(s*0.36, s*0.44), (s*0.46, s*0.44)], fill=p.accent, width=lw)
-    d.line([(s*0.56, s*0.54), (s*0.56, s*0.64)], fill=p.accent, width=lw)
+    lw = max(1, int(stroke_width(cell) * 0.8))
+    brand_cube(d, s * 0.50, s * 0.30, s * 0.17, p, lw)
+    brand_cube(d, s * 0.26, s * 0.68, s * 0.13, p, lw, notch=False, accent=False)
+    brand_cube(d, s * 0.74, s * 0.68, s * 0.13, p, lw, notch=False, accent=False)
+    mlw = max(1, stroke_width(cell) // 2)
+    d.line([(s * 0.50, s * 0.48), (s * 0.26, s * 0.54)], fill=p.accent, width=mlw)
+    d.line([(s * 0.50, s * 0.48), (s * 0.74, s * 0.54)], fill=p.accent, width=mlw)
 
 @icon("sketch_node")
 def draw_sketch_node(d, cell, p):

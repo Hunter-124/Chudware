@@ -49,6 +49,11 @@ def test_windows_plan() -> None:
     check(has(fr"Software\Classes\{fa.PROGID_NATIVE}\shell\open\command", "",
               lambda v: exe in v and "%1" in v),
           "windows: native ProgID open command = \"<exe>\" \"%1\"")
+    # Document ProgIDs use the exe's SECOND icon group (",1" = branded doc icon from
+    # host/app.rc), NOT ",0" (the app tile, which stays on the exe itself).
+    for pid in (fa.PROGID_NATIVE, fa.PROGID_DOC):
+        check(has(fr"Software\Classes\{pid}\DefaultIcon", "", lambda v: v == f"{exe},1"),
+              f"windows: {pid} DefaultIcon = <exe>,1 (doc icon group)")
     # .step+ defaults to the native ProgID; all listed extensions advertise in Open-with.
     check(has(r"Software\Classes\.step+", "", lambda v: v == fa.PROGID_NATIVE),
           "windows: .step+ defaults to the native ProgID")
@@ -78,6 +83,10 @@ def test_linux_content() -> None:
     xml = fa.linux_mime_xml()
     check(fa.MIME_NATIVE in xml and "*.step+" in xml,
           "linux: MIME package defines the .step+ glob")
+    check(f'<icon name="{fa.MIME_ICON}"/>' in xml,
+          "linux: MIME package declares the branded doc icon")
+    check(fa.MIME_ICON == fa.MIME_NATIVE.replace("/", "-"),
+          "linux: icon name is the MIME type with '/' -> '-'")
 
 
 def test_linux_register_roundtrip() -> None:
@@ -97,14 +106,23 @@ def test_linux_register_roundtrip() -> None:
         check(exe in desktop.read_text(), "linux: written .desktop points at the exe")
         check("*.step+" in mime.read_text(), "linux: written MIME package has the .step+ glob")
 
+        # Branded doc icon lands in hicolor/*/mimetypes (only checkable when this
+        # checkout carries assets/doc_icon.png — deployments without it skip cleanly).
+        icon256 = Path(tmp) / "icons" / "hicolor" / "256x256" / "mimetypes" / f"{fa.MIME_ICON}.png"
+        if fa._doc_icon_source() is not None:
+            check(icon256.exists(), "linux: register installs the 256px mimetype icon")
+        else:
+            check(not icon256.exists(), "linux: no doc icon source -> icon install skipped cleanly")
+
         # Idempotent: a second register leaves identical content.
         before = desktop.read_text()
         fa.register_linux(exe, unregister=False, dry_run=False)
         check(desktop.read_text() == before, "linux: register is idempotent")
 
-        # Unregister removes both files.
+        # Unregister removes both files + any installed mimetype icons.
         fa.register_linux(exe, unregister=True, dry_run=False)
         check(not desktop.exists() and not mime.exists(), "linux: unregister removes the files")
+        check(not icon256.exists(), "linux: unregister removes the mimetype icons")
         os.environ.pop("XDG_DATA_HOME", None)
 
 

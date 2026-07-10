@@ -12,6 +12,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$REPO/host/build-linux/bin/AI-CAD"
 ICON_SRC="$REPO/assets/logo_icon.png"
+DOC_ICON_SRC="$REPO/assets/doc_icon.png"
+# freedesktop icon name for the native document MIME type (application/vnd.aicad.stepplus,
+# registered by services/installer/setup_file_assoc.py): the MIME with '/' -> '-'.
+MIME_ICON_NAME="application-vnd.aicad.stepplus"
 
 [ -x "$BIN" ] || { echo "error: binary not found/executable: $BIN"; echo "build it: cmake -S host -B host/build-linux && ninja -C host/build-linux AI-CAD"; exit 1; }
 [ -f "$ICON_SRC" ] || { echo "error: icon not found: $ICON_SRC"; exit 1; }
@@ -36,6 +40,27 @@ install_icon() {
   fi
 }
 for s in 16 32 48 64 128 256; do install_icon "$s"; done
+
+# Install the branded DOCUMENT icon for the AI-CAD MIME type so Dolphin/Nautilus
+# show .step+ files with the doc page icon (not a blank page). Same resize
+# mechanism as install_icon, but into the theme's mimetypes/ dirs.
+install_mime_icon() {
+  local size="$1"
+  local dir="$ICONS/${size}x${size}/mimetypes"
+  mkdir -p "$dir"
+  if command -v magick >/dev/null 2>&1; then
+    magick "$DOC_ICON_SRC" -resize "${size}x${size}" "$dir/$MIME_ICON_NAME.png"
+  elif command -v convert >/dev/null 2>&1; then
+    convert "$DOC_ICON_SRC" -resize "${size}x${size}" "$dir/$MIME_ICON_NAME.png"
+  elif [ "$size" = "256" ]; then
+    cp "$DOC_ICON_SRC" "$dir/$MIME_ICON_NAME.png"
+  fi
+}
+if [ -f "$DOC_ICON_SRC" ]; then
+  for s in 16 32 48 64 128 256; do install_mime_icon "$s"; done
+else
+  echo "note: $DOC_ICON_SRC not found — skipping the document MIME icon"
+fi
 
 # Write the desktop entry with absolute Exec/Icon so it works without a PATH install.
 cat > "$APPS/AI-CAD.desktop" <<EOF

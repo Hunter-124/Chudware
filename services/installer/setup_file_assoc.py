@@ -8,11 +8,13 @@ Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — mod
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
 
   Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"AI-CAD.exe" "%1"`) + a
-           DefaultIcon, the `.step+` extension defaulted to it, and every other extension wired
+           DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
+           host/app.rc), the `.step+` extension defaulted to it, and every other extension wired
            into OpenWithProgids so AI-CAD shows in "Open with".
   Linux:   a custom shared-mime-info type for `.step+` + a `.desktop` launcher in XDG_DATA_HOME,
+           plus assets/doc_icon.png installed into hicolor/*/mimetypes as the type's icon,
            then update-mime-database / update-desktop-database / xdg-mime so the file manager
-           routes a double-click to AI-CAD. Interchange formats are listed in the launcher's
+           routes a double-click to AI-CAD and shows the branded doc icon. Interchange formats are listed in the launcher's
            MimeType via their standard freedesktop types (Open-with), not redefined.
 
     python installer/setup_file_assoc.py [--exe <path>] [--unregister] [--dry-run]
@@ -30,8 +32,10 @@ APP_NAME = "AI-CAD"
 PROGID_NATIVE = "AICAD.stepplus"      # Windows ProgID for the native .step+ document
 PROGID_DOC = "AICAD.document"          # Windows ProgID used for the interchange formats (Open-with)
 MIME_NATIVE = "application/vnd.aicad.stepplus"   # custom MIME for .step+ (no system collision)
+MIME_ICON = MIME_NATIVE.replace("/", "-")        # freedesktop icon name for the MIME type
 DESKTOP_FILE = "ai-cad.desktop"
 MIME_PACKAGE = "ai-cad.xml"
+ICON_SIZES = (16, 32, 48, 64, 128, 256)          # hicolor sizes for the document MIME icon
 
 # Extensions AI-CAD owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
 # the rest are added to "Open with" only (so we never steal the user's STL/STEP viewer). `mime` is the
@@ -64,7 +68,10 @@ def windows_registry_plan(exe: str) -> list[dict]:
     {subkey, name, value}. `name` "" is a key's (Default) value. Kept pure so it unit-tests with no
     registry access; register_windows() just walks it. Reverse = delete each listed subkey."""
     exe = str(exe)
-    icon = f"{exe},0"
+    # ",1" = the exe's SECOND icon group (zero-based, resource order): the branded
+    # document icon embedded via host/app.rc (`2 ICON "assets/doc.ico"`). Group 0
+    # stays the app tile for the exe itself — document types get the doc icon.
+    icon = f"{exe},1"
     plan: list[dict] = []
 
     def progid(pid: str, desc: str) -> None:
@@ -172,6 +179,7 @@ def linux_mime_xml() -> str:
         '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
         f'  <mime-type type="{MIME_NATIVE}">\n'
         "    <comment>AI-CAD Document</comment>\n"
+        f'    <icon name="{MIME_ICON}"/>\n'
         '    <glob pattern="*.step+"/>\n'
         "  </mime-type>\n"
         "</mime-info>\n"
@@ -180,6 +188,41 @@ def linux_mime_xml() -> str:
 
 def _xdg_data_home() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+
+
+def _doc_icon_source() -> Path | None:
+    """The branded 256px document icon shipped in the repo (assets/doc_icon.png), or None
+    when this checkout/deployment doesn't carry it — the icon install is then skipped and
+    the associations still work (the file manager falls back to a generic page icon)."""
+    src = Path(__file__).resolve().parents[2] / "assets" / "doc_icon.png"
+    return src if src.is_file() else None
+
+
+def _mime_icon_paths(data: Path) -> list[Path]:
+    """hicolor mimetype icon paths for every size — the freedesktop lookup for a file of
+    type application/vnd.aicad.stepplus is <theme>/<S>x<S>/mimetypes/<MIME '/'→'-'>.png."""
+    return [data / "icons" / "hicolor" / f"{s}x{s}" / "mimetypes" / f"{MIME_ICON}.png"
+            for s in ICON_SIZES]
+
+
+def _install_mime_icons(data: Path) -> bool:
+    """Resize assets/doc_icon.png into the hicolor mimetypes dirs (PIL when available,
+    else a plain 256px copy). Returns False when the source icon isn't present."""
+    src = _doc_icon_source()
+    if src is None:
+        return False
+    try:
+        from PIL import Image  # noqa: WPS433  (optional dependency, degrade gracefully)
+        img = Image.open(src).convert("RGBA")
+        for size, dest in zip(ICON_SIZES, _mime_icon_paths(data)):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            img.resize((size, size), Image.LANCZOS).save(dest)
+    except ImportError:
+        import shutil
+        dest = data / "icons" / "hicolor" / "256x256" / "mimetypes" / f"{MIME_ICON}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+    return True
 
 
 def register_linux(exe: str, unregister: bool, dry_run: bool) -> list[str]:
@@ -200,11 +243,13 @@ def register_linux(exe: str, unregister: bool, dry_run: bool) -> list[str]:
 
     if unregister:
         if not dry_run:
-            for p in (desktop_path, mime_path):
+            for p in (desktop_path, mime_path, *_mime_icon_paths(data)):
                 p.unlink(missing_ok=True)
             run(["update-mime-database", str(mimedir)])
             run(["update-desktop-database", str(apps)])
-        msgs.append(f"{'would remove' if dry_run else 'removed'} {desktop_path.name} + {mime_path.name}")
+            run(["gtk-update-icon-cache", "-f", "-t", str(data / "icons" / "hicolor")])
+        msgs.append(f"{'would remove' if dry_run else 'removed'} {desktop_path.name} + {mime_path.name}"
+                    " + mimetype icons")
         return msgs
 
     if not dry_run:
@@ -212,6 +257,12 @@ def register_linux(exe: str, unregister: bool, dry_run: bool) -> list[str]:
         (mimedir / "packages").mkdir(parents=True, exist_ok=True)
         desktop_path.write_text(linux_desktop_entry(exe), encoding="utf-8")
         mime_path.write_text(linux_mime_xml(), encoding="utf-8")
+        # Branded document icon for the native MIME type so Dolphin/Nautilus show it
+        # on .step+ files (icon name declared in linux_mime_xml's <icon>).
+        if _install_mime_icons(data):
+            run(["gtk-update-icon-cache", "-f", "-t", str(data / "icons" / "hicolor")])
+            msgs.append(f"installed {MIME_ICON}.png mimetype icons "
+                        f"({'/'.join(str(s) for s in ICON_SIZES)})")
         run(["update-mime-database", str(mimedir)])
         run(["update-desktop-database", str(apps)])
         run(["xdg-mime", "default", DESKTOP_FILE, MIME_NATIVE])  # default ONLY for native .step+

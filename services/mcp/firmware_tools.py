@@ -111,7 +111,24 @@ def register_firmware_tools(mcp) -> None:
           ``AICAD_GPIO_TRACE(pin, level, t_ms)`` macro from the project's ``aicad_trace.h``.
         - ``"gpio:<PIN>=<level>@><T>ms"`` (also ``@<`` / ``@``) — timeline assertion:
           a time-stamped event shows the pin at that level after/before/at-or-after T ms.
+        - ``"toggles:<PIN>>=<N>"`` (also <=, ==, >, <) — pin level changed N times (T-FIN3).
+        - ``"period:<PIN>=<P>ms±<TOL>ms"`` — mean rising-edge period within P±TOL (T-FIN3).
+        - ``"uart_within:<text>@<T>ms"`` — text in a time-stamped UART event at or before
+          T ms (timestamps come from the scenario timeline's AICAD_T_MARK marks; T-FIN3).
         - plain string — treated as uart match.
+
+        ``scenario`` (T-FIN3, schema ``aicad.fwscenario/1``, contracts/firmware_rpc.md §9)
+        binds declarative sensor/GPIO stimulus to the emulated peripherals. Pass a JSON
+        object string or a fixture reference: ``"fixture:i2c_temp_tmp103"`` (I2C TMP103
+        temp sensor with programmed temperature), ``"fixture:spi_imu_stub"``,
+        ``"fixture:quadrature_encoder"`` (PA0/PA1, 24 steps CW), ``"fixture:adc_thermistor"``
+        (NTC heat-up curve via the Python-peripheral ADC stub), ``"fixture:user_button"``.
+        Track kinds: gpio_edges / button / quadrature / i2c_sensor / i2c_registers /
+        spi_stub / uart_rx / adc_waveform (sine|ramp|samples — STM32 families only; no
+        ADC model ships upstream, other families refuse honestly). Scenarios run on the
+        Renode path ONLY; an invalid or platform-unsupported scenario refuses honestly
+        (``invalid_scenario`` envelope, or ``scenario_error`` / ``scenario_unsupported``
+        in ``uart_log``) — never a silent drop.
 
         ``gpio_events`` is the time-ordered pin timeline; ``trace_path`` points at a JSON
         trace artifact (schema ``aicad.firmware.trace/1``, contracts/firmware_rpc.md §7)

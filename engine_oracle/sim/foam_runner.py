@@ -4,15 +4,25 @@ The OpenFOAM CFD bridge (``engine.sim.openfoam``) builds a case directory, runs 
 sequence of OpenFOAM utilities (blockMesh, snappyHexMesh, simpleFoam, …) and parses the
 results.  None of that cares *how* the executables are launched — that is this module's job.
 
-Two runners are provided:
+Three runners are provided:
 
 * :class:`NativeRunner` — a native-Windows OpenFOAM build (blueCFD-Core, an ESI/MinGW port
   that keeps the classic ``simpleFoam`` solver names).  This is the user-preferred target:
   no WSL hop, no path translation.  Detected from a vendored ``third_party/openfoam``, the
   ``AICAD_OPENFOAM`` env var, or a ``C:\\Program Files\\blueCFD-Core*`` install.
+* :class:`LinuxRunner` — OpenFOAM on a Linux/posix host.  Detected from (in order) an
+  already-sourced environment (``simpleFoam`` on PATH), the ``AICAD_OPENFOAM`` env var
+  (an install root containing ``etc/bashrc`` OR a flat ``bin/`` layout like the
+  conda-forge package), and the usual system/user install roots (``/usr/lib/openfoam``,
+  ``/opt``, ``~/OpenFOAM``, ``~/openfoam*``, ``~/micromamba/envs/*``, ``~/.conda/envs/*``,
+  ``~/miniconda3/envs/*``).  No root/sudo needed — a user-space tarball or conda env works.
 * :class:`WslRunner` — OpenFOAM installed inside a WSL2 distro (``apt install openfoam2412``).
-  Used as a verified fallback when no native build is present.  Case directories on the
-  Windows filesystem are reached from Linux under ``/mnt/<drive>/…`` (via ``wslpath``).
+  Used as a verified fallback on Windows when no native build is present.  Case directories
+  on the Windows filesystem are reached from Linux under ``/mnt/<drive>/…`` (via ``wslpath``).
+
+LICENSE POSTURE (contracts/license_debt.md): OpenFOAM is GPL — every invocation in this
+module is a **separate subprocess** (``subprocess.Popen`` of the stock executables); nothing
+is linked, imported, vendored, or bundled.  Keep it that way.
 
 Both expose the same small surface so case-generation / post-processing share 100% of the
 logic:
@@ -210,6 +220,120 @@ class WslRunner(FoamRunner):
         self._pump(proc, app, on_line, timeout)
 
 
+# --------------------------------------------------------------------------- linux
+
+
+class LinuxRunner(FoamRunner):
+    """Run OpenFOAM natively on a Linux/posix host — strictly as subprocesses.
+
+    Detection (no root needed, cached after the first probe):
+
+      1. Already-sourced environment: ``simpleFoam`` resolvable on PATH.
+      2. ``AICAD_OPENFOAM`` env var: an install root — either a classic tree with
+         ``etc/bashrc`` (openfoam.com tarball) or a flat prefix whose ``bin/`` holds the
+         executables (conda-forge package, which also ships ``etc/bashrc``).
+      3. Well-known roots, system and user-space::
+
+            /usr/lib/openfoam/openfoam*   /opt/openfoam*   /opt/OpenFOAM-*
+            ~/OpenFOAM/OpenFOAM-*         ~/openfoam*      ~/.local/openfoam*
+            ~/.local/share/mamba/envs/*   ~/micromamba/envs/*   ~/.local/share/micromamba/envs/*
+            ~/.conda/envs/*               ~/miniconda3/envs/*   ~/mambaforge/envs/*
+
+    Every utility is launched as ``bash -c "source <bashrc>; cd <case> && app"`` (or
+    directly when the environment is pre-sourced).  Nothing is linked or imported.
+    """
+
+    kind = "linux"
+
+    def __init__(self, root: Optional[str] = None):
+        self._root = root           # explicit install root (tests / AICAD_OPENFOAM)
+        self._checked = False
+        self._ok = False
+        self._bashrc = ""           # "" => rely on the already-sourced PATH
+
+    @staticmethod
+    def _bashrc_candidates(root: Optional[str] = None) -> List[Path]:
+        if root:
+            r = Path(root).expanduser()
+            return [r / "etc" / "bashrc", *sorted(r.glob("OpenFOAM-*/etc/bashrc"))]
+        home = Path.home()
+        cands: List[Path] = []
+        env = os.environ.get("AICAD_OPENFOAM")
+        if env:
+            cands += LinuxRunner._bashrc_candidates(env)
+        globs = (
+            "/usr/lib/openfoam/openfoam*/etc/bashrc",
+            "/opt/openfoam*/etc/bashrc",
+            "/opt/OpenFOAM-*/etc/bashrc",
+        )
+        for g in globs:
+            cands += sorted(Path("/").glob(g.lstrip("/")))
+        for rel in ("OpenFOAM/OpenFOAM-*", "openfoam*", ".local/openfoam*",
+                    ".local/share/mamba/envs/*", "micromamba/envs/*",
+                    ".local/share/micromamba/envs/*", ".conda/envs/*",
+                    "miniconda3/envs/*", "mambaforge/envs/*"):
+            for d in sorted(home.glob(rel)):
+                b = d / "etc" / "bashrc"
+                if b.is_file():
+                    cands.append(b)
+        return [c for c in cands if c.is_file()]
+
+    def _probe(self, bashrc: str) -> Optional[str]:
+        """Return the version string if ``simpleFoam`` resolves with this bashrc ('' = PATH)."""
+        pre = f"source '{bashrc}' >/dev/null 2>&1; " if bashrc else ""
+        cmd = pre + "command -v simpleFoam >/dev/null 2>&1 && echo ${WM_PROJECT_VERSION:-unknown}"
+        try:
+            r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        out = (r.stdout or "").strip().splitlines()
+        if r.returncode == 0 and out:
+            return out[-1]
+        return None
+
+    def available(self) -> bool:
+        if self._checked:
+            return self._ok
+        self._checked = True
+        if os.name != "posix" or shutil.which("bash") is None:
+            return False
+        # 1. pre-sourced environment (only when no explicit root was requested)
+        if self._root is None and shutil.which("simpleFoam") is not None:
+            ver = self._probe("")
+            if ver is not None:
+                self._ok, self._bashrc = True, ""
+                self.version_str = f"OpenFOAM {ver} (linux)"
+                return True
+        # 2./3. bashrc-based installs
+        for b in self._bashrc_candidates(self._root):
+            ver = self._probe(str(b))
+            if ver is not None:
+                self._ok, self._bashrc = True, str(b)
+                self.version_str = f"OpenFOAM {ver} (linux, {b})"
+                return True
+        return False
+
+    def to_case_path(self, path: str) -> str:
+        return path                 # native posix: no translation
+
+    def run(self, case_dir: str, app: str, args: Optional[List[str]] = None,
+            on_line: OnLine = None, np: int = 1, timeout: Optional[float] = None) -> None:
+        if not self.available():
+            raise FoamError(app, -1, "no OpenFOAM on this Linux host")
+        args = args or []
+        argstr = " ".join(args)
+        body = (f"cd '{case_dir}' && mpirun -np {np} {app} -parallel {argstr}" if np > 1
+                else f"cd '{case_dir}' && {app} {argstr}")
+        if self._bashrc:
+            body = f"source '{self._bashrc}' >/dev/null 2>&1; {body}"
+        proc = subprocess.Popen(
+            ["bash", "-c", body],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        self._pump(proc, app, on_line, timeout)
+
+
 # --------------------------------------------------------------------------- native
 
 
@@ -316,16 +440,20 @@ _CACHE_SET = False
 
 
 def get_runner(prefer: str = "native") -> Optional[FoamRunner]:
-    """Return the best available runner (native preferred), or ``None`` if no OpenFOAM.
+    """Return the best available runner, or ``None`` if no OpenFOAM.
 
-    Cached after the first call.  ``prefer="wsl"`` flips the order (used by tests / overrides).
+    Windows: native blueCFD preferred, WSL fallback.  Linux/posix: :class:`LinuxRunner`.
+    Cached after the first call.  ``prefer="wsl"`` flips the Windows order (tests / overrides).
     """
     global _CACHED, _CACHE_SET
     if _CACHE_SET:
         return _CACHED
-    native = NativeRunner()
-    wsl = WslRunner()
-    order = [native, wsl] if prefer != "wsl" else [wsl, native]
+    if os.name == "posix":
+        order: List[FoamRunner] = [LinuxRunner()]
+    else:
+        native = NativeRunner()
+        wsl = WslRunner()
+        order = [native, wsl] if prefer != "wsl" else [wsl, native]
     chosen: Optional[FoamRunner] = None
     for r in order:
         try:

@@ -863,13 +863,30 @@ def audit_cfd() -> None:
             _skip("run_cfd_accurate",
                   "OpenFOAM not installed on this machine",
                   install="python -m tools.provision_openfoam --install  "
-                          "(WSL openfoam2412 or blueCFD — GPL2 subprocess isolation)")
+                          "(Linux: user-space conda-forge env, no sudo; Windows: WSL "
+                          "openfoam2412 or blueCFD — GPL subprocess isolation, never linked)")
         else:
             _record("run_cfd_accurate [openfoam]", "REAL",
-                    f"OpenFOAM {caps.get('openfoam_version', 'unknown')} available. "
-                    "Calls engine.sim.openfoam.run_openfoam_tunnel — RANS k-omega SST "
-                    "with prism layers. Docstring: 'sphere/cube within ~10-15% of experiment'.",
+                    f"OpenFOAM {caps.get('openfoam_version', 'unknown')} available "
+                    f"(kind={caps.get('openfoam_kind')}). Calls "
+                    "engine.sim.openfoam.run_openfoam_tunnel — RANS k-omega SST with prism "
+                    "layers. Validation gate: tools/foam_validation.py (sphere/cube Cd bands).",
                     executed=False)
+            # LIVE validation leg (opt-in — a coarse sphere solve takes ~10-30 s):
+            #   AICAD_SIM_AUDIT_LIVE_FOAM=1 python scripts/sim_audit.py
+            if os.environ.get("AICAD_SIM_AUDIT_LIVE_FOAM"):
+                try:
+                    from tools.foam_validation import run_case
+                    res = run_case("sphere", "coarse")
+                    verdict = "REAL" if res["pass"] else "BROKEN"
+                    _record("run_cfd_accurate [live sphere]", verdict,
+                            f"sphere Cd={res['cd']:.3f} vs experimental ~{res['cd_ref']:.2f}, "
+                            f"accepted band {res['band']} -> "
+                            f"{'PASS' if res['pass'] else 'FAIL'} ({res['secs']:.0f}s, "
+                            f"Re {res['re']:.0f}).", executed=True)
+                except Exception as exc:  # noqa: BLE001
+                    _record("run_cfd_accurate [live sphere]", "BROKEN",
+                            f"live validation errored: {exc}")
 
     except Exception as exc:
         _record("run_cfd_flow", "BROKEN",

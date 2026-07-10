@@ -1395,10 +1395,20 @@ run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assem
   physically zero). For heavy runs pass background=True and poll get_job(job_id).
 
 run_cfd_accurate(velocity, aoa, fluid, preset) — HIGH-FIDELITY OpenFOAM RANS (k-omega SST + prism
-  layers). The TRUSTWORTHY absolute Cd/Cl path (validated ~10-15% of experiment) vs run_cfd_flow's
-  coarse LBM estimate. Requires OpenFOAM (WSL/native); runs for MINUTES, always background → poll
-  get_job(job_id) (live progress). preset coarse|medium|fine|xfine. Use run_cfd_flow first to scan
-  trends fast, then run_cfd_accurate to certify the chosen design.
+  layers): STL export → snappyHexMesh body-fit → simpleFoam steady RANS, all via OpenFOAM
+  subprocesses (GPL isolation — never linked). The TRUSTWORTHY absolute Cd/Cl path (validated:
+  sphere/cube land in the documented ±10-15%-class experiment bands, see tools/foam_validation.py)
+  vs run_cfd_flow's coarse LBM estimate. Requires OpenFOAM — detected automatically on Linux
+  (sourced env / system / user-space conda env), native Windows blueCFD, or WSL; if absent the
+  tool returns an honest {ok:false} with the provisioning command
+  (`python -m tools.provision_openfoam --install` — user-space on Linux, no sudo). Runs for
+  MINUTES, always background → poll get_job(job_id) (live meshing/solve progress, like the LBM
+  path). preset coarse|medium|fine|xfine. Use run_cfd_flow first to scan trends fast, then
+  run_cfd_accurate to certify the chosen design.
+  Conjugate-heat-transfer variant (buoyant chtMultiRegionFoam) lives at the engine seam:
+  engine.sim.openfoam.run_openfoam_tunnel(thermal={enabled, mode:"conjugate", inlet_temp_c,
+  solids:[{name, stl_path, kappa_w_mk, power_w}, ...]}) — multi-solid regions with per-solid
+  volumetric heat sources (board + components handoff).
 
 Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate is always
 background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
@@ -3933,10 +3943,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         Use this when you need a TRUSTWORTHY absolute Cd/Cl, not the coarse directional estimate
         from run_cfd_flow (the built-in LBM). This is the validated path — sphere/cube land within
-        ~10-15% of experiment. It body-fits a snappyHexMesh with boundary layers and solves to
-        convergence, so it takes MINUTES and requires OpenFOAM installed (WSL openfoam2412 or native
-        blueCFD). It ALWAYS runs in the background: returns a job_id immediately; poll get_job(job_id)
-        (which reports live meshing/solve progress) for the result.
+        ~10-15% of experiment (regression gate: tools/foam_validation.py). It body-fits a
+        snappyHexMesh with boundary layers and solves to convergence, so it takes MINUTES and
+        requires OpenFOAM installed — detected automatically on Linux (sourced env / system install /
+        user-space conda env / AICAD_OPENFOAM root), native Windows blueCFD, or WSL openfoam2412.
+        All OpenFOAM invocations are subprocesses (GPL isolation — never linked). It ALWAYS runs in
+        the background: returns a job_id immediately; poll get_job(job_id) (which reports live
+        meshing/solve progress) for the result.
 
         CONVENTIONS match run_cfd_flow (Z-up): freestream +X, lift +Z, +aoa pitches nose up.
         velocity : m/s.   aoa : degrees.   fluid : "air" | "water".
@@ -3950,10 +3963,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
             from engine.sim.foam_runner import capabilities
             caps = capabilities()
             if not caps.get("openfoam"):
-                return _dumps({"ok": False, "error":
-                               "OpenFOAM is not available on this machine. Provision it with "
-                               "`python -m tools.provision_openfoam --install` (WSL) or install "
-                               "blueCFD-Core natively. The coarse LBM run_cfd_flow still works."})
+                import os as _os
+                how = ("`python -m tools.provision_openfoam --install` (user-space conda-forge "
+                       "env, no sudo), or unpack an openfoam.com tarball under ~/OpenFOAM/, or "
+                       "set AICAD_OPENFOAM to an install root"
+                       if _os.name == "posix" else
+                       "`python -m tools.provision_openfoam --install` (WSL openfoam2412) or "
+                       "install blueCFD-Core natively and set %AICAD_OPENFOAM%")
+                return _dumps({"ok": False, "skipped": True, "reason": "openfoam_not_installed",
+                               "error": "OpenFOAM is not available on this machine. Provision it "
+                               f"with {how}. The coarse LBM run_cfd_flow still works."})
             if preset not in ("coarse", "medium", "fine", "xfine"):
                 return _dumps({"ok": False, "error": f"unknown preset {preset!r} — use "
                                "coarse|medium|fine|xfine"})

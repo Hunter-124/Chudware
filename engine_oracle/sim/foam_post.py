@@ -258,31 +258,61 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
     cd = Path(case_dir)
     Tin_c = info.inlet_temp_k - 273.15
     t_min = t_max = t_mean = Tin_c
+    regions = list(getattr(info, "solid_regions", None) or [info.solid_region])
 
-    solid = _read_vtm_combined(cd / "VTK" / "part")
-    _, Tsolid = _xyz_and_T(solid)
-    if Tsolid is not None and Tsolid.size:
+    # Aggregate solid temperatures over EVERY solid region (multi-solid CHT, T-FIN19),
+    # keeping a per-region summary for the notes.
+    per_region: List[str] = []
+    all_xyz: list = []
+    all_T: list = []
+    got_any = False
+    for reg in regions:
+        solid = _read_vtm_combined(cd / "VTK" / reg)
+        xyz, Tsolid = _xyz_and_T(solid)
+        if Tsolid is None or not Tsolid.size:
+            per_region.append(f"{reg}: no data")
+            continue
         Tc = Tsolid - 273.15
-        t_min, t_max, t_mean = float(Tc.min()), float(Tc.max()), float(Tc.mean())
+        rmin, rmax, rmean = float(Tc.min()), float(Tc.max()), float(Tc.mean())
+        per_region.append(f"{reg}: {rmean:.0f} C mean, {rmax:.0f} C peak")
+        if not got_any:
+            t_min, t_max, t_mean = rmin, rmax, rmean
+            got_any = True
+        else:
+            t_min = min(t_min, rmin)
+            t_max = max(t_max, rmax)
+        if xyz is not None:
+            all_xyz.append(xyz)
+            all_T.append(Tsolid)
 
-    # Surface temperature overlay: map the part's outer-surface (boundary patch) T onto the
-    # world STL vertices.  Prefer the boundary patch; fall back to the solid cell field.
+    # Surface temperature overlay: map the solids' outer-surface (boundary patch) T onto the
+    # world STL vertices.  Prefer the boundary patches; fall back to the solid cell fields.
     bt = ov._tessellate_stl_world(stl_path)
     surf = ov._surface_verts(bt)
     chunks: list = []
     scalar_fields: List[str] = []
-    bnd = None
-    bvtms = list((cd / "VTK" / "part").rglob("*boundary*.vtm"))  # foamToVTK nests boundary/
-    if bvtms:
-        import pyvista as pv
-        try:
-            bmb = pv.read(str(bvtms[-1]))
-            bnd = bmb.combine() if hasattr(bmb, "combine") else bmb
-        except Exception:
-            bnd = None
-    src_xyz, src_T = _xyz_and_T(bnd)
-    if src_xyz is None:                      # fall back to the solid volume field
-        src_xyz, src_T = _xyz_and_T(solid)
+    b_xyz: list = []
+    b_T: list = []
+    import pyvista as pv
+    for reg in regions:
+        for bvtm in list((cd / "VTK" / reg).rglob("*boundary*.vtm"))[-1:]:
+            try:
+                bmb = pv.read(str(bvtm))
+                bnd = bmb.combine() if hasattr(bmb, "combine") else bmb
+                xyz, T = _xyz_and_T(bnd)
+                if xyz is not None and T is not None and T.size:
+                    b_xyz.append(xyz)
+                    b_T.append(T)
+            except Exception:
+                pass
+    if b_xyz:
+        src_xyz = np.concatenate(b_xyz)
+        src_T = np.concatenate(b_T)
+    elif all_xyz:                            # fall back to the solid volume fields
+        src_xyz = np.concatenate(all_xyz)
+        src_T = np.concatenate(all_T)
+    else:
+        src_xyz, src_T = None, None
     try:
         if src_xyz is not None and src_T.size:
             from scipy.spatial import cKDTree
@@ -300,10 +330,13 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
         overlay_path = tf.name
     tess.write_aicm_file(overlay_path, [bt], extra_chunks=chunks)
 
-    re_note = (f"OpenFOAM CHT (conjugate) - Re {info.reynolds:,.0f}; {info.power_w:.1f} W in solid "
+    what = "solid" if len(regions) == 1 else f"{len(regions)} solids"
+    re_note = (f"OpenFOAM CHT (conjugate) - Re {info.reynolds:,.0f}; {info.power_w:.1f} W in {what} "
                f"(k={info.solid_kappa:.0f} W/mK), inlet {Tin_c:.0f} C -> part {t_mean:.0f} C "
                f"(peak {t_max:.0f} C).")
-    notes = [f"chtMultiRegionFoam coupled solid+fluid; part temperature {t_min:.0f}-{t_max:.0f} C."]
+    notes = [f"chtMultiRegionFoam coupled solid+fluid; solid temperature {t_min:.0f}-{t_max:.0f} C."]
+    if len(regions) > 1:
+        notes.append("per-region: " + "; ".join(per_region) + ".")
     return FlowResult(
         drag_n=0.0, lift_n=0.0, cd=0.0, frontal_area_mm2=info.frontal_area_mm2,
         reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],

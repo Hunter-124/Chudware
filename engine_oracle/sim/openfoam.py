@@ -117,6 +117,11 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
     """Conjugate heat transfer: mesh solid+fluid regions and run chtMultiRegionFoam."""
     from engine.sim.foam_cht import build_cht_case
 
+    # Multi-solid runs (thermal["solids"]) may omit stl_path; the overlay/display surface
+    # then defaults to the first solid's STL.
+    if not stl_path and thermal.get("solids"):
+        stl_path = thermal["solids"][0].get("stl_path")
+
     def prog(stage, pct, text, trace_point=None):
         if on_progress is None:
             return
@@ -133,7 +138,10 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
             aoa_deg=aoa_deg, sideslip_deg=sideslip_deg, fluid=fluid,
             inlet_temp_c=float(thermal.get("inlet_temp_c", 20.0)),
             solid_kappa=float(thermal.get("solid_kappa", 200.0)),
-            power_w=float(thermal.get("power_w", 20.0)))
+            power_w=float(thermal.get("power_w", 20.0)),
+            # T-FIN19 seam: optional list of solid regions with per-solid heat sources
+            # [{name, stl_path, kappa_w_mk, power_w}, ...]; overrides the single-solid form.
+            solids=thermal.get("solids"))
 
         prog("mesh", 6, "blockMesh...")
         runner.run(case_dir, "blockMesh")
@@ -154,10 +162,11 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
 
         prog("post", 90, "Exporting solid temperature...")
         # Export all fields (avoids shell-quoting the `-fields (T)` list across runners).
-        try:
-            runner.run(case_dir, "foamToVTK", ["-region", "part", "-latestTime"])
-        except FoamError:
-            pass
+        for reg in getattr(info, "solid_regions", ("part",)):
+            try:
+                runner.run(case_dir, "foamToVTK", ["-region", reg, "-latestTime"])
+            except FoamError:
+                pass
 
         prog("post", 95, "Post-processing (solid temperature overlay)...")
         from engine.sim.foam_post import postprocess_cht

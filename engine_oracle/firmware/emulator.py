@@ -36,10 +36,17 @@ _ODR_BEGIN_RE = re.compile(r"AICAD_GPIO_ODR_BEGIN\s+(?P<port>[A-K])")
 _ODR_END_RE = re.compile(r"AICAD_GPIO_ODR_END\s+(?P<port>[A-K])")
 _HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
 
-# STM32F4 GPIO register map: GPIOA base 0x40020000, 0x400 stride, ODR at +0x14
+# Default GPIO register map (STM32F4): GPIOA base 0x40020000, 0x400 stride, ODR at +0x14.
+# T-FIN2: per-family maps now live in platform_db.PLATFORM_CAPS["gpio_regmap"] (e.g. the
+# STM32F1 map differs: base 0x40010800, ODR at +0x0C); these constants stay as the default.
 _STM32_GPIO_BASE = 0x4002_0000
 _STM32_GPIO_STRIDE = 0x400
 _STM32_ODR_OFFSET = 0x14
+
+# First declared UART peripheral in a .repl, e.g. `usart1: UART.STM32_UART @ ...` or
+# `uart0: UART.NRF52840_UART @ ...` — used to attach Renode's console analyzer (T-FIN2;
+# previously hard-coded to "usart1", which missed nRF52/RP2040 UART names).
+_REPL_UART_RE = re.compile(r"^(?P<name>\w+)\s*:\s*UART\.", re.MULTILINE)
 
 # gpio assertion pin like PA5 / PB12 (STM32 convention) — used to derive Renode hooks
 _STM32_PIN_RE = re.compile(r"^P(?P<port>[A-K])(?P<num>\d{1,2})$")
@@ -328,7 +335,8 @@ def _emulator_not_found(binary: str, t0: float) -> SimResult:
 # ---------------------------------------------------------------------------
 
 def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
-                gpio_pins: Optional[list[tuple[str, int]]] = None) -> str:
+                gpio_pins: Optional[list[tuple[str, int]]] = None,
+                gpio_regmap: Optional[dict] = None) -> str:
     """Generate a minimal Renode ``.resc`` script that loads the ELF, starts emulation, and lets
     it run for ``run_seconds`` of wall-clock time before the script (and Renode with it) exits.
 
@@ -372,20 +380,26 @@ def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
         platform_text = Path(platform_file).read_text(encoding="utf-8")
     except OSError:
         pass
-    has_uart = "usart1" in platform_text
+    # T-FIN2: attach the console analyzer to the FIRST UART the platform declares
+    # (usart1 on STM32, uart0 on nRF52/RP2040) instead of hard-coding "usart1".
+    uart_m = _REPL_UART_RE.search(platform_text)
+    uart_name = uart_m.group("name") if uart_m else None
 
     # GPIO monitoring (T-FIN1): only wire hooks/reads for ports the platform actually
     # declares — issuing monitor commands against a missing peripheral errors per-command.
     gpio_pins = [(p, n) for (p, n) in (gpio_pins or [])
                  if f"gpioPort{p}" in platform_text]
 
+    regmap = gpio_regmap or {"base": _STM32_GPIO_BASE, "stride": _STM32_GPIO_STRIDE,
+                             "odr_offset": _STM32_ODR_OFFSET}
+
     lines = [
         "mach create",
         f"machine LoadPlatformDescription @{platform_file}",
         f"sysbus LoadELF @{elf_path}",
     ]
-    if has_uart:
-        lines.append("showAnalyzer sysbus.usart1")
+    if uart_name:
+        lines.append(f"showAnalyzer sysbus.{uart_name}")
     # Per-pin state-change hooks print a machine-readable event line the parser picks up.
     # [~] live-verify: hook print goes to the Renode console; timestamps are added by the
     # parser as None (Renode hook context has no stable virtual-time accessor across versions).
@@ -398,7 +412,7 @@ def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
     # Final-state snapshot: read each referenced port's ODR between echo markers so the
     # parser can pair the hex value with its port (STM32F4 register map).
     for port in sorted({p for (p, _) in gpio_pins}):
-        odr = _STM32_GPIO_BASE + _STM32_GPIO_STRIDE * (ord(port) - ord("A")) + _STM32_ODR_OFFSET
+        odr = regmap["base"] + regmap["stride"] * (ord(port) - ord("A")) + regmap["odr_offset"]
         lines.append(f'echo "AICAD_GPIO_ODR_BEGIN {port}"')
         lines.append(f"sysbus ReadDoubleWord {odr:#x}")
         lines.append(f'echo "AICAD_GPIO_ODR_END {port}"')
@@ -419,7 +433,8 @@ class RenodeEmulator:
     BINARY = "renode"
 
     def run(self, elf_path: str, platform_file: str, assertions: list[str],
-            timeout_s: float = _DEFAULT_TIMEOUT_S) -> SimResult:
+            timeout_s: float = _DEFAULT_TIMEOUT_S,
+            gpio_regmap: Optional[dict] = None) -> SimResult:
         """Launch Renode, capture output, evaluate assertions.
 
         Args:
@@ -427,6 +442,8 @@ class RenodeEmulator:
             platform_file: Path to the Renode ``.repl`` platform description.
             assertions: Assertion strings (see :func:`evaluate_assertions`).
             timeout_s: Wall-clock timeout for the emulation run.
+            gpio_regmap: Per-family GPIO ODR register map (T-FIN2,
+                ``platform_db.gpio_regmap_for``); defaults to the STM32F4 map.
 
         Returns:
             :class:`SimResult` — ``passed=False`` when Renode is absent (graceful).
@@ -443,7 +460,7 @@ class RenodeEmulator:
         gpio_pins = _pins_from_assertions(assertions)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".resc", delete=False) as f:
             f.write(_build_resc(elf_path, platform_file, run_seconds=run_seconds,
-                                gpio_pins=gpio_pins))
+                                gpio_pins=gpio_pins, gpio_regmap=gpio_regmap))
             resc_path = f.name
 
         cmd = [self.BINARY, "--disable-xwt", "--console", resc_path]
@@ -558,17 +575,76 @@ class QEMUEmulator:
 # Convenience runner
 # ---------------------------------------------------------------------------
 
+def _assertion_capability(assertion: str) -> str:
+    """Which platform capability an assertion needs: ``"gpio"`` for gpio:*, else ``"uart"``."""
+    return "gpio" if assertion.strip().startswith("gpio:") else "uart"
+
+
+def _unsupported_result(caps: dict, assertions: list[str], unsupported: list[str],
+                        reason: str, t0: float) -> SimResult:
+    """Honest refusal: every assertion gets a result; unsupported ones explain why."""
+    results = [
+        AssertionResult(
+            name=a, passed=False,
+            detail=(f"unsupported on platform '{caps['file']}' "
+                    f"(family {caps['family']}): {reason} — {caps['notes']}")
+            if a in unsupported else "not evaluated: run refused (see unsupported assertions)")
+        for a in assertions
+    ]
+    return SimResult(
+        passed=False,
+        uart_log=f"platform_capability: {reason} (family {caps['family']}, "
+                 f"platform {caps['file']}). {caps['notes']}",
+        assertion_results=results,
+        ms=(time.perf_counter() - t0) * 1000.0,
+    )
+
+
 def run_simulation(elf_path: str, mcu_family: str, assertions: list[str],
                    timeout_s: float = _DEFAULT_TIMEOUT_S) -> SimResult:
     """Top-level entry: pick Renode (with matching platform) or QEMU fallback.
 
-    Neither present → graceful SimResult with explanation in ``uart_log``.
+    T-FIN2 honesty gates (checked BEFORE launching anything):
+    - a family with ``emulation == "none"`` (ESP32) refuses outright — build+flash only;
+    - on the Renode path, assertions that need a peripheral the bundled platform does not
+      model (``uart`` capability for uart:/plain assertions, ``gpio_observe`` for gpio:*)
+      fall back to QEMU's semihosting path when installed, else refuse with a
+      per-assertion explanation instead of silently failing to match.
+    The QEMU fallback is exempt from the peripheral gate: both UART text and GPIO events
+    arrive via the firmware-side semihosting shim, not platform peripheral models.
+
+    Neither emulator present → graceful SimResult with explanation in ``uart_log``.
     """
-    from engine.firmware.platform_db import get_platform_file  # local import to avoid cycles
+    from engine.firmware.platform_db import get_capabilities, get_platform_file  # local import to avoid cycles
+
+    t0 = time.perf_counter()
+    caps = get_capabilities(mcu_family)
+
+    if caps["emulation"] == "none":
+        return _unsupported_result(
+            caps, assertions, list(assertions),
+            "no emulation path for this family (build + flash only)", t0)
 
     platform = get_platform_file(mcu_family)
     if shutil.which(RenodeEmulator.BINARY) and platform is not None:
-        return RenodeEmulator().run(str(elf_path), str(platform), assertions, timeout_s)
+        unsupported = [a for a in assertions
+                       if (_assertion_capability(a) == "gpio" and not caps["gpio_observe"])
+                       or (_assertion_capability(a) == "uart" and not caps["uart"])]
+        if unsupported:
+            # The Renode platform can't observe what the assertions need. The QEMU
+            # semihosting path can (firmware-side aicad_trace.h shim reports both UART
+            # text and pin events), so fall back to it when present; otherwise refuse
+            # honestly instead of running a sim that can never match.
+            if shutil.which(QEMUEmulator.BINARY):
+                return QEMUEmulator().run(str(elf_path), timeout_s, assertions)
+            missing = sorted({"gpio observation" if _assertion_capability(a) == "gpio"
+                              else "a UART model" for a in unsupported})
+            return _unsupported_result(
+                caps, assertions, unsupported,
+                f"platform lacks {' and '.join(missing)} required by the assertions "
+                f"and no QEMU semihosting fallback is installed", t0)
+        return RenodeEmulator().run(str(elf_path), str(platform), assertions, timeout_s,
+                                    gpio_regmap=caps.get("gpio_regmap"))
     elif shutil.which(QEMUEmulator.BINARY):
         return QEMUEmulator().run(str(elf_path), timeout_s, assertions)
     else:

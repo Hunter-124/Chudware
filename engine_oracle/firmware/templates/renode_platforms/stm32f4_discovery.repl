@@ -51,3 +51,62 @@ gpioPortD: GPIOPort.STM32F4GPIOPort @ sysbus <0x40020C00, +0x400>
 
 gpioPortE: GPIOPort.STM32F4GPIOPort @ sysbus <0x40021000, +0x400>
     numberOfAFs: 16
+
+// T-FIN2: peripheral pack — stanzas copied from Renode's own platforms/cpus/stm32f4.repl
+// (https://github.com/renode/renode/blob/master/platforms/cpus/stm32f4.repl, MIT).
+// Local changes vs upstream: DMA request links dropped (this curated platform declares
+// no DMA controller) and the rcc->timer9 reset link dropped (no RCC model here).
+// No ADC: upstream stm32f4.repl ships no ADC model — capability is reported honestly
+// as adc=false in platform_db. [~] live-verify: renode absent on this machine.
+
+usart2: UART.STM32_UART @ sysbus <0x40004400, +0x100>
+    -> nvic@38
+
+spi1: SPI.STM32SPI @ sysbus 0x40013000
+    IRQ->nvic@35
+
+spi2: SPI.STM32SPI @ sysbus 0x40003800
+    IRQ->nvic@36
+
+spi3: SPI.STM32SPI @ sysbus 0x40003C00
+    IRQ->nvic@51
+
+i2c1: I2C.STM32F1_I2C @ sysbus 0x40005400
+    EventInterrupt -> nvic@31
+    ErrorInterrupt -> nvic@32
+
+i2c2: I2C.STM32F1_I2C @ sysbus 0x40005800
+    EventInterrupt -> nvic@33
+    ErrorInterrupt -> nvic@34
+
+i2c3: I2C.STM32F1_I2C @ sysbus 0x40005C00
+    EventInterrupt -> nvic@72
+    ErrorInterrupt -> nvic@73
+
+timer1: Timers.STM32_Timer @ sysbus 0x40010000
+    BreakInterrupt -> nvic@24
+    UpdateInterrupt -> nvic@25
+    [TriggerInterrupt, CommutationInterrupt] -> nvic@[26, 26]
+    CaptureCompareInterrupt -> nvic@27
+    frequency: 10000000
+    initialLimit: 0xFFFF
+
+timer2: Timers.STM32_Timer @ sysbus 0x40000000
+    -> nvic@28
+    frequency: 10000000
+    initialLimit: 0xFFFFFFFF
+
+timer3: Timers.STM32_Timer @ sysbus 0x40000400
+    -> nvic@29
+    frequency: 10000000
+    initialLimit: 0xFFFF
+
+timer4: Timers.STM32_Timer @ sysbus 0x40000800
+    -> nvic@30
+    frequency: 10000000
+    initialLimit: 0xFFFF
+
+timer5: Timers.STM32_Timer @ sysbus 0x40000C00
+    -> nvic@50
+    frequency: 10000000
+    initialLimit: 0xFFFFFFFF

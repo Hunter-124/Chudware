@@ -17,6 +17,8 @@ Shape (frozen for callers — services/mcp/firmware_tools.py ``fw_status`` tool)
     {ok: True,
      tools: {<name>: {found, path, version, install_hint, unlocks}},
      families: {<family>: {can_build, can_emulate, can_flash, missing: [str]}},
+     platforms: {<family>: {file, emulation, uart, gpio, gpio_observe, adc, i2c, spi,
+                            timers, notes}},   # T-FIN2 platform capability matrix
      banners: [str], missing: [str]}
 """
 from __future__ import annotations
@@ -59,7 +61,7 @@ FW_TOOL_DESCRIPTORS: dict[str, dict] = {
     "renode": {
         "aliases": ("renode",),
         "version_args": ("--version",),
-        "unlocks": ["emulate:cortex-m", "emulate:esp32"],
+        "unlocks": ["emulate:cortex-m (stm32f4/stm32f1/nrf52 full, rp2040 minimal)"],
         "install_hint": (
             "Install Renode from https://renode.io/#downloads (portable tarball or "
             "`sudo dnf copr enable ...`); put `renode` on PATH."
@@ -114,7 +116,10 @@ FW_FAMILY_RULES: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "esp32": {
         "can_build": {"all_of": ("idf.py",)},
-        "can_emulate": {"any_of": ("renode",)},  # esp32_stub.repl; QEMU ARM can't run xtensa
+        # T-FIN2 decision: NO emulation path for ESP32 — Renode's Xtensa support is
+        # experimental with no usable peripherals, and QEMU ARM can't run xtensa.
+        # Build + flash only; see platform_db.PLATFORM_CAPS["esp32"] / esp32_stub.repl.
+        "can_emulate": {"any_of": ()},
         "can_flash": {"all_of": ("esptool",)},
     },
     "avr": {
@@ -232,10 +237,19 @@ def fw_status() -> dict:
     if not families["esp32"]["can_flash"]:
         banners.append("ESP32 flashing unavailable: `pip install esptool`.")
 
+    # T-FIN2: per-platform peripheral capability matrix (what the bundled Renode
+    # platforms actually model), independent of which tools are installed.
+    try:
+        from engine.firmware.platform_db import capability_matrix
+        platforms = capability_matrix()
+    except Exception:  # noqa: BLE001 — the doctor never raises
+        platforms = {}
+
     return {
         "ok": True,
         "tools": tools,
         "families": families,
+        "platforms": platforms,
         "banners": banners,
         "missing": missing,
     }

@@ -31,12 +31,16 @@ def register_firmware_tools(mcp) -> None:
 
         Detects each firmware CLI (cmake, ninja, arm-none-eabi-gcc, renode,
         qemu-system-arm, probe-rs, esptool, idf.py, arduino-cli) and returns
-        ``{ok, tools, families, banners, missing}``:
+        ``{ok, tools, families, platforms, banners, missing}``:
 
         - ``tools[name]`` = ``{found, path, version, install_hint, unlocks}``
         - ``families`` = per-MCU-family rollup (``cortex-m`` / ``esp32`` / ``avr``)
           with ``can_build`` / ``can_emulate`` / ``can_flash`` booleans plus the
           ``missing`` tool list that would unlock each family.
+        - ``platforms`` = T-FIN2 Renode platform capability matrix (``stm32f4`` /
+          ``stm32f1`` / ``nrf52`` / ``rp2040`` / ``esp32`` / ``cortex-m`` →
+          ``{file, emulation, uart, gpio, gpio_observe, adc, i2c, spi, timers,
+          notes}``). ESP32 is build+flash only (``emulation="none"``).
         - ``banners`` = human-readable fix-it lines; ``missing`` = absent core tools.
 
         Never fails (mirrors reveng_status / em_status): an unprovisioned machine
@@ -112,6 +116,13 @@ def register_firmware_tools(mcp) -> None:
         ``gpio_events`` is the time-ordered pin timeline; ``trace_path`` points at a JSON
         trace artifact (schema ``aicad.firmware.trace/1``, contracts/firmware_rpc.md §7)
         with interleaved pin + UART events, written next to the ELF.
+
+        Supported targets (T-FIN2 platform pack): stm32f4 (uart+gpio+i2c+spi+timers),
+        stm32f1 (uart+gpio+i2c+timers), nrf52 (uart+i2c+spi+timers; NO gpio assertions),
+        rp2040 (bare-metal uart only), cortex-m generic (no peripherals; QEMU semihosting
+        path). ESP32 has NO emulation — build+flash only. When an assertion needs a
+        peripheral the platform lacks, the run refuses honestly: ``passed=False`` with a
+        ``platform_capability`` explanation per assertion (see fw_status ``platforms``).
 
         Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
         ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.

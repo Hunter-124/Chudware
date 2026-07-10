@@ -27,3 +27,27 @@ flash: Memory.MappedMemory @ sysbus 0x08000000
 
 sram: Memory.MappedMemory @ sysbus 0x20000000
     size: 0x20000
+
+// T-FIN1: GPIO ports A–E so pin-level assertions have a peripheral to observe.
+// Model + register map from Renode's own platforms/cpus/stm32f4.repl (MIT):
+// STM32F4GPIOPort at 0x40020000 + 0x400*port, mode/PUPD reset values per RM0090.
+// [~] live-verify: hook wiring (`AddStateChangedHook`) + ODR reads exercised by the
+// generated .resc; canned-output parser tests cover the extraction path.
+gpioPortA: GPIOPort.STM32F4GPIOPort @ sysbus <0x40020000, +0x400>
+    modeResetValue: 0xA8000000
+    pullUpPullDownResetValue: 0x64000000
+    numberOfAFs: 16
+
+gpioPortB: GPIOPort.STM32F4GPIOPort @ sysbus <0x40020400, +0x400>
+    modeResetValue: 0x00000280
+    pullUpPullDownResetValue: 0x00000100
+    numberOfAFs: 16
+
+gpioPortC: GPIOPort.STM32F4GPIOPort @ sysbus <0x40020800, +0x400>
+    numberOfAFs: 16
+
+gpioPortD: GPIOPort.STM32F4GPIOPort @ sysbus <0x40020C00, +0x400>
+    numberOfAFs: 16
+
+gpioPortE: GPIOPort.STM32F4GPIOPort @ sysbus <0x40021000, +0x400>
+    numberOfAFs: 16

@@ -3,7 +3,7 @@ id: T-FIN21
 title: PCB reliability - board assembly modal + vibration screening
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN21-pcb-reliability-vibe
 depends_on: [T-FIN16]
 lane: simulation

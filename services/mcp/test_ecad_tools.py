@@ -1050,6 +1050,119 @@ def test_e9_noise_top_level_nonzero(tools: dict) -> None:
 # --------------------------------------------------------------------------- runner
 
 
+
+
+# ---------------------------------------------------------------- T-FIN8 engineering metadata
+
+
+def test_fin8_metadata_roundtrip(tools: dict) -> None:
+    """T-FIN8: library eng seeds + per-instance sim_params.eng overrides surface in
+    ecad_status per-component power_w and the board power totals."""
+    s = _call(tools, "ecad_new_schematic", name="FIN8_meta")
+    sid = s["doc_id"]
+    # NE555 carries seeded power (typ 15 mW / max 225 mW) from the starter library.
+    _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0, doc_id=sid)
+    # Resistor with a per-instance override: measured operating dissipation 20 mW typ.
+    r = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=0, value="1k",
+              footprint="Resistor_SMD:R_0805", doc_id=sid,
+              sim_params='{"eng": {"power_w": {"typ": 0.02}, "sources": ["test override"]}}')
+    assert r["ok"], f"place with sim_params failed: {r.get('error')!r}"
+    st = _call(tools, "ecad_status", doc_id=sid)
+    assert st["ok"] and "power" in st, "status must carry the board power rollup"
+    by_ref = {c["ref"]: c for c in st["components"]}
+    u1 = by_ref["U1"]
+    assert abs(u1["power_w"]["typ"] - 0.015) < 1e-9, f"NE555 seed typ: {u1['power_w']}"
+    assert abs(u1["power_w"]["max"] - 0.225) < 1e-9, f"NE555 seed max: {u1['power_w']}"
+    r1 = by_ref["R1"]
+    assert abs(r1["power_w"]["typ"] - 0.02) < 1e-9, \
+        f"sim_params.eng override must win: {r1['power_w']}"
+    assert abs(r1["power_w"]["max"] - 0.125) < 1e-9, \
+        f"0805 rated max must survive the partial override: {r1['power_w']}"
+    tot = st["power"]
+    assert abs(tot["power_w_typ"] - 0.035) < 1e-9, f"board typ total: {tot}"
+    assert tot["n_with_power"] == 2 and tot["n_missing_power"] == 0, tot
+    # Bad JSON in sim_params must fail fast with a hint, not corrupt the doc.
+    bad = _call(tools, "ecad_place_symbol", libid="Device:R", x=60, y=0,
+                doc_id=sid, sim_params="{not json")
+    assert not bad["ok"] and "JSON" in bad["error"], f"bad sim_params must be rejected: {bad}"
+    print(f"  FIN8: U1 {u1['power_w']}, R1 {r1['power_w']}, total {tot}")
+    print("  [fin8_metadata_roundtrip] PASS")
+
+
+def test_fin8_missing_metadata_degrades(tools: dict) -> None:
+    """T-FIN8 honesty rule: parts without eng seeds report null power (never 0), and a board
+    where NOTHING has power data reports null totals."""
+    s = _call(tools, "ecad_new_schematic", name="FIN8_null")
+    sid = s["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Connector:Conn_2", x=0, y=0, doc_id=sid)
+    st = _call(tools, "ecad_status", doc_id=sid)
+    c = st["components"][0]
+    assert c["power_w"]["typ"] is None and c["power_w"]["max"] is None, \
+        f"unknown power must be null, never 0: {c['power_w']}"
+    tot = st["power"]
+    assert tot["power_w_typ"] is None and tot["power_w_max"] is None, \
+        f"no-data board total must be null, not 0: {tot}"
+    assert tot["n_missing_power"] == 1 and tot["n_with_power"] == 0, tot
+    print(f"  FIN8: Conn_2 power {c['power_w']}, totals {tot}")
+    print("  [fin8_missing_metadata_degrades] PASS")
+
+
+def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
+    """T-FIN8: ecad_to_3d places component bodies from package dims and writes the
+    aicad.boardphys/1 sidecar mapping each solid to power/thermal metadata."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN8: build123d not installed — skipping to_3d sidecar test")
+        return
+    import os
+    import tempfile
+
+    s = _call(tools, "ecad_new_schematic", name="FIN8_3d")
+    sid = s["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0,
+          footprint="Package_SO:SOIC-8", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=0, value="1k",
+          footprint="Resistor_SMD:R_0805", doc_id=sid)
+    _call(tools, "ecad_wire", from_ref="U1", from_pin="8", to_ref="R1", to_pin="1", doc_id=sid)
+    mb = _call(tools, "ecad_make_board", pcb_name="FIN8_board", doc_id=sid)
+    # DRC errors on this throwaway 2-part board are fine — we only need a synced board
+    # with a closed outline for the 3D export.
+    assert mb.get("doc_id") and mb.get("footprints_placed", 0) >= 2, \
+        f"make_board did not produce a populated board: {mb.get('reading')!r}"
+    out = os.path.join(tempfile.mkdtemp(prefix="fin8_"), "board.step")
+    r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])
+    if not r.get("ok") and "still" in str(r.get("error", "")).lower():
+        r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])  # kernel warm now
+    assert r["ok"], f"ecad_to_3d failed: {r.get('error')!r}"
+    assert r["n_components"] >= 2, f"expected component bodies, got {r['n_components']}"
+    sidecar = r.get("boardphys_path")
+    assert sidecar and os.path.isfile(sidecar), f"sidecar not written: {sidecar!r}"
+    with open(sidecar, encoding="utf-8") as fh:
+        phys = json.load(fh)
+    assert phys["schema"] == "aicad.boardphys/1", phys["schema"]
+    assert phys["step_path"] == r["step_path"]
+    comps = {c["ref"]: c for c in phys["components"]}
+    assert "U1" in comps and "R1" in comps, f"sidecar refs: {sorted(comps)}"
+    u1 = comps["U1"]
+    assert u1["solid_label"] == "U1", "sidecar must map to the placed solid label"
+    assert u1["body"]["source"] == "package_lib", \
+        f"SOIC-8 must place a library package body, got {u1['body']}"
+    assert abs(u1["body"]["l_mm"] - 4.9) < 1e-9 and abs(u1["body"]["h_mm"] - 1.75) < 1e-9
+    assert abs(u1["power_w"]["typ"] - 0.015) < 1e-9
+    assert u1["theta_c_per_w"]["ja"] is not None and u1["theta_c_per_w"]["jc"] is None, \
+        "theta_jc unknown for SOIC-8 seed -> must be null"
+    assert u1["limits_c"]["tj_max"] == 150.0
+    assert u1["supply"]["rails"] and u1["supply"]["rails"][0]["name"] == "VCC"
+    assert u1["sources"], "seeded values must carry source notes"
+    tot = phys["totals"]
+    assert tot["power_w_typ"] is not None and tot["n_components"] == len(phys["components"])
+    assert r.get("power"), "to_3d response must surface the power totals"
+    print(f"  FIN8: sidecar {os.path.basename(sidecar)} — {len(phys['components'])} comps, "
+          f"totals {tot}")
+    print("  [fin8_to_3d_boardphys_sidecar] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     tools = test_register()
@@ -1090,6 +1203,10 @@ def main() -> None:
     test_e7_bogus_libid_rejected(tools)
     test_e8_temp_probe_surfaced(tools)
     test_e9_noise_top_level_nonzero(tools)
+    # T-FIN8 engineering metadata + boardphys sidecar
+    test_fin8_metadata_roundtrip(tools)
+    test_fin8_missing_metadata_degrades(tools)
+    test_fin8_to_3d_boardphys_sidecar(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

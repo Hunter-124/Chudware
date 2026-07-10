@@ -965,6 +965,44 @@ def _describe_assembly_text(doc_id: str) -> str:
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
+def _board_power_lines(engs: list, label: str) -> list:
+    """Narration lines for per-component power + board total (T-FIN8, honest nulls).
+
+    ``engs`` is [(name, normalized_eng_or_None), ...]. Components without power data are
+    counted, never zero-filled (contracts/ecad/boardphys.md).
+    """
+    try:
+        from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+    except ImportError:
+        return []
+    totals = eng_meta.power_totals([e for _n, e in engs if e])
+    lines = ["\nPower (engineering-metadata layer):"]
+    for name, e in engs:
+        if not e:
+            lines.append(f"  {name}: power unknown (no metadata)")
+            continue
+        p = e.get("power_w") or {}
+        typ, mx = p.get("typ"), p.get("max")
+        if typ is None and mx is None:
+            lines.append(f"  {name}: power unknown")
+        else:
+            t = f"{typ * 1000:.1f} mW typ" if typ is not None else "typ unknown"
+            m = f"{mx * 1000:.1f} mW max" if mx is not None else "max unknown"
+            lines.append(f"  {name}: {t}, {m}")
+    if totals and totals.get("power_w_typ") is not None:
+        lines.append(f"  {label} total: {totals['power_w_typ'] * 1000:.1f} mW typ"
+                     + (f", {totals['power_w_max'] * 1000:.1f} mW max"
+                        if totals.get("power_w_max") is not None else "")
+                     + f"  ({totals['n_missing_power']} component(s) without power data)")
+    elif totals and totals.get("power_w_max") is not None:
+        lines.append(f"  {label} total: {totals['power_w_max'] * 1000:.1f} mW max"
+                     f"  ({totals['n_missing_power']} component(s) without power data)")
+    else:
+        lines.append(f"  {label} total: unknown (no component carries power metadata)")
+    lines.append("  (source: engine.ecad.metadata — seeds carry datasheet source notes)")
+    return lines
+
+
 def _describe_board_text(doc_id: str) -> str:
     """Narrate a PCB or schematic board's status as GSL text.
 
@@ -1037,6 +1075,14 @@ def _describe_board_text(doc_id: str) -> str:
 
         if not fps:
             lines.append("\nNo footprints placed — use ecad_find_part then ecad_place_symbol.")
+        if fps:
+            try:
+                from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+                engs = [(f.get("ref") or f.get("id") or "?",
+                         eng_meta.eng_for_footprint(f)) for f in fps]
+                lines.extend(_board_power_lines(engs, "Board"))
+            except Exception:  # noqa: BLE001 — power narration is advisory
+                pass
         caveats = []
         if not has_outline:
             caveats.append("Board outline missing — required for fabrication (pcb_set_outline).")
@@ -1077,6 +1123,19 @@ def _describe_board_text(doc_id: str) -> str:
             lines.append(f"  {ref}: {val} ({libid}{fp_note})")
     else:
         lines.append("\nNo components — add parts with ecad_find_part + ecad_place_symbol.")
+
+    # Per-component power + total (T-FIN8; honest nulls — contracts/ecad/boardphys.md)
+    if components:
+        try:
+            from engine.ecad import metadata as eng_meta  # noqa: PLC0415
+            engs = [(c.get("ref") or "?",
+                     eng_meta.resolve_eng(libid=c.get("libid") or "",
+                                          fpid=c.get("footprint") or "",
+                                          overrides=c.get("eng_overrides")))
+                    for c in components]
+            lines.extend(_board_power_lines(engs, "Design"))
+        except Exception:  # noqa: BLE001 — power narration is advisory
+            pass
 
     # Net roster (cap at 20 to stay token-bounded)
     if net_list:

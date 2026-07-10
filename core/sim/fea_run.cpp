@@ -655,6 +655,43 @@ std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>
 
 }  // namespace
 
+namespace {
+
+// Parse a per-load time schedule (T-FIN18). Accepts the duty-cycle shorthand
+// {duty, period_s} — the direct mapping for an aicad.powerprofile/1 rail — or the general
+// piecewise form {points:[[t_s,scale],...], period_s?}. An absent/empty schedule = always
+// on. Returns false + err on a malformed schedule.
+bool parse_thermal_schedule(const nlohmann::json& js, aicad::sim::ThermalSchedule& out,
+                            std::string& err) {
+    using nlohmann::json;
+    if (js.is_null() || !js.is_object()) return true;  // no schedule = constant
+    if (js.contains("duty")) {
+        const double d = js.value("duty", 1.0);
+        const double p = js.value("period_s", 0.0);
+        if (!(d >= 0.0 && d <= 1.0)) { err = "schedule duty must be in [0,1]"; return false; }
+        if (d >= 1.0) return true;                       // always on
+        if (d <= 0.0) { out.times = {0.0}; out.scales = {0.0}; return true; }
+        if (!(p > 0.0)) { err = "duty schedule needs period_s > 0"; return false; }
+        out.times = {0.0, d * p};
+        out.scales = {1.0, 0.0};
+        out.period = p;
+        return true;
+    }
+    if (js.contains("points") && js["points"].is_array()) {
+        for (const auto& pt : js["points"]) {
+            if (!pt.is_array() || pt.size() != 2) { err = "schedule points must be [t_s, scale] pairs"; return false; }
+            out.times.push_back(pt[0].get<double>());
+            out.scales.push_back(pt[1].get<double>());
+        }
+        out.period = js.value("period_s", 0.0);
+        return true;
+    }
+    err = "schedule needs {duty, period_s} or {points:[[t,scale],...]}";
+    return false;
+}
+
+}  // namespace
+
 nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     std::vector<double> points;
     std::vector<int> tets;
@@ -704,8 +741,10 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     std::unordered_set<int> flux_seen;
     double flux_q_wm2 = 0.0;  // aggregate flux magnitude (W/m^2); one flux set per study
     std::vector<aicad::sim::ThermalConvection> convections;
-    struct FluxFaceLog { size_t n_nodes; double q_wm2; };
+    std::vector<aicad::sim::ThermalFluxLoad> transient_fluxes;  // per-load (T-FIN18)
+    struct FluxFaceLog { size_t n_nodes; double q_wm2; bool scheduled; };
     std::vector<FluxFaceLog> flux_log;
+    const bool transient = study.contains("transient") && study["transient"].is_object();
     if (study.contains("loads") && study["loads"].is_array()) {
         for (const auto& load : study["loads"]) {
             const std::string type = load.value("type", std::string());
@@ -722,7 +761,17 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                 for (int nid : ids)
                     if (flux_seen.insert(nid).second) flux_nodes.push_back(nid);
                 flux_q_wm2 = q_wm2;  // W/m^2 (positive = heat into the body)
-                flux_log.push_back({ids.size(), q_wm2});
+                flux_log.push_back({ids.size(), q_wm2, load.contains("schedule")});
+                // Transient keeps loads SEPARATE so each carries its own schedule.
+                aicad::sim::ThermalFluxLoad fl;
+                fl.nodes = ids;
+                fl.q = q_wm2 / 1.0e6;  // W/m^2 -> W/mm^2
+                std::string serr;
+                if (!parse_thermal_schedule(load.value("schedule", json()), fl.schedule, serr))
+                    return json{{"ok", false}, {"error", "thermal load schedule: " + serr}};
+                transient_fluxes.push_back(std::move(fl));
+                if (!transient && load.contains("schedule"))
+                    notes.push_back("Flux schedule ignored in a steady-state study");
             } else if (type == "convection") {
                 aicad::sim::ThermalConvection cv;
                 cv.nodes = ids;
@@ -738,6 +787,67 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     }
     // Flux magnitude to the mesh unit: W/m^2 -> W/mm^2 = q/1e6.
     const double flux_q_mm2 = flux_q_wm2 / 1.0e6;
+
+    // ── Transient branch (T-FIN18) — the steady path below stays bit-for-bit intact. ─────
+    if (transient) {
+        const json& tr = study["transient"];
+        // Volumetric heat capacity rho*cp in J/(mm^3·K):
+        //   rho [kg/m^3] * cp [J/(kg·K)] / 1e9  (1 m^3 = 1e9 mm^3);  g/cm^3 = 1000 kg/m^3.
+        const double cp = material.value("cp_j_kgk", study.value("cp_j_kgk", 0.0));
+        double rho_kg_m3 = material.value("rho_kg_m3", 0.0);
+        if (rho_kg_m3 <= 0.0) rho_kg_m3 = material.value("density_g_cm3", 0.0) * 1000.0;
+        if (!(cp > 0.0) || !(rho_kg_m3 > 0.0))
+            return json{{"ok", false},
+                        {"error", "transient thermal needs material.cp_j_kgk (J/kg·K) and "
+                                  "density (density_g_cm3 or rho_kg_m3)"}};
+        aicad::sim::ThermalTransientOptions opts;
+        opts.rho_cp = rho_kg_m3 * cp / 1.0e9;
+        opts.t_end = tr.value("t_end_s", 0.0);
+        opts.dt = tr.value("dt_s", 0.0);
+        opts.t_init = tr.value("t_init_c", 20.0);
+        opts.lumped = tr.value("capacitance", std::string("lumped")) != "consistent";
+        if (tr.contains("frame_times_s") && tr["frame_times_s"].is_array())
+            for (const auto& t : tr["frame_times_s"]) opts.frame_times.push_back(t.get<double>());
+        if (opts.dt <= 0.0 && opts.t_end > 0.0) {
+            opts.dt = opts.t_end / 200.0;  // sensible default resolution
+            notes.push_back("transient dt_s not given — defaulted to t_end_s/200");
+        }
+
+        aicad::sim::ThermalTransientResult r = aicad::sim::fea_thermal_transient(
+            points, tets, k_cond, fixed_nodes, fixed_temps, transient_fluxes, convections,
+            opts, nodes_per_elem);
+        if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};
+
+        json frames = json::array();
+        for (const auto& fr : r.frames)
+            frames.push_back({{"t_s", round_nd(fr.time, 6)}, {"temperature", fr.temperature}});
+        json flux_summary = json::array();
+        for (const auto& fl : flux_log)
+            flux_summary.push_back({{"type", "flux"}, {"q_w_m2", fl.q_wm2},
+                                    {"n_nodes", fl.n_nodes}, {"scheduled", fl.scheduled}});
+        for (const auto& cv : convections)
+            flux_summary.push_back({{"type", "convection"}, {"h_w_m2k", cv.h * 1.0e6},
+                                    {"t_amb_c", cv.t_amb}, {"n_nodes", cv.nodes.size()}});
+        return json{{"ok", true},
+                    {"transient", true},
+                    {"frames", frames},
+                    {"temperature", r.frames.back().temperature},  // final field (steady-compat)
+                    {"envelope_max", r.envelope_max},
+                    {"n_nodes", r.n_nodes},
+                    {"n_dof", r.n_dof},
+                    {"n_elems", r.n_elems},
+                    {"n_steps", r.n_steps},
+                    {"mesh_type_used", mesh_type_used},
+                    {"summary",
+                     {{"max_temp_c", round_nd(r.max_temp, 4)},
+                      {"max_temp_time_s", round_nd(r.max_temp_time, 6)},
+                      {"min_temp_c", round_nd(r.min_temp, 4)},
+                      {"final_max_temp_c",
+                       round_nd(*std::max_element(r.frames.back().temperature.begin(),
+                                                  r.frames.back().temperature.end()), 4)}}},
+                    {"flux_summary", flux_summary},
+                    {"solver_notes", notes}};
+    }
 
     aicad::sim::ThermalResult r = aicad::sim::fea_thermal_solve(
         points, tets, k_cond, fixed_nodes, fixed_temps, flux_nodes, flux_q_mm2, convections,

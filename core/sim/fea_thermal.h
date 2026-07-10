@@ -25,9 +25,24 @@
 //   q  in  W/L^2        (heat flux per mesh-area)
 //   h  in  W/(L^2·K)    (film coefficient per mesh-area)
 // so that ∫k∇N∇N dV, ∫q N dS and h∫N N dS all come out in W/K · K = W consistently. The
-// resulting nodal temperatures are in the same K/°C scale as T_fixed / T_amb. Transient
-// (dT/dt) conduction is OUT of scope — a follow-up (needs the consistent capacitance C and
-// a time integrator); this solver is steady-state only.
+// resulting nodal temperatures are in the same K/°C scale as T_fixed / T_amb.
+//
+// TRANSIENT (T-FIN18). fea_thermal_transient() adds the capacitance term
+//
+//     C dT/dt + K T = f(t),    C_ij = ∫_V rho·cp N_i N_j dV
+//
+// integrated with IMPLICIT BACKWARD EULER at a fixed step dt:
+//     (K + C/dt) T^{n+1} = (C/dt) T^n + f(t^{n+1})
+// The iteration matrix A = K + C/dt is CONSTANT (fixed dt, constant material, constant
+// Dirichlet temperatures), so it is factored ONCE (Cholesky, SparseLU fallback — same
+// convention as the steady solver) and every step is a single back-substitution, even
+// when the loads are time-varying (only the RHS changes). Capacitance is LUMPED by
+// default (row-sum for tet4, HRZ diagonal scaling for tet10): a diagonal C keeps A in
+// K's sparsity pattern, and lumped capacitance + backward Euler is unconditionally
+// stable AND monotone (no spurious initial-transient oscillation at large dt), which is
+// the standard choice for conduction. A consistent C is available (lumped=false) for
+// accuracy studies. rho·cp arrives VOLUMETRIC in J/(L^3·K) (the glue converts
+// kg/m^3 · J/(kg·K) → J/(mm^3·K)).
 #pragma once
 
 #include <string>
@@ -78,5 +93,76 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                                 const std::vector<int>& flux_nodes, double flux_q,
                                 const std::vector<ThermalConvection>& convections,
                                 int nodes_per_elem = 4);
+
+// ── Transient (T-FIN18) ──────────────────────────────────────────────────────────────────
+
+// A piecewise-constant (sample-and-hold) load schedule s(t): scale s = scales[i] holds on
+// [times[i], times[i+1]) — times ascending, times[0] == 0, sizes equal. The last scale holds
+// to t_end (or, when period > 0, to the end of the period, after which the whole pattern
+// repeats: s(t) = s(fmod(t, period))). An EMPTY schedule means s(t) = 1 (always on).
+//
+// This shape is a direct target for the aicad.powerprofile/1 per-rail duty-cycle profiles
+// (T-FIN7): a rail with duty d and period p maps to {times:[0, d*p], scales:[1, 0],
+// period:p}; an arbitrary residency timeline maps to its own breakpoint list.
+struct ThermalSchedule {
+    std::vector<double> times;   // ascending breakpoints, starting at 0 (seconds)
+    std::vector<double> scales;  // dimensionless multiplier held from each breakpoint
+    double period = 0.0;         // > 0: the pattern repeats every `period` seconds
+};
+
+// s(t) for a schedule (exposed so tests / glue / the Python oracle share one definition).
+double thermal_schedule_scale(const ThermalSchedule& sched, double t);
+
+// One heat-flux load for the transient solver: its own node set, magnitude and schedule
+// (the steady solver's single flux set generalises to N independently-scheduled sources —
+// one per power rail when driven from a power profile).
+struct ThermalFluxLoad {
+    std::vector<int> nodes;   // mesh nodes on the loaded face(s)
+    double q = 0.0;           // flux magnitude, W/L^2 (q>0 = heat INTO the body)
+    ThermalSchedule schedule; // time modulation of q (empty = constant)
+};
+
+struct ThermalTransientOptions {
+    double rho_cp = 0.0;   // volumetric heat capacity rho*cp, J/(L^3·K); must be > 0
+    double t_end = 0.0;    // total simulated time, s; must be >= dt
+    double dt = 0.0;       // fixed backward-Euler step, s; must be > 0
+    double t_init = 0.0;   // uniform initial temperature (used when init_temps is empty)
+    std::vector<double> init_temps;   // optional per-node initial field (size n_nodes)
+    std::vector<double> frame_times;  // times at which to record a full nodal frame; each
+                                      // snaps to the first step time >= the request. The
+                                      // final step (t_end) is ALWAYS recorded.
+    bool lumped = true;    // diagonal (row-sum / HRZ) capacitance; false = consistent
+};
+
+struct ThermalFrame {
+    double time = 0.0;                // step time the frame was recorded at, s
+    std::vector<double> temperature;  // n_nodes nodal field
+};
+
+struct ThermalTransientResult {
+    std::vector<ThermalFrame> frames;  // requested frames + the final step, ascending time
+    std::vector<double> envelope_max;  // per-node max temperature over the WHOLE run
+                                       // (including the initial condition)
+    double max_temp = 0.0;       // global max over the run (max of envelope_max)
+    double max_temp_time = 0.0;  // step time at which the global max was first reached
+    double min_temp = 0.0;       // global min over the run
+    int n_nodes = 0;
+    int n_dof = 0;
+    int n_elems = 0;
+    int n_steps = 0;             // backward-Euler steps taken
+    bool ok = false;
+    std::string error;
+};
+
+// Transient conduction with backward Euler (see the header comment). Unlike the steady
+// solver, a model with NO Dirichlet node and NO convection is WELL-POSED here (pure
+// adiabatic heating — the capacitance anchors the evolution), so no singularity guard.
+// Steady-state fea_thermal_solve() is untouched by this entry point (hard regression gate).
+ThermalTransientResult fea_thermal_transient(
+    const std::vector<double>& points, const std::vector<int>& tets, double k_cond,
+    const std::vector<int>& fixed_nodes, const std::vector<double>& fixed_temps,
+    const std::vector<ThermalFluxLoad>& fluxes,
+    const std::vector<ThermalConvection>& convections, const ThermalTransientOptions& opts,
+    int nodes_per_elem = 4);
 
 }  // namespace aicad::sim

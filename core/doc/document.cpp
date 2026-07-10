@@ -6300,10 +6300,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("thread: major_dia and pitch must be > 0");
                 }
 
-                const double length =
+                // LENGTH is OPTIONAL: blank / <= 0 ⇒ the thread spans the WHOLE cylindrical
+                // face (its full axial extent, computed once the face is resolved below). A
+                // positive value is an explicit run length (mm) from the start plane.
+                double length =
                     feat.contains("length") ? num_or_expr(feat.at("length"), env) : 0.0;
-                if (!(length > 0.0))
-                    throw std::runtime_error("thread: 'length' (thread run, mm) must be > 0");
                 int starts = 1;
                 if (feat.contains("starts")) {
                     double sv = num_or_expr(feat.at("starts"), env);
@@ -6384,25 +6385,92 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     gp_Pnt axis_loc = cyl_axis.Location();
                     gp_Dir axis_dir = cyl_axis.Direction();
 
-                    // Anchor the thread start at the LOWER end of the face along the axis,
-                    // so a `length` shorter than the cylinder threads from one end rather
-                    // than from the (arbitrary) surface parametric origin.
+                    // ── Thread START anchor, RUN direction, and LENGTH ──────────────────
+                    // The thread runs from a start plane along the cylinder axis for
+                    // `length` mm. Three optional inputs shape it:
+                    //   from / start_ref  a vertex / edge / face / datum whose axial position
+                    //                     is the thread START (default: the lower face end).
+                    //   flip / reverse    run toward the OTHER end (start from the far end
+                    //                     when there's no explicit `from`, reversing the dir);
+                    //                     lets the user flip when the start reference isn't an
+                    //                     auto-termination end of the face.
+                    //   length            explicit run (mm); blank ⇒ span to the far face end.
+                    // cut_thread clamps the band to the body, so an over-long run is safe.
+                    const gp_Pnt cyl_loc = axis_loc;             // a point on the axis
+                    const gp_Vec ad_v(axis_dir);
+                    // Resolve a start-reference selector (vertex/edge/face/datum) to a point.
+                    auto thread_ref_point = [&](const json& sref, gp_Pnt& out) -> bool {
+                        auto center_of = [&](const TopoDS_Shape& sh) -> bool {
+                            Bnd_Box b; BRepBndLib::Add(sh, b);
+                            if (b.IsVoid()) return false;
+                            double x0, y0, z0, x1, y1, z1; b.Get(x0, y0, z0, x1, y1, z1);
+                            out = gp_Pnt((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5);
+                            return true;
+                        };
+                        const std::string of = (sref.is_object() && sref.contains("of"))
+                                                   ? sref.value("of", std::string())
+                                                   : std::string();
+                        try {
+                            if (of == "edge")   return center_of(resolve_edge_sel(sref, "from"));
+                            if (of == "face")   return center_of(resolve_face_sel(sref, "from"));
+                            if (of == "vertex" || is_datum_ref(sref)) {
+                                Eigen::Vector3d v = vertex_point(sref, "from");
+                                out = gp_Pnt(v.x(), v.y(), v.z()); return true;
+                            }
+                            // Unknown/absent kind: try vertex, then edge, then face.
+                            try { Eigen::Vector3d v = vertex_point(sref, "from");
+                                  out = gp_Pnt(v.x(), v.y(), v.z()); return true; } catch (...) {}
+                            try { return center_of(resolve_edge_sel(sref, "from")); } catch (...) {}
+                            return center_of(resolve_face_sel(sref, "from"));
+                        } catch (...) { return false; }
+                    };
+                    // Face axial extent [s_min, s_max] (signed distance along axis_dir from cyl_loc).
+                    double s_min = 1e300, s_max = -1e300;
                     {
                         Bnd_Box fb;
                         BRepBndLib::Add(tface, fb);
                         double x0, y0, z0, x1, y1, z1;
                         fb.Get(x0, y0, z0, x1, y1, z1);
-                        gp_Pnt lo(x0, y0, z0), hi(x1, y1, z1);
-                        gp_Vec ad_v(axis_dir);
-                        // Project both bbox corners onto the axis; start from the lower one.
-                        gp_Vec to_lo(axis_loc, lo), to_hi(axis_loc, hi);
-                        double s_lo = to_lo.Dot(ad_v), s_hi = to_hi.Dot(ad_v);
-                        double s_start = std::min(s_lo, s_hi);
-                        axis_loc = axis_loc.Translated(ad_v.Multiplied(s_start));
+                        for (int i = 0; i < 8; ++i) {
+                            gp_Pnt c((i & 1) ? x1 : x0, (i & 2) ? y1 : y0, (i & 4) ? z1 : z0);
+                            const double s = gp_Vec(cyl_loc, c).Dot(ad_v);
+                            s_min = std::min(s_min, s); s_max = std::max(s_max, s);
+                        }
                     }
+                    // Optional START reference → clamped axial coordinate.
+                    bool have_from = false; double s_from = 0.0;
+                    {
+                        const json& sref = feat.contains("from") ? feat.at("from")
+                                         : (feat.contains("start_ref") ? feat.at("start_ref")
+                                         : (feat.contains("start") ? feat.at("start") : json()));
+                        gp_Pnt rp;
+                        if (!sref.is_null() && thread_ref_point(sref, rp)) {
+                            s_from = gp_Vec(cyl_loc, rp).Dot(ad_v);
+                            s_from = std::max(s_min, std::min(s_max, s_from));
+                            have_from = true;
+                        }
+                    }
+                    const bool flip = feat.value("flip", false) ||
+                                      feat.value("reverse", false) ||
+                                      feat.value("flip_direction", false);
+                    double s_start; gp_Dir run_dir;
+                    if (!flip) {
+                        run_dir = axis_dir;
+                        s_start = have_from ? s_from : s_min;
+                        if (!(length > 0.0)) length = s_max - s_start;   // span to the far end
+                    } else {
+                        run_dir = axis_dir.Reversed();
+                        s_start = have_from ? s_from : s_max;
+                        if (!(length > 0.0)) length = s_start - s_min;   // span to the far end
+                    }
+                    if (!(length > 1e-6))
+                        throw std::runtime_error(
+                            "thread: computed a zero-length run — the start reference sits at "
+                            "the end of the face, or the face has no axial extent");
+                    axis_loc = cyl_loc.Translated(ad_v.Multiplied(s_start));
 
                     ::geom::ThreadResult tr = ::geom::cut_thread(
-                        body, axis_loc, axis_dir, cyl_radius, pitch, major_dia, length,
+                        body, axis_loc, run_dir, cyl_radius, pitch, major_dia, length,
                         starts, lefthand, internal, raised, turns_cap, tform);
                     if (tr.shape.IsNull())
                         throw std::runtime_error(

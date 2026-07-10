@@ -145,6 +145,7 @@ static const PMSelKinds K_FACEVERTPLANE {true, false, true,  false, true};
 // picking; axis=true arms SketchMode::drawAxisPicker. Used for revolve / circular-pattern axes.
 static const PMSelKinds K_EDGEAXIS     {false, true, false, false, false, true};  // edge or datum axis
 static const PMSelKinds K_FACEEDGEAXIS {true,  true, false, false, false, true};  // face/edge or datum axis
+static const PMSelKinds K_FACEEDGEVERTEX {true, true, true};  // face/edge/vertex (thread start reference)
 
 // ----------------------------------------------------------------------------
 // The forms. Field order == feature_params.md order == PM tab order.
@@ -387,7 +388,15 @@ static const std::vector<PMFormDef>& forms() {
                      "custom_size", "false"),
             DimIf   ("major_dia", "Major Dia.", "Thread", 12.0,  "custom_size", "true", /*omit=*/true),
             DimIf   ("pitch",     "Pitch",      "Thread", 1.75,  "custom_size", "true", /*omit=*/true),
-            Dim     ("length",    "Length",     "Thread", 12.0),
+            // Full length by default: `full_length` checked OMITS `length` so the engine
+            // spans the whole cylindrical face. Uncheck to reveal an explicit Length field.
+            Check   ("full_length", "Full length", "Thread", true),
+            DimIf   ("length",    "Length",     "Thread", 12.0,  "full_length", "false", /*omit=*/true),
+            // Start reference: a vertex / edge / face the thread starts FROM (default: the
+            // lower face end). Flip runs it toward the other end — use it when the picked
+            // reference isn't already an auto-termination end of the thread.
+            Well    ("from",  "Start From (edge/face/vertex)", "Thread", K_FACEEDGEVERTEX, false),
+            Check   ("flip",  "Flip direction", "Thread", false),
             ComboL  ("form",  "Profile", "Thread",
                      "v|acme|trap|square", "V (60 deg)|ACME|Trapezoidal|Square"),
             ComboL  ("mode",  "Mode", "Thread",

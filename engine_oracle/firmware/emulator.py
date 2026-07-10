@@ -181,9 +181,12 @@ def write_trace_artifact(elf_path: str, source: str, uart_log: str,
 
     Schema ``aicad.firmware.trace/1``: interleaved, seq-ordered pin + UART events plus the
     final GPIO snapshot. Atomic tmp+replace; any failure returns None (never raises) —
-    the trace is an artifact, not a gate.
+    the trace is an artifact, not a gate. Skipped (None) when the ELF itself does not
+    exist — keeps mocked-subprocess tests from littering trace files next to fake paths.
     """
     try:
+        if not Path(elf_path).exists():
+            return None
         events: list[dict] = list(gpio_events)
         for i, line in enumerate(uart_log.splitlines()):
             s = line.strip()

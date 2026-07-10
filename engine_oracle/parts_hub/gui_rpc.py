@@ -774,9 +774,32 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
     try:
         req = urllib.request.Request(image_url, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310
-            return resp.read(4 * 1024 * 1024) or None
-    except Exception:  # noqa: BLE001 — hotlink-blocked / transient; GUI shows a glyph
-        return None
+            data = resp.read(4 * 1024 * 1024)
+            if data:
+                return data
+    except Exception:  # noqa: BLE001 — hotlink-blocked / transient; fall through to CEF
+        pass
+    # Fallback: pull the image through the CEF session, which carries the vendor's
+    # real browser fingerprint + saved cookies — this is what defeats the CDNs that
+    # 403 a plain hotlink. site = the catalog part_id's vendor segment.
+    site = ""
+    if part_id.startswith("catalog:"):
+        site = part_id[len("catalog:"):].split("::", 1)[0]
+    try:
+        import tempfile
+        from pathlib import Path as _Path
+        from services.browser.cef_client import client as _cef_client
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+            dest = tf.name
+        r = _cef_client().download(image_url, dest, profile=site)
+        if isinstance(r, dict) and r.get("ok"):
+            data = _Path(dest).read_bytes()
+            _Path(dest).unlink(missing_ok=True)
+            return data or None
+        _Path(dest).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — CEF unavailable / download failed; GUI shows a glyph
+        pass
+    return None
 
 
 def _parts_thumbnail(params: dict, _emit: Callable) -> dict:

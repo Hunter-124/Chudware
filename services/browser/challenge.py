@@ -36,9 +36,12 @@ from __future__ import annotations
 # rule intact — anything that IS a challenge still aborts and hands control to
 # the human — while no longer aborting successful fetches of normal pages.
 _CAPTCHA_MARKERS: tuple[str, ...] = (
-    # Google reCAPTCHA v2 explicit widget / challenge popup, hCaptcha, Turnstile
+    # Google reCAPTCHA v2 explicit widget / challenge popup, hCaptcha, Turnstile.
+    # hCaptcha must be matched by its API domain / hyphenated widget class, NOT a
+    # bare "hcaptcha" substring — that false-matches Magento's stock
+    # `Magento_PaypalCaptcha/.../skipRefreshCaptcha.js` ("refres·hCaptcha").
     "g-recaptcha", "recaptcha/api2/bframe",
-    "hcaptcha", "h-captcha",
+    "hcaptcha.com", "h-captcha",
     "cf-turnstile",
     # Cloudflare interstitial / challenge pages
     "cf-challenge", "cf_chl_", "challenge-platform",
@@ -134,6 +137,19 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
         has_interstitial = any(m in hay for m in _INTERSTITIAL_CF_MARKERS)
         substantive = [m for m in hit_markers if m not in _PASSIVE_WIDGET_MARKERS]
         passive_widgets = [m for m in hit_markers if m in _PASSIVE_WIDGET_MARKERS]
+        # A purely PASSIVE, INVISIBLE reCAPTCHA badge (the v3-style grecaptcha-badge,
+        # or an anchor iframe marked size=invisible) with NO bframe challenge popup is
+        # library presence, not a challenge. Magento (and others) template an invisible
+        # login-popup widget into every page's header, so it rides along on ordinary
+        # catalog/product pages too — those must not be misread as a captcha wall
+        # regardless of URL. An active challenge always brings a bframe popup or a
+        # visible (non-invisible) anchor checkbox, neither of which this branch matches.
+        recaptcha_only = all(m in ("g-recaptcha", "recaptcha/api2/bframe") for m in hit_markers)
+        invisible_badge = ("grecaptcha-badge" in hay
+                           or ("recaptcha/api2/anchor" in hay and "size=invisible" in hay))
+        if (recaptcha_only and invisible_badge and "recaptcha/api2/bframe" not in hay
+                and not has_interstitial):
+            return None
         # Login forms often embed Turnstile/reCAPTCHA widgets — not a full-page CF wall.
         if (_is_auth_url(u) and _login_form_on_page(hay) and not has_interstitial
                 and not substantive and passive_widgets):

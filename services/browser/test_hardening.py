@@ -96,6 +96,40 @@ def test_captcha_wins_when_page_has_both():
     assert challenge.classify_challenge(html) == "captcha"
 
 
+def test_classifier_ignores_invisible_recaptcha_on_magento_catalog():
+    # Magento templates an invisible reCAPTCHA login-popup widget into every page's
+    # header, so it rides along on ordinary catalog/product pages (anaheimautomation
+    # live-probe 2026-07-10). The invisible badge + no bframe popup is not a
+    # challenge, even on a non-auth catalog URL carrying real product content.
+    html = (
+        '<html><body><div class="products-grid">'
+        '<a class="product-item-link" href="/23y104s-lw8.html">23Y104S-LW8</a></div>'
+        '<div id="recaptcha-popup-login-wrapper"><div class="g-recaptcha" '
+        'id="recaptcha-popup-login"><div class="grecaptcha-badge" data-style="inline">'
+        '<iframe src="https://www.google.com/recaptcha/api2/anchor?size=invisible">'
+        '</iframe></div></div></div></body></html>'
+    )
+    assert challenge.classify_challenge(
+        html, "https://www.anaheimautomation.com/catalogsearch/result/?q=stepper") is None
+
+
+def test_classifier_ignores_magento_refresh_captcha_module():
+    # Magento ships `Magento_PaypalCaptcha/js/model/skipRefreshCaptcha.js`, whose name
+    # contains the substring "refres·hCaptcha" — it must NOT false-match hCaptcha.
+    html = ('<html><body>Add to cart.'
+            '<script src="/Magento_PaypalCaptcha/js/model/skipRefreshCaptcha.js"></script>'
+            '</body></html>')
+    assert challenge.classify_challenge(html) is None
+
+
+def test_classifier_still_flags_active_recaptcha_bframe():
+    # An actual reCAPTCHA challenge popup (bframe) still aborts, even alongside the
+    # invisible badge — the invisible-badge escape must not swallow a real challenge.
+    html = ('<div class="grecaptcha-badge"></div>'
+            '<iframe src="https://www.google.com/recaptcha/api2/bframe?k=6Lc"></iframe>')
+    assert challenge.classify_challenge(html) == "captcha"
+
+
 # --- fakes (page carries a .url, unlike test_browser_session's minimal one) ------
 
 class _FakePage:

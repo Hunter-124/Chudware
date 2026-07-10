@@ -1,13 +1,16 @@
 """services/browser/adapters/anaheimautomation.py — anaheimautomation source adapter (T-X7).
 
 Anaheim Automation (anaheimautomation.com) makes stepper motors, drivers,
-controllers and linear actuators, with clean product HTML. Search and STEP
-downloads are open; `acquire` lands the STEP model with provenance for
-part_search / part_place.
+controllers and linear actuators on a Magento storefront with clean product
+HTML. Search and CAD-model downloads are OPEN — no login is required to browse
+the catalog or pull models; `acquire` lands the native 3D model with provenance
+for part_search / part_place.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live anaheimautomation session (T-X6 gates the real per-source
-integration tests behind an env flag).
+The search + result shapes below are verified against a live headless session
+(2026-07-10): the catalog is Magento, so search is `/catalogsearch/result/?q=`
+(the old `/search/search.php` guess 404'd) and result cards are Magento
+`product-item-link` anchors carrying ABSOLUTE product URLs. CAD models are
+series-level archives under `/media/anaheim/files/3D/...` (.rar/.zip/.step).
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from . import download_dir, is_login_wall, login_required, provenance_envelope, 
 
 SITE = "anaheimautomation"
 BASE_URL = "https://www.anaheimautomation.com"
-SEARCH_URL_TMPL = BASE_URL + "/search/search.php?search_query={query}"
+SEARCH_URL_TMPL = BASE_URL + "/catalogsearch/result/?q={query}"
 LICENSE_NOTE = (
     "Anaheim Automation CAD models and datasheets are fetched under the "
     "user's own authenticated Anaheim Automation session for their own "
@@ -29,15 +32,17 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Log in to Anaheim Automation', 'id="loginForm"', 'class="login-form"',
                        'Please sign in to download')
-# Best-effort: search result cards link to a product detail page.
+# Magento search cards: a `product-item-link` anchor whose href is an ABSOLUTE
+# product URL (class may sit before or after href, so require it via lookahead).
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/products/[^"?#]+)"[^>]*>'
+    r'<a\b(?=[^>]*\bclass="[^"]*product-item-link)[^>]*\bhref="(?P<href>[^"]+)"[^>]*>'
     r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
 _MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
                      re.IGNORECASE)
-# Best-effort: a product page's native CAD download link (STEP model or zip).
+# A product page's native CAD download link — Anaheim ships series-level 3D
+# archives under /media/anaheim/files/3D/ (.rar today; keep STEP/zip/iges too).
 _DOWNLOAD_RE = re.compile(
-    r'href="(?P<href>[^"]+\.(?:step|stp|zip)(?:\?[^"]*)?)"', re.IGNORECASE)
+    r'href="(?P<href>[^"]+\.(?:step|stp|stl|igs|iges|zip|rar)(?:\?[^"]*)?)"', re.IGNORECASE)
 
 
 def _strip_tags(text: str) -> str:
@@ -56,12 +61,18 @@ class AnaheimAutomationAdapter:
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
         hits = []
+        seen: set[str] = set()
         for m in _RESULT_RE.finditer(content):
+            href = m.group("href")
+            product_url = href if href.startswith("http") else BASE_URL + href
+            if product_url in seen:  # Magento repeats each card (grid + list view)
+                continue
+            seen.add(product_url)
             card = m.group("title")
             mfr_match = _MFR_RE.search(card)
             hits.append({
                 "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "url": product_url,
                 "site": SITE,
                 "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "Anaheim Automation",
             })

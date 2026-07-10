@@ -302,21 +302,18 @@ static ChipResult drawChipAt(const char* btnId,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + chipW, p0.y + chipH);
 
+    // Liquid-glass background for a tab/chip rect [p0,p1], corner radius `rnd`.
+    // Same glassRowBackground + coloredRowWash combo the ribbon tab strip uses, so the
+    // whole app reads consistently (rest / hover / active are three wash strengths).
+    float tint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
+    ui::glassRowBackground(dl, p0, p1, rnd, /*stripe*/false, /*selected*/isActive, /*washAlpha*/0.42f);
     if (isActive) {
-        // Active: stronger fill + bold accent outline.
-        dl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.buttonActive), rnd);
-        dl->AddRect(p0, p1, ui::Palette::toU32(ui::palette.accent), rnd, 0,
-                    ui::metrics::stroke(1.8f));
+        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.40f, /*selected*/true);
+        ui::glassSelectionGlow(dl, p0, p1, rnd, ui::palette.accent);
     } else if (hovered) {
-        // Hover: brighter fill + subtle border.
-        dl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.buttonHovered), rnd);
-        dl->AddRect(p0, p1, ui::Palette::toU32(ui::palette.border), rnd, 0,
-                    ui::metrics::stroke(1.0f));
+        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.30f, /*selected*/false);
     } else {
-        // REST: subtle fill + subtle border — so the chip is OBVIOUSLY a button at rest.
-        dl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.button), rnd);
-        dl->AddRect(p0, p1, ui::Palette::toU32(ui::palette.border), rnd, 0,
-                    ui::metrics::stroke(1.0f));
+        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.18f, /*selected*/false);
     }
 
     // Icon + label group centered in chip. Width is measured with the same reference
@@ -546,7 +543,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         // Start x: just after logo (screen-relative → then convert to screen-absolute for SetCursorScreenPos).
         // logoEndRelX is already window-relative cursor position; convert to screen.
-        const float leftGroupStartScreenX = winX + logoEndRelX;
+        const float leftGroupStartScreenX = winX + logoEndRelX + 14.0f * s;  // gap off the logo
         // If logo wasn't drawn, cursor is at 12*s (rel). LogoEndRelX covers both cases.
 
         float cx = leftGroupStartScreenX;  // current screen x for left group placement
@@ -564,6 +561,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             cx += fileW + chipGap;
         }
 
+        // Liquid-glass divider in the gap between File and Search.
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float dividerX = cx - chipGap * 0.5f;
+            const float dy0 = barTopScreenY + barH * 0.24f;
+            const float dy1 = barTopScreenY + barH * 0.76f;
+            ImU32 dHi  = (ui::Palette::toU32(ui::palette.accent) & 0x00FFFFFFu) | 0x22000000u;
+            ImU32 dCol = (ui::Palette::toU32(ui::palette.border) & 0x00FFFFFFu) | 0x66000000u;
+            dl->AddLine(ImVec2(dividerX - 0.5f * s, dy0), ImVec2(dividerX - 0.5f * s, dy1), dHi,  1.0f * s);
+            dl->AddLine(ImVec2(dividerX + 0.5f * s, dy0), ImVec2(dividerX + 0.5f * s, dy1), dCol, 1.0f * s);
+        }
+
         // -- Search chip --
         {
             const ImVec2 chipP0(cx, barTopScreenY + chipVPad);
@@ -573,6 +582,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             hitLayout.addSpan((int)(cx - winX), (int)(cx - winX + searchW));
             if (res.clicked) st.showCommandSearch = true;
             cx += searchW + chipGap;
+        }
+
+        // Liquid-glass divider in the gap between Search and Settings.
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float dividerX = cx - chipGap * 0.5f;
+            const float dy0 = barTopScreenY + barH * 0.24f;
+            const float dy1 = barTopScreenY + barH * 0.76f;
+            ImU32 dHi  = (ui::Palette::toU32(ui::palette.accent) & 0x00FFFFFFu) | 0x22000000u;
+            ImU32 dCol = (ui::Palette::toU32(ui::palette.border) & 0x00FFFFFFu) | 0x66000000u;
+            dl->AddLine(ImVec2(dividerX - 0.5f * s, dy0), ImVec2(dividerX - 0.5f * s, dy1), dHi,  1.0f * s);
+            dl->AddLine(ImVec2(dividerX + 0.5f * s, dy0), ImVec2(dividerX + 0.5f * s, dy1), dCol, 1.0f * s);
         }
 
         // -- Settings chip --
@@ -657,6 +678,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float tx = winX + tabsStartRelX;  // current tab x, screen-absolute
+        bool drewPrevTab = false;         // gate the between-tab dividers
 
         for (int i = 0; i < kTabCount; ++i) {
             // T-FIN5 progressive disclosure: the Firmware tab is offered only when a
@@ -668,6 +690,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
             // Clip tab if it would overlap the OS controls area (window-relative check).
             if ((tx - winX) + chipW > rightGroupStartRelX - 2.0f * s) break;
+
+            // Liquid-glass divider centered in the gap before this tab (only between two
+            // visible tabs — never before the first drawn tab or after the last).
+            if (drewPrevTab) {
+                const float dividerX = tx - tabGapX * 0.5f;
+                const float dy0 = barTopScreenY + barH * 0.24f;
+                const float dy1 = barTopScreenY + barH * 0.76f;
+                ImU32 dHi  = (ui::Palette::toU32(ui::palette.accent) & 0x00FFFFFFu) | 0x22000000u;
+                ImU32 dCol = (ui::Palette::toU32(ui::palette.border) & 0x00FFFFFFu) | 0x66000000u;
+                dl->AddLine(ImVec2(dividerX - 0.5f * s, dy0), ImVec2(dividerX - 0.5f * s, dy1), dHi,  1.0f * s);
+                dl->AddLine(ImVec2(dividerX + 0.5f * s, dy0), ImVec2(dividerX + 0.5f * s, dy1), dCol, 1.0f * s);
+            }
 
             const ImVec2 p0(tx, barTopScreenY + chipVPad);
 
@@ -684,6 +718,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (res.clicked) st.activeWorkspace = kTabs[i].ws;
 
             tx += chipW + tabGapX;
+            drewPrevTab = true;
         }
 
         // ---- Window caption buttons (right-aligned, unchanged) ------------------

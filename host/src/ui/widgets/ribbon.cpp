@@ -1810,6 +1810,27 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         float grpW = natW[gi];
         int rowsPerCol = ribbon_rowsPerCol();
 
+        // --- Liquid-glass group background (drawn into the ribbon window's draw list) ---
+        // The button widgets render into the ##RibbonBody child window, which composites ON TOP of
+        // this parent draw list (see the ChildBg note above — the child's default opaque bg used to
+        // paint OVER this band), so this frosted+washed pill always sits behind the group's
+        // icons/labels regardless of code order. Horizontal extent matches the caption bounds
+        // (curX + half a group pad on each side) so adjacent groups don't abut and the divider bar
+        // has a gap to sit in; vertical extent is the body cell with a small inset. Wash is kept
+        // subtle (softer than the tab strip) so the larger body area doesn't overwhelm the icons.
+        {
+            ImVec2 cwp   = ImGui::GetWindowPos();
+            float  gpad  = kGroupPadX * s * 0.5f;
+            float  gvin  = 2.0f * s;                       // top/bottom inset
+            float  rnd   = 6.0f * s;                       // pinned spec corner radius
+            ImVec2 g0(snap(cwp.x + curX + gpad), snap(cwp.y + gvin));
+            ImVec2 g1(snap(cwp.x + curX + grpW - gpad), snap(cwp.y + bodyH2 - gvin));
+            float gtint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
+            ui::glassRowBackground(dl, g0, g1, rnd, /*stripe*/false, /*selected*/false,
+                                   /*washAlpha*/0.30f);
+            ui::coloredRowWash(dl, g0, g1, rnd, gtint, /*strength*/0.16f, /*selected*/false);
+        }
+
         // Resolve the face icon/label of a split (drop) button, honoring last-used variant.
         auto resolveFace = [&](const ui::RibbonCmd* cmd, bool drop,
                                const char*& showIcon, const char*& showLabel) {
@@ -1935,17 +1956,15 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         {
             ImVec2 cwinPos = ImGui::GetWindowPos();
             float  sepX    = snap(cwinPos.x + curX + grpW - kGroupPadX * s * 0.5f);
-            ImVec4 sepMain(palette.border[0], palette.border[1], palette.border[2], 0.92f);
-            ImVec4 sepHi(palette.accent[0], palette.accent[1], palette.accent[2], 0.24f);
-            ImU32  sepCol  = ImGui::ColorConvertFloat4ToU32(sepMain);
-            ImU32  sepHiCol = ImGui::ColorConvertFloat4ToU32(sepHi);
-            float  sepInset = ui::metrics::ribbonSplitInset();
-            dl->AddLine(ImVec2(sepX + ui::metrics::px(1.0f), cwinPos.y + sepInset + ui::metrics::px(4.0f)),
-                        ImVec2(sepX + ui::metrics::px(1.0f), cwinPos.y + bodyH2 - sepInset - ui::metrics::px(4.0f)),
-                        sepHiCol, ui::metrics::stroke(1.0f));
-            dl->AddLine(ImVec2(sepX, cwinPos.y + sepInset),
-                        ImVec2(sepX, cwinPos.y + bodyH2 - sepInset), sepCol,
-                        ui::metrics::stroke(1.25f));
+            // Two-line highlight+hairline divider, retuned to the title-bar pinned spec (faint accent
+            // highlight over a restrained border hairline) so the ribbon dividers read the same weight
+            // as the title bar's — not the previous heavier 0.92 main line.
+            float  dy0 = cwinPos.y + bodyH2 * 0.14f;
+            float  dy1 = cwinPos.y + bodyH2 * 0.86f;
+            ImU32  dHi  = (ui::Palette::toU32(ui::palette.accent) & 0x00FFFFFFu) | 0x22000000u; // faint accent highlight
+            ImU32  dCol = (ui::Palette::toU32(ui::palette.border) & 0x00FFFFFFu) | 0x66000000u; // main hairline
+            dl->AddLine(ImVec2(sepX - 0.5f * s, dy0), ImVec2(sepX - 0.5f * s, dy1), dHi,  ui::metrics::stroke(1.0f));
+            dl->AddLine(ImVec2(sepX + 0.5f * s, dy0), ImVec2(sepX + 0.5f * s, dy1), dCol, ui::metrics::stroke(1.0f));
 
             // Defect 2: centered caption. grpW already includes a caption-width floor, so labels
             // such as "Dimension" never truncate at COL_BIG/COL_SMALL. The clip rect is a safety

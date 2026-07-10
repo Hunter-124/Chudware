@@ -8,7 +8,9 @@ directly (``engine.piping.solve`` / ``engine.piping.schema``), and holds its own
 state so ``piping_report`` can reuse the document / result of the last ``piping_solve``.
 
 Tools:
-  piping_solve           aicad.piping/1 doc + boundary conditions -> node pressures/heads + link flows
+  piping_solve           aicad.piping/1 doc + boundary conditions -> node pressures/heads + link
+                         flows; also consumes externally-supplied networks (source_handoff=
+                         an aicad.simhandoff/1 envelope, e.g. from hydraulic_piping_handoff)
   piping_report          per-segment pressure-drop table with an explicit K-factor breakdown
   piping_internal_volume extract the internal fluid-domain solid from a pipe run (OCCT boolean)
   piping_cfd_handoff     1-D solve -> extract bore -> invoke run_cfd_flow (LBM) in one step

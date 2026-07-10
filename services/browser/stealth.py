@@ -2,12 +2,12 @@
 
 Goal: the user's headless Chromium (login wizard + page fetches) should present
 the same ordinary-desktop-Chrome fingerprint it presents in their headed login
-window, so the *user's own* session isn't flagged, rate-limited, or blocked just
-for running headless. This module genuinely adjusts fingerprint values — it does
-NOT alter nothing. What it does NOT do: solve captchas/Cloudflare (see
-:mod:`.challenge`, always handed back to the user). It only removes the
-gratuitous "I am automation" tells that a normal browser never emits; reducing
-those tells is not the same as defeating a site's bot-wall.
+window, so the *user's own* authenticated session isn't FALSELY flagged,
+rate-limited, or blocked just for running headless. This module genuinely adjusts
+fingerprint values to defeat those false-positive automation flags. A challenge
+that still resolves in front of real content is handled as a data-quality signal
+(:mod:`.challenge`) — its markup is skipped, not parsed as product data — rather
+than treated as a stop sign.
 
 The governing principle is **consistency, not mimicry**. An inconsistent
 fingerprint (UA header says Chrome but ``navigator.webdriver`` is true, or

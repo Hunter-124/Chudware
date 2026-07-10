@@ -56,7 +56,7 @@ CANARY_QUERIES: dict[str, str] = {
 
 #: Failure reasons that mean "provision a login", not "the adapter is broken".
 _EXPECTED_FAIL_REASONS = ("login_required", "no_profile", "terms_confirmation_required",
-                          "playwright_not_installed", "captcha_or_2fa_detected")
+                          "playwright_not_installed", "challenge_page")
 
 
 def _check_site(site: str) -> dict[str, Any]:

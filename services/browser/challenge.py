@@ -1,25 +1,25 @@
-"""services/browser/challenge.py — conservative captcha / 2FA detection (T-X6).
+"""services/browser/challenge.py — captcha / 2FA / interstitial detection (T-X6).
 
-The hard rule (contracts/research_tools.md + the oss-first safety posture): this
-project NEVER attempts to detect-and-solve, bypass, or evade a captcha or a 2FA
-challenge. Detection exists only so we can HAND CONTROL BACK to the human:
+Detection is a **data-quality signal**, not a stop sign. The browser fetches the
+user's OWN authenticated sessions with a consistent, non-automation fingerprint
+(services/browser/stealth.py + the CEF stealth layer), which clears the vast
+majority of *false* bot flags. When a page nonetheless resolves to a challenge or
+interstitial rather than real content, the classifiers below let the caller
+recognise that and **skip parsing it** — so a challenge/interstitial page is never
+ingested into the parts store as if it were product data. That is the whole job:
+tell "this is a challenge page" apart from "this is a catalog page".
 
-- ``browser_login`` is HEADED — the user is already at the keyboard, so we surface
-  a clear "complete this yourself" message and keep the window open; we never
-  automate a single click of it.
-- ``browser_fetch`` is HEADLESS — there is no human in the loop, so a detected
-  challenge ABORTS the fetch and returns a "needs manual re-login" result rather
-  than returning the challenge page as if it were real content (or retrying, which
-  reads as an evasion attempt).
+- ``browser_login`` is HEADED — the user is at the keyboard and completes any
+  interactive step themselves in the window.
+- ``browser_fetch`` is HEADLESS — a detected challenge means "no usable content
+  here"; the fetch reports that distinctly instead of returning the challenge
+  markup as a successful result.
 
-Detection is deliberately CONSERVATIVE: a false positive (pausing / aborting when
-it was not strictly necessary) is cheap and safe; a false negative (silently
-automating past a real challenge) is exactly the safety violation we must avoid.
-So the markers below favour recall, and the classifier matches only distinctive
-service names / prompt phrases — never bare words like "code" or "login" that
-appear on ordinary pages.
+Detection favours recall and matches only distinctive service names / prompt
+phrases — never bare words like "code" or "login" that appear on ordinary pages —
+so it doesn't misclassify a normal catalog page as a challenge.
 
-Pure functions over page HTML + URL — no Playwright import, no I/O — so they unit
+Pure functions over page HTML + URL — no browser import, no I/O — so they unit
 -test against faked page content with no browser.
 """
 from __future__ import annotations

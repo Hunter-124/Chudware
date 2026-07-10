@@ -212,7 +212,7 @@ def test_browser_fetch_profile_busy(tmp_profiles):
     lock = profiles.profile_lock(site)
     assert lock.acquire(blocking=False)
     try:
-        res = session.browser_fetch("https://x.test/p", site, _sync_playwright=lambda: None)
+        res = session.browser_fetch("https://x.test/p", site, _cef=object())
         assert res["ok"] is False and res["reason"] == "profile_busy"
     finally:
         lock.release()
@@ -225,7 +225,7 @@ def test_browser_download_profile_busy(tmp_profiles, tmp_path):
     assert lock.acquire(blocking=False)
     try:
         res = session.browser_download("https://x.test/f.step", site, tmp_path / "f.step",
-                                       _sync_playwright=lambda: None)
+                                       _cef=object())
         assert res["ok"] is False and res["reason"] == "profile_busy"
     finally:
         lock.release()

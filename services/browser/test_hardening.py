@@ -164,6 +164,27 @@ def _factory(html, url="https://example.com/", status=200):
     return _f
 
 
+class _FakeCef:
+    """Stand-in for services.browser.cef_client's daemon client — browser_fetch /
+    browser_download now drive CEF, not Playwright."""
+    def __init__(self, html, url, status):
+        self._html, self._url, self._status = html, url, status
+        self.calls = []
+
+    def fetch(self, url, *, settle_ms=1200, profile=""):
+        self.calls.append(url)
+        return {"ok": True, "status": self._status, "final_url": self._url, "html": self._html}
+
+    def download(self, url, dest, *, profile=""):
+        from pathlib import Path
+        Path(dest).write_bytes(self._html.encode())
+        return {"ok": True, "dest": dest}
+
+
+def _cef(html, url="https://example.com/", status=200):
+    return _FakeCef(html, url, status)
+
+
 @pytest.fixture()
 def sess(tmp_path, monkeypatch):
     """Reload services.browser.* under an isolated APPDATA base (mirrors test_browser_session)."""
@@ -179,41 +200,40 @@ def sess(tmp_path, monkeypatch):
     importlib.reload(engine_paths)
 
 
-# --- browser_fetch: HEADLESS abort on a challenge -------------------------------
+# --- browser_fetch: HEADLESS skip-parse on a challenge --------------------------
 
-def test_fetch_aborts_on_captcha(sess):
+def test_fetch_skips_captcha_page(sess):
     profiles, session = sess
     profiles.profile_dir("amazon").mkdir(parents=True)
-    fac = _factory('<title>Robot Check</title><div class="g-recaptcha"></div>',
-                   url="https://www.amazon.com/dp/B000")
+    cef = _cef('<title>Robot Check</title><div class="g-recaptcha"></div>',
+               url="https://www.amazon.com/dp/B000")
     result = session.browser_fetch("https://www.amazon.com/dp/B000", "amazon",
-                                   _sync_playwright=fac, min_interval=0.0)
+                                   _cef=cef, min_interval=0.0)
     assert result["ok"] is False
-    assert result["reason"] == "captcha_or_2fa_detected"
-    assert "re-login" in result["hint"]
-    # Never returned the challenge page as content, never marked a successful use.
+    # Detection is a data-quality signal: skip parsing, never ingest the markup.
+    assert result["reason"] == "challenge_page"
     assert "content" not in result
     assert profiles.load_meta("amazon").get("last_used_ts") is None
 
 
-def test_fetch_aborts_on_2fa(sess):
+def test_fetch_skips_2fa_page(sess):
     profiles, session = sess
     profiles.profile_dir("grabcad").mkdir(parents=True)
-    fac = _factory("<h1>Two-factor authentication</h1><p>Enter the code we sent.</p>",
-                   url="https://grabcad.com/parts")
+    cef = _cef("<h1>Two-factor authentication</h1><p>Enter the code we sent.</p>",
+               url="https://grabcad.com/parts")
     result = session.browser_fetch("https://grabcad.com/parts", "grabcad",
-                                   _sync_playwright=fac, min_interval=0.0)
+                                   _cef=cef, min_interval=0.0)
     assert result["ok"] is False
-    assert result["reason"] == "captcha_or_2fa_detected"
+    assert result["reason"] == "challenge_page"
 
 
 def test_fetch_passes_ordinary_page(sess):
     profiles, session = sess
     profiles.profile_dir("grabcad").mkdir(parents=True)
-    fac = _factory("<html><body>Flanged Bushing — download STEP</body></html>",
-                   url="https://grabcad.com/library/part-1")
+    cef = _cef("<html><body>Flanged Bushing — download STEP</body></html>",
+               url="https://grabcad.com/library/part-1")
     result = session.browser_fetch("https://grabcad.com/library/part-1", "grabcad",
-                                   _sync_playwright=fac, min_interval=0.0)
+                                   _cef=cef, min_interval=0.0)
     assert result["ok"] is True
     assert "Flanged Bushing" in result["content"]
 
@@ -310,7 +330,8 @@ def test_stealth_init_script_covers_the_known_tells():
     js = stealth.INIT_SCRIPT
     for tell in ("webdriver", "chrome", "plugins", "languages"):
         assert tell in js
-    # We deliberately do NOT spoof WebGL — a getParameter override is itself a
-    # tell (toString + canvas-readback inconsistency). Guard against regressing
-    # by checking the WebGL enum constants never appear in the injected code.
-    assert "37445" not in js and "37446" not in js  # UNMASKED_VENDOR/RENDERER_WEBGL
+    # WebGL vendor/renderer spoof masks the --use-angle=swiftshader software-GL
+    # tell (the top residual sannysoft flag). Kept in lockstep with
+    # cef_stealth.cpp; the hook reads native via toString so it isn't itself a tell.
+    assert "37445" in js and "37446" in js  # UNMASKED_VENDOR/RENDERER_WEBGL
+    assert "getParameter" in js

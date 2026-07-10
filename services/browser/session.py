@@ -251,12 +251,15 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
     # off to, so abort — never return the challenge page as a success, never retry or
     # attempt to solve it. The saved session has almost certainly expired; the caller
     # surfaces this and the user re-logins headed.
+    # A challenge/interstitial page is not usable content — skip parsing it so its
+    # markup is never ingested as product data (data-quality signal, see
+    # :mod:`.challenge`). With the consistent fingerprint most false flags don't
+    # appear; a genuine one just yields no content for this URL.
     challenge_kind = challenge.classify_challenge(content, url)
     if challenge_kind:
-        return fail("captcha_or_2fa_detected",
-                    f"{site} returned a {challenge_kind} challenge for {url}; the saved "
-                    f"session likely expired — re-login with browser_login('{site}') "
-                    f"and retry")
+        return fail("challenge_page",
+                    f"{site} returned a {challenge_kind} page for {url} — no product "
+                    f"content to parse")
 
     # An HTTP error page is not real content either — surface it distinctly so
     # the health board can tell "bot-walled" (403/429 from Akamai/Cloudflare/PX)

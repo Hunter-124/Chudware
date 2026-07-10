@@ -922,6 +922,80 @@ def bench_modal() -> None:
 
 
 # ===========================================================================
+# FAMILY 6b: TRANSIENT thermal — 1D slab quench (T-FIN18)
+# Reference: Incropera & DeWitt "Fundamentals of Heat and Mass Transfer" 7th ed
+# §5.5: series solution for a plane wall with sudden symmetric surface temperature.
+# ===========================================================================
+
+def _thermal_transient_slab_case() -> dict:
+    """TT1: slab at uniform T0 suddenly held at T_s on both x faces (insulated sides —
+    natural BCs on the unlisted faces). Analytic 1D mid-plane temperature:
+        theta(x,t)/theta0 = sum_{odd n} 4/(n*pi) sin(n*pi*x/L) exp(-alpha n^2 pi^2 t/L^2)
+    The run's final-frame max temperature IS the mid-plane temperature (the hottest
+    point of a symmetric quench), so the last frame's max is the observable."""
+    L, b, h = 100.0, 20.0, 20.0                     # mm slab, through-x conduction
+    T0, T_s = 100.0, 25.0
+    k_wmk, rho, cp = 50.0, 7.85, 490.0              # steel; rho in g/cm^3
+    alpha = k_wmk / (rho * 1000.0 * cp) * 1e6       # mm^2/s (= 13.0 for these numbers)
+    t_star = 0.3 * L * L / alpha                    # Fo = 0.3
+    theta = 0.0
+    for n in range(1, 200, 2):
+        theta += (4.0 / (n * math.pi) * math.sin(n * math.pi / 2.0)
+                  * math.exp(-alpha * n * n * math.pi ** 2 * t_star / (L * L)))
+    ref = T_s + (T0 - T_s) * theta
+
+    doc = _build_box_part("vv_tt1", L, b, h)
+    r = _mcp_call("run_fea_thermal", {
+        "hot_faces": [{"face": {"of": "face", "side": "left"}, "temperature": T_s}],
+        "cold_faces": [{"face": {"of": "face", "side": "right"}, "temperature": T_s}],
+        "material": {**_VV_STEEL, "conductivity_w_mk": k_wmk, "cp_j_kgk": cp},
+        "transient": {"t_end_s": t_star, "dt_s": t_star / 300.0, "t_init_c": T0},
+        "doc_id": doc,
+    })
+    got = None
+    if r.get("ok") and r.get("frames"):
+        got = r["frames"][-1].get("max_temp_c")
+    return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
+            "note": f"L={L:.0f}mm slab, Fo=0.3 (t*={t_star:.1f}s), alpha={alpha:.2f}mm^2/s, "
+                    f"backward Euler dt=t*/300, mid-plane T"}
+
+
+def bench_thermal_transient() -> None:
+    """Transient conduction validation: analytic 1D slab quench vs the C++ backward-Euler
+    transient solver (T-FIN18), executed through the full MCP server (same access pattern
+    and graceful-skip rules as bench_fea_static)."""
+    print("\n--- [thermal-transient] 1D slab quench (Incropera 7th §5.5) ---")
+    case_name = "TT1-slab-quench-mid-T"
+    citation = ("Incropera 7th §5.5: plane-wall series "
+                "theta/theta0=sum 4/(n*pi) sin(n*pi*x/L) exp(-alpha n^2 pi^2 t/L^2)")
+    ready, reason = _fea_ready()
+    if not ready:
+        _skip("thermal-transient", case_name, reason, citation)
+        return
+    try:
+        res = _thermal_transient_slab_case()
+    except Exception as exc:
+        _record("thermal-transient", case_name, "N/A", "FAIL", None, None,
+                f"error: {exc}", citation)
+        traceback.print_exc()
+        return
+    if not res["ok"]:
+        err = res.get("error")
+        if _missing_fea_capability(err):
+            _skip("thermal-transient", case_name,
+                  f"engine build lacks sim_run_thermal (needs core/build-occt-linux, "
+                  f"not the plain build-linux .so): {err}", citation)
+        else:
+            _record("thermal-transient", case_name, "N/A", "FAIL", None, res["ref"],
+                    f"run_fea_thermal(transient) failed: {err}", citation)
+        return
+    # ENGINEERING tier, tightened to 3%: real tet mesh + O(dt) backward Euler vs the
+    # exact 1D series — spatial + temporal discretisation both present.
+    _check("thermal-transient", case_name, "ENGINEERING", res["got"], res["ref"],
+           citation, note=res["note"], tol=3.0)
+
+
+# ===========================================================================
 # FAMILY 7: CFD — LBM drag trend (not absolute Cd)
 # The engine explicitly documents Cd as uncalibrated (staircased voxel LBM).
 # We test the TREND: Cd must be velocity-independent (Re-independent for same
@@ -1429,6 +1503,7 @@ def main() -> int:
     bench_structural()
     bench_modal()
     bench_fea_static()
+    bench_thermal_transient()   # T-FIN18: transient conduction vs analytic slab quench
     bench_calculix()
     bench_advanced_fea()   # T-BL04: fatigue + thermal + buckling + contact
     bench_cfd_lbm_trend()

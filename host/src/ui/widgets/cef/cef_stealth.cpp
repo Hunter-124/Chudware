@@ -54,13 +54,26 @@ const char* kInitScript = R"JS(
     if (navigator.deviceMemory > 8)
       Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
   });
-  // WebGL vendor/renderer spoof — masks the software-GL (SwiftShader/ANGLE) tell
-  // that our --use-angle=swiftshader crash-workaround otherwise leaks (a top
-  // bot-scan flag). Report a plausible desktop-Linux Intel/Mesa GPU consistent
-  // with the Linux UA. The override's toString reads native so it isn't itself a
-  // trivial hook tell. Technique ported from the OSS clark-browser patch set.
+  // WebGL vendor/renderer spoof — masks the software-GL (SwiftShader/llvmpipe) tell,
+  // but ONLY when the driver really is software. The getParameter hook is itself a top
+  // bot-scan tell: Function.prototype.toString.call(getParameter) exposes the wrapper
+  // source no matter how we mask the function's own .toString, and reCAPTCHA reads that
+  // vector. So on a REAL GPU (AI_CAD_CEF_GPU=1) we leave getParameter NATIVE — honest
+  // real-Intel values with zero tampering, the clean path for a reCAPTCHA login. On the
+  // SwiftShader fallback (default) we keep the spoof: masking the software renderer is
+  // what lets naive bot-walls (the parts-fetch vendors) serve us, and reCAPTCHA login
+  // isn't expected to pass in software-render mode anyway (the pixels give it away).
+  // Read the TRUE unmasked renderer FIRST (before any hook), then decide.
   patch(() => {
     const VENDOR = 37445, RENDERER = 37446;  // UNMASKED_VENDOR/RENDERER_WEBGL
+    let real = '';
+    try {
+      const c = document.createElement('canvas');
+      const g = c.getContext('webgl') || c.getContext('experimental-webgl');
+      const dbg = g && g.getExtension('WEBGL_debug_renderer_info');
+      real = (g && dbg) ? String(g.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '') : '';
+    } catch (e) { /* unreadable → err toward NOT hooking (native is safest) */ }
+    if (!/swiftshader|llvmpipe|software|basic render|swrast/i.test(real)) return;  // real GPU → stay native
     const spoof = {
       [VENDOR]: 'Google Inc. (Intel)',
       [RENDERER]: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), '

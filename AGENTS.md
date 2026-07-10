@@ -12,9 +12,13 @@ ShopCraft is a parametric CAD application. The core geometry/document/solver/CAM
 engine is a C++ library `libaicad` (under `core/`) that is strangling out a
 legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
 parity corpus until each Python module is flipped off and deleted. The desktop
-GUI is an ImGui shell under `ui/imgui/` — this is the **sole GUI target**.
-The older `host/` tree was **deleted in T-G11 (2026-07-06)** after the cross-platform build
-was de-duplicated off it. The active refactor plan lives at
+GUI is the C++ host under `host/` — this is the **sole GUI target** (production
+GUI at `host/src/ui/`, ~52k LOC). The shared render pipeline lives in
+`ui/viewport/`. (Historical note: T-G11 (2026-07-06) briefly deleted `host/` in
+favor of a cross-platform `ui/imgui` + `ui/abstract` (AI-CAD2) shell; that
+direction was **reversed** — the `ui/imgui`/`ui/abstract` app is retired and
+`host/` is the single cross-platform GUI, building on Linux with GCC/Clang and
+on Windows with MSVC. Binary: `host/build-linux/bin/AI-CAD`.) The active refactor plan lives at
 `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
 and is the source of truth for the target layered layout and the per-phase DAG.
 
@@ -27,16 +31,16 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | Dir | Purpose (current) | Plan target |
 |-----|-------------------|-------------|
 | `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
-| `host/` | **Removed (T-G11, 2026-07-06).** Was the legacy C++ ImGui desktop host. Its shared pieces were de-duplicated into the cross-platform tree (glad → `extern/glad`, render module → `ui/viewport/render/`, assets → `assets/`) and the GUI is now `ui/imgui/` only. | Deleted. |
+| `host/` | **The single GUI target.** Production C++ desktop host (~52k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC). Builds via `host/build-linux` → `host/build-linux/bin/AI-CAD`. (Was briefly removed in T-G11 (2026-07-06) in favor of `ui/imgui`; that was reversed — `host/` is the live GUI.) | Stays `host/`. |
 | `app/` | **Removed (T-G24, 2026-07-05).** Was a convenience symlink → `ui/imgui/`. Use `ui/imgui/` directly. Build output: `build/linux-app/`. | Deleted. |
 | `engine_oracle/` | Python parity oracle (frozen while `core/` catches up). Root `engine` symlink preserves imports. Deleted LAST (N6b). | Deleted N6b. |
 | `services/agent/` | Built-in agent loop (Python now → C++ later). Root `agent` symlink. | C++ at N5e. |
 | `services/mcp/` | MCP server for external agents. Root `mcp_server` symlink. | C++ at N5e. |
 | `services/installer/` | Provisioning, MCP registration, packaging. Root `installer` symlink. | Stays until N6. |
 | `services/worker/` | Engine routing seam (WorkerClient/DocMirror/bootstrap). | N4a. |
-| `ui/abstract/` | Framework-agnostic UI seam (view-model, commands, panel specs). **No ImGui.** | P2. |
-| `ui/imgui/` | ImGui concrete backend (scaffold; `app/` lands here P3). | P3. |
-| `ui/viewport/` | Shared OpenGL viewport pipeline: `renderer`/`mesh`/`camera` + `render/` (AICM loader, id-pass picking, overlays). The single home of the render module (was duplicated in `host/`). | Done. |
+| `ui/abstract/` | **Retired (AI-CAD2).** Was the framework-agnostic UI seam; the AI-CAD2 direction was reversed and `host/` is the GUI. Not on-disk on `master`. | Retired. |
+| `ui/imgui/` | **Retired (AI-CAD2).** Was the ImGui concrete backend; retired when `host/` was restored as the single GUI. Not on-disk on `master`. | Retired. |
+| `ui/viewport/` | Shared OpenGL viewport pipeline: `renderer`/`mesh`/`camera` + `render/` (AICM loader, id-pass picking, overlays). The shared render module, consumed by `host/`. | Done. |
 | `platform/` | Cross-OS shims (scaffold; `app/src/platform/*` lands P3). | P3. |
 | `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root symlinks preserve legacy paths. | Done (N1d). |
 | `docs/` | Design docs, status notes, parity specs. | Stays `docs/`. |
@@ -46,21 +50,24 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | `third_party/` | Vendored third-party deps. | Stays. |
 | `scratch/` | Throwaway scratch area. | Stays (non-blocking). |
 
-## GUI ownership policy (T-G11 — host/ deleted 2026-07-06)
+## GUI ownership policy (host/ is the single GUI target)
 
-- **`ui/imgui/` is the SINGLE GUI target** (concrete backend), over the shared,
-  framework-agnostic `ui/abstract/` (view-model, commands, panel specs) and the shared
-  `ui/viewport/` (OpenGL render pipeline). There is no second GUI tree anymore — the legacy
-  `host/` was deleted in T-G11 after the cross-platform build was de-duplicated off it
-  (glad → `extern/glad`, the render module → `ui/viewport/render/`, assets → `assets/`).
-- **Form/PropertyManager schema is the shared `ui/abstract/panel_spec.cpp`.** A form/PM fix
-  (selector kinds, wells, gating) belongs there — it is the single source the app reads. (There
-  used to be a duplicate `host/src/ui/pm_forms.cpp`; T-BL35's datum-axis fix diverged because it
-  was patched host-only — fixed in `41915e8c`. That trap is gone now that host/ is deleted.)
+- **`host/` is the SINGLE GUI target** — the production C++ desktop host
+  (`host/src/ui/`, ~52k LOC), consuming the shared `ui/viewport/` (OpenGL render
+  pipeline). It builds cross-platform (Linux GCC/Clang + Windows MSVC) →
+  `host/build-linux/bin/AI-CAD`. There is no second GUI tree: the `ui/imgui` +
+  `ui/abstract` (AI-CAD2) shell is retired and off `master`. (Historical: T-G11
+  (2026-07-06) briefly deleted `host/` and made `ui/imgui` the sole target after
+  de-duplicating the cross-platform build off `host/`; that direction was later
+  reversed and `host/` restored as the live, single GUI.)
+- **Form/PropertyManager schema lives with the host GUI** (`host/src/ui/`). A form/PM fix
+  (selector kinds, wells, gating) belongs there — it is the single source the app reads.
+  (Historical: T-G11-era guidance pointed at `ui/abstract/panel_spec.cpp`; with AI-CAD2
+  retired, `host/src/ui/` is again the single home, so there is no host-vs-abstract split to
+  diverge — the trap behind T-BL35's datum-axis fix, `41915e8c`.)
 - **OS-specifics belong in build files / the `platform/` seam, not duplicated source.** The one
-  live GUI compiles cross-platform via the `linux-app` / `windows-app` presets; per-OS bits
-  (subprocess launch, file dialogs, GL loader) live behind CMake conditionals or
-  `ui/imgui/src/platform/`. `ui/abstract` has zero platform ifdefs by design.
+  live GUI compiles cross-platform via CMake; per-OS bits (subprocess launch, file dialogs, GL
+  loader) live behind CMake conditionals in the `host/` build.
 - Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use `xvfb-run`
   when available unless `AI_CAD_SHOT_HEADED=1` is set. Set that env var for
   interactive/walkthrough runs (T-G12 protocol) to see a real window.

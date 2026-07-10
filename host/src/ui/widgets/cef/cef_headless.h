@@ -40,6 +40,19 @@ FetchResult headless_fetch(const std::string& url, int settle_ms = 1200,
 bool headless_download(const std::string& url, const std::string& dest_path,
                        const std::string& profile_dir = "");
 
+// DIAGNOSTIC: drive a real form login headlessly to OBSERVE a bot-wall verdict
+// (e.g. whether an invisible-reCAPTCHA login rejects our browser). Navigates to
+// `url` reusing the profile's session/cookies, lets it settle so the CSRF token +
+// reCAPTCHA are ready, then runs `fill_submit_js` in the main frame via
+// CefFrame::ExecuteJavaScript (render-frame JS — NOT CDP Runtime.evaluate, so the
+// no-automation-tell guarantee holds) to fill + submit the login form, waits up to
+// `post_wait_ms` for the response, and returns the resulting main-frame HTML — search
+// it for the vendor's "reCAPTCHA verification failed" vs "invalid login" message.
+// Opt-in only (daemon gates on AI_CAD_CEF_PROBE); local diagnostics, not a product path.
+FetchResult headless_login_probe(const std::string& url, const std::string& fill_submit_js,
+                                 int settle_ms, int post_wait_ms,
+                                 const std::string& profile_dir = "");
+
 // Close all pooled headless browsers (reused across fetches). Call before
 // shutdown() so CefShutdown doesn't race live browsers. No-op if none are open.
 void headless_close_all();

@@ -92,6 +92,14 @@ public:
         if (browser_) if (CefRefPtr<CefFrame> f = browser_->GetMainFrame()) f->LoadURL(url);
     }
 
+    // DIAGNOSTIC (login_probe): re-arm the load wait to catch a form-submit POST nav,
+    // and run JS in the main frame via ExecuteJavaScript (no CDP/Runtime tell).
+    void armLoadWait() { load_end_ = false; status_ = 0; }
+    void runJs(const std::string& js) {
+        if (browser_) if (CefRefPtr<CefFrame> f = browser_->GetMainFrame())
+            f->ExecuteJavaScript(js, f->GetURL(), 0);
+    }
+
     // CefRenderHandler — give Blink a viewport; ignore the paint.
     void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override { rect.Set(0, 0, 1280, 800); }
     void OnPaint(CefRefPtr<CefBrowser>, PaintElementType, const RectList&,
@@ -192,6 +200,80 @@ FetchResult headless_fetch(const std::string& url, int settle_ms,
             CefRefPtr<SourceVisitor> visitor = new SourceVisitor();
             frame->GetSource(visitor);
             for (int i = 0; i < 200 && !visitor->done(); ++i) pump(10);  // GetSource is async
+            if (visitor->done()) {
+                out.ok = true;
+                out.html = visitor->html();
+                out.status = client->status();
+                out.final_url = frame->GetURL().ToString();
+            }
+        }
+    }
+    return out;
+}
+
+FetchResult headless_login_probe(const std::string& url, const std::string& fill_submit_js,
+                                 int settle_ms, int post_wait_ms,
+                                 const std::string& profile_dir) {
+    FetchResult out;
+    if (!initialized()) return out;
+
+    CefRefPtr<FetchClient>& client = browser_pool()[profile_dir];
+    if (!client) {
+        client = new FetchClient();
+        CefWindowInfo window_info;
+        window_info.SetAsWindowless(0);
+        CefBrowserSettings settings;
+        settings.windowless_frame_rate = 30;
+        if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings,
+                                           nullptr, make_context(profile_dir))) {
+            browser_pool().erase(profile_dir);
+            return out;
+        }
+        for (int i = 0; i < 500 && !client->created(); ++i) pump(20);
+        if (!client->created()) { browser_pool().erase(profile_dir); return out; }
+    }
+
+    client->navigate(url);
+    for (int i = 0; i < 500 && !client->loaded(); ++i) pump(20);
+    if (!client->loaded()) return out;
+    if (settle_ms > 0) pump(settle_ms);      // let form_key + reCAPTCHA arm
+
+    // Inject TRUSTED human interaction before submitting: reCAPTCHA weights mouse
+    // movement/timing heavily, and JS-dispatched events are isTrusted=false (an
+    // instant bot tell). SendMouseMoveEvent goes through the real input pipeline
+    // (isTrusted=true), so a wandering path + dwell gives a faithful interaction
+    // signal — without this the probe fails on zero-interaction regardless of browser.
+    if (CefRefPtr<CefBrowser> b = client->browser()) {
+        CefRefPtr<CefBrowserHost> host = b->GetHost();
+        // Mark the windowless browser VISIBLE + FOCUSED. An OSR browser otherwise
+        // reports document.visibilityState='hidden' / hasFocus()=false, which
+        // reCAPTCHA penalises as a backgrounded/bot page.
+        host->WasHidden(false);
+        host->SetFocus(true);
+        pump(200);
+        for (int i = 0; i < 24; ++i) {
+            CefMouseEvent me;
+            me.x = 120 + (i * 47) % 1000;
+            me.y = 90 + (i * 71) % 600;
+            me.modifiers = 0;
+            host->SendMouseMoveEvent(me, /*mouseLeave=*/false);
+            pump(40);
+        }
+    }
+    client->armLoadWait();                   // watch for the submit's POST-response nav
+    client->runJs(fill_submit_js);           // fill + submit → grecaptcha.execute() fires
+    // A clean pass navigates to the response page; a hard challenge shows an iframe
+    // with NO nav — so wait for either the nav OR post_wait_ms, then capture anyway.
+    const int steps = post_wait_ms / 20;
+    for (int i = 0; i < steps && !client->loaded(); ++i) pump(20);
+    pump(1500);                              // let the result page's messages render
+
+    if (client->browser()) {
+        CefRefPtr<CefFrame> frame = client->browser()->GetMainFrame();
+        if (frame) {
+            CefRefPtr<SourceVisitor> visitor = new SourceVisitor();
+            frame->GetSource(visitor);
+            for (int i = 0; i < 200 && !visitor->done(); ++i) pump(10);
             if (visitor->done()) {
                 out.ok = true;
                 out.html = visitor->html();

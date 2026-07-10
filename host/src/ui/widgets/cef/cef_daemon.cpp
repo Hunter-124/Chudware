@@ -75,6 +75,24 @@ json handle(const std::string& line, bool& stop) {
         const bool ok = headless_download(url, dest, profile);
         return json{{"id", id}, {"result", {{"ok", ok}, {"dest", dest}}}};
     }
+    // DIAGNOSTIC (opt-in AI_CAD_CEF_PROBE): drive a real form login headlessly to
+    // observe a bot-wall verdict. Executes caller JS in the page, so it is gated off
+    // by default and never part of the normal fetch/download surface.
+    if (method == "login_probe") {
+        if (const char* g = std::getenv("AI_CAD_CEF_PROBE"); !(g && g[0] && g[0] != '0'))
+            return err("login_probe disabled (set AI_CAD_CEF_PROBE=1)");
+        const std::string url = p.value("url", "");
+        const std::string js = p.value("fill_js", "");
+        if (url.empty() || js.empty()) return err("missing url/fill_js");
+        const int settle = p.value("settle_ms", 3000);
+        const int postw = p.value("post_wait_ms", 12000);
+        const std::string profile = p.value("profile", warm_profile_dir());
+        FetchResult r = headless_login_probe(url, js, settle, postw, profile);
+        json result = {{"ok", r.ok}, {"status", r.status}, {"final_url", r.final_url},
+                       {"html_len", r.html.size()}};
+        if (r.ok) result["html"] = r.html;
+        return json{{"id", id}, {"result", result}};
+    }
     return err("unknown method");
 }
 

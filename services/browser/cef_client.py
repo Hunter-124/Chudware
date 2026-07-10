@@ -171,6 +171,17 @@ class CefDaemon:
         """Fetch ``url``'s bytes into ``dest`` under the profile's cookies."""
         return self._call("download", {"url": url, "dest": dest, "profile": profile})
 
+    def login_probe(self, url: str, fill_js: str, *, settle_ms: int = 3000,
+                    post_wait_ms: int = 12000, profile: str = "", timeout_s: float = 90.0) -> dict:
+        """DIAGNOSTIC: load ``url``, run ``fill_js`` (fills + submits a login form in
+        the page), and return {ok, status, final_url, html} of the response — so a
+        bot-wall verdict (e.g. reCAPTCHA reject vs invalid-login) can be observed
+        headlessly. Requires the daemon to run with AI_CAD_CEF_PROBE=1."""
+        return self._call("login_probe",
+                          {"url": url, "fill_js": fill_js, "settle_ms": settle_ms,
+                           "post_wait_ms": post_wait_ms, "profile": profile},
+                          timeout_s=timeout_s)
+
 
 #: Process-wide client (the daemon itself serialises requests; one client is fine).
 _CLIENT: Optional[CefDaemon] = None

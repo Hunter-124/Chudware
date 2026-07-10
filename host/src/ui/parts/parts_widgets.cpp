@@ -338,7 +338,11 @@ void requestThumb(AppState& st, const PartsItem& item) {
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
-    if (item.imageUrl.empty()) { S().thumbFailed.insert(item.id); return; }
+    // Standard/library parts carry no vendor image_url — the backend renders their actual 3D
+    // CAD model on demand (cached by item_id). Still fire the RPC for a placeable local part;
+    // only give up when there's neither a URL nor a renderable local part.
+    const bool localRenderable = item.placeable && (item.source == "local" || item.source.empty());
+    if (item.imageUrl.empty() && !localRenderable) { S().thumbFailed.insert(item.id); return; }
     S().thumbBusy.insert(item.id);
     nlohmann::json p;
     p["item_id"]   = item.id;

@@ -802,12 +802,65 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
     return None
 
 
+def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
+    """Render a standard (mech_family) library part's actual 3D CAD model to a PNG,
+    via the native core: ``parts_make`` (instantiate the parametric family+size — the
+    "template part") → ``doc_render_png`` → ``doc_close``. Returns the PNG bytes, or
+    None if the core is unavailable / the render failed (caller falls back to the 2D
+    domain glyph). Uses the RAW core RPCs, never the ``make_standard_part`` MCP wrapper
+    — that wrapper publishes/autosaves and would clobber the user's live doc."""
+    if not part_id.startswith("mech_family:"):
+        return None
+    # part_id == "mech_family:<family>:<size>"; family keys never contain a colon, so split on
+    # the FIRST colon exactly like CoreFamiliesAdapter.get() maps a part_id back to (family, size).
+    sub = part_id[len("mech_family:"):].split(":", 1)
+    if len(sub) != 2 or not sub[0] or not sub[1]:
+        return None
+    family, size = sub
+    try:
+        import pathlib as _pathlib  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+        svc = _pathlib.Path(__file__).resolve().parents[2] / "services" / "mcp"
+        if str(svc) not in _sys.path:
+            _sys.path.insert(0, str(svc))
+        import core_bridge as cb  # type: ignore  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — core bridge unavailable → glyph fallback
+        return None
+    doc_id = ""
+    try:
+        r = cb.call("parts_make", {"family": family, "size": size})
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None
+        doc_id = str(r.get("doc_id") or "")
+        if not doc_id:
+            return None
+        rr = cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(tmp_png)})
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return None
+        p = _pathlib.Path(str(tmp_png))
+        data = p.read_bytes() if p.exists() else None
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return data or None
+    except Exception:  # noqa: BLE001 — render failed → glyph fallback
+        return None
+    finally:
+        if doc_id:
+            try:
+                cb.call("doc_close", {"doc_id": doc_id})
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
     """Best-effort PNG/JPEG preview for a part, base64-encoded, cached on disk.
 
-    v1 sources: (a) disk cache, (b) a vendor image_url passed by the GUI from the
-    search item. Parametric-geometry renders for library parts are a follow-up —
-    the GUI falls back to a domain glyph when this returns ok:false.
+    Sources: (a) disk cache, (b) a rendered 3D CAD-model screenshot for standard
+    ``mech_family`` library parts (parts_make → doc_render_png, cached by part_id),
+    (c) a vendor image_url passed by the GUI. The GUI falls back to a domain glyph
+    when this returns ok:false.
     """
     try:
         part_id = str((params or {}).get("item_id", "")).strip()
@@ -817,6 +870,13 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
         cache = _thumb_cache_dir() / (hashlib.sha1(part_id.encode()).hexdigest() + ".img")
         if cache.exists():
             return {"ok": True, "image_b64": base64.b64encode(cache.read_bytes()).decode()}
+        # Standard/library part with no vendor image: render its 3D model on demand and
+        # cache it (keyed by part_id, so subsequent views are instant cache hits).
+        if part_id.startswith("mech_family:"):
+            data = _render_local_part_png(part_id, str(cache) + ".png")
+            if data:
+                cache.write_bytes(data)
+                return {"ok": True, "image_b64": base64.b64encode(data).decode()}
         if image_url.startswith(("http://", "https://")):
             data = _fetch_image_bytes(image_url, part_id)
             if data:

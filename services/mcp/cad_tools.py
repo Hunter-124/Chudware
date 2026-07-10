@@ -2166,11 +2166,12 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  hydraulic_piping_handoff replaces per-hose loss estimates with a real solve."
         )
     if topic in ("firmware", "fw", "embedded", "mcu", "fw_build", "fw_new_project",
-                 "flash", "debug", "fw_sim_run"):
+                 "flash", "debug", "fw_sim_run", "fw_verify_board", "coverify"):
         return (
             "FIRMWARE — embedded compile loop: build, sim, flash, debug\n\n"
             "Tools: fw_status / fw_new_project / fw_build / fw_sources / fw_sim_run /\n"
-            "       fw_flash / fw_debug_start / fw_debug_halt / fw_debug_read_mem\n\n"
+            "       fw_verify_board / fw_flash / fw_debug_start / fw_debug_halt /\n"
+            "       fw_debug_read_mem\n\n"
             "WORKFLOW:\n"
             "  fw_status()                          FIRST CALL — provisioning doctor. Reports\n"
             "                                       each toolchain/emulator/flasher (found,\n"
@@ -2189,6 +2190,17 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       trace artifact (trace_path) of pin+UART\n"
             "                                       events; QEMU pin events need the project's\n"
             "                                       aicad_trace.h AICAD_GPIO_TRACE macro.\n"
+            "  fw_verify_board(board_doc_ref, ...)  Firmware<->board co-verification (T-FIN6)\n"
+            "                                       BEFORE fab: static checks (every PIN_<NET>\n"
+            "                                       exists on the MCU/net, strap/reset pins\n"
+            "                                       BOOT0/NRST/GPIO0 not repurposed, direction\n"
+            "                                       clashes vs the schematic netlist, decoupling\n"
+            "                                       per MCU supply rail) + dynamic diff of\n"
+            "                                       emulated pin activity vs the netlist (pass\n"
+            "                                       trace_path=<elf>.trace.json or emulate=true).\n"
+            "                                       Findings use the ERC/DRC violation shape\n"
+            "                                       {rule, severity, net, pins, message, fix}.\n"
+            "                                       Pass sch_doc_ref for direction checks.\n"
             "  fw_flash(elf_path, chip, port)       Flash ELF to target hardware.\n"
             "  fw_debug_start/halt/read_mem(chip)   GDB-over-SWD debug session controls.\n\n"
             "SUPPORTED TARGETS (T-FIN2 Renode platform pack — what the bundled platform\n"

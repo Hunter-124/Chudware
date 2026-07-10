@@ -239,7 +239,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "hydraulic_size_cylinder", "hydraulic_size_pump", "hydraulic_bom",
     },
     "firmware": {
-        "fw_new_project", "fw_build", "fw_sources", "fw_sim_run",
+        "fw_new_project", "fw_build", "fw_sources", "fw_sim_run", "fw_verify_board",
         "fw_flash", "fw_debug_start", "fw_debug_halt", "fw_debug_read_mem",
     },
     "structural": {

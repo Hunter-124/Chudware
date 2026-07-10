@@ -752,6 +752,8 @@ def netlist_to_spice_circuit(
 
     subckts = _sub.builtin_subckts()
     x_lines: list[str] = []  # X-instance cards to expand after the component loop
+    vendor_x: list[dict] = []        # vendor-subckt X instances (ngspice backend only)
+    vendor_includes: list[str] = []  # .lib/.subckt file paths to .include
 
     for comp in netlist.get("components", []):
         ref    = comp.get("ref", "?")
@@ -820,6 +822,20 @@ def netlist_to_spice_circuit(
             sub_name = _resolve_subckt_name(model_name, sim)
             sub_def = subckts.get(sub_name.upper())
             if sub_def is None:
+                # Vendor model attachment (T-FIN14): a component may carry a .lib/.subckt
+                # FILE on sim["lib"]. The internal MNA solver can't expand it, but the
+                # optional ngspice backend can — record it as an additive X instance +
+                # .include so `simulate(..., backend='ngspice')` runs the real model.
+                lib_path = sim.get("lib") or sim.get("include")
+                if lib_path:
+                    vendor_x.append({"name": f"X{ref}", "nodes": list(node_list),
+                                     "subckt": sub_name})
+                    if str(lib_path) not in vendor_includes:
+                        vendor_includes.append(str(lib_path))
+                    warn_msgs.append(
+                        f"{ref} ({libid}): vendor subckt '{sub_name}' from {lib_path} — "
+                        "needs backend='ngspice' (the internal MNA solver ignores it)")
+                    continue
                 warn_msgs.append(f"{ref} ({libid}): subckt '{sub_name}' not built-in — skipped")
                 continue
             # Map this part's ordered nodes onto the subckt's ports, dropping extra (supply) pins
@@ -876,6 +892,18 @@ def netlist_to_spice_circuit(
             models.setdefault(mname, dict(mparams))
 
     circuit = _make_circuit(devices, models, params)
+    # Additive optional keys (T-FIN14): vendor attachments for the ngspice backend.
+    # The MNA solver reads only nodes/devices/models/params, so these are transparent to it.
+    if vendor_x:
+        circuit["xdevices"] = vendor_x
+        circuit["includes"] = vendor_includes
+        # Make sure the X-instance nodes exist in the node list (probe defaults etc.).
+        known = set(circuit.get("nodes", []))
+        for xd in vendor_x:
+            for nd in xd["nodes"]:
+                if nd not in known and nd != "?":
+                    circuit.setdefault("nodes", []).append(nd)
+                    known.add(nd)
     return circuit, warn_msgs
 
 

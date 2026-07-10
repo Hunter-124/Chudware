@@ -2,8 +2,8 @@
 id: T-FIN4
 title: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN4-fw-provisioning-doctor
 depends_on: []
 lane: ecad-firmware

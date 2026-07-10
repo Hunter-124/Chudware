@@ -1488,6 +1488,18 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
   board; minor power contributors get advisories, not pass/fail — neighbor heating is
   invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
+  ECAD → CHT airflow (LIVE, T-FIN19, coupling ecad_to_cht): when the convection PRESETS
+  aren't enough (enclosures, fans), ecad_airflow_handoff(inlet_mps=…, inlet_temp_c=…,
+  enclosure={"clearance_mm":10,"wall_mm":2}?) exports the board slab + every POWERED
+  component as separate watertight STL solids and runs OpenFOAM chtMultiRegionFoam via
+  the T-SIM5 multi-solid seam (per-region volumetric heat sources; optional passive
+  4-wall enclosure duct open along the flow axis), mapping per-region mean/peak °C back
+  to component refs. ecad_verify_airflow() then answers "was the film-coefficient
+  assumption sane?" — a per-component preset-h vs CHT rise deviation table with
+  guidance + an effective-h re-run suggestion whenever the preset was OPTIMISTIC.
+  Without OpenFOAM the handoff degrades honestly (skipped:true + full envelope) and
+  offers the LBM wind tunnel as a qualitative-flow ADVISORY, clearly labeled
+  NON-THERMAL. Budget: even the 'coarse' preset is minutes of meshing + solving.
   Helper builders/validator: services/mcp/simhandoff.py.
 """
 

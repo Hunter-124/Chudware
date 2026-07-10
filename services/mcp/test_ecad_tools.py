@@ -1641,3 +1641,212 @@ def _run_all() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# --------------------------------------------------------------------------- T-FIN19 airflow (CHT) handoff
+# Appended EOF (shared-file hygiene). pytest collects these; the __main__ runner above
+# predates them and only runs the older suite.
+
+
+def _fin19_tools() -> dict:
+    from mcp_server.ecad_thermal import (register_ecad_thermal_tools,
+                                         register_ecad_airflow_tools)
+    stub = _StubMCP()
+    register_ecad_tools(stub)
+    register_ecad_thermal_tools(stub)
+    register_ecad_airflow_tools(stub)
+    return stub.tools
+
+
+def _fin19_board_geo() -> tuple:
+    """Synthetic board_to_fea_step()-shaped blocks (engine-less)."""
+    board = {"bbox_mm": [0.0, 0.0, 40.0, 30.0], "z_top_mm": 1.6, "z_bot_mm": 0.0,
+             "thickness_mm": 1.6, "outline_area_mm2": 1200.0}
+    material = {"name": "FR4+Cu homogenized", "k_w_mk": 18.0,
+                "k_through_plane_w_mk": 0.35, "cp_j_kgk": 1100.0, "rho_kg_m3": 1900.0}
+    components = [
+        {"ref": "U1", "power_w": {"typ": 2.0, "max": 3.0},
+         "fea": {"rect_mm": [7.0, 12.0, 13.0, 18.0], "z_bot_mm": 1.6, "z_top_mm": 3.1,
+                 "top_area_mm2": 36.0, "side": "top"}},
+        {"ref": "U2", "power_w": {"typ": None, "max": 0.5},
+         "fea": {"rect_mm": [27.0, 12.0, 33.0, 18.0], "z_bot_mm": 1.6, "z_top_mm": 2.6,
+                 "top_area_mm2": 36.0, "side": "top"}},
+        {"ref": "R1", "power_w": {},   # no power metadata -> no solid (honesty)
+         "fea": {"rect_mm": [18.0, 24.0, 22.0, 26.0], "z_bot_mm": 1.6, "z_top_mm": 2.2,
+                 "top_area_mm2": 8.0, "side": "top"}},
+    ]
+    return board, material, components
+
+
+def test_fin19_box_stl_watertight(tmp_path) -> None:
+    """write_box_stl emits a closed 12-facet ASCII STL in world mm."""
+    from mcp_server.ecad_thermal import write_box_stl
+    p = write_box_stl(str(tmp_path / "b.stl"), 0, 0, 0, 4, 3, 2)
+    txt = open(p, encoding="ascii").read()
+    assert txt.count("facet normal") == 12 and txt.count("endfacet") == 12
+    assert txt.startswith("solid") and "endsolid" in txt
+    try:
+        import trimesh
+        m = trimesh.load(p, force="mesh")
+        assert m.is_watertight, "box STL must be watertight for CHT cellZones"
+        assert abs(m.volume - 24.0) < 1e-6
+    except ImportError:
+        pass
+    print("  [fin19_box_stl_watertight] PASS")
+
+
+def test_fin19_case_generation(tmp_path) -> None:
+    """Engine-less: build_airflow_solids produces the exact T-SIM5 solids seam shape —
+    board (passive, homogenized k) + one region per POWERED component, unpowered
+    components skipped honestly; enclosure adds 4 passive duct walls."""
+    from mcp_server.ecad_thermal import build_airflow_solids, build_enclosure_walls
+    import os as _os
+    board, material, components = _fin19_board_geo()
+    case = build_airflow_solids(board, material, components, str(tmp_path))
+    names = [s["name"] for s in case["solids"]]
+    assert names[0] == "board" and len(case["solids"]) == 3, names
+    for s in case["solids"]:
+        assert _os.path.isfile(s["stl_path"])
+        assert set(s) == {"name", "stl_path", "kappa_w_mk", "power_w"}
+    assert case["solids"][0]["power_w"] == 0.0
+    assert case["solids"][0]["kappa_w_mk"] == 18.0
+    by_ref = {s["ref"]: s for s in case["sources"]}
+    assert by_ref["U1"]["power_w"] == 2.0 and by_ref["U2"]["power_w"] == 0.5
+    assert case["unpowered_refs"] == ["R1"]
+    assert case["region_map"]["U1"].startswith("c_")
+    # heat_source conditions carry units + provenance (simhandoff contract).
+    hs = {c["applied_to"]: c for c in case["conditions"]}
+    assert hs["U1"]["value"] == 2.0 and hs["U1"]["units"] == "W"
+    assert "power_w.typ" in hs["U1"]["provenance"]
+    assert "power_w.max" in hs["U2"]["provenance"]
+    walls, assum = build_enclosure_walls(board, {"clearance_mm": 8.0}, str(tmp_path))
+    assert len(walls) == 4 and all(w["power_w"] == 0.0 for w in walls)
+    assert any("bypass" in a for a in assum), "bypass-flow honesty note required"
+    print("  [fin19_case_generation] PASS")
+
+
+def test_fin19_region_parse() -> None:
+    from mcp_server.ecad_thermal import parse_region_temps
+    notes = ["chtMultiRegionFoam coupled solid+fluid; solid temperature 25-61 C.",
+             "per-region: board: 41 C mean, 44 C peak; c_U1: 58 C mean, 61 C peak."]
+    t = parse_region_temps(notes)
+    assert t["board"] == {"mean_c": 41.0, "peak_c": 44.0}
+    assert t["c_U1"]["peak_c"] == 61.0
+    print("  [fin19_region_parse] PASS")
+
+
+def test_fin19_deviation_table() -> None:
+    """Engine-less: the verify math — sane / optimistic / conservative verdicts, rise-
+    based deviation, and effective-h guidance when the preset was optimistic."""
+    from mcp_server.ecad_thermal import airflow_deviation_table
+    preset = [{"ref": "U1", "t_case_c": 65.0},   # rise 40
+              {"ref": "U2", "t_case_c": 45.0},   # rise 20
+              {"ref": "U3", "t_case_c": 35.0}]   # rise 10
+    cht = [{"ref": "U1", "power_w": 2.0, "t_peak_c": 105.0, "t_mean_c": 95.0},  # rise 80: +100 %
+           {"ref": "U2", "power_w": 0.5, "t_peak_c": 47.0, "t_mean_c": 44.0},   # rise 22: +10 %
+           {"ref": "U3", "power_w": 0.2, "t_peak_c": 29.0, "t_mean_c": 28.0}]   # rise 4: -60 %
+    table, checks, guidance = airflow_deviation_table(preset, cht, 25.0, 25.0, 10.0, 40.0)
+    by = {e["ref"]: e for e in table}
+    assert "OPTIMISTIC" in by["U1"]["verdict"]
+    assert by["U2"]["verdict"].startswith("sane")
+    assert "conservative" in by["U3"]["verdict"]
+    assert len(checks) == 3 and [c["pass"] for c in checks] == [False, True, False]
+    assert checks[0]["deviation_pct"] == 100.0
+    # effective-h guidance: h_eff = 10 * 40/80 = 5 W/m2-K
+    assert guidance and "U1" in guidance[0] and "5.0" in guidance[0], guidance
+    print("  [fin19_deviation_table] PASS")
+
+
+def test_fin19_verify_tool_and_envelope() -> None:
+    """ecad_verify_airflow builds the deviation table + a VALID ecad_to_cht verify
+    envelope from explicit payloads (no engine, no OpenFOAM)."""
+    from services.mcp import simhandoff as sh
+    tools = _fin19_tools()
+    air = {"solved": True, "doc_id": "d1", "inlet": {"temp_c": 25.0, "speed_mps": 2.0},
+           "components": [{"ref": "U1", "power_w": 2.0, "t_peak_c": 105.0,
+                           "t_mean_c": 95.0}],
+           "simhandoff": {"id": "h-123"}}
+    pre = {"solved": True, "doc_id": "d1",
+           "environment": {"h_w_m2k": 10.0, "t_amb_c": 25.0},
+           "components": [{"ref": "U1", "t_case_c": 65.0}]}
+    r = _call(tools, "ecad_verify_airflow", airflow_result=air, preset_result=pre)
+    _assert_context(r, "ecad_verify_airflow")
+    assert r["ok"] and r["pass"] is False and "NOT SANE" in r["verdict"], r
+    assert r["guidance"] and "optimistic" in r["guidance"][0]
+    env = r["simhandoff"]
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    assert env["coupling"] == "ecad_to_cht" and env["handoff_id"] == "h-123"
+    assert env["checks"][0]["quantity"] == "t_rise_U1"
+    # no-airflow degrade is honest
+    r2 = _call(tools, "ecad_verify_airflow", airflow_result={"solved": False})
+    assert not r2["ok"] and "ecad_airflow_handoff" in str(r2["next_actions"])
+    print("  [fin19_verify_tool_and_envelope] PASS")
+
+
+def test_fin19_handoff_dry_run() -> None:
+    """Full-tool dry run on a real board doc: solids + envelope + honest skip; the LBM
+    advisory is offered ONLY as a non-thermal render. Needs build123d (geometry leg)."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN19: build123d not installed — skipping dry-run handoff test")
+        return
+    import os as _os
+    from services.mcp import simhandoff as sh
+    tools = _fin19_tools()
+    doc_id = _fin16_demo_board(tools, name="fin19_dry")
+    r = _call(tools, "ecad_airflow_handoff", doc_id=doc_id, dry_run=True,
+              enclosure={"clearance_mm": 6.0})
+    _assert_context(r, "ecad_airflow_handoff")
+    assert r["ok"] and r["skipped"] and r["solved"] is False, r.get("error")
+    names = [s["name"] for s in r["solids"]]
+    assert names[0] == "board" and "c_U1" in names and "c_U2" in names, names
+    assert sum(n.startswith("encl_") for n in names) == 4, names
+    for s in r["solids"]:
+        assert _os.path.isfile(s["stl_path"]), s
+    assert set(r["coverage"]["unpowered_refs"]) == {"R1", "C1"}
+    env = r["simhandoff"]
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    assert env["coupling"] == "ecad_to_cht"
+    kinds = {c["kind"] for c in env["conditions"]}
+    assert {"heat_source", "inlet_velocity", "inlet_temperature"} <= kinds
+    print(f"  FIN19: dry run — {len(names)} solids, envelope valid")
+    print("  [fin19_handoff_dry_run] PASS")
+
+
+def _fin19_openfoam_available() -> bool:
+    try:
+        from engine.sim.foam_runner import get_runner
+        r = get_runner()
+        return bool(r is not None and r.available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def test_fin19_live_cht_smoke(tmp_path) -> None:
+    """LIVE (gated): one tiny coarse CHT case through the T-SIM5 seam using the exact
+    solids build_airflow_solids emits — proves the STL export + multi-region seam end
+    to end. Skips cleanly without OpenFOAM. Takes minutes."""
+    if not _fin19_openfoam_available():
+        print("  FIN19: OpenFOAM not available — live CHT smoke SKIPPED")
+        return
+    from mcp_server.ecad_thermal import build_airflow_solids, parse_region_temps
+    from engine.sim.openfoam import run_openfoam_tunnel
+    board = {"bbox_mm": [0.0, 0.0, 20.0, 20.0], "z_top_mm": 1.6, "z_bot_mm": 0.0,
+             "thickness_mm": 1.6, "outline_area_mm2": 400.0}
+    material = {"k_w_mk": 18.0}
+    comps = [{"ref": "U1", "power_w": {"typ": 2.0},
+              "fea": {"rect_mm": [7.5, 7.5, 12.5, 12.5], "z_bot_mm": 1.6,
+                      "z_top_mm": 2.6, "top_area_mm2": 25.0, "side": "top"}}]
+    case = build_airflow_solids(board, material, comps, str(tmp_path))
+    res = run_openfoam_tunnel(
+        None, direction=(1.0, 0.0, 0.0), speed_mps=2.0, preset="coarse",
+        thermal={"enabled": True, "mode": "conjugate", "inlet_temp_c": 25.0,
+                 "solids": case["solids"]})
+    temps = parse_region_temps(list(res.solver_notes or []))
+    assert "board" in temps and "c_U1" in temps, res.solver_notes
+    assert temps["c_U1"]["peak_c"] > 25.0 + 2.0, \
+        f"2 W component must heat above inlet: {temps}"
+    assert temps["c_U1"]["peak_c"] >= temps["board"]["mean_c"], temps
+    print(f"  FIN19: live CHT — board {temps['board']}, U1 {temps['c_U1']}")
+    print("  [fin19_live_cht_smoke] PASS")

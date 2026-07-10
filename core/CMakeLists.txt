@@ -1419,6 +1419,7 @@ if(AICAD_WITH_OCCT)
     add_executable(aicad-hostd
       hostd/main.cpp
       hostd/server.cpp
+      hostd/child_supervisor.cpp
       hostd/doc_registry.cpp
       hostd/autosave.cpp
       hostd/hostd_log.cpp

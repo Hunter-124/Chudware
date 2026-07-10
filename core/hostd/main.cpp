@@ -11,6 +11,8 @@
 //   aicad-hostd --foreground    same, explicit (dev convenience)
 //   aicad-hostd --status        print daemon_status of the running instance
 //   aicad-hostd --stop          ask the running instance to drain and exit
+//                               (refused while agent children run; add --force
+//                               to stop them first)
 //   aicad-hostd --version       print build id + engine ABI
 //
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
@@ -48,8 +50,9 @@ static std::string selfPath() {
     return buf;
 }
 
-// --status / --stop: attach-only client against the same instance key.
-static int controlCommand(const char* method) {
+// --status / --stop [--force]: attach-only client against the same instance key.
+static int controlCommand(const char* method,
+                          const nlohmann::json& params = nlohmann::json::object()) {
     aicad_ipc::EngineClient cli;
     aicad_ipc::EngineClient::Options opts;
     opts.hostdBin = selfPath();
@@ -61,7 +64,7 @@ static int controlCommand(const char* method) {
         return 1;
     }
     nlohmann::json result;
-    if (!cli.call(method, {}, result, err)) {
+    if (!cli.call(method, params, result, err)) {
         std::fprintf(stderr, "aicad-hostd: %s failed: %s\n", method, err.c_str());
         return 1;
     }
@@ -76,9 +79,15 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (mode == "--status") return controlCommand("daemon_status");
-    if (mode == "--stop") return controlCommand("daemon_drain");
+    if (mode == "--stop") {
+        // Bare --stop is refused while agent children run (mission_active);
+        // --stop --force stops the children (TERM -> grace -> KILL) first.
+        const bool force = argc > 2 && std::string(argv[2]) == "--force";
+        return controlCommand("daemon_drain", {{"force", force}});
+    }
     if (!mode.empty() && mode != "--foreground") {
-        std::fprintf(stderr, "usage: aicad-hostd [--foreground|--status|--stop|--version]\n");
+        std::fprintf(stderr,
+                     "usage: aicad-hostd [--foreground|--status|--stop [--force]|--version]\n");
         return 2;
     }
 
@@ -112,6 +121,7 @@ int main(int argc, char** argv) {
     }
 
     hostd::Server server(std::move(listener), AICAD_HOSTD_BUILD_ID);
+    server.children().setLogDir(aicad_ipc::stateDir() + "/logs");
     g_server = &server;
     std::signal(SIGTERM, onSignal);
     std::signal(SIGINT, onSignal);

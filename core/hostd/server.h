@@ -20,6 +20,7 @@
 
 #include "../../services/ipc/ipc_transport.h"
 #include "autosave.h"
+#include "child_supervisor.h"
 #include "doc_registry.h"
 
 namespace hostd {
@@ -52,6 +53,8 @@ public:
     // the doc registry (attach modes, holds, events) plug in before run().
     void setAutosave(Autosave* a) { autosave_ = a; }
     DocRegistry& registry() { return registry_; }
+    // Phase 5: supervised agent children (agent_spawn/agent_stop/agent_list).
+    ChildSupervisor& children() { return children_; }
 
     // Accept/dispatch until drained-and-idle (or stop()). lingerSecs: how long
     // the daemon must be idle (no clients, no inflight) before self-exit.
@@ -65,8 +68,9 @@ private:
     nlohmann::json dispatch(ClientConn& c, const std::string& method,
                             const nlohmann::json& params, bool& isError);
     void touch();
-    bool idleExpired(int lingerSecs) const;
+    bool idleExpired(int lingerSecs);
     void sendEventTo(int clientId, const std::string& line);
+    void sendEventToAll(const std::string& line);
 
     aicad_ipc::IpcListener listener_;
     std::string buildId_;
@@ -76,6 +80,7 @@ private:
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;
     DocRegistry registry_;
+    ChildSupervisor children_;
     Autosave* autosave_ = nullptr;
 };
 

@@ -247,6 +247,49 @@ class DaemonClient:
             return out
 
 
+# --------------------------------------------------------------- agent spawn
+#
+# Phase-5 routing note (child supervision): the MCP mission tools
+# (services/mcp/mission_tools.py mission_start -> dag graph -> dag_run) and the
+# in-app agent (services.agent.loop, driven by the GUI's Python worker) all run
+# IN-PROCESS today — there is no subprocess-based mission worker path in
+# services/{mcp,agent,dag} to reroute (verified: the only Popen in the tree is
+# this module's own daemon spawn). When a subprocess agent-worker path lands,
+# route it through spawn_agent_worker() below so the worker is a child of the
+# DAEMON: it survives GUI/MCP-client exit, dies deterministically with the
+# daemon (PDEATHSIG), and pins the daemon against idle-exit while it runs.
+# The GUI's engine.worker Python services process stays a GUI child by design.
+
+
+def agent_worker_env(extra: Optional[dict] = None) -> dict:
+    """Environment for a daemon-supervised agent worker: daemon mode ON plus
+    instance-key/binary/socket passthrough, so the child's own engine calls
+    land on the SAME daemon that supervises it (never a second instance)."""
+    env = {"AI_CAD_ENGINE_DAEMON": "1"}
+    for k in ("AICAD_INSTANCE_KEY", "AICAD_HOSTD_BIN", "AICAD_HOSTD_SOCKET"):
+        v = os.environ.get(k)
+        if v:
+            env[k] = v
+    if extra:
+        env.update(extra)
+    return env
+
+
+def spawn_agent_worker(argv: list, mission_id: str = "", doc_id: str = "",
+                       env: Optional[dict] = None) -> dict:
+    """Spawn an agent worker as a supervised child of aicad-hostd.
+
+    Returns the daemon's {child_id, pid, pgid, log} (or the error payload with
+    _is_error). Stop via client().call("agent_stop", {"child_id": ..}); list
+    via "agent_list"; exits arrive as {"event": "mission.exited"} pushes."""
+    return client().call("agent_spawn", {
+        "argv": [str(a) for a in argv],
+        "env": agent_worker_env(env),
+        "mission_id": mission_id,
+        "doc_id": doc_id,
+    })
+
+
 _client: Optional[DaemonClient] = None
 _client_lock = threading.Lock()
 

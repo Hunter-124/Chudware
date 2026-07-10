@@ -21,7 +21,23 @@ Server::Server(aicad_ipc::IpcListener listener, std::string buildId)
     : listener_(std::move(listener)), buildId_(std::move(buildId)) {
     registry_.setEventSender(
         [this](int clientId, const std::string& line) { sendEventTo(clientId, line); });
+    children_.setBroadcast([this](const std::string& line) {
+        sendEventToAll(line);
+        touch();  // a child exit restarts the linger countdown
+    });
     touch();
+}
+
+void Server::sendEventToAll(const std::string& line) {
+    std::vector<std::shared_ptr<ClientConn>> live;
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        for (auto& [id, c] : clients_) live.push_back(c);
+    }
+    for (auto& c : live) {
+        std::lock_guard<std::mutex> wlk(c->writeMtx);
+        c->conn.writeLine(line);
+    }
 }
 
 void Server::sendEventTo(int clientId, const std::string& line) {
@@ -50,13 +66,17 @@ Server::~Server() {
 
 void Server::touch() { status_.lastActivityMs = monoMs(); }
 
-bool Server::idleExpired(int lingerSecs) const {
+bool Server::idleExpired(int lingerSecs) {
     if (status_.clients > 0 || status_.inflight > 0) return false;
-    // Phase 5 adds: agent children alive / mission active / dirty docs -> autosave.
+    // Never idle-exit under a running mission: children are the daemon's work
+    // even with zero clients (GUI-close continuity). Dirty docs do NOT pin the
+    // daemon — the final autosave on exit covers them.
+    if (children_.aliveCount() > 0) return false;
     return monoMs() - status_.lastActivityMs > (long long)lingerSecs * 1000;
 }
 
 void Server::run(int lingerSecs) {
+    children_.start();
     while (!stopping_) {
         aicad_ipc::IpcConn conn = listener_.accept(500);
         if (conn.valid()) {
@@ -82,6 +102,11 @@ void Server::run(int lingerSecs) {
             break;
         }
     }
+    // Every exit path (drain / idle / SIGTERM via stop()): stop the children
+    // (TERM -> 5 s grace -> KILL) BEFORE main runs the final autosave, so the
+    // saved state postdates the last agent edit. Daemon SIGKILL is covered by
+    // each child's PDEATHSIG.
+    children_.shutdown();
 }
 
 void Server::clientLoop(std::shared_ptr<ClientConn> c) {
@@ -130,21 +155,39 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
     if (method == "ping") return json{{"ok", true}};
     if (method == "daemon_status") {
-        return json{{"state", stateNames[status_.engineState.load()]},
-                    {"clients", status_.clients.load()},
-                    {"inflight", status_.inflight.load()},
-                    {"draining", status_.draining.load()},
-                    {"git_rev", buildId_},
-                    {"recovery", !autosave_                  ? "off"
-                                 : autosave_->recoveryDone() ? "done"
-                                                             : "pending"},
-                    {"pid", (long)getpid()}};
+        json st{{"state", stateNames[status_.engineState.load()]},
+                {"clients", status_.clients.load()},
+                {"inflight", status_.inflight.load()},
+                {"draining", status_.draining.load()},
+                {"git_rev", buildId_},
+                {"recovery", !autosave_                  ? "off"
+                             : autosave_->recoveryDone() ? "done"
+                                                         : "pending"},
+                {"pid", (long)getpid()}};
+        children_.statusInto(st);  // children count + mission ids
+        return st;
     }
     if (method == "daemon_drain") {
-        // Phase 5 adds refusal while a mission is active (unless {"force":true}).
+        if (children_.aliveCount() > 0) {
+            if (!params.value("force", false)) {
+                isError = true;
+                return json{{"code", "mission_active"},
+                            {"message", "agent children are running; stop them or "
+                                        "pass {\"force\":true} (aicad-hostd --stop --force)"}};
+            }
+            children_.stopAll();  // TERM -> grace -> KILL, reaped before we drain
+        }
         status_.draining = true;
         log().line("drain requested by client #%d", c.id);
         return json{{"ok", true}};
+    }
+
+    // Agent child supervision (agent_spawn/agent_stop/agent_list) — daemon
+    // state only, no engine touch.
+    {
+        json result;
+        if (children_.handleMethod(c.id, method, params, result, isError))
+            return result;
     }
 
     // Doc-registry daemon methods (attach_doc/detach_doc/edit_hold/edit_release/

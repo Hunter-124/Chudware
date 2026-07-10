@@ -397,6 +397,8 @@ def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     from engine_oracle.parts_hub import search as _search
     # Flip this vendor's inline status to "loading" before the blocking scrape starts.
     with _live_lock:
+        if job.get("cancelled"):
+            return  # superseded/evicted before this site even started — skip the scrape
         v = job.get("vendors", {}).get(site)
         if v is not None:
             v["status"] = "loading"
@@ -406,6 +408,9 @@ def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
         recs = []
         site_status = "error"
+    with _live_lock:
+        if job.get("cancelled"):
+            return  # cancelled while the scrape was in flight — don't bother parsing
     prefix = f"catalog:{site}::"
     recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
             or r.get("ok") is False]
@@ -450,10 +455,19 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
                "pending": len(sites), "done": not sites, "cancelled": False,
                "vendors": vendors}
         with _live_lock:
+            # A new search supersedes anything still running. The RPC carries no
+            # client/session identity, so cancel EVERY older live job: their workers
+            # bail out instead of scraping vendors nobody will look at, and marking
+            # them done makes the GUI's next poll drain-and-drop the stale token.
+            for old in _live_jobs.values():
+                if not old.get("done"):
+                    old["cancelled"] = True
+                    old["done"] = True
             _live_jobs[token] = job
             # Evict oldest tokens beyond the cap (dicts preserve insertion order).
             while len(_live_jobs) > _LIVE_JOB_CAP:
-                _live_jobs.pop(next(iter(_live_jobs)))
+                evicted = _live_jobs.pop(next(iter(_live_jobs)))
+                evicted["cancelled"] = True  # stop its workers, not just the token
         for s in sites:
             threading.Thread(target=_run_live_site, args=(s, rt, limit, p, job),
                              name=f"parts-live-{s}", daemon=True).start()

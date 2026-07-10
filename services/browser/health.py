@@ -15,6 +15,7 @@ Classification:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import profiles
@@ -137,11 +138,17 @@ def run_health_check(sites: list[str] | None = None) -> list[dict[str, Any]]:
         registered = login_wizard_sites() or [a.key for a in all_adapters()]
         # Registry order first, then any canary-only leftovers (defensive).
         sites = registered + [s for s in CANARY_QUERIES if s not in registered]
-    out = []
-    for site in sites:
+    def _safe_check(site: str) -> dict[str, Any]:
         try:
-            out.append(_check_site(site))
+            return _check_site(site)
         except Exception as exc:  # noqa: BLE001 — belt and braces: never raise
-            out.append({"site": site, "ok": False, "latency_ms": None, "logged_in": False,
-                        "hit_count": 0, "error": str(exc) or type(exc).__name__})
-    return out
+            return {"site": site, "ok": False, "latency_ms": None, "logged_in": False,
+                    "hit_count": 0, "error": str(exc) or type(exc).__name__}
+
+    if not sites:
+        return []
+    # Rate limits are enforced PER SITE, so fanning out across different sites is
+    # safe — ~20 serial canaries otherwise dominate the check's wall time.
+    # executor.map preserves input order, keeping the result shape identical.
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="vendor-health") as pool:
+        return list(pool.map(_safe_check, sites))

@@ -418,9 +418,10 @@ def register_piping_tools(mcp) -> None:
 
         # Run CFD on the imported bore part
         try:
-            from services.mcp import cad_tools as _ct_mod
-            # Resolve the registered run_cfd_flow directly from the module's MCP instance.
-            # Simpler: call via core_bridge sim_run_flow which run_cfd_flow uses internally.
+            # Call via core_bridge sim_run_flow (what run_cfd_flow uses internally).
+            # NB: never `from services.mcp import cad_tools` here — every other tool
+            # module imports it as `mcp_server.cad_tools`, and a second module identity
+            # would mean a second _PERIODIC_TIMER (the autosave thread-leak class).
             prog_path = os.path.join(tmp_dir, "progress.json")
             cfd_raw = cb.call("sim_run_flow", {
                 "doc_id": bore_doc_id,

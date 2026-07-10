@@ -109,7 +109,8 @@ def _autosave_refs() -> list[str]:
     """List filenames of crash-time autosaves (step+ stems) for the bundle."""
     try:
         # Import lazily — cad_tools may not be importable in all test configs.
-        from services.mcp.cad_tools import _autosave_dir as cad_autosave_dir
+        # Relative so it shares module identity with the rest of the package.
+        from .cad_tools import _autosave_dir as cad_autosave_dir
         return [p.stem for p in cad_autosave_dir().glob("*.step+")]
     except Exception:
         return []

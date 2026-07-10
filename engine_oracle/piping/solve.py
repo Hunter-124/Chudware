@@ -230,15 +230,23 @@ def _build_network(doc, fluid, tol) -> dict:
         a, b = run_ep[ri]
         lk = _Link(run.get("id", f"r{ri}"), a, b)
         lk.length_m = _polyline_length_mm(run["path"]) / 1000.0
-        spec = catalog.nearest_pipe(nps=run.get("nps"), schedule=run.get("schedule", "40"))
-        if isinstance(spec, dict):  # soft-fail from catalog
-            lk.spec_err = spec.get("reason")
-            warnings.append(f"{lk.id}: {spec.get('reason')}")
-            # fall back to nps inches as bore so the network stays solvable
-            bore_mm = float(run.get("nps") or 1.0) * 25.4
-            lk.d_m = bore_mm / 1000.0
+        bore_override = run.get("bore_mm")
+        if bore_override:
+            # Explicit inner diameter (mm) — externally-supplied networks (e.g. the
+            # hydraulic→piping handoff, where hose IDs are SAE dash sizes that don't
+            # exist in the NPS schedule catalog) bypass the schedule lookup.
+            lk.d_m = float(bore_override) / 1000.0
         else:
-            lk.d_m = spec.inner_dia / 1000.0
+            spec = catalog.nearest_pipe(nps=run.get("nps"),
+                                        schedule=run.get("schedule", "40"))
+            if isinstance(spec, dict):  # soft-fail from catalog
+                lk.spec_err = spec.get("reason")
+                warnings.append(f"{lk.id}: {spec.get('reason')}")
+                # fall back to nps inches as bore so the network stays solvable
+                bore_mm = float(run.get("nps") or 1.0) * 25.4
+                lk.d_m = bore_mm / 1000.0
+            else:
+                lk.d_m = spec.inner_dia / 1000.0
         lk.area = math.pi * lk.d_m ** 2 / 4.0
         mat = run.get("material") or doc_material
         lk.eps = _ROUGHNESS_M.get(mat, _DEFAULT_ROUGHNESS_M)

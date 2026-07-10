@@ -364,18 +364,28 @@ stage_pytest() {
     fi
 
     # --- wire the engine .so if not already set ---
-    local so_path="$REPO/core/build-linux/bin/libaicad.so"
+    # PREFER the full build-occt-linux engine over the slim build-linux one: on Linux
+    # AICAD_WITH_NETGEN defaults OFF (core/CMakeLists.txt), so the gate's own core-build
+    # stage (which passes only -DAICAD_WITH_OCCT=ON) produces a *sim-less* build-linux .so
+    # whose FEA/CFD dispatch (sim_run_static/sim_run_modal) is compiled out — the FEA tests
+    # then fail with "unknown method: sim_run_static". The 26 MB build-occt-linux engine is
+    # the one that actually ships (dist/AI-CAD) and the only one with the Netgen mesher, so
+    # test against THAT when present. Mirrors the aicad-hostd candidate order above.
+    local so_path=""
+    for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" "$REPO/core/build-linux/bin/libaicad.so"; do
+        [ -f "$cand" ] && { so_path="$cand"; break; }
+    done
     # Accept BILLET_LIBAICAD as alias for AI_CAD_LIBAICAD (T-G10 rename shim)
     if [ -n "${BILLET_LIBAICAD:-}" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
         export AI_CAD_LIBAICAD="$BILLET_LIBAICAD"
     fi
-    if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$so_path" ]; then
+    if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -n "$so_path" ]; then
         export AI_CAD_LIBAICAD="$so_path"
         echo "  AI_CAD_LIBAICAD=$AI_CAD_LIBAICAD (auto-detected)"
     elif [ -n "${AI_CAD_LIBAICAD:-}" ]; then
         echo "  AI_CAD_LIBAICAD=$AI_CAD_LIBAICAD (from environment)"
     else
-        echo "  AI_CAD_LIBAICAD not set and core/build-linux/bin/libaicad.so not found; core-calling tests will skip/deselect"
+        echo "  AI_CAD_LIBAICAD not set and no libaicad.so under core/build-{occt-,}linux/bin; core-calling tests will skip/deselect"
     fi
 
     # --- per-directory sweep ---

@@ -77,6 +77,36 @@ def _solve(name: str, args: dict, timeout_s: float = 300.0):
     raise AssertionError(f"solve {name} did not finish within {timeout_s:.0f}s (job {jid})")
 
 
+_SIM_AVAILABLE: bool | None = None
+
+
+def _require_sim() -> None:
+    """Skip (not fail) when the loaded engine has no Netgen FEA solver compiled in.
+
+    On Linux ``AICAD_WITH_NETGEN`` defaults OFF, so a slim ``build-linux`` libaicad links +
+    loads fine but dispatches ``sim_run_static``/``sim_run_modal`` to "unknown method" — the
+    FEA/CFD-mesher RPCs are #ifdef-compiled-out. That's a build-config state, not a solver
+    regression, so the Netgen-dependent tests must SKIP with a clear reason rather than
+    hard-fail. The gate itself points AI_CAD_LIBAICAD at the full ``build-occt-linux`` engine
+    (see scripts/gate.sh), so this skip only fires on a genuinely sim-less checkout — it is a
+    net *under* the gate, never the sole path to green. Mirrors test_fea_live_bridge.py.
+    """
+    global _SIM_AVAILABLE
+    if _SIM_AVAILABLE is None:
+        # cb.call RAISES CoreError("unknown method: ...") on a sim-less build; a
+        # dispatched-but-invalid-study reply means the RPC IS compiled in (sim present).
+        try:
+            cb.call("sim_run_static", {})
+            _SIM_AVAILABLE = True
+        except cb.CoreError as exc:
+            _SIM_AVAILABLE = "unknown method" not in str(exc).lower()
+    if not _SIM_AVAILABLE:
+        pytest.skip(
+            "engine has no FEA solver (sim-less build: AICAD_WITH_NETGEN=OFF); "
+            "point AI_CAD_LIBAICAD at core/build-occt-linux/bin/libaicad.so"
+        )
+
+
 def _new_plate_with_hole() -> str:
     r, _ = _call("new_part", {"name": "plate"})
     doc = r["doc_id"]
@@ -319,6 +349,7 @@ def test_set_material_unknown_name_errors():
 
 
 def test_fea_static_cantilever():
+    _require_sim()
     doc = _new_plate_with_hole()
     r = _solve("run_fea_static", {
         "fixtures": [{"of": "face", "side": "left"}],
@@ -659,6 +690,7 @@ def test_fea_static_material_scaling_f4():
     accommodates the coarse mesh and boundary-layer effects, but 3.6x too stiff collapses the
     ratio to ~1 and would fail instantly).
     """
+    _require_sim()
     r, _ = _call("new_part", {"name": "mat_scale"})
     doc = r["doc_id"]
     # A simple 80×20×10 mm cantilever beam.
@@ -716,6 +748,7 @@ def test_fea_modal_free_free_f6():
       collapse all 6 near-zero modes into fewer numerical zeros depending on spectral shift)
     - All remaining (elastic) modes are strictly positive
     """
+    _require_sim()
     r, _ = _call("new_part", {"name": "free_free"})
     doc = r["doc_id"]
     _call("add_features", {"doc_id": doc, "ops": [

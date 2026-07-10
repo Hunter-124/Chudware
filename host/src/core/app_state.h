@@ -8,11 +8,14 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -988,6 +991,9 @@ struct AppState {
     // mesh on screen may lag the model, so the viewport draws a small "Rebuilding..." chip.
     // Bump at every st.rpc.call that mutates/evaluates the model; drop in its drain callback.
     int rebuildsInFlight = 0;
+    // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops
+    // completions whose gen != meshGen_ (latest-wins; keep-last-good on screen meanwhile).
+    std::atomic<uint64_t> meshGen_{0};
     std::string buildErrSummary;  // last "Build code" failure, shown under the editor
     std::string buildErrFull;     // its full traceback, behind a Details toggle
     bool showBuildErr = false;
@@ -1374,6 +1380,15 @@ struct AppState {
     // result while picking + highlighting still resolve against the un-rounded base body that the
     // session holds (suppressed). So the user sees the round form but every edge pick is exact.
     bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false);
+
+    // T-PERF3: non-blocking mesh load. Disk parse + pick-cache build run on a dedicated loader
+    // thread; GL upload happens inside drainMeshLoads() (call once per frame after rpc.drain()).
+    // meshGen drops stale completions when a newer load is queued. Keep-last-good is free: the
+    // previous mesh stays on screen until a current completion commits. Safe to call from GL
+    // thread; no-ops empty paths.
+    void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false);
+    void drainMeshLoads();   // GL thread, once per frame
+    uint64_t meshGen() const { return meshGen_.load(); }
 
     // Drop shaded mesh + pick GPU buffers when the active doc has no tessellation (empty model /
     // sketch-only). Does NOT clear selection, body visibility, or other per-doc fields — used on

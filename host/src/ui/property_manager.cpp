@@ -2148,11 +2148,8 @@ bool PropertyManager::applyPreview(AppState& st) {
             }
             firstPreviewDone_ = true;
 
-            if (!resp.aicm_path.empty()) {
-                std::string lerr;
-                st.loadDocMesh(resp.aicm_path, lerr);
-                if (!lerr.empty()) st.addLog("[pm] mesh: " + lerr);
-            }
+            if (!resp.aicm_path.empty())
+                st.loadDocMeshAsync(resp.aicm_path);  // T-PERF3: parse off GL thread
 
             previewWarning_.clear();
             if (!targetId_.empty() && resp.feature_status.is_array()) {

@@ -187,9 +187,7 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
             --st.rebuildsInFlight;
             if (!applied) return;
             if (!r.ok) { st.addLog("[err] insert: " + r.error_message); return; }
-            if (!r.aicm_path.empty()) {
-                std::string le; st.loadDocMesh(r.aicm_path, le);
-            }
+            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
         });
     return true;
 }

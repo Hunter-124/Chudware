@@ -9,11 +9,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -757,13 +760,111 @@ static void clearPickBuffers(render::IdPass* idPass, render::Overlays* overlays)
     if (overlays) overlays->setDoc(empty, discard);
 }
 
+// T-PERF3: dedicated mesh-loader thread. Disk parse of AICM is the multi-100ms hit on big
+// docs; it runs here. GL upload + AppState cache commit stay on the GL thread in
+// drainMeshLoads / commitDocMeshFromParsed.
+namespace {
+struct MeshLoadJob {
+    uint64_t gen = 0;
+    std::string path;
+    bool renderOnly = false;
+    bool ok = false;
+    std::string err;
+    render::DocMesh doc;
+};
+std::mutex              g_meshMtx;
+std::condition_variable g_meshCv;
+std::deque<MeshLoadJob> g_meshQueue;   // waiting for disk parse
+std::vector<MeshLoadJob> g_meshReady;  // parsed, awaiting GL commit
+bool                    g_meshQuit = false;
+bool                    g_meshStarted = false;
+std::thread             g_meshThread;
+
+void meshLoaderMain() {
+    for (;;) {
+        MeshLoadJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_meshMtx);
+            g_meshCv.wait(lk, [] { return g_meshQuit || !g_meshQueue.empty(); });
+            if (g_meshQuit && g_meshQueue.empty()) return;
+            job = std::move(g_meshQueue.front());
+            g_meshQueue.pop_front();
+        }
+        job.ok = render::loadAicmFile(job.path, job.doc, job.err);
+        {
+            std::lock_guard<std::mutex> lk(g_meshMtx);
+            g_meshReady.push_back(std::move(job));
+        }
+    }
+}
+
+void ensureMeshLoader() {
+    if (g_meshStarted) return;
+    g_meshStarted = true;
+    g_meshQuit = false;
+    g_meshThread = std::thread(meshLoaderMain);
+}
+}  // namespace
+
+// Commit a parsed DocMesh onto the GL-side state (setMeshes / id-pass / pick caches).
+// Shared by the sync loadDocMesh path and drainMeshLoads. Requires GL context.
+static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::string& err,
+                                    bool renderOnly);
+
 bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
     if (!render::loadAicmFile(aicmPath, doc, err)) return false;
+    return commitDocMeshFromParsed(*this, doc, err, renderOnly);
+}
+
+void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly) {
+    if (aicmPath.empty()) return;
+    if (!renderer || !idPass || !overlays) return;
+    ensureMeshLoader();
+    const uint64_t gen = ++meshGen_;
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        // Drop queued (not yet parsing) jobs — latest-wins at the queue too.
+        g_meshQueue.clear();
+        g_meshQueue.push_back(MeshLoadJob{gen, aicmPath, renderOnly, false, {}, {}});
+    }
+    g_meshCv.notify_one();
+}
+
+void AppState::drainMeshLoads() {
+    if (!renderer || !idPass || !overlays) return;
+    std::vector<MeshLoadJob> ready;
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        if (g_meshReady.empty()) return;
+        ready.swap(g_meshReady);
+    }
+    const uint64_t cur = meshGen_.load();
+    // Apply only the newest ready job that still matches meshGen_ (drop everything older).
+    MeshLoadJob* best = nullptr;
+    for (auto& j : ready) {
+        if (j.gen == cur) best = &j;
+    }
+    if (!best) return;  // all stale — keep last-good mesh on screen
+    if (!best->ok) {
+        addLog("[err] loadDocMeshAsync: " + best->err);
+        return;
+    }
+    std::string err;
+    if (!commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly) && !err.empty())
+        addLog("[err] loadDocMeshAsync commit: " + err);
+}
+
+static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::string& err,
+                                    bool renderOnly) {
+    if (!st.renderer || !st.idPass || !st.overlays) {
+        err = "render objects not initialized";
+        return false;
+    }
     if (renderOnly) {
         // Render-only (blend live preview): replace ONLY the shaded meshes; leave the id-pass,
-        // overlays, pick caches, selection and hasDocMesh as the base-body load left them, so picks
+        // st.overlays, pick caches, st.selection and st.hasDocMesh as the base-body load left them, so picks
         // and highlights keep resolving against the un-rounded base while the user sees the round.
         std::vector<Renderer::PartMesh> rpms;
         for (const auto& b : doc.bodies) {
@@ -778,7 +879,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
                 pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
             rpms.push_back(std::move(pm));
         }
-        renderer->setMeshes(rpms);
+        st.renderer->setMeshes(rpms);
         return true;
     }
     if (doc.bodies.empty()) {
@@ -787,28 +888,28 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
         // empty MODEL, not a load error. Clear the shaded view + pick caches so the viewport
         // tracks the document; before, the stale previous mesh kept rendering and the
         // rollback bar looked like it did nothing.
-        if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
-        clearPickBuffers(idPass, overlays);
-        bodyVisible.clear();
-        docBodyIds.clear();
-        applyBodyVisibility();
-        faceNormalCache.clear();
-        edgeCentroidCache.clear();
-        bodyBBoxCache.clear();
-        faceBBoxCache.clear();
-        selection.clear();
-        hover = render::PickHit{};
-        pickStatus.clear();
-        docMeshHasScalar = false;
-        docMeshHasDisp = false;
-        hasDocMesh = false;   // the empty-doc fallback (datum planes + camera) takes over
+        if (st.renderer) st.renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+        clearPickBuffers(st.idPass, st.overlays);
+        st.bodyVisible.clear();
+        st.docBodyIds.clear();
+        st.applyBodyVisibility();
+        st.faceNormalCache.clear();
+        st.edgeCentroidCache.clear();
+        st.bodyBBoxCache.clear();
+        st.faceBBoxCache.clear();
+        st.selection.clear();
+        st.hover = render::PickHit{};
+        st.pickStatus.clear();
+        st.docMeshHasScalar = false;
+        st.docMeshHasDisp = false;
+        st.hasDocMesh = false;   // the empty-doc fallback (datum planes + camera) takes over
         return true;
     }
 
     // Shaded view: render each body with its AICM color (camera bounds come from here).
-    // C19: attach any SCLR / DISP overlay arrays so the renderer can colormap + deform.
+    // C19: attach any SCLR / DISP overlay arrays so the st.renderer can colormap + deform.
     std::vector<Renderer::PartMesh> pms;
-    std::vector<uint32_t> newBodyIds;  // AICM body id per renderer slot (parallels pms)
+    std::vector<uint32_t> newBodyIds;  // AICM body id per st.renderer slot (parallels pms)
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         newBodyIds.push_back(b.body_id);
@@ -817,20 +918,20 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
         pm.metallic = b.metallic; pm.roughness = b.roughness;  // C32-A RealView material
         // Per-feature edit-preview isolation: carry the body id + per-face triangle runs so the
-        // renderer can draw a single feature's faces translucent. meshFromBody copies b.idx
+        // st.renderer can draw a single feature's faces translucent. meshFromBody copies b.idx
         // verbatim, so each FaceRange's first_tri/tri_count still index this body's EBO 1:1.
         pm.body_id = b.body_id;
         pm.faces.reserve(b.faces.size());
         for (const auto& fr : b.faces)
             pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
         // Scalar field for this body. Prefer the user-selected result field by name
-        // (activeScalarField — von Mises / principal / shear / disp component / FoS …) so switching
+        // (st.activeScalarField — von Mises / principal / shear / disp component / FoS …) so switching
         // result fields is a cheap renderOnly re-load of the same overlay with no re-solve; fall back
         // to the first scalar present when the named field isn't in this overlay.
         const render::ScalarField* chosen = nullptr;
         for (const auto& sc : doc.scalars) {
             if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
-            if (sc.name == activeScalarField) { chosen = &sc; break; }
+            if (sc.name == st.activeScalarField) { chosen = &sc; break; }
             if (!chosen) chosen = &sc;
         }
         if (chosen) {
@@ -851,31 +952,31 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
     // C48: unconditional — pms can be empty when every body has no triangles; keeping the
     // previous meshes would desync the viewport from the document (same stale-mesh bug as
     // the zero-bodies case above).
-    renderer->setMeshes(pms);
+    st.renderer->setMeshes(pms);
 
     // C19: surface overlay presence for the simulation panel's result controls.
-    docMeshHasScalar = false;
-    docMeshHasDisp = false;
+    st.docMeshHasScalar = false;
+    st.docMeshHasDisp = false;
     for (const auto& pm : pms) {
-        if (!pm.scalar.empty()) docMeshHasScalar = true;
-        if (!pm.disp.empty()) { docMeshHasDisp = true; dispScaleHint = pm.dispScaleHint; }
+        if (!pm.scalar.empty()) st.docMeshHasScalar = true;
+        if (!pm.disp.empty()) { st.docMeshHasDisp = true; st.dispScaleHint = pm.dispScaleHint; }
     }
 
-    if (!idPass->setDoc(doc, err)) return false;
-    if (!overlays->setDoc(doc, err)) return false;
+    if (!st.idPass->setDoc(doc, err)) return false;
+    if (!st.overlays->setDoc(doc, err)) return false;
 
     // Solid Bodies visibility: a rebuild with the SAME body-id list keeps the user's hidden set
     // (hide-by-ordinal is stable while the body set is unchanged); a different list — a feature
     // added/removed a body, so ordinals realigned — resets everything to visible. (Documented
     // limitation: hides are by ordinal, not by persistent body identity.)
-    if (docBodyIds != newBodyIds || bodyVisible.size() != newBodyIds.size())
-        bodyVisible.assign(newBodyIds.size(), 1);
-    docBodyIds = std::move(newBodyIds);
-    applyBodyVisibility();
+    if (st.docBodyIds != newBodyIds || st.bodyVisible.size() != newBodyIds.size())
+        st.bodyVisible.assign(newBodyIds.size(), 1);
+    st.docBodyIds = std::move(newBodyIds);
+    st.applyBodyVisibility();
 
     // C26-C: build per-face normal + centroid cache while the DocMesh is still in memory.
     // For each face, accumulate area-weighted triangle normals and centroids.
-    faceNormalCache.clear();
+    st.faceNormalCache.clear();
     for (const auto& b : doc.bodies) {
         if (b.pos.empty() || b.idx.empty() || b.faces.empty()) continue;
         for (const auto& fr : b.faces) {
@@ -911,13 +1012,13 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
             nx /= len; ny /= len; nz /= len;
             if (totalArea > 1e-12f) { cx /= totalArea; cy /= totalArea; cz /= totalArea; }
             uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
-            faceNormalCache[key] = {nx, ny, nz, cx, cy, cz};
+            st.faceNormalCache[key] = {nx, ny, nz, cx, cy, cz};
         }
     }
 
     // C27-A: per-edge centroid cache (mean of each edge's polyline points). Mirrors the face-cache
     // keying so callout anchors can resolve PickKind::Edge topo ids -> a world point.
-    edgeCentroidCache.clear();
+    st.edgeCentroidCache.clear();
     for (const auto& b : doc.bodies) {
         if (b.edges.empty() || b.edge_pts.empty()) continue;
         for (const auto& es : b.edges) {
@@ -932,14 +1033,14 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
             }
             if (n == 0) continue;
             uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)es.edge_id;
-            edgeCentroidCache[key] = {(float)(cx / n), (float)(cy / n), (float)(cz / n)};
+            st.edgeCentroidCache[key] = {(float)(cx / n), (float)(cy / n), (float)(cz / n)};
         }
     }
 
     // W1-B (item 8): per-body and per-face axis-aligned bounding-box caches for Zoom-to-Selection.
     // Built from the same in-memory DocMesh positions; consumed by a later wave's zoom-to-fit.
-    bodyBBoxCache.clear();
-    faceBBoxCache.clear();
+    st.bodyBBoxCache.clear();
+    st.faceBBoxCache.clear();
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         // Body bbox: sweep all positions.
@@ -951,7 +1052,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
                 if (v > bmx[c]) bmx[c] = v;
             }
         }
-        bodyBBoxCache[b.body_id] = {bmn[0], bmn[1], bmn[2], bmx[0], bmx[1], bmx[2]};
+        st.bodyBBoxCache[b.body_id] = {bmn[0], bmn[1], bmn[2], bmx[0], bmx[1], bmx[2]};
         // Per-face bbox: sweep the vertices referenced by each face's triangle range.
         if (b.idx.empty() || b.faces.empty()) continue;
         for (const auto& fr : b.faces) {
@@ -973,14 +1074,14 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
             }
             if (!any) continue;
             uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
-            faceBBoxCache[key] = {fmn[0], fmn[1], fmn[2], fmx[0], fmx[1], fmx[2]};
+            st.faceBBoxCache[key] = {fmn[0], fmn[1], fmn[2], fmx[0], fmx[1], fmx[2]};
         }
     }
 
-    selection.clear();
-    hover = render::PickHit{};
-    pickStatus.clear();
-    hasDocMesh = true;
+    st.selection.clear();
+    st.hover = render::PickHit{};
+    st.pickStatus.clear();
+    st.hasDocMesh = true;
     return true;
 }
 

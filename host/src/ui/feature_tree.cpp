@@ -600,9 +600,7 @@ static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char*
             --st.rebuildsInFlight;
             if (!applied) return;
             if (resp.ok && !resp.aicm_path.empty()) {
-                std::string lerr;
-                st.loadDocMesh(resp.aicm_path, lerr);
-                if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+                st.loadDocMeshAsync(resp.aicm_path);  // T-PERF3
             } else if (!resp.ok) {
                 if (resp.error_code == "dependency_exists") {
                     st.addLog(std::string("[warn] ") + whatStr +

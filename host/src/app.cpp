@@ -132,8 +132,7 @@ void applyModelAppearance(AppState& st, const float* color, float metallic, floa
             --st.rebuildsInFlight;
             if (!applied) return;
             if (resp.ok && !resp.aicm_path.empty()) {
-                std::string lerr; st.loadDocMesh(resp.aicm_path, lerr);
-                if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+                st.loadDocMeshAsync(resp.aicm_path);  // T-PERF3
             } else if (!resp.ok) {
                 st.addLog("[err] set_appearance: " + resp.error_message);
             }
@@ -575,8 +574,7 @@ static void applyFlatPattern(AppState& st) {
             --st.rebuildsInFlight;
             if (!applied) return;
             if (r.ok && !r.aicm_path.empty()) {
-                std::string le;
-                st.loadDocMesh(r.aicm_path, le);
+                st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
                 st.toast(ui::ToastLevel::Info, "Flat pattern created");
             } else if (!r.ok) {
                 st.toast(ui::ToastLevel::Warn,
@@ -1990,6 +1988,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // C39: deliver finished async worker calls — their callbacks run HERE, on the GL
         // thread, before this frame's panels draw, so results land like any other state.
         st.rpc.drain();
+        // T-PERF3: commit mesh loads that finished disk-parse on the loader thread (GL
+        // upload only here; stale gens dropped so keep-last-good stays on screen).
+        st.drainMeshLoads();
         // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
         // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
         // legacy (in-process) mode.
@@ -2198,10 +2199,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                     aicmPath = r.result["tess"].value("aicm_path", "");
                                 if (aicmPath.empty())
                                     aicmPath = r.result.value("aicm_path", "");
-                                if (!aicmPath.empty()) {
-                                    std::string le;
-                                    st.loadDocMesh(aicmPath, le);
-                                }
+                                if (!aicmPath.empty())
+                                    st.loadDocMeshAsync(aicmPath);  // T-PERF3
                                 st.addLog("[v2] doc_rebuild + resync after run: rev=" +
                                           std::to_string(st.docMirror.revision()));
                             } else {

@@ -68,7 +68,7 @@ bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
                           (r.error_code.empty() ? "" : " [" + r.error_code + "]"));
                 return;
             }
-            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
             st.markActiveTabDirty();
         });
     return true;

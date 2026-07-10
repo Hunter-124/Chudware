@@ -1,0 +1,26 @@
+{
+  "name": "jlc_4layer_7628",
+  "vendor": "JLCPCB",
+  "description": "JLCPCB standard controlled-impedance 4-layer stackup JLC04161H-7628 (1.6 mm, 7628 prepreg outer dielectrics). Layer thicknesses and dielectric constants as published on JLCPCB's impedance stackup page.",
+  "sources": [
+    "https://jlcpcb.com/impedance (JLC04161H-7628 stackup table: 7628 prepreg 0.2104 mm Er 4.4, core 1.065 mm Er 4.6, outer Cu 0.035 mm, inner Cu 0.0152 mm)",
+    "https://docs-testing.jitx.com/en/latest/jitxlib/jitxlib.jlcpcb.JLC04161H_7628.html (published routing structures: 50R SE w=0.3244 mm; 90R diff w=0.2332/s=0.15 mm; 100R diff w=0.1722/s=0.15 mm, outer layers)"
+  ],
+  "copper_layers": 4,
+  "board_thickness": 1.6,
+  "min_trace": 0.09,
+  "min_space": 0.09,
+  "max_trace": 5.0,
+  "diff_gaps": [0.15, 0.127, 0.1],
+  "via": {"diameter": 0.45, "drill": 0.3},
+  "layer_roles": ["signal", "plane_gnd", "plane_pwr", "signal"],
+  "stackup_layers": [
+    {"id": "F.Cu",   "type": "copper",  "thickness": 0.035},
+    {"id": "pp1",    "type": "prepreg", "material": "7628", "thickness": 0.2104, "er": 4.4},
+    {"id": "In1.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "core1",  "type": "core",    "thickness": 1.065, "er": 4.6},
+    {"id": "In2.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "pp2",    "type": "prepreg", "material": "7628", "thickness": 0.2104, "er": 4.4},
+    {"id": "B.Cu",   "type": "copper",  "thickness": 0.035}
+  ]
+}

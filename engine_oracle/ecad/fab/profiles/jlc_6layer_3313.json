@@ -1,0 +1,29 @@
+{
+  "name": "jlc_6layer_3313",
+  "vendor": "JLCPCB",
+  "description": "JLCPCB-style controlled-impedance 6-layer stackup (JLC06161H-3313 family: 3313 prepreg outer dielectrics, symmetric cores). Outer dielectric (3313, 0.0994 mm, Er 4.05) matches JLCPCB's published menu; inner core split is an approximation of the published 1.6 mm build and is NOT a validated reference — validation lives on jlc_4layer_7628.",
+  "sources": [
+    "https://jlcpcb.com/impedance (JLC06161H-3313 family; 3313 prepreg 0.0994 mm Er 4.05)"
+  ],
+  "copper_layers": 6,
+  "board_thickness": 1.6,
+  "min_trace": 0.09,
+  "min_space": 0.09,
+  "max_trace": 5.0,
+  "diff_gaps": [0.15, 0.127, 0.1],
+  "via": {"diameter": 0.45, "drill": 0.3},
+  "layer_roles": ["signal", "plane_gnd", "signal", "signal", "plane_pwr", "signal"],
+  "stackup_layers": [
+    {"id": "F.Cu",   "type": "copper",  "thickness": 0.035},
+    {"id": "pp1",    "type": "prepreg", "material": "3313", "thickness": 0.0994, "er": 4.05},
+    {"id": "In1.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "core1",  "type": "core",    "thickness": 0.45, "er": 4.6},
+    {"id": "In2.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "core2",  "type": "core",    "thickness": 0.2104, "er": 4.6},
+    {"id": "In3.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "core3",  "type": "core",    "thickness": 0.45, "er": 4.6},
+    {"id": "In4.Cu", "type": "copper",  "thickness": 0.0152},
+    {"id": "pp2",    "type": "prepreg", "material": "3313", "thickness": 0.0994, "er": 4.05},
+    {"id": "B.Cu",   "type": "copper",  "thickness": 0.035}
+  ]
+}

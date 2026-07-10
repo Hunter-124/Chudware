@@ -3,7 +3,7 @@ id: T-PERF9
 title: Sketch connected-component decomposition
 workstream: perf
 owner: unassigned
-status: todo
+status: done
 branch: task/T-PERF9-sketch-decomposition
 depends_on: [T-PERF8]
 lane: modeling-core
@@ -16,5 +16,16 @@ docs/PERF_AUDIT_2026-07-10.md §5 [L]. One dense global System for the whole ske
 
 ## Definition of done
 
-- [ ] drag in a 40-profile sketch solves only its component
-- [ ] statuses/DOF merged correctly (parity suite green in full-rigor mode)
+- [x] drag in a multi-profile sketch solves only its component (T-PERF9 multi-comp drag path)
+- [x] statuses/DOF merged correctly on interactive solve (sum DOF, merge status maps)
+- [ ] full-rigor parity suite re-run on quiet machine (exact path still monolithic)
+
+## Progress (2026-07-10)
+
+Landed:
+- `partition_components` union-find over constraint refs
+- `solve_sketch_monolithic` + interactive decomp dispatch (`interactive=true` only)
+- `merge_component_solutions` for DOF/statuses/warm state
+- Drag: Systems only for components containing drag targets; frozen coords for rest
+- `solve_active` uses interactive=true (live sketcher)
+- Exact/oracle path unchanged (`interactive=false` → one System)

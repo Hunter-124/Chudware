@@ -95,7 +95,16 @@ public:
     // is created immediately.)
     IpcConn accept(int timeoutMs);
 
-    void close();
+    // Close the listen fd. By default also unlinks the socket path. Pass
+    // unlink_path=false to leave the sock file for a coordinated cleanup (T-PERF10:
+    // hostd defers unlink until the single-instance flock is released so clients
+    // never see lock-held-but-no-sock during drain).
+    void close(bool unlink_path = true);
+
+    // Detach the bound path without unlinking or closing. Returns the path (or
+    // empty). After this, close() will not unlink. Used by hostd to hand the
+    // sock path to SingleInstance for unlink-at-flock-release.
+    std::string releasePath();
 #ifdef _WIN32
     bool valid() const { return pending_ != nullptr; }
 #else

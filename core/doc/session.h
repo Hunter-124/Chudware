@@ -42,21 +42,20 @@ struct OpError : std::runtime_error {
     }
 };
 
-// CRASH RECOVERY (P0 deadlock fix). Every doc_* RPC takes the process-global
-// session mutex via a std::lock_guard, which releases correctly when a C++
+// CRASH RECOVERY (P0 deadlock fix). Every doc_* RPC takes the target document's
+// per-doc mutex via DocLock (T-PERF5), which releases correctly when a C++
 // exception (e.g. OpError from a rejected op batch) unwinds the stack. But a
 // WINDOWS STRUCTURED EXCEPTION (an access violation — null deref reading 0x60 —
 // raised deep inside compile_document while the lock is held) does NOT run C++
-// destructors under /EHsc, so the lock_guard never releases and the mutex stays
+// destructors under /EHsc, so the DocLock never releases and the mutex stays
 // owned by the worker thread. The NEXT doc_* call on that same thread then
 // re-locks the still-held non-recursive mutex => std::system_error EDEADLK
-// ("resource deadlock would occur"), bricking EVERY document until restart.
+// ("resource deadlock would occur"), bricking that document until restart.
 //
 // The libaicad C dispatch boundary catches such a structured exception with an
-// __except filter and calls this to drop the orphaned lock BEFORE returning the
-// error, so the thread can serve the next call cleanly. Idempotent and safe to
-// call when the lock is NOT held by this thread (it no-ops via try_lock probing).
-// Returns true if it actually released an orphaned lock.
+// __except filter and calls this to drop the orphaned lock(s) BEFORE returning
+// the error, so the thread can serve the next call cleanly. Idempotent and safe
+// to call when no lock is held by this thread. Returns true if it released any.
 bool force_release_doc_lock();
 
 // Create a new blank document ("part"; "assembly" not yet supported). Returns the
@@ -587,10 +586,11 @@ nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    double min_clearance_mm = 0.0,
                                    const nlohmann::json& dynamics = nlohmann::json(nullptr));
 
-// --- g_mtx contention meters (Phase 1b perf visibility) ----------------------------
-// The single global session lock every modeling RPC serialises through is instrumented to
-// measure lock wait/hold/queue-depth. This is the primary bottleneck signal when many
-// subagents drive ONE engine (blocked-on-lock time is invisible to the on-CPU sampler).
+// --- doc-lock contention meters (Phase 1b + T-PERF5 per-doc locking) ---------------
+// Each modeling RPC locks the target document (DocLock → per-session mutex). Meters
+// measure lock wait/hold/queue-depth. Cross-doc ops multi-lock in doc_id order; the
+// registry mutex is short-lived (map pin only). Still the primary bottleneck signal
+// when many subagents drive ONE engine (blocked-on-lock is invisible to on-CPU sampling).
 
 // Stamp the calling thread's current RPC method name so DocLock can attribute wait/hold to
 // the caller. The pointer must stay valid for the duration of the call (the dispatch boundary

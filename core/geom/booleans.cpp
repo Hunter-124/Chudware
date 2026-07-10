@@ -51,6 +51,28 @@ TopoDS_Shape fuse(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return run_pair<BRepAlgoAPI_Fuse>(a, b);
 }
 
+TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
+    // T-PERF10: run fuse with the deferred API so we can inspect SectionEdges
+    // before paying for UnifySameDomain (no-op / expensive walk when disjoint).
+    if (b.IsNull()) return a;
+    if (a.IsNull()) return TopoDS_Shape();
+    TopTools_ListOfShape args, tls;
+    args.Append(a);
+    tls.Append(b);
+    BRepAlgoAPI_Fuse op;
+    op.SetArguments(args);
+    op.SetTools(tls);
+    op.SetRunParallel(Standard_True);
+    op.SetNonDestructive(Standard_True);
+    op.Build();
+    if (!op.IsDone()) return TopoDS_Shape();
+    TopoDS_Shape out = op.Shape();
+    // No section edges => operands did not produce intersection geometry; skip unify.
+    const TopTools_ListOfShape& se = op.SectionEdges();
+    if (se.IsEmpty()) return out;
+    return unify_same_domain(out);
+}
+
 TopoDS_Shape cut(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     // Cut is asymmetric: the result is a's material with b removed (a − b).
     if (b.IsNull()) return a;

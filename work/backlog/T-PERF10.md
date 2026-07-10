@@ -26,3 +26,17 @@ Parking lot from docs/PERF_AUDIT_2026-07-10.md — split out when picked up:
 ## Definition of done
 
 - [ ] each item spun into its own card or fixed when scheduled
+
+## Progress (2026-07-10)
+
+Kernel/hostd items landed this pass:
+- [x] auto-coincide scoped to batch-touched entity ids (`touched_entity_ids` + `coincident_proposals` filter)
+- [x] `geom::fuse_unify` skips UnifySameDomain when SectionEdges empty; document.cpp fuse sites updated
+- [x] hostd drain-window: sock unlink at flock release; spawn-loser waits ≤5s for sock/lock
+
+Still open:
+- fillet bisect fallback
+- AICM shared-mem
+- CEF lazy init / idle render throttle (host/ GUI — out of this pass)
+- profiler cadence/symbolization
+- scrape pool

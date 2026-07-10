@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <initializer_list>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace aicad::sketch {
@@ -2247,12 +2249,109 @@ double measure_cond_adj(const json& constraint, const std::vector<std::string>& 
     return adj;
 }
 
-}  // namespace
+// ---- T-PERF9 connected-component decomposition --------------------------------
+// One dense System for a sketch with many independent profiles is O(n³) on the
+// LM / SVD steps. Union-find over entities linked by constraint refs partitions
+// the sketch into independent components that can be solved separately; DOF /
+// statuses / diagnostics are summed/merged afterward. Exact/oracle path
+// (interactive=false) stays monolithic for byte-identical parity.
 
-SketchSolution solve_sketch(const json& sketch, const json& env,
-                            const std::optional<SolveState>& warm,
-                            std::optional<double> time_budget_ms,
-                            bool interactive) {
+struct UnionFind {
+    std::map<std::string, std::string> parent;
+    std::string find(const std::string& x) {
+        auto it = parent.find(x);
+        if (it == parent.end()) {
+            parent[x] = x;
+            return x;
+        }
+        if (it->second != x) it->second = find(it->second);
+        return it->second;
+    }
+    void unite(const std::string& a, const std::string& b) {
+        std::string ra = find(a), rb = find(b);
+        if (ra != rb) parent[ra] = rb;
+    }
+};
+
+std::string eid_of_handle(const std::string& h) {
+    auto d = h.find('.');
+    return d == std::string::npos ? h : h.substr(0, d);
+}
+
+struct SketchComponent {
+    json entities = json::array();
+    json constraints = json::array();
+    std::vector<std::string> entity_ids;
+};
+
+// Partition entities into connected components under the constraint graph.
+// Constraints that only touch "origin" (or dangling refs) ride with the first
+// real entity they reference; orphan constraints join component 0.
+std::vector<SketchComponent> partition_components(const json& entities_list,
+                                                    const json& constraints_list) {
+    UnionFind uf;
+    std::set<std::string> known;
+    for (const auto& e : entities_list) {
+        if (!e.is_object() || !e.contains("id")) continue;
+        std::string id = e["id"].get<std::string>();
+        known.insert(id);
+        uf.find(id);
+    }
+    for (const auto& c : constraints_list) {
+        if (!c.is_object() || !c.contains("refs") || !c["refs"].is_array()) continue;
+        std::vector<std::string> eids;
+        for (const auto& r : c["refs"]) {
+            if (!r.is_string()) continue;
+            std::string eid = eid_of_handle(r.get<std::string>());
+            if (eid == "origin") continue;
+            if (known.count(eid)) eids.push_back(eid);
+        }
+        for (size_t i = 1; i < eids.size(); ++i) uf.unite(eids[0], eids[i]);
+    }
+
+    std::map<std::string, int> root_to_idx;
+    std::vector<SketchComponent> comps;
+    for (const auto& e : entities_list) {
+        if (!e.is_object() || !e.contains("id")) continue;
+        std::string id = e["id"].get<std::string>();
+        std::string root = uf.find(id);
+        auto it = root_to_idx.find(root);
+        if (it == root_to_idx.end()) {
+            root_to_idx[root] = static_cast<int>(comps.size());
+            comps.push_back(SketchComponent{});
+            it = root_to_idx.find(root);
+        }
+        comps[it->second].entities.push_back(e);
+        comps[it->second].entity_ids.push_back(id);
+    }
+    if (comps.empty()) return comps;
+
+    for (const auto& c : constraints_list) {
+        if (!c.is_object()) continue;
+        std::string root;
+        if (c.contains("refs") && c["refs"].is_array()) {
+            for (const auto& r : c["refs"]) {
+                if (!r.is_string()) continue;
+                std::string eid = eid_of_handle(r.get<std::string>());
+                if (eid == "origin" || !known.count(eid)) continue;
+                root = uf.find(eid);
+                break;
+            }
+        }
+        if (root.empty() || !root_to_idx.count(root))
+            comps[0].constraints.push_back(c);
+        else
+            comps[root_to_idx[root]].constraints.push_back(c);
+    }
+    return comps;
+}
+
+// Monolithic System build + solve (the historical path). Used by the exact/
+// oracle path always, and by each component of the interactive decomp path.
+SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
+                                       const std::optional<SolveState>& warm,
+                                       std::optional<double> time_budget_ms,
+                                       bool interactive) {
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
 
@@ -2270,12 +2369,8 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
         }
     }
 
-    // Track which variables each constraint tag touches (for over-defined coloring)
-    // and register residual blocks.
     std::map<std::string, std::vector<int>> tag_vars;
     for (const auto& c : constraints_list) {
-        int before = sys.n_vars();  // (unused, kept for clarity)
-        (void)before;
         try {
             add_constraint(sys, c, entities, var_map, env, interactive);
         } catch (...) {
@@ -2362,6 +2457,115 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
     sol.state.n_vars = sys.n_vars();
     sol.state.ent_sig = cur_sig;
     return sol;
+}
+
+// Merge per-component solutions into one SketchSolution with a concatenated
+// global variable layout (stable for warm-start / drag handoff).
+SketchSolution merge_component_solutions(
+    const std::vector<SketchSolution>& parts,
+    const json& full_entities_list) {
+    SketchSolution sol;
+    sol.converged = true;
+    sol.dof = 0;
+    sol.entities = json::object();
+    sol.statuses = {};
+    int offset = 0;
+    std::vector<double> x_all;
+    std::map<std::string, std::string> cur_sig;
+    for (const auto& e : full_entities_list)
+        if (e.is_object() && e.contains("id")) cur_sig[e["id"]] = e.dump();
+
+    for (const auto& p : parts) {
+        sol.converged = sol.converged && p.converged;
+        sol.dof += p.dof;
+        sol.redundant.insert(sol.redundant.end(), p.redundant.begin(), p.redundant.end());
+        sol.conflicting.insert(sol.conflicting.end(), p.conflicting.begin(),
+                               p.conflicting.end());
+        for (auto it = p.entities.begin(); it != p.entities.end(); ++it)
+            sol.entities[it.key()] = it.value();
+        for (const auto& kv : p.statuses) sol.statuses[kv.first] = kv.second;
+        for (const auto& kv : p.var_map) {
+            std::vector<int> gidx;
+            gidx.reserve(kv.second.size());
+            for (int li : kv.second) gidx.push_back(li + offset);
+            sol.var_map[kv.first] = std::move(gidx);
+        }
+        for (int i = 0; i < p.x.size(); ++i) x_all.push_back(p.x(i));
+        offset += static_cast<int>(p.x.size());
+    }
+    if (x_all.empty())
+        sol.x = Eigen::VectorXd();
+    else
+        sol.x = Eigen::Map<const Eigen::VectorXd>(
+            x_all.data(), static_cast<Eigen::Index>(x_all.size()));
+    // Entities with no vars (or missing from a part) still need status defaults.
+    for (const auto& e : full_entities_list) {
+        if (!e.is_object() || !e.contains("id")) continue;
+        std::string id = e["id"].get<std::string>();
+        if (!sol.statuses.count(id)) sol.statuses[id] = "under";
+        if (!sol.entities.contains(id)) {
+            // Pass through authored geometry when a component produced nothing.
+            json o = e;
+            sol.entities[id] = o;
+        }
+    }
+    sol.state.x = sol.x;
+    sol.state.var_map = sol.var_map;
+    sol.state.n_vars = static_cast<int>(x_all.size());
+    sol.state.ent_sig = cur_sig;
+    return sol;
+}
+
+}  // namespace
+
+SketchSolution solve_sketch(const json& sketch, const json& env,
+                            const std::optional<SolveState>& warm,
+                            std::optional<double> time_budget_ms,
+                            bool interactive) {
+    // Exact / oracle path: always one monolithic System (parity invariant).
+    if (!interactive)
+        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+
+    json entities_list = sketch.value("entities", json::array());
+    json constraints_list = sketch.value("constraints", json::array());
+    // Small sketches: decomp overhead dominates. Also a single component is just
+    // the monolithic path.
+    if (!entities_list.is_array() || entities_list.size() < 2)
+        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, true);
+
+    std::vector<SketchComponent> comps =
+        partition_components(entities_list, constraints_list);
+    if (comps.size() <= 1)
+        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, true);
+
+    // Independent components — solve each with its own dense System (T-PERF9).
+    // Wall-clock budget is shared across components (remaining time each round).
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<SketchSolution> parts;
+    parts.reserve(comps.size());
+    for (const auto& comp : comps) {
+        json sub;
+        sub["entities"] = comp.entities;
+        sub["constraints"] = comp.constraints;
+        std::optional<double> budget = time_budget_ms;
+        if (time_budget_ms) {
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+            const double rem = *time_budget_ms - elapsed_ms;
+            if (rem <= 0.0) {
+                // Budget exhausted: still run a cold extract via monolithic with a
+                // tiny budget so the caller gets finite geometry.
+                budget = 0.1;
+            } else {
+                budget = rem;
+            }
+        }
+        parts.push_back(
+            solve_sketch_monolithic(sub, env, warm, budget, /*interactive=*/true));
+    }
+    return merge_component_solutions(parts, entities_list);
 }
 
 SketchSolution solve_sketch(const json& sketch, const json& env) {
@@ -2694,13 +2898,60 @@ std::optional<double> measure_constraint(const json& constraint,
 // blocks a fresh build would register (add_constraint's lambdas are pure per-call and
 // the registration-time shape probe in nsolve's add_residual has no side effects the
 // solve depends on), so caching preserves solve semantics by construction.
-struct DragContext {
-    System sys;             // hard blocks registered; soft targets cleared per frame
-    EntMap entities;        // entity id -> entity json (for resolve_handle)
-    VarMap var_map;         // entity id -> variable indices
-    json entities_list;     // parsed "entities" array (for extract_entities)
-    json constraints_list;  // parsed "constraints" array (for full diagnostics)
+//
+// T-PERF9: when the sketch partitions into multiple connected components, only the
+// component(s) containing the drag target(s) are built into Systems; other entities
+// keep their pre-drag solved coords. A single-component sketch uses the historical
+// one-System path (identical block registration order).
+struct DragComp {
+    System sys;
+    EntMap entities;
+    VarMap var_map;
+    json entities_list = json::array();
+    json constraints_list = json::array();
+    std::unordered_set<std::string> eids;
 };
+
+struct DragContext {
+    // Legacy single-System fields (used when comps is empty — one component / fallback).
+    System sys;
+    EntMap entities;
+    VarMap var_map;
+    json entities_list;
+    json constraints_list;
+
+    // Multi-component drag (T-PERF9): one System per dragged component.
+    std::vector<DragComp> comps;
+    std::map<std::string, int> eid_to_comp;  // entity id -> index in comps (-1 = frozen)
+    json frozen_coords = json::object();    // non-dragged entities (pre-drag positions)
+    bool multi = false;
+};
+
+// Build one DragComp System from a SketchComponent (entities + constraints).
+DragComp build_drag_comp(const SketchComponent& sc, const json& env) {
+    DragComp dc;
+    dc.entities_list = sc.entities;
+    dc.constraints_list = sc.constraints;
+    for (const auto& e : sc.entities) {
+        if (!e.is_object() || !e.contains("id")) continue;
+        std::string id = e["id"].get<std::string>();
+        dc.entities[id] = e;
+        dc.eids.insert(id);
+        try {
+            dc.var_map[id] = allocate_entity(dc.sys, e);
+        } catch (...) {
+            dc.var_map[id] = dc.sys.add_vars(0, {});
+        }
+    }
+    dc.sys.set_interactive(true);
+    for (const auto& c : sc.constraints) {
+        try {
+            add_constraint(dc.sys, c, dc.entities, dc.var_map, env, /*interactive=*/true);
+        } catch (...) {
+        }
+    }
+    return dc;
+}
 
 json drag(const SolveState& state, const std::string& handle,
           const std::pair<double, double>& target_xy, const json& sketch,
@@ -2711,43 +2962,6 @@ json drag(const SolveState& state, const std::string& handle,
     // cannot change mid-drag; the CALLER invalidates the context on any doc change.
     const bool fast = ctx_io != nullptr;
     std::shared_ptr<DragContext> ctx = fast ? *ctx_io : nullptr;
-    if (!ctx) {
-        ctx = std::make_shared<DragContext>();
-        // Drag is always interactive (T-PERF8): LDLT-first, in-trial deadline,
-        // single-QR redundancy, tangency (p,q) warm-start. Parity/oracle paths
-        // never call drag(), so the exact solve path is unaffected.
-        ctx->sys.set_interactive(true);
-        ctx->entities_list = sketch.value("entities", json::array());
-        ctx->constraints_list = sketch.value("constraints", json::array());
-        for (const auto& e : ctx->entities_list) ctx->entities[e["id"]] = e;
-        for (const auto& e : ctx->entities_list) {
-            try {
-                ctx->var_map[e["id"]] = allocate_entity(ctx->sys, e);
-            } catch (...) {
-                ctx->var_map[e["id"]] = ctx->sys.add_vars(0, {});
-            }
-        }
-        for (const auto& c : ctx->constraints_list) {
-            try {
-                add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env,
-                               /*interactive=*/true);
-            } catch (...) {
-                // forward-tolerant
-            }
-        }
-        if (fast) *ctx_io = ctx;
-    } else {
-        // Frame N of a drag: drop frame N-1's soft targets so that after the
-        // re-registration below the block set is IDENTICAL to a fresh build
-        // (hard blocks in registration order, then this frame's soft targets).
-        ctx->sys.clear_soft_targets();
-        ctx->sys.set_interactive(true);
-    }
-    System& sys = ctx->sys;
-    const json& entities_list = ctx->entities_list;
-    const json& constraints_list = ctx->constraints_list;
-    const EntMap& entities = ctx->entities;
-    const VarMap& var_map = ctx->var_map;
 
     // Normalize to a list of (handle, (tx, ty)). The single-handle call becomes a
     // one-element list. `targets` (when given) wins over handle/target_xy.
@@ -2770,6 +2984,209 @@ json drag(const SolveState& state, const std::string& handle,
     } else if (!handle.empty()) {
         target_pairs.emplace_back(handle, target_xy);
     }
+
+    if (!ctx) {
+        ctx = std::make_shared<DragContext>();
+        ctx->entities_list = sketch.value("entities", json::array());
+        ctx->constraints_list = sketch.value("constraints", json::array());
+        for (const auto& e : ctx->entities_list) {
+            if (e.is_object() && e.contains("id")) ctx->entities[e["id"]] = e;
+        }
+
+        // Seed frozen coords from the warm state (last solved positions). Fallback
+        // to authored entity geometry so non-dragged components never vanish from
+        // the response when the warm vector layout is unavailable.
+        if (state.n_vars > 0 && !state.var_map.empty() &&
+            state.x.size() == state.n_vars) {
+            try {
+                ctx->frozen_coords =
+                    extract_entities(state.x, ctx->entities_list, state.var_map);
+            } catch (...) {
+                ctx->frozen_coords = json::object();
+            }
+        }
+        if (!ctx->frozen_coords.is_object() || ctx->frozen_coords.empty()) {
+            ctx->frozen_coords = json::object();
+            for (const auto& e : ctx->entities_list) {
+                if (!e.is_object() || !e.contains("id")) continue;
+                ctx->frozen_coords[e["id"].get<std::string>()] = e;
+            }
+        }
+
+        // T-PERF9: partition; if multiple components, only build Systems for those
+        // that contain a drag target. Otherwise fall back to the historical one-System.
+        std::vector<SketchComponent> all_comps =
+            partition_components(ctx->entities_list, ctx->constraints_list);
+        std::set<int> active;
+        if (all_comps.size() > 1) {
+            std::map<std::string, int> eid_comp;
+            for (size_t i = 0; i < all_comps.size(); ++i)
+                for (const auto& id : all_comps[i].entity_ids) eid_comp[id] = static_cast<int>(i);
+            for (const auto& tp : target_pairs) {
+                std::string eid = eid_of_handle(tp.first);
+                auto it = eid_comp.find(eid);
+                if (it != eid_comp.end()) active.insert(it->second);
+            }
+        }
+
+        if (all_comps.size() > 1 && !active.empty()) {
+            ctx->multi = true;
+            // Map every entity to either a live comp index or "frozen" (-1).
+            std::map<int, int> old_to_new;  // original comp idx -> ctx->comps idx
+            for (int oi : active) {
+                old_to_new[oi] = static_cast<int>(ctx->comps.size());
+                ctx->comps.push_back(build_drag_comp(all_comps[static_cast<size_t>(oi)], env));
+            }
+            for (size_t i = 0; i < all_comps.size(); ++i) {
+                int mapped = old_to_new.count(static_cast<int>(i))
+                                 ? old_to_new[static_cast<int>(i)]
+                                 : -1;
+                for (const auto& id : all_comps[i].entity_ids)
+                    ctx->eid_to_comp[id] = mapped;
+            }
+        } else {
+            // Single-component / no active target yet: full-system path.
+            ctx->sys.set_interactive(true);
+            for (const auto& e : ctx->entities_list) {
+                try {
+                    ctx->var_map[e["id"]] = allocate_entity(ctx->sys, e);
+                } catch (...) {
+                    ctx->var_map[e["id"]] = ctx->sys.add_vars(0, {});
+                }
+            }
+            for (const auto& c : ctx->constraints_list) {
+                try {
+                    add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env,
+                                   /*interactive=*/true);
+                } catch (...) {
+                }
+            }
+        }
+        if (fast) *ctx_io = ctx;
+    } else {
+        // Frame N: clear previous soft targets on every live System.
+        if (ctx->multi) {
+            for (auto& dc : ctx->comps) {
+                dc.sys.clear_soft_targets();
+                dc.sys.set_interactive(true);
+            }
+        } else {
+            ctx->sys.clear_soft_targets();
+            ctx->sys.set_interactive(true);
+        }
+    }
+
+    const json& entities_list = ctx->entities_list;
+    const json& constraints_list = ctx->constraints_list;
+
+    // ---- multi-component drag path (T-PERF9) --------------------------------
+    if (ctx->multi) {
+        bool any_target = false;
+        std::vector<std::string> rejected_handles;
+        std::set<int> touched_comps;
+        for (const auto& tp : target_pairs) {
+            const std::string& h = tp.first;
+            double tx = tp.second.first, ty = tp.second.second;
+            std::string eid = eid_of_handle(h);
+            auto cit = ctx->eid_to_comp.find(eid);
+            if (cit == ctx->eid_to_comp.end() || cit->second < 0) {
+                rejected_handles.push_back(h);
+                continue;
+            }
+            DragComp& dc = ctx->comps[static_cast<size_t>(cit->second)];
+            Handle hd;
+            try {
+                hd = resolve_handle(h, dc.entities, dc.var_map);
+            } catch (...) {
+                rejected_handles.push_back(h);
+                continue;
+            }
+            if (hd.idx.empty()) {
+                rejected_handles.push_back(h);
+                continue;
+            }
+            dc.sys.soft_target(hd.idx[0], tx, 0.01);
+            if (hd.idx.size() > 1) dc.sys.soft_target(hd.idx[1], ty, 0.01);
+            any_target = true;
+            touched_comps.insert(cit->second);
+        }
+
+        json entity_coords = ctx->frozen_coords.is_object() ? ctx->frozen_coords
+                                                            : json::object();
+        if (!any_target) {
+            json rej = json::array();
+            if (!rejected_handles.empty()) {
+                for (const auto& h : rejected_handles) rej.push_back(h);
+            } else {
+                for (const auto& tp : target_pairs) rej.push_back(tp.first);
+            }
+            return json{{"ok", false}, {"error", "no drag targets resolved"},
+                        {"rejected_handles", rej}, {"entities", entity_coords},
+                        {"statuses", json::object()}, {"converged", true},
+                        {"budget_exceeded", false}};
+        }
+
+        bool converged = true;
+        bool budget_exceeded = false;
+        const double budget_ms = 10.0;
+        for (int ci : touched_comps) {
+            DragComp& dc = ctx->comps[static_cast<size_t>(ci)];
+            // Per-entity warm start from the full state into this component's layout.
+            std::optional<Eigen::VectorXd> x0;
+            {
+                Eigen::VectorXd base = dc.sys.init_vector();
+                bool any_warm = false;
+                for (const auto& kv : dc.var_map) {
+                    auto wit = state.var_map.find(kv.first);
+                    if (wit == state.var_map.end()) continue;
+                    if (wit->second.size() != kv.second.size()) continue;
+                    if (state.x.size() < 1) continue;
+                    bool ok = true;
+                    for (int wi : wit->second)
+                        if (wi < 0 || wi >= state.x.size()) {
+                            ok = false;
+                            break;
+                        }
+                    if (!ok) continue;
+                    for (size_t i = 0; i < kv.second.size(); ++i)
+                        base(kv.second[i]) = state.x(wit->second[i]);
+                    any_warm = true;
+                }
+                // Also warm from the previous frame's component solution when sizes match.
+                if (!any_warm && state.n_vars == dc.sys.n_vars() &&
+                    state.x.size() == dc.sys.n_vars())
+                    base = state.x;
+                x0 = base;
+            }
+            auto res = dc.sys.solve(x0, 1e-10, 50, budget_ms);
+            Eigen::VectorXd x = res.x;
+            if (!x.allFinite()) {
+                if (x0 && x0->allFinite())
+                    x = *x0;
+                else
+                    x = dc.sys.init_vector();
+            }
+            converged = converged && res.converged;
+            budget_exceeded = budget_exceeded || res.budget_exceeded;
+            json part = extract_entities(x, dc.entities_list, dc.var_map);
+            for (auto it = part.begin(); it != part.end(); ++it)
+                entity_coords[it.key()] = it.value();
+        }
+
+        // Multi-comp drag always skips per-frame diagnostics (topology fixed mid-drag;
+        // full statuses run once on commit via solve_active).
+        json rej_fast = json::array();
+        for (const auto& h : rejected_handles) rej_fast.push_back(h);
+        (void)fast;
+        return json{{"ok", true}, {"entities", entity_coords},
+                    {"statuses", json::object()}, {"rejected_handles", rej_fast},
+                    {"converged", converged}, {"budget_exceeded", budget_exceeded}};
+    }
+
+    // ---- single-System path (historical; one component or decomp unused) ----
+    System& sys = ctx->sys;
+    const EntMap& entities = ctx->entities;
+    const VarMap& var_map = ctx->var_map;
 
     // Soft-target each resolvable handle's variable(s) (weight 0.01). A point handle
     // (idx = {px, py}) is pulled to the cursor (tx, ty); a scalar handle (rim/angle,
@@ -2797,7 +3214,10 @@ json drag(const SolveState& state, const std::string& handle,
     }
 
     if (!any_target) {
-        json entity_coords = extract_entities(state.x, entities_list, var_map);
+        json entity_coords =
+            (!state.var_map.empty() && state.x.size() == state.n_vars)
+                ? extract_entities(state.x, entities_list, state.var_map)
+                : extract_entities(sys.init_vector(), entities_list, var_map);
         json rej = json::array();
         if (!rejected_handles.empty()) {
             for (const auto& h : rejected_handles) rej.push_back(h);

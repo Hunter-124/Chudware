@@ -359,7 +359,14 @@ IpcConn IpcListener::accept(int timeoutMs) {
     return conn;
 }
 
-void IpcListener::close() {
+std::string IpcListener::releasePath() {
+    std::string p = std::move(path_);
+    path_.clear();
+    return p;
+}
+
+void IpcListener::close(bool /*unlink_path*/) {
+    // Named pipes have no sock file to unlink; unlink_path is ignored on Windows.
     if (pending_) {
         CloseHandle((HANDLE)pending_);
         pending_ = nullptr;

@@ -3357,7 +3357,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             throw std::runtime_error("extrude: dir2 slab build failed");
                         // build123d's piece + piece2 runs .clean() (UnifySameDomain), so the
                         // sketch-plane seam between the two direction slabs collapses to one face.
-                        prism = ::geom::unify_same_domain(::geom::fuse(prism, slab2));
+                        prism = ::geom::fuse_unify(prism, slab2);
                         if (prism.IsNull())
                             throw std::runtime_error("extrude: dir2 fuse failed");
                     }
@@ -3470,7 +3470,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     const std::string mtgt = merge ? current_solid_id() : std::string();
                     if (!mtgt.empty()) {
                         const TopoDS_Shape& tgt = require_solid(results, mtgt, "target");
-                        TopoDS_Shape out = ::geom::unify_same_domain(::geom::fuse(tgt, solid));
+                        TopoDS_Shape out = ::geom::fuse_unify(tgt, solid);
                         if (out.IsNull())
                             throw std::runtime_error("extrude boss fuse produced an empty shape");
                         // Guard the silent buried-boss: primitives are CENTRED on the origin,
@@ -3904,7 +3904,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     const TopoDS_Shape& tgt = require_solid(results, stgt, "target");
                     TopoDS_Shape out = (smode == "cut")
                         ? ::geom::cut(tgt, solid)
-                        : ::geom::unify_same_domain(::geom::fuse(tgt, solid));
+                        : ::geom::fuse_unify(tgt, solid);
                     if (out.IsNull())
                         throw std::runtime_error(
                             std::string("sweep ") + smode + " produced an empty shape");
@@ -4016,7 +4016,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const TopoDS_Shape& b = require_solid(results, b_id, "b");
 
                 TopoDS_Shape out;
-                if (op == "fuse")        out = ::geom::fuse(a, b);
+                if (op == "fuse")        out = ::geom::fuse_unify(a, b);  // T-PERF10: skip unify if no section edges
                 else if (op == "cut")    out = ::geom::cut(a, b);
                 else if (op == "common") out = ::geom::common(a, b);
                 else throw std::runtime_error("unknown boolean op '" + op + "'");
@@ -4024,9 +4024,6 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     throw std::runtime_error("boolean '" + op + "' produced an empty shape");
 
                 if (op == "fuse") {
-                    // combine: build123d's `+` runs .clean() (ShapeUpgrade_UnifySameDomain),
-                    // so flush coplanar faces from the two welded blocks merge into one. Match it.
-                    out = ::geom::unify_same_domain(out);
                     // NO SILENT DISJOINT FUSE (issue #8): the BOOLEAN contract in
                     // ops_cheatsheet.md promises a fuse produces ONE connected solid. Two
                     // operands that don't intersect or touch still pass BRepAlgoAPI_Fuse's
@@ -4612,7 +4609,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                                  "an empty shape");
                     TopoDS_Shape out = (so.second == "cut")
                         ? ::geom::cut(body, rtool)
-                        : ::geom::unify_same_domain(::geom::fuse(body, rtool));
+                        : ::geom::fuse_unify(body, rtool);
                     if (out.IsNull())
                         throw std::runtime_error("mirror: feature mirror "
                             + std::string(so.second == "cut" ? "cut" : "fuse")
@@ -4636,8 +4633,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         // merged solid is its new current state in the tree). build123d's
                         // mirror merge runs .clean() (UnifySameDomain), so the seam where
                         // the two flush halves meet collapses — match the face count.
-                        TopoDS_Shape out =
-                            ::geom::unify_same_domain(::geom::fuse(body, reflected));
+                        TopoDS_Shape out = ::geom::fuse_unify(body, reflected);
                         if (out.IsNull())
                             throw std::runtime_error("mirror union (fuse) produced an empty shape");
                         consumed.insert(body_id);

@@ -104,10 +104,18 @@ bool SingleInstance::acquire(const std::string& lockFile, std::string& err) {
 }
 
 void SingleInstance::release() {
+    // Order (T-PERF10 drain-window): drop the flock FIRST, then unlink the sock.
+    // Clients that see lock-held-no-sock during drain previously burned their full
+    // connect budget; now the sock stays until we release, and spawn-losers that
+    // wait on the flock wake as soon as we exit.
     if (fd_ >= 0) {
         ::close(fd_);  // drops the flock
         fd_ = -1;
         path_.clear();
+    }
+    if (!sock_path_.empty()) {
+        ::unlink(sock_path_.c_str());
+        sock_path_.clear();
     }
 }
 

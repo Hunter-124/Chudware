@@ -18,6 +18,7 @@
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
 // engine asynchronously. Racing clients connect immediately and see state:
 // "loading" in the hello instead of a connect timeout.
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -149,8 +150,30 @@ int main(int argc, char** argv) {
     aicad_ipc::SingleInstance instance;
     std::string err;
     if (!instance.acquire(lock, err)) {
-        hostd::log().line("spawn race lost (%s) — exiting 0", err.c_str());
-        return 0;
+        // T-PERF10: spawn-loser flock-wait. The incumbent may be mid-drain with
+        // the sock still up (or briefly gone). Poll for either a live sock
+        // (client will reconnect) or a freed lock we can claim — up to ~5 s —
+        // instead of immediately exiting and leaving the spawner to burn budget.
+        hostd::log().line("spawn race lost (%s) — waiting for incumbent", err.c_str());
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string cerr;
+            aicad_ipc::IpcConn probe = aicad_ipc::connectTo(sock, cerr);
+            if (probe.valid()) {
+                hostd::log().line("incumbent reachable — exiting 0 for client reconnect");
+                return 0;
+            }
+            if (instance.acquire(lock, err)) {
+                hostd::log().line("lock freed — becoming the daemon");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (!instance.held()) {
+            hostd::log().line("spawn race still lost after wait — exiting 0");
+            return 0;
+        }
     }
 
     // 2. Bind before engine load.
@@ -208,6 +231,11 @@ int main(int argc, char** argv) {
     // next daemon recovers them; loss bound on a hard kill = autosave interval.
     autosave.stop(/*finalSave=*/true);
     loader.join();
+    // T-PERF10 drain-window: hand the sock path to SingleInstance BEFORE the
+    // Server dtor closes the listen fd, so unlink happens only at flock release
+    // (instance is destroyed after server, so order is: close fd → release flock
+    // → unlink sock). Clients never observe lock-held-with-no-sock.
+    instance.setSockPathToUnlink(server.detachSocketForFlockRelease());
     hostd::log().line("hostd exiting");
     return 0;
 }

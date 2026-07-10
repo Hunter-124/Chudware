@@ -1016,3 +1016,41 @@ warm-starts mutual_closest (p,q) within a solve.
 Files: `core/doc/document.cpp`, `core/geom/aicm.h`, `core/geom/tessellate.cpp`,
 `core/solver/nsolve.{h,cpp}`, `core/sketch/sketch.{h,cpp}`, `core/doc/session.cpp`,
 `docs/REFACTOR_LOG.md`, `work/backlog/T-PERF{6,7,8}.md`.
+
+## 2026-07-10 — T-PERF9 / T-PERF5 / T-PERF10 kernel-ish: sketch decomp, per-doc locks, odds
+
+Kernel + hostd only (no host/ GUI, no commits). Lands the asymptotic sketch win, concurrent
+multi-doc engine RPCs, and three low-risk PERF10 items.
+
+**T-PERF9** (`core/sketch/sketch.{h,cpp}`, `core/doc/session.cpp` solve_active):
+Union-find over (entity, constraint refs) partitions the sketch into connected components.
+`solve_sketch(..., interactive=true)` solves each component as its own dense System and
+merges DOF / statuses / warm SolveState (concatenated global var layout). Exact/oracle path
+(`interactive=false`) stays monolithic for parity. Drag builds Systems only for components
+that contain the drag target(s); other entities keep pre-drag coords. `solve_active` (live
+sketcher enter/solve/commit) uses interactive=true so decomp applies on the UI path.
+
+**T-PERF5** (`core/doc/session.{h,cpp}`):
+Replaced process-global `g_mtx` with (1) short `g_registry_mtx` protecting `g_sessions` map +
+`g_dep_registry`, (2) per-`Session` mutex, sessions heap-allocated as `shared_ptr`. `DocLock`
+is lazy — `require_session(doc_id)` acquires that doc on first touch; multi-doc upgrade unlocks
+and relocks in sorted `doc_id` order (deadlock-free). Cross-doc `resolve_source_session`
+multi-locks the source. `doc_list`/`doc_close` pin under registry then lock sessions without
+holding the registry. `force_release_doc_lock` walks the TLS DocLock chain. Contention meters
+still fire at RPC granularity. **Remaining risk:** any future cross-doc path that peeks at
+another session without `require_session`/multi-lock is a data race — audit new call sites.
+Stress test for concurrent two-doc edits not yet automated.
+
+**T-PERF10 (partial)**:
+- auto-coincide: proximity scan scoped to batch-touched entity ids (`touched_entity_ids`);
+  full scan retained for explicit `doc_sketch_auto_constrain`.
+- `geom::fuse_unify`: fuse then UnifySameDomain only when BOP `SectionEdges` non-empty;
+  call sites in `document.cpp` (extrude boss/dir2, sweep, mirror, boolean fuse).
+- hostd drain-window: sock unlink deferred to SingleInstance flock release; spawn-loser
+  waits up to 5 s for incumbent sock or freed lock (`core/hostd/main.cpp`,
+  `services/ipc/ipc_{transport,discovery}.*`).
+
+Files: `core/sketch/sketch.cpp`, `core/doc/session.{h,cpp}`, `core/doc/document.cpp`,
+`core/geom/booleans.{h,cpp}`, `core/hostd/{main,server}.{cpp,h}`,
+`services/ipc/ipc_{transport,discovery}.{h,cpp}` (+ win variants),
+`docs/REFACTOR_LOG.md`, `work/backlog/T-PERF{5,9,10}.md`.

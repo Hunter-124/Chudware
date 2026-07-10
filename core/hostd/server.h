@@ -49,6 +49,11 @@ public:
     Server(aicad_ipc::IpcListener listener, std::string buildId);
     ~Server();
 
+    // T-PERF10: close the listen fd without unlinking the sock, and return the
+    // path so the caller can hand it to SingleInstance::setSockPathToUnlink.
+    // Must be called before ~Server so the destructor does not race the unlink.
+    std::string detachSocketForFlockRelease();
+
     // Phase 3: the autosave scheduler (recovery id_remap served in hello) and
     // the doc registry (attach modes, holds, events) plug in before run().
     void setAutosave(Autosave* a) { autosave_ = a; }

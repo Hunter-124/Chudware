@@ -179,13 +179,22 @@ IpcConn IpcListener::accept(int timeoutMs) {
     return c >= 0 ? IpcConn(c) : IpcConn();
 }
 
-void IpcListener::close() {
+std::string IpcListener::releasePath() {
+    std::string p = std::move(path_);
+    path_.clear();
+    return p;
+}
+
+void IpcListener::close(bool unlink_path) {
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
-        if (!path_.empty()) ::unlink(path_.c_str());
-        path_.clear();
     }
+    // T-PERF10: unlink is optional so hostd can drop the listen fd while the
+    // single-instance flock still covers the sock file, then unlink at flock
+    // release (no lock-held-but-no-sock window for spawn-on-demand clients).
+    if (unlink_path && !path_.empty()) ::unlink(path_.c_str());
+    path_.clear();
 }
 
 IpcConn connectTo(const std::string& path, std::string& err) {

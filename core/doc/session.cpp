@@ -154,6 +154,11 @@ struct SketchState {
 };
 
 struct Session {
+    // T-PERF5: per-doc mutex. Locked by DocLock::acquire / require_session; never
+    // touched while holding g_registry_mtx (pin-then-lock). Non-copyable/non-movable
+    // because of the mutex — sessions live behind shared_ptr in g_sessions.
+    std::mutex mtx;
+
     std::string doc_id;
     json doc;
     long revision = 0;
@@ -180,7 +185,7 @@ struct Session {
     // unchanged feature checkpoint instead of feature 1 — editing feature k of N
     // recompiles k..N only. Content-addressed (env+config+feature hashes), so undo/
     // redo/config switches can never be served stale geometry. Accessed only under
-    // g_mtx like everything else in the session.
+    // the per-doc mutex (DocLock).
     std::shared_ptr<aicad::doc::CompileCache> compile_cache = aicad::doc::make_compile_cache();
 
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
@@ -199,28 +204,42 @@ struct Session {
     bool is_assembly() const {
         return doc.is_object() && doc.value("schema", std::string()) == "aicad.asm/1";
     }
+
+    Session() = default;
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+    Session(Session&&) = delete;
+    Session& operator=(Session&&) = delete;
 };
 
 constexpr std::size_t kUndoLimit = 100;
 
-std::mutex g_mtx;
-// Owner-tracking for crash recovery (see force_release_doc_lock / session.h). We
-// record which thread currently holds g_mtx so that, if a Windows structured
-// exception (an access violation) unwinds PAST a DocLock without running its C++
-// destructor under /EHsc, the dispatch boundary can detect the orphaned lock —
-// owned by this very thread — and drop it before serving the next call. A plain
-// std::mutex exposes no owner, so we maintain it ourselves. g_mtx_held is true
-// only while a DocLock is alive; g_mtx_owner is meaningful only when held.
-std::atomic<bool> g_mtx_held{false};
-std::thread::id g_mtx_owner;  // guarded by g_mtx (only read/written while held)
+// =============================================================================
+// T-PERF5 — per-doc engine locking
+// =============================================================================
+//
+// Lock order (MUST be respected to avoid deadlock):
+//   1. Session mutexes, ordered by doc_id ascending (never hold A then wait for
+//      B if A > B lexicographically — upgrade path unlocks + relocks sorted).
+//   2. g_registry_mtx — protects g_sessions map + g_dep_registry. Taken only
+//      briefly to pin shared_ptr<Session> or mutate the map; NEVER held while
+//      waiting on a session mutex (pin-then-lock pattern).
+//
+// Cross-doc ops (refresh_derived, resolve_source_session): either already hold
+// both docs via DocLock multi-acquire, or snapshot the source under a brief
+// source-doc lock. dep_notify only touches g_dep_registry under the registry
+// lock (no session data).
+//
+// DocLock is lazy: construction registers the RAII owner on this thread;
+// require_session(doc_id) acquires that doc's mutex on first touch. Two docs
+// edit concurrently without cross-blocking.
 
-// --- g_mtx contention meters (Phase 1b perf visibility) ----------------------------
-// Every modeling RPC serialises through DocLock/g_mtx. With many subagents on ONE engine
-// the dominant cost is time spent BLOCKED waiting for this lock — which the on-CPU sampling
-// profiler cannot see. These meters make that queueing visible. Overhead is one steady_clock
-// read per lock acquire/release (RPC granularity, not an inner loop), so they are always on.
-// Read + reset via aicad::doc::contention_report(). Per-caller attribution uses a thread-local
-// current-method pointer stamped by the dispatch boundary (set_current_rpc_method).
+// Registry: map of live sessions. Sessions are heap-allocated so pins stay
+// valid after erase (in-flight DocLocks hold shared_ptr until unlock).
+std::mutex g_registry_mtx;
+std::map<std::string, std::shared_ptr<Session>> g_sessions;
+
+// --- Contention meters (Phase 1b; now attribute per-doc acquires) -------------
 struct ContentionMeters {
     std::atomic<unsigned long long> acquisitions{0};
     std::atomic<unsigned long long> contended{0};       // acquires that had to wait (>threshold)
@@ -235,11 +254,7 @@ ContentionMeters g_cont;
 std::chrono::steady_clock::time_point g_cont_since = std::chrono::steady_clock::now();
 constexpr unsigned long long kContendedWaitNs = 20'000;  // >20µs waited => genuinely contended
 
-// Current RPC method for the calling thread (for per-caller contention attribution). A raw
-// interned pointer set by the dispatch boundary; never dereferenced after the call returns.
 thread_local const char* t_cur_method = nullptr;
-// Per-method aggregates (wait/hold ns + count), guarded by its own light mutex — updated once
-// per lock release (RPC granularity), never in a hot path.
 struct MethodContention { unsigned long long count{0}, wait_ns{0}, hold_ns{0}, max_wait_ns{0}; };
 std::mutex g_cont_map_mtx;
 std::map<std::string, MethodContention> g_cont_map;
@@ -249,38 +264,50 @@ inline void atomic_max(std::atomic<unsigned long long>& a, unsigned long long v)
     while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
 }
 
-// RAII lock for the process-global session store. Behaves exactly like
-// std::lock_guard<std::mutex> on g_mtx for the normal (success / C++-exception)
-// paths — the destructor releases on stack unwind — while additionally stamping
-// the owning thread so an SEH-orphaned lock is recoverable (force_release_doc_lock).
-// Also feeds the g_mtx contention meters above.
+// Forward: Session grows a per-doc mutex (declared with Session above — added below).
+// Pin a live session under the registry lock (does NOT lock the session).
+std::shared_ptr<Session> pin_session_unlocked(const std::string& doc_id) {
+    auto it = g_sessions.find(doc_id);
+    if (it == g_sessions.end()) return nullptr;
+    return it->second;
+}
+std::shared_ptr<Session> pin_session(const std::string& doc_id) {
+    std::lock_guard<std::mutex> reg(g_registry_mtx);
+    return pin_session_unlocked(doc_id);
+}
+
+// RAII per-doc (or multi-doc) lock. Lazy: the first require_session / acquire
+// call locks the target doc; further docs are multi-locked in doc_id order.
+// SEH recovery: force_release_doc_lock drops every mutex this thread holds.
+class DocLock;
+thread_local DocLock* t_current_doc_lock = nullptr;
+// True while THIS thread owns one or more session mutexes (force_release probe).
+std::atomic<bool> g_mtx_held{false};
+std::thread::id g_mtx_owner;
+
 class DocLock {
 public:
+    struct Held {
+        std::string id;
+        std::shared_ptr<Session> pin;
+    };
+
     DocLock() {
-        const auto w0 = std::chrono::steady_clock::now();
-        const long long q = g_cont.waiters.fetch_add(1, std::memory_order_relaxed) + 1;
-        {
-            long long mw = g_cont.max_waiters.load(std::memory_order_relaxed);
-            while (q > mw && !g_cont.max_waiters.compare_exchange_weak(mw, q,
-                                                                       std::memory_order_relaxed)) {}
-        }
-        g_mtx.lock();
-        g_cont.waiters.fetch_sub(1, std::memory_order_relaxed);
-        const auto w1 = std::chrono::steady_clock::now();
-        wait_ns_ = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                       w1 - w0).count();
-        hold_t0_ = w1;
+        prev_ = t_current_doc_lock;
+        t_current_doc_lock = this;
         method_ = t_cur_method;
-        g_mtx_owner = std::this_thread::get_id();
-        g_mtx_held.store(true, std::memory_order_release);
+        hold_t0_ = std::chrono::steady_clock::now();
     }
+    // Eager single-doc acquire (optional; require_session also works).
+    explicit DocLock(const std::string& doc_id) : DocLock() { acquire(doc_id); }
+
     ~DocLock() {
+        release_all();
+        t_current_doc_lock = prev_;
+        // Meter the whole RAII scope as one acquisition (RPC granularity).
         const unsigned long long hold_ns =
             (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - hold_t0_).count();
-        g_mtx_held.store(false, std::memory_order_release);
-        g_mtx.unlock();
-        // Record AFTER releasing so meter bookkeeping never extends the critical section.
         g_cont.acquisitions.fetch_add(1, std::memory_order_relaxed);
         g_cont.total_wait_ns.fetch_add(wait_ns_, std::memory_order_relaxed);
         g_cont.total_hold_ns.fetch_add(hold_ns, std::memory_order_relaxed);
@@ -299,13 +326,103 @@ public:
     }
     DocLock(const DocLock&) = delete;
     DocLock& operator=(const DocLock&) = delete;
+
+    // Lock `doc_id` (no-op if already held). Multi-doc: unlocks + relocks all
+    // held ids in sorted order so the lock order invariant holds.
+    Session& acquire(const std::string& doc_id) {
+        for (auto& h : held_)
+            if (h.id == doc_id) return *h.pin;
+        std::shared_ptr<Session> pin = pin_session(doc_id);
+        if (!pin)
+            throw OpError("unknown_doc", "no such document: " + doc_id,
+                          {{"doc_id", doc_id}});
+
+        if (held_.empty()) {
+            lock_one(pin);
+            held_.push_back(Held{doc_id, std::move(pin)});
+            mark_owner();
+            return *held_.back().pin;
+        }
+
+        // Upgrade to multi-doc: unlock everything, sort, relock.
+        std::vector<Held> next = held_;
+        next.push_back(Held{doc_id, std::move(pin)});
+        std::sort(next.begin(), next.end(),
+                  [](const Held& a, const Held& b) { return a.id < b.id; });
+        // Drop current locks (still pinned via shared_ptr).
+        for (auto& h : held_) h.pin->mtx.unlock();
+        held_.clear();
+        for (auto& h : next) lock_one(h.pin);
+        held_ = std::move(next);
+        mark_owner();
+        for (auto& h : held_)
+            if (h.id == doc_id) return *h.pin;
+        return *held_.front().pin;  // unreachable
+    }
+
+    Session* find_held(const std::string& doc_id) {
+        for (auto& h : held_)
+            if (h.id == doc_id) return h.pin.get();
+        return nullptr;
+    }
+
+    // Crash recovery: unlock every session mutex this DocLock owns.
+    void force_release() {
+        for (auto& h : held_) {
+            try {
+                h.pin->mtx.unlock();
+            } catch (...) {
+            }
+        }
+        held_.clear();
+        clear_owner_if_idle();
+    }
+
+    bool holds_any() const { return !held_.empty(); }
+    DocLock* previous() const { return prev_; }
+
 private:
+    void lock_one(const std::shared_ptr<Session>& pin) {
+        const auto w0 = std::chrono::steady_clock::now();
+        const long long q = g_cont.waiters.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+            long long mw = g_cont.max_waiters.load(std::memory_order_relaxed);
+            while (q > mw && !g_cont.max_waiters.compare_exchange_weak(
+                                 mw, q, std::memory_order_relaxed)) {
+            }
+        }
+        pin->mtx.lock();
+        g_cont.waiters.fetch_sub(1, std::memory_order_relaxed);
+        const auto w1 = std::chrono::steady_clock::now();
+        wait_ns_ += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        w1 - w0)
+                        .count();
+    }
+    void release_all() {
+        for (auto& h : held_) h.pin->mtx.unlock();
+        held_.clear();
+        clear_owner_if_idle();
+    }
+    void mark_owner() {
+        g_mtx_owner = std::this_thread::get_id();
+        g_mtx_held.store(true, std::memory_order_release);
+    }
+    void clear_owner_if_idle() {
+        // Only clear the process flag if no nested DocLock on this thread holds locks.
+        if (prev_ && prev_->holds_any()) return;
+        if (!held_.empty()) return;
+        if (g_mtx_owner == std::this_thread::get_id()) {
+            g_mtx_held.store(false, std::memory_order_release);
+        }
+    }
+
+    std::vector<Held> held_;
+    DocLock* prev_ = nullptr;
     unsigned long long wait_ns_ = 0;
     std::chrono::steady_clock::time_point hold_t0_;
     const char* method_ = nullptr;
 };
 
-std::map<std::string, Session> g_sessions;
 std::atomic<unsigned long long> g_doc_seq{1};
 std::atomic<unsigned long long> g_ckpt_seq{1};
 std::atomic<unsigned long long> g_study_seq{1};
@@ -335,11 +452,13 @@ std::string new_study_id() {
     return std::string(buf);
 }
 
+// Acquire (or look up already-held) session under the current thread's DocLock.
+// Callers MUST have a DocLock RAII on the stack; the first touch of each doc_id
+// locks that session's mutex (multi-doc via sorted upgrade — see DocLock::acquire).
 Session& require_session(const std::string& doc_id) {
-    auto it = g_sessions.find(doc_id);
-    if (it == g_sessions.end())
-        throw OpError("unknown_doc", "no such document: " + doc_id, {{"doc_id", doc_id}});
-    return it->second;
+    if (!t_current_doc_lock)
+        throw OpError("internal", "require_session without DocLock", {{"doc_id", doc_id}});
+    return t_current_doc_lock->acquire(doc_id);
 }
 
 json blank_part(const std::string& doc_id, const std::string& name) {
@@ -2644,17 +2763,39 @@ json refresh_derived_group(json& doc, const std::string& group, const json& bund
 
 // session.py::_resolve_source_session — find the live source session for a derived link's
 // source_doc_id, matching BOTH the registry key (session.doc_id) and the doc's internal id.
-// Caller holds g_mtx. Returns nullptr if the source doc is closed/absent.
+// Caller holds a DocLock. Acquires the source doc via multi-lock (sorted) so the returned
+// pointer is safe for the rest of the RAII scope. Returns nullptr if closed/absent.
 Session* resolve_source_session(const json& src_doc_id) {
     if (src_doc_id.is_null()) return nullptr;
+    std::string key;
     if (src_doc_id.is_string()) {
-        auto it = g_sessions.find(src_doc_id.get<std::string>());
-        if (it != g_sessions.end()) return &it->second;
+        key = src_doc_id.get<std::string>();
+        if (pin_session(key)) {
+            if (!t_current_doc_lock) return nullptr;
+            try {
+                return &t_current_doc_lock->acquire(key);
+            } catch (...) {
+                return nullptr;
+            }
+        }
     }
-    for (auto& kv : g_sessions)
-        if (kv.second.doc.is_object() &&
-            (kv.second.doc.contains("id") ? kv.second.doc["id"] : json(nullptr)) == src_doc_id)
-            return &kv.second;
+    // Match against each open session's internal doc["id"] (may differ from map key).
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        for (const auto& kv : g_sessions) ids.push_back(kv.first);
+    }
+    for (const std::string& id : ids) {
+        if (!t_current_doc_lock) return nullptr;
+        try {
+            Session& s = t_current_doc_lock->acquire(id);
+            if (s.doc.is_object() &&
+                (s.doc.contains("id") ? s.doc["id"] : json(nullptr)) == src_doc_id)
+                return &s;
+        } catch (...) {
+            continue;
+        }
+    }
     return nullptr;
 }
 
@@ -3186,8 +3327,13 @@ bool is_readonly_batch(const json& ops) {
 // constraints to the touched sketches (config-gated, default ON). Defined far below;
 // forward-declared here so apply_ops_locked can call it. `working` is the post-op doc,
 // pre-compile; `sketch_fids` are the sketch features the batch touched; `gen` mints ids.
+// `touched_eids` scopes the proximity scan (T-PERF10); empty = full scan.
 void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
-                          IdGen& gen);
+                          IdGen& gen,
+                          const std::unordered_set<std::string>& touched_eids = {});
+// Entity ids touched by sketch-mutating ops in a batch (T-PERF10 scope). Defined with
+// the auto-coincide helpers below.
+std::unordered_set<std::string> touched_entity_ids(const json& ops, const json& id_map);
 
 // The set of sketch feature ids a batch of ops touched. Two sources: (1) a
 // `sketch_*` op's "sketch" ref (interactive editing), and (2) an `add_feature` op that
@@ -3245,6 +3391,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     // tolerance) as coincident BEFORE validation/compile, so touching-corner profiles
     // are already closed when the model sees them. Config-gated (default ON), best-effort
     // — it only ADDS safe (non-conflicting) coincident constraints; a failure is silent.
+    // T-PERF10: proximity scan is scoped to entities this batch touched.
     {
         std::vector<std::string> sk_fids = touched_sketch_fids(ops, id_map);
         if (!sk_fids.empty()) {
@@ -3253,7 +3400,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
             // Without this, gen starts at its pre-op maximum and mints ids that collide
             // with authored ids in the newly-inserted feature params (T-DP7).
             gen.scan(working);
-            maybe_auto_constrain(working, sk_fids, gen);
+            maybe_auto_constrain(working, sk_fids, gen, touched_entity_ids(ops, id_map));
         }
     }
 
@@ -3352,13 +3499,23 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     return warm_and_respond(s, std::move(r), id_map, /*with_tess=*/true);
 }
 
-// Create + register a blank part session, returning a reference (caller holds g_mtx).
+// Create + register a blank part session. Inserts under the registry lock, then
+// acquires the new session on the current DocLock so the caller can use the ref.
 Session& new_part_session_locked(const std::string& name) {
-    Session s;
-    s.doc_id = new_doc_id();
-    s.doc = blank_part(s.doc_id, name);
-    s.revision = 0;
-    return g_sessions[s.doc_id] = std::move(s);
+    auto s = std::make_shared<Session>();
+    s->doc_id = new_doc_id();
+    s->doc = blank_part(s->doc_id, name);
+    s->revision = 0;
+    const std::string id = s->doc_id;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        g_sessions[id] = s;
+    }
+    // Lock the brand-new session on this thread's DocLock (no contention possible).
+    if (t_current_doc_lock) return t_current_doc_lock->acquire(id);
+    // Fallback (should not happen — public APIs always construct DocLock first).
+    s->mtx.lock();
+    return *s;
 }
 
 // ============================================================ C18 sketch helpers
@@ -3638,7 +3795,11 @@ SolveActive solve_active(Session& s, const json& feat,
     sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
     sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
 
-    aicad::sketch::SketchSolution sol = aicad::sketch::solve_sketch(sk, env, warm);
+    // Interactive solve (T-PERF8 LDLT + T-PERF9 component decomp). Exact/oracle
+    // callers hit solve_sketch without interactive; this path is the live sketcher.
+    aicad::sketch::SketchSolution sol =
+        aicad::sketch::solve_sketch(sk, env, warm, /*time_budget_ms=*/std::nullopt,
+                                    /*interactive=*/true);
 
     SolveActive out;
     out.rejected = !sol.conflicting.empty() || !sol.converged;
@@ -3728,25 +3889,28 @@ json sketch_result(const json& feat, const SolveActive& packed,
 }  // namespace
 
 // ----------------------------------------------------------------- crash recovery
-// Drop an orphaned g_mtx lock left held by THIS thread after a Windows structured
+// Drop orphaned per-doc mutexes left held by THIS thread after a Windows structured
 // exception (an access violation) unwound past a DocLock without running its C++
 // destructor under /EHsc. Called from the libaicad C dispatch boundary's __except
 // filter after such a fault, so the worker thread doesn't EDEADLK on its next call.
 //
-// SAFETY: an SEH unwind returns control to this same thread with the OS mutex STILL
-// owned by it (the lock_guard destructor was skipped, so no unlock ran). Calling
-// unlock() from the owning thread is therefore valid and exactly undoes the orphaned
-// lock(). We gate on g_mtx_held && g_mtx_owner == this-thread so we NEVER unlock a
-// mutex this thread doesn't own (which would be UB) and NEVER touch a lock another
-// thread legitimately holds. Idempotent: a second call no-ops once the flag is clear.
+// SAFETY: unlocks only mutexes tracked by this thread's DocLock chain (g_mtx_held &&
+// g_mtx_owner == this-thread). Idempotent: a second call no-ops once the flag is clear.
 bool force_release_doc_lock() {
     if (!g_mtx_held.load(std::memory_order_acquire)) return false;
-    // g_mtx_owner is only meaningful while held; it was last written under the lock by
-    // the DocLock that is now orphaned on THIS thread, so the read is consistent here.
     if (g_mtx_owner != std::this_thread::get_id()) return false;
+    bool released = false;
+    // Walk the nested DocLock chain and force-release each.
+    DocLock* lk = t_current_doc_lock;
+    while (lk) {
+        DocLock* prev = lk->previous();
+        lk->force_release();
+        released = true;
+        lk = prev;
+    }
+    t_current_doc_lock = nullptr;  // abandon the orphaned RAII objects
     g_mtx_held.store(false, std::memory_order_release);
-    g_mtx.unlock();
-    return true;
+    return released;
 }
 
 // ----------------------------------------------------------------- public API
@@ -3757,11 +3921,16 @@ json doc_new(const std::string& kind, const std::string& name) {
                       {{"kind", kind}, {"reason", "bad kind"}});
     DocLock lk;
     if (k == "assembly") {
-        Session s;
-        s.doc_id = new_doc_id();
-        s.doc = blank_assembly(s.doc_id, name);
-        s.revision = 0;
-        Session& stored = g_sessions[s.doc_id] = std::move(s);
+        auto sp = std::make_shared<Session>();
+        sp->doc_id = new_doc_id();
+        sp->doc = blank_assembly(sp->doc_id, name);
+        sp->revision = 0;
+        const std::string id = sp->doc_id;
+        {
+            std::lock_guard<std::mutex> reg(g_registry_mtx);
+            g_sessions[id] = sp;
+        }
+        Session& stored = lk.acquire(id);
         rebuild_assembly(stored);
         json resp = ops_response_assembly(stored, json::object());
         resp["doc_id"] = stored.doc_id;
@@ -3910,9 +4079,8 @@ json doc_live_source(const std::string& doc_id) {
     // for drawings / derived re-pulls). A missing doc returns null so the caller keeps
     // its last good snapshot rather than crashing when the source was closed.
     DocLock lk;
-    auto it = g_sessions.find(doc_id);
-    if (it == g_sessions.end()) return json(nullptr);
-    Session& s = it->second;
+    if (!pin_session(doc_id)) return json(nullptr);
+    Session& s = lk.acquire(doc_id);
     return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision}};
 }
 
@@ -4147,9 +4315,8 @@ json doc_asm_bom_components(const std::string& doc_id) {
     // Non-throwing: a missing / part / closed source returns an empty array so drawing_bom
     // degrades to an empty BOM rather than crashing (mirrors the oracle's try/except).
     DocLock lk;
-    auto it = g_sessions.find(doc_id);
-    if (it == g_sessions.end()) return json::array();
-    Session& s = it->second;
+    if (!pin_session(doc_id)) return json::array();
+    Session& s = lk.acquire(doc_id);
     if (!s.is_assembly()) return json::array();
     if (!s.asm_result) rebuild_assembly(s);
     if (!s.asm_result) return json::array();
@@ -4182,22 +4349,47 @@ json doc_asm_bom_components(const std::string& doc_id) {
 }
 
 bool doc_close(const std::string& doc_id) {
-    DocLock lk;
-    return g_sessions.erase(doc_id) > 0;
+    // Erase from the registry first (so new lookups fail), then acquire the
+    // session mutex to wait out any in-flight op before the shared_ptr drops.
+    std::shared_ptr<Session> pin;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        auto it = g_sessions.find(doc_id);
+        if (it == g_sessions.end()) return false;
+        pin = it->second;
+        g_sessions.erase(it);
+    }
+    {
+        std::lock_guard<std::mutex> doc(pin->mtx);
+        // Session teardown happens when `pin` goes out of scope after this unlock.
+        (void)doc_id;
+    }
+    return true;
 }
 
 json doc_list() {
-    DocLock lk;
+    // Snapshot under registry, then lock each session in sorted order to copy
+    // summary fields (T-PERF5: never hold registry while waiting on a doc mutex).
+    std::vector<std::pair<std::string, std::shared_ptr<Session>>> pins;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        pins.reserve(g_sessions.size());
+        for (const auto& kv : g_sessions) pins.emplace_back(kv.first, kv.second);
+    }
+    std::sort(pins.begin(), pins.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     json docs = json::array();
-    for (const auto& [id, s] : g_sessions) {
-        const std::string schema = s.doc.is_object() ? s.doc.value("schema", std::string()) : std::string();
+    for (const auto& [id, sp] : pins) {
+        std::lock_guard<std::mutex> doc(sp->mtx);
+        const std::string schema =
+            sp->doc.is_object() ? sp->doc.value("schema", std::string()) : std::string();
         docs.push_back({
-            {"doc_id", s.doc_id},
-            {"name", s.doc.is_object() ? s.doc.value("name", s.doc_id) : s.doc_id},
+            {"doc_id", sp->doc_id},
+            {"name", sp->doc.is_object() ? sp->doc.value("name", sp->doc_id) : sp->doc_id},
             {"kind", schema == "aicad.asm/1" ? "assembly" : "part"},
-            {"path", s.path.empty() ? json(nullptr) : json(s.path)},
-            {"revision", s.revision},
-            {"dirty", s.dirty},
+            {"path", sp->path.empty() ? json(nullptr) : json(sp->path)},
+            {"revision", sp->revision},
+            {"dirty", sp->dirty},
         });
     }
     return json{{"docs", docs}};
@@ -8660,15 +8852,20 @@ json doc_open(const std::string& path, bool as_solid) {
                           schema + "')",
                       {{"schema", schema}, {"reason", "unsupported document kind"}});
 
-    Session s;
-    s.doc_id = new_doc_id();
-    s.doc = std::move(loaded.doc);
-    s.revision = 0;
-    s.path = path;
-    s.extra_entries = std::move(loaded.extra);
+    auto sp = std::make_shared<Session>();
+    sp->doc_id = new_doc_id();
+    sp->doc = std::move(loaded.doc);
+    sp->revision = 0;
+    sp->path = path;
+    sp->extra_entries = std::move(loaded.extra);
     // Stamp the document's own id to the new session id (mirrors blank_part).
-    if (s.doc.is_object()) s.doc["id"] = s.doc_id;
-    Session& stored = g_sessions[s.doc_id] = std::move(s);
+    if (sp->doc.is_object()) sp->doc["id"] = sp->doc_id;
+    const std::string sid = sp->doc_id;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        g_sessions[sid] = sp;
+    }
+    Session& stored = lk.acquire(sid);
 
     // Fast cold-open via the persisted geometry cache: if the container carries a valid
     // cache.json/cache.aicm (engine key + doc hash both match the loaded tree), return the
@@ -9602,17 +9799,26 @@ std::unordered_set<std::string> coincident_pair_set(const json& constraints) {
 // already coincident-constrained. Read-only over the SOLVED coords. Each endpoint joins
 // at most one NEW proposal (a greedy union so a shared corner emits one edge, not a
 // clique). Endpoints on the SAME entity are never paired (self-coincidence is noise).
+//
+// T-PERF10: when `touched_eids` is non-empty, only pairs where at least ONE endpoint
+// belongs to a touched entity are considered — O(E·T) instead of O(E²) on edit of a
+// single entity in a large sketch. Empty set = full scan (explicit auto-constrain RPC).
 // Returns [{a:{handle}, b:{handle}, gap_mm}], nearest-first.
 json coincident_proposals(const json& solved_coords, const json& constraints,
-                          double tol_mm) {
+                          double tol_mm,
+                          const std::unordered_set<std::string>& touched_eids = {}) {
     std::vector<aicad::sketch::Endpoint> eps =
         aicad::sketch::entity_endpoints(solved_coords);
     const std::unordered_set<std::string> linked = coincident_pair_set(constraints);
+    const bool scope = !touched_eids.empty();
     struct Cand { int i, j; double gap; };
     std::vector<Cand> cands;
     for (size_t i = 0; i < eps.size(); ++i)
         for (size_t j = i + 1; j < eps.size(); ++j) {
-            if (handle_eid(eps[i].handle) == handle_eid(eps[j].handle)) continue;
+            const std::string ei = handle_eid(eps[i].handle);
+            const std::string ej = handle_eid(eps[j].handle);
+            if (ei == ej) continue;
+            if (scope && !touched_eids.count(ei) && !touched_eids.count(ej)) continue;
             double dx = eps[i].x - eps[j].x, dy = eps[i].y - eps[j].y;
             double gap = std::sqrt(dx * dx + dy * dy);
             if (gap > tol_mm) continue;
@@ -9631,6 +9837,55 @@ json coincident_proposals(const json& solved_coords, const json& constraints,
         out.push_back({{"a", {{"handle", eps[c.i].handle}}},
                        {"b", {{"handle", eps[c.j].handle}}},
                        {"gap_mm", c.gap}});
+    }
+    return out;
+}
+
+// Entity ids a sketch-mutating op batch touched (for scoped auto-coincide). Covers
+// sketch_add_entity / sketch_edit_entity / sketch_delete_entity entity refs, plus every
+// entity in a newly-created sketch feature (add_feature of type sketch).
+std::unordered_set<std::string> touched_entity_ids(const json& ops, const json& id_map) {
+    std::unordered_set<std::string> out;
+    if (!ops.is_array()) return out;
+    auto add_eid = [&](json e) {
+        resolve_placeholders_deep(e, id_map);
+        if (e.is_string()) out.insert(e.get<std::string>());
+    };
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const json& op = ops[i];
+        if (!op.is_object()) continue;
+        const std::string k = op.value("op", std::string());
+        if (k == "add_feature" && op.contains("feature") && op["feature"].is_object() &&
+            op["feature"].value("type", std::string()) == "sketch") {
+            // New sketch: every entity is "touched".
+            const json* ents = nullptr;
+            if (op["feature"].contains("params") && op["feature"]["params"].is_object() &&
+                op["feature"]["params"].contains("entities"))
+                ents = &op["feature"]["params"]["entities"];
+            else if (op["feature"].contains("entities"))
+                ents = &op["feature"]["entities"];
+            if (ents && ents->is_array())
+                for (const json& e : *ents)
+                    if (e.is_object() && e.contains("id") && e["id"].is_string())
+                        out.insert(e["id"].get<std::string>());
+            continue;
+        }
+        if (k == "sketch_add_entity") {
+            if (op.contains("entity") && op["entity"].is_object() &&
+                op["entity"].contains("id") && op["entity"]["id"].is_string())
+                out.insert(op["entity"]["id"].get<std::string>());
+            // Placeholder $N may also map the minted id.
+            const std::string ph = "$" + std::to_string(i);
+            if (id_map.contains(ph) && id_map[ph].is_string())
+                out.insert(id_map[ph].get<std::string>());
+            if (op.contains("id")) add_eid(op["id"]);
+            continue;
+        }
+        if (k == "sketch_edit_entity" || k == "sketch_delete_entity") {
+            if (op.contains("entity")) add_eid(op["entity"]);
+            if (op.contains("id")) add_eid(op["id"]);
+            continue;
+        }
     }
     return out;
 }
@@ -9750,16 +10005,19 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
 // failure on a feature leaves it untouched (never blocks the user's edit). This is the
 // "touching endpoints are already coincident before the model sees a not-closed error"
 // path — it adds constraints, so touching-corner profiles close automatically.
+// `touched_eids` (T-PERF10) scopes the O(E²) proximity scan to entities this batch
+// created/edited; empty = full scan (e.g. brand-new multi-entity sketch).
 void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
-                          IdGen& gen) {
+                          IdGen& gen,
+                          const std::unordered_set<std::string>& touched_eids) {
     if (!sketch_auto_coincident_enabled(working)) return;
     if (!working.contains("features") || !working["features"].is_array()) return;
     const double tol_mm = 1e-4;
     // Wall-clock budget for the solves this pass runs: it executes INSIDE every
-    // sketch-mutating apply_ops batch under the global doc lock (the drag path has had
+    // sketch-mutating apply_ops batch under the per-doc lock (the drag path has had
     // a 10 ms budget since day one — see sketch.cpp drag). A pathological sketch now
     // degrades to "no auto pins this edit" (best-effort, like every other failure here)
-    // instead of stalling all RPC traffic behind the lock. Parity/oracle-facing solves
+    // instead of stalling this doc's RPC traffic. Parity/oracle-facing solves
     // (check_sketch, doc_sketch_health, the compile pipeline) remain unbudgeted.
     const double kInteractiveSolveBudgetMs = 100.0;
     json env = env_from_doc(working);
@@ -9778,7 +10036,8 @@ void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_
                                                 kInteractiveSolveBudgetMs,
                                                 /*interactive=*/true);
                 if (!sol.converged) break;  // don't auto-touch a broken sketch
-                json proposals = coincident_proposals(sol.entities, sk["constraints"], tol_mm);
+                json proposals = coincident_proposals(sol.entities, sk["constraints"],
+                                                      tol_mm, touched_eids);
                 if (proposals.empty()) break;
                 json res = apply_coincident_proposals(params, proposals, env, gen,
                                                       kInteractiveSolveBudgetMs);
@@ -10721,7 +10980,8 @@ json doc_dep_register(const std::string& source_doc_id,
                       const std::string& dep_doc_id,
                       const std::string& kind,
                       long linked_revision) {
-    DocLock lk;
+    // Registry-only: g_dep_registry is guarded by g_registry_mtx (T-PERF5).
+    std::lock_guard<std::mutex> reg(g_registry_mtx);
     auto& entries = g_dep_registry[source_doc_id];
     // Upsert: find existing entry for (dep_doc_id, kind) and update revision.
     for (auto& e : entries) {
@@ -10736,29 +10996,31 @@ json doc_dep_register(const std::string& source_doc_id,
 }
 
 json doc_dep_query(const std::string& source_doc_id, const std::string& kind_filter) {
-    DocLock lk;
-    // Look up the source session to get its current revision (if open).
     long src_rev = -1;
-    {
-        auto it = g_sessions.find(source_doc_id);
-        if (it != g_sessions.end()) src_rev = it->second.revision;
+    if (auto pin = pin_session(source_doc_id)) {
+        std::lock_guard<std::mutex> doc(pin->mtx);
+        src_rev = pin->revision;
     }
 
     json deps = json::array();
-    auto it = g_dep_registry.find(source_doc_id);
-    if (it != g_dep_registry.end()) {
-        for (const auto& e : it->second) {
-            if (!kind_filter.empty() && e.kind != kind_filter) continue;
-            bool stale = e.stale;
-            // Also check live revision if the source is open.
-            if (!stale && src_rev >= 0 && e.linked_revision >= 0 && src_rev > e.linked_revision)
-                stale = true;
-            deps.push_back(json{
-                {"dep_doc_id",       e.dep_doc_id},
-                {"kind",             e.kind},
-                {"linked_revision",  e.linked_revision},
-                {"stale",            stale},
-            });
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        auto it = g_dep_registry.find(source_doc_id);
+        if (it != g_dep_registry.end()) {
+            for (const auto& e : it->second) {
+                if (!kind_filter.empty() && e.kind != kind_filter) continue;
+                bool stale = e.stale;
+                // Also check live revision if the source is open.
+                if (!stale && src_rev >= 0 && e.linked_revision >= 0 &&
+                    src_rev > e.linked_revision)
+                    stale = true;
+                deps.push_back(json{
+                    {"dep_doc_id", e.dep_doc_id},
+                    {"kind", e.kind},
+                    {"linked_revision", e.linked_revision},
+                    {"stale", stale},
+                });
+            }
         }
     }
     return json{{"source_doc_id", source_doc_id},
@@ -10766,9 +11028,11 @@ json doc_dep_query(const std::string& source_doc_id, const std::string& kind_fil
                 {"dependents", deps}};
 }
 
-// Internal: mark dependents stale WITHOUT acquiring DocLock.
-// Called from warm_and_respond (which already holds the lock).
+// Internal: mark dependents stale. Takes g_registry_mtx. Called from
+// warm_and_respond (which holds the source session lock — registry after
+// session is allowed; we never take a session mutex under the registry).
 static int dep_notify_unlocked(const std::string& source_doc_id, long new_revision) {
+    std::lock_guard<std::mutex> reg(g_registry_mtx);
     int notified = 0;
     auto it = g_dep_registry.find(source_doc_id);
     if (it != g_dep_registry.end()) {
@@ -10783,13 +11047,12 @@ static int dep_notify_unlocked(const std::string& source_doc_id, long new_revisi
 }
 
 json doc_dep_notify(const std::string& source_doc_id, long new_revision) {
-    DocLock lk;
     int notified = dep_notify_unlocked(source_doc_id, new_revision);
     return json{{"notified", notified}, {"source_revision", new_revision}};
 }
 
 json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind) {
-    DocLock lk;
+    std::lock_guard<std::mutex> reg(g_registry_mtx);
     int removed = 0;
     for (auto& kv : g_dep_registry) {
         auto& vec = kv.second;

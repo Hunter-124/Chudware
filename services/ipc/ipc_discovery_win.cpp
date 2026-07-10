@@ -177,6 +177,9 @@ void SingleInstance::release() {
         h_ = nullptr;
         path_.clear();
     }
+    // Named pipes have no sock file; sock_path_ is a no-op on Windows (cleared for
+    // API parity with the POSIX drain-window path).
+    sock_path_.clear();
 }
 
 bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {

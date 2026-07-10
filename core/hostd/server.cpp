@@ -67,8 +67,18 @@ void Server::sendEventTo(int clientId, const std::string& line) {
     c->conn.writeLine(line);
 }
 
+std::string Server::detachSocketForFlockRelease() {
+    // Close the listen fd so new connects fail, but leave the sock file for
+    // SingleInstance to unlink when it drops the flock (T-PERF10).
+    std::string path = listener_.releasePath();
+    listener_.close(/*unlink_path=*/false);
+    return path;
+}
+
 Server::~Server() {
-    listener_.close();
+    // If detachSocketForFlockRelease already ran, path is empty and close is a no-op
+    // on the fd; otherwise fall back to the historical unlink-on-close behavior.
+    listener_.close(/*unlink_path=*/true);
     std::vector<std::shared_ptr<ClientConn>> live;
     {
         std::lock_guard<std::mutex> lk(clientsMtx_);

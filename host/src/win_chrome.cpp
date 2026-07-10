@@ -132,6 +132,12 @@ double g_startSx = 0, g_startSy = 0;  // cursor screen pos at grab
 int g_startX = 0, g_startY = 0, g_startW = 0, g_startH = 0;
 bool g_prevDown = false;
 double g_lastCaptionClick = -1.0;
+// Maximized/snapped tear-off: caption grabbed while maximized. We DON'T un-maximize on the grab —
+// only a deliberate downward pull (dy > kTearoff) restores the window and drops it under the cursor,
+// Windows-style. Sideways motion keeps it snapped.
+bool g_maxedPending = false;
+double g_grabRelX = 0.5;   // fractional x of the grab across the maximized width (0..1)
+double g_grabCy = 0.0;     // cursor y within the caption at grab
 
 bool maximized(GLFWwindow* w) { return glfwGetWindowAttrib(w, GLFW_MAXIMIZED) != 0; }
 
@@ -197,10 +203,16 @@ void tick(GLFWwindow* win, HitLayout* layout) {
                 g_lastCaptionClick = -1.0;
             } else {
                 g_lastCaptionClick = now;
-                if (!maxed) {
-                    g_mode = Mode::Drag;
-                    cursorScreen(win, g_startSx, g_startSy);
-                    glfwGetWindowPos(win, &g_startX, &g_startY);
+                g_mode = Mode::Drag;
+                cursorScreen(win, g_startSx, g_startSy);
+                glfwGetWindowPos(win, &g_startX, &g_startY);
+                if (maxed) {
+                    // Snapped/maximized: arm the tear-off but stay put until the user pulls DOWN.
+                    g_maxedPending = true;
+                    g_grabRelX = ww > 0 ? cx / (double)ww : 0.5;
+                    g_grabCy = cy;
+                } else {
+                    g_maxedPending = false;
                 }
             }
         }
@@ -211,7 +223,30 @@ void tick(GLFWwindow* win, HitLayout* layout) {
         cursorScreen(win, sx, sy);
         const int dx = (int)(sx - g_startSx), dy = (int)(sy - g_startSy);
         if (g_mode == Mode::Drag) {
-            glfwSetWindowPos(win, g_startX + dx, g_startY + dy);
+            if (g_maxedPending) {
+                // Still snapped: wait for a deliberate DOWNWARD pull before tearing off. A
+                // sideways/upward drag leaves the window maximized (motion ignored).
+                const int kTearoff = 12;
+                if (dy > kTearoff) {
+                    glfwRestoreWindow(win);
+                    int rw = 0, rh = 0;
+                    glfwGetWindowSize(win, &rw, &rh);
+                    // Drop the restored window under the cursor: same fractional x across its width,
+                    // and the caption grab-point pinned under the pointer (clamped into the caption).
+                    double gy = g_grabCy < 0 ? 0 : (g_grabCy > H ? H : g_grabCy);
+                    const int nx = (int)(sx - g_grabRelX * rw);
+                    const int ny = (int)(sy - gy);
+                    glfwSetWindowPos(win, nx, ny);
+                    // Re-anchor the drag origin to NOW so the rest of the drag tracks 1:1.
+                    g_startX = nx;
+                    g_startY = ny;
+                    g_startSx = sx;
+                    g_startSy = sy;
+                    g_maxedPending = false;
+                }
+            } else {
+                glfwSetWindowPos(win, g_startX + dx, g_startY + dy);
+            }
         } else {  // Resize
             const int MINW = 640, MINH = 420;
             int nx = g_startX, ny = g_startY, nw = g_startW, nh = g_startH;
@@ -234,7 +269,10 @@ void tick(GLFWwindow* win, HitLayout* layout) {
         }
     }
 
-    if (!down) g_mode = Mode::None;
+    if (!down) {
+        g_mode = Mode::None;
+        g_maxedPending = false;
+    }
     g_prevDown = down;
 }
 

@@ -134,6 +134,13 @@ struct PartsState {
     bool hasLive = false;
     std::vector<Notice> notices;   // per-site skip reasons from the last parts_search
 
+    // ---- streaming live vendor search (results paint as each vendor lands) ----
+    bool        liveSearching = false;  // a live fan-out job is in flight
+    bool        livePolling   = false;  // parts_search_live_poll in flight (single-flight)
+    std::string liveToken;              // current job token; stale-poll guard
+    int         liveCursor    = 0;      // results already drained from the job
+    double      lastLivePoll  = 0.0;
+
     // ---- filters (sent with parts_search) ----
     float priceMin = 0.0f;
     float priceMax = 0.0f;      // 0 = no cap
@@ -200,6 +207,8 @@ void loadCategories(AppState& st);
 void loadTaxonomy(AppState& st);     // parts_taxonomy → S().taxonomyRoot (falls back to loadCategories)
 void loadVendors(AppState& st, bool force = false);
 void doSearch(AppState& st);
+void startLiveSearch(AppState& st);
+void pollLiveSearch(AppState& st);
 void pollQueue(AppState& st);
 void queueDownload(AppState& st, const PartsItem& item);
 void insertItem(AppState& st, const PartsItem& item);

@@ -222,7 +222,7 @@ class TestCategoryRoutedPartsSearch:
         """A facets length_mm range must keep the in-range bolt and drop the long one."""
         import engine_oracle.parts_hub as hub_mod
 
-        def _fake_search(query, *, domain=None, filters=None, limit=20):
+        def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             def bolt(pid, length):
                 return {"part_id": f"fastener:SYN:{pid}", "domain": "fastener",
                         "title": f"Synthetic bolt {pid}", "designation": pid,
@@ -241,7 +241,7 @@ class TestCategoryRoutedPartsSearch:
     def test_facet_enum_filters_synthetic_bolt(self, monkeypatch):
         import engine_oracle.parts_hub as hub_mod
 
-        def _fake_search(query, *, domain=None, filters=None, limit=20):
+        def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             return [{"part_id": "fastener:SYN:M8", "domain": "fastener",
                      "title": "Synthetic M8", "designation": "M8",
                      "params": {"thread": "M8"}, "sourcing": [],

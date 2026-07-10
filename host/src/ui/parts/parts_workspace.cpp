@@ -160,15 +160,78 @@ void loadVendors(AppState& st, bool force) {
     });
 }
 
+// Client-side result sort, shared by the initial local search and each live append
+// so the merged list stays ordered as vendor results trickle in. Relevance (0) keeps
+// the backend order (local first, then live in arrival order).
+static void applyResultSort() {
+    auto& v = S().results;
+    switch (S().sortMode) {
+        case 1: std::stable_sort(v.begin(), v.end(),
+                    [](const PartsItem& a, const PartsItem& b) {
+                        if ((a.priceUsd > 0) != (b.priceUsd > 0)) return a.priceUsd > 0;
+                        return a.priceUsd < b.priceUsd; });
+                break;
+        case 2: std::stable_sort(v.begin(), v.end(),
+                    [](const PartsItem& a, const PartsItem& b) { return a.priceUsd > b.priceUsd; });
+                break;
+        case 3: std::stable_sort(v.begin(), v.end(),
+                    [](const PartsItem& a, const PartsItem& b) { return a.name < b.name; });
+                break;
+        default: break;
+    }
+}
+
+// Fill a PartsItem from a backend result object (shared by local + live paths).
+static PartsItem itemFromJson(const nlohmann::json& it) {
+    PartsItem item;
+    item.id          = it.value("id",          "");
+    item.name        = it.value("name",        "");
+    item.vendor      = it.value("vendor",      "");
+    item.partNumber  = it.value("part_number", "");
+    item.description = it.value("description", "");
+    item.unit        = it.value("unit",        "ea");
+    item.material    = it.value("material",    "");
+    item.domain      = it.value("domain",      "");
+    item.standard    = it.value("standard",    "");
+    item.source      = it.value("source",      "local");
+    item.datasheet   = it.value("datasheet",   "");
+    item.imageUrl    = it.value("image_url",   "");
+    item.license     = it.value("license",     "");
+    item.priceUsd    = it.value("price_usd",   0.0);
+    item.downloaded  = it.value("downloaded",  false);
+    item.placeable   = it.value("placeable",   false);
+    return item;
+}
+
+static void collectNotices(const nlohmann::json& res) {
+    if (res.contains("notices") && res["notices"].is_array())
+        for (auto& n : res["notices"]) {
+            Notice nt;
+            nt.site   = n.value("site",   "");
+            nt.reason = n.value("reason", "");
+            nt.hint   = n.value("hint",   "");
+            // De-dupe against notices already shown (live polls re-send the full set).
+            bool dup = false;
+            for (const auto& e : S().notices)
+                if (e.site == nt.site && e.reason == nt.reason) { dup = true; break; }
+            if (!dup) S().notices.push_back(std::move(nt));
+        }
+}
+
 void doSearch(AppState& st) {
     if (S().searching) return;
     S().searching  = true;
     S().searchDone = false;
     S().searchErr.clear();
     S().results.clear();
+    // A fresh query invalidates any in-flight live job (stale polls are dropped).
+    S().liveSearching = false;
+    S().liveToken.clear();
+    S().liveCursor = 0;
     nlohmann::json p;
     p["query"]    = S().searchBuf;
     p["limit"]    = 100;
+    p["live"]     = false;   // instant local layer only; live vendors stream separately
     // Tree mode → taxonomy category_id (incl. vendors.*.<site> leaves = browse that vendor);
     // fallback flat mode keeps the legacy "category" param.
     if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
@@ -197,7 +260,7 @@ void doSearch(AppState& st) {
         }
         if (!facets.empty()) p["facets"] = std::move(facets);
     }
-    st.rpc.call("parts_search", p, [](const core::RpcResult& r) {
+    st.rpc.call("parts_search", p, [&st](const core::RpcResult& r) {
         S().searching  = false;
         S().searchDone = true;
         if (!r.ok) { S().searchErr = r.err; return; }
@@ -211,51 +274,93 @@ void doSearch(AppState& st) {
         // Per-site skip notices (login_required stubs) — shown as a hint line under the
         // results header instead of blank rows.
         S().notices.clear();
-        if (r.result.contains("notices") && r.result["notices"].is_array())
-            for (auto& n : r.result["notices"]) {
-                Notice nt;
-                nt.site   = n.value("site",   "");
-                nt.reason = n.value("reason", "");
-                nt.hint   = n.value("hint",   "");
-                S().notices.push_back(std::move(nt));
-            }
-        if (!r.result.contains("results")) return;
-        for (auto& it : r.result["results"]) {
-            PartsItem item;
-            item.id          = it.value("id",          "");
-            item.name        = it.value("name",        "");
-            item.vendor      = it.value("vendor",      "");
-            item.partNumber  = it.value("part_number", "");
-            item.description = it.value("description", "");
-            item.unit        = it.value("unit",        "ea");
-            item.material    = it.value("material",    "");
-            item.domain      = it.value("domain",      "");
-            item.standard    = it.value("standard",    "");
-            item.source      = it.value("source",      "local");
-            item.datasheet   = it.value("datasheet",   "");
-            item.imageUrl    = it.value("image_url",   "");
-            item.license     = it.value("license",     "");
-            item.priceUsd    = it.value("price_usd",   0.0);
-            item.downloaded  = it.value("downloaded",  false);
-            item.placeable   = it.value("placeable",   false);
-            S().results.push_back(std::move(item));
-        }
+        collectNotices(r.result);
+        if (r.result.contains("results"))
+            for (auto& it : r.result["results"])
+                S().results.push_back(itemFromJson(it));
         // Client-side sort (relevance = backend order). 1 = price low→high (zero-price
         // last), 2 = price high→low, 3 = name.
-        auto& v = S().results;
-        switch (S().sortMode) {
-            case 1: std::stable_sort(v.begin(), v.end(),
-                        [](const PartsItem& a, const PartsItem& b) {
-                            if ((a.priceUsd > 0) != (b.priceUsd > 0)) return a.priceUsd > 0;
-                            return a.priceUsd < b.priceUsd; });
-                    break;
-            case 2: std::stable_sort(v.begin(), v.end(),
-                        [](const PartsItem& a, const PartsItem& b) { return a.priceUsd > b.priceUsd; });
-                    break;
-            case 3: std::stable_sort(v.begin(), v.end(),
-                        [](const PartsItem& a, const PartsItem& b) { return a.name < b.name; });
-                    break;
-            default: break;
+        applyResultSort();
+        // Local results are up — now stream live vendor hits in the background so the
+        // slow browser fan-out never blocks the initial paint. Skipped when the user
+        // has filtered to Local-only.
+        if (S().sourceFilter != 1)
+            startLiveSearch(st);
+    });
+}
+
+// Build the same routing params as doSearch (query + category + filters) so the live
+// fan-out targets the identical set the local search resolved.
+static void fillSearchParams(nlohmann::json& p) {
+    p["query"] = S().searchBuf;
+    p["limit"] = 100;
+    if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
+    else                    p["category"]    = S().selectedCategory;
+    if (S().priceMin > 0.0f) p["price_min"] = S().priceMin;
+    if (S().priceMax > 0.0f) p["price_max"] = S().priceMax;
+    if (S().materialBuf[0])  p["material"]  = S().materialBuf;
+    if (S().vendorBuf[0])    p["vendor"]    = S().vendorBuf;
+    if (S().sourceFilter == 2) p["source"] = "live";
+    nlohmann::json facets = nlohmann::json::object();
+    for (const auto& [key, fv] : S().facetValues) {
+        if (!fv.active()) continue;
+        if (fv.rmin != 0.0f || fv.rmax != 0.0f) {
+            nlohmann::json range = nlohmann::json::object();
+            if (fv.rmin != 0.0f) range["min"] = fv.rmin;
+            if (fv.rmax != 0.0f) range["max"] = fv.rmax;
+            facets[key] = std::move(range);
+        } else if (!fv.multi.empty()) {
+            facets[key] = std::vector<std::string>(fv.multi.begin(), fv.multi.end());
+        } else if (fv.text[0]) {
+            facets[key] = fv.text;
+        }
+    }
+    if (!facets.empty()) p["facets"] = std::move(facets);
+}
+
+void startLiveSearch(AppState& st) {
+    nlohmann::json p;
+    fillSearchParams(p);
+    st.rpc.call("parts_search_live_start", p, [&st](const core::RpcResult& r) {
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
+        std::string token = r.result.value("token", "");
+        if (token.empty() || r.result.value("done", false)) return;  // no live vendors
+        S().liveToken     = token;
+        S().liveCursor    = 0;
+        S().liveSearching = true;
+        S().lastLivePoll  = 0.0;   // poll on the next tick
+    });
+}
+
+void pollLiveSearch(AppState& st) {
+    if (S().livePolling || S().liveToken.empty()) return;
+    S().livePolling  = true;
+    S().lastLivePoll = ImGui::GetTime();
+    nlohmann::json p;
+    p["token"]  = S().liveToken;
+    p["cursor"] = S().liveCursor;
+    const std::string token = S().liveToken;
+    st.rpc.call("parts_search_live_poll", p, [token](const core::RpcResult& r) {
+        S().livePolling = false;
+        // Drop results from a superseded job (a newer query changed the token).
+        if (token != S().liveToken) return;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            S().liveSearching = false;   // give up quietly; local results stay
+            return;
+        }
+        bool appended = false;
+        if (r.result.contains("results"))
+            for (auto& it : r.result["results"]) {
+                S().results.push_back(itemFromJson(it));
+                S().hasLive = true;
+                appended = true;
+            }
+        collectNotices(r.result);
+        S().liveCursor = r.result.value("cursor", S().liveCursor);
+        if (appended) applyResultSort();
+        if (r.result.value("done", false)) {
+            S().liveSearching = false;
+            S().liveToken.clear();
         }
     });
 }
@@ -518,6 +623,12 @@ void drawPartsLibraryWorkspace(AppState& st) {
         doSearch(st);
     }
 
+    // Drive the streaming live-vendor poll (~2.5 Hz) while a fan-out is in flight so
+    // results paint as each vendor lands, without a per-frame RPC.
+    if (S().liveSearching && !S().livePolling &&
+        ImGui::GetTime() - S().lastLivePoll > 0.4)
+        pollLiveSearch(st);
+
     if (!st.workerStarted) {
         emptyState("parts_all", "Parts Library unavailable",
                    "The AI-CAD worker service is not running.");
@@ -595,6 +706,12 @@ void drawPartsLibraryWorkspace(AppState& st) {
             else
                 std::snprintf(hdr, sizeof(hdr), "Parts");
             sectionHeader(hdr, /*firstInPane=*/true);
+        }
+        // While the background vendor fan-out is still running, show a subtle
+        // "loading more" line so the user knows more results are on the way.
+        if (S().liveSearching && !S().results.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("· loading more from vendors…");
         }
         // Subtle one-line hint for per-site skip notices (login_required stubs).
         if (!S().notices.empty()) {

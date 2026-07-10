@@ -83,6 +83,7 @@ void drawResultsList(AppState& st) {
         return;
     }
     if (S().results.empty()) {
+        if (S().liveSearching) { spinner("Searching vendors"); return; }
         if (S().searchDone)
             emptyState("cancel_x", "No results",
                        "Try a different search term, category, or loosen the filters.");
@@ -214,6 +215,7 @@ void drawResultsGrid(AppState& st) {
 
     if (S().searching) { spinner("Searching"); return; }
     if (S().results.empty()) {
+        if (S().liveSearching) { spinner("Searching vendors"); return; }
         if (S().searchDone)
             emptyState("cancel_x", "No results", "Try a different search term or category.");
         else

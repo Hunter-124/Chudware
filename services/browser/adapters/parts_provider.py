@@ -68,13 +68,23 @@ class BrowserCatalogAdapter:
                 continue
             part_id = self._part_id(hit)
             self._cache[part_id] = hit
+            # Carry the product thumbnail (and any sku the adapter surfaced) through
+            # to the record's params so the GUI grid can show an image straight from
+            # the search hit — no second acquire() round-trip. Without this the field
+            # was dropped here and every live result rendered as a bare glyph.
+            params: dict = {"site": self._site, "url": hit.get("url", "")}
+            thumb = hit.get("thumbnail") or hit.get("image_url") or hit.get("image")
+            if thumb:
+                params["thumbnail"] = thumb
+            if hit.get("sku"):
+                params["sku"] = hit["sku"]
             records.append({
                 "part_id": part_id,
                 "domain": self.domain,
                 "title": hit.get("title", ""),
                 "standard": None,
                 "designation": None,
-                "params": {"site": self._site, "url": hit.get("url", "")},
+                "params": params,
                 "geometry_ref": None,  # not yet downloaded — part_get triggers acquisition
                 "sourcing": [],
                 "provenance": f"{self._site} search result via the user's own browser "

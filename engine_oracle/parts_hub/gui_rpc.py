@@ -211,57 +211,127 @@ def _parts_taxonomy(params: dict, _emit: Callable) -> dict:
 
 # ---- search -----------------------------------------------------------------------
 
+def _compute_routing(p: dict) -> dict:
+    """Resolve a GUI search request into engine routing (domain / site / vendor
+    fan-out list / facet defs). Shared by the instant local search and the
+    streaming live fan-out so both agree on where a query is sent."""
+    query       = str(p.get("query", "")).strip()
+    category    = str(p.get("category", "")).strip()
+    category_id = str(p.get("category_id", "")).strip()
+
+    domain: str | list[str] | None = None
+    site: str | None = None
+    route_sites: list[str] = []
+    query_terms: list[str] = []
+    facet_defs: list[dict] = []
+
+    if category_id:
+        # V2 taxonomy routing — unknown ids degrade to an unrouted search.
+        from engine_oracle.parts_hub import taxonomy as _tax
+        if _tax.get_node(category_id) is not None:
+            routing = _tax.route(category_id)
+            domain = routing["domains"] or None
+            route_sites = routing["sites"]
+            query_terms = routing["query_terms"]
+            facet_defs = _tax.effective_facets(category_id)
+    elif category.startswith("catalog:"):
+        # Legacy flat-category vocabulary (kept working verbatim).
+        domain, site = "catalog", category.split(":", 1)[1]
+    elif category:
+        domain = category
+
+    vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
+    return {"query": query, "category_id": category_id, "domain": domain, "site": site,
+            "route_sites": route_sites, "facet_defs": facet_defs,
+            "vendor_query": vendor_query}
+
+
+def _split_notices(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Separate real records from login_required/unavailable stubs (no part_id or
+    title). Stubs become actionable per-site notices instead of blank rows."""
+    notices: list[dict] = []
+    seen_notice: set = set()
+    clean: list[dict] = []
+    for r in records:
+        pid = str(r.get("part_id", "") or "")
+        title = str(r.get("title", "") or "").strip()
+        if pid and title:
+            clean.append(r)
+            continue
+        n_site = str(r.get("site", "") or "")
+        if not n_site and pid.startswith("catalog:"):
+            n_site = pid[len("catalog:"):].split("::", 1)[0]
+        n_reason = str(r.get("reason", "") or "unavailable")
+        if (n_site, n_reason) not in seen_notice:
+            seen_notice.add((n_site, n_reason))
+            notices.append({"site": n_site, "reason": n_reason,
+                            "hint": str(r.get("hint", "") or "")})
+    return clean, notices
+
+
+def _filter_items(records: list[dict], p: dict, facet_defs: list[dict]) -> list[dict]:
+    """Convert records → GUI items and apply the GUI post-filters (price / material /
+    vendor / source / facets)."""
+    facets_q = p.get("facets") if isinstance(p.get("facets"), dict) else {}
+    items = [_record_to_item(r) for r in records]
+
+    def _f(v: Any, dflt: float) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return dflt
+    price_min = _f(p.get("price_min"), 0.0)
+    price_max = _f(p.get("price_max"), 0.0)
+    material  = str(p.get("material", "")).strip().lower()
+    vendor    = str(p.get("vendor", "")).strip().lower()
+    source    = str(p.get("source", "")).strip().lower()  # "", "local", "live"
+
+    if facets_q:
+        from engine_oracle.parts_hub.taxonomy import match_facets as _match_facets
+        items = [i for i, r in zip(items, records)
+                 if _match_facets(r.get("params") or {}, facets_q, facet_defs)]
+    if price_min > 0:
+        items = [i for i in items if i["price_usd"] >= price_min]
+    if price_max > 0:
+        items = [i for i in items if 0 < i["price_usd"] <= price_max]
+    if material:
+        items = [i for i in items if material in i["material"].lower()]
+    if vendor:
+        items = [i for i in items if vendor in i["vendor"].lower()]
+    if source in ("local", "live"):
+        items = [i for i in items if i["source"] == source]
+    return items
+
+
 def _parts_search(params: dict, _emit: Callable) -> dict:
+    """Instant local parts search.
+
+    By default (``live`` unset) this behaves like the legacy call: local FTS plus a
+    synchronous browser fan-out. The Parts Library GUI now passes ``live=False`` to
+    get ONLY the instant local layer, then streams live vendor hits separately via
+    ``parts_search_live_start`` / ``parts_search_live_poll`` so results paint as they
+    arrive instead of blocking on the slowest vendor."""
     try:
         from engine_oracle.parts_hub import search as _search
         p = params or {}
-        query       = str(p.get("query", "")).strip()
-        category    = str(p.get("category", "")).strip()
-        category_id = str(p.get("category_id", "")).strip()
-        facets_q    = p.get("facets") if isinstance(p.get("facets"), dict) else {}
-        limit       = max(1, min(int(p.get("limit", 50)), 200))
+        limit = max(1, min(int(p.get("limit", 50)), 200))
+        want_live = bool(p.get("live", True)) and str(p.get("source", "")).lower() != "local"
+        rt = _compute_routing(p)
 
-        domain: str | list[str] | None = None
-        site: str | None = None
-        route_sites: list[str] = []
-        query_terms: list[str] = []
-        facet_defs: list[dict] = []
-
-        if category_id:
-            # V2 taxonomy routing — unknown ids degrade to an unrouted search.
-            from engine_oracle.parts_hub import taxonomy as _tax
-            if _tax.get_node(category_id) is not None:
-                routing = _tax.route(category_id)
-                domain = routing["domains"] or None
-                route_sites = routing["sites"]
-                query_terms = routing["query_terms"]
-                facet_defs = _tax.effective_facets(category_id)
-        elif category.startswith("catalog:"):
-            # Legacy flat-category vocabulary (kept working verbatim).
-            domain, site = "catalog", category.split(":", 1)[1]
-        elif category:
-            domain = category
-
-        records = _search(query, domain=domain, limit=limit)
-        if site:
-            prefix = f"catalog:{site}::"
+        records = _search(rt["query"], domain=rt["domain"], limit=limit,
+                          include_live=want_live)
+        if rt["site"]:
+            prefix = f"catalog:{rt['site']}::"
             records = [r for r in records if str(r.get("part_id", "")).startswith(prefix)]
 
-        if category_id and route_sites:
-            # Category-routed live catalog search: restrict catalog records to the
-            # taxonomy's sites (unknown/absent adapters simply never match), with
-            # the node's query_terms appended to the vendor query.
-            vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
+        if want_live and rt["category_id"] and rt["route_sites"]:
+            # Legacy blocking fan-out (only when the caller opted into live here).
             try:
-                # Restrict the live fan-out to the category's fitting vendors so
-                # we never fetch from a vendor that can't stock this category
-                # (e.g. no DigiKey for metal stock). The prefix filter below is
-                # kept as a belt-and-braces guard.
-                cat_records = _search(vendor_query, domain="catalog", limit=limit,
-                                      sites=route_sites)
+                cat_records = _search(rt["vendor_query"], domain="catalog", limit=limit,
+                                      sites=rt["route_sites"])
             except Exception:  # noqa: BLE001 — live layer optional
                 cat_records = []
-            prefixes = tuple(f"catalog:{s}::" for s in route_sites)
+            prefixes = tuple(f"catalog:{s}::" for s in rt["route_sites"])
             seen_ids = {str(r.get("part_id", "")) for r in records}
             for rec in cat_records:
                 pid = str(rec.get("part_id", ""))
@@ -269,66 +339,106 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
                     seen_ids.add(pid)
                     records.append(rec)
 
-        # Drop non-record stubs (e.g. login_required pass-throughs from the live
-        # catalog layer) — they have no part_id/title and would render as blank,
-        # ID-colliding rows.  Surface them as actionable notices instead.
-        notices: list[dict] = []
-        _seen_notice: set = set()
-        _clean: list[dict] = []
-        for r in records:
-            pid = str(r.get("part_id", "") or "")
-            title = str(r.get("title", "") or "").strip()
-            if pid and title:
-                _clean.append(r)
-                continue
-            n_site = str(r.get("site", "") or "")
-            if not n_site and pid.startswith("catalog:"):
-                n_site = pid[len("catalog:"):].split("::", 1)[0]
-            n_reason = str(r.get("reason", "") or "unavailable")
-            if (n_site, n_reason) not in _seen_notice:
-                _seen_notice.add((n_site, n_reason))
-                notices.append({"site": n_site, "reason": n_reason,
-                                "hint": str(r.get("hint", "") or "")})
-        records = _clean
-
-        items = [_record_to_item(r) for r in records]
-
-        # ---- post-filters (GUI settings) ----
-        def _f(v: Any, dflt: float) -> float:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return dflt
-        price_min = _f(p.get("price_min"), 0.0)
-        price_max = _f(p.get("price_max"), 0.0)
-        material  = str(p.get("material", "")).strip().lower()
-        vendor    = str(p.get("vendor", "")).strip().lower()
-        source    = str(p.get("source", "")).strip().lower()  # "", "local", "live"
-
-        if facets_q:
-            # Facet post-filter (V2): match on the underlying record params using
-            # the category's effective facet definitions (empty defs → text match).
-            from engine_oracle.parts_hub.taxonomy import match_facets as _match_facets
-            pairs = [(i, r) for i, r in zip(items, records)
-                     if _match_facets(r.get("params") or {}, facets_q, facet_defs)]
-            items = [i for i, _ in pairs]
-
-        if price_min > 0:
-            items = [i for i in items if i["price_usd"] >= price_min]
-        if price_max > 0:
-            items = [i for i in items if 0 < i["price_usd"] <= price_max]
-        if material:
-            items = [i for i in items if material in i["material"].lower()]
-        if vendor:
-            items = [i for i in items if vendor in i["vendor"].lower()]
-        if source in ("local", "live"):
-            items = [i for i in items if i["source"] == source]
-
+        records, notices = _split_notices(records)
+        items = _filter_items(records, p, rt["facet_defs"])
         has_live = any(i["source"] == "live" for i in items)
         return {"ok": True, "count": len(items), "has_live": has_live,
                 "results": items, "notices": notices}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search failed: {exc}"}
+
+
+# ---- streaming live vendor search -------------------------------------------------
+#
+# The live fan-out scrapes each vendor through the CEF session (seconds per site).
+# Rather than block the search RPC on the slowest vendor, the GUI kicks off a job
+# here that fans out across the category's fitting vendors IN PARALLEL (one thread
+# per site — each site has its own profile lock + rate limit, so cross-site calls
+# are safe) and polls for results as each vendor lands.
+
+_live_jobs: dict[str, dict] = {}
+_live_lock = threading.Lock()
+_LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
+
+
+def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
+    from engine_oracle.parts_hub import search as _search
+    try:
+        recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
+    except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
+        recs = []
+    prefix = f"catalog:{site}::"
+    recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
+            or r.get("ok") is False]
+    clean, notices = _split_notices(recs)
+    items = _filter_items(clean, p, rt["facet_defs"])
+    with _live_lock:
+        if job.get("cancelled"):
+            return
+        seen = job["seen_ids"]
+        for it in items:
+            if it["id"] in seen:
+                continue
+            seen.add(it["id"])
+            job["results"].append(it)
+        for nt in notices:
+            key = (nt["site"], nt["reason"])
+            if key not in job["seen_notices"]:
+                job["seen_notices"].add(key)
+                job["notices"].append(nt)
+        job["pending"] -= 1
+        if job["pending"] <= 0:
+            job["done"] = True
+
+
+def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
+    """Begin a background live vendor fan-out for the current query. Returns a token
+    the GUI polls with ``parts_search_live_poll``. No-op (done immediately) when the
+    category routes to no live vendors."""
+    try:
+        import uuid
+        p = params or {}
+        limit = max(1, min(int(p.get("limit", 50)), 200))
+        rt = _compute_routing(p)
+        sites = list(rt["route_sites"])
+        token = uuid.uuid4().hex
+        job = {"results": [], "notices": [], "seen_ids": set(), "seen_notices": set(),
+               "pending": len(sites), "done": not sites, "cancelled": False}
+        with _live_lock:
+            _live_jobs[token] = job
+            # Evict oldest tokens beyond the cap (dicts preserve insertion order).
+            while len(_live_jobs) > _LIVE_JOB_CAP:
+                _live_jobs.pop(next(iter(_live_jobs)))
+        for s in sites:
+            threading.Thread(target=_run_live_site, args=(s, rt, limit, p, job),
+                             name=f"parts-live-{s}", daemon=True).start()
+        return {"ok": True, "token": token, "sites": sites, "done": job["done"]}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"parts_search_live_start failed: {exc}"}
+
+
+def _parts_search_live_poll(params: dict, _emit: Callable) -> dict:
+    """Drain results a live job has accumulated since ``cursor``. Returns
+    ``{ok, results, notices, cursor, done}``; unknown/expired token → done:true."""
+    try:
+        p = params or {}
+        token = str(p.get("token", ""))
+        cursor = max(0, int(p.get("cursor", 0)))
+        with _live_lock:
+            job = _live_jobs.get(token)
+            if job is None:
+                return {"ok": True, "results": [], "notices": [], "cursor": cursor,
+                        "done": True}
+            new_items = job["results"][cursor:]
+            notices = list(job["notices"])
+            done = job["done"]
+            new_cursor = len(job["results"])
+            if done:
+                _live_jobs.pop(token, None)
+        return {"ok": True, "results": new_items, "notices": notices,
+                "cursor": new_cursor, "done": done}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"parts_search_live_poll failed: {exc}"}
 
 
 # ---- download / queue --------------------------------------------------------------
@@ -636,6 +746,39 @@ def _thumb_cache_dir():
     return d
 
 
+_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
+    """Fetch a product image, defeating the common hotlink guard by sending a
+    browser User-Agent and a same-origin Referer derived from the part's product
+    URL (part_id = ``catalog:<site>::<product_url>``). Many vendor CDNs 403 a bare
+    request but serve the byte stream once a plausible Referer is present."""
+    import urllib.parse
+
+    referer = ""
+    if "::" in part_id:
+        prod_url = part_id.split("::", 1)[1]
+        if prod_url.startswith(("http://", "https://")):
+            referer = prod_url
+    if not referer:
+        pu = urllib.parse.urlparse(image_url)
+        if pu.scheme and pu.netloc:
+            referer = f"{pu.scheme}://{pu.netloc}/"
+
+    headers = {"User-Agent": _BROWSER_UA,
+               "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8"}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        req = urllib.request.Request(image_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310
+            return resp.read(4 * 1024 * 1024) or None
+    except Exception:  # noqa: BLE001 — hotlink-blocked / transient; GUI shows a glyph
+        return None
+
+
 def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
     """Best-effort PNG/JPEG preview for a part, base64-encoded, cached on disk.
 
@@ -652,9 +795,7 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
         if cache.exists():
             return {"ok": True, "image_b64": base64.b64encode(cache.read_bytes()).decode()}
         if image_url.startswith(("http://", "https://")):
-            req = urllib.request.Request(image_url, headers={"User-Agent": "AI-CAD parts library"})
-            with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310
-                data = resp.read(2 * 1024 * 1024)
+            data = _fetch_image_bytes(image_url, part_id)
             if data:
                 cache.write_bytes(data)
                 return {"ok": True, "image_b64": base64.b64encode(data).decode()}
@@ -703,6 +844,8 @@ GUI_WORKER_METHODS: dict[str, Callable] = {
     "parts_list_categories": _parts_list_categories,
     "parts_taxonomy":        _parts_taxonomy,
     "parts_search":          _parts_search,
+    "parts_search_live_start": _parts_search_live_start,
+    "parts_search_live_poll":  _parts_search_live_poll,
     "parts_match_model":     _parts_match_model,
     "vendors_health_check":  _vendors_health_check,
     "vendors_health_status": _vendors_health_status,

@@ -128,7 +128,8 @@ class PartsHub:
                domain: str | list[str] | None = None,
                filters: dict | None = None,
                limit: int = 20,
-               sites: list[str] | None = None) -> list[dict]:
+               sites: list[str] | None = None,
+               include_live: bool = True) -> list[dict]:
         """Full-text search. Returns ranked PartRecord dicts.
 
         ``domain`` accepts a single domain string or a list of domains
@@ -152,6 +153,11 @@ class PartsHub:
         results = self._index.search(query, domain=domain, limit=limit)
         if results:
             return _dedupe_related(results)
+        # Local-first phase: the caller wants only the instant FTS layer and will
+        # fan out to live vendors separately (Parts Library streaming search). Skip
+        # the synchronous browser fan-out so the local call returns immediately.
+        if not include_live:
+            return []
         domains = [domain] if isinstance(domain, str) else list(domain or [])
         site_allow = set(sites) if sites else None
         # Fallback to live providers when the index has no hits.

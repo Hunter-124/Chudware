@@ -36,12 +36,15 @@ def search(query: str, *,
            domain: str | list[str] | None = None,
            filters: dict | None = None,
            limit: int = 20,
-           sites: list[str] | None = None) -> list[dict]:
+           sites: list[str] | None = None,
+           include_live: bool = True) -> list[dict]:
     """Full-text search across all indexed providers. Returns ranked PartRecord dicts.
 
     ``sites`` restricts the live vendor fan-out to a category's fitting vendors
-    (taxonomy routing) — see :meth:`PartsHub.search`."""
-    return _get_hub().search(query, domain=domain, filters=filters, limit=limit, sites=sites)
+    (taxonomy routing) — see :meth:`PartsHub.search`. ``include_live=False`` returns
+    only the instant local FTS layer (no browser fan-out)."""
+    return _get_hub().search(query, domain=domain, filters=filters, limit=limit,
+                             sites=sites, include_live=include_live)
 
 
 def get(part_id: str) -> dict | None:

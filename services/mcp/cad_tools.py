@@ -1488,6 +1488,24 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
   board; minor power contributors get advisories, not pass/fail — neighbor heating is
   invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
+  HEATSINK SELECTION (T-FIN17): heatsink_select(component_ref, tj_target_c |
+  t_case_target_c) closes the "pick a heatsink" loop on the LAST ecad_thermal_handoff
+  study. Candidates = curated parts-library heatsinks (part_search domain "thermal",
+  datasheet-class theta_sa + mass + cost) PLUS a parametric plain-finned aluminum
+  generator sized to the component footprint (fin-efficiency theta_sa estimate;
+  buildable via services.mcp.heatsink.sink_ops engine ops). Each candidate is
+  "mounted" as bonded contact through a TIM bondline (default 0.1 mm @ 3.0 W/m-K,
+  override tim_t_mm/tim_k_w_mk) and RE-SOLVED sequentially: because the core solver
+  is single-material, the sink becomes an effective convection
+  h_eff = 1/((R_tim + R_sa)*A_top) over the component top — board geometry is
+  unchanged, so the baseline board MESH IS REUSED per candidate and board spreading +
+  neighbor heating stay in the solve (sink-base overhang spreading is not modeled —
+  conservative). Returns a ranked table {candidate, achieved_tj_c,
+  delta_vs_target_c, mass_g, cost_usd}; winner = lightest candidate meeting the
+  target, its study kept, result carries a verify envelope (coupling
+  ecad_heatsink_to_thermal_fea). IMPOSSIBLE targets are honest: target_met=false with
+  the best achievable candidate named; without a sim-enabled libaicad it degrades to
+  a flagged network estimate (Tj = Ta + P*(theta_jc + R_tim + R_sa)).
   Helper builders/validator: services/mcp/simhandoff.py.
 """
 

@@ -174,6 +174,21 @@ def _load() -> ctypes.CDLL:
     with _lock:
         if _dll is not None:
             return _dll
+        # Mode-divergence guard: a legacy in-process engine editing docs while a
+        # live hostd serves the same docs to other clients = two sources of
+        # truth. Warn loudly (Phase-8 flip upgrades this to a refusal).
+        try:
+            from . import daemon_bridge
+
+            if not _daemon_mode() and daemon_bridge.daemon_socket_alive():
+                print(
+                    "[core_bridge] WARNING: an aicad-hostd daemon is running but this "
+                    "process is loading its OWN in-process engine (AI_CAD_ENGINE_DAEMON "
+                    "unset). Documents will NOT be shared with the daemon's clients.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass  # the guard must never block a legacy load
         lib_path = _resolve_lib()
         lib_dir = lib_path.parent
         # The library's transitive deps (OCCT, Netgen, lib3mf, ...) live alongside it; put
@@ -253,6 +268,30 @@ def available() -> bool:
 
 # ---------------------------------------------------------------- the one RPC call
 
+# Engine backend mode (shared-engine refactor, see hostd plan):
+#   AI_CAD_ENGINE_DAEMON=1  -> route through the shared aicad-hostd daemon (ONE
+#     engine for the GUI + every MCP process; live doc sharing, no per-process copy).
+#   AI_CAD_ENGINE_DAEMON=0 / unset -> legacy in-process ctypes load (default until
+#     the Phase-8 flip; kept at least one release as the fallback).
+# During release N a daemon TRANSPORT failure falls back to legacy with a loud
+# warning rather than bricking the session; N+1 makes it a hard error.
+_DAEMON_FALLBACK_WARNED = False
+
+
+def _daemon_mode() -> bool:
+    return os.environ.get("AI_CAD_ENGINE_DAEMON", "0") == "1"
+
+
+def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
+    from . import daemon_bridge  # local import: zero cost on the legacy path
+
+    result = daemon_bridge.client().call(method, params)
+    if isinstance(result, dict) and result.pop("_is_error", False):
+        msg = result.get("message") or result.get("error") or json.dumps(result)[:400]
+        raise CoreError(msg, code=str(result.get("code", "")), detail=result.get("detail"))
+    return result if isinstance(result, dict) else {"result": result}
+
+
 def call(method: str, params: Optional[dict] = None) -> dict:
     """Invoke one C++ core RPC. Returns the parsed JSON result dict.
 
@@ -261,6 +300,22 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     that the core reports at rc 0 (e.g. a sim returning ``{"ok": false, "error": ...}``) is
     returned as-is so the caller can surface it without an exception.
     """
+    global _DAEMON_FALLBACK_WARNED
+    if _daemon_mode():
+        from .daemon_bridge import DaemonError
+
+        try:
+            return _call_via_daemon(method, params)
+        except DaemonError as e:
+            # Transport-level failure only (spawn/connect/EOF-after-retry) — RPC
+            # errors surface above as CoreError and must NOT trigger fallback.
+            if not _DAEMON_FALLBACK_WARNED:
+                _DAEMON_FALLBACK_WARNED = True
+                print(
+                    f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
+                    "the legacy in-process engine. Doc sharing with the GUI is OFF.",
+                    file=sys.stderr,
+                )
     dll = _load()
     out = ctypes.c_char_p()
     # NOTE: native stdout (OCCT statistics etc.) is kept off the MCP JSON-RPC channel by a

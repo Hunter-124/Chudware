@@ -141,8 +141,17 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     std::string err;
     if (!core::cpp_core().call(method, params, result, err)) {
         isError = true;
-        if (result.is_object() && !result.empty()) return result;  // in-band {"error":...}
-        return json{{"code", "engine_error"}, {"message", err}};
+        // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
+        // whatever in-band payload the engine produced ({"error":...}, OpError
+        // {"code","message","detail"}), but guarantee message + code exist.
+        json e = result.is_object() ? result : json::object();
+        if (!e.contains("message"))
+            e["message"] = !err.empty()           ? err
+                           : e.contains("error")  ? e["error"].dump()
+                                                  : std::string("engine error");
+        if (e["message"].is_string() == false) e["message"] = e["message"].dump();
+        if (!e.contains("code")) e["code"] = "engine_error";
+        return e;
     }
     return result;
 }

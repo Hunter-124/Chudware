@@ -138,6 +138,52 @@ def resolve_board_doc(ref: Optional[str]) -> Optional[dict]:
     return None
 
 
+# --------------------------------------------------------------------------- strap / reset pins
+#
+# T-FIN6: boot-strap and reset pins per firmware family — pins whose level at reset selects the
+# boot mode (or resets the part). Repurposing one as a general signal is a co-verification
+# violation (``engine.firmware.coverify`` rule ``fw_strap_repurposed``). Matching is by NET NAME
+# (upper-cased): boards name these nets after the pin function (BOOT0, NRST, EN) or the physical
+# pin (ESP32 GPIO0). Extend alongside _FAMILY_PREFIXES as new families land.
+_STRAP_PIN_NAMES: dict[str, frozenset[str]] = {
+    # STM32 (all cortex-m*): BOOT0/BOOT1 sample at reset; NRST is the reset line.
+    "cortex-m0": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    "cortex-m3": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    "cortex-m4": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    "cortex-m7": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    # ESP32: EN is reset; GPIO0/GPIO2 select download boot; GPIO12/GPIO15 set flash voltage/mode.
+    "xtensa-lx6": frozenset({"EN", "GPIO0", "GPIO2", "GPIO12", "GPIO15"}),
+    # AVR: RESET (PC6 on ATmega328) — fuse-repurposable, still flagged.
+    "avr": frozenset({"RESET", "NRESET", "PC6"}),
+}
+
+# Input-only physical pins per family (firmware can never drive them). ESP32 GPIO34–39 have no
+# output driver; other supported families have none.
+_INPUT_ONLY_NAMES: dict[str, frozenset[str]] = {
+    "xtensa-lx6": frozenset({f"GPIO{n}" for n in range(34, 40)}),
+}
+
+
+def strap_pins(mcu_family: Optional[str]) -> frozenset[str]:
+    """Boot-strap / reset pin-or-net names for ``mcu_family`` (empty set when unknown)."""
+    return _STRAP_PIN_NAMES.get(str(mcu_family or "").strip().lower(), frozenset())
+
+
+def is_strap_net(net_name: Optional[str], mcu_family: Optional[str]) -> bool:
+    """True when ``net_name`` names a boot-strap or reset pin for ``mcu_family``."""
+    if not net_name:
+        return False
+    return str(net_name).strip().upper() in strap_pins(mcu_family)
+
+
+def is_input_only_pin(net_name: Optional[str], mcu_family: Optional[str]) -> bool:
+    """True when ``net_name`` names a physical pin with no output driver for ``mcu_family``."""
+    if not net_name:
+        return False
+    names = _INPUT_ONLY_NAMES.get(str(mcu_family or "").strip().lower(), frozenset())
+    return str(net_name).strip().upper() in names
+
+
 # --------------------------------------------------------------------------- pin-name decoding
 
 # A named signal net that does not encode a physical pin (MISO, GPIO_LED) gets a deterministic

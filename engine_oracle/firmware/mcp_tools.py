@@ -182,6 +182,98 @@ def fw_sim_run(params: dict) -> dict:
     return result.to_dict()
 
 
+def fw_verify_board(params: dict) -> dict:
+    """``{board_doc_ref, project_id?, sources?:{name:text}, sch_doc_ref?, mcu_family?,
+    trace_path?, emulate?:bool}`` → co-verification findings (T-FIN6, contract §9).
+
+    Static checks always run (firmware ``PIN_<NET>`` refs vs board nets/MCU pads, strap-pin
+    repurposing, direction clashes, per-rail decoupling). The dynamic pass runs when either
+    ``trace_path`` points at an existing ``aicad.firmware.trace/1`` artifact, or
+    ``emulate=true`` and the project has a built ELF (a real emulation is launched via
+    ``run_simulation`` and its pin events are diffed — falls back gracefully when no
+    emulator is installed, reported in ``dynamic.reason``).
+
+    Firmware pin references come from ``sources`` when given, else the project's own source
+    files (``pinmap.h`` is excluded — its defines are declarations, not uses).
+
+    Result: ``{ok, mcu_family, findings:[violation], summary:{n, errors, warnings, rules},
+    fw_pins:{token:{reads,writes,refs,files}}, dynamic:{ran, source, reason?}}``.
+    Findings use the ERC/DRC violation shape plus a ``fix`` hint. Advisory — never blocks.
+    """
+    from engine.firmware import coverify
+
+    board_ref = params.get("board_doc_ref") or ""
+    board = mcu_pinouts.resolve_board_doc(str(board_ref))
+    if board is None:
+        return _err("unknown_board", f"board_doc_ref {board_ref!r} did not resolve to an "
+                    "open ECAD doc or a readable file")
+    sch = mcu_pinouts.resolve_board_doc(str(params.get("sch_doc_ref") or "")) \
+        if params.get("sch_doc_ref") else None
+
+    project = None
+    if params.get("project_id"):
+        try:
+            project = fw_project.load(str(params["project_id"]))
+        except FileNotFoundError as e:
+            return _err("unknown_project", str(e))
+
+    sources = params.get("sources")
+    if not isinstance(sources, dict):
+        sources = coverify.project_sources(project) if project else {}
+    sources = {k: v for k, v in sources.items() if not str(k).endswith("pinmap.h")}
+    if not sources:
+        return _err("invalid_request", "fw_verify_board needs firmware sources: pass "
+                    "'sources' or a 'project_id' whose project has source files")
+
+    mcu_family = (params.get("mcu_family") or
+                  (project.mcu_family if project else None) or
+                  mcu_pinouts.select_mcu_family(board))
+    fw_pins = coverify.scan_firmware_pins(sources)
+
+    # dynamic pass: existing trace artifact, or a real emulation when asked
+    trace: Optional[dict] = None
+    dynamic: dict = {"ran": False, "source": None}
+    if params.get("trace_path"):
+        trace = coverify.load_trace(str(params["trace_path"]))
+        if trace is None:
+            dynamic["reason"] = f"trace_path {params['trace_path']!r} unreadable"
+        else:
+            dynamic = {"ran": True, "source": "trace"}
+    elif params.get("emulate") and project is not None:
+        elf = None
+        build_dir = project.root_dir / project.build_dir
+        for pattern in ("*.elf", "*.bin", "*.hex"):
+            hits = sorted(build_dir.rglob(pattern))
+            if hits:
+                elf = str(hits[0])
+                break
+        if not elf:
+            dynamic["reason"] = "no_elf: run fw_build first"
+        else:
+            # Synthetic gpio assertions install the Renode pin hooks for every pin the
+            # firmware writes; we only consume the observed events, not passed/failed.
+            hooks = [f"gpio:{t}=1" for t, u in sorted(fw_pins.items())
+                     if u.get("writes") and mcu_pinouts.resolve_pin(t, mcu_family) is not None]
+            sim = run_simulation(elf, mcu_family or "cortex-m4", hooks,
+                                 timeout_s=float(params.get("timeout_s", 30)))
+            if sim.gpio_events or sim.gpio_states:
+                trace = {"events": sim.gpio_events, "gpio_final": sim.gpio_states}
+                dynamic = {"ran": True, "source": "emulation"}
+            else:
+                dynamic["reason"] = sim.uart_log[:200] or "emulation produced no pin events"
+
+    findings = coverify.verify_board(board, fw_pins, sch=sch, mcu_family=mcu_family,
+                                     trace=trace)
+    return {
+        "ok": True,
+        "mcu_family": mcu_family,
+        "findings": findings,
+        "summary": coverify.summarize(findings),
+        "fw_pins": fw_pins,
+        "dynamic": dynamic,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Hardware path (T-C4): probe-rs flash/debug
 # ---------------------------------------------------------------------------

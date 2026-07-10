@@ -20,7 +20,8 @@ def fw_root(tmp_path, monkeypatch):
 def test_registry_mirrors_mcp_surface():
     expected = {
         "fw_status", "fw_projects", "fw_new_project", "fw_build", "fw_sources",
-        "fw_sim_run", "fw_flash", "fw_debug_start", "fw_debug_halt", "fw_debug_read_mem",
+        "fw_sim_run", "fw_verify_board", "fw_flash", "fw_debug_start", "fw_debug_halt",
+        "fw_debug_read_mem",
     }
     assert expected == set(worker_rpc.WORKER_METHODS)
 

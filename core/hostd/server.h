@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 
 #include "../../services/ipc/ipc_transport.h"
+#include "autosave.h"
+#include "doc_registry.h"
 
 namespace hostd {
 
@@ -46,6 +48,11 @@ public:
     Server(aicad_ipc::IpcListener listener, std::string buildId);
     ~Server();
 
+    // Phase 3: the autosave scheduler (recovery id_remap served in hello) and
+    // the doc registry (attach modes, holds, events) plug in before run().
+    void setAutosave(Autosave* a) { autosave_ = a; }
+    DocRegistry& registry() { return registry_; }
+
     // Accept/dispatch until drained-and-idle (or stop()). lingerSecs: how long
     // the daemon must be idle (no clients, no inflight) before self-exit.
     void run(int lingerSecs);
@@ -59,6 +66,7 @@ private:
                             const nlohmann::json& params, bool& isError);
     void touch();
     bool idleExpired(int lingerSecs) const;
+    void sendEventTo(int clientId, const std::string& line);
 
     aicad_ipc::IpcListener listener_;
     std::string buildId_;
@@ -67,6 +75,8 @@ private:
     std::mutex clientsMtx_;
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;
+    DocRegistry registry_;
+    Autosave* autosave_ = nullptr;
 };
 
 }  // namespace hostd

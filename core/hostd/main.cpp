@@ -29,6 +29,7 @@
 #include "../../services/ipc/ipc_discovery.h"
 #include "../../services/ipc/ipc_transport.h"
 #include "../../services/worker/cpp_core.h"
+#include "autosave.h"
 #include "hostd_log.h"
 #include "server.h"
 #include "version_info.h"
@@ -133,11 +134,21 @@ int main(int argc, char** argv) {
         }
     });
 
+    // 4. Autosave scheduler + prior-session recovery (Phase 3). Keyed by
+    //    instance so scratch/test daemons never touch the real one's sessions.
+    hostd::Autosave autosave;
+    autosave.start(aicad_ipc::stateDir() + "/hostd_autosave/" + key,
+                   &server.status().engineState);
+    server.setAutosave(&autosave);
+
     int linger = 120;
     if (const char* l = std::getenv("AICAD_HOSTD_LINGER_SECS"); l && *l)
         linger = std::max(1, std::atoi(l));
     server.run(linger);
 
+    // Clean shutdown (idle-exit, --stop drain, SIGTERM): save dirty docs so the
+    // next daemon recovers them; loss bound on a hard kill = autosave interval.
+    autosave.stop(/*finalSave=*/true);
     loader.join();
     hostd::log().line("hostd exiting");
     return 0;

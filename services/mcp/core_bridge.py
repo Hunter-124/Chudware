@@ -282,10 +282,28 @@ def _daemon_mode() -> bool:
     return os.environ.get("AI_CAD_ENGINE_DAEMON", "0") == "1"
 
 
+# Foreign-edit piggyback (Phase 3): the daemon injects "_foreign_edits":[...]
+# into a result when another client advanced the doc since OUR last touch. We
+# strip it off the engine result here (tool code never expects the key) and
+# buffer it; cad_tools._dumps appends a human-readable note to the next tool
+# output. Legacy mode never buffers anything, so this is purely additive.
+_FOREIGN_EDITS_PENDING: list = []
+
+
+def consume_foreign_edits() -> list:
+    """Drain buffered foreign-edit records ({doc_id, revision, source_kind, method})."""
+    out, _FOREIGN_EDITS_PENDING[:] = _FOREIGN_EDITS_PENDING[:], []
+    return out
+
+
 def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
     from . import daemon_bridge  # local import: zero cost on the legacy path
 
     result = daemon_bridge.client().call(method, params)
+    if isinstance(result, dict):
+        fe = result.pop("_foreign_edits", None)
+        if isinstance(fe, list):
+            _FOREIGN_EDITS_PENDING.extend(fe)
     if isinstance(result, dict) and result.pop("_is_error", False):
         msg = result.get("message") or result.get("error") or json.dumps(result)[:400]
         raise CoreError(msg, code=str(result.get("code", "")), detail=result.get("detail"))

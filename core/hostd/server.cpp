@@ -19,7 +19,21 @@ static long long monoMs() {
 
 Server::Server(aicad_ipc::IpcListener listener, std::string buildId)
     : listener_(std::move(listener)), buildId_(std::move(buildId)) {
+    registry_.setEventSender(
+        [this](int clientId, const std::string& line) { sendEventTo(clientId, line); });
     touch();
+}
+
+void Server::sendEventTo(int clientId, const std::string& line) {
+    std::shared_ptr<ClientConn> c;
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        auto it = clients_.find(clientId);
+        if (it == clients_.end()) return;
+        c = it->second;
+    }
+    std::lock_guard<std::mutex> wlk(c->writeMtx);  // interleaves with response writes
+    c->conn.writeLine(line);
 }
 
 Server::~Server() {
@@ -61,6 +75,7 @@ void Server::run(int lingerSecs) {
             c->thread = std::thread([this, c] { clientLoop(c); });
             log().line("client #%d connected (%d total)", c->id, status_.clients.load());
         }
+        registry_.tick();  // expire stale edit-holds + emit doc.lease_change
         if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
         if (idleExpired(lingerSecs)) {
             log().line("idle for %ds with no clients — exiting", lingerSecs);
@@ -95,7 +110,7 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c) {
     touch();
     log().line("client #%d (%s) disconnected (%d left)", c->id, c->kind.c_str(),
                status_.clients.load());
-    // Phase 3: release this client's doc attachments/holds + emit lease_change.
+    registry_.onDisconnect(c->id, c->kind);
 }
 
 json Server::dispatch(ClientConn& c, const std::string& method, const json& params,
@@ -109,7 +124,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"git_rev", buildId_},
                     {"daemon_pid", (long)getpid()},
                     {"state", stateNames[status_.engineState.load()]},
-                    {"id_remap", json::object()}};  // Phase 3: autosave recovery map
+                    // Autosave-recovery rebind map (empty until recovery ran;
+                    // daemon_status.recovery tells clients when to re-hello).
+                    {"id_remap", autosave_ ? autosave_->idRemap() : json::object()}};
     }
     if (method == "ping") return json{{"ok", true}};
     if (method == "daemon_status") {
@@ -118,6 +135,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"inflight", status_.inflight.load()},
                     {"draining", status_.draining.load()},
                     {"git_rev", buildId_},
+                    {"recovery", !autosave_                  ? "off"
+                                 : autosave_->recoveryDone() ? "done"
+                                                             : "pending"},
                     {"pid", (long)getpid()}};
     }
     if (method == "daemon_drain") {
@@ -125,6 +145,14 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         status_.draining = true;
         log().line("drain requested by client #%d", c.id);
         return json{{"ok", true}};
+    }
+
+    // Doc-registry daemon methods (attach_doc/detach_doc/edit_hold/edit_release/
+    // subscribe) — pure daemon state, no engine touch.
+    {
+        json result;
+        if (registry_.handleMethod(c.id, c.kind, method, params, result, isError))
+            return result;
     }
 
     // Engine passthrough.
@@ -137,9 +165,22 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         isError = true;
         return json{{"code", "engine_failed"}, {"message", status_.engineErr}};
     }
+
+    // Registry policy gate: ro-attach rejection, edit-hold busy_preview, overlap
+    // CAS (base_revision injection when >1 writer). May mutate the params copy.
+    json p = params;
+    std::string attachWarning;
+    {
+        json policyErr;
+        if (!registry_.preCall(c.id, c.kind, method, p, policyErr, attachWarning)) {
+            isError = true;
+            return policyErr;
+        }
+    }
+
     json result;
     std::string err;
-    if (!core::cpp_core().call(method, params, result, err)) {
+    if (!core::cpp_core().call(method, p, result, err)) {
         isError = true;
         // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
         // whatever in-band payload the engine produced ({"error":...}, OpError
@@ -153,6 +194,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
+    // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
+    registry_.postCall(c.id, c.kind, method, p, result);
+    if (!attachWarning.empty() && result.is_object() && !result.contains("warning"))
+        result["warning"] = attachWarning;
     return result;
 }
 

@@ -133,14 +133,48 @@ def _resolve_alias(doc_id: str) -> str:
 
 
 def _doc(doc_id: Optional[str]) -> str:
-    d = doc_id or _CUR["doc_id"]
+    # An explicit doc_id is always honoured — this is the required form when several agents /
+    # subagents work in parallel, so each addresses its OWN part and can never touch another's.
+    if doc_id:
+        return _resolve_alias(doc_id)
+    d = _CUR["doc_id"]
     if not d:
         raise ValueError("No current part. Call new_part(...) first (or pass doc_id=).")
+    # Concurrency guard: `_CUR` is a single PROCESS-WIDE "current part" shared by every tool call.
+    # With one document open it's an unambiguous convenience. But when MORE than one part is open —
+    # exactly the multi-subagent case — an omitted doc_id is ambiguous: whichever agent last created
+    # or opened a part moved `_CUR`, so relying on the default silently edits the WRONG part (and
+    # republishes it to the viewport twice). Turn that silent clobber into a loud, fixable error so
+    # parallel agents are forced to be explicit. Single-part workflows are unaffected.
+    try:
+        docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(e, dict) and e.get("doc_id")]
+    except Exception:  # noqa: BLE001 — doc_list unavailable: fall back to legacy current-doc behavior
+        docs = []
+    if len(docs) > 1:
+        listing = ", ".join(f'{e.get("doc_id")}="{e.get("name", "")}"' for e in docs)
+        raise ValueError(
+            f"Ambiguous: {len(docs)} parts are open, so there is no single current part. "
+            "Pass doc_id= explicitly (required whenever multiple parts/agents are active). "
+            f"Open parts: {listing}")
     return _resolve_alias(d)
 
 
 def _dumps(obj: Any) -> str:
-    return json.dumps(obj, indent=2)
+    out = json.dumps(obj, indent=2)
+    # Foreign-edit surfacing (daemon mode only — legacy has no shared docs): the
+    # daemon flagged that ANOTHER client (the human in the GUI, another agent)
+    # edited a doc we touched since our last call. Append a note so the model
+    # re-checks before overwriting. Additive: legacy mode never buffers any.
+    try:
+        for fe in cb.consume_foreign_edits():
+            out += ("\nnote: {src} edited part {doc} since your last call (rev {rev}, "
+                    "via {m}) — re-check its current state before overwriting.").format(
+                src=fe.get("source_kind") or "another client",
+                doc=fe.get("doc_id"), rev=fe.get("revision"), m=fe.get("method"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _err(e: Exception) -> str:
@@ -201,7 +235,7 @@ def _sanitize_output_path(path: str) -> str:
 # polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
 # <app> follows the T-G10 alias rule (ShopCraft, or the legacy AI-CAD dir when it already
 # exists), matching platform::appdataRoot() so publisher and reader agree.
-_PUB: dict = {"rev": None}
+_PUB: dict = {"rev": None, "docs": {}, "active": None}
 
 
 def _handoff_dir() -> Path:
@@ -221,26 +255,313 @@ def _handoff_dir() -> Path:
     return d
 
 
-def _publish_current(doc_id: str) -> Optional[dict]:
-    """Publish `doc_id` to the handoff dir so the open app shows it. Best-effort; never raises."""
+def _handoff_key(doc_id: str) -> str:
+    """A filesystem-safe stem for a doc_id so each open part gets its OWN live-<key>.step+."""
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(doc_id)) or "doc"
+
+
+def _handoff_doc_name(doc_id: str) -> str:
+    """Best-effort human name for a doc so the mirror tab reads sensibly. Never raises."""
     try:
+        for e in (cb.call("doc_list", {}) or {}).get("docs", []):
+            if isinstance(e, dict) and e.get("doc_id") == doc_id:
+                return e.get("name") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _prune_closed_docs() -> None:
+    """Reconcile the published set against the engine's LIVE docs — drop any doc_id the engine no
+    longer has open. An agent that re-creates, re-opens, saves-round-trips or recovers a part gets
+    a NEW doc_id; the SUPERSEDED id would otherwise linger in the control file forever and the app
+    would show that part TWICE (a frozen stale mirror tab beside the live one — the doubled-tab
+    bug). Best-effort: if doc_list is unavailable we leave the set untouched."""
+    try:
+        live = {e.get("doc_id") for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(e, dict) and e.get("doc_id")}
+    except Exception:  # noqa: BLE001
+        return
+    if not live:
+        return  # never seen an empty list mid-session; treat as "can't tell" and keep entries
+    for did in [d for d in _PUB["docs"] if d not in live]:
+        _PUB["docs"].pop(did, None)
+    if _PUB.get("active") not in _PUB["docs"]:
+        _PUB["active"] = next(reversed(_PUB["docs"]), None) if _PUB["docs"] else None
+
+
+def _supersede_same_name(doc_id: str, name: str) -> None:
+    """Close abandoned earlier incarnations of the SAME part.
+
+    When an agent re-creates a part it already had open (a fresh `doc_id` under the same name —
+    e.g. it rebuilt `CC-201_Rim` from scratch instead of editing), the old doc stays live in the
+    engine forever: it keeps its own mirror tab (the doubled-tab bug) AND pins its OCCT bodies in
+    memory. Here we close any OTHER doc WE published under the same non-empty name, provided it is
+    neither the just-published doc nor the active one. Scoped to `_PUB["docs"]` so we only ever
+    close ids this process itself put on screen — never another agent's part or a doc we never
+    owned. Best-effort: a close failure must never break publishing."""
+    if not name:
+        return  # unknown name — treat every such doc as distinct (never collapse blindly)
+    stale = [did for did, v in _PUB["docs"].items()
+             if did != doc_id and did != _PUB.get("active") and v.get("name") == name]
+    for did in stale:
+        try:
+            cb.call("doc_close", {"doc_id": did})
+        except Exception:  # noqa: BLE001
+            pass  # already gone / engine declined — drop it from the mirror set regardless
+        _PUB["docs"].pop(did, None)
+
+
+def _write_handoff_control(d: Path, active: Optional[str]) -> None:
+    """Emit BOTH control files, atomically:
+
+      • live.json  (LEGACY {rev, step, doc_id}) — points at `active`. The OLD single-tab host
+        keeps mirroring the most-recent part unchanged, so writing the new format can never
+        break a running session.
+      • docs.json  (NEW {rev, active, docs:[{doc_id, step, rev, name}]}) — the full set of parts
+        the agent currently has open. A rebuilt host keeps ONE mirror tab per doc_id from this,
+        so a swarm opening many parts leaves them all open for live inspection.
+    """
+    docs = _PUB["docs"]
+    entries = [{"doc_id": did, "step": v["step"], "rev": v["rev"], "name": v.get("name", "")}
+               for did, v in docs.items()]
+    # Collapse duplicate same-name entries (newest rev wins) so a re-created part shows exactly ONE
+    # mirror tab. Belt-and-suspenders behind _supersede_same_name: catches dupes that weren't
+    # engine-closable (e.g. name was blank when first published, filled in later). Blank names are
+    # NOT collapsed — an unknown name is treated as a distinct doc. The GUI closes any tab whose
+    # doc_id stops being advertised here, so dropping stale entries retires their tabs automatically.
+    by_name: dict = {}
+    collapsed = []
+    for e in entries:
+        nm = e["name"]
+        if not nm:
+            collapsed.append(e)
+            continue
+        prev = by_name.get(nm)
+        if prev is None or e["rev"] > prev["rev"]:
+            by_name[nm] = e
+    collapsed.extend(by_name.values())
+    entries = collapsed
+    # Keep `active` pointing at a surviving entry (remap to the newest same-name doc if the active
+    # doc_id was collapsed away, so the app still focuses the right part).
+    advertised = {e["doc_id"] for e in entries}
+    if active is not None and active not in advertised:
+        act_name = docs.get(active, {}).get("name", "")
+        active = by_name.get(act_name, {}).get("doc_id", active) if act_name else active
+    # Compound the advertised keys with our session id. The host uses doc_id as its per-tab key;
+    # engine doc_ids reset per process, so without this two swarm members would both advertise
+    # "doc-cpp00000001" and the host would fuse their tabs. The agent never reads these back, so an
+    # opaque compound key is safe. Ops still use the bare engine doc_id (this is display-only).
+    cid = lambda did: f"{_SESSION_ID}-{did}"
+    frag_entries = [{"doc_id": cid(e["doc_id"]), "step": e["step"],
+                     "rev": e["rev"], "name": e["name"]} for e in entries]
+    frag_active = cid(active) if active else None
+    # Write OUR OWN fragment (uniquely named → zero cross-process write contention). The single
+    # docs.json the host reads is then rebuilt by merging every LIVE fragment, so concurrent
+    # subagents each contribute their parts instead of clobbering the shared file (last-writer-wins).
+    frag = {"rev": _PUB["rev"], "active": frag_active, "docs": frag_entries,
+            "session": _SESSION_ID, "pid": _HANDOFF_PID, "updated_at": time.time()}
+    tmp = d / f"docs-{_SESSION_ID}.json.tmp"
+    tmp.write_text(json.dumps(frag))
+    os.replace(tmp, d / f"docs-{_SESSION_ID}.json")
+    _merge_handoff_fragments(d)
+
+
+def _merge_handoff_fragments(d: Path) -> None:
+    """Rebuild docs.json (and legacy live.json) by unioning every LIVE `docs-<session>.json`
+    fragment. Idempotent over the fragment set — concurrent mergers converge because they see the
+    same files — so no lock is needed; a transient partial merge self-heals on the next publish.
+    Dead-process fragments are skipped and unlinked so a crashed swarm member's tabs disappear."""
+    try:
+        now = time.time()
+        merged: list = []
+        active: Optional[str] = None
+        active_at = -1.0
+        top_rev = 0
+        live_sessions: set = set()  # sessions with a still-alive fragment (their step files are kept)
+        for fp in sorted(d.glob("docs-*.json")):
+            try:
+                m = json.loads(fp.read_text())
+            except Exception:  # noqa: BLE001 — half-written / corrupt; skip this round
+                continue
+            pid = int(m.get("pid", 0) or 0)
+            updated = float(m.get("updated_at", 0.0) or 0.0)
+            alive = _pid_alive(pid) and (now - updated) <= _HANDOFF_FRAG_TTL_S
+            if not alive:
+                # Owner is gone — retire its fragment (and mirror files) so its tabs close.
+                if pid and not _pid_alive(pid):
+                    try:
+                        fp.unlink(missing_ok=True)
+                        for step in d.glob(f"live-{m.get('session','')}-*.step+"):
+                            step.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+            live_sessions.add(str(m.get("session", "")))
+            merged.extend(m.get("docs", []))
+            top_rev = max(top_rev, int(m.get("rev", 0) or 0))
+            if m.get("active") and updated > active_at:
+                active, active_at = m.get("active"), updated
+        # Orphan sweep: step files whose owning session has NO live fragment leak forever
+        # (the dead-fragment cleanup above only fires while the fragment still exists; a
+        # session whose fragment was already retired — or a crash before atexit — strands
+        # its live-<session>-*.step+). Also collects legacy pre-session-prefix files
+        # (live-doc-*.step+, no session segment). Only touch files older than the TTL so a
+        # file a live process just wrote — before its fragment lands — is never raced away.
+        try:
+            for step in d.glob("live-*.step+"):
+                stem = step.name[len("live-"):]  # "<session>-<doc>.step+" or "<doc>.step+"
+                seg = stem.split("-", 1)
+                sess = seg[0] if len(seg) == 2 and seg[0] and not seg[0].startswith("doc") else ""
+                if sess and sess in live_sessions:
+                    continue  # owned by a live session — keep
+                try:
+                    if (now - step.stat().st_mtime) <= _HANDOFF_FRAG_TTL_S:
+                        continue  # too fresh — a publisher may be mid-write; leave it
+                    step.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        payload = {"rev": top_rev, "active": active, "docs": merged}
+        tmp = d / "docs.json.tmp"
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, d / "docs.json")
+        # live.json (legacy single-doc host) — point at the active merged entry.
+        act = next((e for e in merged if e["doc_id"] == active), None) or (merged[-1] if merged else None)
+        if act is not None:
+            tmp = d / "live.json.tmp"
+            tmp.write_text(json.dumps({"rev": top_rev, "step": act["step"], "doc_id": act["doc_id"]}))
+            os.replace(tmp, d / "live.json")
+    except Exception:  # noqa: BLE001 — publishing is best-effort; never break an op on mirror IO
+        pass
+
+
+# Publish throttling: every publish serializes the FULL doc to a .step+ (50-200ms on a
+# mid-size part), and mutation-heavy agents call _publish_current after every op batch.
+# Two guards, both per-doc:
+#   • revision-skip — the engine's monotonic doc revision hasn't moved since our last
+#     publish (e.g. an activation republish), so the .step+ on disk is already current.
+#   • burst-coalescing — publishes inside AI_CAD_PUBLISH_MIN_INTERVAL_S of the previous
+#     one are deferred to ONE trailing publish (daemon Timer), so a rapid edit burst
+#     writes the mirror once at the end instead of per edit. 0 disables.
+_PUBLISH_MIN_INTERVAL_S: float = float(os.environ.get("AI_CAD_PUBLISH_MIN_INTERVAL_S", "0.25") or 0.25)
+_PUB_THROTTLE: dict = {}  # doc_id -> {"revision": int|None, "t": float, "timer": Timer|None, "last": dict|None}
+
+
+def _engine_doc_revision(doc_id: str) -> Optional[int]:
+    """The engine's monotonic revision for `doc_id` (cheap metadata call), or None."""
+    try:
+        for e in (cb.call("doc_list", {}) or {}).get("docs", []):
+            if isinstance(e, dict) and e.get("doc_id") == doc_id:
+                rev = e.get("revision")
+                return int(rev) if isinstance(rev, (int, float)) else None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
+    """Publish `doc_id` to the handoff dir so the open app shows it. Best-effort; never raises.
+
+    Each open doc is saved to its OWN live-<key>.step+, and the control files list every open
+    doc — so when an AI agent (built-in or an MCP-driven cowork swarm) opens several parts, the
+    desktop app keeps a tab open for each instead of overwriting a single live view.
+    """
+    try:
+        import threading as _t
+
+        st = _PUB_THROTTLE.setdefault(
+            doc_id, {"revision": None, "t": 0.0, "timer": None, "last": None})
+        engine_rev = _engine_doc_revision(doc_id)
+        # Revision-skip: nothing changed since the last publish of this doc — the mirror
+        # file and control entry are already current. (Never skips a doc we've not yet
+        # published this process: st["revision"] starts as None.)
+        if (engine_rev is not None and st["revision"] is not None
+                and engine_rev == st["revision"] and doc_id in _PUB["docs"]):
+            return st["last"]
+        # Burst-coalescing: too soon after the previous publish — arm ONE trailing timer
+        # that flushes the newest state after the interval, and report the prior publish.
+        now = time.time()
+        if (not _deferred and _PUBLISH_MIN_INTERVAL_S > 0
+                and now - st["t"] < _PUBLISH_MIN_INTERVAL_S):
+            if st["timer"] is None:
+                delay = max(0.01, _PUBLISH_MIN_INTERVAL_S - (now - st["t"]))
+                timer = _t.Timer(delay, lambda: (_PUB_THROTTLE.get(doc_id, {}).update(timer=None),
+                                                 _publish_current(doc_id, _deferred=True)))
+                timer.daemon = True
+                timer.name = f"aicad-publish-{doc_id}"
+                st["timer"] = timer
+                timer.start()
+            return st["last"]
+        st["t"] = now
         d = _handoff_dir()
-        step = d / "live.step+"
+        key = _handoff_key(doc_id)
+        # Session-prefix the mirror file: engine doc_ids reset per process, so two concurrent MCP
+        # servers both holding doc-cpp00000001 would otherwise write the SAME live-doc-cpp00000001
+        # .step+ and clobber each other's mirror. _SESSION_ID makes every process's files disjoint.
+        step = d / f"live-{_SESSION_ID}-{key}.step+"
         cb.call("doc_save", {"doc_id": doc_id, "path": str(step)})
         if _PUB["rev"] is None:
             # Seed from any existing control file so the rev keeps rising across MCP restarts.
             try:
-                _PUB["rev"] = int(json.loads((d / "live.json").read_text()).get("rev", 0))
+                _PUB["rev"] = int(json.loads((d / "docs.json").read_text()).get("rev", 0))
             except Exception:
-                _PUB["rev"] = 0
+                try:
+                    _PUB["rev"] = int(json.loads((d / "live.json").read_text()).get("rev", 0))
+                except Exception:
+                    _PUB["rev"] = 0
         _PUB["rev"] += 1
-        ctrl = {"rev": _PUB["rev"], "step": str(step), "doc_id": doc_id}
-        tmp = d / "live.json.tmp"
-        tmp.write_text(json.dumps(ctrl))
-        os.replace(tmp, d / "live.json")  # atomic: the host never reads a half-written control file
-        return {"shown_in_app": True, "rev": _PUB["rev"]}
+        name = _handoff_doc_name(doc_id)
+        _PUB["docs"][doc_id] = {"rev": _PUB["rev"], "step": str(step), "name": name}
+        _PUB["active"] = doc_id
+        _prune_closed_docs()   # evict superseded/closed doc_ids so a part never mirrors twice
+        _supersede_same_name(doc_id, name)  # close abandoned older docs of the same part name
+        _write_handoff_control(d, doc_id)
+        out = {"shown_in_app": True, "rev": _PUB["rev"], "open_docs": len(_PUB["docs"])}
+        st["revision"] = engine_rev
+        st["last"] = out
+        return out
     except Exception:
         return None
+
+
+def sweep_stale_handoff() -> None:
+    """One-shot startup sweep: re-merge the handoff fragments so a previous publisher
+    that CRASHED (atexit never dropped its fragment) stops being advertised now instead
+    of after the TTL. The merge already drops dead-PID fragments and orphaned step
+    files; it just needs someone alive to run it. Best-effort; never raises."""
+    try:
+        _merge_handoff_fragments(_handoff_dir())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _unpublish(doc_id: str) -> None:
+    """Drop `doc_id` from the handoff set (called on close_part) so its mirror tab can close.
+    Best-effort; never raises. Leaves the per-doc live-<key>.step+ on disk (cheap; overwritten
+    on reuse) — only the control files decide what the app keeps open."""
+    try:
+        # Drop throttle state (cancel any pending trailing publish) so a re-created doc
+        # with the same engine doc_id can never be revision-skipped or ghost-published.
+        st = _PUB_THROTTLE.pop(doc_id, None)
+        if st and st.get("timer") is not None:
+            try:
+                st["timer"].cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        if doc_id not in _PUB["docs"]:
+            return
+        del _PUB["docs"][doc_id]
+        d = _handoff_dir()
+        if _PUB["rev"] is None:
+            _PUB["rev"] = 0
+        _PUB["rev"] += 1
+        if _PUB.get("active") == doc_id:
+            _PUB["active"] = next(reversed(_PUB["docs"]), None) if _PUB["docs"] else None
+        _write_handoff_control(d, _PUB.get("active"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # A per-process session id stamped onto every autosave. Recovery is scoped to the
@@ -248,6 +569,43 @@ def _publish_current(doc_id: str) -> Optional[dict]:
 # history, so a restart doesn't drag in 19 unrelated old docs (Bug S-1).
 import uuid as _uuid_session  # noqa: E402
 _SESSION_ID = _uuid_session.uuid4().hex[:12]
+_HANDOFF_PID = os.getpid()
+# A handoff fragment from another MCP process is included in the merged docs.json only while its
+# owning process is alive (PID probe) and its file is fresh. PID-liveness closes a restarted
+# server's stale tabs immediately (no duplicate-across-restart window); the mtime TTL is a backstop
+# for the rare PID-reuse case.
+_HANDOFF_FRAG_TTL_S = float(os.environ.get("AI_CAD_HANDOFF_TTL_S", "1800") or 1800)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is a live process on this machine. os.kill(pid, 0) is the POSIX probe:
+    ESRCH -> dead, EPERM -> alive but not ours. Best-effort; assume alive if we can't tell."""
+    if not pid or pid < 0:
+        return True  # unknown owner (legacy fragment) — don't evict on liveness grounds
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:  # noqa: BLE001 — non-POSIX / can't tell -> fall back to mtime TTL
+        return True
+
+
+import atexit as _atexit  # noqa: E402
+
+
+@_atexit.register
+def _cleanup_handoff_fragment() -> None:
+    """On clean shutdown drop our fragment and re-merge so survivors close our tabs at once
+    (rather than waiting for the PID probe on their next publish). Best-effort."""
+    try:
+        d = _handoff_dir()
+        (d / f"docs-{_SESSION_ID}.json").unlink(missing_ok=True)
+        _merge_handoff_fragments(d)
+    except Exception:  # noqa: BLE001
+        pass
 # Autosaves older than this are pruned at startup so the directory can't grow forever.
 _AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("AI_CAD_AUTOSAVE_MAX_AGE_DAYS", "7") or 7)
 
@@ -295,26 +653,50 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
                         break
             except Exception:  # noqa: BLE001
                 pass
-        path = _autosave_dir() / f"{doc_id}.step+"
+        # Session-prefix the filename: doc_ids are engine-allocated per-process ("doc-cpp0000000N")
+        # and RESET across processes, so two concurrent MCP servers both holding doc-cpp00000001
+        # would otherwise write the SAME mcp_autosave/doc-cpp00000001.step+ and silently clobber
+        # each other's real geometry (unrecoverable data loss). The real doc_id is preserved in the
+        # sidecar so recovery can still restore the agent's original handle via _DOC_ALIASES.
+        stem = f"{_SESSION_ID}-{doc_id}"
+        path = _autosave_dir() / f"{stem}.step+"
         cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
         meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
                 "saved_at": time.time()}
-        (_autosave_dir() / f"{doc_id}.json").write_text(json.dumps(meta))
+        (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta))
     except Exception:  # noqa: BLE001
         pass
 
 
+# doc_id -> engine revision at the doc's last autosave. Each autosave serializes the
+# full doc to disk; skipping unchanged docs turns the idle 60s sweep into a no-op.
+_AUTOSAVE_LAST_REV: dict = {}
+
+
 def _autosave_all_open() -> None:
-    """Autosave EVERY open document. Called before a heavy solve so a transport timeout
-    that kills the server can never lose an unrelated open part (Bug R-1)."""
+    """Autosave every open document THAT CHANGED since its last autosave (the engine's
+    monotonic per-doc revision is the change signal; docs without one are always saved).
+    Called on the periodic timer and before a heavy solve so a transport timeout that
+    kills the server can never lose an unrelated open part (Bug R-1)."""
     try:
         docs = (cb.call("doc_list", {}) or {}).get("docs", [])
     except Exception:  # noqa: BLE001
         return
+    seen = set()
     for d in docs:
         did = d.get("doc_id") if isinstance(d, dict) else None
-        if did:
-            _autosave(did, d.get("name") if isinstance(d, dict) else None)
+        if not did:
+            continue
+        seen.add(did)
+        rev = d.get("revision") if isinstance(d, dict) else None
+        if isinstance(rev, (int, float)) and _AUTOSAVE_LAST_REV.get(did) == rev:
+            continue  # unchanged since last autosave — skip the full serialize
+        _autosave(did, d.get("name") if isinstance(d, dict) else None)
+        if isinstance(rev, (int, float)):
+            _AUTOSAVE_LAST_REV[did] = rev
+    # Forget closed docs so a re-created doc_id (engine ids reset/reuse) is never skipped.
+    for gone in [k for k in _AUTOSAVE_LAST_REV if k not in seen]:
+        _AUTOSAVE_LAST_REV.pop(gone, None)
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +753,11 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     """
     import threading as _t
 
+    if os.environ.get("AI_CAD_ENGINE_DAEMON") == "1":
+        # Daemon mode: aicad-hostd runs THE one autosave scheduler (core/hostd/
+        # autosave.cpp). Arming a per-process Timer chain here would recreate the
+        # exact thread-leak class the shared daemon exists to kill.
+        return
     global _AUTOSAVE_INTERVAL_S
     if interval_s is not None:
         _AUTOSAVE_INTERVAL_S = float(interval_s)
@@ -418,18 +805,61 @@ def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS) -> int:
     return n
 
 
-def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str]:
-    """(session_id, saved_at, name) for an autosave from its sidecar, falling back to
-    file mtime when there's no sidecar (legacy autosaves)."""
+def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, str]:
+    """(session_id, saved_at, name, doc_id) for an autosave from its sidecar, falling back to
+    file mtime when there's no sidecar (legacy autosaves). The real doc_id comes from the sidecar
+    (the filename is now `{session}-{doc_id}` so its stem can't be used as the doc_id); for a
+    legacy untagged file the stem IS the doc_id."""
     side = step_path.with_suffix(".json")
     try:
         m = json.loads(side.read_text())
-        return m.get("session"), float(m.get("saved_at", step_path.stat().st_mtime)), m.get("name", "")
+        return (m.get("session"),
+                float(m.get("saved_at", step_path.stat().st_mtime)),
+                m.get("name", ""),
+                m.get("doc_id", "") or step_path.stem)
     except Exception:  # noqa: BLE001
         try:
-            return None, step_path.stat().st_mtime, ""
+            return None, step_path.stat().st_mtime, "", step_path.stem
         except OSError:
-            return None, 0.0, ""
+            return None, 0.0, "", step_path.stem
+
+
+def _recover_via_daemon() -> list:
+    """Daemon-mode recovery: aicad-hostd already recovered the prior session's
+    autosaves itself (core/hostd/autosave.cpp) — we just consume the daemon's
+    {old_id: new_id} rebind map into _DOC_ALIASES instead of re-opening files.
+    Waits briefly for the daemon's recovery pass (it runs right after the engine
+    loads), then re-hellos to fetch the final id_remap. Best-effort; never raises."""
+    out: list = []
+    try:
+        from . import daemon_bridge
+        c = daemon_bridge.client()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            st = c.call("daemon_status")
+            if st.get("recovery") in ("done", "off") or st.get("state") == "failed":
+                break
+            time.sleep(0.2)
+        info = c.call("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+        if isinstance(info, dict) and not info.get("_is_error"):
+            c.server_info = info
+        remap = (c.server_info or {}).get("id_remap") or {}
+        names = {}
+        try:
+            for d in (cb.call("doc_list", {}) or {}).get("docs", []):
+                if isinstance(d, dict):
+                    names[d.get("doc_id")] = d.get("name") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        for old, new in remap.items():
+            if old and new and old != new:
+                _DOC_ALIASES[old] = new
+            out.append({"path": None, "doc_id": new, "name": names.get(new, ""),
+                        "original_doc_id": old})
+            _CUR["doc_id"] = new
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def recover_autosaved(scope: str = "recent") -> list:
@@ -439,6 +869,8 @@ def recover_autosaved(scope: str = "recent") -> list:
     scope="recent" (default): only the SINGLE most-recent prior session's docs — the
     crash we're recovering from — never the whole history. scope="all": every autosave.
     Prunes stale autosaves first. Called at server startup and by recover_parts."""
+    if os.environ.get("AI_CAD_ENGINE_DAEMON") == "1":
+        return _recover_via_daemon()
     _prune_autosaves()
     out: list = []
     try:
@@ -446,7 +878,7 @@ def recover_autosaved(scope: str = "recent") -> list:
     except Exception:  # noqa: BLE001
         return out
 
-    info = [(p, *_autosave_session_of(p)) for p in files]  # (path, session, saved_at, name)
+    info = [(p, *_autosave_session_of(p)) for p in files]  # (path, session, saved_at, name, doc_id)
     if scope != "all":
         prior = [t for t in info if t[1] != _SESSION_ID]  # exclude our own (fresh) session
         if prior:
@@ -461,14 +893,16 @@ def recover_autosaved(scope: str = "recent") -> list:
         else:
             info = []
 
-    for p, _sess, _ts, name in info:
+    for p, _sess, _ts, name, orig_id in info:
         try:
             r = cb.call("doc_open", {"path": str(p)})
             did = r.get("doc_id")
             if did:
                 # Prefer the sidecar name; fall back to the reopened doc's own name so an
                 # untagged/legacy autosave still recovers with a real name (Bug N-6).
-                original = p.stem
+                # `orig_id` is the REAL pre-restart doc_id from the sidecar (not the now
+                # session-prefixed filename stem), so the _DOC_ALIASES handle stays valid.
+                original = orig_id
                 out.append({"path": str(p), "doc_id": did,
                             "name": name or r.get("name") or "",
                             "original_doc_id": original})
@@ -1996,6 +2430,59 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         return cad_guide_text(topic)
 
+    # ---------------------------------------------------------------- diagnostics
+
+    @mcp.tool()
+    def engine_profile(action: str = "status", hz: int = 0, mode: str = "modeling",
+                       top: int = 40, min_samples: int = 0,
+                       write_folded: str = "", write_speedscope: str = "") -> str:
+        """Profile THIS engine process (the one your modeling RPCs run in) at runtime.
+
+        The desktop app's profiler window only sees the GUI's own engine — a DIFFERENT process
+        from this MCP server, where subagent modeling actually happens. This tool drives the
+        engine's built-in sampling profiler + lock-contention meters in-process, so a heavy
+        multi-subagent run can be measured without a restart. All modeling in one engine
+        serialises under a single global lock; the `contention` action is what reveals time
+        spent BLOCKED on that lock (which the CPU sampler cannot see).
+
+        action:
+          "start"       begin sampling. hz sets the rate (default ~1kHz); mode "modeling"
+                        (default) samples only modeling ops, "all" samples every RPC.
+          "stop"        stop sampling and return the symbolized report.
+          "report"      return the report WITHOUT stopping (modules + hot frames + folded stacks).
+          "status"      (default) is the sampler running? how many samples so far?
+          "contention"  return g_mtx lock-wait/hold/queue-depth stats since last reset — the
+                        primary multi-subagent bottleneck signal (%wall blocked, top callers).
+          "reset_contention"  zero the contention counters (call before a measured run).
+
+        top/min_samples/write_folded/write_speedscope tune the sampling report (see PROFILER.md).
+        """
+        try:
+            a = (action or "status").strip().lower()
+            if a == "start":
+                p = {"mode": mode}
+                if hz and hz > 0:
+                    p["hz"] = int(hz)
+                return _dumps(cb.call("prof_start", p))
+            if a == "stop":
+                return _dumps(cb.call("prof_stop", {"top": top, "min_samples": min_samples,
+                                                    "write_folded": write_folded or None,
+                                                    "write_speedscope": write_speedscope or None}))
+            if a == "report":
+                return _dumps(cb.call("prof_report", {"top": top, "min_samples": min_samples,
+                                                      "write_folded": write_folded or None,
+                                                      "write_speedscope": write_speedscope or None}))
+            if a == "status":
+                return _dumps(cb.call("prof_status", {}))
+            if a == "contention":
+                return _dumps(cb.call("prof_contention", {}))
+            if a == "reset_contention":
+                return _dumps(cb.call("prof_contention", {"reset": True}))
+            return _err(ValueError(
+                f"unknown action {action!r}; use start|stop|report|status|contention|reset_contention"))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
     # ---------------------------------------------------------------- modeling
 
     @mcp.tool()
@@ -2775,6 +3262,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             r = cb.call("doc_close", {"doc_id": d})
+            _unpublish(d)  # drop its mirror tab in the app
             if _CUR["doc_id"] == d:
                 _CUR["doc_id"] = None
             return _dumps({"ok": True, "closed": r.get("closed", True), "doc_id": d})

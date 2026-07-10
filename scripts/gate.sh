@@ -238,6 +238,74 @@ stage_hostd_smoke() {
     fi
 }
 
+# ---- Stage 3c: AppImage smoke (advisory, env-gated) ---------------------------
+# Builds the AppImage (wheelhouse skipped for speed — provisioning isn't what this
+# stage tests) and boots it headless in daemon mode: screenshot must render, exit 0,
+# and the bundled aicad-hostd must idle-exit after its linger. ADVISORY: failures are
+# RECORDED as WARN, never fatal (packaging tooling + xvfb are machine-dependent).
+# Opt in with AICAD_GATE_APPIMAGE=1. A scratch AICAD_INSTANCE_KEY isolates the run
+# from any live dev/installed daemon.
+stage_appimage_smoke() {
+    echo "=== [3c/6] AppImage smoke (advisory) ==="
+    if [ "${AICAD_GATE_APPIMAGE:-0}" != "1" ]; then
+        record "appimage smoke      SKIP    set AICAD_GATE_APPIMAGE=1 to build + boot the AppImage"
+        echo "  SKIP: AICAD_GATE_APPIMAGE not set"
+        return 0
+    fi
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+        record "appimage smoke      SKIP    xvfb-run not on PATH"
+        echo "  SKIP: xvfb-run not installed"
+        return 0
+    fi
+    local out=/tmp/gate_appimage
+    rm -rf "$out"; mkdir -p "$out"
+    if ! packaging/linux/build_appimage.sh --out "$out" --skip-wheels \
+            > /tmp/gate_appimage.out 2>&1; then
+        record "appimage smoke      WARN    AppImage build failed (see /tmp/gate_appimage.out)"
+        echo "  WARN: build failed"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+        return 0
+    fi
+    local img
+    img="$(ls "$out"/AI-CAD-*.AppImage 2>/dev/null | head -1)"
+    if [ -z "$img" ]; then
+        record "appimage smoke      WARN    build reported success but no .AppImage produced"
+        echo "  WARN: no artifact"; return 0
+    fi
+    local shot=/tmp/appimage_shot.png key="gateimg$$"
+    rm -f "$shot"
+    local rc=0
+    AI_CAD_ENGINE_DAEMON=1 AICAD_HOSTD_LINGER_SECS=5 AICAD_INSTANCE_KEY="$key" \
+        xvfb-run -a "$img" --appimage-extract-and-run --ui-screenshot "$shot" \
+        >> /tmp/gate_appimage.out 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        record "appimage smoke      WARN    AppImage exited rc=$rc (see /tmp/gate_appimage.out)"
+        echo "  WARN: run rc=$rc"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+        return 0
+    fi
+    if [ ! -s "$shot" ]; then
+        record "appimage smoke      WARN    screenshot not produced ($shot)"
+        echo "  WARN: no screenshot"; return 0
+    fi
+    # Daemon hygiene: the GUI exits after the shot; its hostd (scratch key) must
+    # idle-exit within linger (5 s) + grace.
+    sleep 9
+    local leftover
+    leftover="$(pgrep -af aicad-hostd | grep -F "$key" || true)"
+    if [ -z "$leftover" ]; then
+        # Instance key travels via env, not argv — also check any hostd running out of
+        # an AppImage extraction dir (this run's daemon path is unique to the extract).
+        leftover="$(pgrep -af 'appimage.*aicad-hostd|aicad-hostd.*appimage_extracted' || true)"
+    fi
+    if [ -n "$leftover" ]; then
+        record "appimage smoke      WARN    aicad-hostd still running after linger+grace"
+        echo "  WARN: leftover daemon:"; echo "$leftover" | sed 's/^/    /'
+        pkill -f 'appimage_extracted.*aicad-hostd' 2>/dev/null || true
+        return 0
+    fi
+    record "appimage smoke      PASS    built $(basename "$img") + xvfb screenshot + daemon idle-exit"
+    echo "  PASS ($(du -h "$img" | cut -f1) image, shot at $shot)"
+}
+
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 # Uses the mcp-venv (~/.local/share/AI-CAD/mcp-venv/bin/python) when present — that
 # venv has all service/oracle deps installed. Falls back to the old venv search and
@@ -627,6 +695,7 @@ stage_core_build
 stage_ui_abstract
 stage_ctest
 stage_hostd_smoke
+stage_appimage_smoke
 stage_pytest
 stage_vv
 stage_modeling

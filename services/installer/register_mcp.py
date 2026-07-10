@@ -39,12 +39,18 @@ def config_paths() -> dict[str, Path]:
     }
 
 
-def server_entry(python_exe: Path, cwd: Path) -> dict:
+def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None) -> dict:
+    env: dict[str, str] = {}
+    if hostd_bin is not None:
+        # Pin the installed engine-host daemon so MCP sessions and the GUI share ONE
+        # daemon (same binary path -> same instance key -> same socket/pipe). Without
+        # this the MCP venv would resolve a dev-tree hostd and mint a separate daemon.
+        env["AICAD_HOSTD_BIN"] = str(hostd_bin)
     return {
         "command": str(python_exe),
         "args": ["-m", "mcp_server.server"],
         "cwd": str(cwd),
-        "env": {},
+        "env": env,
     }
 
 
@@ -58,8 +64,8 @@ def _load(path: Path) -> dict:
 
 
 def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
-          unregister: bool) -> dict:
-    entry = server_entry(python_exe, cwd)
+          unregister: bool, hostd_bin: Path | None = None) -> dict:
+    entry = server_entry(python_exe, cwd, hostd_bin)
     out: dict = {}
     for name, path in config_paths().items():
         if name not in targets:
@@ -95,15 +101,19 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--python", type=Path, default=default_python())
     ap.add_argument("--cwd", type=Path, default=Path(__file__).resolve().parent.parent)
     ap.add_argument("--target", choices=["desktop", "code", "both"], default="both")
+    ap.add_argument("--hostd-bin", type=Path, default=None,
+                    help="installed aicad-hostd binary; written into the server env as "
+                         "AICAD_HOSTD_BIN so MCP sessions attach to the installed daemon")
     args = ap.parse_args(argv)
 
     targets = ["desktop", "code"] if args.target == "both" else [args.target]
-    res = apply(args.python, args.cwd, targets, args.dry_run, args.unregister)
+    res = apply(args.python, args.cwd, targets, args.dry_run, args.unregister,
+                hostd_bin=args.hostd_bin)
     print(json.dumps({
         "action": "unregister" if args.unregister else "register",
         "dry_run": args.dry_run,
         "server": SERVER_NAME,
-        "entry": server_entry(args.python, args.cwd),
+        "entry": server_entry(args.python, args.cwd, args.hostd_bin),
         "targets": res,
     }, indent=2))
     return 0

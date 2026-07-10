@@ -9,8 +9,26 @@ param(
 $ErrorActionPreference = "Stop"
 $src = $PSScriptRoot
 Write-Host "==> Installing AI-CAD to $InstallDir"
+
+# Stop any engine-host daemon that was spawned from THIS install dir before we copy
+# over its binaries (a running aicad-hostd.exe would hold locks on the payload files).
+# --stop drains cleanly; the scoped taskkill only touches processes whose image path is
+# under $InstallDir, so a dev-tree daemon on the same machine is never killed.
+$hostdExe = Join-Path $InstallDir "aicad-hostd.exe"
+if (Test-Path $hostdExe) {
+    Write-Host "==> Stopping engine daemon from previous install ..."
+    try { & $hostdExe --stop 2>$null | Out-Null } catch {}
+    Start-Sleep -Seconds 2
+    Get-Process -Name "aicad-hostd" -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)
+    } | ForEach-Object {
+        Write-Warning "force-killing lingering daemon pid $($_.Id) ($($_.Path))"
+        taskkill /PID $_.Id /F /T 2>$null | Out-Null
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach ($item in @("AI-CAD.exe", "assets", "app", "wheelhouse", "python-embed", "requirements.txt", "llamacpp", "models")) {
+foreach ($item in @("AI-CAD.exe", "aicad-hostd.exe", "aicad-hostd.pdb", "assets", "app", "wheelhouse", "python-embed", "requirements.txt", "llamacpp", "models")) {
     $p = Join-Path $src $item
     if (Test-Path $p) { Copy-Item $p -Destination $InstallDir -Recurse -Force }
 }
@@ -39,7 +57,11 @@ try {
     $venvPy = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
     if (-not $NoRegister) {
         Write-Host "==> Registering AI-CAD MCP server with Claude ..."
-        & $venvPy -m installer.register_mcp --python $venvPy --cwd $app
+        # Pin AICAD_HOSTD_BIN in the registered server env so MCP sessions and the GUI
+        # resolve the SAME installed engine daemon (shared instance key = shared daemon).
+        $regArgs = @("--python", $venvPy, "--cwd", $app)
+        if (Test-Path $hostdExe) { $regArgs += @("--hostd-bin", $hostdExe) }
+        & $venvPy -m installer.register_mcp @regArgs
         # File associations (.step+ default + Open-with for the formats AI-CAD loads). Per-user
         # (HKCU), idempotent, reversed on uninstall. Stdlib-only, so the base python is fine too.
         Write-Host "==> Registering AI-CAD file associations ..."

@@ -10,27 +10,31 @@
 #   ninja -C host/build-linux AI-CAD
 #
 # Usage:
-#   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--with-libaicad] [--zip-only-appdir]
+#   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--no-libaicad] [--keep-appdir]
 #
 #   --out DIR           output directory for the .AppImage (default: <repo>/dist)
 #   --skip-wheels       omit the offline wheelhouse (smaller AppImage; runtime provisioning
 #                        then needs network access instead of being fully offline-friendly)
-#   --with-libaicad     bundle core/build-linux/bin/libaicad.so if present, and point
-#                        AI_CAD_LIBAICAD at it from AppRun (the real engine, not demo mode)
+#   --no-libaicad       do NOT bundle libaicad.so (demo mode / smaller image). Bundling is
+#                        the DEFAULT for release builds: the full FEA engine from
+#                        core/build-occt-linux is preferred, the slim core/build-linux one
+#                        is a loud-warning fallback. (--with-libaicad is accepted as a
+#                        no-op for backward compatibility.)
 #   --keep-appdir       don't delete the staged AppDir/ after building (for inspection)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO/dist"
 SKIP_WHEELS=0
-WITH_LIBAICAD=0
+WITH_LIBAICAD=1
 KEEP_APPDIR=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT="$2"; shift 2 ;;
         --skip-wheels) SKIP_WHEELS=1; shift ;;
-        --with-libaicad) WITH_LIBAICAD=1; shift ;;
+        --with-libaicad) WITH_LIBAICAD=1; shift ;;   # legacy no-op (now the default)
+        --no-libaicad) WITH_LIBAICAD=0; shift ;;
         --keep-appdir) KEEP_APPDIR=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -57,13 +61,78 @@ if [ -d "$REPO/host/build-linux/bin/assets" ]; then
     cp -a "$REPO/host/build-linux/bin/assets" "$APPDIR/usr/bin/assets"
 fi
 
+# CEF runtime — the GUI initializes Chromium unconditionally at startup (the embedded
+# vendor browser has no toggle; see host/src/main.cpp), and CefInitialize HARD-ABORTS
+# ("Invalid file descriptor to ICU data received") when icudtl.dat/pak files aren't next
+# to the exe. Without this block the AppImage cannot boot at all. libcef.so carries
+# ~940 MB of debug sections; ship a --strip-debug copy, cached and re-stripped only when
+# the source .so changes.
+CEF_SRC="$REPO/host/build-linux/bin"
+if [ -f "$CEF_SRC/libcef.so" ]; then
+    echo "==> staging CEF runtime"
+    CEF_STRIPPED="$REPO/build/tools/libcef-stripped.so"
+    mkdir -p "$REPO/build/tools"
+    if [ ! -f "$CEF_STRIPPED" ] || [ "$CEF_SRC/libcef.so" -nt "$CEF_STRIPPED" ]; then
+        echo "==> stripping libcef.so debug sections (cached at build/tools/)"
+        strip --strip-debug -o "$CEF_STRIPPED" "$CEF_SRC/libcef.so"
+    fi
+    cp "$CEF_STRIPPED" "$APPDIR/usr/bin/libcef.so"
+    for f in ai_cad_cef_helper chrome-sandbox icudtl.dat v8_context_snapshot.bin \
+             chrome_100_percent.pak chrome_200_percent.pak resources.pak \
+             libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
+             vk_swiftshader_icd.json; do
+        [ -e "$CEF_SRC/$f" ] && cp "$CEF_SRC/$f" "$APPDIR/usr/bin/$f"
+    done
+    [ -d "$CEF_SRC/locales" ] && cp -a "$CEF_SRC/locales" "$APPDIR/usr/bin/locales"
+else
+    echo "WARNING: CEF runtime not found in $CEF_SRC — the packaged GUI will abort at startup (CefInitialize needs icudtl.dat/pak next to the exe)" >&2
+fi
+
+# Engine host daemon (aicad-hostd, core/hostd) — the shared engine process the GUI
+# and MCP servers attach to (AI_CAD_ENGINE_DAEMON=1). Same build-dir preference as
+# the engine below: full occt build first, slim fallback with a loud warning.
+HOSTD=""
+for cand in "$REPO/core/build-occt-linux/bin/aicad-hostd" "$REPO/core/build-linux/bin/aicad-hostd"; do
+    [ -x "$cand" ] && { HOSTD="$cand"; break; }
+done
+if [ -n "$HOSTD" ]; then
+    case "$HOSTD" in
+        */build-linux/*) echo "WARNING: staging aicad-hostd from the SLIM core/build-linux tree (core/build-occt-linux/bin/aicad-hostd not built) — daemon will load whatever engine AppRun points it at, but rebuild the occt tree for release" >&2 ;;
+    esac
+    cp "$HOSTD" "$APPDIR/usr/bin/aicad-hostd"
+    echo "==> staged aicad-hostd ($HOSTD)"
+else
+    echo "WARNING: aicad-hostd not built (core/build-occt-linux or core/build-linux) — AppImage ships WITHOUT the engine daemon; AI_CAD_ENGINE_DAEMON=1 will fall back to in-process" >&2
+fi
+
 if [ "$WITH_LIBAICAD" = "1" ]; then
-    LIBAICAD="$REPO/core/build-linux/bin/libaicad.so"
-    if [ -f "$LIBAICAD" ]; then
+    # Prefer the FULL engine (FEA/sim, OCCT geometry) from core/build-occt-linux; the
+    # slim core/build-linux .so has no sim solvers and is only a loud-warning fallback.
+    # (This was a real shipped bug: the AppImage used to bundle the slim engine.)
+    LIBAICAD=""
+    for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" "$REPO/core/build-linux/bin/libaicad.so"; do
+        [ -f "$cand" ] && { LIBAICAD="$cand"; break; }
+    done
+    if [ -n "$LIBAICAD" ]; then
+        case "$LIBAICAD" in
+            */build-linux/*) echo "WARNING: bundling the SLIM core/build-linux engine (no FEA/sim) — build core/build-occt-linux for a release AppImage" >&2 ;;
+        esac
         cp "$LIBAICAD" "$APPDIR/usr/lib/libaicad.so"
-        echo "==> bundled libaicad.so (real engine, not demo mode)"
+        # Sibling runtime .so deps that live next to the occt engine (Netgen mesher,
+        # lib3mf export) — libaicad.so resolves them via its RUNPATH/LD_LIBRARY_PATH,
+        # so they must ride along or FEA meshing breaks on a clean machine.
+        # NOTE: system OCCT (libTK*.so 7.9) + curl/X11 etc. are NOT bundled — the
+        # AppImage still requires an OCCT 7.9 runtime on the host (documented in
+        # docs/HOSTD.md; full linuxdeploy-style bundling is a follow-up).
+        LIBDIR="$(dirname "$LIBAICAD")"
+        for sib in libnglib.so libngcore.so lib3mf.so; do
+            if [ -f "$LIBDIR/$sib" ]; then
+                cp "$LIBDIR/$sib" "$APPDIR/usr/lib/$sib"
+            fi
+        done
+        echo "==> bundled libaicad.so + siblings from $LIBDIR (real engine, not demo mode)"
     else
-        echo "warning: --with-libaicad given but $LIBAICAD not found — shipping demo mode" >&2
+        echo "WARNING: no libaicad.so found in core/build-occt-linux or core/build-linux — shipping demo mode (use --no-libaicad to silence)" >&2
     fi
 fi
 
@@ -103,6 +172,20 @@ HERE="$(dirname "$(readlink -f "$0")")"
 export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
 if [ -f "$HERE/usr/lib/libaicad.so" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
     export AI_CAD_LIBAICAD="$HERE/usr/lib/libaicad.so"
+fi
+# Engine host daemon (aicad-hostd): point clients at the bundled binary, and pin
+# the daemon instance key to the AppImage FILE path ($APPIMAGE, set by the runtime).
+# The squashfs mount point is randomized per launch, so hashing the resolved hostd
+# binary path (the default in ipc_discovery) would mint a NEW key — and daemon —
+# every run. Hashing $APPIMAGE keeps one stable daemon per installed AppImage while
+# two different AppImage versions still get different keys and coexist. Socket/lock
+# live in $XDG_RUNTIME_DIR (host fs) — nothing daemon-related inside this read-only
+# mount. Respect pre-set env so tests/dev can override.
+if [ -x "$HERE/usr/bin/aicad-hostd" ] && [ -z "${AICAD_HOSTD_BIN:-}" ]; then
+    export AICAD_HOSTD_BIN="$HERE/usr/bin/aicad-hostd"
+fi
+if [ -z "${AICAD_INSTANCE_KEY:-}" ]; then
+    export AICAD_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"
 fi
 exec "$HERE/usr/bin/AI-CAD" "$@"
 EOF

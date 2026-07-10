@@ -176,6 +176,33 @@ noted here so nobody hunts for it in this phase.
       agent children survive. (Phase 7 will call this from uninstall.ps1; verify the
       primitive works now.)
 
+## Installer integration (Phase 7) — verification checklist
+
+The Phase-7 wiring (written and reviewed on Linux, untested on Windows): `build_release.py`
+stages `aicad-hostd.exe`/`.pdb`, `install.ps1`/`uninstall.ps1` stop the install-dir daemon
+first, `register_mcp.py --hostd-bin` pins `AICAD_HOSTD_BIN` in the MCP server env, the
+`.iss` gained `CloseApplications=yes`. See `docs/HOSTD.md` for the daemon reference.
+
+- [ ] `python -m installer.build_release --zip` after
+      `cmake --build core\build --config Release --target aicad-hostd`: `dist\AI-CAD\`
+      contains `aicad-hostd.exe` (and `.pdb`), `manifest.json` says `"hostd": true`.
+      Without the core build it prints the warning and stages the rest (`"hostd": false`).
+- [ ] Fresh install: `dist\AI-CAD-Setup-<ver>.exe /VERYSILENT` completes;
+      `%LOCALAPPDATA%\Programs\AI-CAD\aicad-hostd.exe --version` prints the build id.
+- [ ] MCP registration env: `~\.claude.json` (and Claude Desktop config) `shopcraft`
+      entry has `env.AICAD_HOSTD_BIN` = the installed exe path.
+- [ ] Shared daemon: launch the GUI with `AI_CAD_ENGINE_DAEMON=1`, then an MCP session —
+      Task Manager shows ONE `aicad-hostd.exe`, image path under the install dir.
+- [ ] Upgrade-over-running-daemon: with the installed daemon serving, re-run the
+      installer — install.ps1's `--stop` (plus scoped taskkill) stops it, the payload
+      copy succeeds (no locked-file errors), and a dev-tree `aicad-hostd.exe` running
+      simultaneously from the repo is NOT killed.
+- [ ] `/VERYSILENT` install → `--status` OK → silent uninstall
+      (`"%LOCALAPPDATA%\Programs\AI-CAD\unins000.exe" /VERYSILENT`): no
+      `aicad-hostd.exe` remains, install dir removed, MCP entry unregistered.
+- [ ] `CloseApplications=yes`: run the installer while AI-CAD.exe is open — Restart
+      Manager prompts/handles it instead of failing the file copy.
+
 ## Known gaps (not fixed here — flagging so they aren't rediscovered)
 
 - **No bundled Python.** `build_release.py --with-python` is a documented `TODO` (drop a

@@ -3,7 +3,7 @@ id: T-FIN2
 title: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN2-fw-peripheral-platforms
 depends_on: [T-FIN1]
 lane: ecad-firmware

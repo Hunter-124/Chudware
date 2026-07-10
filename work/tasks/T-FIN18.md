@@ -3,7 +3,7 @@ id: T-FIN18
 title: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN18-thermal-transient
 depends_on: []
 lane: simulation

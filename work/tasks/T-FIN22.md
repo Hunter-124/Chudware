@@ -3,7 +3,7 @@ id: T-FIN22
 title: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN22-hydraulic-piping-fea
 depends_on: [T-FIN15]
 lane: simulation

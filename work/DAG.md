@@ -93,31 +93,31 @@ graph TD
   end
   subgraph WS_FIN["workstream FIN"]
     T_FIN1["T-FIN1: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU"]:::done
-    T_FIN10["T-FIN10: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout"]:::todo
-    T_FIN11["T-FIN11: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)"]:::todo
+    T_FIN10["T-FIN10: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout"]:::doing
+    T_FIN11["T-FIN11: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)"]:::doing
     T_FIN12["T-FIN12: Stackup advisor - impedance-target-driven layer stackup solve"]:::done
-    T_FIN13["T-FIN13: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map"]:::todo
+    T_FIN13["T-FIN13: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map"]:::doing
     T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::done
     T_FIN15["T-FIN15: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract"]:::done
     T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::todo
     T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::todo
-    T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::doing
+    T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::done
     T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::todo
-    T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::doing
+    T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::done
     T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::doing
     T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::todo
-    T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::doing
+    T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::done
     T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::todo
     T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::todo
     T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::todo
     T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
-    T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::todo
+    T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::doing
     T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::done
-    T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::doing
-    T_FIN6["T-FIN6: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist"]:::todo
+    T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::done
+    T_FIN6["T-FIN6: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist"]:::doing
     T_FIN7["T-FIN7: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run"]:::todo
-    T_FIN8["T-FIN8: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map"]:::doing
-    T_FIN9["T-FIN9: MCU host-board rule pack - decoupling, power sequencing, crystal, boot-strap checks"]:::todo
+    T_FIN8["T-FIN8: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map"]:::done
+    T_FIN9["T-FIN9: MCU host-board rule pack - decoupling, power sequencing, crystal, boot-strap checks"]:::doing
   end
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
@@ -232,7 +232,7 @@ graph TD
     T_SIM2["T-SIM2: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport"]:::done
     T_SIM3["T-SIM3: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish"]:::done
     T_SIM4["T-SIM4: Solver validation depth - fatigue S-N anchor, FEA live bridge integration test, sim_audit extension"]:::done
-    T_SIM5["T-SIM5: OpenFOAM accurate-CFD integration - run_cfd_accurate live path with GPL2 subprocess isolation"]:::doing
+    T_SIM5["T-SIM5: OpenFOAM accurate-CFD integration - run_cfd_accurate live path with GPL2 subprocess isolation"]:::done
   end
   subgraph WS_U["workstream U"]
     T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::done

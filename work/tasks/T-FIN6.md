@@ -2,8 +2,8 @@
 id: T-FIN6
 title: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN6-fw-board-coverify
 depends_on: [T-FIN1, T-FIN8]
 lane: ecad-firmware

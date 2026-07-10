@@ -2,8 +2,8 @@
 id: T-FIN3
 title: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN3-fw-sensor-scenarios
 depends_on: [T-FIN2]
 lane: ecad-firmware

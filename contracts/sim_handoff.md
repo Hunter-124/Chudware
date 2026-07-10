@@ -30,6 +30,7 @@ Known couplings this shape must carry (docs/SIM_FW_FINALIZE_PLAN_2026-07-10.md �
 | `motion_to_fea` | motion study joint reactions → static FEA | one condition per reaction force/moment; optional `case` labels group conditions into per-timestep/pose load cases |
 | `hydraulic_to_piping` | hydraulic circuit → piping network solve | doc-to-doc: `geometry` may be empty; a `geometry_ref` of `kind:"doc"` carries the generated piping document |
 | `thermal_to_cfd` | thermal FEA surface temps → conjugate CFD | `temperature`/`heat_flux` conditions on named faces; expectations compare temperatures |
+| `hydraulic_to_fea` | cylinder/actuator mount loads → static FEA | one force condition per case; `case` labels (`extend_max_pressure` / `retract_max_pressure`) group per-stroke load cases (shipped by `hydraulic_fea_handoff`, T-FIN22) |
 
 Non-goals: this is a *data* contract, not an orchestration contract (DAG scheduling is
 `contracts/dag_schema.md`); it does not prescribe solver internals or mesh formats.

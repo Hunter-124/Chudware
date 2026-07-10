@@ -2,8 +2,8 @@
 id: T-FIN11
 title: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN11-ecad-fpga-pack
 depends_on: [T-FIN8]
 lane: ecad-firmware

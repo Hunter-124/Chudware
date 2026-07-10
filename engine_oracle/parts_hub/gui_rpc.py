@@ -899,21 +899,45 @@ def _fastener_thread_op(family: str, size: str) -> dict | None:
     }}
 
 
+def _resolve_core_family(part_id: str) -> tuple[str, str] | None:
+    """(family, size) for a parametric ``core_family`` part, else None. Fast path parses a
+    ``mech_family:<family>:<size>`` id directly; every OTHER local id (``fastener:ISO 4762:M8``,
+    ``bearing:…``, …) is resolved via its PartRecord's ``geometry_ref`` — those catalog parts carry
+    ``geometry_ref.kind == "core_family"`` with the same {family,size}, so they render identically.
+    This is why bolt/nut thumbnails must NOT be gated on the ``mech_family:`` prefix alone."""
+    if part_id.startswith("mech_family:"):
+        # family keys never contain a colon, so split on the FIRST colon (as CoreFamiliesAdapter).
+        sub = part_id[len("mech_family:"):].split(":", 1)
+        if len(sub) == 2 and sub[0] and sub[1]:
+            return sub[0], sub[1]
+        return None
+    if part_id.startswith(("catalog:", "vendorlogo:")):
+        return None   # live vendor product / a logo — not a local parametric part
+    try:
+        from engine_oracle import parts_hub  # noqa: PLC0415
+        rec = parts_hub.get(part_id)
+    except Exception:  # noqa: BLE001 — unknown / non-local id
+        return None
+    if not isinstance(rec, dict):
+        return None
+    gref = rec.get("geometry_ref") or {}
+    if gref.get("kind") != "core_family":
+        return None
+    fam, sz = gref.get("family"), gref.get("size")
+    return (str(fam), str(sz)) if fam and sz else None
+
+
 def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
-    """Render a standard (mech_family) library part's actual 3D CAD model to a PNG,
-    via the native core: ``parts_make`` (instantiate the parametric family+size — the
-    "template part") → ``doc_render_png`` → ``doc_close``. Returns the PNG bytes, or
-    None if the core is unavailable / the render failed (caller falls back to the 2D
-    domain glyph). Uses the RAW core RPCs, never the ``make_standard_part`` MCP wrapper
-    — that wrapper publishes/autosaves and would clobber the user's live doc."""
-    if not part_id.startswith("mech_family:"):
+    """Render a standard parametric (``core_family``) library part's actual 3D CAD model to a PNG,
+    via the native core: ``parts_make`` (instantiate the family+size — the "template part") →
+    material + threads → ``doc_render_png`` (clean) → ``doc_close``. Returns the PNG bytes, or None
+    if the part isn't a core_family part / the core is unavailable / the render failed (caller falls
+    back to the 2D domain glyph). Uses the RAW core RPCs, never the ``make_standard_part`` MCP
+    wrapper — that wrapper publishes/autosaves and would clobber the user's live doc."""
+    fam_sz = _resolve_core_family(part_id)
+    if fam_sz is None:
         return None
-    # part_id == "mech_family:<family>:<size>"; family keys never contain a colon, so split on
-    # the FIRST colon exactly like CoreFamiliesAdapter.get() maps a part_id back to (family, size).
-    sub = part_id[len("mech_family:"):].split(":", 1)
-    if len(sub) != 2 or not sub[0] or not sub[1]:
-        return None
-    family, size = sub
+    family, size = fam_sz
     try:
         import pathlib as _pathlib  # noqa: PLC0415
         import sys as _sys  # noqa: PLC0415
@@ -984,16 +1008,17 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
             return {"ok": True, "image_b64": base64.b64encode(cache.read_bytes()).decode()}
         # Standard/library part with no vendor image: render its 3D model on demand and
         # cache it (keyed by part_id, so subsequent views are instant cache hits).
-        if part_id.startswith("mech_family:"):
-            data = _render_local_part_png(part_id, str(cache) + ".png")
-            if data:
-                cache.write_bytes(data)
-                return {"ok": True, "image_b64": base64.b64encode(data).decode()}
         if image_url.startswith(("http://", "https://")):
             data = _fetch_image_bytes(image_url, part_id)
             if data:
                 cache.write_bytes(data)
                 return {"ok": True, "image_b64": base64.b64encode(data).decode()}
+        # No usable vendor image → render the 3D model of any local parametric (core_family) part:
+        # mech_family:/fastener:/bearing:/… all resolve through _render_local_part_png.
+        data = _render_local_part_png(part_id, str(cache) + ".png")
+        if data:
+            cache.write_bytes(data)
+            return {"ok": True, "image_b64": base64.b64encode(data).decode()}
         return {"ok": False, "reason": "no preview available"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_thumbnail failed: {exc}"}

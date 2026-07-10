@@ -146,3 +146,65 @@ Field semantics:
 
 MCP surfaces: `ecad_to_3d` writes the sidecar and returns its path + totals;
 `ecad_status` and `describe_board` narrate per-component power and the board total.
+
+## 3. `pdn` extension (additive, T-FIN13)
+
+Optional top-level key on the sidecar document — added under the append-only rule (new
+optional keys allowed; nothing above changes). Producer: `engine.ecad.pdn.solve_pdn`
+via `attach_pdn()` (MCP: `ecad_run_pdn`, which merges into an existing
+`board.step.boardphys.json` when `ecad_to_3d` already wrote one, else writes a
+PDN-only sidecar `pdn.boardphys.json` carrying `schema`, `board`, empty
+`components`, a `note`, and this block). Consumer: the ECAD→thermal handoff
+(T-FIN16) — the `i2r_map` is the trace-heating source field.
+
+```json
+"pdn": {
+  "schema": "aicad.pdn/1",
+  "generated_by": "engine.ecad.pdn.solve_pdn",
+  "nets": [
+    {
+      "net": "+5V", "vsrc": 5.0, "sources": ["U3"],
+      "drops": [{"ref": "U2", "i_a": 0.35, "v_pad": 4.971, "drop_v": 0.029,
+                 "v_min": 4.75, "within_tolerance": true, "connected": true}],
+      "worst_drop": {"ref": "U2", "...": "same shape as drops[*]"},
+      "max_j_a_mm2": 12.4, "j_limit_a_mm2": 30.0,
+      "hotspots": [{"layer": "F.Cu", "x_mm": 21.3, "y_mm": 8.0, "j_a_mm2": 41.2}],
+      "violations": ["<human-readable strings>"],
+      "unknown_sinks": ["U9"],
+      "i2r_map": {
+        "cell_size_mm": 0.25,
+        "copper_thickness_mm": {"F.Cu": 0.035, "B.Cu": 0.035},
+        "columns": ["layer", "x_mm", "y_mm", "p_w"],
+        "cells": [["F.Cu", 21.25, 8.0, 3.1e-4]],
+        "vias": [{"id": "v3", "at": [20.0, 8.0], "i_a": 1.2,
+                  "r_ohm": 0.0011, "p_w": 1.6e-3}],
+        "total_w": 0.128,
+        "omitted_w": 0.0
+      }
+    }
+  ]
+}
+```
+
+Field semantics (per net entry):
+
+- One entry per solved power net. `vsrc` is the source (regulator-output) voltage the
+  solve was pinned to; `sources` are the refs whose pads were held at `vsrc`.
+- `drops[*]` — per sink component on the net. `i_a` is the modelled draw
+  (`supply.rails` metadata or an explicit override); **`null` means unknown draw** (the
+  ref also appears in `unknown_sinks`) — per the honesty rule the solve does NOT invent
+  0 A, it reports the coverage gap. `v_pad` is the worst (minimum) pad voltage,
+  `drop_v = vsrc - v_pad`. `within_tolerance` compares the delivered voltage against
+  the rail's `voltage_v_min` (`null` when either side is unknown). `connected: false`
+  = the component's pads are not on the source's copper (open PDN path).
+- `hotspots` — mesh cells whose in-plane current density `J = I / (cell_size * t_cu)`
+  exceeds `j_limit_a_mm2` (top offenders, capped at 50).
+- `i2r_map` — the per-element DC dissipation field (watts) for thermal consumption.
+  `cells` rows follow `columns`: copper layer id, cell-centre x/y (board mm, same
+  frame as `pos_mm` above), dissipated power in that `cell_size_mm`-square element.
+  Cells are sorted by power, capped (largest 20k); the truncated remainder is
+  `omitted_w`, so `sum(cells) + sum(vias[].p_w) + omitted_w == total_w`. Via barrels
+  are listed separately with their barrel resistance and current (their power is NOT
+  double-counted in `cells`).
+- Model scope (v1): DC resistive only; arc tracks ignored; one net per entry (the
+  return path is its own entry, typically `GND`).

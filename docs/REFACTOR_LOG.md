@@ -1092,3 +1092,15 @@ close, stages them, and pushes into the CEF daemon warm profile so
 browser; wizard bar gains **Desktop browser** for any site. Anaheim adapter
 sets `LOGIN_URL`. Not a captcha bypass — user completes the challenge in real
 Chrome; we only carry the resulting session.
+
+**2026-07-10 — Anaheim Magento login/referer loop fix.** Users bounced onto
+`/customer/account/login/referer/…` after submit (looks like a "referral"
+page). Root causes: (1) LOGIN_URL used `www.` while Magento is non-www —
+session cookies didn't stick across the 308; (2) headed `browser_login`
+still injected the WebGL `getParameter` spoof — a reCAPTCHA tell on a real
+GPU; (3) storefront header Sign-In is self-referential
+(`/login/referer/<login page itself>/`). Fix: canonical non-www
+`LOGIN_URL` + real login markers/`is_logged_in`; `INIT_SCRIPT_HEADED`
+without WebGL hook; prefer system `channel=chrome`; Magento fixup seeds
+`login_redirect` to `/customer/account/`, rewrites self-referer links, hops
+to the dashboard when the session already took.

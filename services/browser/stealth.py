@@ -57,9 +57,16 @@ _VERSION_CACHE: dict[str, str] = {}
 # (window.chrome absent, empty plugin list, single-entry languages). Each patch
 # is isolated in try/catch so a hardened property on a future Chromium can never
 # break page init. webdriver is handled by the launch flag; we only re-assert it
-# defensively. We deliberately do NOT spoof WebGL/canvas — the real values are
-# honest and inventing them risks a fresh inconsistency.
-INIT_SCRIPT = r"""
+# defensively.
+#
+# WebGL spoof is SEPARATE and HEADLESS/software-GL only. Hooking
+# WebGLRenderingContext.getParameter is a reCAPTCHA tell (Function.prototype
+# .toString exposes the wrapper regardless of a masked .toString) — confirmed
+# against Anaheim Magento MSP invisible reCAPTCHA. Headed login (real GPU /
+# real Chrome) must leave getParameter NATIVE. Headless CEF/SwiftShader still
+# needs the spoof so catalog fetches aren't wall-flagged on the software-GL
+# renderer string. Same policy as cef_stealth.cpp (real GPU → no hook).
+_INIT_SCRIPT_BASE = r"""
 (() => {
   const patch = (fn) => { try { fn(); } catch (e) { /* keep page init alive */ } };
 
@@ -82,11 +89,15 @@ INIT_SCRIPT = r"""
   patch(() => {
     if (navigator.webdriver) Object.defineProperty(navigator, 'webdriver', { get: () => false });
   });
-  // WebGL vendor/renderer spoof — masks the software-GL (SwiftShader/ANGLE) tell
-  // that CEF's --use-angle=swiftshader crash-workaround leaks (a top bot-scan
-  // flag on bot.sannysoft). Reports a plausible desktop-Linux Intel/Mesa GPU
-  // consistent with the Linux UA, with a native-reading toString so the hook
-  // isn't itself a tell. Kept in lockstep with cef_stealth.cpp's apply_stealth().
+})();
+"""
+
+_INIT_SCRIPT_WEBGL = r"""
+(() => {
+  const patch = (fn) => { try { fn(); } catch (e) { /* keep page init alive */ } };
+  // WebGL vendor/renderer spoof — HEADLESS/software-GL only. Masks the
+  // SwiftShader/ANGLE tell CEF's --use-angle=swiftshader crash-workaround
+  // leaks. Do NOT inject this on headed login (reCAPTCHA reads the hook).
   patch(() => {
     const VENDOR = 37445, RENDERER = 37446;  // UNMASKED_VENDOR/RENDERER_WEBGL
     const spoof = {
@@ -106,6 +117,11 @@ INIT_SCRIPT = r"""
   });
 })();
 """
+
+# Headless / software-GL path (catalog fetch, embed OSR): base + WebGL spoof.
+INIT_SCRIPT = _INIT_SCRIPT_BASE + "\n" + _INIT_SCRIPT_WEBGL
+# Headed human login: base only — honest GPU, no getParameter wrapper.
+INIT_SCRIPT_HEADED = _INIT_SCRIPT_BASE
 
 
 def _major(full_version: str) -> str:
@@ -221,11 +237,16 @@ async def chromium_version_async(pw: Any) -> str:
 
 # ---- applying the hardening to a live context/page (guarded) ------------------
 
-def harden_context_sync(context: Any) -> None:
+def harden_context_sync(context: Any, *, headed: bool = False) -> None:
     """Inject the client-side patch script into every page of ``context``.
-    No-op (swallowed) if the context can't take init scripts (e.g. a test fake)."""
+
+    ``headed=True`` (human login window) skips the WebGL getParameter hook —
+    that hook is a reCAPTCHA tell on a real GPU. Headless keeps the spoof so
+    software-GL renderer strings don't wall catalog fetches.
+    No-op (swallowed) if the context can't take init scripts (e.g. a test fake).
+    """
     try:
-        context.add_init_script(INIT_SCRIPT)
+        context.add_init_script(INIT_SCRIPT_HEADED if headed else INIT_SCRIPT)
     except Exception:  # noqa: BLE001 — degrade gracefully; UA/args still applied
         pass
 
@@ -241,10 +262,10 @@ def harden_page_sync(context: Any, page: Any, ua: str, full_version: str) -> Non
         pass
 
 
-async def harden_context_async(context: Any) -> None:
+async def harden_context_async(context: Any, *, headed: bool = False) -> None:
     """Async counterpart of :func:`harden_context_sync`."""
     try:
-        await context.add_init_script(INIT_SCRIPT)
+        await context.add_init_script(INIT_SCRIPT_HEADED if headed else INIT_SCRIPT)
     except Exception:  # noqa: BLE001
         pass
 

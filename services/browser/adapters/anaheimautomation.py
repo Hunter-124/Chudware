@@ -20,10 +20,17 @@ from .. import session as _session
 from . import download_dir, is_login_wall, login_required, provenance_envelope, register
 
 SITE = "anaheimautomation"
-BASE_URL = "https://www.anaheimautomation.com"
-# Magento customer login — headed browser_login + CEF panel both land here.
-# reCAPTCHA (MSP invisible) scores embedded OSR/SwiftShader CEF as a bot on
-# NVIDIA+Wayland; prefer the desktop-browser Sign-in path for this site.
+# Canonical host is NON-www (www 308s → bare). Login cookies set on one host
+# do not stick on the other, which is the main "I signed in then bounced back
+# to login/referer" failure mode on this Magento storefront.
+BASE_URL = "https://anaheimautomation.com"
+POST_LOGIN_URL = BASE_URL + "/customer/account/"
+# Clean Magento customer login (NO /login/referer/… path). The storefront's
+# header "Sign In" link is self-referential
+# (/login/referer/<base64 of the login page itself>/) and is what leaves users
+# on a "login/referral" URL after a failed captcha/form_key — we deliberately
+# open the plain login form and, after success, land on POST_LOGIN_URL via the
+# headed browser_login Magento hop (session.py).
 LOGIN_URL = BASE_URL + "/customer/account/login/"
 SEARCH_URL_TMPL = BASE_URL + "/catalogsearch/result/?q={query}"
 LICENSE_NOTE = (
@@ -34,10 +41,43 @@ LICENSE_NOTE = (
     "contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('Log in to Anaheim Automation', 'id="loginForm"', 'class="login-form"',
-                       'Please sign in to download')
-# Magento search cards: a `product-item-link` anchor whose href is an ABSOLUTE
-# product URL (class may sit before or after href, so require it via lookahead).
+# Real Magento login markup (live 2026-07-10): id="login-form", class
+# "form form-login", title "Customer Login". Older guesses (loginForm /
+# login-form class) never matched and made wall detection unreliable.
+_LOGIN_WALL_MARKERS = (
+    "Customer Login",
+    'id="login-form"',
+    'class="form form-login"',
+    "Please sign in to download",
+    "reCAPTCHA verification failed",
+    "Invalid Form Key",
+)
+
+
+def is_logged_in(content: str | None, url: str = "") -> bool:
+    """True when Magento shows a post-login surface (account dashboard or
+    header customer menu), never when still on login/create/referer auth."""
+    u = (url or "").lower()
+    if any(frag in u for frag in (
+        "/customer/account/login",
+        "/customer/account/create",
+        "/customer/account/forgotpassword",
+        "/customer/ajax/login",
+    )):
+        return False
+    if "/customer/account" in u and "/login" not in u:
+        return True
+    hay = content or ""
+    # Magento signed-in header / account chrome (not present on the login form).
+    if re.search(r'class="[^"]*customer-welcome', hay, re.I):
+        return True
+    if re.search(r'href="[^"]*customer/account/logout', hay, re.I):
+        return True
+    if "Log Out" in hay or "Sign Out" in hay:
+        return True
+    return False
+
+
 _RESULT_RE = re.compile(
     r'<a\b(?=[^>]*\bclass="[^"]*product-item-link)[^>]*\bhref="(?P<href>[^"]+)"[^>]*>'
     r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
@@ -55,6 +95,13 @@ def _strip_tags(text: str) -> str:
 
 class AnaheimAutomationAdapter:
     key = SITE
+    # expose hooks for embed.classify_login_state / start_url_for_site
+    LOGIN_URL = LOGIN_URL
+    BASE_URL = BASE_URL
+    _LOGIN_WALL_MARKERS = _LOGIN_WALL_MARKERS
+
+    def is_logged_in(self, content: str | None, url: str = "") -> bool:
+        return is_logged_in(content, url)
 
     def search(self, query: str) -> list[dict]:
         url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))

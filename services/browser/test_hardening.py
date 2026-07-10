@@ -394,3 +394,14 @@ def test_stealth_init_script_covers_the_known_tells():
     # cef_stealth.cpp; the hook reads native via toString so it isn't itself a tell.
     assert "37445" in js and "37446" in js  # UNMASKED_VENDOR/RENDERER_WEBGL
     assert "getParameter" in js
+
+
+def test_stealth_headed_init_script_skips_webgl_hook():
+    # reCAPTCHA treats a hooked getParameter as a bot tell on a real GPU
+    # (Anaheim Magento). Headed login must leave WebGL native.
+    from services.browser import stealth
+    headed = stealth.INIT_SCRIPT_HEADED
+    for tell in ("webdriver", "chrome", "plugins", "languages"):
+        assert tell in headed
+    assert "37445" not in headed and "getParameter" not in headed
+    assert "37445" in stealth.INIT_SCRIPT  # headless still spoofs

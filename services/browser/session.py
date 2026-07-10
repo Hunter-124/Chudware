@@ -145,20 +145,99 @@ def _push_cookies_to_cef_warm(cookies: list) -> None:
         pass
 
 
+def _chrome_channel_available() -> bool:
+    """True when a system Google Chrome install is on PATH (Playwright channel)."""
+    import shutil
+    return bool(shutil.which("google-chrome")
+                or shutil.which("google-chrome-stable")
+                or shutil.which("chrome"))
+
+
+# Magento (Anaheim et al.) often leaves the user on ``/login/referer/<base64>/``
+# after a failed captcha/form_key OR via a self-referential header Sign-In link
+# that encodes the login page as its own post-login destination. Two helpers:
+#
+# 1) On the login form, seed Magento's ``login_redirect`` cookie + strip broken
+#    self-referer from header "Sign In" links so a successful POST lands on the
+#    account dashboard instead of bouncing back onto /login/referer/….
+# 2) If the session actually took (customer-welcome / logout link) while the URL
+#    is still on /login…, hop once to /customer/account/ so classify_login_state
+#    can stamp verified and cookie export captures a post-login jar.
+#
+# Observation + cookie/link fix + one navigation. Never fills credentials.
+_MAGENTO_LOGIN_FIXUP_JS = r"""
+(() => {
+  try {
+    const path = (location.pathname || '').toLowerCase();
+    if (!path.includes('/customer/account/login')) return 'skip';
+    // Prefer account dashboard after a good login (Magento AccountRedirect).
+    try {
+      const dest = location.origin + '/customer/account/';
+      document.cookie = 'login_redirect=' + encodeURIComponent(dest)
+        + '; path=/; SameSite=Lax; max-age=600'
+        + (location.protocol === 'https:' ? '; Secure' : '');
+    } catch (e) {}
+    // Rewrite header "Sign In" links that point at /login/referer/<login-itself>/
+    // (Anaheim's storefront ships this self-loop; base64 of the login URL ends
+    // with the login path and keeps users on a login/referer page forever).
+    try {
+      for (const a of document.querySelectorAll('a[href*="/customer/account/login/referer/"]')) {
+        const href = a.getAttribute('href') || '';
+        // Magento encode of …/customer/account/login/ contains "L2xvZ2lu" ( /login )
+        // and of …/customer/account/ does not end the payload with "login".
+        if (/login\/referer\/[^/]*bG9naW4/i.test(href) || /login\/referer\/[^/]*sb2dpbi/i.test(href)) {
+          a.setAttribute('href', location.origin + '/customer/account/login/');
+        }
+      }
+    } catch (e) {}
+    const signed = !!(
+      document.querySelector('.customer-welcome') ||
+      document.querySelector('a[href*="customer/account/logout"]') ||
+      /log\s*out|sign\s*out/i.test(document.body ? document.body.innerText.slice(0, 4000) : '')
+    );
+    if (signed) {
+      location.replace(location.origin + '/customer/account/');
+      return 'hop';
+    }
+    return 'fixed';
+  } catch (e) { return 'err'; }
+})();
+"""
+
+
 def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callable[[], Any]) -> dict:
     profile_path = profiles.profile_dir(site)
     challenge_detected: str | None = None
     last_content: str | None = None
     last_url: str = ""
     exported_cookies: list = []
+    launch_channel: str | None = None
     try:
         with sync_playwright() as pw:
             ver = stealth.chromium_version_sync(pw)
             ua  = stealth.user_agent(ver)
-            context = pw.chromium.launch_persistent_context(
-                str(profile_path), headless=False,
-                args=stealth.launch_args(headless=False), **stealth.context_options(ua))
-            stealth.harden_context_sync(context)
+            # Prefer real Google Chrome for headed login when installed: Playwright's
+            # bundled Chromium + any WebGL hook is a reCAPTCHA bot tell (Anaheim
+            # Magento MSP invisible). channel="chrome" uses the system browser
+            # with a real GPU fingerprint while still writing our site profile.
+            launch_kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile_path),
+                "headless": False,
+                "args": stealth.launch_args(headless=False),
+                **stealth.context_options(ua),
+            }
+            if _chrome_channel_available():
+                launch_kwargs["channel"] = "chrome"
+                launch_channel = "chrome"
+            try:
+                context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            except Exception:
+                # Channel missing / broken install → plain Chromium still usable.
+                launch_kwargs.pop("channel", None)
+                launch_channel = None
+                context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            # headed=True: NO WebGL getParameter hook (reCAPTCHA tell on real GPU).
+            stealth.harden_context_sync(context, headed=True)
             _apply_staged_cookies(context, site)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
@@ -177,6 +256,7 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                 # and record it — we never click, solve, or bypass it. The user completes
                 # it in this headed window (real GPU / real Chrome) and closes it when done.
                 announced: set[str] = set()
+                magento_hop_done = False
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     try:
@@ -191,6 +271,18 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                             print(f"[browser_login] {site}: {kind.upper()} detected — "
                                   f"please complete it in the browser window. This tool "
                                   f"will not attempt to solve or bypass it.", flush=True)
+                    # Magento: seed login_redirect + unbreak self-referer links;
+                    # if the session already took on a /login/referer/… URL, hop
+                    # once to the account dashboard (window still open).
+                    if (last_url and "/customer/account/login" in last_url.lower()):
+                        try:
+                            result = page.evaluate(_MAGENTO_LOGIN_FIXUP_JS)
+                            if result == "hop" and not magento_hop_done:
+                                magento_hop_done = True
+                                page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                                last_content, last_url = page.content(), page.url
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
                         page.wait_for_event("close", timeout=_LOGIN_POLL_INTERVAL_S * 1000)
                         break  # window closed → the user signalled "done"
@@ -214,6 +306,8 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
     # logged_in — best-effort; if we couldn't read it, degrade to not-verified.
     now = time.time()
     fields: dict[str, Any] = {"last_login_ts": now}
+    if launch_channel:
+        fields["login_channel"] = launch_channel
     login_verified = False
     try:
         from .embed import classify_login_state, import_session_cookies  # lazy
@@ -240,7 +334,8 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
             "last_login_ts": meta["last_login_ts"],
             "login_verified": bool(meta.get("login_verified_ts")),
             "challenge_detected": challenge_detected,
-            "cookies_exported": len(exported_cookies)}
+            "cookies_exported": len(exported_cookies),
+            "channel": launch_channel or "chromium"}
 
 
 def browser_fetch(url: str, site: str, *,

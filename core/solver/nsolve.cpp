@@ -192,6 +192,14 @@ void System::soft_target(int idx, double target, double weight) {
         "soft:" + std::to_string(idx), weight, /*soft=*/true);
 }
 
+void System::clear_soft_targets() {
+    auto it = std::remove_if(blocks_.begin(), blocks_.end(),
+                             [](const Block& b) { return b.soft; });
+    if (it == blocks_.end()) return;  // nothing soft registered — no-op
+    blocks_.erase(it, blocks_.end());
+    dirty_ = true;  // finalize_rows() recomputes row offsets + has_soft_ lazily
+}
+
 // -- assembly -----------------------------------------------------------------
 
 void System::finalize_rows() {

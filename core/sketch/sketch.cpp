@@ -2221,7 +2221,8 @@ double measure_cond_adj(const json& constraint, const std::vector<std::string>& 
 }  // namespace
 
 SketchSolution solve_sketch(const json& sketch, const json& env,
-                            const std::optional<SolveState>& warm) {
+                            const std::optional<SolveState>& warm,
+                            std::optional<double> time_budget_ms) {
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
 
@@ -2289,7 +2290,7 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
     }
 
     SketchSolution sol;
-    auto res = sys.solve(x0, 1e-10, 50);
+    auto res = sys.solve(x0, 1e-10, 50, time_budget_ms);
     sol.x = res.x;
     sol.converged = res.converged;
     sol.var_map = var_map;
@@ -2413,9 +2414,12 @@ std::vector<std::string> entity_var_names(const std::string& t, int nvars) {
     return {};
 }
 
-}  // namespace
-
-std::vector<FreeVar> free_variables(const json& sketch, const json& env) {
+// Shared body of the two free_variables overloads. `solved_x` (nullable) is a prior
+// solve_sketch cold solve of the SAME sketch/env — when its size matches the rebuilt
+// system it is reused verbatim, skipping the redundant cold solve (the systems are
+// built identically and the LM solve is deterministic, so the vectors are equal).
+std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
+                                       const Eigen::VectorXd* solved_x) {
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
 
@@ -2437,8 +2441,13 @@ std::vector<FreeVar> free_variables(const json& sketch, const json& env) {
         } catch (...) { /* forward-tolerant */ }
     }
 
-    auto res = sys.solve(std::nullopt, 1e-10, 50);
-    const VectorXd& x = res.x;
+    VectorXd x;
+    if (solved_x && solved_x->size() == sys.n_vars()) {
+        x = *solved_x;  // reuse the caller's solve — skip the second cold solve
+    } else {
+        auto res = sys.solve(std::nullopt, 1e-10, 50);
+        x = res.x;
+    }
     int n = sys.n_vars();
     MatrixXd J = sys.real_jacobian(x);
 
@@ -2483,6 +2492,17 @@ std::vector<FreeVar> free_variables(const json& sketch, const json& env) {
         }
     }
     return out;
+}
+
+}  // namespace
+
+std::vector<FreeVar> free_variables(const json& sketch, const json& env) {
+    return free_variables_at(sketch, env, nullptr);
+}
+
+std::vector<FreeVar> free_variables(const json& sketch, const json& env,
+                                    const Eigen::VectorXd& solved_x) {
+    return free_variables_at(sketch, env, &solved_x);
 }
 
 std::vector<Endpoint> entity_endpoints(const json& coords) {
@@ -2638,31 +2658,59 @@ std::optional<double> measure_constraint(const json& constraint,
     return std::nullopt;
 }
 
+// Per-drag cached solve context — see the sketch.h contract. Everything here is what
+// drag() historically rebuilt per frame. Reusing the System reuses the exact residual
+// blocks a fresh build would register (add_constraint's lambdas are pure per-call and
+// the registration-time shape probe in nsolve's add_residual has no side effects the
+// solve depends on), so caching preserves solve semantics by construction.
+struct DragContext {
+    System sys;             // hard blocks registered; soft targets cleared per frame
+    EntMap entities;        // entity id -> entity json (for resolve_handle)
+    VarMap var_map;         // entity id -> variable indices
+    json entities_list;     // parsed "entities" array (for extract_entities)
+    json constraints_list;  // parsed "constraints" array (for full diagnostics)
+};
+
 json drag(const SolveState& state, const std::string& handle,
           const std::pair<double, double>& target_xy, const json& sketch,
-          const json& env, const json& targets) {
-    json entities_list = sketch.value("entities", json::array());
-    json constraints_list = sketch.value("constraints", json::array());
-
-    EntMap entities;
-    for (const auto& e : entities_list) entities[e["id"]] = e;
-
-    System sys;
-    VarMap var_map;
-    for (const auto& e : entities_list) {
-        try {
-            var_map[e["id"]] = allocate_entity(sys, e);
-        } catch (...) {
-            var_map[e["id"]] = sys.add_vars(0, {});
+          const json& env, const json& targets,
+          std::shared_ptr<DragContext>* ctx_io) {
+    // Cached fast path (ctx_io != nullptr): build the context once, reuse it on every
+    // later frame of the same drag, and skip the per-frame diagnostics below. Topology
+    // cannot change mid-drag; the CALLER invalidates the context on any doc change.
+    const bool fast = ctx_io != nullptr;
+    std::shared_ptr<DragContext> ctx = fast ? *ctx_io : nullptr;
+    if (!ctx) {
+        ctx = std::make_shared<DragContext>();
+        ctx->entities_list = sketch.value("entities", json::array());
+        ctx->constraints_list = sketch.value("constraints", json::array());
+        for (const auto& e : ctx->entities_list) ctx->entities[e["id"]] = e;
+        for (const auto& e : ctx->entities_list) {
+            try {
+                ctx->var_map[e["id"]] = allocate_entity(ctx->sys, e);
+            } catch (...) {
+                ctx->var_map[e["id"]] = ctx->sys.add_vars(0, {});
+            }
         }
-    }
-    for (const auto& c : constraints_list) {
-        try {
-            add_constraint(sys, c, entities, var_map, env);
-        } catch (...) {
-            // forward-tolerant
+        for (const auto& c : ctx->constraints_list) {
+            try {
+                add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env);
+            } catch (...) {
+                // forward-tolerant
+            }
         }
+        if (fast) *ctx_io = ctx;
+    } else {
+        // Frame N of a drag: drop frame N-1's soft targets so that after the
+        // re-registration below the block set is IDENTICAL to a fresh build
+        // (hard blocks in registration order, then this frame's soft targets).
+        ctx->sys.clear_soft_targets();
     }
+    System& sys = ctx->sys;
+    const json& entities_list = ctx->entities_list;
+    const json& constraints_list = ctx->constraints_list;
+    const EntMap& entities = ctx->entities;
+    const VarMap& var_map = ctx->var_map;
 
     // Normalize to a list of (handle, (tx, ty)). The single-handle call becomes a
     // one-element list. `targets` (when given) wins over handle/target_xy.
@@ -2741,8 +2789,22 @@ json drag(const SolveState& state, const std::string& handle,
             x = sys.init_vector();
     }
 
-    auto analysis = sys.analyze(x);
     json entity_coords = extract_entities(x, entities_list, var_map);
+
+    // Cached fast path: skip the per-frame diagnostics (analyze's dense ColPivQR,
+    // real_jacobian, and compute_statuses' full-V SVD) — they are pure diagnostics
+    // and topology cannot change mid-drag. "statuses" stays in the response shape
+    // as an empty object; the caller serves its drag-start snapshot and runs full
+    // diagnostics once on commit.
+    if (fast) {
+        json rej_fast = json::array();
+        for (const auto& h : rejected_handles) rej_fast.push_back(h);
+        return json{{"ok", true}, {"entities", entity_coords},
+                    {"statuses", json::object()}, {"rejected_handles", rej_fast},
+                    {"converged", res.converged}, {"budget_exceeded", res.budget_exceeded}};
+    }
+
+    auto analysis = sys.analyze(x);
     int n = sys.n_vars();
     MatrixXd J = sys.real_jacobian(x);
     std::map<std::string, std::vector<int>> tag_vars;  // (statuses below; empty refs ok)

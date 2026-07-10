@@ -27,6 +27,7 @@
 #include <Eigen/Dense>
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -63,9 +64,15 @@ struct SketchSolution {
 // §3). `env` maps expression variable names to numeric values (for expression
 // dims); pass an empty object when there are none. `warm` (optional) is a prior
 // SolveState for per-entity warm-starting; omit it (or pass nullopt) for a cold solve.
+// `time_budget_ms` (optional) caps the solve wall-clock (nsolve returns best-so-far,
+// possibly with converged=false, once it elapses) — ONLY for interactive edit paths
+// that run under the global doc lock (the apply_ops auto-coincident pass); parity /
+// oracle-facing callers (check_sketch, the compile pipeline) leave it unset so their
+// convergence behavior is unchanged.
 SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& env);
 SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& env,
-                            const std::optional<SolveState>& warm);
+                            const std::optional<SolveState>& warm,
+                            std::optional<double> time_budget_ms = std::nullopt);
 
 // Current solved measurement for a DIMENSIONAL constraint, in canonical units —
 // C++ port of sketch_solver.py's measure_constraint. distance -> mm (point-point
@@ -107,6 +114,12 @@ struct FreeVar {
 // line L4 end x/y") via a per-entity-type table mirroring allocate_entity's layout.
 // The list is stable-ordered by entity declaration order then local variable index.
 std::vector<FreeVar> free_variables(const nlohmann::json& sketch, const nlohmann::json& env);
+// Same, reusing `solved_x` — a prior solve_sketch's SketchSolution::x over the SAME
+// sketch/env — instead of re-running the cold solve (the expensive step; that cold solve
+// and solve_sketch's build the identical deterministic system, so the vectors match).
+// Falls back to a fresh cold solve when the vector's size doesn't fit the rebuilt system.
+std::vector<FreeVar> free_variables(const nlohmann::json& sketch, const nlohmann::json& env,
+                                    const Eigen::VectorXd& solved_x);
 
 // One endpoint of a sketch entity: its world (u,v) plus the handle string that
 // addresses it in a constraint ref ("L4.p2", "A1.start", "C1.center", "P3"). Produced
@@ -124,15 +137,35 @@ struct Endpoint {
 // points themselves, circles their center. Used by the auto-coincident proximity scan.
 std::vector<Endpoint> entity_endpoints(const nlohmann::json& coords);
 
+// Opaque per-drag solve context (defined in sketch.cpp). Caches everything drag()
+// otherwise rebuilds EVERY mouse-move frame: the parsed entity list, the entity ->
+// variable layout, and the built solver System with all hard-constraint residual
+// blocks registered. A host serving an interactive drag passes the SAME shared_ptr
+// slot on every frame: the first call fills it, later calls reuse it (clearing only
+// the previous frame's soft targets before registering this frame's, so the block
+// set is identical to a fresh build). The context is only valid for the exact
+// sketch/env it was built from — reset the pointer on ANY document change.
+struct DragContext;
+
 // Constrained drag — C++ port of sketch_solver.py's drag. Rebuilds the system from
 // `sketch`, soft-targets the dragged handle(s) at weight 0.01, warm-starts from
 // state.x when the topology matches, and solves with a 10 ms time budget. Returns a
 // JSON object {ok, entities, statuses, converged, budget_exceeded, rejected_handles}.
 // Single-point drag passes `handle`+`target_xy`; multi-target drag passes `targets`
 // (a list of {"handle":..,"xy":[x,y]}), in which case handle/target_xy are ignored.
+//
+// `ctx_io` (optional) enables the cached per-frame fast path. When non-null, the
+// System/var layout is built once into *ctx_io (first frame) and reused on later
+// frames, and the per-frame DIAGNOSTICS — analyze(), real_jacobian(), and the
+// per-entity compute_statuses SVD — are SKIPPED: the returned "statuses" is an empty
+// object and the caller is expected to serve its drag-start snapshot, then run full
+// diagnostics once on commit. Solved ENTITY POSITIONS are identical with or without
+// a context (same residual blocks, same warm start, same 10 ms budget). When ctx_io
+// is null, behavior is exactly the historical per-call rebuild + full diagnostics.
 nlohmann::json drag(const SolveState& state, const std::string& handle,
                     const std::pair<double, double>& target_xy,
                     const nlohmann::json& sketch, const nlohmann::json& env,
-                    const nlohmann::json& targets = nlohmann::json());
+                    const nlohmann::json& targets = nlohmann::json(),
+                    std::shared_ptr<DragContext>* ctx_io = nullptr);
 
 }  // namespace aicad::sketch

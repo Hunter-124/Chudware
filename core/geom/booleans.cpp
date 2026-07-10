@@ -20,6 +20,13 @@ namespace geom {
 // so a later SetRunParallel would be a no-op. Parallel mode lets the BOPDS face-face
 // intersection use the OCCT thread pool (otherwise-idle cores) — a real win for tool-heavy
 // ops like a bolt-circle cut. See core/geom/booleans.h and tools/perf_regression.py.
+//
+// NON-DESTRUCTIVE: without it an OCCT BOP may mutate its ARGUMENT shapes in place
+// (tolerance refinement on the shared TShapes) while building the result. The compile
+// checkpoints (document.h CompileCache) and the body tessellation cache both hold live
+// TShapes across compiles, so an in-place tolerance bump would silently edit cached
+// inputs. SetNonDestructive(true) makes the op copy-on-touch instead — the RESULT shape
+// is geometrically identical either way; only the inputs are left untouched.
 namespace {
 // Run a two-operand boolean in parallel deferred form. `Op` is a BRepAlgoAPI_* algo type.
 template <class Op>
@@ -32,6 +39,7 @@ TopoDS_Shape run_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     op.SetArguments(args);
     op.SetTools(tls);
     op.SetRunParallel(Standard_True);
+    op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
     return op.Shape();
@@ -65,6 +73,7 @@ TopoDS_Shape fuse_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>
     op.SetArguments(args);
     op.SetTools(tls);
     op.SetRunParallel(Standard_True);  // parallelize the N-tool intersection over idle cores
+    op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
     return op.Shape();
@@ -80,6 +89,7 @@ TopoDS_Shape cut_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>&
     op.SetArguments(args);
     op.SetTools(tls);
     op.SetRunParallel(Standard_True);  // parallelize the N-tool intersection over idle cores
+    op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
     return op.Shape();

@@ -95,6 +95,13 @@ public:
     // constraint dominates the pull. Register one per dragged coordinate.
     void soft_target(int idx, double target, double weight = 0.01);
 
+    // Remove every soft(-target) block registered so far, leaving the hard
+    // constraint blocks — and their registration order — untouched. Lets an
+    // interactive drag build the System ONCE and reuse it across mouse-move
+    // frames: clear the previous frame's pulls, register this frame's, re-solve.
+    // Row offsets / has_soft are re-finalized lazily on the next solve/analyze.
+    void clear_soft_targets();
+
     // Levenberg-Marquardt solve with adaptive damping. x0 empty uses the
     // registered initial guess; pass the previous solution to warm-start. tol is
     // the convergence threshold on the max absolute residual. time_budget_ms, if

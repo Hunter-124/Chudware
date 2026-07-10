@@ -1,0 +1,147 @@
+// POSIX implementation of daemon discovery/lifecycle. Windows lands in the
+// Windows-parity phase (named mutex + \\.\pipe names).
+#ifndef _WIN32
+
+#include "ipc_discovery.h"
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace aicad_ipc {
+
+std::string fnv1aHex(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
+    return buf;
+}
+
+std::string instanceKey(const std::string& hostdBin) {
+    if (const char* k = std::getenv("AICAD_INSTANCE_KEY"); k && *k) return k;
+    std::string id = hostdBin;
+    char real[PATH_MAX];
+    if (!id.empty() && ::realpath(id.c_str(), real)) id = real;
+    if (id.empty()) id = "default";
+    return fnv1aHex(id);
+}
+
+std::string runtimeDir() {
+    std::string dir;
+    if (const char* x = std::getenv("XDG_RUNTIME_DIR"); x && *x) {
+        dir = std::string(x) + "/aicad";
+    } else {
+        dir = "/tmp/aicad-" + std::to_string((long)::getuid());
+    }
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
+    // Refuse a dir we don't own or that others can write (symlink squat defence).
+    struct stat st{};
+    if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != ::getuid() || (st.st_mode & 077) != 0)
+        return "";
+    return dir;
+}
+
+std::string stateDir() {
+    std::string base;
+    if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) base = x;
+    else if (const char* h = std::getenv("HOME"); h && *h) base = std::string(h) + "/.local/share";
+    else base = ".";
+    return base + "/AI-CAD";
+}
+
+std::string socketPath(const std::string& key) {
+    if (const char* p = std::getenv("AICAD_HOSTD_SOCKET"); p && *p) return p;
+    std::string dir = runtimeDir();
+    return dir.empty() ? "" : dir + "/hostd-" + key + ".sock";
+}
+
+std::string lockPath(const std::string& key) {
+    std::string dir = runtimeDir();
+    return dir.empty() ? "" : dir + "/hostd-" + key + ".lock";
+}
+
+std::string resolveHostdBin(const std::string& hint) {
+    if (const char* b = std::getenv("AICAD_HOSTD_BIN"); b && *b) return b;
+    if (!hint.empty() && ::access(hint.c_str(), X_OK) == 0) return hint;
+    return "";
+}
+
+bool SingleInstance::acquire(const std::string& lockFile, std::string& err) {
+    release();
+    int fd = ::open(lockFile.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        err = "open " + lockFile + ": " + std::strerror(errno);
+        return false;
+    }
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        err = "another instance holds " + lockFile;
+        ::close(fd);
+        return false;
+    }
+    // PID recorded for diagnostics only — liveness comes from the flock itself.
+    if (::ftruncate(fd, 0) == 0) {
+        std::string pid = std::to_string((long)::getpid()) + "\n";
+        ssize_t rc = ::write(fd, pid.c_str(), pid.size());
+        (void)rc;
+    }
+    fd_ = fd;
+    path_ = lockFile;
+    return true;
+}
+
+void SingleInstance::release() {
+    if (fd_ >= 0) {
+        ::close(fd_);  // drops the flock
+        fd_ = -1;
+        path_.clear();
+    }
+}
+
+bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        err = std::string("fork: ") + std::strerror(errno);
+        return false;
+    }
+    if (pid == 0) {
+        // Child: new session, second fork so the daemon reparents to init and can
+        // never reacquire a controlling terminal.
+        ::setsid();
+        pid_t pid2 = ::fork();
+        if (pid2 != 0) ::_exit(0);
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, 0);
+            ::dup2(devnull, 1);
+            ::dup2(devnull, 2);
+            if (devnull > 2) ::close(devnull);
+        }
+        if (arg.empty())
+            ::execl(exe.c_str(), exe.c_str(), (char*)nullptr);
+        else
+            ::execl(exe.c_str(), exe.c_str(), arg.c_str(), (char*)nullptr);
+        ::_exit(127);
+    }
+    // Parent: reap the intermediate child immediately (grandchild is init's).
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    return true;
+}
+
+}  // namespace aicad_ipc
+
+#endif  // !_WIN32

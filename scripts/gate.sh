@@ -212,6 +212,32 @@ stage_ctest() {
     echo "  PASS (${passed:-ok})"
 }
 
+# ---- Stage 3b: aicad-hostd smoke ---------------------------------------------
+# The shared engine-host daemon (core/hostd): spawn -> connect -> engine call ->
+# idle-exit, dual-client race -> one daemon, --stop, kill -9 stale-socket
+# recovery. Uses a scratch AICAD_INSTANCE_KEY so a live dev/installed daemon is
+# never touched. FATAL when the binary exists and the suite fails.
+stage_hostd_smoke() {
+    echo "=== [3b/6] hostd smoke ==="
+    local hostd=""
+    for cand in core/build-occt-linux/bin/aicad-hostd core/build-linux/bin/aicad-hostd; do
+        [ -x "$cand" ] && { hostd="$cand"; break; }
+    done
+    if [ -z "$hostd" ]; then
+        record "hostd smoke         SKIP    aicad-hostd not built"
+        echo "  SKIP: no aicad-hostd binary"
+        return 0
+    fi
+    if python3 scripts/hostd_smoke.py "$hostd" > /tmp/gate_hostd.out 2>&1; then
+        record "hostd smoke         PASS    lifecycle + race + stop + recovery"
+        echo "  PASS"
+    else
+        record "hostd smoke         FAIL    see /tmp/gate_hostd.out"
+        echo "  FAIL: hostd smoke"; tail -n 12 /tmp/gate_hostd.out | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 # Uses the mcp-venv (~/.local/share/AI-CAD/mcp-venv/bin/python) when present — that
 # venv has all service/oracle deps installed. Falls back to the old venv search and
@@ -422,6 +448,47 @@ stage_bench() {
     echo "  PASS"; tail -n 8 /tmp/gate_bench.out | sed 's/^/    /'
 }
 
+# ---- Stage 7: modeling perf-regression (tools/perf_regression.py) -----------
+# Times the geometry kernel against tools/perf_baseline.json and flags median slowdowns.
+# Env-gated (perf timings are machine + load sensitive, so this is NOT a hard blocker by
+# default): set AICAD_RUN_PERF=1 to run. A regression is RECORDED (non-fatal) unless
+# AICAD_PERF_FATAL=1. Needs a loadable .so — prefers the freshly built build-occt-linux
+# engine (the profiler/contention RPCs live there); falls back to whatever core_bridge
+# resolves. Update the baseline deliberately with `python tools/perf_regression.py --update`.
+stage_perf() {
+    echo "=== [7/7] modeling perf-regression ==="
+    if [ "${AICAD_RUN_PERF:-0}" != "1" ]; then
+        record "perf-regression     SKIP    set AICAD_RUN_PERF=1 to time the modeling kernel"
+        echo "  SKIP: AICAD_RUN_PERF not set"
+        return 0
+    fi
+    local perf_py="$HOME/.local/share/AI-CAD/mcp-venv/bin/python"
+    [ -x "$perf_py" ] || perf_py="$(command -v python3)"
+    if [ -z "$perf_py" ]; then
+        record "perf-regression     SKIP    no python for perf harness"
+        echo "  SKIP: no python"; return 0
+    fi
+    # Prefer the just-built OCCT engine so the contention/per-feature diagnostics are captured.
+    if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$REPO/core/build-occt-linux/bin/libaicad.so" ]; then
+        export AI_CAD_LIBAICAD="$REPO/core/build-occt-linux/bin/libaicad.so"
+    fi
+    local rc=0
+    "$perf_py" "$REPO/tools/perf_regression.py" --iters "${AICAD_PERF_ITERS:-5}" \
+        --json /tmp/gate_perf.json > /tmp/gate_perf.out 2>&1 || rc=$?
+    tail -n 16 /tmp/gate_perf.out | sed 's/^/    /'
+    if [ "$rc" -eq 0 ]; then
+        record "perf-regression     PASS    no median regressions vs baseline"
+        echo "  PASS"
+    elif [ "$rc" -eq 1 ]; then
+        record "perf-regression     $([ "${AICAD_PERF_FATAL:-0}" = 1 ] && echo FAIL || echo WARN)    median regression vs baseline (see /tmp/gate_perf.out)"
+        echo "  REGRESSION detected"
+        [ "${AICAD_PERF_FATAL:-0}" = 1 ] && fail_fatal=1
+    else
+        record "perf-regression     SKIP    harness could not run (rc=$rc; likely no loadable .so)"
+        echo "  SKIP: harness rc=$rc"
+    fi
+}
+
 # ---- Stage 4.5: V&V benchmark smoke (T-BL01) --------------------------------
 # Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode
 # (pure-Python families only — no .so required for the smoke subset).
@@ -559,11 +626,13 @@ stage_ui_style_check
 stage_core_build
 stage_ui_abstract
 stage_ctest
+stage_hostd_smoke
 stage_pytest
 stage_vv
 stage_modeling
 stage_ui_imgui
 stage_bench
+stage_perf
 
 echo
 echo "============================================================"

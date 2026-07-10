@@ -150,6 +150,13 @@ add_executable(AI-CAD
   src/ui/section_tool.cpp   # C25 W3-I: SolidWorks-style Section View (clip plane + cap)
   # --- end C25 ---
   ../services/worker/worker_client.cpp
+  # --- Phase 4 (shared engine daemon): backend seam + IPC client + event drain ---
+  ../services/worker/engine_backend.cpp
+  ../services/ipc/ipc_transport.cpp
+  ../services/ipc/ipc_discovery.cpp
+  ../services/ipc/ipc_client.cpp
+  src/core/engine_events.cpp
+  # --- end Phase 4 ---
   src/bootstrap.cpp
   src/ui_theme.cpp
   src/win_chrome.cpp
@@ -199,6 +206,7 @@ endif()
 target_include_directories(AI-CAD PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
   ${stb_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
   ${imgui_SOURCE_DIR}

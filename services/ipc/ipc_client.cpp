@@ -116,7 +116,12 @@ bool EngineClient::call(const std::string& method, const json& params, json& res
 }
 
 std::vector<json> EngineClient::drainEvents() {
-    std::lock_guard<std::mutex> lk(mtx_);
+    // try_lock: the GUI thread drains per frame while call()s run on the async
+    // worker thread; a long solve holding mtx_ must never stall the render loop.
+    // Events arriving mid-call are queued by readResponse and picked up on the
+    // first uncontended frame after it returns.
+    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return {};
     // Non-blocking poll for pushes that arrived while idle.
     std::string line;
     while (conn_.valid() && conn_.readLine(line, 0)) {

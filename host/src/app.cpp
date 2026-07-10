@@ -41,6 +41,8 @@
 #include "render/splat_renderer.h"  // RE-27: splat GL draw in reveng reconstruct stage
 
 #include "core/app_state.h"
+#include "core/engine_events.h"  // Phase 4: per-frame hostd event drain (daemon mode)
+#include "engine_backend.h"      // Phase 4: engine::daemonMode() (services/worker)
 
 #ifdef AI_CAD_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"  // CEF process lifecycle (init/pump/shutdown)
@@ -810,6 +812,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // window's swaps indefinitely — observed as multi-minute drmSyncobjTimelineWait stalls). GL
     // rendering + glReadPixels work as normal on the hidden window's framebuffer. Shot-mode only.
     if (shot && std::getenv("AI_CAD_HIDDEN")) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    // Stable window class / app_id so the desktop shell (KDE/GNOME) matches the window to the
+    // installed AI-CAD.desktop (StartupWMClass=AI-CAD) and shows the app icon in the taskbar
+    // instead of a generic placeholder. Without this, GLFW's WM_CLASS falls back to the window
+    // title ("ShopCraft"), which matches no .desktop entry. Harmless on Windows (no-op hints).
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "AI-CAD");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "AI-CAD");
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "AI-CAD");
     GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "ShopCraft", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
@@ -1951,6 +1960,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // C39: deliver finished async worker calls — their callbacks run HERE, on the GL
         // thread, before this frame's panels draw, so results land like any other state.
         st.rpc.drain();
+        // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
+        // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
+        // legacy (in-process) mode.
+        core::engineEventsTick(st);
         // Multi-document: release closed-tab sessions whose async work (PM preview / sketch / eval
         // callbacks that captured `this`) has now fully drained — safe to destroy once rpc is idle.
         st.sweepRetiredSessions();
@@ -1958,7 +1971,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Live MCP handoff: if the external AI-CAD MCP server (the engine Claude drives) published
         // a new part, open/refresh it in the viewport so the user watches the AI build. Self-guards
         // and no-ops the vast majority of frames (a single mtime stat).
-        ui::pollAiCadHandoff(st);
+        // In daemon mode the live preview arrives as doc.changed events with the
+        // mesh path (engineEventsTick above) — the .step+ file handoff is legacy
+        // only, so skip the poller entirely (no second source of truth).
+        if (!engine::daemonMode()) ui::pollAiCadHandoff(st);
 
         // If a chat-triggered accurate (OpenFOAM) CFD finished on the SimClient channel, post its
         // Cd/Cl onto the running chat bubble. No-op unless a chat OpenFOAM run is pending.

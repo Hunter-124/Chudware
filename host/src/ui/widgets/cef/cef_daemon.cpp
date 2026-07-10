@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -22,9 +23,13 @@ using nlohmann::json;
 namespace ui::cef {
 namespace {
 
-// The warm persistent profile shared with the interactive panel — mirrors
-// cef_web_view.cpp's warm_profile_dir() so a login there carries into headless
-// fetch here (once the daemon is the sole CEF host, Phase 2b).
+// The warm persistent profile. The daemon is now its SOLE on-disk owner (Phase 2b):
+// the interactive panel writes its OWN separate profile (cef_web_view.cpp's
+// panel_profile_dir) so two Chromium processes never write this store concurrently.
+// A login in the panel carries here via the "import_session" method below, which
+// re-writes the panel's exported cookies into this jar under the daemon's own
+// OSCrypt (raw dir-sharing can't hand a session across processes — see MEMORY
+// vendor-login-session-handoff).
 std::string warm_profile_dir() {
     if (const char* ov = std::getenv("AI_CAD_CEF_PROFILE_DIR"); ov && ov[0]) return ov;
     return cef_platform::cache_root() + "/_warm_profile";
@@ -74,6 +79,32 @@ json handle(const std::string& line, bool& stop) {
         const std::string profile = p.value("profile", warm_profile_dir());
         const bool ok = headless_download(url, dest, profile);
         return json{{"id", id}, {"result", {{"ok", ok}, {"dest", dest}}}};
+    }
+    // Inject a cookie jar exported from the interactive panel into the warm profile,
+    // so a login there carries into headless fetch/download here (the panel→daemon
+    // session hand-off; the panel no longer shares this on-disk profile).
+    // params: {cookies:[{name,value,domain,path?,secure?,httponly?,expires?,same_site?}], profile?}
+    if (method == "import_session") {
+        const json jar = p.value("cookies", json::array());
+        if (!jar.is_array() || jar.empty()) return err("missing cookies");
+        std::vector<ImportCookie> cookies;
+        cookies.reserve(jar.size());
+        for (const auto& j : jar) {
+            if (!j.is_object()) continue;
+            ImportCookie c;
+            c.name      = j.value("name", "");
+            c.value     = j.value("value", "");
+            c.domain    = j.value("domain", "");
+            c.path      = j.value("path", "");
+            c.secure    = j.value("secure", false);
+            c.http_only = j.value("httponly", false);
+            c.expires   = j.value("expires", 0.0);
+            c.same_site = j.value("same_site", "");
+            cookies.push_back(std::move(c));
+        }
+        const std::string profile = p.value("profile", warm_profile_dir());
+        const int n = headless_import_cookies(profile, cookies);
+        return json{{"id", id}, {"result", {{"ok", n > 0}, {"count", n}}}};
     }
     // DIAGNOSTIC (opt-in AI_CAD_CEF_PROBE): drive a real form login headlessly to
     // observe a bot-wall verdict. Executes caller JS in the page, so it is gated off

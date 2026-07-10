@@ -171,6 +171,16 @@ class CefDaemon:
         """Fetch ``url``'s bytes into ``dest`` under the profile's cookies."""
         return self._call("download", {"url": url, "dest": dest, "profile": profile})
 
+    def import_session(self, cookies: list[dict], *, profile: str = "",
+                       timeout_s: float = 60.0) -> dict:
+        """Inject a cookie jar (exported from the interactive CEF panel) into the
+        daemon's warm profile so a login there carries into headless fetch/download.
+        ``profile`` empty = the warm profile. Returns {ok, count}. The panel and
+        daemon own SEPARATE on-disk profiles (never the same store concurrently), so
+        the session crosses via this cookie re-injection, not by sharing a dir."""
+        return self._call("import_session", {"cookies": cookies, "profile": profile},
+                          timeout_s=timeout_s)
+
     def login_probe(self, url: str, fill_js: str, *, settle_ms: int = 3000,
                     post_wait_ms: int = 12000, profile: str = "", timeout_s: float = 90.0) -> dict:
         """DIAGNOSTIC: load ``url``, run ``fill_js`` (fills + submits a login form in

@@ -7,12 +7,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <thread>
 #include <vector>
 
 #include "include/cef_app.h"          // CefDoMessageLoopWork
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
+#include "include/cef_cookie.h"       // cookie import (panel→daemon session hand-off)
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_render_handler.h"
@@ -319,6 +321,75 @@ bool headless_download(const std::string& url, const std::string& dest_path,
     f.write(reinterpret_cast<const char*>(client->bytes().data()),
             static_cast<std::streamsize>(client->bytes().size()));
     return static_cast<bool>(f);
+}
+
+namespace {
+// Counts SetCookie completions so headless_import_cookies can pump until the async
+// writes land (single-threaded pump, so plain shared ints are safe).
+class SetCookieCounter : public CefSetCookieCallback {
+public:
+    SetCookieCounter(std::shared_ptr<int> ok, std::shared_ptr<int> done)
+        : ok_(std::move(ok)), done_(std::move(done)) {}
+    void OnComplete(bool success) override { if (success) ++*ok_; ++*done_; }
+private:
+    std::shared_ptr<int> ok_, done_;
+    IMPLEMENT_REFCOUNTING(SetCookieCounter);
+};
+// Fires when FlushStore has persisted the jar to disk.
+class FlushWaiter : public CefCompletionCallback {
+public:
+    explicit FlushWaiter(std::shared_ptr<bool> done) : done_(std::move(done)) {}
+    void OnComplete() override { *done_ = true; }
+private:
+    std::shared_ptr<bool> done_;
+    IMPLEMENT_REFCOUNTING(FlushWaiter);
+};
+}  // namespace
+
+int headless_import_cookies(const std::string& profile_dir,
+                            const std::vector<ImportCookie>& cookies) {
+    if (!initialized() || cookies.empty()) return 0;
+    CefRefPtr<CefRequestContext> ctx = make_context(profile_dir);
+    CefRefPtr<CefCookieManager> mgr = ctx ? ctx->GetCookieManager(nullptr) : nullptr;
+    if (!mgr) return 0;
+
+    auto ok = std::make_shared<int>(0);
+    auto done = std::make_shared<int>(0);
+    int posted = 0;
+    for (const auto& c : cookies) {
+        if (c.name.empty() || c.domain.empty()) continue;
+        CefCookie ck;
+        CefString(&ck.name).FromString(c.name);
+        CefString(&ck.value).FromString(c.value);
+        CefString(&ck.domain).FromString(c.domain);
+        CefString(&ck.path).FromString(c.path.empty() ? std::string("/") : c.path);
+        ck.secure = c.secure;
+        ck.httponly = c.http_only;
+        if (c.expires > 0) {
+            cef_time_t t{};
+            cef_basetime_t bt{};
+            if (cef_time_from_doublet(c.expires, &t) && cef_time_to_basetime(&t, &bt)) {
+                ck.has_expires = true;
+                ck.expires = bt;
+            }
+        }
+        if (c.same_site == "none")        ck.same_site = CEF_COOKIE_SAME_SITE_NO_RESTRICTION;
+        else if (c.same_site == "lax")    ck.same_site = CEF_COOKIE_SAME_SITE_LAX_MODE;
+        else if (c.same_site == "strict") ck.same_site = CEF_COOKIE_SAME_SITE_STRICT_MODE;
+        else                              ck.same_site = CEF_COOKIE_SAME_SITE_UNSPECIFIED;
+
+        // URL whose host+scheme let CEF accept this (domain-scoped) cookie.
+        const std::string host = (!c.domain.empty() && c.domain[0] == '.')
+                                     ? c.domain.substr(1) : c.domain;
+        const std::string url = (c.secure ? "https://" : "http://") + host + "/";
+        if (mgr->SetCookie(url, ck, new SetCookieCounter(ok, done))) ++posted;
+    }
+    // Pump until every posted write has completed (~5s cap), then flush to disk.
+    for (int i = 0; i < 500 && *done < posted; ++i) pump(10);
+    auto flushed = std::make_shared<bool>(false);
+    mgr->FlushStore(new FlushWaiter(flushed));
+    for (int i = 0; i < 500 && !*flushed; ++i) pump(10);
+    return *ok;
 }
 
 void shutdown_and_exit(int exit_code) {

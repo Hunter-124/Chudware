@@ -161,20 +161,29 @@ std::string slug(const std::string& site) {
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
-// WARM PERSISTENT PROFILE: one stable on-disk profile shared by EVERY vendor and
-// every app run. Under --single-process only the FIRST CefRequestContext is ever
-// created (vendor switches reuse it via LoadURL — see openOrNavigate), so the old
-// per-vendor cache dirs were already collapsed to one de-facto jar, and a raw-URL
-// open passed "" == an in-memory context wiped on every restart. Consolidating to a
-// single persistent dir means Google / Cloudflare / reCAPTCHA cookies + history
-// accumulate across sessions, which lifts the challenge trust score on repeat
-// visits (a pristine empty profile scores near zero — a big reason first-time
+// PANEL PERSISTENT PROFILE: one stable on-disk profile for the interactive panel,
+// shared by EVERY vendor and every app run. Under --single-process only the FIRST
+// CefRequestContext is ever created (vendor switches reuse it via LoadURL — see
+// openOrNavigate), so the old per-vendor cache dirs were already collapsed to one
+// de-facto jar, and a raw-URL open passed "" == an in-memory context wiped on every
+// restart. A single persistent dir means Google / Cloudflare / reCAPTCHA cookies +
+// history accumulate across sessions, which lifts the challenge trust score on
+// repeat visits (a pristine empty profile scores near zero — a big reason first-time
 // reCAPTCHA/Turnstile fail in-app). Cookies stay domain-scoped so vendors never
-// collide. AI_CAD_CEF_PROFILE_DIR overrides the location (tests / throwaway runs).
-std::string warm_profile_dir() {
-    if (const char* ov = std::getenv("AI_CAD_CEF_PROFILE_DIR"); ov && ov[0])
+// collide.
+//
+// This is DELIBERATELY a DIFFERENT dir from the headless daemon's _warm_profile:
+// the panel (app process) and the cef_daemon (sibling process) must never write the
+// same Chromium profile concurrently — two owners corrupt the cookie/leveldb store.
+// The daemon is the sole owner of _warm_profile; a login here carries into headless
+// fetch via exportSession → browser_session_import → the daemon's "import_session"
+// (cookie re-injection, not dir-sharing — OSCrypt is per-process). See MEMORY
+// vendor-login-session-handoff and cef_daemon.cpp.
+// AI_CAD_CEF_PANEL_PROFILE_DIR overrides the location (tests / throwaway runs).
+std::string panel_profile_dir() {
+    if (const char* ov = std::getenv("AI_CAD_CEF_PANEL_PROFILE_DIR"); ov && ov[0])
         return ov;
-    return cef_platform::cache_root() + "/_warm_profile";
+    return cef_platform::cache_root() + "/_panel_profile";
 }
 
 // URL-path fragments that mean "still in an auth flow" — mirrors
@@ -762,8 +771,8 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
     AppState* stp = &st;   // AppState outlives every RPC/callback (app-lifetime object)
     auto doOpen = [impl, stp, siteOrUrl, isUrl]() {
         if (isUrl) {
-            // Warm shared profile even for raw URLs (was "" == in-memory/no persist).
-            impl->openOrNavigate(siteOrUrl, warm_profile_dir(), isAuthUrl(siteOrUrl));
+            // Persistent panel profile even for raw URLs (was "" == in-memory/no persist).
+            impl->openOrNavigate(siteOrUrl, panel_profile_dir(), isAuthUrl(siteOrUrl));
             std::lock_guard<std::mutex> lk(impl->s->mtx);
             impl->s->url = siteOrUrl;
             return;
@@ -788,9 +797,9 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
                 impl->s->lastError = err.empty() ? "no sign-in URL for this vendor" : err;
                 return;
             }
-            // One warm, persistent, shared profile for every vendor (see
-            // warm_profile_dir) — accumulates challenge cookies across sessions.
-            impl->openOrNavigate(url, warm_profile_dir(), isAuthUrl(url));
+            // One persistent panel profile for every vendor (see panel_profile_dir)
+            // — accumulates challenge cookies across sessions.
+            impl->openOrNavigate(url, panel_profile_dir(), isAuthUrl(url));
             std::lock_guard<std::mutex> lk(impl->s->mtx);
             impl->s->url = url;
         });

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace ui::cef {
 
@@ -52,6 +53,25 @@ bool headless_download(const std::string& url, const std::string& dest_path,
 FetchResult headless_login_probe(const std::string& url, const std::string& fill_submit_js,
                                  int settle_ms, int post_wait_ms,
                                  const std::string& profile_dir = "");
+
+// One cookie to inject into a profile's jar (plain fields — no CEF/JSON types, so
+// the daemon TU can parse the wire jar and this TU can build the CefCookie).
+struct ImportCookie {
+    std::string name, value, domain, path, same_site;  // same_site: none|lax|strict|""
+    bool   secure = false, http_only = false;
+    double expires = 0;                                 // epoch seconds; <=0 = session cookie
+};
+
+// Inject `cookies` into the persistent cookie jar of `profile_dir` (the daemon's
+// warm profile) and flush it to disk, so a session captured in the interactive
+// panel carries into subsequent headless_fetch/download. This is the daemon-side
+// half of the panel→daemon login hand-off: raw profile-dir sharing across the two
+// CEF processes can't share sessions (OSCrypt re-encrypts per process), so the
+// panel exports its cookies and the daemon re-writes them here under its own
+// crypto. Returns the number of cookies accepted. Pumps the CEF loop inline, so it
+// must run on the browser-process main thread (like the other headless_* calls).
+int headless_import_cookies(const std::string& profile_dir,
+                            const std::vector<ImportCookie>& cookies);
 
 // Close all pooled headless browsers (reused across fetches). Call before
 // shutdown() so CefShutdown doesn't race live browsers. No-op if none are open.

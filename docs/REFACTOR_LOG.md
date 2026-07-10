@@ -919,3 +919,30 @@ Ninja** — so the gate produced an -O0 core while printing "PASS (Release)".
 `core/build-linux` in `core_bridge` resolution order — refresh or remove it so tool/worker
 paths don't load stale -O0 code. Secondary levers (not yet done): single-threaded Netgen
 mesher, no mesh caching (re-meshes every solve), double STEP parse, tet10-by-default.
+
+---
+
+**2026-07-10 — CEF daemon is now the sole owner of the warm profile (Phase 2b).**
+The interactive CEF panel (`cef_web_view.cpp`, app process) and the headless
+`cef_daemon` (sibling process) both opened a `CefRequestContext` on the SAME
+`_warm_profile` dir — two Chromium processes writing one cookie/leveldb store,
+which corrupts it, and a login in the panel did not carry into headless fetch
+(OSCrypt is per-process, so raw dir-sharing can't move a session). Fix: the panel
+now uses its OWN persistent dir `panel_profile_dir()` = `_warm_profile`→`_panel_profile`
+(env `AI_CAD_CEF_PANEL_PROFILE_DIR`); the daemon stays sole owner of `_warm_profile`.
+Login carry rides the existing `exportSession → browser_session_import` seam: the
+worker handler (`engine_oracle/embed_rpc.py`) now also pushes the exported jar to a
+new daemon `import_session` RPC (`cef_client.import_session` → `headless_import_cookies`
+in `cef_headless.cpp`, `CefCookieManager::SetCookie` + `FlushStore` into `_warm_profile`),
+off-thread so a cold daemon spawn never stalls the login chip. Files: `cef_headless.{h,cpp}`,
+`cef_daemon.cpp`, `cef_web_view.cpp`, `services/browser/cef_client.py`, `embed_rpc.py`.
+Verified: CEF build (`ninja -C host/build-cef AI-CAD`) links; `cef_client` ping + a
+login-carry smoke (inject cookie via `import_session`, `fetch` a local echo server,
+cookie carried) PASS; embed pytest 39 passed/1 skip. **Deferred fast-follow** (only if
+in-panel challenge rates warrant it): bidirectional seed — on panel open, pull the
+daemon's `_warm_profile` cookies (new daemon `export_session` + host-side `SetCookie`,
+spawn=False) so the panel benefits from the daemon's independently-accumulated
+Google/CF/reCAPTCHA trust, not just its own. Push-only today means the two persistent
+jars warm in parallel and don't share third-party trust cookies. Pre-existing unrelated
+gate debt: `scripts/check.py` `feature_surface_audit` fails on Sketch3D/Reverse-Eng
+ribbon handlers (untouched here).

@@ -87,18 +87,43 @@ def _login_wizard_next(params: dict, _emit: Callable) -> dict:
         return _wrap_exc(exc)
 
 
-def _browser_session_import(params: dict, _emit: Callable) -> dict:
-    """Stage a GUI-exported cookie jar for a site (CEF → Playwright hand-off)
-    and stamp the login as verified. ``{site, cookies:[...], verified?}``.
-    Needs no Playwright — it only writes the staging sidecar + metadata."""
+def _push_cookies_to_cef_daemon(cookies: list) -> None:
+    """Best-effort: re-inject the panel-exported cookie jar into the CEF daemon's
+    warm profile so the login carries into headless fetch/download. Runs in a
+    background thread — a cold daemon spawn (~CEF bootstrap) must never stall the
+    login chip, and a daemon/transport failure degrades to "GUI-session-only"
+    rather than failing the import (the on-disk warm jar is the durable carrier;
+    a later fetch re-spawns the daemon and reads it)."""
     try:
+        from services.browser.cef_client import client, CefDaemonError
+        try:
+            client().import_session(list(cookies))
+        except CefDaemonError:
+            pass  # daemon unavailable; login still stamped for this GUI session
+    except Exception:  # noqa: BLE001 — never let the carry break the import
+        pass
+
+
+def _browser_session_import(params: dict, _emit: Callable) -> dict:
+    """Stage a GUI-exported cookie jar for a site and stamp the login as verified,
+    then carry it into the CEF daemon's warm profile so headless fetch/download
+    reuse the session. ``{site, cookies:[...], verified?}``. The staging sidecar +
+    metadata (login_verified_ts, which profiles.has_login gates on) needs no
+    Playwright; the daemon push is best-effort and off-thread."""
+    try:
+        import threading
+
         from services.browser.embed import import_session_cookies
         p = params or {}
         site = str(p.get("site", "")).strip()
         cookies = p.get("cookies")
-        return import_session_cookies(
-            site, list(cookies) if isinstance(cookies, list) else [],
-            verified=bool(p.get("verified", True)))
+        cookies = list(cookies) if isinstance(cookies, list) else []
+        result = import_session_cookies(
+            site, cookies, verified=bool(p.get("verified", True)))
+        if cookies:
+            threading.Thread(target=_push_cookies_to_cef_daemon, args=(cookies,),
+                             daemon=True).start()
+        return result
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 

@@ -5,11 +5,25 @@
 
 #include <string>
 
+#include "include/cef_devtools_message_observer.h"
 #include "include/cef_values.h"
 #include "include/cef_version.h"  // CHROME_VERSION_* for Sec-CH-UA alignment
 
 namespace ui::cef {
 namespace {
+
+// Minimal observer whose only job is to attach the DevTools agent so
+// ExecuteDevToolsMethod takes effect (see cef_stealth.h). We consume no messages.
+class StealthDevToolsObserver : public CefDevToolsMessageObserver {
+public:
+    bool OnDevToolsMessage(CefRefPtr<CefBrowser>, const void*, size_t) override { return false; }
+    void OnDevToolsMethodResult(CefRefPtr<CefBrowser>, int, bool, const void*, size_t) override {}
+    void OnDevToolsEvent(CefRefPtr<CefBrowser>, const CefString&, const void*, size_t) override {}
+    void OnDevToolsAgentAttached(CefRefPtr<CefBrowser>) override {}
+    void OnDevToolsAgentDetached(CefRefPtr<CefBrowser>) override {}
+private:
+    IMPLEMENT_REFCOUNTING(StealthDevToolsObserver);
+};
 
 // Document-start hardening. Mirrors stealth.INIT_SCRIPT: removes the automation
 // tells a normal Chrome never emits (window.chrome absent, single-entry languages,
@@ -40,6 +54,28 @@ const char* kInitScript = R"JS(
     if (navigator.deviceMemory > 8)
       Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
   });
+  // WebGL vendor/renderer spoof — masks the software-GL (SwiftShader/ANGLE) tell
+  // that our --use-angle=swiftshader crash-workaround otherwise leaks (a top
+  // bot-scan flag). Report a plausible desktop-Linux Intel/Mesa GPU consistent
+  // with the Linux UA. The override's toString reads native so it isn't itself a
+  // trivial hook tell. Technique ported from the OSS clark-browser patch set.
+  patch(() => {
+    const VENDOR = 37445, RENDERER = 37446;  // UNMASKED_VENDOR/RENDERER_WEBGL
+    const spoof = {
+      [VENDOR]: 'Google Inc. (Intel)',
+      [RENDERER]: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), '
+                + 'OpenGL 4.6 (Core Profile) Mesa 23.2.1)',
+    };
+    const hook = (proto) => {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      const patched = function (p) { return (p in spoof) ? spoof[p] : orig.call(this, p); };
+      try { patched.toString = orig.toString.bind(orig); } catch (e) { /* keep going */ }
+      proto.getParameter = patched;
+    };
+    hook(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    hook(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  });
 })();
 )JS";
 
@@ -52,8 +88,15 @@ CefRefPtr<CefDictionaryValue> brand(const char* name, const std::string& version
 
 }  // namespace
 
-void apply_stealth(CefRefPtr<CefBrowser> browser) {
-    if (!browser) return;
+const char* stealth_init_script() { return kInitScript; }
+
+CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
+    if (!browser) return nullptr;
+
+    // Attach a DevTools observer FIRST — this wires the in-process CDP pipe;
+    // without it the ExecuteDevToolsMethod calls below are silent no-ops.
+    CefRefPtr<CefRegistration> reg =
+        browser->GetHost()->AddDevToolsMessageObserver(new StealthDevToolsObserver());
 
     const std::string major = std::to_string(CHROME_VERSION_MAJOR);
     const std::string full  = major + "." + std::to_string(CHROME_VERSION_MINOR) +
@@ -97,6 +140,7 @@ void apply_stealth(CefRefPtr<CefBrowser> browser) {
     CefRefPtr<CefDictionaryValue> sp = CefDictionaryValue::Create();
     sp->SetString("source", kInitScript);
     browser->GetHost()->ExecuteDevToolsMethod(0, "Page.addScriptToEvaluateOnNewDocument", sp);
+    return reg;
 }
 
 }  // namespace ui::cef

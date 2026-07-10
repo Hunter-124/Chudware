@@ -10,9 +10,12 @@
 
 #include "include/cef_app.h"
 #include "include/cef_command_line.h"
+#include "include/cef_frame.h"
+#include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
 
 #include "cef_platform.h"
+#include "cef_stealth.h"
 
 namespace ui::cef {
 namespace {
@@ -52,9 +55,22 @@ void schedule_pump(long long delay_ms) {
 
 // Browser-process CefApp: registers windowless rendering and forces the cookie
 // crypto that makes CEF's saved sessions readable by the Playwright scraper.
-class AiCadApp : public CefApp, public CefBrowserProcessHandler {
+class AiCadApp : public CefApp,
+                public CefBrowserProcessHandler,
+                public CefRenderProcessHandler {
 public:
     CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
+    CefRefPtr<CefRenderProcessHandler>  GetRenderProcessHandler() override  { return this; }
+
+    // ANTI-DETECTION: inject the document-start fingerprint hardening (window.chrome,
+    // plugins, languages, webdriver, deviceMemory cap, WebGL vendor/renderer spoof)
+    // at V8-context creation — BEFORE any page script runs, in EVERY frame, with no
+    // CDP (so no Runtime.enable automation tell). This is the render-process path;
+    // it fires in-process under --single-process too. Mirrors stealth.INIT_SCRIPT.
+    void OnContextCreated(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                          CefRefPtr<CefV8Context>) override {
+        if (frame) frame->ExecuteJavaScript(stealth_init_script(), frame->GetURL(), 0);
+    }
 
     void OnBeforeCommandLineProcessing(const CefString& /*process_type*/,
                                        CefRefPtr<CefCommandLine> cmd) override {

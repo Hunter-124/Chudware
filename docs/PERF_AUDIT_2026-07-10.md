@@ -193,3 +193,24 @@ cluster decomposition; JacobiSVD min-norm step ALWAYS (nsolve.cpp:335, O(n³) wo
 
 Re-baseline `tools/perf_regression.py` only after (1), in legacy AND daemon modes, on a
 quiet machine (the current baseline numbers are polluted by the 15 s tax).
+
+---
+
+## Addendum (same day): fixes landed
+
+Commits (master): 9f7ef5d5 transport tax fix · 9fd63cec autosave token / module identity /
+live-search cancel / parallel health · 13cdaa1f daemon RPC timeouts + GL stall fixes +
+Rebuilding chip + thumbnail LRU · kernel package (external-ref cache, SetNonDestructive,
+drag System caching, sketch_health, coincident hash-set, solve budgets) · e75ee677
+`./build.sh stage` (hostd into dist) + supervisor idle wait · fbceb288 test seam for the
+sticky fallback. Deferred work: work/backlog/T-PERF1..10 (T-PERF7/T-PERF8 carry decisions).
+
+Additional root cause found post-audit: hostd.log showed 569 daemon starts / 255 spawn-race
+losses / 61 drains in one day — rebuild-triggered self-drain leaves a window where the flock
+is held with the socket gone; every client then burned its full 15 s budget (now: fast-fail
+~2 s + sticky fallback; C++ drain-window hardening tracked in T-PERF10).
+
+Verification: gate green (core build, ctest 100%, hostd smoke, host build); mcp_server suite
+7→3 failed (the 3 = pre-existing FEA env failures, pass standalone against the staged
+engine; 34 ecad errors pre-existing). Kernel workload A/B: broken-daemon path 46 s → 0.07 s
+for a 3-call script; in-process build unchanged at ~0.10 s.

@@ -407,6 +407,14 @@ CAM_SPECS: list[dict] = [
             "geometry": {"points": [[-14, 0, -3], [14, 0, -3], [0, -14, -3],
                                     [0, 14, -3]]},
             "feed": 200.0, "plunge": 100.0}},
+    # ---- Workspace-tab exemplar (title-bar Manufacture tab, T-BL-wsicons) --------
+    # A concentric 2D pocket over rectangular stock -- the ringed cutter passes read
+    # unmistakably as "CNC toolpath" at 32px, the clearest small-size Manufacture cue.
+    # Clone of cam_pocket2d with a dedicated cell so the title bar can blit it directly.
+    {"cell": "ws_manufacture", "machine": "mill3", "stock": MILL_STOCK, "tool": EM6,
+     "op": {"type": "pocket2d", "tool_number": 1, "stepover": 3.2, "stepdown": 6.0,
+            "pattern": "concentric", "heights": H,
+            "geometry": {"regions": [{"outer": SQUARE}]}, **FEEDS}},
 ]
 
 CAM_CELLS = [s["cell"] for s in CAM_SPECS]
@@ -451,7 +459,15 @@ def _run_spec(cb, spec) -> tuple[list, dict]:
 
 def render_all(out_dir: Path = RENDER_DIR, only: list[str] | None = None):
     """Render every Manufacture op tile. Returns (done_names, failures dict)."""
-    import core_bridge as cb
+    # core_bridge does `from .daemon_bridge import DaemonError` inside call(), which only
+    # resolves when core_bridge is imported as the `services.mcp` package member. Prefer the
+    # package import (add REPO to sys.path); fall back to the bare top-level import for envs
+    # where services/mcp is already the sole path entry.
+    try:
+        sys.path.insert(0, str(REPO))
+        from services.mcp import core_bridge as cb  # type: ignore
+    except Exception:
+        import core_bridge as cb  # type: ignore
     done, failures = [], {}
     for spec in CAM_SPECS:
         name = spec["cell"]

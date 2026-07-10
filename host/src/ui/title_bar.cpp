@@ -22,6 +22,7 @@
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"   // ui::uiScale, ui::palette
+#include "icons.h"             // ui::getIcon (raster workspace-tab tiles)
 #include "metrics.h"           // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"          // ui::openNewDocChooser (File > New)
 #include "firmware/fw_workspace.h"  // T-FIN5: ui::firmwareTabVisible
@@ -295,7 +296,8 @@ static ChipResult drawChipAt(const char* btnId,
                               ImVec2 p0, float chipW, float chipH,
                               bool isActive, float rnd,
                               ImFont* boldFont,
-                              TbIcon icon, float iconSz, float iconGap) {
+                              TbIcon icon, float iconSz, float iconGap,
+                              const char* rasterCell = nullptr) {
     ImGui::SetCursorScreenPos(p0);
     bool clicked = ImGui::InvisibleButton(btnId, ImVec2(chipW, chipH));
     bool hovered = ImGui::IsItemHovered();
@@ -331,8 +333,22 @@ static ChipResult drawChipAt(const char* btnId,
     const ImU32 textU32 = ImGui::ColorConvertFloat4ToU32(textColV);
     const float contentW = iconSz + iconGap + textW;
     const float gx = p0.x + (chipW - contentW) * 0.5f;  // group left edge
-    drawTbIcon(dl, icon, ImVec2(gx + iconSz * 0.5f, p0.y + chipH * 0.5f),
-               iconSz, textU32);
+    const ImVec2 iconCenter(gx + iconSz * 0.5f, p0.y + chipH * 0.5f);
+    // Exemplar workspace tabs (Model, Manufacture) blit a real engine-rendered raster
+    // tile when one exists in the atlas; every other tab (and any tab if the tile is
+    // missing) falls back to the procedural TbIcon glyph. Raster tiles are full-color and
+    // deliberately NOT tinted to the text color -- default white ImGui vertex color keeps
+    // the render's own shading. Use the 32-cell for this ~13-15px draw (getIcon picks the
+    // nearest size).
+    ui::IconUV riv;
+    if (rasterCell && rasterCell[0]) riv = ui::getIcon(rasterCell, 32);
+    if (riv.valid) {
+        const ImVec2 tl(iconCenter.x - iconSz * 0.5f, iconCenter.y - iconSz * 0.5f);
+        const ImVec2 br(iconCenter.x + iconSz * 0.5f, iconCenter.y + iconSz * 0.5f);
+        dl->AddImage(riv.texId, tl, br, riv.uv0, riv.uv1);
+    } else {
+        drawTbIcon(dl, icon, iconCenter, iconSz, textU32);
+    }
     const float tx = gx + iconSz + iconGap;
     const float ty = p0.y + (chipH - drawFont->FontSize) * 0.5f;
     dl->AddText(drawFont, drawFont->FontSize, ImVec2(tx, ty), textU32, label);
@@ -635,18 +651,21 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float leftGroupEndRelX = (cx + 14.0f * s) - winX;  // +separator width
 
         // ---- CENTER GROUP: workspace tabs, centered between left group and caption buttons ----
-        struct WsTab { const char* label; AppState::Workspace ws; TbIcon icon; };
+        // rasterCell: an engine-rendered atlas tile blitted instead of the procedural
+        // glyph (exemplar wave — Model + Manufacture only; nullptr = keep the glyph).
+        struct WsTab { const char* label; AppState::Workspace ws; TbIcon icon;
+                       const char* rasterCell; };
         static const WsTab kTabs[] = {
-            {"Model",        AppState::Workspace::Model,        TbIcon::Model},
-            {"Drawing",      AppState::Workspace::Drawing,      TbIcon::Drawing},
-            {"Simulate",     AppState::Workspace::Simulate,     TbIcon::Simulate},
-            {"Electronics",  AppState::Workspace::Electronics,  TbIcon::Electronics},
-            {"Manufacture",  AppState::Workspace::Manufacture,  TbIcon::Manufacture},
-            {"PLM",          AppState::Workspace::PLM,          TbIcon::PLM},
-            {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary},
-            {"AI",           AppState::Workspace::AI,           TbIcon::AI},
-            {"Reverse Eng",  AppState::Workspace::ReverseEng,   TbIcon::Search},
-            {"Firmware",     AppState::Workspace::Firmware,     TbIcon::Firmware},
+            {"Model",        AppState::Workspace::Model,        TbIcon::Model,        "ws_model"},
+            {"Drawing",      AppState::Workspace::Drawing,      TbIcon::Drawing,      nullptr},
+            {"Simulate",     AppState::Workspace::Simulate,     TbIcon::Simulate,     nullptr},
+            {"Electronics",  AppState::Workspace::Electronics,  TbIcon::Electronics,  nullptr},
+            {"Manufacture",  AppState::Workspace::Manufacture,  TbIcon::Manufacture,  "ws_manufacture"},
+            {"PLM",          AppState::Workspace::PLM,          TbIcon::PLM,          nullptr},
+            {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary, nullptr},
+            {"AI",           AppState::Workspace::AI,           TbIcon::AI,           nullptr},
+            {"Reverse Eng",  AppState::Workspace::ReverseEng,   TbIcon::Search,       nullptr},
+            {"Firmware",     AppState::Workspace::Firmware,     TbIcon::Firmware,     nullptr},
         };
         constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
 
@@ -710,7 +729,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             snprintf(btnId, sizeof(btnId), "##ws_%d", i);
             auto res = drawChipAt(btnId, kTabs[i].label, p0, chipW, chipH,
                                   isActive, tabRound, boldFont,
-                                  kTabs[i].icon, iconSz, iconGap);
+                                  kTabs[i].icon, iconSz, iconGap, kTabs[i].rasterCell);
 
             // Register window-relative span.
             hitLayout.addSpan((int)(tx - winX), (int)(tx - winX + chipW));

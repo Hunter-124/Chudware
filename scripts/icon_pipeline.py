@@ -211,6 +211,44 @@ RECIPES: dict[str, dict] = {
     # Plain solid block reads as "create a 3D body / boss".
     "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [box(52, 40, 34), accent()]},
 
+    # ws_model: the title-bar "Model" workspace exemplar tile. A recognizable little
+    # mechanical part (NOT a bare box): an L-bracket plate with two through-holes bored
+    # through the base flange. f1=L-profile sketch on plane.top, f2=extrude, f3/f4=hole
+    # circle sketches on the top face, f5/f6=extrude-cuts. Region selectors only (the
+    # iconpipe runner resolves regions but not face+point hole picks). accent() last so
+    # the whole body reads in app teal. Iso camera to match the 3D-body family.
+    "ws_model": {"yaw": 35, "pitch": 26, "steps": [
+        # L-shaped profile (base flange 44 wide, upstand 16 tall wall on the +Y edge).
+        *sketch_with_id([
+            {"type": "line", "p1": [-22, -16], "p2": [22, -16], "id": "l1"},
+            {"type": "line", "p1": [22, -16], "p2": [22, -4], "id": "l2"},
+            {"type": "line", "p1": [22, -4], "p2": [-10, -4], "id": "l3"},
+            {"type": "line", "p1": [-10, -4], "p2": [-10, 16], "id": "l4"},
+            {"type": "line", "p1": [-10, 16], "p2": [-22, 16], "id": "l5"},
+            {"type": "line", "p1": [-22, 16], "p2": [-22, -16], "id": "l6"},
+        ], plane="plane.top", name="BracketSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Bracket",
+            "params": {"mode": "boss", "depth": dim(10)},
+            "refs": {"profile": [region("f1", 0, -10)]}}},
+        # Two mounting holes bored through the wide base flange (on the top face, Z=10).
+        *sketch_with_id([
+            {"type": "circle", "center": [10, -10], "radius": 4.5, "id": "h1"},
+        ], plane="plane.top", name="Hole1Sk", fid="f3", offset=10),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Hole1",
+            "params": {"mode": "cut", "depth": dim(12)},
+            "refs": {"profile": [region("f3", 10, -10)]}}},
+        *sketch_with_id([
+            {"type": "circle", "center": [-16, -10], "radius": 4.5, "id": "h2"},
+        ], plane="plane.top", name="Hole2Sk", fid="f5", offset=10),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Hole2",
+            "params": {"mode": "cut", "depth": dim(12)},
+            "refs": {"profile": [region("f5", -16, -10)]}}},
+        accent(),
+    ]},
+
     # extrude_cut: solid block with a deep rectangular pocket cut into its TOP face,
     # so material is obviously REMOVED (reads as an extruded cut). f1=block sketch,
     # f2=block extrude, f3=pocket sketch on top face, f4=extrude-cut.

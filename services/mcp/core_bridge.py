@@ -300,6 +300,16 @@ def active_daemon_mode() -> bool:
     return _daemon_mode() and not _DAEMON_FALLBACK_WARNED
 
 
+def reset_daemon_fallback() -> None:
+    """Clear the sticky legacy-engine demotion (see call()). Test seam: the
+    fallback is deliberately process-permanent in production, but pytest runs
+    hundreds of tests in one process, and a test that intentionally breaks a
+    daemon must not strand every later test in legacy mode (suite-order bugs).
+    The root conftest resets this around each test."""
+    global _DAEMON_FALLBACK_WARNED
+    _DAEMON_FALLBACK_WARNED = False
+
+
 # Foreign-edit piggyback (Phase 3): the daemon injects "_foreign_edits":[...]
 # into a result when another client advanced the doc since OUR last touch. We
 # strip it off the engine result here (tool code never expects the key) and

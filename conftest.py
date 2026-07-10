@@ -1,4 +1,5 @@
-"""Root conftest.py — stub optional heavy deps ONLY when they are genuinely absent.
+"""Root conftest.py — stub optional heavy deps ONLY when they are genuinely absent,
+plus cross-test state hygiene (core_bridge daemon-fallback reset).
 
 engine.vision.__init__ eagerly imports engine.vision.ingest, which needs Pillow (a declared
 runtime dep). On a bare box without Pillow/cv2, collection of ANY test that touches engine
@@ -146,3 +147,18 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip_live)
+
+
+@_pytest.fixture(autouse=True)
+def _reset_core_bridge_daemon_fallback():
+    """core_bridge's daemon→legacy fallback is sticky for the process by design
+    (docs/PERF_AUDIT_2026-07-10.md §1); in a pytest process that stickiness makes
+    suite outcomes order-dependent (one intentionally-broken daemon strands every
+    later test in legacy mode). Reset it around each test, on every loaded module
+    identity (mcp_server.core_bridge / services.mcp.core_bridge)."""
+    yield
+    for name, mod in list(sys.modules.items()):
+        if name.endswith("core_bridge") and mod is not None:
+            reset = getattr(mod, "reset_daemon_fallback", None)
+            if callable(reset):
+                reset()

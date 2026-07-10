@@ -139,6 +139,12 @@ def fw_sim_run(params: dict) -> dict:
     The result includes ``gpio_events`` (time-ordered pin timeline) and ``trace_path`` —
     a structured JSON trace artifact (``aicad.firmware.trace/1``, contract §7) written
     next to the ELF with interleaved pin + UART events and the final GPIO snapshot.
+
+    T-FIN2: supported emulation targets come from ``platform_db.capability_matrix()``
+    (stm32f4 / stm32f1 / nrf52 full Renode platforms, rp2040 minimal UART-only,
+    esp32 build+flash only). When an assertion needs a peripheral the platform lacks,
+    the run refuses honestly (``passed=False`` with a ``platform_capability`` reason)
+    unless the QEMU semihosting fallback can cover it.
     """
     project_id = params.get("project_id")
     if not project_id:

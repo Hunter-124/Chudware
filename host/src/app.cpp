@@ -813,13 +813,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // rendering + glReadPixels work as normal on the hidden window's framebuffer. Shot-mode only.
     if (shot && std::getenv("AI_CAD_HIDDEN")) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     // Stable window class / app_id so the desktop shell (KDE/GNOME) matches the window to the
-    // installed AI-CAD.desktop (StartupWMClass=AI-CAD) and shows the app icon in the taskbar
+    // installed .desktop entry (StartupWMClass=Billet) and shows the app icon in the taskbar
     // instead of a generic placeholder. Without this, GLFW's WM_CLASS falls back to the window
-    // title ("ShopCraft"), which matches no .desktop entry. Harmless on Windows (no-op hints).
-    glfwWindowHintString(GLFW_X11_CLASS_NAME, "AI-CAD");
-    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "AI-CAD");
-    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "AI-CAD");
-    GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "ShopCraft", nullptr, nullptr);
+    // title, which may match no .desktop entry. Harmless on Windows (no-op hints).
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "Billet");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "Billet");
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "Billet");
+    GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "Billet", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -1633,7 +1633,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             st.suppressToasts = true;
         else
             st.toast(ui::ToastLevel::Info,
-                     "ShopCraft: live view of the AI's part — it updates as it builds");
+                     "Billet: live view of the AI's part — it updates as it builds");
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= AppState::RT_Manufacture) st.ribbonTab = t;
@@ -2213,7 +2213,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                      st.job.error.find("No module named") != std::string::npos;
                 if (missingModule && !st.importRepairTried && !st.setupRunning.load()) {
                     st.importRepairTried = true;
-                    st.addLog("[..] runtime module missing — auto-repairing (use ShopCraft > Repair runtime if this persists)...");
+                    st.addLog("[..] runtime module missing — auto-repairing (use Billet > Repair runtime if this persists)...");
                     st.startSetup(true);
                     assistant = "A required module is missing from the runtime — repairing now (may take a minute). Try again once the console shows setup complete.";
                 } else {
@@ -2894,9 +2894,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 const auto& tab = st.docTabs[st.activeTab];
                 title = tab.title.empty() ? "Untitled" : tab.title;
                 if (tab.dirty) title += "*";
-                title += " \xe2\x80\x94 AI-CAD";                 // " — AI-CAD"
+                title += " \xe2\x80\x94 Billet";                 // " — Billet"
             } else {
-                title = "AI-CAD";
+                title = "Billet";
             }
             static std::string lastTitle;
             if (title != lastTitle) { lastTitle = title; glfwSetWindowTitle(win, title.c_str()); }
@@ -3285,12 +3285,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         {
             static bool s_quitModalOpen = false;
             if (st.wantQuitConfirm) { st.wantQuitConfirm = false; s_quitModalOpen = true; }
-            if (s_quitModalOpen) ImGui::OpenPopup("Quit ShopCraft?##appquit");
+            if (s_quitModalOpen) ImGui::OpenPopup("Quit Billet?##appquit");
             ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
                                            vp->Pos.y + vp->Size.y * 0.5f),
                                     ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
             bool open = true;
-            if (ImGui::BeginPopupModal("Quit ShopCraft?##appquit", &open,
+            if (ImGui::BeginPopupModal("Quit Billet?##appquit", &open,
                                        ImGuiWindowFlags_AlwaysAutoResize |
                                            ImGuiWindowFlags_NoSavedSettings)) {
                 int n = 0;

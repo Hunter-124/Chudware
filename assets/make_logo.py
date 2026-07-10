@@ -1,4 +1,4 @@
-"""Generate the AI-CAD brand assets (logo tile, wordmark, window icon, doc icons) with Pillow.
+"""Generate the Billet brand assets (logo tile, wordmark, window icon, doc icons) with Pillow.
 
 Run with the runtime venv python:
     python assets/make_logo.py
@@ -147,24 +147,34 @@ def make_tile(px=256, radius_frac=0.235, with_spark=True):
 
 
 def make_wordmark(height=200, cad_color=WHITE):
+    """Mark + "Billet" wordmark. The cube carries the accent; the type stays
+    quiet (white on dark theme, slate on light) with a teal tittle on the i."""
     s = height * SS
     cube_r = s * 0.32
     pad = s * 0.16
     font = ImageFont.truetype(str(FONT_BOLD), int(s * 0.50))
     tmp = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-    seg_ai = "AI"
-    seg_cad = "-CAD"
-    w_ai = tmp.textlength(seg_ai, font=font)
-    w_cad = tmp.textlength(seg_cad, font=font)
+    seg_b, seg_i, seg_rest = "B", "i", "llet"
+    w_b = tmp.textlength(seg_b, font=font)
+    w_i = tmp.textlength(seg_i, font=font)
+    w_rest = tmp.textlength(seg_rest, font=font)
     cube_w = cube_r * 2
-    total_w = int(pad + cube_w + pad * 0.9 + w_ai + w_cad + pad)
+    total_w = int(pad + cube_w + pad * 0.9 + w_b + w_i + w_rest + pad)
     img = Image.new("RGBA", (total_w, s), (0, 0, 0, 0))
     draw_mark(img, pad + cube_r, s * 0.54, cube_r)
     d = ImageDraw.Draw(img)
     tx = pad + cube_w + pad * 0.9
     ty = s * 0.5 - s * 0.30
-    d.text((tx, ty), seg_ai, font=font, fill=ACCENT)
-    d.text((tx + w_ai, ty), seg_cad, font=font, fill=cad_color)
+    d.text((tx, ty), seg_b, font=font, fill=cad_color)
+    # the "i" twice: body in the text color, then the tittle re-struck in accent
+    ix = tx + w_b
+    d.text((ix, ty), seg_i, font=font, fill=cad_color)
+    asc, _ = font.getmetrics()
+    dot_r = s * 0.042
+    dot_cx = ix + w_i * 0.5
+    dot_cy = ty + asc * 0.315
+    d.ellipse([dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r], fill=ACCENT)
+    d.text((ix + w_i, ty), seg_rest, font=font, fill=cad_color)
     target_h = height
     target_w = int(total_w * target_h / s)
     return img.resize((target_w, target_h), Image.LANCZOS)

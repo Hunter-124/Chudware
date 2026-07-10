@@ -1614,7 +1614,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float titleAvail = anchorX - ImGui::GetCursorPosX() - style.ItemSpacing.x;
         float wmW = 0.0f;
         if (wordF) ImGui::PushFont(wordF);
-        wmW = ImGui::CalcTextSize("AI-CAD").x;
+        wmW = ImGui::CalcTextSize("Billet").x;
         if (wordF) ImGui::PopFont();
         const float sufGap = ui::metrics::U(1.5f);
         const float sufW   = sufGap + ImGui::CalcTextSize("Copilot").x;
@@ -1622,7 +1622,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             centerY(wordLh);
             if (wordF) ImGui::PushFont(wordF);
             ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-            ImGui::TextUnformatted("AI-CAD");
+            ImGui::TextUnformatted("Billet");
             ImGui::PopStyleColor();
             if (wordF) ImGui::PopFont();
             if (titleAvail >= wmW + sufW) {

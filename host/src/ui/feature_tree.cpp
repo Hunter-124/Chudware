@@ -1858,7 +1858,7 @@ void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, fl
 // Save As writes the native .step+ ONLY — non-native formats live under File > Export (the Win32
 // dialog appends the default extension regardless of the chosen filter, so a multi-format Save As
 // silently wrote .step+ anyway).
-static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
+static const char* kStepPlusFilter = "Billet part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
 
 // F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
 // FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
@@ -1867,7 +1867,7 @@ static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files 
 // (the C string literal's own trailing NUL supplies the final one).
 static const char* kImportFilter =
     "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
-    "AI-CAD part (*.step+)\0*.step+\0"
+    "Billet part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
     "BREP (*.brep)\0*.brep\0"
@@ -3812,7 +3812,7 @@ void pollAiCadHandoff(AppState& st) {
                 }
                 shownRev[docId] = hd.rev;
                 if (takeFocus)
-                    st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
+                    st.toast(ui::ToastLevel::Info, "Billet: live view of the AI's part — it updates as it builds");
                 done.push_back(docId);
             } else if (!opened) {
                 // Open failed. This is often TRANSIENT — the agent may have swapped the .step+ a

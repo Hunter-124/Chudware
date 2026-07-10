@@ -724,7 +724,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
 
     if (!st.workerStarted) {
         emptyState("parts_all", "Parts Library unavailable",
-                   "The AI-CAD worker service is not running.");
+                   "The Billet worker service is not running.");
         return;
     }
 

@@ -1,19 +1,18 @@
 [Desktop Entry]
 Type=Application
-Name=AI-CAD
+Name=Billet
 Comment=AI-native parametric CAD
 Exec=AI-CAD %F
-Icon=AI-CAD
+Icon=Billet
 Categories=Graphics;Engineering;
 Terminal=false
 # Must match the window class set via glfwWindowHintString(GLFW_X11_CLASS_NAME/…) in
 # host/src/app.cpp so the shell binds the live window to this entry (taskbar icon).
-StartupWMClass=AI-CAD
+StartupWMClass=Billet
 X-BinaryName=AI-CAD
 # NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja AI-CAD.
 # In the AppImage this is staged to usr/bin/AI-CAD and launched via AppRun.
 # For system installs, install host/build-linux/bin/AI-CAD to a PATH directory.
 # ui/imgui (AI-CAD2) is retired; host/ is the single cross-platform GUI (see docs/PORT_LEDGER.md).
-# BRANDING NOTE for Hunter: window title is "ShopCraft" (T-G3) but binary/desktop
-# name is AI-CAD. Renaming binary or product name is Hunter's call — not
-# changed here per T-G24 policy.
+# BRANDING NOTE: user-facing identity is "Billet" (2026-07 rename wave). The binary
+# stays AI-CAD this wave (deep rename deferred), so Exec/X-BinaryName keep the old name.

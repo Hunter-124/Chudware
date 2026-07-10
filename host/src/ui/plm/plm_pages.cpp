@@ -593,7 +593,7 @@ void drawFilesTab(AppState& st) {
     // link a GitHub / Git repo (kept under version control externally; its issues
     // are tracked here in the project). Optional local checkout enables pinning.
     ImGui::Dummy(ImVec2(0, 6 * S));
-    dimText("Link a GitHub / Git repo (version-controlled outside AI-CAD).");
+    dimText("Link a GitHub / Git repo (version-controlled outside Billet).");
     ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(-1);

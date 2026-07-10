@@ -440,7 +440,7 @@ struct FilMenuDrawer {
             st.showAIPanel = true;
             st.aiInteraction = 2;  // Ask
         }
-        if (ImGui::MenuItem("About ShopCraft")) st.showAbout = true;
+        if (ImGui::MenuItem("About Billet")) st.showAbout = true;
         ImGui::Separator();
         // Repair/install runtime
         if (ImGui::MenuItem("Repair / install runtime", nullptr, false,

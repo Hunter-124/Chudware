@@ -1,8 +1,12 @@
-"""Register AI-CAD as a handler for the document types it owns (task 05).
+"""Register Billet as a handler for the document types it owns (task 05).
 
-Makes a double-clicked file (or right-click -> Open with) open in AI-CAD, and lets AI-CAD be set
-as the default app. The native **.step+** document is the priority; the interchange formats AI-CAD
+Makes a double-clicked file (or right-click -> Open with) open in Billet, and lets Billet be set
+as the default app. The native **.step+** document is the priority; the interchange formats Billet
 natively loads are added to "Open with" without hijacking the user's existing handlers for them.
+
+The user-facing identity is "Billet" (2026-07 rename wave); the executable is still named
+AI-CAD this wave, so the Open commands keep pointing at the AI-CAD binary. Register/unregister
+also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
 
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
 installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
@@ -10,11 +14,11 @@ installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
   Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"AI-CAD.exe" "%1"`) + a
            DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
            host/app.rc), the `.step+` extension defaulted to it, and every other extension wired
-           into OpenWithProgids so AI-CAD shows in "Open with".
+           into OpenWithProgids so Billet shows in "Open with".
   Linux:   a custom shared-mime-info type for `.step+` + a `.desktop` launcher in XDG_DATA_HOME,
            plus assets/doc_icon.png installed into hicolor/*/mimetypes as the type's icon,
            then update-mime-database / update-desktop-database / xdg-mime so the file manager
-           routes a double-click to AI-CAD and shows the branded doc icon. Interchange formats are listed in the launcher's
+           routes a double-click to Billet and shows the branded doc icon. Interchange formats are listed in the launcher's
            MimeType via their standard freedesktop types (Open-with), not redefined.
 
     python installer/setup_file_assoc.py [--exe <path>] [--unregister] [--dry-run]
@@ -28,20 +32,27 @@ import sys
 from pathlib import Path
 
 # Vendor identifiers for the native document type.
-APP_NAME = "AI-CAD"
-PROGID_NATIVE = "AICAD.stepplus"      # Windows ProgID for the native .step+ document
-PROGID_DOC = "AICAD.document"          # Windows ProgID used for the interchange formats (Open-with)
-MIME_NATIVE = "application/vnd.aicad.stepplus"   # custom MIME for .step+ (no system collision)
+APP_NAME = "Billet"
+PROGID_NATIVE = "Billet.stepplus"      # Windows ProgID for the native .step+ document
+PROGID_DOC = "Billet.document"         # Windows ProgID used for the interchange formats (Open-with)
+MIME_NATIVE = "application/vnd.billet.stepplus"  # custom MIME for .step+ (no system collision)
 MIME_ICON = MIME_NATIVE.replace("/", "-")        # freedesktop icon name for the MIME type
-DESKTOP_FILE = "ai-cad.desktop"
-MIME_PACKAGE = "ai-cad.xml"
+DESKTOP_FILE = "billet.desktop"
+MIME_PACKAGE = "billet.xml"
 ICON_SIZES = (16, 32, 48, 64, 128, 256)          # hicolor sizes for the document MIME icon
+
+# Pre-rename (AI-CAD) identifiers — register/unregister remove these so a machine that
+# had the old associations migrates cleanly to the Billet names.
+LEGACY_PROGIDS = ("AICAD.stepplus", "AICAD.document")
+LEGACY_MIME_ICON = "application-vnd.aicad.stepplus"
+LEGACY_DESKTOP_FILE = "ai-cad.desktop"
+LEGACY_MIME_PACKAGE = "ai-cad.xml"
 
 # Extensions AI-CAD owns / natively loads. `native` marks the priority .step+ document we DEFAULT to;
 # the rest are added to "Open with" only (so we never steal the user's STL/STEP viewer). `mime` is the
 # standard freedesktop type used in the Linux launcher's MimeType (None -> skip on Linux Open-with).
 ASSOCIATIONS = [
-    {"ext": ".step+", "native": True,  "desc": "AI-CAD Document",       "mime": MIME_NATIVE},
+    {"ext": ".step+", "native": True,  "desc": "Billet Document",       "mime": MIME_NATIVE},
     {"ext": ".step",  "native": False, "desc": "STEP 3D Model",         "mime": "model/step"},
     {"ext": ".stp",   "native": False, "desc": "STEP 3D Model",         "mime": "model/step"},
     {"ext": ".iges",  "native": False, "desc": "IGES 3D Model",         "mime": "model/iges"},
@@ -53,7 +64,8 @@ ASSOCIATIONS = [
 
 
 def default_exe() -> str:
-    """Best-guess path to the AI-CAD executable for this platform (overridable with --exe)."""
+    """Best-guess path to the executable for this platform (overridable with --exe).
+    Still the AI-CAD binary name — the Billet rename is user-facing identity only."""
     repo = Path(__file__).resolve().parent.parent
     if sys.platform.startswith("win"):
         return str(repo / "dist" / "AI-CAD" / "AI-CAD.exe")
@@ -81,27 +93,50 @@ def windows_registry_plan(exe: str) -> list[dict]:
         plan.append({"subkey": fr"Software\Classes\{pid}\shell\open\command",
                      "name": "", "value": f'"{exe}" "%1"'})
 
-    progid(PROGID_NATIVE, "AI-CAD Document")
-    progid(PROGID_DOC, "AI-CAD Model")
+    progid(PROGID_NATIVE, "Billet Document")
+    progid(PROGID_DOC, "Billet Model")
 
     for a in ASSOCIATIONS:
         ext, pid = a["ext"], (PROGID_NATIVE if a["native"] else PROGID_DOC)
         # Always advertise in "Open with".
         plan.append({"subkey": fr"Software\Classes\{ext}\OpenWithProgids",
                      "name": pid, "value": ""})
-        # Default ONLY the native .step+ to AI-CAD (don't hijack the user's STEP/STL viewer).
+        # Default ONLY the native .step+ to Billet (don't hijack the user's STEP/STL viewer).
         if a["native"]:
             plan.append({"subkey": fr"Software\Classes\{ext}", "name": "", "value": pid})
+    return plan
+
+
+def windows_legacy_cleanup_plan() -> list[dict]:
+    """Pure description of the PRE-RENAME (AICAD.*) registry state to remove — list of
+    {"kind": "tree", "subkey": ...} (delete whole key tree) and
+    {"kind": "value", "subkey": ..., "name": ...} (delete one value). Applied on BOTH
+    register (migration) and unregister (full cleanup)."""
+    plan: list[dict] = [{"kind": "tree", "subkey": fr"Software\Classes\{pid}"}
+                        for pid in LEGACY_PROGIDS]
+    native_legacy, doc_legacy = LEGACY_PROGIDS
+    for a in ASSOCIATIONS:
+        pid = native_legacy if a["native"] else doc_legacy
+        plan.append({"kind": "value",
+                     "subkey": fr"Software\Classes\{a['ext']}\OpenWithProgids", "name": pid})
     return plan
 
 
 def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
     import winreg  # noqa: WPS433  (Windows-only import, inside the function on purpose)
 
+    def apply_legacy_cleanup() -> None:
+        for e in windows_legacy_cleanup_plan():
+            if e["kind"] == "tree":
+                _winreg_delete_tree(winreg, winreg.HKEY_CURRENT_USER, e["subkey"])
+            else:
+                _winreg_delete_value(winreg, winreg.HKEY_CURRENT_USER, e["subkey"], e["name"])
+
     plan = windows_registry_plan(exe)
     msgs: list[str] = []
     if unregister:
-        # Delete the ProgID trees + our OpenWithProgids values. Deepest keys first.
+        # Delete the ProgID trees + our OpenWithProgids values (current AND pre-rename
+        # AICAD.* names). Deepest keys first.
         progid_roots = [fr"Software\Classes\{PROGID_NATIVE}", fr"Software\Classes\{PROGID_DOC}"]
         if not dry_run:
             for root in progid_roots:
@@ -110,16 +145,22 @@ def register_windows(exe: str, unregister: bool, dry_run: bool) -> list[str]:
                 pid = PROGID_NATIVE if a["native"] else PROGID_DOC
                 _winreg_delete_value(winreg, winreg.HKEY_CURRENT_USER,
                                      fr"Software\Classes\{a['ext']}\OpenWithProgids", pid)
+            apply_legacy_cleanup()
         msgs.append(f"{'would remove' if dry_run else 'removed'} {len(progid_roots)} ProgIDs "
-                    f"+ {len(ASSOCIATIONS)} associations")
+                    f"+ {len(ASSOCIATIONS)} associations (+ legacy AICAD.* names)")
         return msgs
 
+    if not dry_run:
+        # Migration: drop the pre-rename AICAD.* ProgIDs/values FIRST, then write the
+        # Billet plan (which re-defaults .step+ to the new native ProgID).
+        apply_legacy_cleanup()
     for e in plan:
         if not dry_run:
             key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, e["subkey"])
             winreg.SetValueEx(key, e["name"], 0, winreg.REG_SZ, e["value"])
             winreg.CloseKey(key)
-    msgs.append(f"{'would write' if dry_run else 'wrote'} {len(plan)} HKCU\\Software\\Classes entries")
+    msgs.append(f"{'would write' if dry_run else 'wrote'} {len(plan)} HKCU\\Software\\Classes entries"
+                " (legacy AICAD.* entries removed)")
     return msgs
 
 
@@ -178,7 +219,7 @@ def linux_mime_xml() -> str:
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
         f'  <mime-type type="{MIME_NATIVE}">\n'
-        "    <comment>AI-CAD Document</comment>\n"
+        "    <comment>Billet Document</comment>\n"
         f'    <icon name="{MIME_ICON}"/>\n'
         '    <glob pattern="*.step+"/>\n'
         "  </mime-type>\n"
@@ -198,11 +239,18 @@ def _doc_icon_source() -> Path | None:
     return src if src.is_file() else None
 
 
-def _mime_icon_paths(data: Path) -> list[Path]:
+def _mime_icon_paths(data: Path, icon_name: str = MIME_ICON) -> list[Path]:
     """hicolor mimetype icon paths for every size — the freedesktop lookup for a file of
-    type application/vnd.aicad.stepplus is <theme>/<S>x<S>/mimetypes/<MIME '/'→'-'>.png."""
-    return [data / "icons" / "hicolor" / f"{s}x{s}" / "mimetypes" / f"{MIME_ICON}.png"
+    type application/vnd.billet.stepplus is <theme>/<S>x<S>/mimetypes/<MIME '/'→'-'>.png."""
+    return [data / "icons" / "hicolor" / f"{s}x{s}" / "mimetypes" / f"{icon_name}.png"
             for s in ICON_SIZES]
+
+
+def _legacy_linux_paths(data: Path) -> list[Path]:
+    """Pre-rename (AI-CAD) XDG artifacts removed on both register and unregister."""
+    return [data / "applications" / LEGACY_DESKTOP_FILE,
+            data / "mime" / "packages" / LEGACY_MIME_PACKAGE,
+            *_mime_icon_paths(data, LEGACY_MIME_ICON)]
 
 
 def _install_mime_icons(data: Path) -> bool:
@@ -243,18 +291,22 @@ def register_linux(exe: str, unregister: bool, dry_run: bool) -> list[str]:
 
     if unregister:
         if not dry_run:
-            for p in (desktop_path, mime_path, *_mime_icon_paths(data)):
+            for p in (desktop_path, mime_path, *_mime_icon_paths(data), *_legacy_linux_paths(data)):
                 p.unlink(missing_ok=True)
             run(["update-mime-database", str(mimedir)])
             run(["update-desktop-database", str(apps)])
             run(["gtk-update-icon-cache", "-f", "-t", str(data / "icons" / "hicolor")])
         msgs.append(f"{'would remove' if dry_run else 'removed'} {desktop_path.name} + {mime_path.name}"
-                    " + mimetype icons")
+                    " + mimetype icons (+ legacy ai-cad.* files)")
         return msgs
 
     if not dry_run:
         apps.mkdir(parents=True, exist_ok=True)
         (mimedir / "packages").mkdir(parents=True, exist_ok=True)
+        # Migration: drop the pre-rename ai-cad.desktop / ai-cad.xml / old mime icons so
+        # the shell doesn't keep a duplicate "AI-CAD" handler next to Billet.
+        for p in _legacy_linux_paths(data):
+            p.unlink(missing_ok=True)
         desktop_path.write_text(linux_desktop_entry(exe), encoding="utf-8")
         mime_path.write_text(linux_mime_xml(), encoding="utf-8")
         # Branded document icon for the native MIME type so Dolphin/Nautilus show it

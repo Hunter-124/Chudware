@@ -337,7 +337,7 @@ void drawPlmWorkspace(AppState& st) {
 
     if (!st.workerStarted) {
         plmEmptyState("[V]", "Project history unavailable",
-                      "The AI-CAD service is not running.");
+                      "The Billet service is not running.");
         return;
     }
 

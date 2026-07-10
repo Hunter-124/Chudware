@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the AI-CAD
-# host GUI. Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
+# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Billet
+# host GUI (binary still named AI-CAD this rename wave).
+# Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
 # (app/ Python packages + wheelhouse/ offline wheels) so the SAME bootstrap.cpp
 # findPayload()/provisionRuntime() logic that already runs on Windows also works unmodified
 # inside the AppImage's mount (exeDir()/app + exeDir()/wheelhouse via /proc/self/exe).
@@ -233,8 +234,11 @@ fi
 exec "$HERE/usr/bin/AI-CAD" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
-cp "$REPO/packaging/linux/AI-CAD.desktop" "$APPDIR/AI-CAD.desktop"
-cp "$REPO/assets/logo_icon.png" "$APPDIR/AI-CAD.png"
+# User-facing identity is "Billet" (desktop entry + icon names); the staged binary
+# stays usr/bin/AI-CAD this rename wave, which the .desktop's Exec still points at.
+cp "$REPO/packaging/linux/Billet.desktop" "$APPDIR/Billet.desktop"
+cp "$REPO/assets/logo_icon.png" "$APPDIR/Billet.png"
+ln -sf Billet.png "$APPDIR/.DirIcon"
 
 APPIMAGETOOL="$REPO/build/tools/appimagetool"
 if [ ! -x "$APPIMAGETOOL" ]; then
@@ -246,7 +250,7 @@ if [ ! -x "$APPIMAGETOOL" ]; then
 fi
 
 mkdir -p "$OUT"
-OUTFILE="$OUT/AI-CAD-$VERSION-x86_64.AppImage"
+OUTFILE="$OUT/Billet-$VERSION-x86_64.AppImage"
 echo "==> building $OUTFILE"
 if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT/appimagetool.log"; then
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"

@@ -1568,7 +1568,7 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
         drawAgentWorkflowView(st);
     } else if (!st.workerStarted) {
         emptyState("[#]", "Worker not running",
-                   "The AI-CAD worker service is required to load and steer plans.");
+                   "The Billet worker service is required to load and steer plans.");
     } else {
         // Session Plan: the persisted buildgraph view (unchanged Phase-1 behavior).
         drawDagView(st);

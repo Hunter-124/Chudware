@@ -16,6 +16,12 @@ Tools:
 
 Registration is deferred behind :func:`register_piping_tools` so ``server.py`` wires us in with a
 tiny fenced block, exactly like ``register_ecad_tools`` / ``register_cam_tools``.
+
+CONFORMANCE: ``piping_cfd_handoff`` and ``piping_verify_cfd`` conform to
+``aicad.simhandoff/1`` (contracts/sim_handoff.md) — the generalized cross-sim handoff &
+verify contract this pair originally proved. Successful results additionally carry a
+validated envelope under the reserved ``simhandoff`` key (built through
+``services.mcp.simhandoff``); all pre-existing result fields are unchanged.
 """
 
 from __future__ import annotations
@@ -27,6 +33,8 @@ from typing import Any, Optional, Union
 from engine.piping import schema as piping_schema
 from engine.piping import solve as piping_solve_mod
 from engine.piping import cfd_handoff as piping_cfd_mod
+
+from services.mcp import simhandoff as sh
 
 # Session bookkeeping: the last solved doc + result so piping_report can be called with no args.
 _PIPING: dict = {"doc": None, "result": None, "boundary": None, "fluid": None, "pumps": None}
@@ -72,6 +80,67 @@ def _as_obj(x: Union[str, list, dict, None]) -> Any:
 def _node_menu(nodes: list) -> list:
     """A compact node reference table so the model can address boundary conditions."""
     return [{"node": n["id"], "xyz": n["xyz"]} for n in nodes]
+
+
+def _handoff_envelope(solve_res: dict, bc_cfd: dict, step_path: Optional[str],
+                      volume_mm3: Optional[float], bore_doc_id: Optional[str]) -> dict:
+    """Build the aicad.simhandoff/1 handoff envelope for the piping→CFD coupling.
+
+    Pure translation of already-computed pieces (1D solve, CFD BC extraction, bore
+    STEP) into the contract shape — contracts/sim_handoff.md §6 is this envelope.
+    Module-level (not a closure) so tests can exercise it engine-less with mock dicts.
+    """
+    fluid = solve_res.get("fluid") or {}
+    total_dp = sum(abs(lk.get("dp_kpa", 0.0)) for lk in solve_res.get("links", []))
+    geometry = []
+    if step_path:
+        geometry.append(sh.geometry_ref(
+            "fluid_domain", "step", path=step_path, doc_id=bore_doc_id,
+            derived_by="piping_internal_volume", units="mm",
+            meta={"volume_mm3": volume_mm3} if volume_mm3 is not None else None))
+    conditions = [
+        sh.condition("inlet_velocity", "velocity", bc_cfd["inlet_velocity_ms"], "m/s",
+                     f"1D solve link {bc_cfd.get('inlet_link')} velocity_ms",
+                     applied_to="inlet"),
+        sh.condition("inlet_pressure", "pressure", bc_cfd["inlet_pressure_kpa"], "kPa",
+                     "1D solve inlet node pressure_kpa", applied_to="inlet"),
+        sh.condition("outlet_pressure", "pressure", bc_cfd["outlet_pressure_kpa"], "kPa",
+                     f"1D solve node {bc_cfd.get('outlet_node')} pressure_kpa",
+                     applied_to="outlet"),
+    ]
+    expectations = [sh.expectation(
+        "pressure_drop", bc_cfd["pressure_drop_1d_kpa"], "kPa",
+        "1D inlet−outlet pressure (cfd_boundary_from_solve pressure_drop_1d_kpa)")]
+    return sh.build_handoff(
+        "piping_to_cfd",
+        sh.study_ref("piping", "piping_solve",
+                     result_digest={"converged": solve_res.get("converged"),
+                                    "total_dp_kpa": round(total_dp, 3),
+                                    "fluid": fluid.get("name") or fluid}),
+        sh.study_ref("cfd", "run_cfd_flow", doc_id=bore_doc_id),
+        geometry=geometry, conditions=conditions, expectations=expectations)
+
+
+def _verify_envelope(result: dict) -> dict:
+    """Build the aicad.simhandoff/1 verify envelope from a verify_pressure_drop result.
+
+    Pure translation — the pass/deviation/verdict numbers are the existing ones,
+    re-expressed in the contract's check shape (contracts/sim_handoff.md §6).
+    """
+    checks = [sh.check("pressure_drop", "kPa",
+                       result["dp_1d_kpa"], result["dp_3d_kpa"],
+                       result["deviation_pct"], result["tolerance_pct"],
+                       result["pass"])]
+    viol = (result.get("velocity_limits") or {}).get("violations") or []
+    advisories = ([{"name": "velocity_limit", "detail": result["velocity_limits"]}]
+                  if viol else None)
+    return sh.build_verify(
+        "piping_to_cfd",
+        sh.study_ref("piping", "piping_solve"),
+        sh.study_ref("cfd", "run_cfd_flow"),
+        checks, result.get("verdict", ""),
+        advisories=advisories,
+        warnings=result.get("warnings") or None)
 
 
 def register_piping_tools(mcp) -> None:
@@ -315,6 +384,8 @@ def register_piping_tools(mcp) -> None:
 
         Returns ``{ok, solve, boundary_cfd, step_path, cfd, next_actions}`` — all sub-results
         included so ``piping_verify_cfd`` can be called immediately on the returned data.
+        Successful results also carry a validated ``aicad.simhandoff/1`` handoff envelope
+        under ``simhandoff`` (contracts/sim_handoff.md).
         """
         # ── 1D solve ──────────────────────────────────────────────────────────
         try:
@@ -396,7 +467,7 @@ def register_piping_tools(mcp) -> None:
         if bore_doc_id is None:
             # Core bridge not available or import failed — return the STEP + BCs,
             # instruct the caller to import manually then run run_cfd_flow.
-            return _dumps({
+            return _dumps(sh.attach({
                 "ok": True,
                 "stage": "cfd_pending_manual_import",
                 "solve": solve_res,
@@ -414,7 +485,8 @@ def register_piping_tools(mcp) -> None:
                     "Core bridge not available in this context — import the bore STEP manually "
                     "and call run_cfd_flow. All BCs are in boundary_cfd."
                 ),
-            })
+            }, _handoff_envelope(solve_res, bc_cfd, step_path,
+                                 vol_res.get("volume_mm3"), None)))
 
         # Run CFD on the imported bore part
         try:
@@ -442,7 +514,7 @@ def register_piping_tools(mcp) -> None:
         except Exception as exc:  # noqa: BLE001
             cfd_res = {"ok": False, "reason": f"run_cfd_flow failed: {exc}"}
 
-        return _dumps({
+        return _dumps(sh.attach({
             "ok": True,
             "solve": solve_res,
             "boundary_cfd": bc_cfd,
@@ -455,7 +527,8 @@ def register_piping_tools(mcp) -> None:
                 "raise cells/n_steps for more accurate CFD (at cost of runtime)",
                 "use run_cfd_accurate for RANS-quality results (requires OpenFOAM)",
             ],
-        })
+        }, _handoff_envelope(solve_res, bc_cfd, step_path,
+                             vol_res.get("volume_mm3"), bore_doc_id)))
 
     @mcp.tool()
     def piping_verify_cfd(solve_result: Union[str, dict],
@@ -478,7 +551,9 @@ def register_piping_tools(mcp) -> None:
 
         If called with no live results, falls back to the most recent ``piping_cfd_handoff``
         result stored in session state. Always returns ``{ok, pass, dp_1d_kpa, dp_3d_kpa,
-        deviation_pct, tolerance_pct, verdict, velocity_limits, warnings}``.
+        deviation_pct, tolerance_pct, verdict, velocity_limits, warnings}``. Successful
+        results also carry a validated ``aicad.simhandoff/1`` verify envelope under
+        ``simhandoff`` (contracts/sim_handoff.md).
         """
         try:
             sr = _as_obj(solve_result)
@@ -500,4 +575,6 @@ def register_piping_tools(mcp) -> None:
         result = piping_cfd_mod.verify_pressure_drop(
             sr, cr, tolerance_pct=float(tolerance_pct), run_id=run_id
         )
+        if result.get("ok"):
+            sh.attach(result, _verify_envelope(result))
         return _dumps(result)

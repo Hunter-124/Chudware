@@ -946,3 +946,19 @@ Google/CF/reCAPTCHA trust, not just its own. Push-only today means the two persi
 jars warm in parallel and don't share third-party trust cookies. Pre-existing unrelated
 gate debt: `scripts/check.py` `feature_surface_audit` fails on Sketch3D/Reverse-Eng
 ribbon handlers (untouched here).
+
+## 2026-07-10 — T-SIM5: OpenFOAM accurate-CFD live path (branch task/T-SIM5-openfoam)
+run_cfd_accurate is now production-real on Linux: new `LinuxRunner` in
+engine_oracle/sim/foam_runner.py (sourced-env / AICAD_OPENFOAM / system / user-space
+conda detection, strict subprocess exec — GPL isolation, license_debt.md row 18);
+tools/provision_openfoam.py gained a no-sudo conda-forge install path (installed live:
+OpenFOAM v2412); foam_cht.py grew the T-FIN19 multi-solid seam
+(build_cht_case(solids=[{name, stl_path, kappa_w_mk, power_w}]) — per-region cellZones,
+heat sources, coupled BCs; openfoam.py passes thermal["solids"], foam_post aggregates
+per-region temperatures). Live-verified: foam_validation sphere/cube Cd PASS in-band,
+2-solid board+chip CHT end-to-end. sim_audit.py gained an opt-in live validation leg
+(AICAD_SIM_AUDIT_LIVE_FOAM=1). Gotchas: OpenFOAM case files must stay ASCII (`_w` writes
+ascii); conda env bashrc lives at <env>/etc/bashrc and MUST be sourced (bare exe fails on
+etc/controlDict lookup); mcp test suite legs needing libaicad were skipped here (worktree
+has no staged dist). Deferred: MCP-level exposure of the CHT variant (T-FIN19 will wire
+board solids + heat sources into thermal["solids"]).

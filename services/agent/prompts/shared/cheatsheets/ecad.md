@@ -1,4 +1,4 @@
-ECAD — schematic capture, SPICE, PCB layout, controlled impedance
+ECAD — schematic capture, SPICE, PCB layout, controlled impedance, 3D/physics handoff
 
 WORKFLOW (schematic -> board -> fab):
   ecad_new_schematic('amp')          start a schematic (ecad_status() = THE context tool)
@@ -7,7 +7,8 @@ WORKFLOW (schematic -> board -> fab):
   ecad_run_erc() / ecad_simulate()   check + SPICE (op/dc/tran/ac, four/mc/temp/noise)
   ecad_make_board('board1')          ONE SHOT: sync -> route -> fill -> DRC; sets current board
   ecad_autoroute() / ecad_run_drc()  route + rule check (widths/clearances from NET CLASSES)
-  ecad_export('gerber') / ecad_to_3d()   fab outputs / STEP bridge
+  ecad_export('gerber') / ecad_to_3d()   fab outputs / STEP + boardphys sidecar (below)
+  BIAS: fix ERC errors before layout; fix DRC errors before export.
 
 SIMULATION BACKENDS (ecad_simulate / ecad_tf, param backend=):
   'mna' (DEFAULT)  validated internal Python MNA solver — deterministic, always
@@ -30,6 +31,24 @@ VENDOR MODEL IMPORT: attach a SPICE library to a component via its sim dict:
   netlist_to_spice_circuit records an X instance + .include; only the ngspice
   backend simulates it (MNA warns and ignores). Parity gated in
   engine/sim/test_ngspice_backend.py (RC + divider fixtures match across backends).
+
+ENGINEERING METADATA (T-FIN8; contract: contracts/ecad/boardphys.md):
+  The bundled library carries per-part engineering seeds — power_w (typ/max),
+  theta_ja/theta_jc, Tj/Ta limits, package body dims, supply rails (voltage min/nom/max,
+  current active/sleep), voltage domains, sequencing requirements — each with a datasheet
+  source note.  Resolution: footprint eng < symbol eng < per-instance override.
+  Per-instance override: place/update a symbol with sim_params={"eng": {...}} (partial dict,
+  e.g. {"power_w": {"typ": 0.02}}) — it flows to the board on ecad_update_from_sch.
+  HONESTY RULE: unknown metadata is null, never 0. sequencing [] = known none; null = unknown.
+
+  ecad_status()/describe_board()       Per-component power_w + board "power" totals
+                                       (n_missing_power tells you the coverage gap).
+  ecad_to_3d()                         Writes <board>.step + <board>.step.boardphys.json:
+                                       component -> solid label, body dims, power, theta,
+                                       limits, rails + board totals. This sidecar is THE seam
+                                       for thermal handoff, PDN checks and power budgets.
+  Never invent power/thermal numbers — read them from ecad_status/boardphys, and add
+  overrides with a source note.
 
 CONTROLLED IMPEDANCE (stackup advisor + checkers):
   ecad_stackup_solve(copper_layers, targets, profile, net_map)

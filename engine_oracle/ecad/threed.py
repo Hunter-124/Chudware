@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from engine.ecad import metadata as eng_metadata
 from engine.ecad.schema import pad_world
 
 # build123d / OCP are imported lazily inside functions so importing this module stays cheap and
@@ -487,6 +488,39 @@ def _proxy_shape(fp: dict):
     return Pos(0, 0, ht / 2.0) * Box(w, h, ht)
 
 
+def _package_shape(fp: dict, eng: dict):
+    """Component body from the library package dims (T-FIN8), or None when unknown.
+
+    ``eng`` is the normalized metadata dict (engine.ecad.metadata.eng_for_footprint).
+    Box packages need l/w/h; cylinder packages need d/h. Shapes sit on z=0, growing +z,
+    centered on the footprint origin — same convention as the proxy.
+    Returns ``(shape, body_descriptor)`` or ``(None, None)``.
+    """
+    pkg = eng.get("package") or {}
+    shape = pkg.get("shape")
+    h = pkg.get("h_mm")
+    if shape == "box" and pkg.get("l_mm") and pkg.get("w_mm") and h:
+        from build123d import Pos, Box
+        body = Pos(0, 0, float(h) / 2.0) * Box(float(pkg["l_mm"]), float(pkg["w_mm"]), float(h))
+        return body, {"shape": "box", "l_mm": float(pkg["l_mm"]), "w_mm": float(pkg["w_mm"]),
+                      "h_mm": float(h), "d_mm": None, "source": "package_lib"}
+    if shape == "cylinder" and pkg.get("d_mm") and h:
+        from build123d import Pos, Cylinder
+        body = Pos(0, 0, float(h) / 2.0) * Cylinder(radius=float(pkg["d_mm"]) / 2.0,
+                                                    height=float(h))
+        return body, {"shape": "cylinder", "l_mm": None, "w_mm": None,
+                      "h_mm": float(h), "d_mm": float(pkg["d_mm"]), "source": "package_lib"}
+    return None, None
+
+
+def _proxy_body_descriptor(fp: dict) -> dict:
+    """Body descriptor for the pad-extent box proxy (honest about its provenance)."""
+    w, h = _footprint_extent(fp)
+    ht = _proxy_height(fp)
+    return {"shape": "box", "l_mm": float(w), "w_mm": float(h), "h_mm": float(ht),
+            "d_mm": None, "source": "proxy_extent"}
+
+
 def _is_on_board(fp: dict) -> bool:
     """A footprint contributes a 3D body unless explicitly excluded (virtual / on_board=False)."""
     if fp.get("on_board") is False:
@@ -526,33 +560,103 @@ def _load_model(model_ref: str, summary: _Summary):
 
 
 def _build_components(board: dict, opts: BoardToStepOpts, thickness: float, zb: float,
-                      summary: _Summary):
-    """One world-placed body per on_board footprint (real model when loadable, else box proxy)."""
+                      summary: _Summary, phys: list | None = None):
+    """One world-placed body per on_board footprint.
+
+    Body preference (T-FIN8): real ``model_3d`` STEP > library package box/cylinder
+    (engine.ecad.metadata package dims) > pad-extent box proxy. When ``phys`` is a list,
+    one ``aicad.boardphys/1`` component record is appended per placed body (and per
+    skipped footprint, with ``solid_label: null``) — see contracts/ecad/boardphys.md.
+    """
     out: list = []
     for fp in board.get("footprints", []):
         if not _is_on_board(fp):
             continue
+        eng = eng_metadata.eng_for_footprint(fp)
+        rec = None
+        if phys is not None:
+            rec = _phys_record(fp, eng)
+            phys.append(rec)
         if not fp.get("pads"):
             summary.warnings.append(f"footprint {fp.get('ref', fp.get('id'))!r} has no pads — skipped.")
             summary.n_skipped += 1
             continue
         model = _load_model(fp.get("model_3d"), summary)
+        body_desc = None
         if model is not None:
             shape = model
             summary.n_models += 1
+            body_desc = {"shape": None, "l_mm": None, "w_mm": None, "h_mm": None,
+                         "d_mm": None, "source": "model_3d"}
         else:
-            shape = _proxy_shape(fp)
+            shape, body_desc = _package_shape(fp, eng)
+            if shape is None:
+                shape = _proxy_shape(fp)
+                body_desc = _proxy_body_descriptor(fp)
             summary.n_proxies += 1
         try:
             placed = _place_component(shape, fp, thickness, zb)
-            placed.label = str(fp.get("ref") or fp.get("id") or "CMP")
+            label = str(fp.get("ref") or fp.get("id") or "CMP")
+            placed.label = label
             out.append(placed)
             summary.n_components += 1
+            if rec is not None:
+                rec["solid_label"] = label
+                rec["body"] = body_desc
         except Exception as exc:  # noqa: BLE001
             summary.warnings.append(
                 f"component {fp.get('ref', fp.get('id'))!r} placement failed: {exc}")
             summary.n_skipped += 1
     return out
+
+
+# --------------------------------------------------------------------------- boardphys sidecar
+
+
+BOARDPHYS_SCHEMA = "aicad.boardphys/1"
+
+
+def _phys_record(fp: dict, eng: dict) -> dict:
+    """One boardphys component record (before the solid is placed). Missing metadata is
+    honest ``None`` — never invented zeros (contracts/ecad/boardphys.md)."""
+    return {
+        "ref": fp.get("ref") or None,
+        "id": fp.get("id") or None,
+        "fpid": fp.get("fpid") or None,
+        "libid": fp.get("libid") or None,
+        "solid_label": None,             # filled in when the body places successfully
+        "pos_mm": [float(fp["pos"][0]), float(fp["pos"][1])] if fp.get("pos") else None,
+        "angle_deg": float(fp.get("angle", 0.0)),
+        "side": fp.get("side", "top"),
+        "body": None,                    # filled in with the placed body descriptor
+        "power_w": eng["power_w"],
+        "theta_c_per_w": eng["theta_c_per_w"],
+        "limits_c": eng["limits_c"],
+        "supply": eng["supply"],
+        "sources": eng["sources"],
+    }
+
+
+def build_boardphys(board: dict, step_path: str, components: list, summary: _Summary) -> dict:
+    """Assemble the ``aicad.boardphys/1`` sidecar document (schema doc:
+    contracts/ecad/boardphys.md). ``components`` is the record list produced by
+    :func:`_build_components`."""
+    totals = eng_metadata.power_totals(
+        [{"power_w": c.get("power_w") or {}} for c in components])
+    stack = board.get("stackup", {}) or {}
+    return {
+        "schema": BOARDPHYS_SCHEMA,
+        "generated_by": "engine.ecad.threed.board_to_step",
+        "board": {
+            "name": board.get("name"),
+            "id": board.get("id"),
+            "thickness_mm": float(stack.get("thickness", 1.6)),
+            "outline_area_mm2": summary.outline_area,
+        },
+        "step_path": os.path.abspath(step_path),
+        "components": components,
+        "totals": totals,
+    }
 
 
 # --------------------------------------------------------------------------- public API
@@ -561,8 +665,10 @@ def _build_components(board: dict, opts: BoardToStepOpts, thickness: float, zb: 
 def board_to_step(board: dict, out_path: str, opts: Any = None) -> dict:
     """Convert ``board`` (an ``aicad.pcb/1`` BoardDocument) into a STEP solid at ``out_path``.
 
-    Returns ``{"step_path": <abs path>, "summary": {...}}``. Raises :class:`BoardGeometryError`
-    for a board whose outline is empty or does not close.
+    Returns ``{"step_path": <abs path>, "summary": {...}, "boardphys": {...}}`` where
+    ``boardphys`` is the machine-readable ``aicad.boardphys/1`` sidecar mapping every placed
+    component body to its power/thermal metadata (contracts/ecad/boardphys.md). Raises
+    :class:`BoardGeometryError` for a board whose outline is empty or does not close.
     """
     from build123d import Compound, export_step
 
@@ -576,8 +682,10 @@ def board_to_step(board: dict, out_path: str, opts: Any = None) -> dict:
     if opts.copper:
         children.extend(_build_copper(board, opts, thickness, zb, summary))
 
+    phys_components: list = []
     if opts.components:
-        children.extend(_build_components(board, opts, thickness, zb, summary))
+        children.extend(_build_components(board, opts, thickness, zb, summary,
+                                          phys=phys_components))
 
     try:
         summary.board_volume = float(substrate.volume)
@@ -591,7 +699,8 @@ def board_to_step(board: dict, out_path: str, opts: Any = None) -> dict:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     export_step(assembly, out_path)
 
-    return {"step_path": out_path, "summary": summary.asdict()}
+    boardphys = build_boardphys(board, out_path, phys_components, summary)
+    return {"step_path": out_path, "summary": summary.asdict(), "boardphys": boardphys}
 
 
 def board_to_part_doc(board: dict, step_path: str) -> dict:

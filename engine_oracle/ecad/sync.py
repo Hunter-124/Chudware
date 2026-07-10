@@ -200,6 +200,12 @@ def _new_footprint(board: dict, comp: dict, fpdef: dict, place_xy: list[float],
         # fab outputs (BOM) and downstream pricing can read them. The symbol is the
         # source of truth for these; the update branch below refreshes them on re-sync.
         "fields": dict(comp.get("fields", {}) or {}),
+        # Back-link to the symbol libid + per-instance eng overrides (T-FIN8) so the
+        # metadata resolver (engine.ecad.metadata) can find electrical seeds/overrides
+        # from the board document alone.
+        "libid": comp.get("libid", ""),
+        "eng_overrides": copy.deepcopy(comp.get("eng_overrides"))
+                         if isinstance(comp.get("eng_overrides"), dict) else None,
     }
 
 
@@ -296,6 +302,14 @@ def update_board_from_sch(board: dict, netlist: dict, *, library: Any = None,
                 if merged != (fp.get("fields") or {}):
                     fp["fields"] = merged
                     dirty = True
+            # Refresh the eng metadata back-links (T-FIN8) — symbol wins.
+            if comp.get("libid") and fp.get("libid") != comp.get("libid"):
+                fp["libid"] = comp.get("libid")
+                dirty = True
+            new_ov = comp.get("eng_overrides") if isinstance(comp.get("eng_overrides"), dict) else None
+            if new_ov is not None and fp.get("eng_overrides") != new_ov:
+                fp["eng_overrides"] = copy.deepcopy(new_ov)
+                dirty = True
             changed, bound = _bind_pads(fp.get("pads", []), comp_pins, work)
             report["nets_bound"] += bound
             if changed or dirty:

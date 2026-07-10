@@ -43,6 +43,40 @@ from engine.ecad import session as ecad_session
 from engine.ecad.library import search as lib_search
 from engine.ecad.ops import OpError
 
+try:  # T-FIN8 engineering-metadata layer — advisory, must never break the tools
+    from engine.ecad import metadata as _eng_metadata
+except Exception:  # noqa: BLE001
+    _eng_metadata = None  # type: ignore[assignment]
+
+
+def _component_eng(libid: str = "", fpid: str = "", overrides=None):
+    """Normalized eng metadata for one component (contracts/ecad/boardphys.md), or None."""
+    if _eng_metadata is None:
+        return None
+    try:
+        return _eng_metadata.resolve_eng(libid=libid, fpid=fpid, overrides=overrides)
+    except Exception:  # noqa: BLE001 — metadata is advisory
+        return None
+
+
+def _fp_overrides(fp: dict):
+    if _eng_metadata is None:
+        return None
+    try:
+        return _eng_metadata.footprint_overrides(fp)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _power_totals(engs: list):
+    """Board power rollup (nulls when unknown — never invented zeros), or None."""
+    if _eng_metadata is None:
+        return None
+    try:
+        return _eng_metadata.power_totals([e for e in engs if e])
+    except Exception:  # noqa: BLE001
+        return None
+
 
 # --------------------------------------------------------------------------- module state
 #
@@ -540,7 +574,8 @@ def register_ecad_tools(mcp) -> None:
     @mcp.tool()
     def ecad_place_symbol(libid: str, x: float = 0.0, y: float = 0.0,
                           ref: str = "", value: str = "",
-                          angle: float = 0.0, footprint: str = "", doc_id: str = "") -> str:
+                          angle: float = 0.0, footprint: str = "", doc_id: str = "",
+                          sim_params: str = "") -> str:
         """Place a symbol on the active schematic and return its assigned REF plus its full PIN
         LIST (name/number/type/world-xy) and the count of pins still unconnected.
 
@@ -550,6 +585,12 @@ def register_ecad_tools(mcp) -> None:
         ``ref`` auto-assigns (R1, R2, ...) if omitted. ``footprint`` (an fpid like
         'Resistor_SMD:R_0603') makes the part board-ready for ecad_update_from_sch; omit it and a
         sane default for the part's libid is used automatically when you sync to a board.
+
+        ``sim_params`` (JSON object string) attaches per-instance simulation/engineering data.
+        Its ``"eng"`` sub-object overrides the library engineering metadata for THIS instance
+        (partial dict — e.g. '{"eng": {"power_w": {"typ": 0.02}}}'); see
+        contracts/ecad/boardphys.md. Overrides flow onto the board footprint at sync and into
+        the aicad.boardphys/1 sidecar + ecad_status power totals.
         """
         try:
             session = _get_sch(doc_id or None)
@@ -580,6 +621,18 @@ def register_ecad_tools(mcp) -> None:
             op["value"] = value
         if footprint:
             op["footprint"] = footprint
+        if sim_params:
+            try:
+                sp = json.loads(sim_params)
+            except (TypeError, ValueError) as e:
+                return _err(f"sim_params is not valid JSON: {e}",
+                            hint='Pass a JSON object string, e.g. '
+                                 '\'{"eng": {"power_w": {"typ": 0.02}}}\'.',
+                            next_actions=["ecad_place_symbol(...)  # retry with valid JSON"])
+            if not isinstance(sp, dict):
+                return _err("sim_params must be a JSON object",
+                            hint='e.g. \'{"eng": {"power_w": {"typ": 0.02}}}\'.')
+            op["sim_params"] = sp
         try:
             resp = _apply(session, [op])
         except OpError as e:
@@ -772,7 +825,9 @@ def register_ecad_tools(mcp) -> None:
     @mcp.tool()
     def ecad_status(doc_id: str = "") -> str:
         """THE situational-awareness call. Returns a COMPACT design summary sized for a small
-        context window: component count + list, every net with its size and members, the ERC
+        context window: component count + list (each with its ``power_w`` typ/max from the
+        engineering-metadata layer — honest nulls when unknown), a board ``power`` total
+        (contracts/ecad/boardphys.md), every net with its size and members, the ERC
         violation summary grouped by rule, and a PRIORITIZED ``next_actions`` list naming the
         exact pins to fix.
 
@@ -795,10 +850,19 @@ def register_ecad_tools(mcp) -> None:
             return _pcb_status(session)
         # ---- schematic status ----
         nl = netlist_mod.build_netlist(doc)
-        components = [{"ref": c.get("ref"), "libid": c.get("libid"),
-                       "value": c.get("value"), "footprint": c.get("footprint") or None,
-                       "pins": c.get("pins")}
-                      for c in nl.get("components", [])]
+        components = []
+        comp_engs = []
+        for c in nl.get("components", []):
+            eng = _component_eng(libid=c.get("libid") or "", fpid=c.get("footprint") or "",
+                                 overrides=c.get("eng_overrides"))
+            comp_engs.append(eng)
+            components.append({"ref": c.get("ref"), "libid": c.get("libid"),
+                               "value": c.get("value"), "footprint": c.get("footprint") or None,
+                               "pins": c.get("pins"),
+                               # T-FIN8: per-component power (honest nulls when unknown —
+                               # contracts/ecad/boardphys.md)
+                               "power_w": eng["power_w"] if eng else {"typ": None, "max": None}})
+        power = _power_totals(comp_engs)
         nets = []
         for name, members in sorted(nl.get("nets", {}).items()):
             nets.append({"name": name, "size": len(members),
@@ -836,11 +900,14 @@ def register_ecad_tools(mcp) -> None:
         head = (f"{len(components)} component(s), {len(nets)} net(s), "
                 f"{erc['errors']} ERC error(s), {erc['warnings']} warning(s), "
                 f"{len(unconnected)} unconnected pin(s).")
+        if power and power.get("power_w_typ") is not None:
+            head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
         return _dumps({
             "ok": True, "doc_id": session.doc_id, "kind": "sch",
             "name": doc.get("name"), "revision": session.revision,
             "summary": head,
             "component_count": len(components), "components": components,
+            "power": power,
             "net_count": len(nets), "nets": nets,
             "erc": erc,
             "unconnected_pins": [_pretty_pin(p) for p in unconnected],
@@ -872,15 +939,24 @@ def register_ecad_tools(mcp) -> None:
             next_actions.append("No footprints — place parts (ecad_find_part finds fpids).")
         if not doc.get("outline", {}).get("shapes"):
             next_actions.append("No board outline yet — set one with a pcb_set_outline op.")
+        # T-FIN8: per-footprint power + board total (honest nulls when unknown).
+        fp_engs = [_component_eng(libid=f.get("libid") or "", fpid=f.get("fpid") or "",
+                                  overrides=_fp_overrides(f)) for f in fps]
+        power = _power_totals(fp_engs)
         head = (f"{len(fps)} footprint(s), {len(nets)} net(s), {len(tracks)} track(s), "
                 f"{len(vias)} via(s), {erc['errors']} DRC error(s), {erc['warnings']} warning(s).")
+        if power and power.get("power_w_typ") is not None:
+            head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
         return _dumps({
             "ok": True, "doc_id": session.doc_id, "kind": "pcb",
             "name": doc.get("name"), "revision": session.revision,
             "summary": head,
             "footprint_count": len(fps),
             "footprints": [{"ref": f.get("ref"), "fpid": f.get("fpid"),
-                            "pos": f.get("pos"), "side": f.get("side")} for f in fps],
+                            "pos": f.get("pos"), "side": f.get("side"),
+                            "power_w": (e or {}).get("power_w", {"typ": None, "max": None})}
+                           for f, e in zip(fps, fp_engs)],
+            "power": power,
             "nets": [n.get("name") for n in nets],
             "track_count": len(tracks), "via_count": len(vias),
             "drc": erc,
@@ -1673,12 +1749,20 @@ def register_ecad_tools(mcp) -> None:
 
     @mcp.tool()
     def ecad_to_3d(path: str = "", doc_id: str = "") -> str:
-        """Export a 3D model (STEP) of the active board.
+        """Export a 3D model (STEP) of the active board + the aicad.boardphys/1 sidecar.
 
-        Calls ``engine.ecad.threed.board_to_step`` (now available), assembles the board substrate
-        and proxy-boxes for every on-board footprint, and writes a STEP file. Returns the file
-        path + volume summary and a hint telling the user to open the STEP as an import feature
-        in the AI-CAD app so they can design an enclosure around the board.
+        Calls ``engine.ecad.threed.board_to_step``: assembles the board substrate and a
+        component BODY for every on-board footprint (real model_3d STEP > library package
+        box/cylinder from the eng metadata > pad-extent proxy box) and writes a STEP file.
+        Also writes ``<step>.boardphys.json`` — the machine-readable ``aicad.boardphys/1``
+        sidecar mapping each component solid to its power/thermal metadata (power_w typ/max,
+        theta_ja/jc, Tj/Ta limits, supply rails) with board power totals. Missing metadata is
+        honest ``null``, never 0 (contracts/ecad/boardphys.md). Downstream consumers (thermal
+        handoff, PDN, power budget, host-board rules) read the sidecar.
+
+        Returns the STEP path, sidecar path, volume summary + power totals, and a hint telling
+        the user to open the STEP as an import feature in the AI-CAD app so they can design an
+        enclosure around the board.
 
         Falls back to a clean, actionable error (never raises) when the board has no outline or
         when there is no active PCB session.
@@ -1735,19 +1819,36 @@ def register_ecad_tools(mcp) -> None:
         step_path = result.get("step_path", out_path)
         summary   = result.get("summary", {})
         _ECAD["out_dir"] = os.path.dirname(step_path)
+        # T-FIN8: persist the aicad.boardphys/1 sidecar next to the STEP.
+        boardphys = result.get("boardphys")
+        sidecar_path = None
+        sidecar_warnings: list = []
+        if boardphys:
+            sidecar_path = step_path + ".boardphys.json"
+            try:
+                with open(sidecar_path, "w", encoding="utf-8") as fh:
+                    json.dump(boardphys, fh, indent=1)
+            except Exception as e:  # noqa: BLE001 — sidecar failure must not void the STEP
+                sidecar_warnings.append(f"boardphys sidecar write failed: {e}")
+                sidecar_path = None
+        totals = (boardphys or {}).get("totals") or {}
         return _dumps({
             "ok": True, "doc_id": session.doc_id, "kind": "step",
             "step_path": step_path,
+            "boardphys_path": sidecar_path,
+            "power": totals or None,
             "board_volume_mm3": summary.get("board_volume", 0.0),
             "n_components": summary.get("n_components", 0),
             "n_proxies": summary.get("n_proxies", 0),
             "summary": summary,
-            "warnings": summary.get("warnings", []),
+            "warnings": list(summary.get("warnings", [])) + sidecar_warnings,
             "hint": (f"Wrote STEP to {step_path} "
                      f"(board volume {summary.get('board_volume', 0):.1f} mm³, "
-                     f"{summary.get('n_components', 0)} component body/bodies). "
-                     "Open this STEP in the CAD app as an import feature to design "
-                     "the enclosure."),
+                     f"{summary.get('n_components', 0)} component body/bodies)"
+                     + (f" + boardphys sidecar {sidecar_path} (power/thermal map)."
+                        if sidecar_path else ".")
+                     + " Open this STEP in the CAD app as an import feature to design "
+                       "the enclosure."),
             "next_actions": [
                 f"# In the CAD app: File > Import > {step_path}",
                 "# Or drag the STEP onto the 3D canvas to start the enclosure design.",

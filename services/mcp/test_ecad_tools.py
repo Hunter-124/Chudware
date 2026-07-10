@@ -1163,6 +1163,85 @@ def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
     print("  [fin8_to_3d_boardphys_sidecar] PASS")
 
 
+def test_fin13_run_pdn(tools: dict) -> None:
+    """T-FIN13: ecad_run_pdn flags an undersized 3 A trace (drop + current density) and
+    exports the I2R map as the boardphys `pdn` sidecar extension."""
+    import os
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _call(tools, "ecad_new_pcb", name="fin13_pdn")
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+    doc = pcb.doc
+    # hand-build a +5V net: connector source pad -> skinny 0.3mm trace -> hungry load
+    doc["nets"].append({"name": "+5V", "class": "default"})
+    rail = {"supply": {"rails": [{"name": "+5V", "voltage_v_min": 4.9,
+                                  "voltage_v_nom": 5.0, "voltage_v_max": 5.25,
+                                  "current_a_active": 3.0, "current_a_sleep": None}],
+                       "voltage_domains": ["+5V"], "sequencing": []},
+            "sources": ["test fixture"]}
+
+    def _pad(net):
+        return {"id": "p1", "number": "1", "pin": "1", "pos": [0.0, 0.0], "angle": 0.0,
+                "shape": "rect", "size": [1.0, 1.0], "type": "smd",
+                "layers": ["F.Cu"], "net": net}
+    doc["footprints"].extend([
+        {"id": "fp1", "ref": "J1", "fpid": "Test:PAD1", "pos": [0.0, 0.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+5V")]},
+        {"id": "fp2", "ref": "U1", "fpid": "Test:PAD1", "pos": [30.0, 0.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+5V")],
+         "eng_overrides": rail},
+    ])
+    doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [0.0, 0.0],
+                          "p2": [30.0, 0.0], "width": 0.3, "net": "+5V",
+                          "layer": "F.Cu"})
+
+    r = _call(tools, "ecad_run_pdn", net="+5V", source_refs="J1")
+    _assert_context(r, "ecad_run_pdn")
+    assert r["ok"], f"ecad_run_pdn failed: {r}"
+    net = r["nets"][0]
+    assert net["vsrc"] == 5.0, "vsrc must come from the rail metadata"
+    u1 = next(d for d in net["drops"] if d["ref"] == "U1")
+    assert u1["i_a"] == 3.0 and u1["within_tolerance"] is False, u1
+    assert net["hotspots"], "0.3mm @ 3A must produce current-density hotspots"
+    assert r["violations"], "expected drop + density violations"
+    sidecar = r.get("boardphys_path")
+    assert sidecar and os.path.isfile(sidecar), f"pdn sidecar not written: {sidecar!r}"
+    with open(sidecar, encoding="utf-8") as fh:
+        phys = json.load(fh)
+    assert phys["schema"] == "aicad.boardphys/1"
+    blk = phys["pdn"]
+    assert blk["schema"] == "aicad.pdn/1" and blk["nets"][0]["net"] == "+5V"
+    m = blk["nets"][0]["i2r_map"]
+    assert m["columns"] == ["layer", "x_mm", "y_mm", "p_w"] and m["cells"]
+    assert m["total_w"] > 0.1  # ~ I^2 R = 9 * ~0.05 ohm
+    print(f"  FIN13: verdict={r['verdict']!r} total_i2r={m['total_w']:.3f} W "
+          f"hotspots={len(net['hotspots'])}")
+
+    # a fat clean net must pass
+    doc["nets"].append({"name": "+3V3", "class": "default"})
+    doc["footprints"].extend([
+        {"id": "fp3", "ref": "J2", "fpid": "Test:PAD1", "pos": [0.0, 10.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+3V3")]},
+        {"id": "fp4", "ref": "U2", "fpid": "Test:PAD1", "pos": [30.0, 10.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+3V3")],
+         "eng_overrides": {"supply": {"rails": [{"name": "+3V3", "voltage_v_min": 3.0,
+                                                 "voltage_v_nom": 3.3, "voltage_v_max": 3.6,
+                                                 "current_a_active": 0.1,
+                                                 "current_a_sleep": None}],
+                                      "voltage_domains": ["+3V3"], "sequencing": []},
+                           "sources": ["test fixture"]}},
+    ])
+    doc["tracks"].append({"id": "t2", "kind": "segment", "p1": [0.0, 10.0],
+                          "p2": [30.0, 10.0], "width": 3.0, "net": "+3V3",
+                          "layer": "F.Cu"})
+    r2 = _call(tools, "ecad_run_pdn", net="+3V3", source_refs="J2")
+    assert r2["ok"] and not r2["violations"], f"clean net must pass: {r2.get('violations')}"
+    u2 = next(d for d in r2["nets"][0]["drops"] if d["ref"] == "U2")
+    assert u2["within_tolerance"] is True
+    print("  [fin13_run_pdn] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     tools = test_register()
@@ -1207,6 +1286,8 @@ def main() -> None:
     test_fin8_metadata_roundtrip(tools)
     test_fin8_missing_metadata_degrades(tools)
     test_fin8_to_3d_boardphys_sidecar(tools)
+    # T-FIN13 PDN IR-drop
+    test_fin13_run_pdn(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

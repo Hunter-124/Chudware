@@ -1325,6 +1325,158 @@ def register_ecad_tools(mcp) -> None:
             ),
         })
 
+    # ---------------------------------------------------------------- PDN (T-FIN13)
+
+    @mcp.tool()
+    def ecad_run_pdn(net: str = "", vsrc: float = 0.0, source_refs: str = "",
+                     sink_overrides: str = "", resolution_mm: float = 0.0,
+                     j_limit_a_mm2: float = 0.0, doc_id: str = "") -> str:
+        """DC power-delivery (IR-drop) analysis of the active board's power-net copper.
+
+        Meshes the net's pours/tracks/pads into a 2.5D resistor grid (sheet resistance
+        from the stackup copper thickness) with via barrels as annular resistors, then
+        does a sparse DC solve. Sources = regulator/connector output pads (auto-detected
+        from ``power_out`` symbol pins, or pass ``source_refs='U3,J1'``) held at ``vsrc``
+        (default: the rail's ``voltage_v_nom`` metadata, else parsed from names like
+        '+3V3'). Sinks = per-component supply currents from the aicad.boardphys/1 rail
+        metadata (T-FIN8); override/provide with ``sink_overrides='{"U2": 0.35}'`` (amps).
+
+        ``net`` may be one net name, a comma list, or empty = every net with a detected
+        source (GND excluded). Reports per-component voltage drop vs the rail's
+        voltage_v_min tolerance, current-density hotspots vs ``j_limit_a_mm2`` (default
+        30 A/mm²), open PDN paths, and refs with unknown current draw (honest coverage
+        gap — metadata missing is never modelled as 0 A).
+
+        Also exports the per-element I²R dissipation map as the ``pdn`` extension of the
+        aicad.boardphys/1 sidecar (contracts/ecad/boardphys.md) — the trace-heating
+        input for the ECAD→thermal handoff: merged into the existing
+        ``board.step.boardphys.json`` when ecad_to_3d already wrote one, else written to
+        ``pdn.boardphys.json`` in the board's export dir.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="PDN analysis needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        doc = session.doc
+        try:
+            from engine.ecad import pdn as pdn_mod  # lazy import (pulls scipy)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"PDN engine unavailable: {e}",
+                        hint="numpy/scipy are required for the sparse solve.")
+        try:
+            overrides = {str(k): float(v)
+                         for k, v in (json.loads(sink_overrides) if sink_overrides
+                                      else {}).items()}
+        except Exception as e:  # noqa: BLE001
+            return _err(f"sink_overrides must be a JSON object of ref->amps: {e}")
+        srcs = [s.strip() for s in source_refs.split(",") if s.strip()] or None
+
+        nets = [n.strip() for n in net.split(",") if n.strip()]
+        if not nets:
+            nets = sorted({n.get("name") for n in doc.get("nets", [])
+                           if n.get("name") and n.get("name") != "GND"
+                           and pdn_mod._auto_sources(doc, n.get("name"))})
+            if not nets:
+                return _err("no power net with a detectable source (power_out pin) — "
+                            "pass net='+5V' and source_refs='<regulator/connector ref>'.",
+                            next_actions=["ecad_run_pdn(net='+5V', source_refs='J1')"])
+
+        _autosave_all_open_ecad()
+
+        def _solve_all():
+            return [pdn_mod.solve_pdn(
+                doc, n,
+                vsrc=(vsrc if vsrc else None),
+                source_refs=srcs,
+                sink_overrides=overrides,
+                resolution_mm=(resolution_mm if resolution_mm > 0 else None),
+                j_limit_a_mm2=(j_limit_a_mm2 if j_limit_a_mm2 > 0
+                               else pdn_mod.DEFAULT_J_LIMIT_A_MM2),
+            ) for n in nets]
+
+        status, results = _run_with_budget(_solve_all)
+        if status == "timeout":
+            return _budget_timeout_err(
+                "PDN solve",
+                simplify="The copper mesh is large — pass resolution_mm=0.5 (or 1.0) to "
+                         "coarsen, or solve one net at a time (net='+5V').",
+                next_actions=["ecad_run_pdn(net='+5V', resolution_mm=0.5)"])
+        if status == "error":
+            return _err(f"PDN solve failed: {type(results).__name__}: {results}",
+                        hint="Check the net is routed (ecad_status) and re-run.")
+
+        ok_results = [r for r in results if r.get("ok")]
+        failed = [{"net": r.get("net"), "error": r.get("error")}
+                  for r in results if not r.get("ok")]
+
+        # ---- persist the I2R map as the boardphys `pdn` sidecar extension
+        sidecar_path = None
+        sidecar_warnings: list[str] = []
+        if ok_results:
+            out_dir = _default_out_dir(doc.get("name", "board"))
+            existing = os.path.join(str(out_dir), "board.step.boardphys.json")
+            try:
+                if os.path.exists(existing):
+                    with open(existing, encoding="utf-8") as fh:
+                        sidecar = json.load(fh)
+                    pdn_mod.attach_pdn(sidecar, ok_results)
+                    sidecar_path = existing
+                else:
+                    sidecar = pdn_mod.attach_pdn({
+                        "schema": "aicad.boardphys/1",
+                        "generated_by": "engine.ecad.pdn.solve_pdn",
+                        "board": {"name": doc.get("name"), "id": doc.get("id"),
+                                  "thickness_mm": doc.get("stackup", {}).get("thickness")},
+                        "components": [],
+                        "note": "PDN-only sidecar — run ecad_to_3d for the full "
+                                "component power/thermal map.",
+                    }, ok_results)
+                    os.makedirs(str(out_dir), exist_ok=True)
+                    sidecar_path = os.path.join(str(out_dir), "pdn.boardphys.json")
+                with open(sidecar_path, "w", encoding="utf-8") as fh:
+                    json.dump(sidecar, fh, indent=1)
+            except Exception as e:  # noqa: BLE001 — sidecar failure must not void the solve
+                sidecar_warnings.append(f"boardphys pdn sidecar write failed: {e}")
+                sidecar_path = None
+
+        violations = [f"[{r['net']}] {v}" for r in ok_results for v in r["violations"]]
+        unknown = sorted({u for r in ok_results for u in r["unknown_sinks"]})
+        worst = None
+        for r in ok_results:
+            w = r.get("worst_drop")
+            if w and w.get("drop_v") is not None and (
+                    worst is None or w["drop_v"] > worst["drop_v"]):
+                worst = {**w, "net": r["net"]}
+        verdict = (f"{len(violations)} PDN violation(s) across {len(ok_results)} net(s)."
+                   if violations else
+                   f"PDN clean on {len(ok_results)} net(s)."
+                   ) + (f" worst drop {worst['drop_v']*1000:.1f} mV at {worst['ref']} "
+                        f"({worst['net']})." if worst and worst.get("drop_v") else "")
+        summaries = [{k: r[k] for k in ("net", "vsrc", "sources", "resolution_mm",
+                                        "n_nodes", "drops", "worst_drop", "max_j_a_mm2",
+                                        "j_limit_a_mm2", "hotspots", "violations",
+                                        "unknown_sinks", "elapsed_s")}
+                     for r in ok_results]
+        return _dumps({
+            "ok": bool(ok_results), "doc_id": session.doc_id, "revision": session.revision,
+            "verdict": verdict,
+            "nets": summaries,
+            "failed_nets": failed,
+            "violations": violations,
+            "unknown_current_refs": unknown,
+            "boardphys_path": sidecar_path,
+            "warnings": sidecar_warnings + (
+                [f"current draw unknown for {', '.join(unknown)} — drops there assume "
+                 "0 A from them; add rail metadata or sink_overrides"] if unknown else []),
+            "hint": verdict + (f" I2R heat map -> {sidecar_path} (pdn block, for the "
+                               "thermal handoff)." if sidecar_path else ""),
+            "next_actions": (
+                ["Widen the flagged copper / add a pour or stitching vias, then re-run "
+                 "ecad_run_pdn()."] if violations else
+                ["ecad_to_3d()  # export STEP + full boardphys sidecar for thermal"]),
+        })
+
     # ---------------------------------------------------------------- sync sch -> pcb
 
     @mcp.tool()

@@ -98,6 +98,23 @@ def _fake_sync_playwright_factory(html: str = "<html>ok</html>", status: int = 2
     return _factory
 
 
+class _FakeCef:
+    """Stand-in for the CEF daemon client — browser_fetch/download drive CEF now."""
+    def __init__(self, html="<html>ok</html>", status=200, url="https://example.com/"):
+        self._html, self._status, self._url = html, status, url
+        self.fetched, self.downloaded = [], []
+
+    def fetch(self, url, *, settle_ms=1200, profile=""):
+        self.fetched.append(url)
+        return {"ok": True, "status": self._status, "final_url": self._url, "html": self._html}
+
+    def download(self, url, dest, *, profile=""):
+        from pathlib import Path
+        Path(dest).write_bytes(self._html.encode())
+        self.downloaded.append((url, dest))
+        return {"ok": True, "dest": dest}
+
+
 # --- profiles -----------------------------------------------------------------
 
 def test_profile_dir_and_metadata_roundtrip(browser_mods):
@@ -242,9 +259,8 @@ def test_browser_fetch_without_profile_autocreates_one(browser_mods):
     # Anonymous browsing allowed (2026-07-07): a missing profile is created on
     # the fly instead of failing with no_profile.
     profiles, _ratelimit, session = browser_mods
-    fake_factory = _fake_sync_playwright_factory(html="<html>part page</html>", status=200)
     result = session.browser_fetch("https://example.com/part", "grabcad",
-                                   _sync_playwright=fake_factory)
+                                   _cef=_FakeCef(html="<html>part page</html>"))
     assert result["ok"] is True
     assert profiles.has_profile("grabcad") is True
     assert profiles.has_login("grabcad") is False  # a dir is not a login
@@ -255,9 +271,8 @@ def test_browser_fetch_surfaces_bot_wall_status(browser_mods):
     # they used to return ok:True and adapters reported silent empty results).
     profiles, _ratelimit, session = browser_mods
     profiles.profile_dir("grabcad").mkdir(parents=True)
-    fake_factory = _fake_sync_playwright_factory(html="<html>Access Denied</html>", status=403)
     result = session.browser_fetch("https://example.com/part", "grabcad",
-                                   _sync_playwright=fake_factory)
+                                   _cef=_FakeCef(html="<html>Access Denied</html>", status=403))
     assert result["ok"] is False
     assert result["reason"] == "bot_walled"
 
@@ -265,17 +280,17 @@ def test_browser_fetch_surfaces_bot_wall_status(browser_mods):
 def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):
     profiles, ratelimit, session = browser_mods
     profiles.profile_dir("grabcad").mkdir(parents=True)
-    fake_factory = _fake_sync_playwright_factory(html="<html>part page</html>", status=200)
+    cef = _FakeCef(html="<html>part page</html>")
 
     result = session.browser_fetch("https://grabcad.com/part/1", "grabcad",
-                                   _sync_playwright=fake_factory, min_interval=0.0)
+                                   _cef=cef, min_interval=0.0)
 
     assert result["ok"] is True
     assert result["status"] == 200
     assert result["content"] == "<html>part page</html>"
     assert result["session_profile_used"] == "grabcad"
     assert "fetched_ts" in result
-    assert fake_factory.instance.chromium.launched[-1][1] is True  # headless=True
+    assert cef.fetched[-1] == "https://grabcad.com/part/1"
     # Rate-limit hit was recorded even though this call itself didn't need to wait.
     assert ratelimit.seconds_until_ready("grabcad", min_interval=1000.0) > 0.0
 
@@ -284,11 +299,12 @@ def test_browser_fetch_never_raises_on_navigation_error(browser_mods):
     profiles, _ratelimit, session = browser_mods
     profiles.profile_dir("grabcad").mkdir(parents=True)
 
-    def _factory():
-        raise RuntimeError("net::ERR_CONNECTION_RESET")
+    class _Boom:
+        def fetch(self, *a, **k):
+            raise RuntimeError("net::ERR_CONNECTION_RESET")
 
     result = session.browser_fetch("https://grabcad.com/part/1", "grabcad",
-                                   _sync_playwright=_factory, min_interval=0.0)
+                                   _cef=_Boom(), min_interval=0.0)
     assert result["ok"] is False
     assert result["reason"] == "browser_fetch_failed"
 
@@ -296,14 +312,13 @@ def test_browser_fetch_never_raises_on_navigation_error(browser_mods):
 def test_browser_fetch_rate_limits_between_calls(browser_mods, monkeypatch):
     profiles, ratelimit, session = browser_mods
     profiles.profile_dir("grabcad").mkdir(parents=True)
-    fake_factory = _fake_sync_playwright_factory()
 
     calls = []
     monkeypatch.setattr(ratelimit, "wait",
                         lambda site, *, min_interval=ratelimit.DEFAULT_MIN_INTERVAL_S, url=None:
                         calls.append((site, min_interval)))
 
-    session.browser_fetch("https://grabcad.com/a", "grabcad", _sync_playwright=fake_factory,
+    session.browser_fetch("https://grabcad.com/a", "grabcad", _cef=_FakeCef(),
                           min_interval=5.0)
 
     assert calls == [("grabcad", 5.0)]

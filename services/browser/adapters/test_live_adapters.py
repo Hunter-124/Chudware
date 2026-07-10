@@ -50,7 +50,7 @@ def test_live_canary_search(site, monkeypatch):
     if failure is not None:
         reason = failure.get("reason")
         if reason in ("login_required", "no_profile", "terms_confirmation_required",
-                      "captcha_or_2fa_detected", "playwright_not_installed"):
+                      "challenge_page", "playwright_not_installed"):
             pytest.skip(f"{site}: expected degradation '{reason}' — provision a login/session")
         pytest.fail(f"{site}: live search failed: {failure}")
 

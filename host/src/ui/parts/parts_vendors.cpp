@@ -225,10 +225,20 @@ void drawVendorSignInList(AppState& st) {
                 ImVec4(palette.button[0], palette.button[1],
                        palette.button[2], 0.80f));
             const char* lbl = v.loginInProgress ? "..." : (v.loggedIn ? "Re-login" : "Sign in");
-            // Phase C: single-vendor embedded wizard (login_wizard_start {sites:[id]});
-            // headed vendor_login fallback lives inside startLoginWizard.
-            if (!v.loginInProgress && ImGui::SmallButton(lbl))
-                startLoginWizard(st, v.id);
+            // Magento + invisible reCAPTCHA (Anaheim) scores the in-panel OSR CEF
+            // as a bot under software GL — open real desktop Chromium for those.
+            // Everyone else gets the embedded CEF wizard first.
+            const bool preferDesktop =
+                (v.id == "anaheimautomation");
+            if (!v.loginInProgress && ImGui::SmallButton(lbl)) {
+                if (preferDesktop) {
+                    startVendorLogin(st, v);
+                    st.toast(ui::ToastLevel::Info,
+                             "Desktop browser — complete captcha/sign-in, then close the window.");
+                } else {
+                    startLoginWizard(st, v.id);
+                }
+            }
             ImGui::PopStyleColor();
 
             ImGui::PushStyleColor(ImGuiCol_Text,

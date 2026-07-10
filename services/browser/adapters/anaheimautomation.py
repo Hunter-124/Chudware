@@ -21,6 +21,10 @@ from . import download_dir, is_login_wall, login_required, provenance_envelope, 
 
 SITE = "anaheimautomation"
 BASE_URL = "https://www.anaheimautomation.com"
+# Magento customer login — headed browser_login + CEF panel both land here.
+# reCAPTCHA (MSP invisible) scores embedded OSR/SwiftShader CEF as a bot on
+# NVIDIA+Wayland; prefer the desktop-browser Sign-in path for this site.
+LOGIN_URL = BASE_URL + "/customer/account/login/"
 SEARCH_URL_TMPL = BASE_URL + "/catalogsearch/result/?q={query}"
 LICENSE_NOTE = (
     "Anaheim Automation CAD models and datasheets are fetched under the "

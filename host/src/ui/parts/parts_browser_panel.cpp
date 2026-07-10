@@ -460,10 +460,12 @@ void drawBrowserPanel(AppState& st) {
         const char*  chipTxt  = chipLabel(w.web->loginState(), chipRole);
         const bool   showChip = chipTxt && chipTxt[0];
         const float  chipW    = showChip ? ImGui::CalcTextSize(chipTxt).x + 14.0f * sc : 0.0f;
+        const bool showDesktop = !w.currentSite.empty() && !w.actionPending;
         float rightW = showChip ? chipW + 10.0f * sc : 0.0f;
         if (showSkip)    rightW += bsz("Skip") + 4.0f * sc;
         if (showConfirm) rightW += bsz("I'm signed in") + 4.0f * sc;
         if (showRetry)   rightW += bsz("Retry") + 4.0f * sc;
+        if (showDesktop) rightW += bsz("Desktop browser") + 4.0f * sc;
         rightW += bsz("Close") + 4.0f * sc;
 
         // Title.
@@ -555,6 +557,29 @@ void drawBrowserPanel(AppState& st) {
             vcenter(th);
             if (ImGui::SmallButton("Retry"))
                 retryCurrentSite(st);
+            ImGui::SameLine(0.0f, 4.0f * sc);
+        }
+        // Desktop Chromium (real GPU, headed Playwright) — needed when the
+        // in-panel OSR CEF fails vendor bot checks (Anaheim Magento reCAPTCHA
+        // under SwiftShader on NVIDIA+Wayland). Opens a real window; cookies
+        // are exported into the CEF warm profile when the user closes it.
+        if (showDesktop) {
+            vcenter(th);
+            if (ImGui::SmallButton("Desktop browser")) {
+                for (auto& v : S().vendors) {
+                    if (v.id == w.currentSite && !v.loginInProgress) {
+                        startVendorLogin(st, v);
+                        st.toast(ui::ToastLevel::Info,
+                                 "Desktop browser opened for " + vendorLabel(w.currentSite) +
+                                     " — complete any captcha there, then close the window.");
+                        break;
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Open a full desktop Chromium window (real GPU). Use this when the "
+                    "in-panel browser fails a vendor bot check / reCAPTCHA.");
             ImGui::SameLine(0.0f, 4.0f * sc);
         }
         vcenter(th);

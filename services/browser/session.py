@@ -131,9 +131,26 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
         lock.release()
 
 
+def _push_cookies_to_cef_warm(cookies: list) -> None:
+    """Best-effort: inject a headed-login jar into the CEF daemon warm profile so
+    headless ``browser_fetch`` / download reuse the session (same carry path as
+    the in-panel CEF export). Never raises — a cold/unavailable daemon must not
+    fail the user's login."""
+    if not cookies:
+        return
+    try:
+        from . import cef_client
+        cef_client.client().import_session(list(cookies))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callable[[], Any]) -> dict:
     profile_path = profiles.profile_dir(site)
     challenge_detected: str | None = None
+    last_content: str | None = None
+    last_url: str = ""
+    exported_cookies: list = []
     try:
         with sync_playwright() as pw:
             ver = stealth.chromium_version_sync(pw)
@@ -146,13 +163,20 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 stealth.harden_page_sync(context, page, ua, ver)
+                # Land on the vendor sign-in page (was blank about:blank before —
+                # users had to type the URL by hand).
+                try:
+                    from .embed import start_url_for_site
+                    start = start_url_for_site(site)
+                    if start:
+                        page.goto(start, wait_until="domcontentloaded", timeout=60_000)
+                except Exception:  # noqa: BLE001 — blank window is still usable
+                    pass
                 # Poll for the user closing the window. Between polls, if the page shows
                 # a captcha/2FA we surface a clear "do it yourself" message ONCE per kind
                 # and record it — we never click, solve, or bypass it. The user completes
-                # it in this headed window and closes it when signed in.
+                # it in this headed window (real GPU / real Chrome) and closes it when done.
                 announced: set[str] = set()
-                last_content: str | None = None
-                last_url: str = ""
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     try:
@@ -172,6 +196,13 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                         break  # window closed → the user signalled "done"
                     except Exception:  # noqa: BLE001 — poll interval elapsed, still open
                         continue
+                # Snapshot cookies BEFORE context.close() wipes the live jar from
+                # memory (disk profile still has them, but CEF warm needs an explicit
+                # import — Playwright and CEF do not share OSCrypt/cookie stores).
+                try:
+                    exported_cookies = list(context.cookies() or [])
+                except Exception:  # noqa: BLE001
+                    exported_cookies = []
             finally:
                 context.close()
     except Exception as exc:  # noqa: BLE001 — never crash the caller on a browser-launch error
@@ -183,18 +214,33 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
     # logged_in — best-effort; if we couldn't read it, degrade to not-verified.
     now = time.time()
     fields: dict[str, Any] = {"last_login_ts": now}
+    login_verified = False
     try:
-        from .embed import classify_login_state  # lazy: avoid import cycle
+        from .embed import classify_login_state, import_session_cookies  # lazy
         if last_content is not None and \
                 classify_login_state(site, last_content, last_url) == "logged_in":
             fields["login_verified_ts"] = now
-    except Exception:  # noqa: BLE001 — verification is best-effort, never fatal
+            login_verified = True
+        # Stage + push to CEF warm so the headless daemon (browser_fetch) sees the
+        # same session the user just completed in real Chrome — critical for
+        # reCAPTCHA-hard vendors (e.g. Anaheim Magento) where in-panel OSR CEF
+        # fails Google's bot score under software GL.
+        if exported_cookies:
+            try:
+                import_session_cookies(site, exported_cookies, verified=login_verified)
+            except Exception:  # noqa: BLE001
+                pass
+            import threading
+            threading.Thread(target=_push_cookies_to_cef_warm, args=(exported_cookies,),
+                             daemon=True).start()
+    except Exception:  # noqa: BLE001 — verification / carry is best-effort, never fatal
         pass
     meta = profiles.save_meta(site, **fields)
     return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
             "last_login_ts": meta["last_login_ts"],
             "login_verified": bool(meta.get("login_verified_ts")),
-            "challenge_detected": challenge_detected}
+            "challenge_detected": challenge_detected,
+            "cookies_exported": len(exported_cookies)}
 
 
 def browser_fetch(url: str, site: str, *,

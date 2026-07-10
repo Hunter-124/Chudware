@@ -1080,3 +1080,15 @@ stack — restore eager `CefInitialize` before `run_gui` (opt-out
 `AI_CAD_CEF_LAZY=1` only). Join T-PERF3 mesh-loader thread on `run_gui`
 teardown. Performance profiler window shows labeled live FPS (header +
 top-right overlay) while open.
+
+**2026-07-10 — Anaheim reCAPTCHA: desktop browser login + CEF cookie carry.**
+In-panel OSR CEF on NVIDIA+Wayland is forced onto SwiftShader (real GPU
+crashes); Google reCAPTCHA scores that software-GL canvas as a bot, so
+Anaheim Magento login fails even with a full paint + token-attach shim.
+Product path: headed Playwright Chromium (real GPU) for hard sites —
+`browser_login` now navigates to adapter `LOGIN_URL`, exports cookies on
+close, stages them, and pushes into the CEF daemon warm profile so
+`browser_fetch` reuses the session. UI: Anaheim Sign-in defaults to desktop
+browser; wizard bar gains **Desktop browser** for any site. Anaheim adapter
+sets `LOGIN_URL`. Not a captcha bypass — user completes the challenge in real
+Chrome; we only carry the resulting session.

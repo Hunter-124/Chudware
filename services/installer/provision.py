@@ -121,6 +121,22 @@ def reveng_provisioning_status() -> dict:
     return reveng_provision.reveng_status()
 
 
+def ngspice_provisioning_status() -> dict:
+    """Availability of the OPTIONAL ngspice SPICE backend (T-FIN14) — never installs.
+
+    ngspice is subprocess-only: discovered via the ``AI_CAD_NGSPICE`` env var or PATH,
+    never bundled. Its absence is not an error — ecad_simulate/ecad_tf degrade honestly
+    to the internal MNA solver (backend='mna', the default) with a ``backend_note``.
+    Delegates to engine.sim.ngspice_backend.ngspice_status(); never raises.
+    """
+    try:
+        from engine_oracle.sim.ngspice_backend import ngspice_status
+    except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
+        return {"tool": "ngspice", "installed": False,
+                "hint": f"ngspice_backend unavailable: {exc}"}
+    return ngspice_status()
+
+
 def is_ready() -> bool:
     if not STAMP.exists():
         return False
@@ -236,6 +252,7 @@ def main(argv: list[str]) -> int:
                           "exists": _venv_python().exists(),
                           "imports_ok": _imports_ok(_venv_python()),
                           "converters": converters_status(),
+                          "ngspice": ngspice_provisioning_status(),
                           "reveng": reveng_provisioning_status()}, indent=2))
         return 0
 

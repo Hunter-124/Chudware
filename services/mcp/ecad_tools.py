@@ -937,9 +937,21 @@ def register_ecad_tools(mcp) -> None:
 
     @mcp.tool()
     def ecad_simulate(analysis: str = "op", params: Optional[dict] = None,
-                      probes: Optional[list] = None, doc_id: str = "") -> str:
-        """Build the netlist -> SPICE circuit -> run the native simulator, and return the KEY
+                      probes: Optional[list] = None, doc_id: str = "",
+                      backend: str = "mna") -> str:
+        """Build the netlist -> SPICE circuit -> run the simulator, and return the KEY
         results with a plain-English reading.
+
+        ``backend`` picks the solver (T-FIN14):
+          'mna'     -- the validated internal MNA solver (DEFAULT, deterministic)
+          'ngspice' -- an installed ngspice binary as a subprocess; unlocks vendor
+                       .SUBCKT/.MODEL libraries (real op-amps/regulators). If ngspice is
+                       NOT installed this degrades honestly to 'mna' and says so in the
+                       result's ``backend_note`` (install: dnf install ngspice).
+          'auto'    -- mna unless the circuit carries vendor .lib/.subckt attachments
+                       AND ngspice is installed.
+        Advanced analyses (four/mc/temp/noise) always run on the internal MNA solver.
+        The result always carries ``backend`` = the solver that actually ran.
 
         ``analysis`` is one of:
           'op'    -- DC operating point (no params needed)
@@ -999,6 +1011,9 @@ def register_ecad_tools(mcp) -> None:
         # heaviest sim paths (Monte-Carlo runs many solves) — budget-guard so an overrun never times
         # out the transport and kills the server (Gap (b)).
         if an["type"] in ("four", "mc", "temp", "noise"):
+            if (backend or "mna").lower() in ("ngspice", "auto"):
+                warns.append(f"{an['type']} always runs on the internal MNA solver — "
+                             "the ngspice backend covers op/dc/tran/ac/tf only.")
             _autosave_all_open_ecad()
             status, val = _run_with_budget(
                 lambda: _simulate_advanced(session, circuit, an, probe_list, warns))
@@ -1051,7 +1066,7 @@ def register_ecad_tools(mcp) -> None:
 
         study = {"analyses": [an], "probes": probe_list}
         _autosave_all_open_ecad()
-        status, result = _run_with_budget(lambda: sim_run(circuit, study))
+        status, result = _run_with_budget(lambda: sim_run(circuit, study, backend=backend))
         if status == "timeout":
             return _budget_timeout_err(
                 f"{an['type']} simulation",
@@ -1066,8 +1081,11 @@ def register_ecad_tools(mcp) -> None:
         conv = result.get("convergence", {})
         converged = bool(conv.get(an["type"], False))
 
+        if result.get("backend_note"):
+            warns.append(result["backend_note"])
         payload: dict = {
             "ok": True, "doc_id": session.doc_id, "analysis": an["type"],
+            "backend": result.get("backend", "mna"),
             "converged": converged,
             "device_count": len(circuit["devices"]),
             "nodes": nodes, "probes": probe_list,
@@ -2210,8 +2228,12 @@ def register_ecad_tools(mcp) -> None:
     # ---------------------------------------------------------------- .tf transfer function
 
     @mcp.tool()
-    def ecad_tf(output: str, source: str, doc_id: str = "") -> str:
+    def ecad_tf(output: str, source: str, doc_id: str = "", backend: str = "mna") -> str:
         """Run a DC small-signal transfer function (.tf) on the active schematic's circuit.
+
+        ``backend``: 'mna' (default, internal solver) | 'ngspice' (installed ngspice binary,
+        needed for vendor .SUBCKT models) | 'auto'. Absent ngspice degrades honestly to
+        'mna' with a ``backend_note``.
 
         Computes:
           * DC gain  -- output / source (V/V for V-source input, V/A transimpedance for I-source)
@@ -2246,7 +2268,9 @@ def register_ecad_tools(mcp) -> None:
 
         study = {"analyses": [{"type": "tf", "output": output, "source": source}],
                  "probes": [output]}
-        result = sim_run(circuit, study)
+        result = sim_run(circuit, study, backend=backend)
+        if result.get("backend_note"):
+            warns.append(result["backend_note"])
         tf = result.get("tf", {})
         conv = bool(result.get("convergence", {}).get("tf", False))
         gain = tf.get("gain", float("nan"))
@@ -2286,6 +2310,7 @@ def register_ecad_tools(mcp) -> None:
 
         return _dumps({
             "ok": conv, "doc_id": session.doc_id,
+            "backend": result.get("backend", "mna"),
             "output": output, "source": source,
             "gain": _round(gain), "rin": _round(rin), "rout": _round(rout),
             "converged": conv,

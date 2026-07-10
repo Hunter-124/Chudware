@@ -282,6 +282,12 @@ def test_publish_revision_skip_and_burst_coalescing(tmp_path, monkeypatch):
 
     from services.mcp import cad_tools as ct
 
+    # The .step+ publish/throttle/coalesce path this test exercises is LEGACY-only:
+    # in daemon mode (the Phase-8 default) _publish_current() short-circuits to None
+    # because the GUI shares the daemon's docs live and ignores handoff files
+    # (cad_tools._publish_current + docs/HOSTD.md). Pin legacy mode so the throttle
+    # logic under test actually runs regardless of the process-wide engine mode.
+    monkeypatch.setattr(ct.cb, "active_daemon_mode", lambda: False)
     monkeypatch.setattr(ct, "_handoff_dir", lambda: tmp_path)
     did = cb.call("doc_new", {"name": "pub_throttle"})["doc_id"]
     try:

@@ -87,7 +87,8 @@ set_source_files_properties(
 # them. Must sit next to AI-CAD at runtime.
 add_executable(ai_cad_cef_helper
   src/ui/widgets/cef/cef_helper_main.cpp
-  src/ui/widgets/cef/cef_app.cpp)
+  src/ui/widgets/cef/cef_app.cpp
+  src/ui/widgets/cef/cef_stealth.cpp)   # render-process OnContextCreated injects this
 if(WIN32)
   target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
 else()

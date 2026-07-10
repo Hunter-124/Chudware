@@ -14,13 +14,27 @@
 #pragma once
 
 #include "include/cef_browser.h"
+#include "include/cef_registration.h"
 
 namespace ui::cef {
 
 // Apply the UA / Sec-CH-UA client-hints override (adds the "Google Chrome" brand
 // that CEF's native hints omit) and the document-start JS hardening to `browser`.
-// Call from OnAfterCreated. No-op on a null browser. Idempotent-safe to call once
-// per browser. Mirrors services/browser/stealth.py so both browser surfaces agree.
-void apply_stealth(CefRefPtr<CefBrowser> browser);
+// Call from OnAfterCreated, BEFORE navigating to the real URL.
+//
+// Returns a DevTools-observer registration that the CALLER MUST KEEP ALIVE (store
+// it as a member for the browser's lifetime). ExecuteDevToolsMethod is a silent
+// no-op unless a DevTools message observer is attached to the browser — attaching
+// one is what wires the in-process CDP pipe. Dropping the returned registration
+// detaches the agent and the hardening stops taking effect on later navigations.
+// No-op (returns null) on a null browser. Mirrors services/browser/stealth.py.
+CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser);
+
+// The document-start fingerprint-hardening JS (window.chrome, plugins, languages,
+// webdriver, deviceMemory cap, WebGL vendor/renderer spoof). Injected from the
+// render process at V8-context creation (CefRenderProcessHandler::OnContextCreated
+// in cef_app.cpp) so it runs BEFORE any page script with zero CDP — the robust,
+// no-Runtime.enable path. Mirrors services/browser/stealth.INIT_SCRIPT.
+const char* stealth_init_script();
 
 }  // namespace ui::cef

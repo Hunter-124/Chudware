@@ -14,8 +14,11 @@ fingerprint (UA header says Chrome but ``navigator.webdriver`` is true, or
 ``Sec-CH-UA`` still says ``HeadlessChrome``) reads to a bot-scorer as *active
 evasion* — worse than a plain automated browser. So every value we present is
 derived from the REAL bundled Chromium at its REAL version, with only the
-"Headless" label stripped; the OS stays honest (Linux), and we never invent a
-GPU/plugin set that would disagree with the rest of the client state.
+"Headless" label stripped; the OS stays honest (Linux). The one deliberate
+exception is the WebGL vendor/renderer (see INIT_SCRIPT): CEF's
+``--use-angle=swiftshader`` crash-workaround leaks a "SwiftShader" software-GL
+renderer that is itself a strong bot tell, so we mask it with a plausible
+desktop-Linux Intel/Mesa GPU consistent with the Linux UA.
 
 Applied identically to both browser surfaces so they share one fingerprint:
   * page fetches — :mod:`.session` (browser_fetch / browser_login / browser_download)
@@ -79,11 +82,28 @@ INIT_SCRIPT = r"""
   patch(() => {
     if (navigator.webdriver) Object.defineProperty(navigator, 'webdriver', { get: () => false });
   });
-  // NB: we deliberately do NOT spoof WebGL vendor/renderer. A getParameter
-  // override is itself detectable (its .toString() no longer reads "[native
-  // code]"), and claiming an Intel GPU while the canvas actually rasterises via
-  // SwiftShader is a canvas-readback inconsistency that scores WORSE than the
-  // honest software-GL string. Consistency over mimicry (see module header).
+  // WebGL vendor/renderer spoof — masks the software-GL (SwiftShader/ANGLE) tell
+  // that CEF's --use-angle=swiftshader crash-workaround leaks (a top bot-scan
+  // flag on bot.sannysoft). Reports a plausible desktop-Linux Intel/Mesa GPU
+  // consistent with the Linux UA, with a native-reading toString so the hook
+  // isn't itself a tell. Kept in lockstep with cef_stealth.cpp's apply_stealth().
+  patch(() => {
+    const VENDOR = 37445, RENDERER = 37446;  // UNMASKED_VENDOR/RENDERER_WEBGL
+    const spoof = {
+      [VENDOR]: 'Google Inc. (Intel)',
+      [RENDERER]: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), '
+                + 'OpenGL 4.6 (Core Profile) Mesa 23.2.1)',
+    };
+    const hook = (proto) => {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      const patched = function (p) { return (p in spoof) ? spoof[p] : orig.call(this, p); };
+      try { patched.toString = orig.toString.bind(orig); } catch (e) { /* keep going */ }
+      proto.getParameter = patched;
+    };
+    hook(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    hook(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  });
 })();
 """
 

@@ -152,8 +152,9 @@ public:
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
         // Same fingerprint hardening the headless-fetch path applies, so --cef-shot
-        // reflects the real wire fingerprint (see cef_stealth.h).
-        apply_stealth(browser);
+        // reflects the real wire fingerprint (see cef_stealth.h). Keep the returned
+        // registration alive — it holds the DevTools agent that makes it take effect.
+        stealth_reg_ = apply_stealth(browser);
     }
 
     // CefLoadHandler
@@ -166,6 +167,7 @@ private:
     bool load_end_ = false;
     std::vector<unsigned char> bgra_;
     CefRefPtr<CefBrowser> browser_;
+    CefRefPtr<CefRegistration> stealth_reg_;  // keeps the DevTools agent attached
     IMPLEMENT_REFCOUNTING(ShotClient);
 };
 

@@ -69,6 +69,8 @@ class FetchClient : public CefClient,
                     public CefLifeSpanHandler,
                     public CefLoadHandler {
 public:
+    explicit FetchClient(std::string url) : url_(std::move(url)) {}
+
     CefRefPtr<CefRenderHandler>   GetRenderHandler() override   { return this; }
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler>     GetLoadHandler() override     { return this; }
@@ -82,21 +84,31 @@ public:
     void OnPaint(CefRefPtr<CefBrowser>, PaintElementType, const RectList&,
                  const void*, int, int) override {}
 
-    // CefLifeSpanHandler
+    // CefLifeSpanHandler. The browser is created at about:blank so the
+    // document-start stealth script is registered BEFORE the real navigation —
+    // otherwise CreateBrowser(url) races the addScriptToEvaluateOnNewDocument
+    // registration and the target's first document runs unhardened (its WebGL/etc.
+    // would leak the real values).
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
-        apply_stealth(browser);  // UA/hints + document-start hardening, no CDP tell
+        stealth_reg_ = apply_stealth(browser);  // UA/hints + JS hardening, no CDP tell
+        if (CefRefPtr<CefFrame> f = browser->GetMainFrame()) f->LoadURL(url_);
     }
 
-    // CefLoadHandler
+    // CefLoadHandler — only the real navigation counts, not the about:blank seed.
     void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int http) override {
-        if (frame->IsMain()) { status_ = http; load_end_ = true; }
+        if (frame->IsMain() && frame->GetURL().ToString().rfind("about:", 0) != 0) {
+            status_ = http;
+            load_end_ = true;
+        }
     }
 
 private:
+    std::string url_;
     bool load_end_ = false;
     int  status_ = 0;
     CefRefPtr<CefBrowser> browser_;
+    CefRefPtr<CefRegistration> stealth_reg_;  // keeps the DevTools agent attached
     IMPLEMENT_REFCOUNTING(FetchClient);
 };
 
@@ -131,13 +143,15 @@ FetchResult headless_fetch(const std::string& url, int settle_ms,
     FetchResult out;
     if (!initialized()) return out;
 
-    CefRefPtr<FetchClient> client = new FetchClient();
+    CefRefPtr<FetchClient> client = new FetchClient(url);
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);
     CefBrowserSettings settings;
     settings.windowless_frame_rate = 30;
 
-    if (!CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr,
+    // Seed at about:blank; the client navigates to `url` from OnAfterCreated once
+    // the stealth document-start script is registered (see FetchClient).
+    if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings, nullptr,
                                        make_context(profile_dir)))
         return out;
 

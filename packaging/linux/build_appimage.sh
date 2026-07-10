@@ -120,10 +120,8 @@ if [ "$WITH_LIBAICAD" = "1" ]; then
         cp "$LIBAICAD" "$APPDIR/usr/lib/libaicad.so"
         # Sibling runtime .so deps that live next to the occt engine (Netgen mesher,
         # lib3mf export) — libaicad.so resolves them via its RUNPATH/LD_LIBRARY_PATH,
-        # so they must ride along or FEA meshing breaks on a clean machine.
-        # NOTE: system OCCT (libTK*.so 7.9) + curl/X11 etc. are NOT bundled — the
-        # AppImage still requires an OCCT 7.9 runtime on the host (documented in
-        # docs/HOSTD.md; full linuxdeploy-style bundling is a follow-up).
+        # so they must ride along or FEA meshing breaks on a clean machine. (The full
+        # OCCT 7.9 closure is bundled by the excludelist walk just below.)
         LIBDIR="$(dirname "$LIBAICAD")"
         for sib in libnglib.so libngcore.so lib3mf.so; do
             if [ -f "$LIBDIR/$sib" ]; then
@@ -131,6 +129,51 @@ if [ "$WITH_LIBAICAD" = "1" ]; then
             fi
         done
         echo "==> bundled libaicad.so + siblings from $LIBDIR (real engine, not demo mode)"
+
+        # OCCT 7.9 + engine runtime closure. The engine links 34 libTK*.so.7.9 plus
+        # TBB and a networking tail; none of it is bundled by default, so the AppImage
+        # cannot open a document on a machine without OCCT 7.9 installed (verified: the
+        # libTK* deps resolve to /lib64 on the build host but are "not found" in a clean
+        # fedora:rawhide container). ldd emits the FULL flattened transitive closure, so
+        # seeding with libaicad.so (+ the mesh/export siblings and aicad-hostd, which
+        # dlopens the engine) captures OCCT and everything OCCT itself pulls. We copy
+        # every resolved dep whose basename is NOT on the AppImage excludelist — glibc,
+        # libstdc++/libgcc_s, the GL/X11 graphics-driver stack, and freetype/fontconfig/
+        # harfbuzz stay host-provided (they interoperate with the host's fonts/drivers).
+        # AppRun prepends usr/lib to LD_LIBRARY_PATH, so presence is enough — no rpath
+        # patching. PORTABILITY: keeping glibc/libstdc++ host-provided means an AppImage
+        # built here (glibc 2.43) still needs host glibc >= 2.43; build on an older base
+        # for broad distro coverage — a separate axis from OCCT bundling.
+        EXCLUDELIST="$REPO/build/tools/excludelist"
+        if [ ! -f "$EXCLUDELIST" ]; then
+            echo "==> fetching AppImage excludelist (cached at build/tools/excludelist)"
+            curl -sL -o "$EXCLUDELIST" \
+                "https://raw.githubusercontent.com/AppImage/pkg2appimage/master/excludelist" \
+                || echo "WARNING: excludelist fetch failed — dep bundling may pull host-reserved libs" >&2
+        fi
+        mapfile -t EXCL < <(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$EXCLUDELIST" 2>/dev/null | awk '{print $1}')
+        is_excluded() {  # 0 if $1 starts with any excludelist basename (case globs = literal, +/. safe)
+            local base="$1" e
+            for e in "${EXCL[@]}"; do case "$base" in "$e"*) return 0 ;; esac; done
+            return 1
+        }
+        SEEDS=("$LIBAICAD")
+        for s in "$APPDIR/usr/lib/libnglib.so" "$APPDIR/usr/lib/libngcore.so" \
+                 "$APPDIR/usr/lib/lib3mf.so" "$APPDIR/usr/bin/aicad-hostd"; do
+            [ -e "$s" ] && SEEDS+=("$s")
+        done
+        echo "==> bundling engine runtime closure (OCCT 7.9 + deps) into usr/lib"
+        while read -r dep; do
+            [ -f "$dep" ] || continue
+            base="$(basename "$dep")"
+            is_excluded "$base" && continue
+            [ -e "$APPDIR/usr/lib/$base" ] && continue
+            cp -L "$dep" "$APPDIR/usr/lib/$base"
+        done < <(ldd "${SEEDS[@]}" 2>/dev/null | awk '/=> \//{print $3}' | sort -u)
+        ntk=$(find "$APPDIR/usr/lib" -name 'libTK*.so.*' | wc -l)
+        nlib=$(find "$APPDIR/usr/lib" -maxdepth 1 -name '*.so*' | wc -l)
+        echo "==> usr/lib now has $nlib shared objects ($ntk OCCT libTK*)"
+        [ "$ntk" -ge 30 ] || echo "WARNING: only $ntk OCCT libs bundled (expected ~34) — engine may not load on a clean machine" >&2
     else
         echo "WARNING: no libaicad.so found in core/build-occt-linux or core/build-linux — shipping demo mode (use --no-libaicad to silence)" >&2
     fi

@@ -140,8 +140,14 @@ outliving its binaries:
   lib3mf sibling .so files) from `core/build-occt-linux` by default
   (`--no-libaicad` to opt out; slim `core/build-linux` is a loud-warning
   fallback). AppRun exports `AICAD_HOSTD_BIN` + `AICAD_INSTANCE_KEY` as above.
-  Caveat: system OCCT 7.9 (libTK*.so) is NOT bundled yet — the target machine
-  needs an OCCT runtime; full linuxdeploy-style bundling is a follow-up.
+  The full OCCT 7.9 closure (34 `libTK*.so.7.9` + TBB + the engine's non-system
+  dep tail) is bundled into `usr/lib` via an ldd walk filtered by the AppImage
+  excludelist, so the target machine needs **no** OCCT install (verified: the
+  engine `ctypes.CDLL`-loads in a clean `fedora:rawhide` container with no OCCT).
+  Caveat: glibc/libstdc++ stay host-provided (excludelist), so an AppImage built
+  on glibc 2.43 requires host glibc ≥ 2.43 — build on an older base for wider
+  distro coverage. freetype/fontconfig/libX11 are likewise host-provided (they
+  interoperate with the host's fonts/X server; present on any GUI machine).
 - **Windows** (`services/installer/` + `packaging/windows/AI-CAD.iss`):
   `build_release.py` stages `aicad-hostd.exe` (+ `.pdb`) into the payload;
   `install.ps1`/`uninstall.ps1` first run `<InstallDir>\aicad-hostd.exe --stop`

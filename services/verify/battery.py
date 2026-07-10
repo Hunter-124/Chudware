@@ -88,6 +88,9 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "eval_check":                ("gap",  "eval_check_direct",         "subsecond", "any",   "binary"),
     # T-BL50: layout-first critical-dim & interface coverage gate
     "layout_coverage":           ("gap",  "layout_coverage",           "subsecond", "any",   "scalar"),
+    # T-FIN23: system power/energy budget (rail tree + duty cycle + battery verdict).
+    # Runs only when a power_source kwarg is supplied; otherwise passes with a skip note.
+    "power_budget":              ("gap",  "power_budget",              "subsecond", "any",   "findings"),
 }
 
 # ---------------------------------------------------------------------------
@@ -517,6 +520,38 @@ def _gap_layout_coverage(doc_id: str = None, **_) -> str:
         return json.dumps({"ok": False, "error": str(e)})
 
 
+def _gap_power_budget(doc_id: str = None, power_source: dict = None,
+                      power_converters: list = None, board_path: str = None,
+                      power_profile_path: str = None, power_board: dict = None,
+                      power_profile: dict = None, power_scenario: str = "",
+                      **_) -> str:
+    """T-FIN23 system power/energy budget as a verify check.
+
+    Delegates to mcp_server.power_budget.solve_power_budget: rail tree
+    (source → converters → boardphys loads), duty-cycle weighting from an
+    aicad.powerprofile/1 artifact, PDN cross-check, battery-life verdict.
+    Without a power_source kwarg the check passes with a skip note (the battery's
+    default all-subsecond sweep must stay green on non-electronic parts).
+    Findings shape: overloads are severity="fail", other warnings severity="warn".
+    """
+    if not power_source:
+        return json.dumps({"ok": True, "findings": [],
+                           "note": "no power_source specified — power budget skipped"})
+    try:
+        from mcp_server.power_budget import solve_power_budget, _load_json
+        board = power_board
+        if board is None and board_path:
+            board = _load_json(board_path, "boardphys sidecar")
+        profile = power_profile
+        if profile is None and power_profile_path:
+            profile = _load_json(power_profile_path, "power profile")
+        return json.dumps(solve_power_budget(
+            power_source, converters=power_converters, board=board,
+            power_profile=profile, scenario=power_scenario))
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)})
+
+
 GAP_FNS: dict[str, Any] = {
     "interface_check":   _gap_interface_check,
     "is_manifold":       _gap_is_manifold,
@@ -527,6 +562,7 @@ GAP_FNS: dict[str, Any] = {
     "req_join":          _gap_req_join,
     "eval_check_direct": _gap_eval_check_direct,
     "layout_coverage":   _gap_layout_coverage,  # T-BL50
+    "power_budget":      _gap_power_budget,     # T-FIN23
 }
 
 

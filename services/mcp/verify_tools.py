@@ -24,6 +24,12 @@ def register_verify_tools(mcp: FastMCP) -> None:
         round_trip_threshold: float = 99.0,
         # dim_coverage: the source PART doc backing a drawing doc
         source_doc_id: Optional[str] = None,
+        # power_budget (T-FIN23): system energy budget kwargs
+        power_source: dict = None,
+        power_converters: list = None,
+        board_path: str = "",
+        power_profile_path: str = "",
+        power_scenario: str = "",
     ) -> str:
         """Run a subset of deterministic quality checks on the current part.
 
@@ -31,6 +37,16 @@ def register_verify_tools(mcp: FastMCP) -> None:
         checks: list of check names (see check_metadata for available checks + cost/platform).
                Empty or omitted → run all subsecond/any-platform checks.
         doc_id: target document (default = current part).
+
+        power_budget check (T-FIN23, system energy budget): pass power_source
+        ({kind:"battery"|"supply", name, voltage_v, capacity_mah, i_max_a}),
+        power_converters (rail tree: [{name, input, output, voltage_out_v,
+        topology:"ldo|buck|boost", efficiency: eta|[[load_frac,eta]], i_out_max_a}]),
+        board_path (aicad.boardphys/1 sidecar from ecad_to_3d — loads + PDN + sequencing)
+        and power_profile_path (aicad.powerprofile/1 from fw_sim_run/fw_power_profile —
+        duty-cycle weighting; omit → degraded datasheet-typ mode, labelled).
+        Verdict includes battery life for the scenario, per-rail load vs converter
+        rating, worst-rail margin, PDN cross-check, sequencing sanity note.
 
         score per check: 0.0 (fail) .. 1.0 (pass). findings: list of failing details.
         Use check_metadata() for the full check registry with cost/platform annotations.
@@ -54,6 +70,16 @@ def register_verify_tools(mcp: FastMCP) -> None:
                 kwargs["threshold"] = round_trip_threshold
             if source_doc_id:
                 kwargs["source_doc_id"] = source_doc_id
+            if power_source:
+                kwargs["power_source"] = power_source
+            if power_converters:
+                kwargs["power_converters"] = power_converters
+            if board_path:
+                kwargs["board_path"] = board_path
+            if power_profile_path:
+                kwargs["power_profile_path"] = power_profile_path
+            if power_scenario:
+                kwargs["power_scenario"] = power_scenario
             result = verify(doc_id=doc_id, checks=checks or [], **kwargs)
             return json.dumps(result)
         except Exception as e:  # noqa: BLE001

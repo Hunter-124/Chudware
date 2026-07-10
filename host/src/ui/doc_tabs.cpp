@@ -155,7 +155,12 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
                           r);
     }
 
-    ui::glassPanel(dl, tabRect, level, 4.0f /*dp — glassPanel scales by uiScale*/, surf);
+    // Only the ACTIVE tab (or a hovered / AI-pulsing one) paints its own glass-pill background.
+    // Inactive middle tabs stay transparent against the shared band so no stray rounded background
+    // bar shows behind them — the effect belongs to the active tab + the "+N" overflow caps, not to
+    // every file title (Hunter P4: a background was displaying where it isn't supposed to be).
+    if (active || hovered || t.aiPulse)
+        ui::glassPanel(dl, tabRect, level, 4.0f /*dp — glassPanel scales by uiScale*/, surf);
     if (active) {
         // polish(G3): bold bounding-box outline replaces the thin top-edge line indicator —
         // matches the SolidWorks-refined active-state language (filled pill + visible border).

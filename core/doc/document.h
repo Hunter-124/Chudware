@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,11 @@ struct FeatureStatus {
     bool ok = false;
     std::string error;    // empty when ok
     std::string warning;  // non-fatal note on an ok feature (e.g. fillet rounded a subset of edges)
+    double ms = 0.0;      // wall-clock this feature took to compile (rebuild profiling; 0 if untimed)
+    // True when this feature's result was REUSED from the incremental-rebuild prefix cache
+    // instead of recompiled (see CompileCache below). `ms` then reports the ORIGINAL compile
+    // cost from the run that produced it, not this run's (near-zero) restore cost.
+    bool reused = false;
 };
 
 // Per-surviving-body geometry stats (in AICM body order). Additive surfacing gate
@@ -128,7 +134,48 @@ struct CompileResult {
     // ("Default" for a config-less doc). Surfaced in the ops-response doc_status so
     // the host's config switcher knows which config the geometry matches.
     std::string active_configuration = "Default";
+    // Incremental-rebuild accounting (CompileCache): how many features were served from a
+    // cached prefix checkpoint vs actually executed this compile. reused+executed may be
+    // less than statuses.size() only never — they always sum to the feature count. 0/N on
+    // a cache-less compile. Surfaced in ops_response.rebuild.doc_status for tests/profiling.
+    int features_reused = 0;
+    int features_executed = 0;
+    // Phase timing (ms): the feature loop (incl. restored-prefix bookkeeping), the
+    // post-loop tessellation/AICM build, and the owner-map topology diff. On a
+    // prefix-reuse edit the loop shrinks toward zero and these expose what remains —
+    // the profiler's "where does an incremental edit actually spend time" answer.
+    double loop_ms = 0.0;
+    double tess_ms = 0.0;
+    double owner_ms = 0.0;
+    // Tessellation phase broken down: BRepMesh meshing vs AicmBody extraction
+    // (tess_ms − mesh − extract ≈ write_aicm serialization). Pinpoints whether an
+    // incremental edit's tessellation cost is real re-meshing or re-extraction of
+    // unchanged faces. From geom::tess_timing_read().
+    double tess_mesh_ms = 0.0;
+    double tess_extract_ms = 0.0;
+    double tess_write_ms = 0.0;  // write_aicm serialization of all bodies
 };
+
+// Incremental-rebuild prefix cache (opaque; defined in document.cpp — it snapshots the
+// compiler's internal per-feature state, whose types are private to that TU). One cache
+// belongs to ONE document session and must only be used under that session's lock (the
+// engine serialises all doc access through g_mtx today, so this holds by construction).
+//
+// How it works: every compile hashes a CHAIN over its inputs — h0 = fnv(env, active
+// config), h[i+1] = fnv(h[i], feature[i].json) — and checkpoints the loop-carried
+// compiler state after each executed feature. The next compile walks the new chain
+// against the cached one, restores the DEEPEST matching checkpoint, and executes only
+// the divergent suffix: editing feature k of N recompiles k..N, not 1..N. A fully
+// matching chain (plus unchanged appearances) returns the cached CompileResult outright.
+// Content-addressed, so undo/redo/config switches/failed-compile rollbacks can never be
+// served stale state — a mismatch is just a cache miss. Checkpoint shapes are refcounted
+// TopoDS handles shared with the live result, so memory cost is the intermediate
+// (consumed) bodies of one compile, not N copies of the model.
+struct CompileCache;
+std::shared_ptr<CompileCache> make_compile_cache();
+// Global compile-cache counters for the profiler: {full_hits, features_reused,
+// features_executed, compiles} since engine start (process-wide, all docs).
+nlohmann::json compile_cache_stats();
 
 // Compile a document into geometry. `doc` = {"features":[ ... ]}. `env` maps
 // equation variable names to numbers (for expression-valued params / dims).
@@ -137,7 +184,14 @@ struct CompileResult {
 // continues with the bodies produced so far (compiler.py contract). Call it twice
 // with the SAME `doc` and DIFFERENT `env` to re-run the tree into new geometry —
 // that is the parametric-rebuild payoff.
-CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env);
+//
+// `cache` (optional): the session's incremental-rebuild cache. When supplied, an
+// unchanged feature PREFIX is restored from its checkpoint instead of recompiled
+// (see CompileCache above); geometry is bit-identical to a full rebuild because the
+// checkpoint holds the actual shapes the previous compile produced. nullptr = the
+// previous always-full-rebuild behavior, byte-for-byte.
+CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env,
+                               CompileCache* cache = nullptr);
 
 // Per-body appearance (C26 colour + C32-A RealView material) for AICM body ordinal `body_num`
 // (1-based). Reads doc["appearances"]["b<body_num>"] — a bare [r,g,b] (colour only) or

@@ -73,9 +73,10 @@ bool CppCore::ensureLoaded(std::string& err) {
 
     void* h = nullptr;
     std::string loadDiag;
+    std::string winner;
     for (const std::string& path : candidates) {
         h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (h) break;
+        if (h) { winner = path; break; }
         const char* de = dlerror();
         loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
     }
@@ -102,6 +103,11 @@ bool CppCore::ensureLoaded(std::string& err) {
     }
     dll_ = h;
     abi_ = abi_fn_();
+    path_ = winner;
+    // Optional export (older engines predate it): the configure-time git-describe
+    // build id, surfaced by hostd as engine_build_id for staleness checks.
+    if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_build_id")))
+        build_id_ = bid();
     loaded_ = true;
     return true;
 #else
@@ -116,6 +122,7 @@ bool CppCore::ensureLoaded(std::string& err) {
 
     HMODULE h = nullptr;
     std::string loadDiag;
+    std::wstring winnerW;
     for (const std::wstring& path : candidates) {
         // Resolve the DLL's directory and add it to the PROCESS search path. This is the
         // crucial bit: LOAD_WITH_ALTERED_SEARCH_PATH adds that directory only for
@@ -128,7 +135,7 @@ bool CppCore::ensureLoaded(std::string& err) {
         size_t slash = path.find_last_of(L"\\/");
         if (slash != std::wstring::npos) SetDllDirectoryW(path.substr(0, slash).c_str());
         h = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (h) break;
+        if (h) { winnerW = path; break; }
         DWORD gle = GetLastError();
         // narrow the wide path for the diagnostic
         std::string p(path.begin(), path.end());
@@ -160,6 +167,18 @@ bool CppCore::ensureLoaded(std::string& err) {
     }
     dll_ = h;
     abi_ = abi_fn_();
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, winnerW.c_str(), (int)winnerW.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        std::string p(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, winnerW.c_str(), (int)winnerW.size(), p.data(), n,
+                            nullptr, nullptr);
+        path_ = p;
+    }
+    // Optional export (older engines predate it) — see the POSIX branch.
+    if (auto bid = reinterpret_cast<const char* (*)(void)>(
+            GetProcAddress(h, "aicad_build_id")))
+        build_id_ = bid();
     loaded_ = true;
     return true;
 #endif

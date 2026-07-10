@@ -1,7 +1,7 @@
-# work/ — git-tracked task coordination
+# work/ — git-tracked task board
 
-Lightweight, file-based task tracking so 4 people + AI agents can work in parallel
-without overlapping. Everything is markdown in git — no external tracker.
+Lightweight, file-based personal task tracking (solo dev). Everything is markdown
+in git — no external tracker.
 
 ## Layout
 
@@ -19,20 +19,18 @@ work/
 
 ## How to work
 
-1. **Find a task:** `python3 work/tools/work.py ready --owner <you>` lists todo tasks
-   whose dependencies are all done.
-2. **Claim it:** edit the task file — set `owner:` to your name and `status: doing` —
-   in a tiny commit pushed straight to `master`. Claims never go through branches, so
-   two people can't silently grab the same task.
-3. **Branch:** create the branch named in the task's `branch:` field
-   (`task/<id>-<slug>`), from fresh `master`.
+1. **Find a task:** `python3 work/tools/work.py ready` lists todo tasks whose
+   dependencies are all done.
+2. **Start it:** set `status: doing` in the task file.
+3. **Branch (optional):** create the branch named in the task's `branch:` field
+   (`task/<id>-<slug>`) if you want the work isolated; fine to work on `master`
+   directly for small stuff.
 4. **Do the work:** paste the task file into your AI agent as the work order. Stay
    inside the task's "Files / areas touched" list; log discovered work as a new task
    file instead of scope-creeping.
 5. **Done means done:** every checkbox in "Definition of done" checks, `bash
    scripts/gate.sh` passes, `graphify update .` run.
-6. **Merge:** PR to `master`, set `status: done` in the task file within the same
-   merge. Branches live days, not weeks.
+6. **Merge:** set `status: done` in the task file within the same commit/merge.
 
 After any status change, regenerate the graph: `python3 work/tools/work.py dag`
 and commit `work/DAG.md`.
@@ -44,12 +42,8 @@ python3 work/tools/work.py validate   # schema + dependency-cycle check (CI-able
 python3 work/tools/work.py ready      # what can start now
 python3 work/tools/work.py board      # full status board by workstream
 python3 work/tools/work.py dag        # regenerate work/DAG.md
-python3 work/tools/work.py claim --owner NAME [--task ID]  # atomically claim next ready task
-python3 work/tools/work.py prompt ID  # emit a self-contained agent work order
+python3 work/tools/work.py prompt ID   # emit a self-contained agent work order
 ```
-
-For running fleets of local agents against this system (autopilot mode, model
-tiering, escalation), see [prompts/README.md](prompts/README.md).
 
 ## Adding a task
 

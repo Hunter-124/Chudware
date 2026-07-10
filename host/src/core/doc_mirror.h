@@ -102,6 +102,14 @@ public:
     // open/new. Additive + tolerant: stays empty if the engine omits the field.
     const nlohmann::json& lastOpenedDrawings() const { return lastOpenedDrawings_; }
 
+    // Mesh path + body volume from the most recent doc_open's own tess block. When non-empty,
+    // the open caller can load this mesh directly instead of issuing a redundant forced
+    // doc_rebuild — on an embedded-cache open that rebuild is a FULL recompile, i.e. the
+    // double-build that made every AI-handoff refresh pay for the part twice. Reset per open;
+    // empty when the engine response had no tess block (caller falls back to doc_rebuild).
+    const std::string& lastOpenedAicm() const { return lastOpenedAicm_; }
+    double lastOpenedVolume() const { return lastOpenedVolume_; }
+
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
     // engine not (yet) sending "owner_map": the map is simply empty and the lookups return nothing.
@@ -316,6 +324,8 @@ private:
     nlohmann::json featureStatus_;
     nlohmann::json refDatums_ = nlohmann::json::array();           // datum reference geometry to draw
     nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
+    std::string    lastOpenedAicm_;                                // doc_open tess.aicm_path
+    double         lastOpenedVolume_ = 1.0;                        // doc_open "volume" (flat-2D probe)
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
 

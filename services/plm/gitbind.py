@@ -42,6 +42,11 @@ from dulwich.repo import Repo
 
 VAULT_DIRNAME = ".aicadvault"
 
+
+class ConcurrentUpdate(Exception):
+    """HEAD moved under a concurrent writer between our snapshot read and the CAS commit.
+    Retryable: the caller should rebuild its shadow tree from fresh HEAD and commit again."""
+
 # git binary is an OPTIONAL accelerator; feature-detected once.
 _GIT_ON_PATH: bool | None = None
 
@@ -186,11 +191,19 @@ class GitBinding:
         commit.message = (f"{body}\n\n{trailer}").encode("utf-8")
 
         obj_store.add_object(commit)
-        self._repo.refs.set_if_equals(
+        # Compare-and-swap HEAD. If a concurrent session moved HEAD between our head_commit() read
+        # (line above) and now, set_if_equals returns False and our commit is orphaned — NOT on
+        # HEAD. The old code discarded this boolean and returned an unreachable commit id, silently
+        # losing the writer's change (and dropping the other writer's item edits, since our tree was
+        # built from a stale snapshot). Surface it so the caller can rebuild against fresh HEAD.
+        swapped = self._repo.refs.set_if_equals(
             b"HEAD",
             parent.encode("ascii") if parent else None,
             commit.id,
         )
+        if not swapped:
+            raise ConcurrentUpdate(
+                "HEAD moved under a concurrent write; rebuild the shadow tree and retry")
         return commit.id.decode("ascii")
 
     # -- maintenance -------------------------------------------------------

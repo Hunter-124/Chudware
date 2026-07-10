@@ -3708,7 +3708,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
                 return true;
             };
-            static const char* kPlaneName[3] = {"Front Plane", "Top Plane", "Right Plane"};
+            static const char* kPlaneName[3] = {"X/Z", "X/Y", "Y/Z"};
             // W4-K: chip border tracks the datum-plane outline color (light-blue, SolidWorks look)
             // so the labels read as part of the unified overlay family instead of per-axis RGB.
             const ImU32 planeChipBord = ui::Palette::toU32(vpal.planeOutline);

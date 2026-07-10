@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 # Allow `python mcp_server/test_cad_tools.py` (script dir, not repo root, lands on path).
@@ -48,6 +49,32 @@ def _call(name: str, args: dict):
         except json.JSONDecodeError:
             parsed = None
     return parsed, content
+
+
+def _solve(name: str, args: dict, timeout_s: float = 300.0):
+    """Call a heavy solve tool and honor its async contract.
+
+    A solve (run_fea_*/run_cfd_*) runs on a worker thread and AUTO-HANDS-OFF to the
+    background if it overruns AI_CAD_MCP_SYNC_BUDGET_S (default 45s) — a small plate
+    FEA sits right on that edge, so the reply is non-deterministically either the
+    inline result or {status:"running", auto_backgrounded:True, job_id}. When it's
+    backgrounded we poll get_job() until it completes and return the solve `result`,
+    exactly as the tool docstring instructs the agent to. Returns the final solve dict.
+    """
+    r, _ = _call(name, args)
+    if not (isinstance(r, dict) and r.get("auto_backgrounded") and r.get("job_id")):
+        return r  # finished inline within the sync budget
+    jid = r["job_id"]
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        j, _ = _call("get_job", {"job_id": jid})
+        status = j.get("status") if isinstance(j, dict) else None
+        if status == "done":
+            return j.get("result")
+        if status == "error":
+            return {"ok": False, "error": j.get("error", "solve failed")}
+        time.sleep(0.5)
+    raise AssertionError(f"solve {name} did not finish within {timeout_s:.0f}s (job {jid})")
 
 
 def _new_plate_with_hole() -> str:
@@ -100,7 +127,17 @@ def _dim(cid, ctype, refs, value):
             "driven": False}
 
 
-def _rect_sketch(fid, w, h, with_dims=True):
+def _rect_sketch(name, w, h, with_dims=True):
+    """A fully/under-constrained rectangle as a CANONICAL add_feature op.
+
+    Entities + constraints live under `params`; the sketch plane is a `refs.plane`
+    datum ("plane.top"). This is the shape core/doc/validate.cpp enforces for a
+    sketch feature — the old flat shape ({id,type,plane,entities,constraints} at
+    top level) is rejected by validation before it can land (normalize_feature
+    accepts it, but validate runs first). The engine assigns the feature id (f1,
+    f2, …) and keeps `name` as the caller's label, so callers reference the sketch
+    by the id returned from add_features, not by `name` (see _add_rect_sketch).
+    """
     cons = [
         _rel("c1", "coincident", ["e1.p2", "e2.p1"]),
         _rel("c2", "coincident", ["e2.p2", "e3.p1"]),
@@ -117,21 +154,27 @@ def _rect_sketch(fid, w, h, with_dims=True):
             _dim("c10", "distance", ["e1.p1", "e1.p2"], w),
             _dim("c11", "distance", ["e2.p1", "e2.p2"], h),
         ]
-    return {"op": "add_feature", "feature": {
-        "id": fid, "type": "sketch", "plane": "top",
-        "entities": [
-            _line("e1", 0, 0, w, 0), _line("e2", w, 0, w, h),
-            _line("e3", w, h, 0, h), _line("e4", 0, h, 0, 0),
-        ],
-        "constraints": cons,
-    }}
+    entities = [
+        _line("e1", 0, 0, w, 0), _line("e2", w, 0, w, h),
+        _line("e3", w, h, 0, h), _line("e4", 0, h, 0, 0),
+    ]
+    return cb.feat("sketch", name, {"entities": entities, "constraints": cons},
+                   {"plane": "plane.top"})
+
+
+def _add_rect_sketch(doc, w, h, with_dims=True, name="s1"):
+    """Add a rectangle sketch and return the engine-assigned feature id (e.g. "f1")."""
+    r, _ = _call("add_features",
+                 {"ops": [_rect_sketch(name, w, h, with_dims=with_dims)], "doc_id": doc})
+    assert r["ok"], r
+    return r["features"][0]["id"]
 
 
 def test_check_sketch_fully_defined():
     r, _ = _call("new_part", {"name": "sk"})
     doc = r["doc_id"]
-    _call("add_features", {"ops": [_rect_sketch("s1", 40, 24, with_dims=True)], "doc_id": doc})
-    r, _ = _call("check_sketch", {"sketch": "s1", "doc_id": doc})
+    sid = _add_rect_sketch(doc, 40, 24, with_dims=True)
+    r, _ = _call("check_sketch", {"sketch": sid, "doc_id": doc})
     assert r["ok"], r
     assert r["status"] == "full" and r["dof"] == 0, r
     assert r["fully_defined"] is True, r
@@ -142,8 +185,8 @@ def test_check_sketch_fully_defined():
 def test_check_sketch_under_defined():
     r, _ = _call("new_part", {"name": "sk2"})
     doc = r["doc_id"]
-    _call("add_features", {"ops": [_rect_sketch("s1", 40, 24, with_dims=False)], "doc_id": doc})
-    r, _ = _call("check_sketch", {"sketch": "s1", "doc_id": doc})
+    sid = _add_rect_sketch(doc, 40, 24, with_dims=False)
+    r, _ = _call("check_sketch", {"sketch": sid, "doc_id": doc})
     assert r["ok"], r
     assert r["status"] == "under" and r["dof"] >= 1, r
     assert r["fully_defined"] is False, r
@@ -277,7 +320,7 @@ def test_set_material_unknown_name_errors():
 
 def test_fea_static_cantilever():
     doc = _new_plate_with_hole()
-    r, _ = _call("run_fea_static", {
+    r = _solve("run_fea_static", {
         "fixtures": [{"of": "face", "side": "left"}],
         "loads": [{"face": {"of": "face", "side": "right"}, "force": [0, 0, -200]}],
         "material": "aluminum",
@@ -291,7 +334,7 @@ def test_fea_static_cantilever():
 
 def test_cfd_flow_box():
     doc = _new_plate_with_hole()
-    r, _ = _call("run_cfd_flow", {"velocity": 20.0, "doc_id": doc})
+    r = _solve("run_cfd_flow", {"velocity": 20.0, "doc_id": doc})
     assert r["ok"], r
     assert r["drag_n"] is not None
     assert r["reynolds"] > 0
@@ -557,8 +600,8 @@ def test_cfd_diagnostics_and_v2_scaling():
     doc = r["doc_id"]
     _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("sphere", "S", {"radius": cb.dim(50)})]})
-    r1, _ = _call("run_cfd_flow", {"doc_id": doc, "velocity": 10.0, "cells": 64, "n_steps": 1200})
-    r2, _ = _call("run_cfd_flow", {"doc_id": doc, "velocity": 20.0, "cells": 64, "n_steps": 1200})
+    r1 = _solve("run_cfd_flow", {"doc_id": doc, "velocity": 10.0, "cells": 64, "n_steps": 1200})
+    r2 = _solve("run_cfd_flow", {"doc_id": doc, "velocity": 20.0, "cells": 64, "n_steps": 1200})
     for rr in (r1, r2):
         assert rr["ok"] and "voxel_mm" in rr and "converged" in rr and "residual" in rr, rr
         assert "ref_length_mm" in rr
@@ -628,8 +671,8 @@ def test_fea_static_material_scaling_f4():
         "fixtures": [{"of": "face", "side": "left"}],
         "loads": [{"face": {"of": "face", "side": "right"}, "force": [0, 0, -300]}],
     }
-    rs, _ = _call("run_fea_static", {**common, "material": "steel"})
-    ra, _ = _call("run_fea_static", {**common, "material": "aluminum"})
+    rs = _solve("run_fea_static", {**common, "material": "steel"})
+    ra = _solve("run_fea_static", {**common, "material": "aluminum"})
     assert rs["ok"], f"steel solve failed: {rs}"
     assert ra["ok"], f"aluminum solve failed: {ra}"
 
@@ -681,8 +724,8 @@ def test_fea_modal_free_free_f6():
 
     # Free-free: no fixture faces.  Before the F6 fix this returned {"ok":False,
     # "error":"no fixture faces resolved"} without ever calling the C++ solver.
-    rf, _ = _call("run_fea_modal", {"doc_id": doc, "fixtures": [], "n_modes": 12,
-                                    "material": "steel"})
+    rf = _solve("run_fea_modal", {"doc_id": doc, "fixtures": [], "n_modes": 12,
+                                  "material": "steel"})
     assert rf["ok"], (
         f"F6 regression: free-free modal returned an error — the Python guard is still "
         f"blocking unconstrained solves.  Error: {rf.get('error', rf)}"

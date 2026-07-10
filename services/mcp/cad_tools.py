@@ -467,7 +467,15 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
     Each open doc is saved to its OWN live-<key>.step+, and the control files list every open
     doc — so when an AI agent (built-in or an MCP-driven cowork swarm) opens several parts, the
     desktop app keeps a tab open for each instead of overwriting a single live view.
+
+    Daemon mode (the default since the Phase-8 flip): the GUI shares the daemon's
+    docs live and IGNORES handoff files, so writing them would only burn a full
+    doc serialization per op batch and leave a stale second source of truth —
+    skip entirely. The legacy path (explicit AI_CAD_ENGINE_DAEMON=0, or daemon
+    transport fallback) keeps publishing; the whole publisher is deleted in N+1.
     """
+    if cb.active_daemon_mode():
+        return None
     try:
         import threading as _t
 
@@ -753,8 +761,8 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     """
     import threading as _t
 
-    if os.environ.get("AI_CAD_ENGINE_DAEMON") == "1":
-        # Daemon mode: aicad-hostd runs THE one autosave scheduler (core/hostd/
+    if cb._daemon_mode():
+        # Daemon mode (the default): aicad-hostd runs THE one autosave scheduler (core/hostd/
         # autosave.cpp). Arming a per-process Timer chain here would recreate the
         # exact thread-leak class the shared daemon exists to kill.
         return
@@ -869,7 +877,7 @@ def recover_autosaved(scope: str = "recent") -> list:
     scope="recent" (default): only the SINGLE most-recent prior session's docs — the
     crash we're recovering from — never the whole history. scope="all": every autosave.
     Prunes stale autosaves first. Called at server startup and by recover_parts."""
-    if os.environ.get("AI_CAD_ENGINE_DAEMON") == "1":
+    if cb._daemon_mode():
         return _recover_via_daemon()
     _prune_autosaves()
     out: list = []

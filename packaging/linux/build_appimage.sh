@@ -102,7 +102,7 @@ if [ -n "$HOSTD" ]; then
     cp "$HOSTD" "$APPDIR/usr/bin/aicad-hostd"
     echo "==> staged aicad-hostd ($HOSTD)"
 else
-    echo "WARNING: aicad-hostd not built (core/build-occt-linux or core/build-linux) — AppImage ships WITHOUT the engine daemon; AI_CAD_ENGINE_DAEMON=1 will fall back to in-process" >&2
+    echo "WARNING: aicad-hostd not built (core/build-occt-linux or core/build-linux) — AppImage ships WITHOUT the engine daemon; daemon mode (the default) will fall back to in-process" >&2
 fi
 
 if [ "$WITH_LIBAICAD" = "1" ]; then

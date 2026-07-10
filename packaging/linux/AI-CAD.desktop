@@ -6,6 +6,9 @@ Exec=AI-CAD %F
 Icon=AI-CAD
 Categories=Graphics;Engineering;
 Terminal=false
+# Must match the window class set via glfwWindowHintString(GLFW_X11_CLASS_NAME/…) in
+# host/src/app.cpp so the shell binds the live window to this entry (taskbar icon).
+StartupWMClass=AI-CAD
 X-BinaryName=AI-CAD
 # NOTE: binary is built from host/ — cmake -S host -B host/build-linux + ninja AI-CAD.
 # In the AppImage this is staged to usr/bin/AI-CAD and launched via AppRun.

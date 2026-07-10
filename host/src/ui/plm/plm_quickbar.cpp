@@ -35,6 +35,13 @@ std::string baseName(const std::string& p) {
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
+// Null-safe string field: old vaults emit null for part_number/rev/working_rev
+// (items predating those fields) and json::value() throws on the type mismatch.
+std::string jstr(const nlohmann::json& j, const char* key) {
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+
 nlohmann::json pathParam(AppState& st) {
     nlohmann::json p; p["path"] = st.plmProjectPath(); return p;
 }
@@ -61,16 +68,15 @@ void resolve(AppState& st) {
         auto items = r.result.find("items");
         if (items == r.result.end() || !items->is_array()) return;
         for (const auto& it : *items) {
-            std::string p = it.value("path", "");
-            if (baseName(p) != docBase) continue;
+            if (!it.is_object()) continue;
+            if (baseName(jstr(it, "path")) != docBase) continue;
             q.haveItem  = true;
-            q.itemId    = it.value("item_id", "");
-            q.partNumber= it.value("part_number", "");
-            q.rev       = it.is_object() && it.contains("rev") && it["rev"].is_string()
-                        ? it["rev"].get<std::string>() : "";
-            q.workingRev= it.value("working_rev", "");
-            q.lifecycle = it.value("lifecycle", "");
-            q.dirty     = it.value("dirty", false);
+            q.itemId    = jstr(it, "item_id");
+            q.partNumber= jstr(it, "part_number");
+            q.rev       = jstr(it, "rev");
+            q.workingRev= jstr(it, "working_rev");
+            q.lifecycle = jstr(it, "lifecycle");
+            q.dirty     = it.contains("dirty") && it["dirty"].is_boolean() && it["dirty"].get<bool>();
             break;
         }
     });

@@ -1403,6 +1403,15 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     // C54: Move/Copy entities (engine op sketch_move) — reuses the mirror/pattern selection stage.
     if (cmdId == "sk_move")            { resetTool(); tool_ = SketchTool::Move;
                                          mpStage_ = 0; mpSel_.clear(); moveCopy_ = false;   return true; }
+    // Gizmo-driven bulk transforms (engine ops sketch_move / sketch_rotate); shared select stage.
+    if (cmdId == "sk_move_entities")   { resetTool(); tool_ = SketchTool::MoveEntities;
+                                         mpStage_ = 0; mpSel_.clear(); gizmoOriginInit_ = false;
+                                         gzDragging_ = false; gzDragAxis_ = -1;
+                                         moveDx_ = moveDy_ = 0.0f;                          return true; }
+    if (cmdId == "sk_rotate_entities") { resetTool(); tool_ = SketchTool::RotateEntities;
+                                         mpStage_ = 0; mpSel_.clear(); gizmoOriginInit_ = false;
+                                         gzDragging_ = false; gzDragAxis_ = -1;
+                                         rotCurAng_ = 0.0f; rotDidType_ = false;            return true; }
     // C54: Tangent Arc — draws an arc starting tangent to a prior/selected entity's free endpoint.
     if (cmdId == "sk_arc_tangent")     { resetTool(); tool_ = SketchTool::ArcTangent;      return true; }
     // C42: remaining draw tools.
@@ -1517,6 +1526,8 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::CircPattern:     return "sk_circ_pattern";
         case SketchTool::Convert:         return "sk_convert_ent";
         case SketchTool::Move:            return "sk_move";
+        case SketchTool::MoveEntities:    return "sk_move_entities";
+        case SketchTool::RotateEntities:  return "sk_rotate_entities";
         case SketchTool::ArcTangent:      return "sk_arc_tangent";
         case SketchTool::Arc3pt:          return "sk_arc_3pt";
         case SketchTool::Polygon:         return "sk_polygon";
@@ -1982,6 +1993,97 @@ void SketchMode::applyMoveOp(AppState& st, float dx, float dy, bool copy) {
     }
     mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another move
 }
+
+// (u,v) centroid of the bounding box of the current mpSel_ selection. False if empty.
+bool SketchMode::computeSelCentroid(ImVec2& out) const {
+    bool any = false;
+    float lo0 = 0, lo1 = 0, hi0 = 0, hi1 = 0;
+    auto acc = [&](float u, float v) {
+        if (!any) { lo0 = hi0 = u; lo1 = hi1 = v; any = true; }
+        else { lo0 = std::min(lo0, u); hi0 = std::max(hi0, u);
+               lo1 = std::min(lo1, v); hi1 = std::max(hi1, v); }
+    };
+    for (const auto& id : mpSel_) {
+        const SketchEntity* e = entById(id);
+        if (!e) continue;
+        if (e->type == "line") { acc(e->p1[0], e->p1[1]); acc(e->p2[0], e->p2[1]); }
+        else { acc(e->center[0] - e->radius, e->center[1] - e->radius);
+               acc(e->center[0] + e->radius, e->center[1] + e->radius); }
+    }
+    if (!any) return false;
+    out = ImVec2(0.5f * (lo0 + hi0), 0.5f * (lo1 + hi1));
+    return true;
+}
+
+// Apply sketch_rotate (in-place or copy) for the current selection about (cx,cy) by angleDeg.
+// Snapshots horizontal/vertical relations wholly inside the selection before/after so the user
+// is told what the engine swapped (90/270) or dropped (non-axis angles).
+void SketchMode::applyRotateOp(AppState& st, float cx, float cy, float angleDeg, bool copy) {
+    // Snapshot pre-op H/V relations wholly within the selection (id -> type).
+    std::set<std::string> sel(mpSel_.begin(), mpSel_.end());
+    auto wholly_in = [&](const SketchConstraint& c) {
+        if (c.refs.empty()) return false;
+        for (const auto& r : c.refs) {
+            std::string eid = r; auto dot = eid.find('.');
+            if (dot != std::string::npos) eid = eid.substr(0, dot);
+            if (!sel.count(eid)) return false;
+        }
+        return true;
+    };
+    std::map<std::string, std::string> preHV;
+    for (const auto& c : cons_)
+        if ((c.type == "horizontal" || c.type == "vertical") && wholly_in(c)) preHV[c.id] = c.type;
+
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_rotate"}, {"sketch", fid_}, {"entities", eids},
+                         {"cx", cx}, {"cy", cy}, {"angle", angleDeg}, {"copy", copy}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Rotate failed") : r.error_message;
+        st.addLog("[sketch] rotate failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+        mpStage_ = 0; mpSel_.clear();
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);   // refreshes cons_ from the solved sketch
+
+    // Diff: which pre-op H/V relations are gone (dropped) vs. flipped type (swapped)?
+    int dropped = 0, swapped = 0;
+    for (const auto& [id, ptype] : preHV) {
+        const SketchConstraint* now = nullptr;
+        for (const auto& c : cons_) if (c.id == id) { now = &c; break; }
+        if (!now) ++dropped;
+        else if (now->type != ptype) ++swapped;
+    }
+    if (dropped || swapped) {
+        std::string m = "Rotated selection";
+        if (swapped) m += " — swapped " + std::to_string(swapped) + " H/V relation" +
+                          (swapped == 1 ? "" : "s");
+        // Non-axis rotation retires the H/V locks; the engine re-imposes parallel/perpendicular
+        // so the shape stays rigid (it may become free to spin). Report that, not a bare "dropped".
+        if (dropped) m += (swapped ? "," : " —") + std::string(" converted ") +
+                          std::to_string(dropped) + " H/V lock" + (dropped == 1 ? "" : "s") +
+                          " to parallel/perpendicular (shape kept rigid)";
+        st.toast(ui::ToastLevel::Info, m);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another rotate
+}
+
+// Viewport HUD state accessor (read by viewport_panel to draw the offset/angle + check/X panel).
+SketchMode::TransformHud SketchMode::transformHudState() const {
+    TransformHud h;
+    if (tool_ == SketchTool::MoveEntities && mpStage_ >= 1 && !mpSel_.empty()) {
+        h.kind = 1; h.dx = moveDx_; h.dy = moveDy_;
+    } else if (tool_ == SketchTool::RotateEntities && mpStage_ >= 1 && !mpSel_.empty()) {
+        h.kind = 2; h.angle = rotCurAng_;
+    }
+    return h;
+}
+
+void SketchMode::commitTransform(AppState& /*st*/) { hudFinish_ = true; }
+void SketchMode::cancelTransform() { hudCancel_ = true; }
 
 // C54: resolve the tangent-arc source — the line/circle/arc nearest the cursor, the endpoint of it
 // nearest the cursor (the arc start), and the unit tangent direction there (pointing into the arc).
@@ -4396,7 +4498,7 @@ static bool hitTestOriginPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin,
     Vec3 ro, rd;
     if (!screenRay(cam, imgMin, vw, vh, mouse, ro, rd)) return false;
     static const char* kSel[3]  = {"plane.front", "plane.top", "plane.right"};
-    static const char* kName[3] = {"Front Plane", "Top Plane", "Right Plane"};
+    static const char* kName[3] = {"X/Z", "X/Y", "Y/Z"};
     bool found = false;
     for (int p = 0; p < 3; ++p) {
         if (!st.showPlane[p]) continue;   // only a visible plane is clickable in the graphics area
@@ -6134,7 +6236,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                      tool_ == SketchTool::Offset ||
                      tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer ||
                      tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
-                     tool_ == SketchTool::CircPattern || tool_ == SketchTool::Move);
+                     tool_ == SketchTool::CircPattern || tool_ == SketchTool::Move ||
+                     tool_ == SketchTool::MoveEntities || tool_ == SketchTool::RotateEntities);
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
@@ -6185,7 +6288,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     return false;
                 }
                 nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
-                    {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})}};
+                    {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})},
+                    {"keep_construction", trimKeepConstruction_}};
                 auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
                 if (!r.ok) { st.addLog("[sketch] trim failed: " + r.error_message); return false; }
                 if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -6207,6 +6311,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) trimSweeping_ = false;
+            // 'C' toggles keep-as-construction: the trimmed-away span survives as construction
+            // geometry (still constrained to its neighbours) rather than being deleted.
+            if (ImGui::IsKeyPressed(ImGuiKey_C)) trimKeepConstruction_ = !trimKeepConstruction_;
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();
         }
 
@@ -6556,6 +6663,241 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 escHandled = true;
                 if (mpStage_ > 0) mpStage_ = mpStage_ - 1;   // back out from to-pick -> from-pick -> select
                 else cancelTool();
+            }
+        }
+        // ----- Gizmo MOVE / ROTATE ENTITIES: stage 0 selects (like Move); stage 1 shows an -----
+        // ----- in-plane manipulator at the (draggable) selection centroid. Move = two axis -----
+        // ----- arrows + a free center square; Rotate = a bent-arrow ring. Relation snapping -----
+        // ----- on the moved anchors; a viewport HUD (check/X + live offset/angle) finishes.  -----
+        else if (tool_ == SketchTool::MoveEntities || tool_ == SketchTool::RotateEntities) {
+            const bool isRot = (tool_ == SketchTool::RotateEntities);
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            const ImU32 gc = col(pal.sketchUnder, 0.85f);
+            const ImU32 uCol = IM_COL32(228, 86, 86, 255);    // u / first in-plane axis (red)
+            const ImU32 vCol = IM_COL32(96, 200, 112, 255);   // v / second in-plane axis (green)
+            const float uis = ui::uiScale;
+            auto inSel = [&](const std::string& id) {
+                return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();
+            };
+            // Draw an entity through a (u,v)->(u,v) transform, in colour c, thickness th.
+            auto strokeXf = [&](const SketchEntity& e, ImU32 c, float th,
+                                const std::function<ImVec2(float, float)>& tf) {
+                if (e.type == "line") {
+                    dl->AddLine(tf(e.p1[0], e.p1[1]), tf(e.p2[0], e.p2[1]), c, th);
+                } else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = tf(e.center[0] + e.radius * std::cos(a),
+                                      e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, c, th); prev = p;
+                    }
+                }
+            };
+            auto identityTf = [&](float u, float v) { return uvToScreen(u, v); };
+            for (const auto& e : ents_) if (inSel(e.id)) strokeXf(e, ac, 3.5f * uis, identityTf);
+
+            if (mpStage_ == 0) {
+                int hov2 = hovered;
+                if (hov2 >= 0 && !inSel(ents_[hov2].id)) strokeXf(ents_[hov2], hc, 3.0f, identityTf);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hov2 >= 0) {
+                    const SketchEntity& e = ents_[hov2];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.toast(ui::ToastLevel::Info,
+                                 std::string(isRot ? "Rotate" : "Move") +
+                                 " works on lines, circles, and arcs — not " + e.type);
+                    } else {
+                        auto it = std::find(mpSel_.begin(), mpSel_.end(), e.id);
+                        if (it != mpSel_.end()) mpSel_.erase(it); else mpSel_.push_back(e.id);
+                    }
+                }
+                bool advance = (!mpSel_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter));
+                if (advance) {
+                    computeSelCentroid(gizmoOrigin_); gizmoOriginInit_ = true;
+                    moveDx_ = moveDy_ = 0.0f; rotCurAng_ = 0.0f;
+                    gzDragging_ = false; gzDragAxis_ = -1;
+                    mpStage_ = 1;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { escHandled = true; cancelTool(); }
+            } else {   // mpStage_ == 1 : manipulate
+                if (!gizmoOriginInit_) { computeSelCentroid(gizmoOrigin_); gizmoOriginInit_ = true; }
+                const ImVec2 oScr = uvToScreen(gizmoOrigin_.x, gizmoOrigin_.y);
+                // Screen-space unit directions of the two in-plane sketch axes.
+                float uLen = std::hypot(uAxisS_.x, uAxisS_.y), vLen = std::hypot(vAxisS_.x, vAxisS_.y);
+                ImVec2 uDir = uLen > 1e-6f ? ImVec2(uAxisS_.x / uLen, uAxisS_.y / uLen) : ImVec2(1, 0);
+                ImVec2 vDir = vLen > 1e-6f ? ImVec2(vAxisS_.x / vLen, vAxisS_.y / vLen) : ImVec2(0, 1);
+                const float armLen = 72.0f * uis, headLen = 13.0f * uis, headW = 6.0f * uis;
+                const float grabPx = 8.0f * uis, ringR = 58.0f * uis;
+                // distance from point p to segment [a,b]
+                auto distSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) {
+                    float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
+                    float L2 = vx * vx + vy * vy; float t = L2 > 1e-6f ? (wx * vx + wy * vy) / L2 : 0.0f;
+                    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+                    float cx = a.x + t * vx - p.x, cy = a.y + t * vy - p.y;
+                    return std::hypot(cx, cy);
+                };
+                // Anchor-based relation snapping: nudge a (du,dv) so a moved selection point lands
+                // exactly on a nearby snap target (endpoint/center/midpoint/rim/origin).
+                auto snapDelta = [&](float& du, float& dv) {
+                    float best = 1e30f, cu = 0, cv = 0; bool found = false;
+                    auto tryPt = [&](float au, float av) {
+                        float su = au + du, sv = av + dv; std::string h; snapPoint(su, sv, h);
+                        if (!h.empty()) {
+                            float corr = std::hypot(su - (au + du), sv - (av + dv));
+                            if (corr < best) { best = corr; cu = su - (au + du); cv = sv - (av + dv); found = true; }
+                        }
+                    };
+                    for (const auto& e : ents_) {
+                        if (!inSel(e.id)) continue;
+                        if (e.type == "line") {
+                            tryPt(e.p1[0], e.p1[1]); tryPt(e.p2[0], e.p2[1]);
+                            tryPt((e.p1[0] + e.p2[0]) * 0.5f, (e.p1[1] + e.p2[1]) * 0.5f);
+                        } else { tryPt(e.center[0], e.center[1]); }
+                    }
+                    if (found) { du += cu; dv += cv; }
+                };
+
+                // ---- pick up / release a handle ----
+                bool lmbDown = imgHovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+                if (!gzDragging_ && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    int axis = -1;
+                    float dCenter = std::hypot(io.MousePos.x - oScr.x, io.MousePos.y - oScr.y);
+                    if (!isRot) {
+                        ImVec2 uEnd(oScr.x + uDir.x * armLen, oScr.y + uDir.y * armLen);
+                        ImVec2 vEnd(oScr.x + vDir.x * armLen, oScr.y + vDir.y * armLen);
+                        if (dCenter < 11.0f * uis) axis = 2;                 // center square: free move
+                        else if (distSeg(io.MousePos, oScr, uEnd) < grabPx) axis = 0;
+                        else if (distSeg(io.MousePos, oScr, vEnd) < grabPx) axis = 1;
+                    } else {
+                        if (dCenter < 12.0f * uis) axis = 2;                 // center dot: move rot axis
+                        else if (std::fabs(dCenter - ringR) < grabPx + 2.0f * uis) axis = 3;  // ring: rotate
+                    }
+                    if (axis >= 0) {
+                        gzDragging_ = true; gzDragAxis_ = axis;
+                        gzDragStartUV_ = ImVec2(mu, mv);
+                        gzOriginAtDragStart_ = ImVec2(moveDx_, moveDy_);   // base offset snapshot
+                        if (isRot && axis == 3)
+                            rotStartAng_ = std::atan2(io.MousePos.y - oScr.y, io.MousePos.x - oScr.x);
+                        if (isRot && axis == 3) gzOriginAtDragStart_ = ImVec2(rotCurAng_, 0);
+                    }
+                }
+                if (gzDragging_ && !lmbDown) { gzDragging_ = false; gzDragAxis_ = -1; }
+
+                // ---- live drag update ----
+                if (gzDragging_) {
+                    if (!isRot) {
+                        float du = mu - gzDragStartUV_.x, dv = mv - gzDragStartUV_.y;
+                        if (gzDragAxis_ == 0) dv = 0.0f;              // constrain to u
+                        else if (gzDragAxis_ == 1) du = 0.0f;        // constrain to v
+                        du += gzOriginAtDragStart_.x; dv += gzOriginAtDragStart_.y;
+                        snapDelta(du, dv);
+                        if (gzDragAxis_ == 0) dv = 0.0f;             // re-lock after snap
+                        else if (gzDragAxis_ == 1) du = 0.0f;
+                        moveDx_ = du; moveDy_ = dv;
+                    } else if (gzDragAxis_ == 3) {
+                        float ang = std::atan2(io.MousePos.y - oScr.y, io.MousePos.x - oScr.x);
+                        float d = (ang - rotStartAng_) * 180.0f / 3.14159265f;
+                        float a = gzOriginAtDragStart_.x + d;
+                        // angle snapping: strong pull to 90s, softer to 15s (unless typing overrides)
+                        auto nearMul = [&](float step, float tol) {
+                            float m = std::round(a / step) * step;
+                            return std::fabs(a - m) < tol ? m : a;
+                        };
+                        if (!io.KeyShift) { float s90 = nearMul(90.0f, 6.0f);
+                            a = (s90 != a) ? s90 : nearMul(15.0f, 2.5f); }
+                        rotCurAng_ = a; rotDidType_ = false;
+                    } else if (gzDragAxis_ == 2) {
+                        // reposition the rotation axis / move origin (snaps to vertices/centers)
+                        float su = mu, sv = mv; std::string h; snapPoint(su, sv, h);
+                        gizmoOrigin_ = ImVec2(su, sv);
+                    }
+                }
+
+                // ---- ghost preview of the pending transform ----
+                std::function<ImVec2(float, float)> tf;
+                if (!isRot) {
+                    float dxu = moveDx_, dyu = moveDy_;
+                    tf = [&, dxu, dyu](float u, float v) { return uvToScreen(u + dxu, v + dyu); };
+                } else {
+                    float a = rotCurAng_ * 3.14159265f / 180.0f, ca = std::cos(a), sa = std::sin(a);
+                    ImVec2 o = gizmoOrigin_;
+                    tf = [&, ca, sa, o](float u, float v) {
+                        float x = u - o.x, y = v - o.y;
+                        return uvToScreen(o.x + x * ca - y * sa, o.y + x * sa + y * ca);
+                    };
+                }
+                for (const auto& e : ents_) if (inSel(e.id)) strokeXf(e, gc, 2.0f, tf);
+
+                // ---- draw the manipulator ----
+                if (!isRot) {
+                    auto arrow = [&](ImVec2 dir, ImU32 c, int hot) {
+                        ImVec2 tip(oScr.x + dir.x * armLen, oScr.y + dir.y * armLen);
+                        float th = (hot ? 3.2f : 2.2f) * uis;
+                        dl->AddLine(oScr, tip, c, th);
+                        ImVec2 n(-dir.y, dir.x);
+                        ImVec2 base(tip.x - dir.x * headLen, tip.y - dir.y * headLen);
+                        dl->AddTriangleFilled(tip, ImVec2(base.x + n.x * headW, base.y + n.y * headW),
+                                              ImVec2(base.x - n.x * headW, base.y - n.y * headW), c);
+                    };
+                    int hotAxis = gzDragging_ ? gzDragAxis_ : -1;
+                    arrow(uDir, uCol, hotAxis == 0); arrow(vDir, vCol, hotAxis == 1);
+                    float hs = 5.0f * uis;
+                    dl->AddRectFilled(ImVec2(oScr.x - hs, oScr.y - hs), ImVec2(oScr.x + hs, oScr.y + hs),
+                                      hotAxis == 2 ? ac : col(pal.accent, 0.6f));
+                } else {
+                    // rotation ring with two arrowheads (bent arrows) + a live radial angle line
+                    int seg = 72; ImVec2 prev; ImU32 rc = (gzDragging_ && gzDragAxis_ == 3) ? ac : uCol;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = (i / (float)seg) * 6.2831853f;
+                        ImVec2 p(oScr.x + ringR * std::cos(a), oScr.y + ringR * std::sin(a));
+                        if (i) dl->AddLine(prev, p, rc, 2.2f * uis); prev = p;
+                    }
+                    // two little tangential arrowheads at 45 and 225 deg to read as "rotate"
+                    for (float base : {0.7853982f, 3.9269908f}) {
+                        ImVec2 p(oScr.x + ringR * std::cos(base), oScr.y + ringR * std::sin(base));
+                        ImVec2 tan(-std::sin(base), std::cos(base));   // ccw tangent
+                        ImVec2 nrm(std::cos(base), std::sin(base));
+                        ImVec2 tip(p.x + tan.x * 10.0f * uis, p.y + tan.y * 10.0f * uis);
+                        dl->AddTriangleFilled(
+                            tip, ImVec2(p.x + nrm.x * 5.0f * uis, p.y + nrm.y * 5.0f * uis),
+                            ImVec2(p.x - nrm.x * 5.0f * uis, p.y - nrm.y * 5.0f * uis), rc);
+                    }
+                    float la = rotCurAng_ * 3.14159265f / 180.0f;
+                    dl->AddLine(oScr, ImVec2(oScr.x + ringR * std::cos(la), oScr.y + ringR * std::sin(la)),
+                                col(pal.accent, 0.9f), 1.6f * uis);
+                    float ds = 6.0f * uis;
+                    dl->AddCircleFilled(oScr, ds, (gzDragging_ && gzDragAxis_ == 2) ? ac
+                                                 : col(pal.accent, 0.6f));
+                }
+
+                // ---- finish / cancel (HUD buttons, Enter, Esc) ----
+                bool finish = hudFinish_ || ImGui::IsKeyPressed(ImGuiKey_Enter);
+                bool cancel = hudCancel_ || ImGui::IsKeyPressed(ImGuiKey_Escape);
+                hudFinish_ = false; hudCancel_ = false;
+                if (cancel) {
+                    escHandled = true;
+                    mpStage_ = 0; gzDragging_ = false; gzDragAxis_ = -1;
+                    moveDx_ = moveDy_ = 0.0f; rotCurAng_ = 0.0f;   // stay in tool, back to select
+                } else if (finish) {
+                    if (!isRot) {
+                        if (std::fabs(moveDx_) > 1e-6f || std::fabs(moveDy_) > 1e-6f)
+                            applyMoveOp(st, moveDx_, moveDy_, io.KeyCtrl);
+                        else { mpStage_ = 0; mpSel_.clear(); }
+                    } else {
+                        if (std::fabs(rotCurAng_) > 1e-4f)
+                            applyRotateOp(st, gizmoOrigin_.x, gizmoOrigin_.y, rotCurAng_, io.KeyCtrl);
+                        else { mpStage_ = 0; mpSel_.clear(); }
+                    }
+                    gizmoOriginInit_ = false; gzDragging_ = false; gzDragAxis_ = -1;
+                    moveDx_ = moveDy_ = 0.0f; rotCurAng_ = 0.0f;
+                }
             }
         }
     }
@@ -8011,6 +8353,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::CircPattern ? "Circular Pattern" :
                          tool_ == SketchTool::Convert ? "Convert Entities" :
                          tool_ == SketchTool::Move ? "Move Entities" :
+                         tool_ == SketchTool::MoveEntities ? "Move Entities" :
+                         tool_ == SketchTool::RotateEntities ? "Rotate Entities" :
                          tool_ == SketchTool::ArcTangent ? "Tangent Arc" :
                          tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
                          tool_ == SketchTool::Polygon ? "Polygon" :
@@ -8104,6 +8448,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = mpStage_ == 0 ? "click entities to move, then Enter"
                      : mpStage_ == 1 ? "click the from point (anchor)"
                                      : "click the to point \xC2\xB7 hold Ctrl to copy"; break;
+            case SketchTool::MoveEntities:
+                step = mpStage_ == 0 ? "click entities to move, then Enter"
+                                     : "drag the arrows (or center) \xC2\xB7 \xE2\x9C\x93 / Enter to finish \xC2\xB7 Ctrl copies"; break;
+            case SketchTool::RotateEntities:
+                step = mpStage_ == 0 ? "click entities to rotate, then Enter"
+                                     : "drag the ring or type an angle \xC2\xB7 \xE2\x9C\x93 / Enter to finish"; break;
             case SketchTool::ArcTangent:
                 step = "click the arc end (it starts tangent to the prior/selected entity)"; break;
             case SketchTool::Arc3pt:
@@ -8146,6 +8496,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                           polyStarPoints_, polyStarRatio_);
             hint += sb;
         }
+        if (tool_ == SketchTool::Trim)   // C29-B: keep-as-construction toggle (key 'C')
+            hint += trimKeepConstruction_ ? "  [Keep as construction: ON \xC2\xB7 C toggles]"
+                                          : "  [Keep as construction: off \xC2\xB7 C toggles]";
         hint += "  (ESC to end)";
         // Stacks BELOW the top-center status/DOF island (y+52); centered on the inter-column safe
         // area so it never slides under the pinned columns.

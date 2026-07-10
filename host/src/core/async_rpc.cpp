@@ -1,6 +1,8 @@
 // AsyncRpc (C39) implementation — see async_rpc.h.
 #include "async_rpc.h"
 
+#include <cstdio>
+
 #include "../worker_client.h"
 
 namespace core {
@@ -55,7 +57,17 @@ void AsyncRpc::drain() {
         done.swap(doneQ_);
     }
     for (auto& p : done) {
-        if (p->done) p->done(p->res);
+        // A callback that throws (e.g. a json parse on an unexpected payload shape) must
+        // not escape into the GL loop — uncaught it would std::terminate the whole app.
+        try {
+            if (p->done) p->done(p->res);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[async_rpc] callback for '%s' threw: %s\n",
+                         p->method.c_str(), e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[async_rpc] callback for '%s' threw (non-std)\n",
+                         p->method.c_str());
+        }
         pending_.fetch_sub(1);
     }
 }

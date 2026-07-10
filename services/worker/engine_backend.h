@@ -2,11 +2,13 @@
 // GUI's C++-engine calls execute.
 //
 // Two backends behind one call() contract (the CppCore::call signature):
-//   * InProcCore  — today's behavior: core::cpp_core() dlopens libaicad into
-//                   the GUI process. Default.
 //   * DaemonConn  — aicad_ipc::EngineClient over the hostd unix socket
-//                   (clientKind "gui"), selected ONCE at startup by
-//                   AI_CAD_ENGINE_DAEMON=1. On connect/spawn failure we log
+//                   (clientKind "gui"). DEFAULT since the Phase-8 flip
+//                   (unset or AI_CAD_ENGINE_DAEMON=1).
+//   * InProcCore  — legacy: core::cpp_core() dlopens libaicad into the GUI
+//                   process. Selected ONCE at startup by an explicit
+//                   AI_CAD_ENGINE_DAEMON=0 (kept >= one release; N+1 removes
+//                   it). On daemon connect/spawn failure we log
 //                   loudly and fall back to InProcCore (same pattern as
 //                   services/mcp/core_bridge.py), so the GUI never hard-breaks.
 //

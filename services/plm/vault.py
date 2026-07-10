@@ -187,13 +187,10 @@ class Vault:
         """
         if kind not in (hist.KIND_AUTO, hist.KIND_CHECKPOINT, hist.KIND_RESTORE):
             raise VaultError("invalid_mode", f"save does not accept kind={kind!r}")
-        m = self.manifest()
-        # T-R4 lifecycle rule (contract §4): no edit-in-place of a Released
-        # item — "start a new revision" first. Restore is exempt (§8.3: you
-        # can always go back).
-        files = self._explode_project_into_shadow(
-            m, kind=kind, message=message, author=author, ai=ai,
-            enforce_released_lock=(kind != hist.KIND_RESTORE))
+        # Optimistic concurrency: manifest() reads HEAD, we build the shadow tree from that
+        # snapshot, then commit_tree CAS-swaps HEAD. If a concurrent session moved HEAD in between,
+        # commit_tree raises ConcurrentUpdate; we rebuild from fresh HEAD and retry (bounded) so
+        # neither writer is silently lost. No cross-process lock — same lock-free ethos as handoff.
         author = author or _user_author()
         emeta = gitbind.EntryMeta(
             kind=kind,
@@ -201,9 +198,22 @@ class Vault:
             author_name=author["display"],
             author_email=f'{author["id"]}@aicad.local',
         )
-        commit = self._bind.commit_tree(files, emeta)
-        return {"commit": commit, "kind": kind,
-                "entry": self._entry_view(commit, self._bind.read_tree(commit), item_id)}
+        for _attempt in range(6):
+            m = self.manifest()
+            # T-R4 lifecycle rule (contract §4): no edit-in-place of a Released
+            # item — "start a new revision" first. Restore is exempt (§8.3: you
+            # can always go back).
+            files = self._explode_project_into_shadow(
+                m, kind=kind, message=message, author=author, ai=ai,
+                enforce_released_lock=(kind != hist.KIND_RESTORE))
+            try:
+                commit = self._bind.commit_tree(files, emeta)
+            except gitbind.ConcurrentUpdate:
+                continue  # HEAD advanced under us — rebuild against the new snapshot and retry
+            return {"commit": commit, "kind": kind,
+                    "entry": self._entry_view(commit, self._bind.read_tree(commit), item_id)}
+        raise VaultError("write_conflict",
+                         "vault HEAD kept moving under concurrent writers; retry the save")
 
     def checkpoint(self, message: str = "", *, author: dict[str, Any] | None = None,
                    ai: dict[str, Any] | None = None, item_id: str | None = None) -> dict[str, Any]:

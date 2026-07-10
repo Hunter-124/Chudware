@@ -61,7 +61,12 @@ enum class SketchTool {
     // surfaces as two through-point splines (chained into a closed, extrudable loop).
     Airfoil,
     // Polygon flyout: Star tool (2*polyStarPoints_ alternating outer/inner radii).
-    Star
+    Star,
+    // Gizmo-driven bulk transforms (engine ops sketch_move / sketch_rotate). Select entities,
+    // then drag an in-plane manipulator (arrows for move, a bent-arrow ring for rotate) with a
+    // draggable centroid origin, live relation snapping, and a viewport HUD (offset / angle +
+    // check/X to finish). Distinct from the simple from->to `Move` tool above.
+    MoveEntities, RotateEntities
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -675,6 +680,9 @@ private:
     // Trim power-sweep state: LMB held after a trim keeps trimming entities the cursor crosses.
     bool trimSweeping_ = false;
     ImVec2 trimSweepLast_{0, 0};
+    // Trim option: keep the trimmed-away span as construction geometry (still constrained to
+    // the surrounding sketch) instead of deleting it. Toggled in the Trim tool HUD.
+    bool trimKeepConstruction_ = false;
 
     // C29-B Offset tool state. Stages: collect a chain of entity ids (selected ones tint accent),
     // then a distance overlay (InputFloat near cursor, Enter commits), then one click for the side
@@ -730,6 +738,39 @@ private:
     void applyMoveOp(AppState& st, float dx, float dy, bool copy);
     // Apply one sketch_convert op for a model edge/face ref (already resolved to a selector JSON).
     void applyConvertRef(AppState& st, const nlohmann::json& ref);
+
+    // ---- Gizmo-driven Move/Rotate Entities (engine ops sketch_move / sketch_rotate) ----
+    // Stage 0 reuses mpSel_ (click line/circle/arc to toggle). Advancing (Enter or first drag)
+    // seeds gizmoOrigin_ at the selection centroid. Stage 1 shows an in-plane manipulator at
+    // gizmoOrigin_: Move draws two axis arrows (drag = translate; center square drag repositions
+    // the origin); Rotate draws a bent-arrow ring (drag = spin about the plane normal). A green
+    // check / red X (Enter / Esc, or the viewport HUD) commits / cancels. Live values feed the HUD.
+    ImVec2 gizmoOrigin_{0, 0};          // manipulator origin in (u,v) = move basis / rotation axis
+    bool gizmoOriginInit_ = false;      // false until stage 0 -> 1 seeds the centroid
+    bool gzDragging_ = false;           // a handle is being dragged this gesture
+    int gzDragAxis_ = -1;               // -1 none, 0=u arrow, 1=v arrow, 2=free/center, 3=rotate ring
+    ImVec2 gzDragStartUV_{0, 0};        // (u,v) under the cursor when the drag began
+    ImVec2 gzOriginAtDragStart_{0, 0};  // gizmoOrigin_ snapshot for center-repositioning
+    float moveDx_ = 0.0f, moveDy_ = 0.0f;   // live translation offset (mm), shown in HUD
+    float rotStartAng_ = 0.0f;          // pointer angle (rad) about origin when a rotate drag began
+    float rotCurAng_ = 0.0f;            // current net rotation (degrees), shown/edited in HUD
+    bool rotDidType_ = false;           // HUD angle field committed a typed value this frame
+    // Compute the (u,v) centroid of the mpSel_ bounding box; false if selection empty.
+    bool computeSelCentroid(ImVec2& out) const;
+    // Apply sketch_rotate {entities, cx, cy, angle, copy} over mpSel_ + refresh (toast on error);
+    // diffs horizontal/vertical relations before/after to report swaps/drops.
+    void applyRotateOp(AppState& st, float cx, float cy, float angleDeg, bool copy);
+
+public:
+    // Viewport HUD (drawn by viewport_panel below the file title): state of an active gizmo
+    // transform. kind 0 = none, 1 = MoveEntities, 2 = RotateEntities.
+    struct TransformHud { int kind = 0; float dx = 0, dy = 0; float angle = 0; };
+    TransformHud transformHudState() const;
+    void setHudAngle(float deg) { rotCurAng_ = deg; rotDidType_ = true; }
+    void commitTransform(AppState& st);   // finish (green check) — applies the pending gizmo op
+    void cancelTransform();               // cancel (red X) — drops the gesture, back to select
+private:
+    bool hudFinish_ = false, hudCancel_ = false;   // set by HUD buttons, consumed by the tool branch
 
     // ---- C54 Tangent Arc (draw an arc that starts tangent to a prior/selected entity) ----
     // The start point is the FREE endpoint of a source entity (the most-recently-drawn entity, or

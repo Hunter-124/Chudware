@@ -22,6 +22,12 @@
 
 #include <miniz.h>
 
+// OCCT version folded into the geometry-cache engine key when the kernel is present (slim
+// non-OCCT builds compile without it). Preprocessor-guarded so it never breaks either build.
+#if __has_include(<Standard_Version.hxx>)
+#  include <Standard_Version.hxx>
+#endif
+
 #include "doc/session.h"  // OpError
 
 namespace aicad::doc {
@@ -306,6 +312,46 @@ StepPlusDoc stepplus_open(const std::string& path) {
 
     mz_zip_reader_end(&zip);
     return result;
+}
+
+// --- persisted-geometry cache keys ------------------------------------------------
+namespace {
+// FNV-1a 64-bit — deterministic across runs/platforms (unlike std::hash), which matters
+// because this value is written into the file and compared on a later open.
+std::string fnv1a_hex(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+    return std::string(buf);
+}
+}  // namespace
+
+std::string stepplus_doc_hash(const json& doc) {
+    // Hash the SAME canonical form stepplus_save writes, so an unchanged saved tree hashes
+    // identically on reopen (a hand-edit of document.json changes it -> cache rejected). Strip
+    // the volatile top-level "id" first: doc_open re-stamps it to the new session id BEFORE the
+    // hash check, and it never affects geometry — leaving it in would miss every cache.
+    if (doc.is_object() && doc.contains("id")) {
+        json d = doc;
+        d.erase("id");
+        return fnv1a_hex(canonical_doc_json(d));
+    }
+    return fnv1a_hex(canonical_doc_json(doc));
+}
+
+std::string stepplus_cache_engine_key() {
+    // Bump CACHE_SCHEMA on ANY geometry-compiler change that could alter output geometry, so
+    // caches written by an older engine are rejected. OCCT version folded in when available.
+    static constexpr const char* kCacheSchema = "aicad-geomcache/1";
+#ifdef OCC_VERSION_COMPLETE
+    return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
+#else
+    return std::string(kCacheSchema) + ";occt=none";
+#endif
 }
 
 }  // namespace aicad::doc

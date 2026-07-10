@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
 
     hostd::Server server(std::move(listener), AICAD_HOSTD_BUILD_ID);
     server.children().setLogDir(aicad_ipc::stateDir() + "/logs");
+    server.setSelfBinary(self);  // stale-binary self-drain watches this + libaicad
     g_server = &server;
 #ifdef _WIN32
     SetConsoleCtrlHandler(onConsoleCtrl, TRUE);

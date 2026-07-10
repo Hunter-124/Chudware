@@ -1350,9 +1350,22 @@ if(AICAD_WITH_OCCT)
   # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libaicad.cpp are
   # compiled out unless AICAD_WITH_NETGEN, so the lib builds without the mesher (geometry,
   # sketch, features, STEP/IGES/STL still work — those need only OCCT).
+  # Build id (git describe), captured at CONFIGURE time and configured into ONE
+  # header shared by libaicad (aicad_build_id export) and aicad-hostd, so a
+  # matched-build engine + daemon report the SAME id (version drain-replace).
+  execute_process(COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE AICAD_HOSTD_BUILD_ID
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT AICAD_HOSTD_BUILD_ID)
+    set(AICAD_HOSTD_BUILD_ID "unknown")
+  endif()
+  configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
+
   add_library(aicad SHARED
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
   target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_prof)
   if(AICAD_WITH_NETGEN)
@@ -1407,14 +1420,7 @@ if(AICAD_WITH_OCCT)
   # engine (via services/worker/cpp_core.cpp) rather than linking it, so the
   # daemon binary is tiny, engine-version-agnostic, and reuses the exact loader
   # every other consumer runs. See the hostd plan + docs/HOSTD.md.
-  execute_process(COMMAND git describe --tags --always --dirty
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE AICAD_HOSTD_BUILD_ID
-    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(NOT AICAD_HOSTD_BUILD_ID)
-    set(AICAD_HOSTD_BUILD_ID "unknown")
-  endif()
-  configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
+  # (Build id header configured above, next to the aicad target — shared.)
   # Both platform backends are always listed; each file self-selects via
   # #ifdef _WIN32 / #ifndef _WIN32, so there is one source list to maintain.
   add_executable(aicad-hostd

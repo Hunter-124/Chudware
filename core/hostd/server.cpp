@@ -1,6 +1,9 @@
 #include "server.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <process.h>  // _getpid
@@ -78,6 +81,41 @@ Server::~Server() {
 
 void Server::touch() { status_.lastActivityMs = monoMs(); }
 
+// Stale-binary self-drain backstop (Phase 8; plan Design A "Version &
+// staleness"). Deploys are temp+RENAME (never cp over a live .so — SIGBUS), so
+// an mtime change on the hostd binary or the loaded libaicad means a NEW file
+// sits at that path: drain so existing clients finish, new connects are refused
+// with daemon.draining, and the next client respawns the fresh build. Installers
+// calling --stop are the primary path; this covers dev rebuilds.
+void Server::staleBinaryTick() {
+    static const long long intervalMs = [] {
+        if (const char* s = std::getenv("AICAD_HOSTD_STALECHECK_S"); s && *s)
+            return (long long)std::max(1, std::atoi(s)) * 1000;
+        return 60000LL;
+    }();
+    const long long now = monoMs();
+    if (now - lastStaleCheckMs_ < intervalMs) return;
+    lastStaleCheckMs_ = now;
+    namespace fs = std::filesystem;
+    const std::string paths[] = {selfBinary_, core::cpp_core().loadedPath()};
+    for (const std::string& p : paths) {
+        if (p.empty()) continue;
+        std::error_code ec;
+        const auto t = fs::last_write_time(p, ec);
+        if (ec) continue;  // transient (mid-rename) — recheck next tick
+        const long long mt =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch())
+                .count();
+        auto [it, inserted] = watchBaselineMs_.emplace(p, mt);
+        if (!inserted && it->second != mt && !status_.draining) {
+            log().line("binary changed on disk (%s) — draining so clients respawn the "
+                       "new build",
+                       p.c_str());
+            status_.draining = true;
+        }
+    }
+}
+
 bool Server::idleExpired(int lingerSecs) {
     if (status_.clients > 0 || status_.inflight > 0) return false;
     // Never idle-exit under a running mission: children are the daemon's work
@@ -108,6 +146,7 @@ void Server::run(int lingerSecs) {
             log().line("client #%d connected (%d total)", c->id, status_.clients.load());
         }
         registry_.tick();  // expire stale edit-holds + emit doc.lease_change
+        staleBinaryTick();  // mtime watch on hostd binary + libaicad (self-drain)
         if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
         if (idleExpired(lingerSecs)) {
             log().line("idle for %ds with no clients — exiting", lingerSecs);
@@ -159,6 +198,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return json{{"proto", 1},
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
+                    // "" while the engine loads or when the .so predates the
+                    // aicad_build_id export — clients tolerate absence.
+                    {"engine_build_id", core::cpp_core().buildId()},
                     {"daemon_pid", selfPid()},
                     {"state", stateNames[status_.engineState.load()]},
                     // Autosave-recovery rebind map (empty until recovery ran;
@@ -172,6 +214,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                 {"inflight", status_.inflight.load()},
                 {"draining", status_.draining.load()},
                 {"git_rev", buildId_},
+                {"engine_build_id", core::cpp_core().buildId()},
                 {"recovery", !autosave_                  ? "off"
                              : autosave_->recoveryDone() ? "done"
                                                          : "pending"},

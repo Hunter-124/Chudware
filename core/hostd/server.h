@@ -55,6 +55,11 @@ public:
     DocRegistry& registry() { return registry_; }
     // Phase 5: supervised agent children (agent_spawn/agent_stop/agent_list).
     ChildSupervisor& children() { return children_; }
+    // Phase 8: stale-binary self-drain backstop. The accept-loop tick stats the
+    // hostd binary itself + the loaded libaicad every AICAD_HOSTD_STALECHECK_S
+    // (default 60 s); an mtime change (dev rebuild, installer upgrade) flips the
+    // daemon to draining so the next client respawns the new build.
+    void setSelfBinary(std::string path) { selfBinary_ = std::move(path); }
 
     // Accept/dispatch until drained-and-idle (or stop()). lingerSecs: how long
     // the daemon must be idle (no clients, no inflight) before self-exit.
@@ -69,6 +74,7 @@ private:
                             const nlohmann::json& params, bool& isError);
     void touch();
     bool idleExpired(int lingerSecs);
+    void staleBinaryTick();
     void sendEventTo(int clientId, const std::string& line);
     void sendEventToAll(const std::string& line);
 
@@ -82,6 +88,10 @@ private:
     DocRegistry registry_;
     ChildSupervisor children_;
     Autosave* autosave_ = nullptr;
+    // Stale-binary watch state (accept-loop thread only — no locking needed).
+    std::string selfBinary_;
+    long long lastStaleCheckMs_ = 0;
+    std::map<std::string, long long> watchBaselineMs_;  // path -> first-seen mtime
 };
 
 }  // namespace hostd

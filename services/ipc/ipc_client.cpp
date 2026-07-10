@@ -1,11 +1,23 @@
 #include "ipc_client.h"
 
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <map>
 #include <thread>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <process.h>  // _getpid
 #else
+#include <csignal>
 #include <unistd.h>
 #endif
 
@@ -18,6 +30,64 @@ long selfPid() {
 #else
     return (long)::getpid();
 #endif
+}
+
+// True once `pid` no longer exists (drained daemon finished exiting).
+bool pidGone(long pid) {
+    if (pid <= 0) return true;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return true;
+    CloseHandle(h);
+    return false;
+#else
+    return ::kill((pid_t)pid, 0) == -1 && errno == ESRCH;
+#endif
+}
+
+// Build id of the hostd binary ON DISK: `aicad-hostd --version` prints
+// "aicad-hostd <git-describe id>". One subprocess per (path, mtime) — cached, so
+// steady-state reconnects never exec anything. "" on any failure (callers treat
+// unknown as not-stale). This is the client half of the version drain-replace:
+// hello.git_rev (the RUNNING daemon's configure-time id) vs what a fresh spawn
+// of the on-disk binary would report.
+std::string diskBuildId(const std::string& bin) {
+    if (bin.empty()) return "";
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(bin, ec);
+    const long long mtime =
+        ec ? 0
+           : std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch())
+                 .count();
+    static std::mutex m;
+    static std::map<std::string, std::pair<long long, std::string>> cache;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        auto it = cache.find(bin);
+        if (it != cache.end() && it->second.first == mtime) return it->second.second;
+    }
+    std::string out;
+#ifdef _WIN32
+    FILE* f = _popen(("\"" + bin + "\" --version").c_str(), "r");
+#else
+    FILE* f = ::popen(("'" + bin + "' --version 2>/dev/null").c_str(), "r");
+#endif
+    if (f) {
+        char buf[256] = {0};
+        if (std::fgets(buf, sizeof buf, f)) out = buf;
+#ifdef _WIN32
+        _pclose(f);
+#else
+        ::pclose(f);
+#endif
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    const size_t sp = out.find_last_of(" \t");
+    if (sp != std::string::npos) out = out.substr(sp + 1);
+    std::lock_guard<std::mutex> lk(m);
+    cache[bin] = {mtime, out};
+    return out;
 }
 }  // namespace
 
@@ -43,6 +113,40 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
 }
 
 bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
+    if (!connectInner(opts, err)) return false;
+    if (!opts.allowSpawn) return true;  // control clients (--stop/--status) never drain
+
+    // Version drain-replace (Phase 8): the running daemon predates the hostd
+    // binary on disk -> ask it to drain (autosaves + exits), wait for exit, then
+    // respawn/reconnect so everyone lands on the new build. A refusal
+    // (mission_active) is a warn-and-continue: never kill running agent work.
+    const std::string running = serverInfo_.value("git_rev", std::string());
+    const std::string disk = diskBuildId(resolveHostdBin(opts.hostdBin));
+    if (running.empty() || disk.empty() || running == "unknown" || disk == "unknown" ||
+        running == disk)
+        return true;
+    nlohmann::json r;
+    std::string e;
+    if (!call("daemon_drain", nlohmann::json::object(), r, e)) {
+        std::fprintf(stderr,
+                     "[ipc] hostd on disk is %s but the running daemon is %s; drain "
+                     "refused (%s) — continuing on the old daemon\n",
+                     disk.c_str(), running.c_str(), e.c_str());
+        return true;
+    }
+    std::fprintf(stderr,
+                 "[ipc] hostd stale (running %s, on disk %s) — drained; respawning the "
+                 "new build\n",
+                 running.c_str(), disk.c_str());
+    const long oldPid = serverInfo_.value("daemon_pid", 0L);
+    disconnect();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!pidGone(oldPid) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return connectInner(opts, err);
+}
+
+bool EngineClient::connectInner(const Options& opts, std::string& err) {
     const std::string key = instanceKey(opts.hostdBin);
     sockPath_ = socketPath(key);
     if (sockPath_.empty()) {

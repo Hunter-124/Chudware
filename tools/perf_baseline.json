@@ -1,0 +1,105 @@
+{
+  "engine": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
+  "git_sha": "a2a2ac7f",
+  "iters": 9,
+  "metrics": {
+    "box": {
+      "median_ms": 1.08,
+      "min_ms": 1.04,
+      "max_ms": 1.212,
+      "n": 9
+    },
+    "fillet": {
+      "median_ms": 12.245,
+      "min_ms": 11.942,
+      "max_ms": 12.722,
+      "n": 9
+    },
+    "chamfer": {
+      "median_ms": 7.041,
+      "min_ms": 6.986,
+      "max_ms": 7.096,
+      "n": 9
+    },
+    "shell": {
+      "median_ms": 4.622,
+      "min_ms": 4.601,
+      "max_ms": 4.693,
+      "n": 9
+    },
+    "boolean": {
+      "median_ms": 59.581,
+      "min_ms": 58.337,
+      "max_ms": 63.914,
+      "n": 9
+    },
+    "pattern": {
+      "median_ms": 122.058,
+      "min_ms": 119.736,
+      "max_ms": 124.422,
+      "n": 9
+    },
+    "heavy_mix": {
+      "median_ms": 72.347,
+      "min_ms": 71.218,
+      "max_ms": 74.046,
+      "n": 9
+    },
+    "open_cold": {
+      "median_ms": 9.337,
+      "min_ms": 9.298,
+      "max_ms": 9.395,
+      "n": 9
+    }
+  },
+  "diagnostics": {
+    "per_feature_ms_heavy_mix": [
+      {
+        "id": "f1",
+        "ms": 0.121597
+      },
+      {
+        "id": "f2",
+        "ms": 5.075272
+      },
+      {
+        "id": "f3",
+        "ms": 43.691643
+      }
+    ],
+    "contention_burst": {
+      "available": true,
+      "threads": 6,
+      "pct_wall_blocked": 481.7,
+      "contended_pct": 95.4,
+      "max_waiters": 5,
+      "avg_wait_ms": 114.367,
+      "top_methods": [
+        {
+          "avg_wait_ms": 118.89314541666666,
+          "calls": 72,
+          "max_wait_ms": 289.739414,
+          "method": "doc_new",
+          "total_hold_ms": 3.433774,
+          "total_wait_ms": 8560.30647
+        },
+        {
+          "avg_wait_ms": 112.69699695833333,
+          "calls": 72,
+          "max_wait_ms": 287.337167,
+          "method": "doc_apply_ops",
+          "total_hold_ms": 5108.25196,
+          "total_wait_ms": 8114.183781
+        },
+        {
+          "avg_wait_ms": 111.51180195833334,
+          "calls": 72,
+          "max_wait_ms": 285.202919,
+          "method": "doc_close",
+          "total_hold_ms": 15.022619,
+          "total_wait_ms": 8028.849741
+        }
+      ]
+    }
+  }
+}

@@ -591,6 +591,19 @@ struct AppState {
         // own tabs are never the handoff. Flagged so the refresh can find it without path-matching,
         // label it clearly, and avoid stealing focus / yanking an in-progress edit.
         bool        aiHandoff = false;
+        // When aiHandoff is set, which MCP doc_id this mirror tab tracks. The poller keeps ONE tab
+        // per doc_id, so an AI agent opening several parts leaves them all open side by side. Empty
+        // for the legacy single-mirror path (older handoffs that only publish live.json).
+        std::string handoffDocId;
+        // The advertised part NAME for this mirror (from docs.json). Lets the poller collapse two
+        // mirror tabs that are the SAME part re-created under different doc_ids (the duplicate-tab
+        // bug) even when the doc_id key differs. Empty for legacy/unnamed handoffs.
+        std::string handoffName;
+        // An AI subagent has edited this part since the user last looked at it (it is NOT the active
+        // tab). The tab strip renders an animated, pulsating glow around such tabs so a swarm working
+        // in the background is visible without stealing focus or the viewport. Cleared the moment the
+        // user switches to the tab (switchToTab) or the poller refreshes it while it IS active.
+        bool        aiPulse = false;
 
         // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
         // thing the user actually opened/saved) over the internal tree "name" — an opened .step+

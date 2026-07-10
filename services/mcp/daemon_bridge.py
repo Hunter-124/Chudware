@@ -3,8 +3,9 @@
 The Python mirror of services/ipc/ipc_client.cpp: connect-or-spawn against the
 instance-key socket, newline-delimited JSON-RPC, one outstanding request per
 connection (Lock-serialized — FastMCP runs sync tools off-thread). core_bridge
-routes through here when AI_CAD_ENGINE_DAEMON=1, keeping its call() signature
-so the ~200 tool call sites never change.
+routes through here BY DEFAULT since the Phase-8 flip (unset or
+AI_CAD_ENGINE_DAEMON=1; only an explicit =0 selects the legacy in-process
+path), keeping its call() signature so the ~200 tool call sites never change.
 
 Semantics preserved vs the legacy in-process ctypes path:
   * call() BLOCKS with no client timeout (solves run minutes; ctypes had none).
@@ -174,6 +175,56 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
     return f"/tmp/aicad-{os.getuid()}/hostd-{key}.sock"
 
 
+def _pid_alive(pid: int) -> bool:
+    """Liveness for a daemon pid, treating a ZOMBIE as dead. The daemon is
+    spawned as OUR direct child (single fork + setsid), so after it exits it
+    lingers as a zombie until reaped — os.kill(pid, 0) alone would report it
+    alive forever. POSIX only (the Windows path polls the pipe name instead)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
+                try:
+                    os.waitpid(pid, os.WNOHANG)  # reap if it's our child
+                except ChildProcessError:
+                    pass
+                return False
+    except OSError:
+        pass  # no /proc (macOS): fall through to "alive"; bounded by the deadline
+    return True
+
+
+_DISK_BUILD_ID_CACHE: dict = {}  # str(path) -> (mtime_ns, build_id)
+
+
+def _disk_build_id(hostd: Optional[Path]) -> str:
+    """Build id of the hostd binary ON DISK (`aicad-hostd --version` prints
+    "aicad-hostd <git-describe id>"). Cached per (path, mtime) so the subprocess
+    runs once per binary change per process — steady-state connects are free.
+    Returns "" on any failure (treated as not-stale). Client half of the version
+    drain-replace: compared against hello.git_rev, the RUNNING daemon's id."""
+    if not hostd:
+        return ""
+    try:
+        key = str(hostd)
+        mtime = os.stat(key).st_mtime_ns
+        hit = _DISK_BUILD_ID_CACHE.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        out = subprocess.run([key, "--version"], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+        bid = out.split()[-1] if out else ""
+        _DISK_BUILD_ID_CACHE[key] = (mtime, bid)
+        return bid
+    except Exception:
+        return ""
+
+
 def daemon_socket_alive(hostd_bin: Optional[Path] = None) -> bool:
     """Cheap liveness probe — used by the legacy path's mode-divergence warning."""
     sp = socket_path(hostd_bin or resolve_hostd_bin())
@@ -245,6 +296,7 @@ class DaemonClient:
         self._events: list[dict] = []
         self.server_info: dict = {}
         self._sock_path: Optional[str] = None
+        self._stale_retry_done = False  # one drain-replace attempt per client
 
     # ---------------------------------------------------------------- connect
 
@@ -287,6 +339,51 @@ class DaemonClient:
         self.server_info = self._call_raw(
             "hello", {"client": "mcp", "pid": os.getpid(), "proto": 1}
         )
+        self._drain_replace_if_stale(hostd, spawn)
+
+    def _drain_replace_if_stale(self, hostd: Optional[Path], spawn: bool) -> None:
+        """Version drain-replace (Phase 8): the running daemon predates the hostd
+        binary on disk (dev rebuild / installer upgrade) -> ask it to drain
+        (autosaves + exits), wait for the old pid to die, then respawn/reconnect
+        so everyone lands on the new build. A mission_active refusal is
+        warn-and-continue: never kill running agent work from a connect."""
+        if not spawn or self._stale_retry_done:
+            return
+        running = str(self.server_info.get("git_rev") or "")
+        disk = _disk_build_id(hostd)
+        if not running or not disk or "unknown" in (running, disk) or running == disk:
+            return
+        self._stale_retry_done = True  # one attempt per connection, never a loop
+        r = self._call_raw("daemon_drain", {})
+        if r.get("_is_error"):
+            print(
+                f"[daemon_bridge] WARNING: hostd on disk is {disk} but the running "
+                f"daemon is {running}; drain refused ({r.get('code')}) — continuing "
+                "on the old daemon.",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"[daemon_bridge] hostd stale (running {running}, on disk {disk}) — "
+            "drained; respawning the new build.",
+            file=sys.stderr,
+        )
+        old_pid = int(self.server_info.get("daemon_pid") or 0)
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+        deadline = time.monotonic() + 30.0
+        while old_pid > 0 and time.monotonic() < deadline:
+            if sys.platform == "win32":
+                # os.kill(pid, 0) is NOT a liveness probe on Windows; the pipe
+                # name existing exactly while a server listens is.
+                if not (self._sock_path and os.path.exists(self._sock_path)):
+                    break
+            else:
+                if not _pid_alive(old_pid):
+                    break
+            time.sleep(0.1)
+        self.connect()
 
     def connected(self) -> bool:
         return self._sock is not None
@@ -309,7 +406,11 @@ class DaemonClient:
                     return json.loads(line)
                 except json.JSONDecodeError:
                     continue  # tolerate stray lines
-            chunk = self._sock.recv(65536)
+            try:
+                chunk = self._sock.recv(65536)
+            except OSError as e:
+                # e.g. ECONNRESET from a draining daemon that closed on accept.
+                raise DaemonError(f"daemon connection lost ({e})") from e
             if not chunk:
                 raise DaemonError("daemon connection closed")
             self._buf += chunk
@@ -322,7 +423,10 @@ class DaemonClient:
         rid = self._next_id
         self._next_id += 1
         req = json.dumps({"id": rid, "method": method, "params": params})
-        self._sock.sendall(req.encode() + b"\n")
+        try:
+            self._sock.sendall(req.encode() + b"\n")
+        except OSError as e:
+            raise DaemonError(f"daemon connection lost ({e})") from e
         while True:
             msg = self._read_msg()
             if "event" in msg:

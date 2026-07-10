@@ -1,6 +1,8 @@
 #include "geom/tessellate.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
@@ -29,6 +31,30 @@
 #include <gp_Trsf.hxx>
 
 namespace geom {
+
+// --- tessellation micro-profiling accumulators (see tessellate.h) ---------------
+namespace {
+std::atomic<long long> g_tess_mesh_ns{0};
+std::atomic<long long> g_tess_extract_ns{0};
+std::atomic<long> g_tess_bodies{0};
+std::atomic<long> g_tess_faces{0};
+}  // namespace
+
+void tess_timing_reset() {
+    g_tess_mesh_ns.store(0, std::memory_order_relaxed);
+    g_tess_extract_ns.store(0, std::memory_order_relaxed);
+    g_tess_bodies.store(0, std::memory_order_relaxed);
+    g_tess_faces.store(0, std::memory_order_relaxed);
+}
+
+TessTiming tess_timing_read() {
+    TessTiming t;
+    t.mesh_ms = g_tess_mesh_ns.load(std::memory_order_relaxed) / 1e6;
+    t.extract_ms = g_tess_extract_ns.load(std::memory_order_relaxed) / 1e6;
+    t.bodies = g_tess_bodies.load(std::memory_order_relaxed);
+    t.faces = g_tess_faces.load(std::memory_order_relaxed);
+    return t;
+}
 
 namespace {
 
@@ -102,9 +128,21 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
                                : kDisplayMaxAngularDeflection;
 
     // Mesh the shape (parallel, absolute deflection) — same call as tessellate.py.
+    // BRepMesh is face-incremental: a face whose TShape already carries a matching
+    // triangulation is skipped, so on a downstream edit only the changed faces re-mesh.
+    const auto _mesh_t0 = std::chrono::steady_clock::now();
     BRepMesh_IncrementalMesh mesher(shape, lin_deflection, Standard_False,
                                     eff_ang, Standard_True);
     mesher.Perform();
+    const auto _mesh_t1 = std::chrono::steady_clock::now();
+    g_tess_mesh_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(_mesh_t1 - _mesh_t0).count(),
+        std::memory_order_relaxed);
+    g_tess_bodies.fetch_add(1, std::memory_order_relaxed);
+
+    // Everything past meshing — the topology index maps + the triangle/edge/vertex
+    // extraction — is the "extract" cost (distinct from BRepMesh above).
+    const auto _extract_t0 = std::chrono::steady_clock::now();
 
     // Stable 1-based index maps.
     TopTools_IndexedMapOfShape face_map, edge_map, vert_map;
@@ -114,6 +152,8 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
 
     TopTools_IndexedDataMapOfShapeListOfShape anc_map;
     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc_map);
+
+    g_tess_faces.fetch_add(face_map.Extent(), std::memory_order_relaxed);
 
     // ----- Per-face geometry: triangles grouped per face (contiguous ranges) -----
     for (int fi = 1; fi <= face_map.Extent(); ++fi) {
@@ -248,6 +288,10 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
         body.verts.push_back(vr);
     }
 
+    g_tess_extract_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _extract_t0).count(),
+        std::memory_order_relaxed);
     return body;
 }
 

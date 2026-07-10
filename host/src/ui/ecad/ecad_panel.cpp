@@ -690,31 +690,20 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         const std::string selId = "layer:" + ly.id;
         const bool sel = (es.mgrSel == selId);
         bool vis = m.layerVisible(ly.id);
-        // fmRowPill(false): NEVER let the shared selection chrome paint its blue accent — a layer's
-        // highlight must read in the LAYER's own color, not the app accent (Hunter round-5b). The
-        // selected state is expressed below via a stronger layer-color dye + a layer-color border.
-        ui::FmRowRect r = ui::fmRowPill(false);
-        // Effective layer color: a per-layer override (picked via the swatch) wins over the
-        // copperIndex-derived default.
+        // Effective layer color (per-layer override picked via the swatch wins over the
+        // copperIndex-derived default) — computed BEFORE the pill so it can dye the shared wash.
         float ov[3];
         const ImVec4 c = m.layerColor(ly.id, ov) ? ImVec4(ov[0], ov[1], ov[2], 1.0f)
                                                   : layerSwatch(ly.copperIndex);
+        const float layerTint[3] = {c.x, c.y, c.z};
+        // The SHARED row pill, dyed the layer's own color: same seam-free frosted-glass base +
+        // colored wash + in-color selection glow as the Feature Manager rows (Hunter: Layers must
+        // match the rest of the app, not roll their own gradient). Passing the tint routes the glow
+        // through the layer color too, so there is no app-accent bleed and no hand-rolled fill.
+        ui::FmRowRect r = ui::fmRowPill(sel, layerTint);
         auto dye = [&](float a) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, a)); };
-        // Liquid-glass pill DYED the layer color: a translucent left→right color tint over the glass
-        // (light alpha so it reads as a tint, text stays legible). BOUNDED to the rounded pill. When
-        // selected, the dye is stronger and a layer-color border frames the pill.
-        const float dl0 = sel ? (vis ? 0.55f : 0.30f) : (vis ? 0.34f : 0.16f);
-        const ImU32 cL = dye(dl0), cR = dye(vis ? (sel ? 0.10f : 0.05f) : 0.02f);
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float s = sc, rr = 3.5f * s;
-        ImVec2 mn(r.mn.x + 2.0f * s, r.mn.y + 2.0f * s), mx(r.mx.x - 2.0f * s, r.mx.y - 2.0f * s);
-        dl->AddRectFilled(mn, mx, cR, rr);
-        dl->AddRectFilledMultiColor(ImVec2(mn.x + rr, mn.y), ImVec2(mx.x - rr, mx.y), cL, cR, cR, cL);
-        // Left accent bar dyed the LAYER color (round-4: was the always-blue selection accent).
-        dl->AddRectFilled(mn, ImVec2(mn.x + 3.0f * s, mx.y), dye(vis ? 0.95f : 0.45f), rr,
-                          ImDrawFlags_RoundCornersLeft);
-        if (sel)   // layer-color selection border (replaces the app-accent border)
-            dl->AddRect(mn, mx, dye(vis ? 0.95f : 0.55f), rr, 0, std::max(1.0f, 1.4f * s));
+        const float s = sc;
         // Circular color swatch to the LEFT of the text: click it to change the layer color. Drawn
         // vertically centered in the pill and padded off the left edge (Hunter round-5b).
         const float swR = 5.5f * s, swPad = 8.0f * s;

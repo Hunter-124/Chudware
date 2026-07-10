@@ -97,8 +97,11 @@ void logPingLatency(aicad_ipc::EngineClient& c) {
 }
 
 void initOnce() {
+    // Phase-8 flip: daemon mode is the DEFAULT. Only an explicit
+    // AI_CAD_ENGINE_DAEMON=0 forces the legacy in-process load (kept at least
+    // one release; removal is a named N+1 task).
     const char* f = std::getenv("AI_CAD_ENGINE_DAEMON");
-    if (!f || !f[0] || f[0] == '0') return;  // default OFF until Phase 8
+    if (f && f[0] == '0') return;  // explicit opt-out -> legacy in-process
     auto* c = new aicad_ipc::EngineClient();
     aicad_ipc::EngineClient::Options opts;
     opts.hostdBin = hostdBinHint();
@@ -107,7 +110,7 @@ void initOnce() {
     if (!c->connectOrSpawn(opts, err)) {
         // core_bridge.py-style loud warning + legacy fallback.
         std::fprintf(stderr,
-                     "[engine] WARNING: AI_CAD_ENGINE_DAEMON=1 but hostd connect failed (%s) "
+                     "[engine] WARNING: daemon mode (default) but hostd connect failed (%s) "
                      "— falling back to in-process libaicad\n",
                      err.c_str());
         delete c;

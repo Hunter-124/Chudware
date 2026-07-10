@@ -176,15 +176,17 @@ def _load() -> ctypes.CDLL:
             return _dll
         # Mode-divergence guard: a legacy in-process engine editing docs while a
         # live hostd serves the same docs to other clients = two sources of
-        # truth. Warn loudly (Phase-8 flip upgrades this to a refusal).
+        # truth. Still a WARNING this release (the N+1 task upgrades it to a
+        # refusal once the legacy path is scheduled for deletion).
         try:
             from . import daemon_bridge
 
             if not _daemon_mode() and daemon_bridge.daemon_socket_alive():
                 print(
                     "[core_bridge] WARNING: an aicad-hostd daemon is running but this "
-                    "process is loading its OWN in-process engine (AI_CAD_ENGINE_DAEMON "
-                    "unset). Documents will NOT be shared with the daemon's clients.",
+                    "process is loading its OWN in-process engine "
+                    "(AI_CAD_ENGINE_DAEMON=0). Documents will NOT be shared with the "
+                    "daemon's clients. This becomes a hard refusal next release.",
                     file=sys.stderr,
                 )
         except Exception:
@@ -268,18 +270,28 @@ def available() -> bool:
 
 # ---------------------------------------------------------------- the one RPC call
 
-# Engine backend mode (shared-engine refactor, see hostd plan):
-#   AI_CAD_ENGINE_DAEMON=1  -> route through the shared aicad-hostd daemon (ONE
-#     engine for the GUI + every MCP process; live doc sharing, no per-process copy).
-#   AI_CAD_ENGINE_DAEMON=0 / unset -> legacy in-process ctypes load (default until
-#     the Phase-8 flip; kept at least one release as the fallback).
+# Engine backend mode (shared-engine refactor, see hostd plan). Phase-8 flip:
+#   AI_CAD_ENGINE_DAEMON unset / =1 -> DEFAULT: route through the shared
+#     aicad-hostd daemon (ONE engine for the GUI + every MCP process; live doc
+#     sharing, no per-process copy).
+#   AI_CAD_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
+#     (kept at least one release as the safety net; removal is a named N+1 task).
 # During release N a daemon TRANSPORT failure falls back to legacy with a loud
 # warning rather than bricking the session; N+1 makes it a hard error.
 _DAEMON_FALLBACK_WARNED = False
 
 
 def _daemon_mode() -> bool:
-    return os.environ.get("AI_CAD_ENGINE_DAEMON", "0") == "1"
+    """Daemon mode is the default; only an explicit '0' selects legacy."""
+    return os.environ.get("AI_CAD_ENGINE_DAEMON", "1") != "0"
+
+
+def active_daemon_mode() -> bool:
+    """True when calls are ACTUALLY going through the daemon right now: daemon
+    mode is selected AND we have not fallen back to the legacy in-process engine
+    after a transport failure. Gates daemon-only behavior that would be wrong on
+    the fallback path (e.g. skipping the legacy .step+ handoff publisher)."""
+    return _daemon_mode() and not _DAEMON_FALLBACK_WARNED
 
 
 # Foreign-edit piggyback (Phase 3): the daemon injects "_foreign_edits":[...]

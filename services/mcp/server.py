@@ -47,6 +47,10 @@ _LITE_INSTRUCTIONS = (
     "Touching sketch endpoints auto-coincide on every edit, so profiles close on their own. "
     "render_part() SEES the annotated result; describe_part()/describe_sketch()/describe_scene() "
     "are the text-only read when you have no vision.\n"
+    "PARALLEL WORK: every tool takes a doc_id. When more than one part is open — e.g. several "
+    "subagents each building a different part — ALWAYS pass the doc_id you got from new_part/open "
+    "so you address your OWN part; omitting it errors (the 'current part' is process-wide and "
+    "shared, so a bare call would clobber another agent's work).\n"
     "LOOK IT UP, DON'T RECALL: use research_* for any load-bearing number (materials, sections, "
     "threads, unit conversions) — never type one from memory.\n"
     "STANDARD PARTS FIRST for hardware: part_search/part_source → part_place before custom "
@@ -63,6 +67,11 @@ _FULL_INSTRUCTIONS = (
         "START by calling cad_guide() — it returns the engine's modeling op vocabulary and "
         "worked examples; cad_guide('simulation') and cad_guide('review') cover FEA/CFD and "
         "how to read the annotated render.\n"
+        "PARALLEL WORK: every tool takes a doc_id. When more than one part is open — e.g. several "
+        "subagents each building a different part in this shared engine — ALWAYS pass the doc_id "
+        "returned by new_part/new_assembly/import so you address your OWN part; omitting it errors "
+        "when >1 part is open (the 'current part' is process-wide, so a bare call would edit "
+        "another agent's part). The engine serialises ops safely, so parallel agents just work.\n"
         "TYPICAL LOOP: new_part(name) -> add_features([...ops...]) to build with standard "
         "editable features (boxes/sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell, "
         "holes, bolt_circle, patterns/mirror) -> render_part() to SEE the colour-coded, "
@@ -453,7 +462,12 @@ def _warm_core() -> None:
         # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
         # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
         try:
-            from mcp_server.cad_tools import recover_autosaved, start_periodic_autosave
+            from mcp_server.cad_tools import (recover_autosaved, start_periodic_autosave,
+                                              sweep_stale_handoff)
+            # Prune dead-session handoff fragments FIRST: if the last publisher crashed
+            # (atexit never ran), docs.json still advertises its docs and the GUI shows
+            # ghost mirror tabs until someone re-merges — which is us, right now.
+            sweep_stale_handoff()
             recover_autosaved()
             # Arm the periodic autosave timer AFTER recovery (so we don't re-save stale files).
             start_periodic_autosave()
@@ -470,7 +484,46 @@ def _warm_core() -> None:
         pass
 
 
+def _reexec_with_fast_malloc() -> None:
+    """Re-exec THIS process with a fast allocator preloaded (tcmalloc), then return in the child.
+
+    OCCT's booleans/meshing are allocation-heavy; tcmalloc cuts modeling time ~5-10% vs glibc
+    malloc (measured, tools/perf_regression.py) with no logic change and ctest still green. The
+    engine is dlopened via ctypes, so linking an allocator into libaicad wouldn't override the
+    already-resolved glibc malloc — LD_PRELOAD before the process allocates is the only reliable
+    way, hence this early self-reexec. Opt out with AICAD_NO_FAST_MALLOC=1. Loop-guarded + fully
+    best-effort: any problem just continues on the default allocator.
+    """
+    if os.name == "nt":
+        return
+    if os.environ.get("AICAD_NO_FAST_MALLOC") or os.environ.get("_AICAD_MALLOC_REEXEC"):
+        return
+    pre = os.environ.get("LD_PRELOAD", "")
+    if "tcmalloc" in pre or "jemalloc" in pre:
+        return  # an allocator is already preloaded (by a launcher) — respect it
+    import ctypes.util
+    lib = None
+    for cand in ("/lib64/libtcmalloc_minimal.so.4", "/usr/lib64/libtcmalloc_minimal.so.4",
+                 "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"):
+        if os.path.exists(cand):
+            lib = cand
+            break
+    if lib is None:
+        found = ctypes.util.find_library("tcmalloc_minimal") or ctypes.util.find_library("jemalloc")
+        lib = found
+    if not lib:
+        return
+    try:
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = (lib + (":" + pre if pre else ""))
+        env["_AICAD_MALLOC_REEXEC"] = "1"  # sentinel: never re-exec twice
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    except Exception:  # noqa: BLE001
+        pass  # exec failed -> fall through and run on the default allocator
+
+
 def main() -> None:
+    _reexec_with_fast_malloc()  # fast-allocator preload (best-effort, before any core alloc)
     real_stream = _install_clean_stdout()
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.

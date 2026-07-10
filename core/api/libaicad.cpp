@@ -16,6 +16,8 @@
 
 #include "api/libaicad.h"
 
+#include "version_info.h"  // CMake-configured AICAD_HOSTD_BUILD_ID (shared with aicad-hostd)
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -504,6 +506,10 @@ extern "C" {
 
 AICAD_API const char* aicad_abi_version(void) { return "1"; }
 
+// Same configure_file'd id aicad-hostd embeds (core/hostd/version_info.h.in) —
+// one source of truth, so a matched-build daemon + engine report ONE id.
+AICAD_API const char* aicad_build_id(void) { return AICAD_HOSTD_BUILD_ID; }
+
 AICAD_API void aicad_free(char* s) { std::free(s); }
 
 // ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
@@ -844,6 +850,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
     aicad::prof::TargetScope _prof_scope(
         aicad::prof::active() &&
         (aicad::prof::mode() == "all" || prof_is_modeling_method(m)));
+    // Stamp the calling method so the g_mtx contention meters (DocLock) can attribute lock
+    // wait/hold to this RPC (Phase 1b). `m` outlives the call; the pointer is cleared on return.
+    struct RpcMethodScope {
+        explicit RpcMethodScope(const char* s) { aicad::doc::set_current_rpc_method(s); }
+        ~RpcMethodScope() { aicad::doc::set_current_rpc_method(nullptr); }
+    } _rpc_method_scope(m.c_str());
 
     try {
         if (m == "ping") {
@@ -886,6 +898,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"interval_us", aicad::prof::interval_us()},
                              {"mode", aicad::prof::mode()}},
                         out_json, 0);
+        }
+        // prof_contention {reset?} -> g_mtx lock wait/hold/queue-depth meters (Phase 1b).
+        // The on-CPU sampler above sees only the ONE thread holding the lock; this reveals the
+        // time OTHER threads spend BLOCKED on it — the dominant cost when many subagents drive
+        // one engine. reset=true zeroes the counters + restarts the window (call before a run).
+        if (m == "prof_contention") {
+            return emit(aicad::doc::contention_report(params.value("reset", false)), out_json, 0);
         }
         // prof_target_push / prof_target_pop {} -> persistently (un)register the CALLING
         // thread as the sampler's stack-walk target beyond this call (ref-counted, see

@@ -18,20 +18,41 @@ import unittest
 # Stubs so imports succeed without libaicad.so or live MCP server
 # ---------------------------------------------------------------------------
 
-def _setup_stubs():
-    """Install lightweight stubs so dimension_scheme_tools and deps import cleanly."""
-    # core_bridge stub
+def _install_stubs():
+    """Install lightweight stubs so dimension_scheme_tools + deps import without libaicad.so.
+
+    Returns a `restore()` callable. The stubs are needed ONLY at import time (every test
+    here exercises pure offline logic — no bridge call at run time), so the module wraps
+    its imports in `try: … finally: restore()` below. That matters for whole-dir pytest
+    sweeps: this module used to `setdefault` a fake `services.mcp.core_bridge` / `mcp` SDK
+    and — worse — mutate the REAL `mcp_server` package's attributes, which leaked into
+    sibling test modules (test_cad_tools' volume-baseline + render-caption saw a stubbed
+    core_bridge and failed). `restore()` removes exactly the keys/attrs this installed and
+    leaves any pre-existing real module untouched, so nothing leaks past import.
+    """
+    added: list = []            # sys.modules keys we newly created
+    attr_undo: list = []        # (module, attr, had_it, original) to undo attribute writes
+
+    def _set(key: str, mod):
+        """Install `mod` at sys.modules[key] only if absent; track it for restore."""
+        if key not in sys.modules:
+            sys.modules[key] = mod
+            added.append(key)
+        return sys.modules[key]
+
+    def _setattr(mod, attr, value):
+        attr_undo.append((mod, attr, hasattr(mod, attr), getattr(mod, attr, None)))
+        setattr(mod, attr, value)
+
+    # core_bridge stub. Issue #17: cad_tools does `from .core_bridge import CoreError` at
+    # import time, so the stub must carry CoreError or a full-dir collection aborts.
     cb = types.ModuleType("mcp_server.core_bridge")
     cb.available = lambda: False
     cb.call = lambda method, params=None: {}
-    # Issue #17: the real services/mcp/cad_tools.py does `from .core_bridge import
-    # CoreError` at import time; when this stub wins the services.mcp.core_bridge
-    # sys.modules slot first (full-dir sweeps: dimension < fea_advanced), a missing
-    # CoreError aborts the WHOLE mcp_server collection. Keep the stub import-compatible.
     cb.CoreError = type("CoreError", (Exception,), {})
-    sys.modules.setdefault("mcp_server.core_bridge", cb)
-    sys.modules.setdefault("core_bridge", cb)
-    sys.modules.setdefault("services.mcp.core_bridge", cb)
+    _set("mcp_server.core_bridge", cb)
+    _set("core_bridge", cb)
+    _set("services.mcp.core_bridge", cb)
 
     # mcp.server.fastmcp stub
     class _FakeMCP:
@@ -46,28 +67,29 @@ def _setup_stubs():
     server_mod = types.ModuleType("mcp.server")
     fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
     fastmcp_mod.FastMCP = _FakeMCP
-    sys.modules.setdefault("mcp", mcp_mod)
-    sys.modules.setdefault("mcp.server", server_mod)
-    sys.modules.setdefault("mcp.server.fastmcp", fastmcp_mod)
+    _set("mcp", mcp_mod)
+    _set("mcp.server", server_mod)
+    _set("mcp.server.fastmcp", fastmcp_mod)
 
     # mcp_server.cad_tools stubs for _dumps / _err / _doc
     ct = types.ModuleType("mcp_server.cad_tools")
     ct._dumps = json.dumps
     ct._err = lambda e: json.dumps({"ok": False, "error": str(e)})
     ct._doc = lambda d: d
-    sys.modules.setdefault("mcp_server.cad_tools", ct)
+    _set("mcp_server.cad_tools", ct)
     ms = types.ModuleType("mcp_server")
-    sys.modules.setdefault("mcp_server", ms)
+    mcp_server_pkg = _set("mcp_server", ms)
 
     # fit_narration stub — gsl_tools imports _format_fit at module level
     fn_mod = types.ModuleType("mcp_server.fit_narration")
     fn_mod._format_fit = lambda fit_result: ""  # no-op for offline tests
-    sys.modules.setdefault("mcp_server.fit_narration", fn_mod)
-    # Make mcp_server a package so submodule attribute access works
-    pkg = sys.modules["mcp_server"]
-    pkg.fit_narration = fn_mod
-    pkg.cad_tools = ct
-    pkg.core_bridge = cb
+    _set("mcp_server.fit_narration", fn_mod)
+    # Wire submodule attributes ONLY on a mcp_server package WE created — never clobber a
+    # real, already-imported mcp_server (that leak is what broke sibling tests).
+    if "mcp_server" in added:
+        _setattr(mcp_server_pkg, "fit_narration", fn_mod)
+        _setattr(mcp_server_pkg, "cad_tools", ct)
+        _setattr(mcp_server_pkg, "core_bridge", cb)
 
     # engine stub (for research imports in fits.py / material_lookup.py)
     eng = types.ModuleType("engine")
@@ -78,29 +100,43 @@ def _setup_stubs():
     eng_paths.CONFIG = pathlib.Path("/nonexistent/config.json")
     eng.materials = eng_materials
     eng.paths = eng_paths
-    sys.modules.setdefault("engine", eng)
-    sys.modules.setdefault("engine.materials", eng_materials)
-    sys.modules.setdefault("engine.paths", eng_paths)
+    _set("engine", eng)
+    _set("engine.materials", eng_materials)
+    _set("engine.paths", eng_paths)
+
+    def restore():
+        for key in added:
+            sys.modules.pop(key, None)
+        for mod, attr, had_it, original in attr_undo:
+            if had_it:
+                setattr(mod, attr, original)
+            else:
+                try:
+                    delattr(mod, attr)
+                except AttributeError:
+                    pass
+
+    return restore
 
 
-_setup_stubs()
+# Install stubs, import the offline modules-under-test, then REMOVE the stubs so a
+# whole-dir sweep never inherits a fake core_bridge / mcp SDK.
+_restore_stubs = _install_stubs()
+try:
+    from engine_oracle.research.fits import fit_calc, recommend_fit  # noqa: E402
+    from engine_oracle.dfm.process_profiles import get_profile  # noqa: E402
 
-# Now we can import the module under test
-from engine_oracle.research.fits import fit_calc, recommend_fit  # noqa: E402
-from engine_oracle.dfm.process_profiles import get_profile  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Import dimension_scheme internals directly (not via MCP)
-# ---------------------------------------------------------------------------
-from services.mcp.dimension_scheme_tools import (  # noqa: E402
-    _plan_from_entities,
-    _make_fixture_sketch as _dim_fixture,
-    _make_bore_sketch,
-    _it_grade_for_process,
-    _bilateral_tolerance,
-    _find_bolt_patterns,
-)
+    # Import dimension_scheme internals directly (not via MCP)
+    from services.mcp.dimension_scheme_tools import (  # noqa: E402
+        _plan_from_entities,
+        _make_fixture_sketch as _dim_fixture,
+        _make_bore_sketch,
+        _it_grade_for_process,
+        _bilateral_tolerance,
+        _find_bolt_patterns,
+    )
+finally:
+    _restore_stubs()
 
 
 class TestBoltPatternRule(unittest.TestCase):

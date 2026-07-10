@@ -1992,6 +1992,26 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
         }
     }
     std::string base = pathBaseName(path);
+    // FAST PATH: the doc_open response itself carried the mesh (DocMirror::open now keeps
+    // tess.aicm_path + volume + feature_status/owner_map instead of discarding them). Load it
+    // directly and skip the forced doc_rebuild below — that rebuild is a FULL recompile
+    // whenever the open was served from the .step+'s embedded cache, i.e. every AI-handoff
+    // refresh paid for the part twice. Fallback (empty aicm) keeps the historical path.
+    if (!st.docMirror.lastOpenedAicm().empty()) {
+        std::string lerr;
+        if (st.loadDocMesh(st.docMirror.lastOpenedAicm(), lerr)) {
+            if (std::abs(st.docMirror.lastOpenedVolume()) < 1e-6) {
+                // Flat 2D import (DXF/DWG): same plane + colour as the datum planes washes the
+                // drawing out — hide the planes and face it Top-on (mirrors the async branch).
+                st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = false;
+                st.planesUserToggled = true;
+                st.yaw = 0.0f; st.pitch = 89.5f; st.zoom = 1.0f;
+                st.addLog("[open] flat 2D import — hid datum planes + oriented Top");
+            }
+            return;
+        }
+        st.addLog("[err] loadDocMesh(open fast path): " + lerr + " — falling back to rebuild");
+    }
     // Multi-document: bind this open-refresh to the doc it targets so a tab switch before the async
     // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
     const std::string openDocId = st.docMirror.docId();
@@ -2798,7 +2818,11 @@ void drawFeatureTreeBody(AppState& st,
                 }
                 fmRowPillEnd(originRect, originSelected);
                 if (originOpen) {
-                    static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
+                    // Labels are the axis-pair the plane spans (front=X/Z, top=X/Y, right=Y/Z),
+                    // indexed by the true plane index so showPlane[]/planeEmphasis/kPlane*Id below
+                    // keep their front/top/right meaning. kOrder puts Top (X/Y) first in the list.
+                    static const char* kPlanes[] = {"X/Z", "X/Y", "Y/Z"};
+                    static const int   kOrder[3] = {1, 0, 2};   // display slots -> plane index
                     bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
                     auto takePlaneControl = [&st, planesAutoShow]() {
                         if (st.planesUserToggled) return;
@@ -2806,7 +2830,8 @@ void drawFeatureTreeBody(AppState& st,
                             st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = true;
                         st.planesUserToggled = true;
                     };
-                    for (int pi = 0; pi < 3; ++pi) {
+                    for (int slot = 0; slot < 3; ++slot) {
+                        int pi = kOrder[slot];
                         ImGuiTreeNodeFlags pf = ImGuiTreeNodeFlags_Leaf |
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth |
@@ -3638,7 +3663,7 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
 // tiny live.json {rev, step}. We open/refresh a single tab from it so the user watches the AI
 // build in the viewport. Loading the native .step+ (not bare STEP) brings the whole feature tree.
 // One published part the MCP currently has open, parsed from the handoff control file.
-struct HandoffDoc { std::string docId, step; long long rev = -1; };
+struct HandoffDoc { std::string docId, step, name; long long rev = -1; };
 
 void pollAiCadHandoff(AppState& st) {
     if (!st.workerStarted) return;   // worker not up — nothing can open yet
@@ -3651,6 +3676,8 @@ void pollAiCadHandoff(AppState& st) {
     // Per-doc_id rev already drawn on screen. "" keys the legacy single-mirror (no doc_id).
     static std::map<std::string, long long> shownRev;
     static std::map<std::string, HandoffDoc> pending;   // doc_id -> latest published, awaiting a safe moment
+    static std::map<std::string, int> openFails;        // doc_id -> consecutive failed open attempts
+    constexpr int kMaxOpenRetries = 30;                 // ~0.5s of frames before giving a part up
     static fs::file_time_type lastMtime{};
     static std::string lastCtrl;   // which control file lastMtime belongs to (reset on a switch)
     std::error_code ec;
@@ -3674,6 +3701,7 @@ void pollAiCadHandoff(AppState& st) {
                     HandoffDoc hd;
                     hd.docId = e.value("doc_id", std::string());
                     hd.step  = e.value("step", std::string());
+                    hd.name  = e.value("name", std::string());
                     hd.rev   = e.value("rev", (long long)-1);
                     if (!hd.step.empty()) published.push_back(hd);
                 }
@@ -3705,6 +3733,7 @@ void pollAiCadHandoff(AppState& st) {
             if (st.docTabs[i].aiHandoff && !live.count(st.docTabs[i].handoffDocId)) {
                 shownRev.erase(st.docTabs[i].handoffDocId);
                 pending.erase(st.docTabs[i].handoffDocId);
+                openFails.erase(st.docTabs[i].handoffDocId);
                 st.closeDocTab(i);
             }
         }
@@ -3751,11 +3780,25 @@ void pollAiCadHandoff(AppState& st) {
                 const int newIdx = st.activeTab;              // applyOpenedDoc made the new tab active
                 st.docTabs[newIdx].aiHandoff = true;
                 st.docTabs[newIdx].handoffDocId = docId;
-                // DEDUPE (fixes the doubled-view bug): if any OTHER tab already mirrors this doc_id
-                // (a racing/stale open), close it so the part shows exactly once.
-                for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
-                    if (i != newIdx && st.docTabs[i].aiHandoff && st.docTabs[i].handoffDocId == docId)
+                st.docTabs[newIdx].handoffName = hd.name;
+                openFails.erase(docId);
+                // DEDUPE (fixes the doubled-view bug): close any OTHER mirror tab that shows the
+                // same part — either the same doc_id (a racing/stale open) OR the same non-empty
+                // NAME under a different doc_id (the agent re-created the part from scratch, so its
+                // old incarnation lingers as a second tab). Only aiHandoff tabs are touched, never a
+                // tab the user opened themselves.
+                // NB: never erase from `pending` here — we are iterating it in the outer range-for;
+                // shownRev is a separate map so erasing it is safe. A stale tab's own pending entry
+                // (if any) is reconciled by the removal pass next frame.
+                for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+                    if (i == newIdx || !st.docTabs[i].aiHandoff) continue;
+                    const bool sameId = st.docTabs[i].handoffDocId == docId;
+                    const bool sameName = !hd.name.empty() && st.docTabs[i].handoffName == hd.name;
+                    if (sameId || sameName) {
+                        shownRev.erase(st.docTabs[i].handoffDocId);
                         st.closeDocTab(i);
+                    }
+                }
                 if (!takeFocus) {
                     // Background open: return focus to the tab the user was on (re-find it by doc id,
                     // since closeDocTab above may have shifted indices) and pulse the new tab.
@@ -3772,11 +3815,30 @@ void pollAiCadHandoff(AppState& st) {
                     st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
                 done.push_back(docId);
             } else if (!opened) {
-                // Open failed (e.g. an assembly the core's doc_open declines). Consume the rev so we
-                // don't retry every frame; a newer rev will still be attempted.
-                shownRev[docId] = hd.rev;
-                done.push_back(docId);
+                // Open failed. This is often TRANSIENT — the agent may have swapped the .step+ a
+                // frame ago and the mesh side-file isn't visible yet — so RETRY for a short window
+                // instead of dropping the part forever (the "a whole part silently never appears"
+                // bug: the old code consumed the rev after ONE failure, and when the agent is done
+                // there is no newer rev to trigger a re-attempt). Give up only after kMaxOpenRetries
+                // so a genuinely-unopenable part (e.g. an assembly the core declines) can't spin.
+                if (++openFails[docId] >= kMaxOpenRetries) {
+                    shownRev[docId] = hd.rev;
+                    done.push_back(docId);
+                    openFails.erase(docId);
+                }
+                // else: leave it pending (no shownRev, not done) so the next frame retries.
             }
+            continue;
+        }
+
+        // Protect the human's unsaved edits: the refresh below is a destructive close+reopen of the
+        // AI's newer snapshot, which would silently discard any local edit the user made to this
+        // mirror (the finished-but-unsaved case that `userMidEdit` — open sketch/PM form — misses).
+        // If the tab is dirty, defer and pulse so the user's work is never lost; the AI's update
+        // applies once they save or discard (clearing `dirty`). True merge/co-edit is future work —
+        // this just guarantees no data loss when both sides touch the same part.
+        if (st.docTabs[idx].dirty) {
+            st.docTabs[idx].aiPulse = true;
             continue;
         }
 
@@ -3792,24 +3854,40 @@ void pollAiCadHandoff(AppState& st) {
         // their orbit/zoom each step.
         const float cy = st.yaw, cp = st.pitch, cz = st.zoom,
                     px = st.pan[0], py = st.pan[1], pz = st.pan[2];
-        st.closeDocTab(idx);
 
+        // OPEN FIRST, CLOSE SECOND. The old close-then-open order had two costs: closing the
+        // ACTIVE tab switched the viewport to a NEIGHBOR doc for the frames until the reopen
+        // landed (a visible flicker on every AI build step), and a failed reopen left the part
+        // gone from the strip entirely for the whole retry window. Opening the new snapshot
+        // first appends a tab at the end (old tab untouched at `idx`), then closing the now-
+        // BACKGROUND old tab is index-fixup only — no neighbor switch, no blank frames — and a
+        // failed open simply leaves the old snapshot on screen while we retry.
         st.handoffQuietOpen = true;
         const bool opened = featureTreeOpenPath(st, hd.step);
         st.handoffQuietOpen = false;
 
         if (opened && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+            st.closeDocTab(idx);   // retire the superseded snapshot (background close; activeTab fixed up)
             st.docTabs[st.activeTab].aiHandoff = true;
             st.docTabs[st.activeTab].handoffDocId = docId;
+            st.docTabs[st.activeTab].handoffName = hd.name;
             st.docTabs[st.activeTab].aiPulse = false;   // user is viewing this refresh — no glow
             st.yaw = cy; st.pitch = cp; st.zoom = cz;
             st.pan[0] = px; st.pan[1] = py; st.pan[2] = pz;
             st.zoomToBBoxRequested = false;                  // keep our restored view; cancel auto-fit
             shownRev[docId] = hd.rev;
-        } else if (!opened) {
-            shownRev[docId] = hd.rev;
+            openFails.erase(docId);
+            done.push_back(docId);
+        } else {
+            // Open failed — the OLD tab is still on screen (nothing was closed), so the user never
+            // loses the part; just retry next frame, bounded so a genuinely-unopenable snapshot
+            // eventually stops trying.
+            if (++openFails[docId] >= kMaxOpenRetries) {
+                shownRev[docId] = hd.rev;
+                openFails.erase(docId);
+                done.push_back(docId);
+            }
         }
-        done.push_back(docId);
     }
     for (const auto& id : done) pending.erase(id);
 }

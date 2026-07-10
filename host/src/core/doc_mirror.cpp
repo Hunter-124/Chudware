@@ -475,9 +475,29 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err,
     docId_ = jstr(res, "doc_id");
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    // The doc_open response is a full ops-response: adopt the feature status / owner map /
+    // datums / mesh it already carries instead of discarding them — the caller then has no
+    // reason to issue the historical follow-up doc_rebuild (a FULL recompile whenever the
+    // open itself was served from the embedded cache).
     featureStatus_ = {};
-    refDatums_ = nlohmann::json::array();
-    storeOwnerMap(nlohmann::json());
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else
+        refDatums_ = nlohmann::json::array();
+    lastOpenedAicm_.clear();
+    if (res.contains("tess") && res["tess"].is_object())
+        lastOpenedAicm_ = jstr(res["tess"], "aicm_path");
+    lastOpenedVolume_ = (res.contains("volume") && res["volume"].is_number())
+                            ? res["volume"].get<double>() : 1.0;
     // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
     if (res.contains("drawings") && res["drawings"].is_array())
         lastOpenedDrawings_ = res["drawings"];

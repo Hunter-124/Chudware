@@ -36,6 +36,18 @@ std::vector<nlohmann::json> split_entity(const nlohmann::json& target,
                                          const std::vector<nlohmann::json>& others,
                                          double px, double py);
 
+// Detailed split: the surviving spans PLUS the doomed span that was removed (so the caller
+// can re-emit it as construction geometry). `whole` => no interior crossing, the entire
+// entity is doomed and `removed` holds a copy of `target`.
+struct SplitResult {
+    std::vector<nlohmann::json> survivors;
+    std::optional<nlohmann::json> removed;
+    bool whole = false;
+};
+SplitResult split_entity_ex(const nlohmann::json& target,
+                            const std::vector<nlohmann::json>& others,
+                            double px, double py);
+
 // Extend the "start"|"end" of `target` (line/arc) to the first crossing ahead. nullopt
 // => nothing ahead (caller raises extend_no_target). circle => UnsupportedEntity.
 std::optional<nlohmann::json> extend_entity(const nlohmann::json& target,

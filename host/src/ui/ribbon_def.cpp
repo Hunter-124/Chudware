@@ -43,6 +43,9 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Hole ---
     { "hole_wizard",       "Hole Wizard",    "hole_wizard",     "Features", "Hole",            true,  nullptr,          false },
+    // Thread Wizard — external/internal ISO/Unified threads on a picked cylindrical face (opens the
+    // "thread" PM form). Icon "thread" is added by the icon agent; falls back to a text glyph meanwhile.
+    { "thread",            "Thread",         "thread",          "Features", "Hole",            true,  nullptr,          false },
 
     // --- Group: Pattern/Mirror ---
     { "linear_pattern",   "Lin. Pattern",   "linear_pattern",  "Features", "Pattern",         true,  nullptr,          false },
@@ -89,6 +92,10 @@ static const RibbonCmd kCmds[] = {
     // engine centerline entity exists, so this is a construction-line variant (see sketch_mode.cpp
     // SketchTool::Centerline). Positioned right after Point per the ribbon spec.
     { "sk_centerline",     "Centerline",     "construction",    "Sketch",   "Draw",            false, nullptr,          false },
+    // Gizmo-driven bulk transforms: in-plane manipulator + relation snapping + viewport HUD.
+    // Placed in Draw right under Point/Centerline per the ribbon spec (moved out of Sketch Tools).
+    { "sk_move_entities",  "Move Ent.",      "move_ent",        "Sketch",   "Draw",            false, nullptr,          false },
+    { "sk_rotate_entities","Rotate Ent.",    "rotate_ent",      "Sketch",   "Draw",            false, nullptr,          false },
     // Ellipse + Text promoted to tall/big tool buttons to match airfoil/spline/slot/polygon.
     { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            true,  nullptr,          false },
 

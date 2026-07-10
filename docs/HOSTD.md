@@ -14,7 +14,7 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 ## Lifecycle
 
 - **Spawn on demand.** No service/systemd/autostart. The first client (GUI or an
-  MCP session with `AI_CAD_ENGINE_DAEMON=1`) tries to connect; on refuse/absent
+  MCP session — daemon mode is the default) tries to connect; on refuse/absent
   it spawns the daemon detached and retries (50 ms doubling backoff, ~15 s
   budget). Simultaneous spawns race on a lock; the loser exits 0 and both
   clients land on the winner.
@@ -42,12 +42,13 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 
 | Variable | Meaning |
 |---|---|
-| `AI_CAD_ENGINE_DAEMON` | `1` = clients route engine calls through the daemon; `0`/unset = legacy in-process load (still the default until the Phase-8 flip). |
+| `AI_CAD_ENGINE_DAEMON` | Unset/`1` = **default**: clients route engine calls through the daemon. `0` = explicit opt-out to the legacy in-process load (kept at least one release; removal is a named N+1 task). |
 | `AICAD_HOSTD_BIN` | Path to the daemon binary a client should spawn. Unset → resolution order: dist → `core/build-occt-linux/bin` → `core/build-linux/bin`. Installed/AppImage deployments pin this. |
 | `AICAD_INSTANCE_KEY` | 12-hex instance key override. Unset → hash of the realpath of the resolved hostd binary (Windows: lowercased path). Same key = same daemon; different keys coexist. |
 | `AICAD_HOSTD_SOCKET` | Explicit socket path override (Linux). |
 | `AICAD_HOSTD_PIPE` | Explicit pipe name override (Windows; `AICAD_HOSTD_SOCKET` also accepted). |
 | `AICAD_HOSTD_LINGER_SECS` | Idle-exit linger, default 120. Tests/smokes use small values (5). |
+| `AICAD_HOSTD_STALECHECK_S` | Stale-binary self-drain check interval, default 60. Tests use 1. |
 | `AI_CAD_LIBAICAD` | Engine .so/.dll the daemon loads (same variable the in-process path uses). |
 
 ## Paths (per platform)
@@ -105,13 +106,32 @@ interval; undo/redo stacks are not persisted. Clean shutdown (idle-exit,
 
 | | GUI | MCP |
 |---|---|---|
-| `=1` | Engine calls go through `DaemonConn` → daemon; viewport gets live `doc.changed` events | `core_bridge` routes via `daemon_bridge.py`; docs shared with GUI + other sessions |
-| `=0`/unset (current default) | In-process dlopen (legacy) | In-process ctypes load (legacy); doc sharing with the GUI is OFF; `.step+` handoff files remain the preview path |
+| unset/`=1` (**default**) | Engine calls go through `DaemonConn` → daemon; viewport gets live `doc.changed` events | `core_bridge` routes via `daemon_bridge.py`; docs shared with GUI + other sessions; NO `.step+` handoff files are written |
+| `=0` (explicit legacy opt-out) | In-process dlopen (legacy) | In-process ctypes load (legacy); doc sharing with the GUI is OFF; `.step+` handoff files remain the preview path |
 
 Mixing modes on the same docs is guarded: a legacy in-process load warns loudly
 when a live daemon socket for the same install exists ("mode divergence" —
-two engines would be two sources of truth). The Phase-8 flip upgrades the
-warning to a refusal.
+two engines would be two sources of truth). The N+1 release upgrades the
+warning to a refusal, alongside deleting the legacy path.
+
+## Version staleness (drain-replace)
+
+The daemon and the engine embed the same configure-time git-describe build id
+(`aicad-hostd --version`, `aicad_build_id()`; the `hello` handshake carries both
+as `git_rev` and `engine_build_id`). Two mechanisms keep a running daemon from
+outliving its binaries:
+
+- **Client-side drain-replace**: on connect, clients compare `hello.git_rev`
+  (the RUNNING daemon) against the build id of the hostd binary ON DISK
+  (`--version` output, cached per binary mtime — one subprocess per rebuild per
+  client process). Mismatch → the client sends `daemon_drain` (refused while a
+  mission is active — the client warns and stays on the old daemon), waits for
+  the old pid to exit, then respawns/reconnects the new build.
+- **Daemon-side self-drain backstop**: the accept loop stats its own binary and
+  the loaded `libaicad` every `AICAD_HOSTD_STALECHECK_S` (default 60 s); an
+  mtime change flips it to draining — existing clients finish, new connects get
+  a `daemon.draining` event and are refused, and the daemon exits once idle.
+  Deploys must still be temp-file + RENAME (never `cp` over a live .so).
 
 ## Installer integration
 

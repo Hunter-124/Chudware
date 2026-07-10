@@ -50,6 +50,7 @@ public:
     std::vector<nlohmann::json> drainEvents();
 
 private:
+    bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);
     bool hello(const std::string& kind, std::string& err);
     // Read lines until a response with `id` arrives; queue event lines seen on the way.

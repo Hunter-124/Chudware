@@ -3,8 +3,8 @@ id: T-SIM11
 title: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz
 workstream: SIM
 owner:
-status: ready
-branch:
+status: todo
+branch: task/T-SIM11-em-solver-family
 depends_on: []
 lane: simulation
 kind: new

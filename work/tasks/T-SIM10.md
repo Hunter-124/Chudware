@@ -3,8 +3,9 @@ id: T-SIM10
 title: Simulate tab — full multi-physics setup tree with per-part-type disclosure
 workstream: SIM
 owner: unassigned
-status: ready
-branch: master
+status: todo
+deferred: yes
+branch: task/T-SIM10-simulate-tab-multiphysics
 depends_on: []
 lane: simulation
 kind: new
@@ -54,3 +55,10 @@ option surface scoped to what the user actually has open so nobody is overwhelme
 
 Builds on the fleet run wf_b556d138-1bf output (motion studies + Simulate workspace routing).
 Do not start while that fleet holds `sim_manager.*` — check `git log -5 -- host/src/ui/sim_manager.cpp` is quiet first.
+
+
+## Supersession note (2026-07-10)
+
+Superseded by T-FIN24 (Simulate tab multi-physics tree retargeted to ui/imgui —
+host/ paths in this file are stale post-T-G24/T-G11). Kept for the original
+disclosure-matrix spec; deferred so the ready queue stays honest.

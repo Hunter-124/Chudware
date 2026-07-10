@@ -91,6 +91,34 @@ graph TD
     T_F8["T-F8: describe_assembly, describe_board (GSL promotion), describe_project"]:::done
     T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::done
   end
+  subgraph WS_FIN["workstream FIN"]
+    T_FIN1["T-FIN1: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU"]:::todo
+    T_FIN10["T-FIN10: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout"]:::todo
+    T_FIN11["T-FIN11: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)"]:::todo
+    T_FIN12["T-FIN12: Stackup advisor - impedance-target-driven layer stackup solve"]:::todo
+    T_FIN13["T-FIN13: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map"]:::todo
+    T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::todo
+    T_FIN15["T-FIN15: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract"]:::todo
+    T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::todo
+    T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::todo
+    T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::todo
+    T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::todo
+    T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::todo
+    T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::todo
+    T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::todo
+    T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::todo
+    T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::todo
+    T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::todo
+    T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::todo
+    T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
+    T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::todo
+    T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::todo
+    T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::todo
+    T_FIN6["T-FIN6: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist"]:::todo
+    T_FIN7["T-FIN7: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run"]:::todo
+    T_FIN8["T-FIN8: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map"]:::todo
+    T_FIN9["T-FIN9: MCU host-board rule pack - decoupling, power sequencing, crystal, boot-strap checks"]:::todo
+  end
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::done
@@ -161,40 +189,46 @@ graph TD
     T_R8["T-R8: Self-hosted PLM server + live co-editing — two people in the same part, no locks"]:::todo
   end
   subgraph WS_RE["workstream RE"]
-    RE_00["RE-00: Reveng contracts + schemas + DAG templates + anchors"]:::doing
-    RE_01["RE-01: reveng_session.py session manager"]:::todo
-    RE_02["RE-02: reveng_tools MCP skeleton + server registration"]:::todo
-    RE_03["RE-03: Reverse Eng workspace tab shell"]:::todo
-    RE_04["RE-04: frames.py video ingest + blur cull"]:::todo
-    RE_05["RE-05: scale mat PDF + ArUco scale solver"]:::todo
-    RE_06["RE-06: RE provisioning entries + reveng_status probe"]:::todo
-    RE_07["RE-07: webcam CameraBackend V4L2 + MF + stub"]:::todo
-    RE_08["RE-08: image decode + GL texture util"]:::todo
-    RE_09["RE-09: pycolmap sparse pipeline"]:::todo
-    RE_10["RE-10: feed-forward SfM fallback VGGT/MapAnything"]:::todo
-    RE_11["RE-11: dense backends OpenMVS + Brush subprocess"]:::todo
-    RE_12["RE-12: single-photo tier TripoSR/TRELLIS approximate"]:::todo
-    RE_13["RE-13: segment_fit Open3D primitive fitting"]:::todo
-    RE_14["RE-14: recon bridge fits → reverse_engineer hints"]:::todo
-    RE_15["RE-15: datasheet ingest via docling"]:::todo
-    RE_16["RE-16: deviation tool mesh vs B-rep"]:::todo
-    RE_17["RE-17: DAG missions wiring + EventJournal events"]:::todo
-    RE_18["RE-18: routing personas + cad_guide reveng section"]:::todo
-    RE_19["RE-19: GUI capture suite webcam + gallery + QR"]:::todo
-    RE_20["RE-20: synthetic bracket fixture generator"]:::todo
-    RE_21["RE-21: GUI reconstruct stage point cloud + splat preview"]:::todo
-    RE_22["RE-22: GUI dim-review + deviation view"]:::todo
-    RE_23["RE-23: Parts Library RE round-trip"]:::todo
-    RE_24["RE-24: E2E scan demo test"]:::todo
-    RE_25["RE-25: E2E datasheet demo bearing 6205"]:::todo
-    RE_26["RE-26: degradation matrix + license_debt updates"]:::todo
-    RE_27["RE-27: ribbon polish + icons + screenshots"]:::todo
-    RE_28["RE-28: 3DGS splat renderer"]:::todo
+    RE_00["RE-00: Reveng contracts + schemas + DAG templates + anchors"]:::done
+    RE_01["RE-01: reveng_session.py session manager"]:::done
+    RE_02["RE-02: reveng_tools MCP skeleton + server registration"]:::done
+    RE_03["RE-03: Reverse Eng workspace tab shell"]:::done
+    RE_04["RE-04: frames.py video ingest + blur cull"]:::done
+    RE_05["RE-05: scale mat PDF + ArUco scale solver"]:::done
+    RE_06["RE-06: RE provisioning entries + reveng_status probe"]:::done
+    RE_07["RE-07: webcam CameraBackend V4L2 + MF + stub"]:::done
+    RE_08["RE-08: image decode + GL texture util"]:::done
+    RE_09["RE-09: pycolmap sparse pipeline"]:::done
+    RE_10["RE-10: feed-forward SfM fallback VGGT/MapAnything"]:::done
+    RE_11["RE-11: dense backends OpenMVS + Brush subprocess"]:::done
+    RE_12["RE-12: single-photo tier TripoSR/TRELLIS approximate"]:::done
+    RE_13["RE-13: segment_fit Open3D primitive fitting"]:::done
+    RE_14["RE-14: recon bridge fits → reverse_engineer hints"]:::done
+    RE_15["RE-15: datasheet ingest via docling"]:::done
+    RE_16["RE-16: deviation tool mesh vs B-rep"]:::done
+    RE_17["RE-17: DAG missions wiring — reveng orchestration keystone"]:::done
+    RE_18["RE-18: routing personas + cad_guide reveng section"]:::done
+    RE_19["RE-19: GUI capture suite webcam + gallery + QR"]:::done
+    RE_20["RE-20: synthetic bracket fixture generator"]:::done
+    RE_21["RE-21: GUI reconstruct stage point cloud + splat preview"]:::done
+    RE_22["RE-22: GUI dim-review + deviation view"]:::done
+    RE_23["RE-23: Parts Library RE round-trip"]:::done
+    RE_24["RE-24: E2E scan demo test"]:::done
+    RE_25["RE-25: E2E datasheet demo bearing 6205"]:::done
+    RE_26["RE-26: degradation matrix + license_debt updates"]:::review
+    RE_27["RE-27: ribbon polish + icons + screenshots"]:::done
+    RE_28["RE-28: 3DGS splat renderer"]:::done
+    RE_29["RE-29: Reveng web/part-number research ingestion (datasheet lane front-end)"]:::done
+    RE_30["RE-30: Reveng Sources — source-mode selector + adaptive stepper (multi-lane)"]:::done
+    RE_31["RE-31: Fix _FakeFastMCP sys.modules test pollution (MCP test isolation)"]:::done
+    RE_32["RE-32: Parts Library 'Reverse Engineer / Generate 3D model' context menu"]:::done
+    RE_33["RE-33: Parts Library one-call 'make un-modeled part' flow (research→build→attach)"]:::done
+    RE_34["RE-34: Fix research_and_ingest monkeypatch seam (ordering-dependent test failure)"]:::done
   end
   subgraph WS_SIM["workstream SIM"]
     T_SIM1["T-SIM1: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end"]:::done
-    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::ready
-    T_SIM11["T-SIM11: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz"]:::ready
+    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::todo
+    T_SIM11["T-SIM11: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz"]:::todo
     T_SIM2["T-SIM2: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport"]:::done
     T_SIM3["T-SIM3: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish"]:::done
     T_SIM4["T-SIM4: Solver validation depth - fatigue S-N anchor, FEA live bridge integration test, sim_audit extension"]:::done
@@ -328,6 +362,18 @@ graph TD
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
   end
+  subgraph WS_perf["workstream perf"]
+    T_PERF1["T-PERF1: GUI async applyOps conversions (never block GL thread on edits)"]:::todo
+    T_PERF10["T-PERF10: Perf odds & ends — auto-coincide scoping, fillet bisect, unify skip, AICM shared-mem, CEF lazy init, idle render throttle, profiler fix, scrape pool"]:::todo
+    T_PERF2["T-PERF2: Async latest-wins drag pipelines (sketch/3D/push-pull/asm/explode)"]:::todo
+    T_PERF3["T-PERF3: Mesh load off the GL thread (loader worker + meshGen)"]:::todo
+    T_PERF4["T-PERF4: Async tab switch, file open/save, sim_mesh, drawing HLR"]:::todo
+    T_PERF5["T-PERF5: Per-doc engine locking (split g_mtx)"]:::todo
+    T_PERF6["T-PERF6: Kernel copy amplification — checkpoint O(N²), blob out-of-line, hit-path copies"]:::todo
+    T_PERF7["T-PERF7: Owner-map checkpointing + size-relative tess deflection (DECISION)"]:::todo
+    T_PERF8["T-PERF8: Sketcher solver interactive mode — LDLT-first, in-trial deadline, single-QR redundancy, tangency warm-start"]:::todo
+    T_PERF9["T-PERF9: Sketch connected-component decomposition"]:::todo
+  end
   subgraph WS_setup["workstream setup"]
     T_S1["T-S1: Apply for vendor API keys"]:::todo
     T_S2["T-S2: Land the AI-experience lane (recon/GSL) uncommitted files"]:::done
@@ -351,11 +397,12 @@ graph TD
   RE_01 --> RE_15
   RE_06 --> RE_15
   RE_01 --> RE_16
-  RE_02 --> RE_17
-  RE_09 --> RE_17
+  RE_01 --> RE_17
+  RE_10 --> RE_17
   RE_11 --> RE_17
   RE_13 --> RE_17
   RE_15 --> RE_17
+  RE_16 --> RE_17
   RE_00 --> RE_18
   RE_03 --> RE_19
   RE_07 --> RE_19
@@ -380,6 +427,19 @@ graph TD
   RE_21 --> RE_27
   RE_22 --> RE_27
   RE_00 --> RE_28
+  RE_02 --> RE_29
+  RE_15 --> RE_29
+  RE_03 --> RE_30
+  RE_19 --> RE_30
+  RE_29 --> RE_30
+  RE_33 --> RE_32
+  RE_03 --> RE_32
+  RE_23 --> RE_32
+  RE_17 --> RE_33
+  RE_23 --> RE_33
+  RE_29 --> RE_33
+  RE_29 --> RE_34
+  RE_33 --> RE_34
   T_S1 --> T_A1
   T_A1 --> T_A2
   T_A2 --> T_A3
@@ -453,6 +513,39 @@ graph TD
   T_A3 --> T_F4
   T_F5 --> T_F6
   T_F7 --> T_F8
+  T_FIN8 --> T_FIN10
+  T_FIN8 --> T_FIN11
+  T_FIN8 --> T_FIN13
+  T_FIN8 --> T_FIN16
+  T_FIN13 --> T_FIN16
+  T_FIN15 --> T_FIN16
+  T_FIN16 --> T_FIN17
+  T_FIN16 --> T_FIN19
+  T_SIM5 --> T_FIN19
+  T_FIN1 --> T_FIN2
+  T_FIN15 --> T_FIN20
+  T_FIN16 --> T_FIN21
+  T_FIN15 --> T_FIN22
+  T_FIN7 --> T_FIN23
+  T_FIN13 --> T_FIN23
+  T_FIN1 --> T_FIN24
+  T_FIN15 --> T_FIN24
+  T_FIN16 --> T_FIN24
+  T_FIN3 --> T_FIN25
+  T_FIN6 --> T_FIN25
+  T_FIN9 --> T_FIN25
+  T_FIN11 --> T_FIN25
+  T_FIN17 --> T_FIN25
+  T_FIN23 --> T_FIN25
+  T_FIN24 --> T_FIN25
+  T_FIN25 --> T_FIN26
+  T_FIN2 --> T_FIN3
+  T_FIN1 --> T_FIN5
+  T_FIN4 --> T_FIN5
+  T_FIN1 --> T_FIN6
+  T_FIN8 --> T_FIN6
+  T_FIN3 --> T_FIN7
+  T_FIN8 --> T_FIN9
   T_G9 --> T_G10
   T_G3 --> T_G10
   T_G10 --> T_G11
@@ -505,6 +598,11 @@ graph TD
   T_M6 --> T_M3
   T_P1 --> T_P2
   T_P2 --> T_P3
+  T_PERF1 --> T_PERF4
+  T_PERF1 --> T_PERF5
+  T_PERF2 --> T_PERF5
+  T_PERF3 --> T_PERF5
+  T_PERF8 --> T_PERF9
   T_R1 --> T_R2
   T_R2 --> T_R3
   T_R2 --> T_R4

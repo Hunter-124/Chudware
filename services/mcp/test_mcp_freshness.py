@@ -188,7 +188,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "ecad_new_schematic", "ecad_new_pcb", "ecad_place_symbol",
         "ecad_wire", "ecad_label", "ecad_add_power", "ecad_add_zone",
         "ecad_autoroute", "ecad_fill_zones", "ecad_run_erc", "ecad_run_drc",
-        "ecad_run_dfm", "ecad_simulate", "ecad_to_3d", "ecad_export",
+        "ecad_run_dfm", "ecad_run_hostcheck", "ecad_simulate", "ecad_to_3d", "ecad_export",
         "ecad_status", "ecad_find_part", "ecad_design", "ecad_sweep",
         "ecad_tf", "ecad_update_from_sch", "ecad_check_impedance",
         "ecad_check_diff_impedance",

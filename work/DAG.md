@@ -107,7 +107,7 @@ graph TD
     T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::done
     T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::todo
     T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::done
-    T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::todo
+    T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::doing
     T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::todo
     T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::todo
     T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
@@ -115,7 +115,7 @@ graph TD
     T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::done
     T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::done
     T_FIN6["T-FIN6: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist"]:::done
-    T_FIN7["T-FIN7: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run"]:::doing
+    T_FIN7["T-FIN7: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run"]:::done
     T_FIN8["T-FIN8: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map"]:::done
     T_FIN9["T-FIN9: MCU host-board rule pack - decoupling, power sequencing, crystal, boot-strap checks"]:::done
   end

@@ -1341,6 +1341,71 @@ def test_simulate_motion_rejects_non_dimensional_mate(tmp_path):
     assert "coincident" in out["error"] or "dimensional" in out["error"], out
 
 
+def test_simulate_motion_kinematics_only_has_no_dynamics_key(tmp_path):
+    """Regression contract (T-FIN20): the default (kinematics) result gains NO new key."""
+    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+    r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
+                                     "start": 0.0, "stop": 30.0, "steps": 4,
+                                     "check_interference": False})
+    assert r["ok"], r
+    assert "dynamics" not in r, sorted(r.keys())
+
+
+def test_simulate_motion_dynamics_block(tmp_path):
+    """dynamics={} adds the rigid-body block: per-component mass from geometry x density,
+    per-frame joint reactions for the resolved mates (the angle drive + the parallel lock),
+    per_joint_worst + worst_case summaries (T-FIN20)."""
+    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+    r, _ = _call("simulate_motion", {
+        "doc_id": asm, "mate_id": mate_id, "start": 0.0, "stop": 90.0, "steps": 8,
+        "check_interference": False,
+        "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 2.7,
+                     "gravity": [0, 0, -9.81]}})
+    assert r["ok"], r
+    dyn = r.get("dynamics")
+    assert dyn, r
+    # Every non-pattern component got a mass (Bar 40x4x4 mm @2.7 = 1.728 g; Obstacle 2.7 g).
+    masses = {b["component"]: b["mass_kg"] for b in dyn["bodies"]}
+    assert len(masses) == 3, masses
+    assert any(abs(m - 0.001728) < 1e-6 for m in masses.values()), masses
+    # Frames span duration_s and carry reactions for the resolved mates.
+    frames = dyn["frames"]
+    assert len(frames) == len(r["trajectory"])
+    assert abs(frames[-1]["t_s"] - 0.8) < 1e-9
+    mids = {x["mate_id"] for x in frames[0]["reactions"]}
+    assert mate_id in mids, (mids, dyn.get("warnings"))
+    assert dyn.get("worst_case"), dyn
+    assert dyn.get("per_joint_worst"), dyn
+
+
+def test_motion_fea_handoff_dry_run(tmp_path):
+    """motion_fea_handoff (dry_run): worst-case joint reactions become face loads on the
+    selected component and a VALID aicad.simhandoff/1 envelope (coupling motion_to_fea,
+    case-labelled conditions with provenance) is attached (T-FIN20)."""
+    from mcp_server import simhandoff as sh
+
+    asm, mate_id, arm = _build_swinging_arm_assembly(tmp_path)
+    r, _ = _call("motion_fea_handoff", {
+        "doc_id": asm, "component": arm, "fixtures": [{"of": "face", "pick": "largest"}],
+        "mate_id": mate_id, "start": 0.0, "stop": 90.0, "steps": 8,
+        "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 7.85},
+        "dry_run": True})
+    assert r["ok"], r
+    assert r["component"] == arm
+    assert r["part_doc_id"]
+    assert r["loads_applied"], r
+    env = r.get("simhandoff")
+    assert env and env.get("coupling") == "motion_to_fea", env
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    conds = env["conditions"]
+    assert any(c["kind"] == "force" and c["units"] == "N" for c in conds), conds
+    assert all(c.get("case") for c in conds), conds
+    assert all("simulate_motion" in c["provenance"] for c in conds), conds
+    assert env["source"]["domain"] == "motion" and env["target"]["domain"] == "fea", env
+    # dry_run never solves.
+    assert r["fea"] is None, r
+
+
 # ================================================================ W2 hole-frame determinism
 # hole/bolt_circle `positions` frame: origin = OUTER-boundary centroid (stable when the face
 # already carries holes), axes = SketchPlane convention (u = world +X projected, v = n×u).

@@ -1,0 +1,1868 @@
+{
+ "banks": {
+  "0": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "1": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "2": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "3": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "6": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "7": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "8": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  }
+ },
+ "capabilities": {
+  "clock_pins_known": false,
+  "diff_pairs_known": true
+ },
+ "config": {
+  "notes": "PARTIAL SEED: user-IO balls with banks + true A/B pairs from prjtrellis. PCLK clock-capable flags, VCCIO ball sites and sysCONFIG/JTAG dedicated pins are not yet populated \u2014 clock and config checks SKIP for this device. Extend this JSON (data-only) from Lattice FPGA-DS-02012 pinout files.",
+  "required": {}
+ },
+ "constraint_dialect": "lpf",
+ "coverage": "partial",
+ "device": "LFE5U-25F-CABGA256",
+ "family": "ecp5",
+ "package": "CABGA256",
+ "pins": {
+  "A10": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C42B",
+   "pair": "R0C42AB",
+   "pol": "n",
+   "role": null
+  },
+  "A11": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C53A",
+   "pair": "R0C53AB",
+   "pol": "p",
+   "role": null
+  },
+  "A12": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C53B",
+   "pair": "R0C53AB",
+   "pol": "n",
+   "role": null
+  },
+  "A13": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C65A",
+   "pair": "R0C65AB",
+   "pol": "p",
+   "role": null
+  },
+  "A14": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C65B",
+   "pair": "R0C65AB",
+   "pol": "n",
+   "role": null
+  },
+  "A15": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C67B",
+   "pair": "R0C67AB",
+   "pol": "n",
+   "role": null
+  },
+  "A2": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C4A",
+   "pair": "R0C4AB",
+   "pol": "p",
+   "role": null
+  },
+  "A3": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C6A",
+   "pair": "R0C6AB",
+   "pol": "p",
+   "role": null
+  },
+  "A4": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C6B",
+   "pair": "R0C6AB",
+   "pol": "n",
+   "role": null
+  },
+  "A5": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C18A",
+   "pair": "R0C18AB",
+   "pol": "p",
+   "role": null
+  },
+  "A6": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C18B",
+   "pair": "R0C18AB",
+   "pol": "n",
+   "role": null
+  },
+  "A7": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C29A",
+   "pair": "R0C29AB",
+   "pol": "p",
+   "role": null
+  },
+  "A8": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C29B",
+   "pair": "R0C29AB",
+   "pol": "n",
+   "role": null
+  },
+  "A9": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C42A",
+   "pair": "R0C42AB",
+   "pol": "p",
+   "role": null
+  },
+  "B1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C0A",
+   "pair": "R2C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "B10": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C44A",
+   "pair": "R0C44AB",
+   "pol": "p",
+   "role": null
+  },
+  "B11": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C49A",
+   "pair": "R0C49AB",
+   "pol": "p",
+   "role": null
+  },
+  "B12": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C56A",
+   "pair": "R0C56AB",
+   "pol": "p",
+   "role": null
+  },
+  "B13": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C60A",
+   "pair": "R0C60AB",
+   "pol": "p",
+   "role": null
+  },
+  "B14": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C67A",
+   "pair": "R0C67AB",
+   "pol": "p",
+   "role": null
+  },
+  "B15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C72B",
+   "pair": "R2C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "B16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C72A",
+   "pair": "R2C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "B2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C0B",
+   "pair": "R2C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "B3": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C4B",
+   "pair": "R0C4AB",
+   "pol": "n",
+   "role": null
+  },
+  "B4": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C11B",
+   "pair": "R0C11AB",
+   "pol": "n",
+   "role": null
+  },
+  "B5": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C15B",
+   "pair": "R0C15AB",
+   "pol": "n",
+   "role": null
+  },
+  "B6": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C22B",
+   "pair": "R0C22AB",
+   "pol": "n",
+   "role": null
+  },
+  "B7": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C27B",
+   "pair": "R0C27AB",
+   "pol": "n",
+   "role": null
+  },
+  "B8": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C35B",
+   "pair": "R0C35AB",
+   "pol": "n",
+   "role": null
+  },
+  "B9": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C38A",
+   "pair": "R0C38AB",
+   "pol": "p",
+   "role": null
+  },
+  "C1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C0A",
+   "pair": "R5C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "C10": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C44B",
+   "pair": "R0C44AB",
+   "pol": "n",
+   "role": null
+  },
+  "C11": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C49B",
+   "pair": "R0C49AB",
+   "pol": "n",
+   "role": null
+  },
+  "C12": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C56B",
+   "pair": "R0C56AB",
+   "pol": "n",
+   "role": null
+  },
+  "C13": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C60B",
+   "pair": "R0C60AB",
+   "pol": "n",
+   "role": null
+  },
+  "C14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C72C",
+   "pair": "R2C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "C15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C72B",
+   "pair": "R5C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "C16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C72A",
+   "pair": "R5C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "C2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C0B",
+   "pair": "R5C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "C3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C0C",
+   "pair": "R2C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "C4": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C11A",
+   "pair": "R0C11AB",
+   "pol": "p",
+   "role": null
+  },
+  "C5": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C15A",
+   "pair": "R0C15AB",
+   "pol": "p",
+   "role": null
+  },
+  "C6": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C22A",
+   "pair": "R0C22AB",
+   "pol": "p",
+   "role": null
+  },
+  "C7": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C27A",
+   "pair": "R0C27AB",
+   "pol": "p",
+   "role": null
+  },
+  "C8": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C35A",
+   "pair": "R0C35AB",
+   "pol": "p",
+   "role": null
+  },
+  "C9": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C38B",
+   "pair": "R0C38AB",
+   "pol": "n",
+   "role": null
+  },
+  "D1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C0A",
+   "pair": "R8C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "D10": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C47A",
+   "pair": "R0C47AB",
+   "pol": "p",
+   "role": null
+  },
+  "D11": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C51A",
+   "pair": "R0C51AB",
+   "pol": "p",
+   "role": null
+  },
+  "D12": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C58A",
+   "pair": "R0C58AB",
+   "pol": "p",
+   "role": null
+  },
+  "D13": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C62A",
+   "pair": "R0C62AB",
+   "pol": "p",
+   "role": null
+  },
+  "D14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C72D",
+   "pair": "R2C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "D16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C72A",
+   "pair": "R8C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "D3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R2C0D",
+   "pair": "R2C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "D4": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C9B",
+   "pair": "R0C9AB",
+   "pol": "n",
+   "role": null
+  },
+  "D5": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C13B",
+   "pair": "R0C13AB",
+   "pol": "n",
+   "role": null
+  },
+  "D6": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C20B",
+   "pair": "R0C20AB",
+   "pol": "n",
+   "role": null
+  },
+  "D7": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C24B",
+   "pair": "R0C24AB",
+   "pol": "n",
+   "role": null
+  },
+  "D8": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C33B",
+   "pair": "R0C33AB",
+   "pol": "n",
+   "role": null
+  },
+  "D9": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C40A",
+   "pair": "R0C40AB",
+   "pol": "p",
+   "role": null
+  },
+  "E1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C0D",
+   "pair": "R11C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "E10": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C47B",
+   "pair": "R0C47AB",
+   "pol": "n",
+   "role": null
+  },
+  "E11": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C51B",
+   "pair": "R0C51AB",
+   "pol": "n",
+   "role": null
+  },
+  "E12": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C58B",
+   "pair": "R0C58AB",
+   "pol": "n",
+   "role": null
+  },
+  "E13": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C62B",
+   "pair": "R0C62AB",
+   "pol": "n",
+   "role": null
+  },
+  "E14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C72C",
+   "pair": "R5C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "E15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C72B",
+   "pair": "R8C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "E16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C72D",
+   "pair": "R11C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "E2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C0B",
+   "pair": "R8C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "E3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C0C",
+   "pair": "R5C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "E4": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C9A",
+   "pair": "R0C9AB",
+   "pol": "p",
+   "role": null
+  },
+  "E5": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C13A",
+   "pair": "R0C13AB",
+   "pol": "p",
+   "role": null
+  },
+  "E6": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C20A",
+   "pair": "R0C20AB",
+   "pol": "p",
+   "role": null
+  },
+  "E7": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C24A",
+   "pair": "R0C24AB",
+   "pol": "p",
+   "role": null
+  },
+  "E8": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C33A",
+   "pair": "R0C33AB",
+   "pol": "p",
+   "role": null
+  },
+  "E9": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "R0C40B",
+   "pair": "R0C40AB",
+   "pol": "n",
+   "role": null
+  },
+  "F1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C0A",
+   "pair": "R14C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "F12": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C72D",
+   "pair": "R8C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "F13": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C72C",
+   "pair": "R8C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "F14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C72D",
+   "pair": "R5C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "F15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C72C",
+   "pair": "R11C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "F16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C72A",
+   "pair": "R14C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "F2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C0C",
+   "pair": "R11C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "F3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R5C0D",
+   "pair": "R5C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "F4": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C0C",
+   "pair": "R8C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "F5": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R8C0D",
+   "pair": "R8C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "G1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C0A",
+   "pair": "R20C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "G12": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C72A",
+   "pair": "R11C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "G13": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C72B",
+   "pair": "R11C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "G14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C72C",
+   "pair": "R14C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "G15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C72B",
+   "pair": "R14C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "G16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C72A",
+   "pair": "R20C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "G2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C0B",
+   "pair": "R14C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "G3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C0C",
+   "pair": "R14C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "G4": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C0B",
+   "pair": "R11C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "G5": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R11C0A",
+   "pair": "R11C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "H12": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C72A",
+   "pair": "R17C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "H13": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C72B",
+   "pair": "R17C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "H14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C72D",
+   "pair": "R14C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "H15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C72B",
+   "pair": "R20C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "H2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C0B",
+   "pair": "R20C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "H3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R14C0D",
+   "pair": "R14C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "H4": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C0B",
+   "pair": "R17C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "H5": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C0A",
+   "pair": "R17C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "J1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C0A",
+   "pair": "R23C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "J12": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C72D",
+   "pair": "R17C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "J13": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C72C",
+   "pair": "R17C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "J14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C72C",
+   "pair": "R20C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "J15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C72B",
+   "pair": "R23C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "J16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C72A",
+   "pair": "R23C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "J2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C0B",
+   "pair": "R23C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "J3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C0C",
+   "pair": "R20C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "J4": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C0C",
+   "pair": "R17C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "J5": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R17C0D",
+   "pair": "R17C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "K1": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C0C",
+   "pair": "R23C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "K12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C72B",
+   "pair": "R29C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "K13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C72A",
+   "pair": "R29C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "K14": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C72D",
+   "pair": "R20C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "K15": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C72D",
+   "pair": "R23C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "K16": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C72C",
+   "pair": "R23C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "K2": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R23C0D",
+   "pair": "R23C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "K3": {
+   "bank": "7",
+   "clock": false,
+   "kind": "io",
+   "name": "R20C0D",
+   "pair": "R20C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "K4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C0A",
+   "pair": "R29C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "K5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C0B",
+   "pair": "R29C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "L1": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C0A",
+   "pair": "R26C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "L12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C72D",
+   "pair": "R29C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "L13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C72C",
+   "pair": "R29C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "L14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C72C",
+   "pair": "R32C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "L15": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C72B",
+   "pair": "R26C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "L16": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C72A",
+   "pair": "R26C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "L2": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C0B",
+   "pair": "R26C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "L3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C0C",
+   "pair": "R32C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "L4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C0C",
+   "pair": "R29C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "L5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R29C0D",
+   "pair": "R29C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "M1": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C0C",
+   "pair": "R26C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "M11": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C72A",
+   "pair": "R47C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "M12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C72C",
+   "pair": "R44C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "M13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C72C",
+   "pair": "R35C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "M14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C72D",
+   "pair": "R32C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "M15": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C72D",
+   "pair": "R26C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "M16": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C72C",
+   "pair": "R26C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "M2": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R26C0D",
+   "pair": "R26C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "M3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C0D",
+   "pair": "R32C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "M4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C0C",
+   "pair": "R35C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "M5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C0C",
+   "pair": "R44C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "M6": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C0A",
+   "pair": "R47C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "M7": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C9B",
+   "pair": "R50C9AB",
+   "pol": "n",
+   "role": null
+  },
+  "M8": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C15B",
+   "pair": "R50C15AB",
+   "pol": "n",
+   "role": null
+  },
+  "M9": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C18A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "N1": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C0A",
+   "pair": "R32C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "N11": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C72B",
+   "pair": "R47C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "N12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C72D",
+   "pair": "R44C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "N13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C72A",
+   "pair": "R38C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "N14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C72D",
+   "pair": "R35C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "N16": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C72A",
+   "pair": "R32C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "N3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C0D",
+   "pair": "R35C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "N4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C0A",
+   "pair": "R38C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "N5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C0D",
+   "pair": "R44C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "N6": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C0B",
+   "pair": "R47C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "N7": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C9A",
+   "pair": "R50C9AB",
+   "pol": "p",
+   "role": null
+  },
+  "N8": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C15A",
+   "pair": "R50C15AB",
+   "pol": "p",
+   "role": null
+  },
+  "P1": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C0A",
+   "pair": "R35C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "P11": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C72C",
+   "pair": "R47C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "P12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C72D",
+   "pair": "R47C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "P13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C72A",
+   "pair": "R41C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "P14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C72B",
+   "pair": "R38C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "P15": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C72B",
+   "pair": "R32C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "P16": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C72A",
+   "pair": "R35C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "P2": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R32C0B",
+   "pair": "R32C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "P3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C0B",
+   "pair": "R38C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "P4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C0A",
+   "pair": "R41C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "P5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C0D",
+   "pair": "R47C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "P6": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R47C0C",
+   "pair": "R47C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "P7": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C6B",
+   "pair": "R50C6AB",
+   "pol": "n",
+   "role": null
+  },
+  "P8": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C13B",
+   "pair": "R50C13AB",
+   "pol": "n",
+   "role": null
+  },
+  "R1": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C0B",
+   "pair": "R35C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "R12": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C72A",
+   "pair": "R44C72AB",
+   "pol": "p",
+   "role": null
+  },
+  "R13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C72C",
+   "pair": "R41C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "R14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C72B",
+   "pair": "R41C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "R15": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C72C",
+   "pair": "R38C72CD",
+   "pol": "p",
+   "role": null
+  },
+  "R16": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R35C72B",
+   "pair": "R35C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "R2": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C0C",
+   "pair": "R38C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "R3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C0B",
+   "pair": "R41C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "R4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C0C",
+   "pair": "R41C0CD",
+   "pol": "p",
+   "role": null
+  },
+  "R5": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C0A",
+   "pair": "R44C0AB",
+   "pol": "p",
+   "role": null
+  },
+  "R6": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C4B",
+   "pair": "R50C4AB",
+   "pol": "n",
+   "role": null
+  },
+  "R7": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C6A",
+   "pair": "R50C6AB",
+   "pol": "p",
+   "role": null
+  },
+  "R8": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C13A",
+   "pair": "R50C13AB",
+   "pol": "p",
+   "role": null
+  },
+  "T13": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C72B",
+   "pair": "R44C72AB",
+   "pol": "n",
+   "role": null
+  },
+  "T14": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C72D",
+   "pair": "R41C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "T15": {
+   "bank": "3",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C72D",
+   "pair": "R38C72CD",
+   "pol": "n",
+   "role": null
+  },
+  "T2": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R38C0D",
+   "pair": "R38C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "T3": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R41C0D",
+   "pair": "R41C0CD",
+   "pol": "n",
+   "role": null
+  },
+  "T4": {
+   "bank": "6",
+   "clock": false,
+   "kind": "io",
+   "name": "R44C0B",
+   "pair": "R44C0AB",
+   "pol": "n",
+   "role": null
+  },
+  "T6": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C4A",
+   "pair": "R50C4AB",
+   "pol": "p",
+   "role": null
+  },
+  "T7": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C11A",
+   "pair": "R50C11AB",
+   "pol": "p",
+   "role": null
+  },
+  "T8": {
+   "bank": "8",
+   "clock": false,
+   "kind": "io",
+   "name": "R50C11B",
+   "pair": "R50C11AB",
+   "pol": "n",
+   "role": null
+  }
+ },
+ "schema": "aicad.fpga_device/1",
+ "sources": [
+  "prjtrellis-db (ISC) ECP5/LFE5U-25F/iodb.json \u2014 CABGA256 ball map + bank/pair metadata",
+  "Lattice ECP5 Family Data Sheet FPGA-DS-02012 \u2014 VCCIO ranges"
+ ],
+ "vendor": "lattice"
+}

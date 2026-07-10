@@ -791,7 +791,72 @@ def _apply_symbol_eng(syms: dict) -> None:
             syms[libid]["eng"] = eng
 
 
+# ─── FPGA parts (T-FIN11) ─────────────────────────────────────────────────────
+# Symbol pins are GENERATED from the aicad.fpga_device/1 JSON seed (engine/ecad/
+# fpga_devices/) so the schematic part can never drift from the bank/pin model the
+# FPGA checks and constraint exporters use. Only the full-coverage seed (the
+# iCE40UP5K-SG48) gets a placeable symbol+footprint; partial seeds (ECP5/XC7A35T
+# classes) are check/export data — tag any symbol with fields {"fpga_device": ...}
+# to bind it to one of those.
+
+def _make_fpga_symbols() -> dict:
+    try:
+        from engine.ecad import fpga as _fpga
+    except ImportError:  # pragma: no cover - starter must import standalone
+        return {}
+    syms: dict[str, dict] = {}
+    for dev in _fpga.load_devices().values():
+        if dev.get("coverage") != "full":
+            continue
+        devid = dev["device"]
+        libid = f"FPGA:{devid}"
+        pin_items = sorted(dev.get("pins", {}).items(),
+                           key=lambda kv: (int(kv[0]) if kv[0].isdigit() else 10_000, kv[0]))
+        n = len(pin_items)
+        half = (n + 1) // 2
+        rows = max(half, n - half)
+        h = rows * 2.54 + 5.08
+        w = 30.48
+        pins = []
+        for i, (num, pd) in enumerate(pin_items):
+            nm = pd.get("name") or num
+            ptype = {"power": "power_in", "config": "input", "jtag": "input"}.get(
+                pd.get("kind"), "bidirectional")
+            if pd.get("role") == "GND":
+                ptype = "power_in"
+            if i < half:   # left column, top to bottom
+                y = h / 2 - 2.54 - i * 2.54
+                pins.append(_pin(num, nm, [-w / 2 - 2.54, y], 180.0, ptype))
+            else:          # right column, top to bottom
+                y = h / 2 - 2.54 - (i - half) * 2.54
+                pins.append(_pin(num, nm, [w / 2 + 2.54, y], 0.0, ptype))
+        syms[libid] = _sym(
+            libid, devid, "U", devid,
+            f"{dev.get('vendor', '').title()} {dev.get('family')} FPGA, {dev.get('package')} "
+            f"package (aicad.fpga_device/1 seed)",
+            f"fpga {dev.get('family')} {dev.get('vendor')} programmable logic",
+            pins=pins,
+            graphics=[_rect(-w / 2, -h / 2, w / 2, h / 2)],
+            footprint_filters=["QFN-48*"] if dev.get("package") == "SG48" else [],
+            eng={
+                "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+                "supply": {"rails": [
+                    _rail("VCC", 1.14, 1.2, 1.26, None, None),
+                    _rail("VCCIO", 1.71, 3.3, 3.465, None, None),
+                ], "voltage_domains": ["VCC", "VCCIO_0", "VCCIO_1", "VCCIO_2"],
+                    "sequencing": None},
+                "sources": ["research_datasheet_fetch: Lattice iCE40 UltraPlus Family Data"
+                            " Sheet FPGA-DS-02008 — VCC 1.2 V core, VCCIO 1.8-3.3 V,"
+                            " industrial Tj. Currents are design-dependent (null)."],
+            },
+        )
+        # let the device model be found by libid/value AND record it explicitly
+        syms[libid]["fields"] = {"fpga_device": devid}
+    return syms
+
+
 SYMBOLS: dict[str, dict] = _make_symbols()
+SYMBOLS.update(_make_fpga_symbols())
 _apply_symbol_eng(SYMBOLS)
 
 
@@ -1159,6 +1224,30 @@ def _make_footprints() -> dict:
         description="Mounting hole 3.2 mm for M3 screw (NPTH, no copper)",
     )
 
+    # ── QFN-48-1EP 7x7 0.5mm pitch (iCE40UP5K-SG48 et al; IPC-7351 nominal) ──
+    # 12 pads/side, pad 0.28x0.85 centred at +/-3.45; exposed pad 5.6x5.6 = pin 49 (GND).
+    qfn48_pads = []
+    for i in range(12):   # pins 1-12: left side, top to bottom
+        y = (5.5 - i) * 0.5
+        qfn48_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -3.45, y, 0.85, 0.28, 0.25))
+    for i in range(12):   # pins 13-24: bottom, left to right
+        x = (i - 5.5) * 0.5
+        qfn48_pads.append(_smd_pad(f"p{i+13}", str(i + 13), x, -3.45, 0.28, 0.85, 0.25))
+    for i in range(12):   # pins 25-36: right side, bottom to top
+        y = (i - 5.5) * 0.5
+        qfn48_pads.append(_smd_pad(f"p{i+25}", str(i + 25), 3.45, y, 0.85, 0.28, 0.25))
+    for i in range(12):   # pins 37-48: top, right to left
+        x = (5.5 - i) * 0.5
+        qfn48_pads.append(_smd_pad(f"p{i+37}", str(i + 37), x, 3.45, 0.28, 0.85, 0.25))
+    qfn48_pads.append(_smd_pad("p49", "49", 0.0, 0.0, 5.6, 5.6, 0.05))  # EP = GND paddle
+    fps["Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm"] = _fp(
+        "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm",
+        pads=qfn48_pads,
+        graphics=_silk_box(-3.6, -3.6, 3.6, 3.6) + _crtyd_box(-4.15, -4.15, 4.15, 4.15)
+        + [_circle(-4.0, 3.2, 0.15)],   # pin-1 dot
+        description="QFN-48 7x7 mm 0.5 mm pitch with exposed pad (pin 49)",
+    )
+
     # Final pass: clip every footprint's silk off its pads so no generated footprint
     # ships silk over copper (DFM silk_over_pad) — generic, covers all sizes + future parts.
     for fp in fps.values():
@@ -1210,6 +1299,7 @@ _FOOTPRINT_ENG: dict[str, dict] = {
         _pkg_eng("cylinder", d_mm=4.7, h_mm=4.6, theta_ja=200.0, source=_JEDEC_SRC),
     "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical":
         _box(10.16, 2.54, 8.5, source=_JEDEC_SRC + " Header height incl. pins (nominal)."),
+    "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm": _box(7.0, 7.0, 0.85, theta_ja=28.0),
 }
 _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
     _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"]

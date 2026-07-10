@@ -1415,25 +1415,34 @@ if(AICAD_WITH_OCCT)
     set(AICAD_HOSTD_BUILD_ID "unknown")
   endif()
   configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
-  if(NOT WIN32)  # Windows backend (named pipes / Job Objects) lands in the parity phase
-    add_executable(aicad-hostd
-      hostd/main.cpp
-      hostd/server.cpp
-      hostd/child_supervisor.cpp
-      hostd/doc_registry.cpp
-      hostd/autosave.cpp
-      hostd/hostd_log.cpp
-      ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
-      ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery.cpp
-      ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_client.cpp
-      ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
-    target_include_directories(aicad-hostd PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
-    target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json)
-    set_target_properties(aicad-hostd PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-    add_dependencies(aicad-hostd aicad)  # engine staged before the daemon can serve it
+  # Both platform backends are always listed; each file self-selects via
+  # #ifdef _WIN32 / #ifndef _WIN32, so there is one source list to maintain.
+  add_executable(aicad-hostd
+    hostd/main.cpp
+    hostd/server.cpp
+    hostd/child_supervisor.cpp        # POSIX: fork/PDEATHSIG/execvpe
+    hostd/child_supervisor_win.cpp    # Windows: Job Objects, KILL_ON_JOB_CLOSE
+    hostd/doc_registry.cpp
+    hostd/autosave.cpp
+    hostd/hostd_log.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery_win.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_client.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
+  target_include_directories(aicad-hostd PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+  target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json)
+  if(WIN32)
+    # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
+    # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
+    # Job Objects, CreateProcessW) is kernel32, linked by default.
+    target_link_libraries(aicad-hostd PRIVATE advapi32)
   endif()
+  set_target_properties(aicad-hostd PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_dependencies(aicad-hostd aicad)  # engine staged before the daemon can serve it
 endif()
 
 # === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========

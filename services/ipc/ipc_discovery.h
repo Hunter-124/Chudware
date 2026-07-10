@@ -39,18 +39,28 @@ std::string stateDir();
 // caller knows, e.g. next to its own binary), else "" (caller reports failure).
 std::string resolveHostdBin(const std::string& hint);
 
-// flock-based single-instance guard. Held for the daemon's lifetime; evaporates
-// on process death, so there is never a stale lock to clean up.
+// Single-instance guard: flock on POSIX, named mutex on Windows (lockPath()
+// returns a file path / a Global\ mutex name respectively). Held for the
+// daemon's lifetime; evaporates on process death, so there is never a stale
+// lock to clean up.
 class SingleInstance {
 public:
     ~SingleInstance() { release(); }
     // Try to take the lock (non-blocking). False = another daemon holds it.
     bool acquire(const std::string& lockFile, std::string& err);
     void release();
+#ifdef _WIN32
+    bool held() const { return h_ != nullptr; }
+#else
     bool held() const { return fd_ >= 0; }
+#endif
 
 private:
+#ifdef _WIN32
+    void* h_ = nullptr;  // mutex HANDLE
+#else
     int fd_ = -1;
+#endif
     std::string path_;
 };
 

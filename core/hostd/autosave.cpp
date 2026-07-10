@@ -7,7 +7,13 @@
 #include <filesystem>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#define AICAD_GETPID _getpid
+#else
 #include <unistd.h>
+#define AICAD_GETPID getpid
+#endif
 
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
@@ -26,7 +32,7 @@ void Autosave::start(const std::string& baseDir, const std::atomic<int>* engineS
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
     char sid[64];
-    std::snprintf(sid, sizeof sid, "%015lld-%ld", startMs, (long)::getpid());
+    std::snprintf(sid, sizeof sid, "%015lld-%ld", startMs, (long)AICAD_GETPID());
     sessionDir_ = baseDir_ + "/" + sid;
     thread_ = std::thread([this] { loop(); });
 }

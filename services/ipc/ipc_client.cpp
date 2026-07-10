@@ -1,13 +1,25 @@
-#ifndef _WIN32
-
 #include "ipc_client.h"
 
 #include <chrono>
 #include <thread>
 
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include "ipc_discovery.h"
+
+namespace {
+long selfPid() {
+#ifdef _WIN32
+    return (long)_getpid();
+#else
+    return (long)::getpid();
+#endif
+}
+}  // namespace
 
 namespace aicad_ipc {
 
@@ -20,7 +32,7 @@ bool EngineClient::tryConnect(std::string& err) {
 
 bool EngineClient::hello(const std::string& kind, std::string& err) {
     json params = {{"client", kind},
-                   {"pid", (long)::getpid()},
+                   {"pid", selfPid()},
                    {"proto", 1}};
     json result;
     // Engine may still be loading; hello is a daemon-level method and answers
@@ -135,5 +147,3 @@ std::vector<json> EngineClient::drainEvents() {
 }
 
 }  // namespace aicad_ipc
-
-#endif  // !_WIN32

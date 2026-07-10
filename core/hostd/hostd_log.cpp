@@ -1,9 +1,10 @@
 #include "hostd_log.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
-
-#include <sys/stat.h>
+#include <filesystem>
+#include <system_error>
 
 namespace hostd {
 
@@ -15,18 +16,13 @@ Log& log() {
     return l;
 }
 
+// std::filesystem for portability (Windows parity): handles both separators and
+// drive-letter roots; permissions stay platform-default (the parent state dir
+// is per-user on both platforms).
 static bool mkdirs(const std::string& dir) {
-    std::string cur;
-    for (size_t i = 0; i < dir.size(); ++i) {
-        cur.push_back(dir[i]);
-        if (dir[i] == '/' || i + 1 == dir.size()) {
-            std::string node = (dir[i] == '/') ? cur.substr(0, cur.size() - 1) : cur;
-            if (node.empty() || node == "/") continue;
-            ::mkdir(node.c_str(), 0755);
-        }
-    }
-    struct stat st{};
-    return ::stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return std::filesystem::is_directory(dir, ec);
 }
 
 bool Log::open(const std::string& dir) {
@@ -39,18 +35,22 @@ bool Log::open(const std::string& dir) {
 }
 
 void Log::rotateIfNeeded() {
-    struct stat st{};
-    if (::stat(path_.c_str(), &st) != 0 || st.st_size < kMaxBytes) return;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path_, ec);
+    if (ec || size < (std::uintmax_t)kMaxBytes) return;
+    const bool wasOpen = f_ != nullptr;
     if (f_) {
-        std::fclose(f_);
+        std::fclose(f_);  // Windows requires the handle closed before rename
         f_ = nullptr;
     }
     for (int g = kGenerations - 1; g >= 1; --g) {
         std::string from = path_ + "." + std::to_string(g);
         std::string to = path_ + "." + std::to_string(g + 1);
-        std::rename(from.c_str(), to.c_str());  // best-effort
+        std::filesystem::rename(from, to, ec);  // best-effort (replaces `to` on both platforms)
+        (void)ec;
     }
-    std::rename(path_.c_str(), (path_ + ".1").c_str());
+    std::filesystem::rename(path_, path_ + ".1", ec);
+    if (wasOpen) f_ = std::fopen(path_.c_str(), "a");  // keep logging after rotation
 }
 
 void Log::line(const char* fmt, ...) {
@@ -59,8 +59,13 @@ void Log::line(const char* fmt, ...) {
     char ts[32];
     std::time_t now = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &now);  // MSVC's re-entrant variant (args swapped vs POSIX)
+#else
     localtime_r(&now, &tm);
-    std::strftime(ts, sizeof ts, "%F %T", &tm);
+#endif
+    // Spelled out (not %F %T): pre-UCRT Windows CRTs lack the C99 specifiers.
+    std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
     std::fprintf(f_, "[%s] ", ts);
     va_list ap;
     va_start(ap, fmt);

@@ -14,10 +14,26 @@ Semantics preserved vs the legacy in-process ctypes path:
   * Daemon push events (doc.changed etc., Phase 3) buffer in-process; MCP tool
     layers drain them via poll_events() to surface _foreign_edits notes.
 
-Discovery mirrors ipc_discovery.cpp — keep the two in sync:
+Discovery mirrors ipc_discovery.cpp / ipc_discovery_win.cpp — keep them in sync:
   key    = $AICAD_INSTANCE_KEY or fnv1a64(realpath(hostd binary))
-  socket = $AICAD_HOSTD_SOCKET or $XDG_RUNTIME_DIR/aicad/hostd-<key>.sock
+           (Windows: fnv1a64 of the resolved path LOWERCASED — NTFS is
+           case-insensitive and the C++ side lowercases before hashing)
+  POSIX  = $AICAD_HOSTD_SOCKET or $XDG_RUNTIME_DIR/aicad/hostd-<key>.sock
            (fallback /tmp/aicad-<uid>/hostd-<key>.sock)
+  win32  = $AICAD_HOSTD_PIPE/$AICAD_HOSTD_SOCKET or
+           \\\\.\\pipe\\aicad-hostd-<SID>-<key>
+
+Windows transport choice (documented per the Phase 6 plan): the pipe is opened
+with the plain builtin ``open(path, 'r+b', buffering=0)``. CPython never
+shipped AF_UNIX on Windows, but a duplex byte-mode named pipe behaves as a
+regular file handle: unbuffered ``write()`` maps to WriteFile, ``read(n)`` maps
+to ReadFile and blocks until >=1 byte then returns what is available — exactly
+the recv()-shaped semantics ``_read_msg`` needs. A ctypes CreateFileW path
+(for overlapped/timeout control) is deliberately NOT used: call() has no client
+timeout by design (solves run minutes), so blocking reads are the contract, and
+the simple route has no handle-lifetime or GIL-during-Overlapped pitfalls.
+Escalate to ctypes only if a real Windows box shows edge semantics (e.g.
+ERROR_PIPE_BUSY storms) that open() cannot express.
 """
 from __future__ import annotations
 
@@ -43,6 +59,68 @@ def _fnv1a64_hex(s: str) -> str:
     return f"{h:016x}"
 
 
+def _windows_user_sid() -> str:
+    """Current user's SID string ("S-1-5-21-..."), matching the SID the C++ side
+    (ipc_discovery_win.cpp currentUserSid) embeds in the pipe name. ctypes only —
+    no pywin32 dependency."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    TOKEN_QUERY, TOKEN_USER_CLASS = 0x0008, 1
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                     ctypes.byref(token)):
+        raise DaemonError("OpenProcessToken failed")
+    try:
+        need = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, None, 0,
+                                     ctypes.byref(need))
+        buf = ctypes.create_string_buffer(need.value)
+        if not advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, buf, need,
+                                            ctypes.byref(need)):
+            raise DaemonError("GetTokenInformation failed")
+        # TOKEN_USER starts with SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }
+        sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
+        str_sid = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(str_sid)):
+            raise DaemonError("ConvertSidToStringSidW failed")
+        try:
+            return str_sid.value or "S-unknown"
+        finally:
+            kernel32.LocalFree(str_sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+class _PipeIO:
+    """socket-shaped adapter over a Windows named-pipe file handle so
+    DaemonClient's wire I/O is transport-agnostic (see module docstring for why
+    plain open() is the chosen transport)."""
+
+    def __init__(self, path: str) -> None:
+        self._f = open(path, "r+b", buffering=0)
+
+    def sendall(self, data: bytes) -> None:
+        self._f.write(data)
+
+    def recv(self, n: int) -> bytes:
+        # Raw ReadFile: blocks until at least one byte, returns up to n. A
+        # server-side close raises BrokenPipeError (ERROR_BROKEN_PIPE) — map to
+        # the b"" EOF convention _read_msg expects from sockets.
+        try:
+            return self._f.read(n) or b""
+        except (BrokenPipeError, OSError):
+            return b""
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except OSError:
+            pass
+
+
 def _repo_root() -> Path:
     # .../services/mcp/daemon_bridge.py -> repo root (also correct for the
     # installed mcp_server/ package layout, where core/ sits beside it).
@@ -56,24 +134,41 @@ def resolve_hostd_bin() -> Optional[Path]:
         return Path(p)
     exe = "aicad-hostd.exe" if sys.platform == "win32" else "aicad-hostd"
     root = _repo_root()
-    for cand in (
-        Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
-        root / "core" / "build-occt-linux" / "bin" / exe,
-        root / "core" / "build-linux" / "bin" / exe,
-    ):
+    if sys.platform == "win32":
+        cands = (
+            Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
+            root / "core" / "build" / "bin" / exe,  # build.bat / MSVC preset dir
+        )
+    else:
+        cands = (
+            Path(os.environ.get("AI_CAD_DIST") or "nonexistent") / exe,
+            root / "core" / "build-occt-linux" / "bin" / exe,
+            root / "core" / "build-linux" / "bin" / exe,
+        )
+    for cand in cands:
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand
     return None
 
 
 def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
+    """The daemon endpoint: unix-socket path on POSIX, \\\\.\\pipe\\... name on
+    win32 (transport-neutral name, matching ipc_discovery's socketPath())."""
+    if sys.platform == "win32":
+        if p := os.environ.get("AICAD_HOSTD_PIPE"):
+            return p
     if p := os.environ.get("AICAD_HOSTD_SOCKET"):
         return p
     key = os.environ.get("AICAD_INSTANCE_KEY")
     if not key:
         if not hostd_bin:
             return None
-        key = _fnv1a64_hex(str(Path(hostd_bin).resolve()))
+        resolved = str(Path(hostd_bin).resolve())
+        if sys.platform == "win32":
+            resolved = resolved.lower()  # NTFS case-insensitive; C++ side lowercases too
+        key = _fnv1a64_hex(resolved)
+    if sys.platform == "win32":
+        return f"\\\\.\\pipe\\aicad-hostd-{_windows_user_sid()}-{key}"
     if xdg := os.environ.get("XDG_RUNTIME_DIR"):
         return f"{xdg}/aicad/hostd-{key}.sock"
     return f"/tmp/aicad-{os.getuid()}/hostd-{key}.sock"
@@ -84,6 +179,9 @@ def daemon_socket_alive(hostd_bin: Optional[Path] = None) -> bool:
     sp = socket_path(hostd_bin or resolve_hostd_bin())
     if not sp:
         return False
+    if sys.platform == "win32":
+        # A named pipe exists exactly while a server instance is listening.
+        return os.path.exists(sp)
     try:
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(0.25)
@@ -94,6 +192,45 @@ def daemon_socket_alive(hostd_bin: Optional[Path] = None) -> bool:
         return False
 
 
+def _spawn_hostd_detached(hostd: Path) -> None:
+    """Launch the daemon so it outlives this client.
+
+    POSIX: start_new_session detaches enough for a daemon that self-manages via
+    its own flock singleton; an orphaned child reparents to init.
+
+    Windows: DETACHED_PROCESS (no console) + CREATE_NEW_PROCESS_GROUP, and try
+    CREATE_BREAKAWAY_FROM_JOB first — MCP under Claude Code often runs inside a
+    KILL_ON_JOB_CLOSE Job Object, and a daemon left inside it dies with the
+    agent session (plan Top-risk 1). If the job denies breakaway
+    (PermissionError / ERROR_ACCESS_DENIED), retry contained with a loud
+    warning: autosave bounds the loss and the next client respawns."""
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        try:
+            subprocess.Popen([str(hostd)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB,
+                             close_fds=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            print(
+                "[daemon_bridge] WARNING: job breakaway denied — aicad-hostd will die "
+                "with this process's Job Object (e.g. when the agent session ends). "
+                "Start the AI-CAD GUI first for a durable daemon.",
+                file=sys.stderr,
+            )
+            subprocess.Popen([str(hostd)], creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+    subprocess.Popen(
+        [str(hostd)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 class DaemonClient:
     """One connection to aicad-hostd. Thread-safe; reconnects once on EOF."""
 
@@ -101,7 +238,8 @@ class DaemonClient:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._sock: Optional[socket.socket] = None
+        # AF_UNIX socket on POSIX, _PipeIO on win32 (same sendall/recv/close shape).
+        self._sock: Optional[object] = None
         self._buf = b""
         self._next_id = 1
         self._events: list[dict] = []
@@ -120,9 +258,16 @@ class DaemonClient:
         spawned = False
         while True:
             try:
-                s = socket.socket(socket.AF_UNIX)
-                s.connect(self._sock_path)
-                self._sock = s
+                if sys.platform == "win32":
+                    # FileNotFoundError = no server instance yet (spawn/retry);
+                    # ERROR_PIPE_BUSY surfaces as OSError and is retried the same
+                    # way — the daemon creates the next instance right after each
+                    # accept, so busy is a sub-millisecond window.
+                    self._sock = _PipeIO(self._sock_path)
+                else:
+                    s = socket.socket(socket.AF_UNIX)
+                    s.connect(self._sock_path)
+                    self._sock = s
                 self._buf = b""
                 break
             except OSError as e:
@@ -133,15 +278,7 @@ class DaemonClient:
                         raise DaemonError(
                             "aicad-hostd binary not found (set AICAD_HOSTD_BIN or build core)"
                         ) from e
-                    # start_new_session detaches enough for a daemon that
-                    # self-manages via its own flock singleton; the daemon must
-                    # outlive us, and an orphaned child reparents to init.
-                    subprocess.Popen(
-                        [str(hostd)],
-                        start_new_session=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                    _spawn_hostd_detached(hostd)
                     spawned = True
                 if time.monotonic() > deadline:
                     raise DaemonError(f"hostd spawn timed out ({e})") from e

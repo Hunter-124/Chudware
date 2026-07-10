@@ -1,3 +1,7 @@
+// POSIX backend (fork/PDEATHSIG/execvpe). Windows sibling: child_supervisor_win.cpp
+// (Job Objects, KILL_ON_JOB_CLOSE).
+#ifndef _WIN32
+
 #include "child_supervisor.h"
 
 #include <chrono>
@@ -340,7 +344,9 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
                clientId);
     result = json{{"child_id", childId}, {"pid", (long)pid}, {"pgid", (long)pid},
                   {"log", logPath}};
-    
+
 }
 
 }  // namespace hostd
+
+#endif  // !_WIN32

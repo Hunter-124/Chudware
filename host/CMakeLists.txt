@@ -153,7 +153,9 @@ add_executable(AI-CAD
   # --- Phase 4 (shared engine daemon): backend seam + IPC client + event drain ---
   ../services/worker/engine_backend.cpp
   ../services/ipc/ipc_transport.cpp
+  ../services/ipc/ipc_transport_win.cpp
   ../services/ipc/ipc_discovery.cpp
+  ../services/ipc/ipc_discovery_win.cpp
   ../services/ipc/ipc_client.cpp
   src/core/engine_events.cpp
   # --- end Phase 4 ---

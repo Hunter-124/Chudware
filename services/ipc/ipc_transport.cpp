@@ -18,6 +18,17 @@
 
 namespace aicad_ipc {
 
+IpcListener& IpcListener::operator=(IpcListener&& o) noexcept {
+    if (this != &o) {
+        close();
+        fd_ = o.fd_;
+        path_ = std::move(o.path_);
+        o.fd_ = -1;
+        o.path_.clear();
+    }
+    return *this;
+}
+
 IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
     if (this != &o) {
         close();

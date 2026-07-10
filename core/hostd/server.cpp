@@ -2,7 +2,11 @@
 
 #include <chrono>
 
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
@@ -10,6 +14,14 @@
 namespace hostd {
 
 using nlohmann::json;
+
+static long selfPid() {
+#ifdef _WIN32
+    return (long)_getpid();
+#else
+    return (long)::getpid();
+#endif
+}
 
 static long long monoMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -147,7 +159,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return json{{"proto", 1},
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
-                    {"daemon_pid", (long)getpid()},
+                    {"daemon_pid", selfPid()},
                     {"state", stateNames[status_.engineState.load()]},
                     // Autosave-recovery rebind map (empty until recovery ran;
                     // daemon_status.recovery tells clients when to re-hello).
@@ -163,7 +175,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                 {"recovery", !autosave_                  ? "off"
                              : autosave_->recoveryDone() ? "done"
                                                          : "pending"},
-                {"pid", (long)getpid()}};
+                {"pid", selfPid()}};
         children_.statusInto(st);  // children count + mission ids
         return st;
     }

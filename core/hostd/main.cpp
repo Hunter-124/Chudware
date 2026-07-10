@@ -24,8 +24,20 @@
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <process.h>  // _getpid
+#else
 #include <limits.h>
 #include <unistd.h>
+#endif
 
 #include "../../services/ipc/ipc_client.h"
 #include "../../services/ipc/ipc_discovery.h"
@@ -38,6 +50,31 @@
 
 static hostd::Server* g_server = nullptr;
 
+#ifdef _WIN32
+
+// Ctrl-C / console close / logoff / system shutdown all funnel into the same
+// graceful drain the POSIX SIGTERM handler runs. Returning TRUE claims the
+// event; for CTRL_CLOSE/SHUTDOWN Windows still terminates us after a grace
+// period, which the final autosave fits inside.
+static BOOL WINAPI onConsoleCtrl(DWORD /*ctrlType*/) {
+    if (g_server) g_server->stop();
+    return TRUE;
+}
+
+static std::string selfPath() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+static long selfPid() { return (long)_getpid(); }
+
+#else
+
 static void onSignal(int) {
     if (g_server) g_server->stop();
 }
@@ -49,6 +86,10 @@ static std::string selfPath() {
     buf[n] = 0;
     return buf;
 }
+
+static long selfPid() { return (long)::getpid(); }
+
+#endif
 
 // --status / --stop [--force]: attach-only client against the same instance key.
 static int controlCommand(const char* method,
@@ -123,12 +164,18 @@ int main(int argc, char** argv) {
     hostd::Server server(std::move(listener), AICAD_HOSTD_BUILD_ID);
     server.children().setLogDir(aicad_ipc::stateDir() + "/logs");
     g_server = &server;
+#ifdef _WIN32
+    SetConsoleCtrlHandler(onConsoleCtrl, TRUE);
+    // No SIGPIPE on Windows: a dead client mid-write surfaces as a WriteFile
+    // error (ERROR_BROKEN_PIPE), which IpcConn::writeLine already handles.
+#else
     std::signal(SIGTERM, onSignal);
     std::signal(SIGINT, onSignal);
     std::signal(SIGPIPE, SIG_IGN);  // dead client mid-write must not kill the daemon
+#endif
 
     hostd::log().line("hostd %s starting: key=%s sock=%s pid=%ld", AICAD_HOSTD_BUILD_ID,
-                      key.c_str(), sock.c_str(), (long)::getpid());
+                      key.c_str(), sock.c_str(), selfPid());
 
     // 3. Load the engine asynchronously (many seconds for OCCT).
     std::thread loader([&server] {

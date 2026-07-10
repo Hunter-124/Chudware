@@ -43,7 +43,9 @@
 #include <string>
 #include <thread>
 
+#ifndef _WIN32
 #include <sys/types.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -86,8 +88,18 @@ public:
 private:
     struct Child {
         std::string childId;
+#ifdef _WIN32
+        // Windows (child_supervisor_win.cpp): the child lives in its OWN Job
+        // Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (breakaway NOT granted).
+        // Both handles are owned by this record; daemon death closes them, the
+        // job's last handle drop fires KILL_ON_JOB_CLOSE = the PDEATHSIG analog.
+        void* process = nullptr;  // HANDLE
+        void* job = nullptr;      // HANDLE
+        unsigned long pid = 0;
+#else
         pid_t pid = 0;
         pid_t pgid = 0;
+#endif
         std::string missionId;
         std::string docId;
         std::string logPath;

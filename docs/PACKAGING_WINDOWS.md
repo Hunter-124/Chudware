@@ -68,6 +68,114 @@ version stamping in `packaging/linux/build_appimage.sh`) — e.g. in PowerShell:
       (`installer.register_mcp --unregister` runs as part of `uninstall.ps1`).
 - [ ] `python -m installer.provision --check` inside the installed `app\` reports `"ready": true`.
 
+## Engine-host daemon (aicad-hostd) — Windows validation checklist (Phase 6)
+
+The Windows backend of the shared engine daemon (named pipes, Job Objects, named-mutex
+single instance) was **written and code-reviewed on Linux, never compiled or executed on
+Windows**. The sources are `services/ipc/ipc_transport_win.cpp`, `services/ipc/
+ipc_discovery_win.cpp`, `core/hostd/child_supervisor_win.cpp`, plus small `#ifdef _WIN32`
+branches in `core/hostd/main.cpp`, `services/worker/engine_backend.cpp` and
+`services/mcp/daemon_bridge.py`. Every item below must pass on a real Windows 10/11 box
+before Windows daemon mode is considered shipped. Installer integration (`/VERYSILENT`
+install staging `aicad-hostd.exe`, install.ps1/uninstall.ps1 calling `--stop`) is Phase 7 —
+noted here so nobody hunts for it in this phase.
+
+### Build
+
+- [ ] `cmake --build core\build --config Release --target aicad-hostd` succeeds with MSVC
+      (the target is no longer POSIX-gated). Expect zero warnings from the `_win.cpp` files;
+      treat any signed/unsigned or handle-cast warning as a review miss, not noise.
+- [ ] `aicad-hostd.exe --version` prints the build id. `--status` with no daemon prints
+      "no running instance" and exits 1.
+
+### Daemon lifecycle
+
+- [ ] Run `aicad-hostd.exe --foreground` in one terminal. Second terminal:
+      `aicad-hostd.exe --status` returns JSON with `state`, `pid`, `children`.
+      Task Manager shows exactly ONE aicad-hostd.exe.
+- [ ] Start a second `aicad-hostd.exe --foreground`: it must exit 0 immediately
+      (named-mutex race lost), leaving the first serving.
+- [ ] `aicad-hostd.exe --stop` drains and exits the daemon; the pipe name disappears
+      (`Test-Path \\.\pipe\aicad-hostd-<SID>-<key>` in PowerShell goes $false).
+- [ ] Idle exit: start the daemon with `AICAD_HOSTD_LINGER_SECS=5`, connect nothing —
+      it exits on its own within ~6 s and the log (`%APPDATA%\AI-CAD\logs\hostd.log`)
+      says "idle ... exiting".
+
+### MCP client (daemon_bridge.py pipe transport)
+
+- [ ] `set AI_CAD_ENGINE_DAEMON=1`, start a Claude Code session with the AI-CAD MCP
+      server; a `new_part` + `add_features` round trip works, and Task Manager shows the
+      engine (OCCT memory) inside aicad-hostd.exe, NOT the python MCP process.
+- [ ] Dual-client race: launch two MCP sessions simultaneously from a state with no
+      daemon — exactly one aicad-hostd.exe results; both sessions' calls succeed.
+- [ ] Kill aicad-hostd.exe in Task Manager mid-session; the next MCP call reconnects
+      (respawn + one retry) and succeeds after the engine reloads.
+
+### Job containment (KILL_ON_JOB_CLOSE + breakaway-denied fallback, plan Top-risk 1)
+
+- [ ] agent child containment: `agent_spawn` a `powershell -c sleep 600`, then kill the
+      DAEMON with Task Manager (hard kill, not --stop). The powershell child must die
+      immediately (its Job Object's last handle closed -> KILL_ON_JOB_CLOSE). This is the
+      PDEATHSIG-analog acceptance test.
+- [ ] `agent_stop` (non-forced) terminates the child ~5 s later (grace timer -> job
+      termination; there is no SIGTERM analog on Windows — expected).
+- [ ] Breakaway-denied recipe: wrap the spawning client in a deny-breakaway
+      KILL_ON_JOB_CLOSE job and confirm the documented degraded mode. PowerShell wrapper
+      (run as admin not required):
+
+      ```powershell
+      # jobwrap.ps1 — approximates Claude Code's job containment:
+      # create a job with KILL_ON_JOB_CLOSE and WITHOUT LimitBreakawayOk,
+      # assign a child cmd.exe to it, and from THAT cmd run the MCP client.
+      $cs = @"
+      using System; using System.Runtime.InteropServices;
+      public static class J {
+        [DllImport("kernel32")] public static extern IntPtr CreateJobObject(IntPtr a, string n);
+        [DllImport("kernel32")] public static extern bool SetInformationJobObject(IntPtr j, int c, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION i, int l);
+        [DllImport("kernel32")] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+        [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long a,b; public uint LimitFlags; public UIntPtr c,d; public uint e,f,g,h; }
+        [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong a,b,c,d,e,f; }
+        [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION { public JOBOBJECT_BASIC_LIMIT_INFORMATION Basic; public IO_COUNTERS Io; public UIntPtr p1,p2,p3,p4; }
+      }
+      "@
+      Add-Type -TypeDefinition $cs
+      $job = [J]::CreateJobObject([IntPtr]::Zero, $null)
+      $info = New-Object J+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+      $info.Basic.LimitFlags = 0x2000   # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, no BREAKAWAY_OK (0x800)
+      [J]::SetInformationJobObject($job, 9, [ref]$info, [Runtime.InteropServices.Marshal]::SizeOf($info)) | Out-Null
+      $p = Start-Process cmd -PassThru -ArgumentList '/k','title jobbed-shell'
+      [J]::AssignProcessToJobObject($job, $p.Handle) | Out-Null
+      Write-Host "jobbed shell pid $($p.Id) — run the MCP client from that window; close THIS PowerShell to kill the job"
+      while ($true) { Start-Sleep 5 }   # keep $job handle alive
+      ```
+
+      Inside the jobbed cmd, trigger a daemon spawn (python -c "from services.mcp import
+      daemon_bridge; daemon_bridge.client().call('ping')"). Expect: the loud
+      "job breakaway denied" warning on stderr, the daemon still comes up and serves,
+      and closing the wrapper PowerShell (job handle drop) kills daemon + children.
+      Then verify the next client cleanly respawns a daemon.
+- [ ] GUI-first durability: start the GUI (never jobbed) with AI_CAD_ENGINE_DAEMON=1
+      first, then agent sessions; killing the agent sessions leaves the daemon alive.
+
+### Pipe security (plan Top-risk 2)
+
+- [ ] Squat resistance: pre-create the pipe name from another (same-user) process
+      (`[System.IO.Pipes.NamedPipeServerStream]::new("aicad-hostd-<SID>-<key>")`) and start
+      the daemon — it must FAIL loudly at listen() (FILE_FLAG_FIRST_PIPE_INSTANCE), not
+      silently coexist.
+- [ ] Spoof resistance: with the squatter serving instead of a real daemon, a client
+      connect must be REFUSED ("pipe server identity mismatch" requires a different-user
+      squatter; same-user squatters pass the SID check by design — confirm the error path
+      with a second Windows account or a service-hosted squatter).
+- [ ] DACL: `[System.IO.Pipes.NamedPipeClientStream]` connect from a DIFFERENT user
+      account fails with access denied.
+
+### Uninstall hygiene (dry-run of the Phase 7 wiring)
+
+- [ ] After `aicad-hostd.exe --stop`, no aicad-hostd.exe remains in Task Manager and no
+      agent children survive. (Phase 7 will call this from uninstall.ps1; verify the
+      primitive works now.)
+
 ## Known gaps (not fixed here — flagging so they aren't rediscovered)
 
 - **No bundled Python.** `build_release.py --with-python` is a documented `TODO` (drop a

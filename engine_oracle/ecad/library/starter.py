@@ -112,8 +112,8 @@ def _tht_pad(pid: str, number: str, x: float, y: float,
 
 
 def _fp(fpid: str, pads: list, graphics: list, attr: str = "smd",
-        description: str = "") -> dict:
-    return {
+        description: str = "", eng: dict | None = None) -> dict:
+    d = {
         "fpid": fpid,
         "pads": pads,
         "graphics": graphics,
@@ -122,6 +122,28 @@ def _fp(fpid: str, pads: list, graphics: list, attr: str = "smd",
         "attr": attr,
         "description": description,
     }
+    if eng:
+        d["eng"] = eng
+    return d
+
+
+def _pkg_eng(shape: str, *, l_mm: float | None = None, w_mm: float | None = None,
+             h_mm: float | None = None, d_mm: float | None = None,
+             theta_ja: float | None = None, source: str = "") -> dict:
+    """Footprint-level engineering metadata: package body dims + package theta_ja.
+
+    Dims are the nominal PLASTIC BODY (not lead span). theta_ja is the JEDEC-style
+    single-part-on-standard-board value — a layout-dependent APPROXIMATION carried with a
+    source note; downstream thermal handoff (boardphys consumers) must treat it as a seed.
+    Unknown values stay None (contracts/ecad/boardphys.md honesty rule).
+    """
+    eng: dict = {"package": {"shape": shape, "l_mm": l_mm, "w_mm": w_mm,
+                             "h_mm": h_mm, "d_mm": d_mm}}
+    if theta_ja is not None:
+        eng["theta_c_per_w"] = {"ja": theta_ja}
+    if source:
+        eng["sources"] = [source]
+    return eng
 
 
 def _sym(libid: str, name: str, ref_prefix: str, value: str,
@@ -129,7 +151,8 @@ def _sym(libid: str, name: str, ref_prefix: str, value: str,
          pins: list, graphics: list,
          units_count: int = 1, power: bool = False,
          sim: dict | None = None,
-         footprint_filters: list | None = None) -> dict:
+         footprint_filters: list | None = None,
+         eng: dict | None = None) -> dict:
     d: dict = {
         "libid": libid,
         "name": name,
@@ -145,6 +168,8 @@ def _sym(libid: str, name: str, ref_prefix: str, value: str,
     }
     if sim:
         d["sim"] = sim
+    if eng:
+        d["eng"] = eng
     return d
 
 
@@ -681,7 +706,93 @@ def _make_symbols() -> dict:
     return syms
 
 
+# ─── engineering-metadata seeds (T-FIN8; schema: contracts/ecad/boardphys.md) ──
+# Values are DATASHEET-CLASS SEEDS, each with a source note (research_datasheet_fetch
+# style provenance). They are nominal/typical figures for the generic part class the
+# starter symbol represents — good enough for power budgets and thermal screening, and
+# every consumer sees the source note. Unknown values are intentionally ABSENT so the
+# resolver reports honest nulls (never invented zeros).
+#   sequencing: [] = known "no sequencing requirement" (single-rail device);
+#               absent/None = unknown.
+
+def _rail(name: str, vmin: float | None, vnom: float | None, vmax: float | None,
+          i_active: float | None, i_sleep: float | None = None) -> dict:
+    return {"name": name, "voltage_v_min": vmin, "voltage_v_nom": vnom,
+            "voltage_v_max": vmax, "current_a_active": i_active,
+            "current_a_sleep": i_sleep}
+
+
+_SYMBOL_ENG: dict[str, dict] = {
+    # Bipolar 555: Icc 3 mA typ / 6 mA max @ Vcc=5 V; 10/15 mA @ 15 V; Vcc 4.5–16 V.
+    "Timer:NE555": {
+        "power_w": {"typ": 0.015, "max": 0.225},   # 5 V·3 mA typ; 15 V·15 mA worst-case quiescent
+        "limits_c": {"tj_max": 150.0, "ta_max": 70.0},
+        "supply": {"rails": [_rail("VCC", 4.5, 5.0, 16.0, 0.003, None)],
+                   "voltage_domains": ["VCC"], "sequencing": []},
+        "sources": ["research_datasheet_fetch: TI NE555 datasheet (SLFS022) — Icc 3 mA typ /"
+                    " 6 mA max @5 V, 10/15 mA @15 V; Vcc 4.5–16 V; Ta 0–70 °C. Seed values"
+                    " nominal; verify against the exact device grade."],
+    },
+    # LM358-class dual op-amp: Icc 0.7 mA typ / 1.2 mA max (both amps); V+ 3–32 V.
+    "Amplifier_Operational:OPAMP_dual": {
+        "power_w": {"typ": 0.0035, "max": 0.0384},  # 5 V·0.7 mA typ; 32 V·1.2 mA max quiescent
+        "limits_c": {"tj_max": 150.0, "ta_max": 85.0},
+        "supply": {"rails": [_rail("V+", 3.0, 5.0, 32.0, 0.0007, None)],
+                   "voltage_domains": ["V+"], "sequencing": []},
+        "sources": ["research_datasheet_fetch: TI LM358 datasheet (SLOS068) — Icc 0.7 mA typ /"
+                    " 1.2 mA max, single-supply 3–32 V. Quiescent-only seed; load power is"
+                    " circuit-dependent (null until sim provides it)."],
+    },
+    # Small-signal transistor classes: dissipation is circuit-dependent (left null);
+    # junction limit is the class-standard 150 °C.
+    "Device:Q_NPN": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: 2N3904-class small-signal NPN — Tj max 150 °C"
+                    " (onsemi 2N3904 datasheet). Pd depends on package + circuit; package"
+                    " theta_ja seeds come from the footprint."],
+    },
+    "Device:Q_PNP": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: 2N3906-class small-signal PNP — Tj max 150 °C"
+                    " (onsemi 2N3906 datasheet)."],
+    },
+    "Device:NMOS": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: 2N7002-class small-signal NMOS — Tj max 150 °C"
+                    " (Nexperia 2N7002 datasheet)."],
+    },
+    "Device:PMOS": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: BSS84-class small-signal PMOS — Tj max 150 °C"
+                    " (Nexperia BSS84 datasheet)."],
+    },
+    "Device:LED": {
+        "power_w": {"typ": 0.04, "max": 0.12},      # 2 V·20 mA typ drive; 0805 LED Pd max class
+        "limits_c": {"tj_max": 115.0, "ta_max": 85.0},
+        "sources": ["research_datasheet_fetch: 0805 chip LED class (e.g. Kingbright APT2012) —"
+                    " If 20 mA typ, Pd ~120 mW max, Tj ~115 °C. Actual color/bin changes Vf;"
+                    " treat as a budget seed."],
+    },
+    "Device:D": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: S1A/SS1x-class rectifier — Tj max 150 °C"
+                    " (Vishay S1A datasheet). Conduction loss is circuit-dependent (null)."],
+    },
+    "Device:Zener": {
+        "limits_c": {"tj_max": 150.0, "ta_max": None},
+        "sources": ["research_datasheet_fetch: BZT52-class zener — Tj max 150 °C"
+                    " (Nexperia BZT52 datasheet)."],
+    },
+}
+
+def _apply_symbol_eng(syms: dict) -> None:
+    for libid, eng in _SYMBOL_ENG.items():
+        if libid in syms:
+            syms[libid]["eng"] = eng
+
+
 SYMBOLS: dict[str, dict] = _make_symbols()
+_apply_symbol_eng(SYMBOLS)
 
 
 # ─── FOOTPRINTS ───────────────────────────────────────────────────────────────
@@ -1056,7 +1167,69 @@ def _make_footprints() -> dict:
     return fps
 
 
+# ─── footprint engineering-metadata seeds (T-FIN8) ────────────────────────────
+# Package BODY dims (nominal plastic body, mm — not lead span) + JEDEC-style
+# single-part theta_ja seeds. ecad_to_3d uses the body dims for component solids;
+# the boardphys sidecar carries theta for the thermal handoff. All approximate,
+# all carrying a source note. Chip R footprints additionally carry the rated max
+# dissipation of the standard thick-film part in that size.
+
+_JEDEC_SRC = ("research_standard_section: JEDEC/IPC-7351 nominal package outlines +"
+              " JEDEC JESD51 single-part theta_ja on a standard 2-layer test board."
+              " Body dims nominal; theta_ja is layout-dependent — seed only.")
+_R_SRC = ("research_datasheet_fetch: standard thick-film chip resistor ratings by EIA size"
+          " (Vishay CRCW / Yageo RC series): 0402=1/16 W, 0603=1/10 W, 0805=1/8 W,"
+          " 1206=1/4 W rated max continuous at 70 °C. Rated MAX, not operating dissipation.")
+
+
+def _box(l, w, h, theta_ja=None, source=_JEDEC_SRC):
+    return _pkg_eng("box", l_mm=l, w_mm=w, h_mm=h, theta_ja=theta_ja, source=source)
+
+
+_FOOTPRINT_ENG: dict[str, dict] = {
+    # Chip passives (EIA imperial): body L×W×H.
+    "Resistor_SMD:R_0402":  _box(1.0, 0.5, 0.35),
+    "Resistor_SMD:R_0603":  _box(1.6, 0.8, 0.45),
+    "Resistor_SMD:R_0805":  _box(2.0, 1.25, 0.55),
+    "Resistor_SMD:R_1206":  _box(3.2, 1.6, 0.60),
+    "Capacitor_SMD:C_0402": _box(1.0, 0.5, 0.5),
+    "Capacitor_SMD:C_0603": _box(1.6, 0.8, 0.8),
+    "Capacitor_SMD:C_0805": _box(2.0, 1.25, 1.25),
+    "Capacitor_SMD:C_1206": _box(3.2, 1.6, 1.6),
+    "LED_SMD:LED_0805":     _box(2.0, 1.25, 0.8),
+    # SMD ICs / discretes.
+    "Package_TO_SOT_SMD:SOT-23": _box(2.9, 1.3, 1.1, theta_ja=350.0),
+    "Package_SO:SOIC-8":         _box(4.9, 3.9, 1.75, theta_ja=120.0),
+    "Package_SO:SOIC-14":        _box(8.65, 3.9, 1.75, theta_ja=95.0),
+    "Diode_SMD:D_SMA":           _box(4.3, 2.6, 2.3, theta_ja=90.0),
+    "Diode_SMD:D_SMB":           _box(5.4, 3.6, 2.3, theta_ja=75.0),
+    # THT.
+    "Package_DIP:DIP-8":  _box(9.27, 6.35, 3.3, theta_ja=100.0),
+    "Package_DIP:DIP-14": _box(19.05, 6.35, 3.3, theta_ja=85.0),
+    "Package_TO_SOT_THT:TO-92":
+        _pkg_eng("cylinder", d_mm=4.7, h_mm=4.6, theta_ja=200.0, source=_JEDEC_SRC),
+    "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical":
+        _box(10.16, 2.54, 8.5, source=_JEDEC_SRC + " Header height incl. pins (nominal)."),
+}
+_FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
+    _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"]
+
+# Rated max dissipation for the standard thick-film resistor of each size (power_w.typ
+# stays null — actual dissipation is circuit-defined and must come from sim/overrides).
+for _fpid, _pmax in (("Resistor_SMD:R_0402", 0.0625), ("Resistor_SMD:R_0603", 0.1),
+                     ("Resistor_SMD:R_0805", 0.125), ("Resistor_SMD:R_1206", 0.25)):
+    _FOOTPRINT_ENG[_fpid]["power_w"] = {"max": _pmax}
+    _FOOTPRINT_ENG[_fpid].setdefault("sources", []).append(_R_SRC)
+
+
+def _apply_footprint_eng(fps: dict) -> None:
+    for fpid, eng in _FOOTPRINT_ENG.items():
+        if fpid in fps:
+            fps[fpid]["eng"] = eng
+
+
 FOOTPRINTS: dict[str, dict] = _make_footprints()
+_apply_footprint_eng(FOOTPRINTS)
 
 
 # ─── public helpers ──────────────────────────────────────────────────────────

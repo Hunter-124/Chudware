@@ -480,6 +480,10 @@ def build_netlist(sch: dict) -> dict:
             comp["ac_mag"] = _sp["ac_mag"]
         if _sp.get("ac_phase") is not None:
             comp["ac_phase"] = _sp["ac_phase"]
+        # Carry per-instance engineering-metadata overrides (T-FIN8) so sync can put
+        # them on the board footprint and boardphys/status see them (metadata.py).
+        if isinstance(_sp.get("eng"), dict):
+            comp["eng_overrides"] = _sp["eng"]
         components.append(comp)
 
     by_pin_sorted = dict(sorted(by_pin.items()))

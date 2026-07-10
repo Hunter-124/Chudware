@@ -3132,8 +3132,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 const int    sm_steps = std::max(2, params.value("steps", 24));
                 const bool   sm_ci    = params.value("check_interference", true);
                 const double sm_mcl   = params.value("min_clearance_mm", 0.0);
+                // T-FIN20: optional rigid-body dynamics options object — null keeps
+                // the kinematics-only result field-identical (regression contract).
+                const json   sm_dyn   = params.contains("dynamics") ? params["dynamics"]
+                                                                    : json(nullptr);
                 return emit(aicad::doc::doc_simulate_motion(
-                                sm_doc, sm_mid, sm_start, sm_stop, sm_steps, sm_ci, sm_mcl),
+                                sm_doc, sm_mid, sm_start, sm_stop, sm_steps, sm_ci, sm_mcl,
+                                sm_dyn),
                             out_json, 0);
             }
 

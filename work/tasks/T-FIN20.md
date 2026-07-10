@@ -33,3 +33,16 @@ to simhandoff/1.
 - Pendulum + crank analytic reaction forces match within tolerance
 - Handoff produces a static study with reaction loads placed at joint faces, provenance recorded
 - Kinematics-only results regression-identical when dynamics not requested
+
+## Completion notes (2026-07-10, branch task/T-FIN20-motion-dynamics-fea)
+
+- Shipped: core/doc/motion_dynamics.{h,cpp} (inverse dynamics, jacobian wrench bases,
+  min-norm LS), doc_simulate_motion `dynamics` param, AssemblyResult.mate_geometry,
+  MCP simulate_motion dynamics + motion_fea_handoff (simhandoff/1 motion_to_fea,
+  dry_run), cad_guide simulation/motion updates.
+- DoD: pendulum + slider-crank analytic reactions PASS (test_motion_dynamics, 191
+  assertions); kinematics-only regression-identical (C++ + pytest field-set checks);
+  handoff places reaction loads at joint faces with provenance (dry-run pytest PASS;
+  live solve path shares run_fea_static's recipe, not exercised without Netgen engine).
+- Tests: core ctest 52/52; pytest test_cad_tools -k "simulate_motion or motion_fea" 7
+  passed; test_simhandoff 16 passed.

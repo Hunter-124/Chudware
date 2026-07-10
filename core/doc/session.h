@@ -565,11 +565,27 @@ nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::stri
 //          interference:{checked, first_collision_step, first_collision_value, detail},
 //          summary}.
 // Throws OpError("invalid_op") on non-assembly doc, missing/non-drivable mate, or bad range.
+//
+// `dynamics` (T-FIN20): pass a JSON OBJECT to additionally run rigid-body INVERSE
+// dynamics over the swept trajectory (mass/inertia from body geometry × density,
+// gravity / applied loads / viscous damping; per-mate joint reaction wrenches solved
+// through the mate-type constraint-jacobian wrench bases — doc/motion_dynamics.h).
+// Keys (all optional): {duration_s (default 1.0 across the sweep),
+//   gravity:[3] m/s² (default [0,0,-9.81]), default_density_g_cm3 (default 7.85),
+//   densities:{component_id: g_cm3}, masses:{component_id: kg — overrides density},
+//   loads:[{component, force_n:[3], torque_nm:[3]}],
+//   damping:{linear_ns_per_m, angular_nms_per_rad}}.
+// The result then carries a "dynamics" block: {dt_s, duration_s, gravity, bodies,
+//   joints, frames:[{i, t_s, residual_n, reactions:[{mate_id, force_n:[3],
+//   moment_nm:[3], force_mag_n}]}], per_joint_worst, worst_case, warnings}.
+// Pass null / omit for the pre-existing KINEMATICS-ONLY behavior — the result is
+// then field-identical to before this feature existed (regression contract).
 nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    const std::string& mate_id,  // "" = auto-pick
                                    double start, double stop, int steps,
                                    bool check_interference,
-                                   double min_clearance_mm = 0.0);
+                                   double min_clearance_mm = 0.0,
+                                   const nlohmann::json& dynamics = nlohmann::json(nullptr));
 
 // --- g_mtx contention meters (Phase 1b perf visibility) ----------------------------
 // The single global session lock every modeling RPC serialises through is instrumented to

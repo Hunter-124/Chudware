@@ -35,6 +35,7 @@ from typing import Any, Optional, Union
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import core_bridge as cb
+from . import simhandoff as sh
 from .core_bridge import CoreError
 
 # The "current part" so single-argument calls just work (every tool also takes an explicit
@@ -1467,6 +1468,13 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   generated piping doc rides INLINE in the envelope, consumable via
   piping_solve(source_handoff=...)) and hydraulic_fea_handoff/hydraulic_verify_fea
   (cylinder mount loads at max pressure → case-labelled static-FEA load cases).
+  motion → FEA (LIVE): motion_fea_handoff(component, fixtures, stop=…) runs the motion
+  study WITH rigid-body dynamics (simulate_motion dynamics={} — mass/inertia from
+  geometry x density, gravity/loads/damping, joint reactions via the mate constraint
+  jacobian), picks the worst-case frame (or `at`=time s), applies the joint reaction
+  forces on the selected component's mate faces and runs run_fea_static on it — "is this
+  link strong enough at the worst instant" in one call. Conditions are `case`-labelled
+  per frame; dry_run=True builds loads + envelope without solving.
   Helper builders/validator: services/mcp/simhandoff.py.
 """
 
@@ -1481,9 +1489,18 @@ WHAT IT ANSWERS: "does this linkage / crank / cam / gear-train move the way I me
 anything CLASH as it sweeps?" It returns a trajectory (every body's world 4x4 pose per step) plus
 a per-step interference sweep that flags the FIRST colliding step.
 
-SCOPE (v1): KINEMATICS ONLY — position (and, by sampling, velocity). NO forces, torque, inertia
-or contact dynamics. It is geometry-of-motion + collision, not loads. (A dynamics follow-up would
-add mass/inertia, joint torques and a time integrator on top of this same driven-mate loop.)
+SCOPE: kinematics by default — position (and, by sampling, velocity). Pass dynamics={...} (even
+{}) to ALSO run RIGID-BODY INVERSE DYNAMICS on the same sweep: mass/inertia from each component's
+geometry x density (densities/masses overridable per component), gravity, applied forces/torques,
+simple viscous damping, and per-mate JOINT REACTION forces/moments solved through the mate
+constraint jacobian (per-frame min-norm least squares; V&V'd against analytic pendulum +
+slider-crank reactions). The result gains a `dynamics` block with per-frame reactions,
+per_joint_worst and worst_case. Contact dynamics is still out of scope.
+
+MOTION → FEA: motion_fea_handoff(component, fixtures, stop=…, at="worst"|t_s) chains it —
+worst-instant joint reactions become force loads on that component's mate faces and
+run_fea_static answers "is this link strong enough at the worst instant" in one call,
+conforming to aicad.simhandoff/1 (see cad_guide('simulation'), CROSS-SIM HANDOFF).
 
 HOW TO USE
   1. Open/build an ASSEMBLY with mates (asm_insert_component + asm_add_mate; solve_mates to seat
@@ -4960,7 +4977,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
     def simulate_motion(mate_id: Optional[str] = None, start: Optional[float] = None,
                         stop: Optional[float] = None, steps: int = 24,
                         check_interference: bool = True, min_clearance_mm: float = 0.0,
-                        loop: bool = False, doc_id: Optional[str] = None) -> str:
+                        loop: bool = False, dynamics: Optional[dict] = None,
+                        doc_id: Optional[str] = None) -> str:
         """Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each
         step, return the trajectory (every body's pose per step) + a swept interference check.
 
@@ -4971,9 +4989,23 @@ def register_cad_tools(mcp: FastMCP) -> None:
         previous solved pose warm-starts the next), so a full-cycle sweep stays on one branch
         instead of flipping to a mirror configuration.
 
-        Scope: KINEMATICS ONLY (position, v1) — no forces, inertia, torque or contact dynamics
-        (a dynamics follow-up would add those). It answers geometry-of-motion + collision, not
-        loads.
+        Scope: kinematics by default; pass `dynamics` (even {}) to ALSO run rigid-body inverse
+        dynamics over the swept trajectory — mass/inertia from each component's geometry x
+        density, gravity, applied forces/torques and simple viscous damping, with per-mate JOINT
+        REACTION forces/moments solved through the mate constraint jacobian. Contact dynamics is
+        still out of scope.
+
+        dynamics : None (default) = kinematics only, result unchanged. A dict (may be empty —
+                  all keys optional) turns on dynamics and adds a `dynamics` block:
+                  {duration_s (sweep wall-time, default 1.0), gravity:[3] m/s² (default
+                  [0,0,-9.81]), default_density_g_cm3 (default 7.85 steel),
+                  densities:{component_id: g_cm3}, masses:{component_id: kg},
+                  loads:[{component, force_n:[3], torque_nm:[3]}],
+                  damping:{linear_ns_per_m, angular_nms_per_rad}}.
+                  The block carries per-frame per-mate reactions ({mate_id, force_n:[3] N,
+                  moment_nm:[3] N·m, force_mag_n}), per_joint_worst, worst_case and warnings —
+                  feed it to motion_fea_handoff to stress the worst-loaded link. (`loop` extra
+                  samples are not part of the dynamics timeline.)
 
         mate_id : which mate to drive. Must be a DIMENSIONAL mate whose value means motion —
                   one of angle / angle_limit (deg), distance / distance_limit (mm),
@@ -5111,7 +5143,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
                            f"{len(samples)} samples (interference check skipped).")
 
-            return _dumps({
+            out = {
                 "ok": True, "doc_id": d, "mate_id": mate_id,
                 "driver": {"type": mtype, "unit": unit, "start": start, "stop": stop,
                            "steps": steps, "samples": len(samples), "loop": bool(loop)},
@@ -5121,7 +5153,247 @@ def register_cad_tools(mcp: FastMCP) -> None:
                                  "first_collision_value": first_collision_value,
                                  "detail": first_collision_detail},
                 "summary": summary,
+            }
+            # T-FIN20: rigid-body inverse dynamics on the SAME sweep (engine-side).
+            # Kinematics-only calls never reach this branch — their result shape is
+            # regression-frozen above.
+            if dynamics is not None:
+                r_dyn = cb.call("simulate_motion", {
+                    "doc_id": d, "mate_id": mate_id, "start": float(start),
+                    "stop": float(stop), "steps": int(steps),
+                    "check_interference": False, "min_clearance_mm": 0.0,
+                    "dynamics": dynamics if isinstance(dynamics, dict) else {}})
+                out["dynamics"] = r_dyn.get("dynamics") or {
+                    "warnings": ["engine returned no dynamics block"]}
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def motion_fea_handoff(component: str, fixtures: list,
+                           mate_id: Optional[str] = None,
+                           start: Optional[float] = None, stop: Optional[float] = None,
+                           steps: int = 24, at: Union[str, float] = "worst",
+                           dynamics: Optional[dict] = None,
+                           material: Union[str, dict] = "steel",
+                           mesh_fineness: float = 0.5, dry_run: bool = False,
+                           doc_id: Optional[str] = None) -> str:
+        """Motion → static FEA handoff: "is this link strong enough at the worst instant?"
+        in one call (aicad.simhandoff/1, coupling `motion_to_fea`).
+
+        Pipeline: (1) runs the motion study WITH rigid-body dynamics (simulate_motion +
+        dynamics — mass/inertia from geometry x density, gravity, joint reactions via the
+        mate constraint jacobian); (2) picks the WORST-CASE frame (or the frame nearest a
+        time you pass in `at`) for the joints touching the selected component; (3) opens
+        that component's part file and applies each joint reaction as a FORCE on the mate
+        face (load placed at the joint face via the mate ref's stored face centroid);
+        (4) runs run_fea_static on it. The result embeds a validated handoff envelope
+        under `simhandoff` with one condition per reaction force/moment, `case`-labelled
+        with the chosen frame/time, full provenance, and the FEA study records the
+        handoff id — closing the chain motion study → handoff → static study.
+
+        component : the assembly component to stress-check — its id ("k2") or name ("Arm").
+        fixtures  : face queries held fixed on THAT COMPONENT's part (run_fea_static
+                    vocabulary, e.g. ["bottom"] or [{"of":"face","near":[x,y,z]}]).
+                    Fix the face(s) of the joint you consider grounded; the OTHER joints'
+                    reactions are applied as loads.
+        mate_id / start / stop / steps : the motion sweep (same semantics as
+                    simulate_motion; stop required, start defaults to current value).
+        at        : "worst" (default) = frame with the peak reaction force magnitude on
+                    this component's joints; or a time in seconds (float) to pick the
+                    nearest frame.
+        dynamics  : simulate_motion dynamics options (duration_s, gravity, densities,
+                    masses, loads, damping). Defaults apply when omitted.
+        dry_run   : if True, build the loads + envelope but SKIP the FEA solve (fast
+                    inspection / no solver required).
+
+        Returns {ok, doc_id (assembly), part_doc_id, frame:{i, t_s}, loads_applied,
+        fea (run_fea_static summary or null when dry_run), simhandoff}. Moment reactions
+        are recorded in the envelope (units N*m) but only forces are applied to the
+        static study (point-moment loads are not supported by the solver — a warning is
+        attached when a significant moment is dropped).
+        """
+        try:
+            d = _doc(doc_id)
+            if stop is None:
+                raise ValueError("motion_fea_handoff: `stop` is required (end of the sweep).")
+            mates = _asm_mates(d)
+            if not mates:
+                raise ValueError("motion_fea_handoff: document has no mates.")
+
+            # --- resolve the component (id or name) --------------------------
+            tr = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
+            comps = [c for c in (tr.get("components") or []) if not c.get("suppressed")]
+            comp = next((c for c in comps if c.get("id") == component or
+                         (c.get("name") or "") == component), None)
+            if comp is None:
+                ids = ", ".join(f"{c.get('id')}({c.get('name')})" for c in comps)
+                raise ValueError(f"motion_fea_handoff: component '{component}' not found. "
+                                 f"Components: {ids}")
+            cid = comp.get("id")
+            src_path = (comp.get("source") or {}).get("path") or ""
+            if not src_path or not os.path.exists(src_path):
+                raise ValueError(f"motion_fea_handoff: component '{cid}' has no readable "
+                                 f"source file ({src_path!r}) to run FEA on.")
+
+            # --- default `start` to the driven mate's current value ------------
+            if start is None:
+                cand = [m for m in mates if m.get("id") == mate_id] if mate_id else \
+                       [m for m in mates
+                        if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
+                v = (cand[0].get("value") if cand else None)
+                start = float(v.get("value", 0.0)) if isinstance(v, dict) else \
+                        float(v) if isinstance(v, (int, float)) else 0.0
+
+            # --- motion study WITH dynamics (engine-side sweep) ---------------
+            dyn_opts = dict(dynamics) if isinstance(dynamics, dict) else {}
+            r_mot = cb.call("simulate_motion", {
+                "doc_id": d, "mate_id": mate_id or "", "start": float(start),
+                "stop": float(stop), "steps": int(steps),
+                "check_interference": False, "min_clearance_mm": 0.0,
+                "dynamics": dyn_opts})
+            dyn = r_mot.get("dynamics") or {}
+            frames = dyn.get("frames") or []
+            if not frames:
+                return _dumps({"ok": False, "error": "motion dynamics produced no frames",
+                               "warnings": dyn.get("warnings")})
+            drv_mate = r_mot.get("mate_id")
+
+            # --- joints touching this component -------------------------------
+            touch_mids = set()
+            sel_by_mid = {}
+            for m in mates:
+                for ref in (m.get("refs") or []):
+                    if isinstance(ref, dict) and ref.get("component") == cid:
+                        touch_mids.add(m.get("id"))
+                        sel_by_mid[m.get("id")] = ref.get("selector") or {}
+            have = {r.get("mate_id") for r in frames[0].get("reactions", [])}
+            touch_mids &= have
+            if not touch_mids:
+                return _dumps({"ok": False, "error":
+                               f"no solved joint reactions touch component '{cid}' — its "
+                               "mates may be dangling (see dynamics.warnings).",
+                               "warnings": dyn.get("warnings")})
+
+            # --- pick the frame ------------------------------------------------
+            def _peak(fr: dict) -> float:
+                return max((r.get("force_mag_n", 0.0) for r in fr.get("reactions", [])
+                            if r.get("mate_id") in touch_mids), default=0.0)
+            if isinstance(at, str) and at == "worst":
+                frame = max(frames, key=_peak)
+            else:
+                t_want = float(at)
+                frame = min(frames, key=lambda fr: abs(fr.get("t_s", 0.0) - t_want))
+            fi, ft = int(frame.get("i", 0)), float(frame.get("t_s", 0.0))
+            case = f"frame{fi}@t{ft:.6g}s"
+
+            # --- build loads + envelope conditions ------------------------------
+            conditions = []
+            loads = []
+            warnings = list(dyn.get("warnings") or [])
+            for r in frame.get("reactions", []):
+                mid = r.get("mate_id")
+                if mid not in touch_mids:
+                    continue
+                f_vec = [float(x) for x in (r.get("force_n") or [0, 0, 0])]
+                m_vec = [float(x) for x in (r.get("moment_nm") or [0, 0, 0])]
+                centroid = (sel_by_mid.get(mid) or {}).get("centroid")
+                applied_to = (f"{cid}:face@{centroid}" if centroid else cid)
+                prov = (f"simulate_motion dynamics frame {fi} (t={ft:.6g}s) joint '{mid}' "
+                        f"reaction on component '{cid}'")
+                conditions.append(sh.condition(
+                    f"{mid}_reaction_force", "force", f_vec, "N", prov,
+                    applied_to=applied_to, case=case))
+                if any(abs(x) > 1e-9 for x in m_vec):
+                    conditions.append(sh.condition(
+                        f"{mid}_reaction_moment", "moment", m_vec, "N*m", prov,
+                        applied_to=applied_to, case=case))
+                    if max(abs(x) for x in m_vec) > 1e-3:
+                        warnings.append(
+                            f"joint '{mid}' carries a moment {m_vec} N*m that is NOT "
+                            "applied to the static study (force loads only)")
+                if centroid:
+                    loads.append({"face": {"of": "face", "near": centroid}, "force": f_vec,
+                                  "mate_id": mid})
+                else:
+                    warnings.append(f"mate '{mid}' ref has no stored face centroid — its "
+                                    "reaction force was not applied as an FEA load")
+            if not loads:
+                return _dumps({"ok": False, "error":
+                               "no reaction could be placed on a face of the component "
+                               "(mate refs carry no face centroids)",
+                               "warnings": warnings})
+
+            # --- open the component part ----------------------------------------
+            part_doc = cb.call("doc_open", {"path": src_path}).get("doc_id")
+
+            # --- envelope (aicad.simhandoff/1) ------------------------------------
+            env = sh.build_handoff(
+                "motion_to_fea",
+                sh.study_ref("motion", "simulate_motion", doc_id=d,
+                             result_digest={"driver_mate": drv_mate,
+                                            "worst_case": dyn.get("worst_case"),
+                                            "picked_frame": {"i": fi, "t_s": ft}}),
+                sh.study_ref("fea", "run_fea_static", doc_id=part_doc),
+                geometry=[sh.geometry_ref("component", "doc_id", doc_id=part_doc,
+                                          path=src_path, units="mm",
+                                          derived_by="assembly component source",
+                                          meta={"component": cid,
+                                                "name": comp.get("name")})],
+                conditions=conditions,
+                warnings=warnings or None,
+                meta={"at": at if isinstance(at, str) else float(at),
+                      "case": case, "material": material if isinstance(material, str)
+                      else "custom"})
+
+            result = {"ok": True, "doc_id": d, "component": cid,
+                      "part_doc_id": part_doc, "frame": {"i": fi, "t_s": ft},
+                      "loads_applied": loads, "warnings": warnings, "fea": None}
+            if dry_run:
+                result["note"] = "dry_run: loads + envelope built, FEA solve skipped"
+                return _dumps(sh.attach(result, env))
+
+            # --- static FEA on the component (same path as run_fea_static) --------
+            mat = _resolve_material(material)
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": part_doc, "path": step})
+            fixture_sets: list = []
+            for q in fixtures:
+                fixture_sets.extend(_resolve_face_points(part_doc, q))
+            if not fixture_sets:
+                return _dumps({"ok": False, "error": "no fixture faces resolved on the "
+                               "component part — check the fixture queries."})
+            load_specs = []
+            for ld in loads:
+                faces = _resolve_face_points(part_doc, ld["face"])
+                merged: dict = {"points": []}
+                for fp in faces:
+                    merged["points"].extend(fp.get("points", []))
+                if faces:
+                    for k in ("tol_mm", "face_normal", "perp_tol_mm"):
+                        if k in faces[0]:
+                            merged[k] = faces[0][k]
+                load_specs.append({"faces": merged, "type": "force",
+                                   "vector": ld["force"]})
+            study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
+                     "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness}
+            _autosave_all_open()
+            res = cb.call("sim_run_static", {"study": study})
+            if not res.get("ok"):
+                result["fea"] = {"ok": False, "error": res.get("error", "solve failed")}
+                return _dumps(sh.attach(result, env))
+            _persist_study(part_doc, {
+                "type": "fea_static",
+                "name": f"Motion reactions {case} ({mat.get('name', material)})",
+                "engine": "cpp", "material": mat, "fixtures": fixtures,
+                "loads": [{"face": ld["face"], "force": ld["force"]} for ld in loads],
+                "mesh_fineness": mesh_fineness,
+                "results": res.get("summary", {}), "n_dof": res.get("n_dof"),
+                "simhandoff_id": env.get("id"),
             })
+            result["fea"] = {"ok": True, "summary": res.get("summary", {}),
+                             "n_dof": res.get("n_dof"), "material": mat.get("name", material)}
+            return _dumps(sh.attach(result, env))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

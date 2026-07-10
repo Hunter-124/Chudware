@@ -191,6 +191,62 @@ TEST_CASE("doc_simulate_motion: trajectory shape + frame count") {
     fs::remove(pb);
 }
 
+TEST_CASE("doc_simulate_motion: kinematics-only result carries NO dynamics block") {
+    // Regression contract (T-FIN20): when dynamics is not requested the result
+    // must be field-identical to the pre-dynamics tool — in particular no
+    // "dynamics" key may appear.
+    fs::path pa = make_box_step("kin_a", 0.0);
+    fs::path pb = make_box_step("kin_b", 40.0);
+    AsmInfo ai = make_distance_mate_assembly(pa, pb);
+
+    json result = doc::doc_simulate_motion(ai.doc_id, ai.mate_id,
+                                           10.0, 50.0, 4, false, 0.0);
+    REQUIRE(result.value("ok", false));
+    CHECK_FALSE(result.contains("dynamics"));
+    // Exact top-level field set of the kinematics-only result.
+    for (auto& [key, val] : result.items())
+        CHECK_MESSAGE((key == "ok" || key == "doc_id" || key == "mate_id" ||
+                       key == "driver" || key == "trajectory" ||
+                       key == "interference" || key == "summary"),
+                      "unexpected new kinematics-only field: ", key);
+    fs::remove(pa);
+    fs::remove(pb);
+}
+
+TEST_CASE("doc_simulate_motion: dynamics request adds a dynamics block") {
+    // Smoke: dynamics options produce the block with bodies + frames. (The mate
+    // selectors in this fixture dangle, so no joints resolve — that must be a
+    // WARNING, never a failure; the analytic joint-reaction V&V lives in
+    // test_motion_dynamics.cpp.)
+    fs::path pa = make_box_step("dyn_a", 0.0);
+    fs::path pb = make_box_step("dyn_b", 40.0);
+    AsmInfo ai = make_distance_mate_assembly(pa, pb);
+
+    json dyn = {
+        {"duration_s", 0.5},
+        {"gravity", {0.0, 0.0, -9.81}},
+        {"default_density_g_cm3", 2.7},
+    };
+    json result = doc::doc_simulate_motion(ai.doc_id, ai.mate_id,
+                                           10.0, 50.0, 5, false, 0.0, dyn);
+    REQUIRE(result.value("ok", false));
+    REQUIRE(result.contains("dynamics"));
+    const json& d = result["dynamics"];
+    CHECK(d.contains("bodies"));
+    CHECK(d.contains("frames"));
+    CHECK(d.contains("warnings"));
+    // Both boxes got mass from geometry x density (10x10x10 mm at 2.7 g/cm3 = 2.7 g).
+    REQUIRE((int)d["bodies"].size() == 2);
+    for (const json& b : d["bodies"])
+        CHECK(std::abs(b.value("mass_kg", 0.0) - 0.0027) < 1e-6);
+    // One dynamics frame per kept trajectory sample, timestamped across duration_s.
+    CHECK((int)d["frames"].size() == (int)result["trajectory"].size());
+    if (!d["frames"].empty())
+        CHECK(std::abs(d["frames"].back().value("t_s", -1.0) - 0.5) < 1e-9);
+    fs::remove(pa);
+    fs::remove(pb);
+}
+
 TEST_CASE("doc_simulate_motion: invalid doc_id throws") {
     bool threw = false;
     try {

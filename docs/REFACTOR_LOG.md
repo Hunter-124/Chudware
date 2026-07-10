@@ -962,3 +962,23 @@ ascii); conda env bashrc lives at <env>/etc/bashrc and MUST be sourced (bare exe
 etc/controlDict lookup); mcp test suite legs needing libaicad were skipped here (worktree
 has no staged dist). Deferred: MCP-level exposure of the CHT variant (T-FIN19 will wire
 board solids + heat sources into thermal["solids"]).
+
+## 2026-07-10 — T-FIN20: motion dynamics + motion→FEA handoff
+
+Rigid-body INVERSE dynamics on simulate_motion's swept trajectory. New OCCT-free module
+`core/doc/motion_dynamics.{h,cpp}` (prescribed-motion Newton–Euler; per-mate reaction
+wrenches restricted to each mate type's constraint-jacobian wrench basis; per-frame
+min-norm least squares). `doc_simulate_motion` gains an optional `dynamics` json param
+(mass/inertia from geometry × density with per-component density/mass overrides,
+gravity, applied loads, viscous damping) — kinematics-only results are field-identical
+(regression-tested). `AssemblyResult.mate_geometry` newly exposes resolved mate ref
+geometry (component + local MateGeom) for joint anchoring. MCP: `simulate_motion`
+`dynamics` option; new `motion_fea_handoff` (worst-case/at-time joint reactions →
+force loads on the component's mate faces → run_fea_static, aicad.simhandoff/1
+`motion_to_fea` envelope with case-labelled conditions + provenance; `dry_run` mode).
+V&V: `core/tests/test_motion_dynamics.cpp` — pendulum (uniform + oscillating) and
+slider-crank analytic reaction/torque cross-checks. Gotchas: FEA applies FORCES only —
+significant joint moments are recorded in the envelope + warned, not loaded; dynamics
+uses the FIRST resolved ref of each mate for anchor/axis; pattern instances (`#`) are
+excluded from dynamics. Deferred: point-moment loads in static FEA; friction beyond
+viscous damping; live (non-dry-run) handoff FEA run needs a Netgen-enabled engine.

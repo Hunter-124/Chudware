@@ -564,6 +564,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                 continue;
             }
             resolved_geometry[{mid, i}] = geom;
+            res.mate_geometry[mid].push_back(AsmMateRefGeom{i, cid, geom});
         }
     }
 

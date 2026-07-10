@@ -104,10 +104,27 @@ const char* kRecaptchaLoginHelper = R"JS(
   const findSitekey = (form) => {
     const el = (form && form.querySelector('[data-sitekey]')) || document.querySelector('[data-sitekey]');
     if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-    // Magento MSP and other explicit-render setups keep the key in page config; a
-    // Google sitekey is a 40-char 6L… token. Match the first one in the document.
-    try { const m = document.documentElement.innerHTML.match(/6L[0-9A-Za-z_-]{38}/); if (m) return m[0]; } catch (e) {}
-    return null;
+    // Explicit-render setups (Magento's invisible reCAPTCHA) carry the key only in
+    // the widget's own endpoints, not a data-sitekey attr. reCAPTCHA injects its
+    // anchor/bframe IFRAME whose src is ...?k=<sitekey>; read the DECODED iframe.src
+    // (the property gives real '&', unlike serialized innerHTML which HTML-escapes it
+    // to '&amp;' and defeats a naive [?&]k= scan). This is the robust source and
+    // avoids look-alikes: a base64 `referer` param can begin "6L…" and precede the
+    // true key in the DOM, so a bare /6L…/ scan would grab that garbage.
+    try {
+      for (const f of document.querySelectorAll('iframe[src*="recaptcha"]')) {
+        const m = (f.src || '').match(/[?&]k=(6L[0-9A-Za-z_-]{38})/);
+        if (m) return m[1];
+      }
+    } catch (e) {}
+    // Fallbacks: the api.js ?render=<key>, or a k=/render= key in serialized HTML
+    // (tolerate the &amp; / entity boundary before the param name).
+    try {
+      const html = document.documentElement.innerHTML;
+      const m = html.match(/(?:[?&;=]|&amp;)(?:k|render)=(6L[0-9A-Za-z_-]{38})/);
+      if (m) return m[1];
+    } catch (e) {}
+    return null;   // no reCAPTCHA-bound key found → don't guess, let native flow run
   };
   const ensureToken = (form) => {
     // Already carries a token → nothing to do.
@@ -132,8 +149,14 @@ const char* kRecaptchaLoginHelper = R"JS(
         try { const m = document.cookie.match(/(?:^|;\s*)form_key=([^;]+)/);
           if (m) { const fk = form.querySelector('[name="form_key"]');
             if (fk) fk.value = decodeURIComponent(m[1]); } } catch (e) {}
-        form.__aicadRcSubmitting = true;   // let this pass straight through the hook
-        if (form.requestSubmit) form.requestSubmit(); else form.submit();
+        // RAW submit() — NOT requestSubmit()/click(). requestSubmit re-dispatches a
+        // 'submit' event, which re-fires the vendor's OWN handler (Magento's MSP);
+        // that handler then re-executes its widget over ours and the server rejects
+        // the collision with "reCAPTCHA verification failed" (proven: requestSubmit
+        // fails, raw submit passes). The token is already in the field, so a bare
+        // POST that skips every submit handler is exactly what the server needs.
+        form.__aicadRcSubmitting = true;   // belt-and-suspenders if a form.submit shim exists
+        form.submit();
       } catch (e) {}
     } }); } catch (e) { return false; }   // widget already rendered / not ready → don't block
     try { grecaptcha.execute(wid); } catch (e) { return false; }

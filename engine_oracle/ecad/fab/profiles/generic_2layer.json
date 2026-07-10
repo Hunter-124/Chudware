@@ -1,0 +1,21 @@
+{
+  "name": "generic_2layer",
+  "vendor": "generic",
+  "description": "Generic 1.6 mm 2-layer FR-4 (0.035 mm copper, 1.51 mm core Er 4.5). No controlled-impedance dielectric menu — a 50R microstrip needs a ~2.9 mm trace here, which is the honest physics of a 1.5 mm dielectric; use a 4/6-layer profile for practical controlled impedance.",
+  "sources": [
+    "Typical 2-layer FR-4 rigid build (1.6 mm nominal, 1 oz copper)"
+  ],
+  "copper_layers": 2,
+  "board_thickness": 1.6,
+  "min_trace": 0.15,
+  "min_space": 0.15,
+  "max_trace": 5.0,
+  "diff_gaps": [0.2, 0.15],
+  "via": {"diameter": 0.6, "drill": 0.3},
+  "layer_roles": ["signal", "plane_gnd"],
+  "stackup_layers": [
+    {"id": "F.Cu",  "type": "copper", "thickness": 0.035},
+    {"id": "core1", "type": "core",   "thickness": 1.51, "er": 4.5},
+    {"id": "B.Cu",  "type": "copper", "thickness": 0.035}
+  ]
+}

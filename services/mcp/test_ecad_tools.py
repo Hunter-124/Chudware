@@ -1348,6 +1348,231 @@ def _disable_live_provider():
     return _restore
 
 
+# --------------------------------------------------------------------------- T-FIN16 thermal handoff
+
+
+def _fin16_tools() -> dict:
+    """Register the ECAD + thermal-handoff tools onto ONE stub (the handoff needs
+    ecad session state)."""
+    from mcp_server.ecad_thermal import register_ecad_thermal_tools
+    stub = _StubMCP()
+    register_ecad_tools(stub)
+    register_ecad_thermal_tools(stub)
+    return stub.tools
+
+
+def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
+    """Regulator (~2 W) + MCU (0.3 W) + passives demo board with a closed outline and
+    a skinny +5V trace (for the PDN/trace-heating leg). Returns the pcb doc_id."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _call(tools, "ecad_new_pcb", name=name)
+    doc_id = _ECAD["current_pcb"]
+    doc = ecad_session.get_session(doc_id).doc
+    # 40 x 30 mm closed rectangle outline.
+    pts = [(0, 0), (40, 0), (40, 30), (0, 30)]
+    doc["outline"] = {"closed": True, "shapes": [
+        {"type": "line", "p1": list(pts[i]), "p2": list(pts[(i + 1) % 4])}
+        for i in range(4)]}
+
+    def _pad(net, n="1", size=1.2):
+        return {"id": f"p{n}", "number": n, "pin": n, "pos": [0.0, 0.0], "angle": 0.0,
+                "shape": "rect", "size": [size, size], "type": "smd",
+                "layers": ["F.Cu"], "net": net}
+
+    doc["nets"].append({"name": "+5V", "class": "default"})
+    reg_eng = {"power_w": {"typ": 2.0, "max": 3.0},
+               "theta_c_per_w": {"ja": 40.0, "jc": 5.0},
+               "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+               "supply": {"rails": [{"name": "+5V", "voltage_v_min": 4.75,
+                                     "voltage_v_nom": 5.0, "voltage_v_max": 5.25,
+                                     "current_a_active": 1.5, "current_a_sleep": None}],
+                          "voltage_domains": ["+5V"], "sequencing": []},
+               "sources": ["test fixture: 2 W linear regulator"]}
+    mcu_eng = {"power_w": {"typ": 0.3, "max": 0.5},
+               "theta_c_per_w": {"ja": 60.0, "jc": None},
+               "limits_c": {"tj_max": 105.0, "ta_max": 85.0},
+               # deliberately hungry fixture current so the skinny trace makes real I2R heat
+               "supply": {"rails": [{"name": "+5V", "voltage_v_min": 4.75,
+                                     "voltage_v_nom": 5.0, "voltage_v_max": 5.25,
+                                     "current_a_active": 1.5, "current_a_sleep": None}],
+                          "voltage_domains": ["+5V"], "sequencing": []},
+               "sources": ["test fixture: MCU"]}
+    doc["footprints"].extend([
+        {"id": "fp1", "ref": "U1", "fpid": "Test:REG", "pos": [10.0, 15.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+5V", size=6.0)],  # thermal tab
+         "fields": {"height": 4.5}, "eng_overrides": reg_eng},
+        {"id": "fp2", "ref": "U2", "fpid": "Test:MCU", "pos": [30.0, 15.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("+5V")],
+         "fields": {"height": 1.6}, "eng_overrides": mcu_eng},
+        {"id": "fp3", "ref": "R1", "fpid": "Test:R", "pos": [20.0, 25.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("GND")]},
+        {"id": "fp4", "ref": "C1", "fpid": "Test:C", "pos": [20.0, 5.0],
+         "angle": 0.0, "side": "top", "pads": [_pad("GND")]},
+    ])
+    # Skinny 0.3 mm trace carrying the regulator's 1.5 A: real I2R heat for the PDN leg.
+    doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [10.0, 15.0],
+                          "p2": [30.0, 15.0], "width": 0.3, "net": "+5V",
+                          "layer": "F.Cu"})
+    return doc_id
+
+
+def test_fin16_dry_run_handoff() -> None:
+    """T-FIN16: dry-run handoff builds the fused FEA solid, per-component heat sources,
+    convection BCs and a VALID aicad.simhandoff/1 envelope; missing power metadata
+    degrades honestly into the coverage note."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN16: build123d not installed — skipping dry-run handoff test")
+        return
+    import os
+    from services.mcp import simhandoff as sh
+
+    tools = _fin16_tools()
+    doc_id = _fin16_demo_board(tools)
+    r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, dry_run=True)
+    _assert_context(r, "ecad_thermal_handoff")
+    assert r["ok"] and r["dry_run"] and r["solved"] is False, r.get("error")
+    assert os.path.isfile(r["step_path"]), "FEA STEP not written"
+    # Homogenization documented (DoD): assumptions + both conductivities surfaced.
+    mat = r["material"]
+    assert 1.0 < mat["k_w_mk"] < 60.0, f"implausible in-plane k: {mat['k_w_mk']}"
+    assert mat["k_through_plane_w_mk"] < 1.0
+    assert any("homogenized" in a for a in r["assumptions"])
+    # One heat_source condition PER powered component, applied_to = ref (contract).
+    env = r["simhandoff"]
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    assert env["coupling"] == "ecad_to_thermal_fea"
+    hs = {c["applied_to"]: c for c in env["conditions"] if c["kind"] == "heat_source"}
+    assert set(hs) == {"U1", "U2"}, f"heat sources: {sorted(hs)}"
+    assert hs["U1"]["value"] == 2.0 and hs["U1"]["units"] == "W"
+    assert "power_w.typ" in hs["U1"]["provenance"]
+    assert any(c["kind"] == "convection" for c in env["conditions"])
+    # Honest degrade: unpowered passives named, never given invented watts.
+    cov = r["coverage"]
+    assert set(cov["unpowered_refs"]) == {"R1", "C1"}, cov
+    assert cov["n_heat_sources"] == 2
+    # theta_ja expectations for the verify hand calc.
+    exp = {e["quantity"]: e for e in env.get("expectations", [])}
+    assert "tj_U1_c" in exp and abs(exp["tj_U1_c"]["value"] - (25.0 + 2.0 * 40.0)) < 1e-6
+    print(f"  FIN16: dry run — {cov['n_heat_sources']} sources, "
+          f"k_eff {mat['k_w_mk']} W/mK, envelope valid")
+    print("  [fin16_dry_run_handoff] PASS")
+
+
+def test_fin16_trace_heating_toggle() -> None:
+    """T-FIN16: include_trace_heating pulls the ecad_run_pdn I2R map in as distributed
+    flux — the load set and envelope visibly change."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN16: build123d not installed — skipping trace-heating test")
+        return
+    tools = _fin16_tools()
+    doc_id = _fin16_demo_board(tools, name="fin16_i2r")
+    p = _call(tools, "ecad_run_pdn", net="+5V", source_refs="U1", doc_id=doc_id)
+    assert p["ok"] and p.get("boardphys_path"), f"pdn failed: {p.get('error')}"
+    base = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, dry_run=True)
+    with_i2r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, dry_run=True,
+                     include_trace_heating=True)
+    assert base["ok"] and with_i2r["ok"]
+    assert base["trace_heating"]["included"] is False
+    ti = with_i2r["trace_heating"]
+    assert ti["included"] and ti["total_w"] > 0.05 and ti["n_cell_loads"] > 0, ti
+    assert with_i2r["n_flux_loads"] > base["n_flux_loads"], \
+        "I2R map must add flux loads"
+    conds = {c["name"] for c in with_i2r["simhandoff"]["conditions"]}
+    assert "trace_heating_i2r" in conds and \
+        "trace_heating_i2r" not in {c["name"] for c in base["simhandoff"]["conditions"]}
+    print(f"  FIN16: I2R toggle — +{with_i2r['n_flux_loads'] - base['n_flux_loads']} "
+          f"flux loads, {ti['total_w']} W trace heat")
+    print("  [fin16_trace_heating_toggle] PASS")
+
+
+def test_fin16_verify_thermal() -> None:
+    """T-FIN16: ecad_verify_thermal builds the Tj/limits margin table + the theta_ja
+    hand-calc verify envelope from a solved handoff payload (engine-less)."""
+    from services.mcp import simhandoff as sh
+    tools = _fin16_tools()
+    # Synthetic SOLVED handoff: U1 solved rise ~ hand-calc rise (2W x 40 C/W = 80 C);
+    # U2 exceeds its 105 C limit.
+    solved = {
+        "ok": True, "solved": True, "doc_id": "pcb-test",
+        "environment": {"name": "still_air", "h_w_m2k": 10.0, "t_amb_c": 25.0},
+        "components": [
+            {"ref": "U1", "power_w": 2.0, "t_case_c": 95.0, "tj_c": 105.0,
+             "theta_jc": 5.0, "theta_ja": 40.0, "tj_max_c": 125.0},
+            {"ref": "U2", "power_w": 0.3, "t_case_c": 108.0, "tj_c": None,
+             "theta_jc": None, "theta_ja": 60.0, "tj_max_c": 105.0},
+            {"ref": "R1", "power_w": None, "t_case_c": 60.0, "tj_c": None,
+             "theta_jc": None, "theta_ja": None, "tj_max_c": None},
+        ],
+        "simhandoff": {"id": "hid-1"},
+    }
+    v = _call(tools, "ecad_verify_thermal", handoff_result=solved, tolerance_pct=75.0)
+    _assert_context(v, "ecad_verify_thermal")
+    assert v["ok"], v.get("error")
+    rows = {e["ref"]: e for e in v["table"]}
+    assert rows["U1"]["pass"] is True and abs(rows["U1"]["margin_c"] - 20.0) < 1e-6
+    # U2 has no theta_jc -> Tcase basis, over its 105 C limit -> FAIL with margin.
+    assert rows["U2"]["pass"] is False and rows["U2"]["margin_c"] == -3.0
+    assert rows["R1"]["pass"] is None, "no limit -> unchecked, never assumed OK"
+    assert v["pass"] is False and "FAIL" in v["verdict"]
+    env = v["simhandoff"]
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    assert env["kind"] == "verify" and env["handoff_id"] == "hid-1"
+    checks = {c["quantity"]: c for c in env["checks"]}
+    # U1 hand calc: rise 80 C vs solved rise 80 C -> 0 % deviation, passes.
+    assert checks["tj_rise_U1"]["pass"] and checks["tj_rise_U1"]["deviation_pct"] < 1.0
+    # Dry-run / unsolved input is rejected honestly.
+    bad = _call(tools, "ecad_verify_thermal", handoff_result={"ok": True, "solved": False})
+    assert not bad["ok"] and "not solved" in bad["error"]
+    print(f"  FIN16: verify — verdict {v['verdict']!r}")
+    print("  [fin16_verify_thermal] PASS")
+
+
+def test_fin16_live_solve() -> None:
+    """T-FIN16 (live leg): full board -> solved temperature field with zero manual BC
+    setup, when a sim-enabled libaicad is loadable. Honest skip otherwise."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN16: build123d not installed — skipping live solve")
+        return
+    try:
+        from mcp_server import core_bridge as cb
+        cb.call("ping", {})
+    except Exception as e:  # noqa: BLE001
+        print(f"  FIN16: libaicad not loadable ({type(e).__name__}) — live solve SKIPPED "
+              "(dry-run coverage above still exercises geometry/BC/envelope)")
+        return
+    tools = _fin16_tools()
+    doc_id = _fin16_demo_board(tools, name="fin16_live")
+    r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, mesh_fineness=0.25)
+    if not r.get("ok") or not r.get("solved"):
+        # A Netgen-less build degrades to an envelope-only result — honest skip.
+        why = r.get("error_solve") or r.get("error")
+        assert "unavailable" in str(why) or r.get("simhandoff"), r
+        print(f"  FIN16: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
+        return
+    amb = r["environment"]["t_amb_c"]
+    assert r["board_max_temp_c"] > amb + 5.0, \
+        f"2.35 W in still air must heat the board: {r['board_max_temp_c']} C"
+    temps = {c["ref"]: c for c in r["components"]}
+    assert temps["U1"]["t_case_c"] is not None and temps["U2"]["t_case_c"] is not None
+    assert temps["U1"]["t_case_c"] >= temps["U2"]["t_case_c"], \
+        "the 2 W regulator must run hotter than the 0.3 W MCU"
+    assert temps["U1"]["tj_c"] is not None, "theta_jc known -> Tj must be estimated"
+    v = _call(tools, "ecad_verify_thermal")
+    assert v["ok"] and v["table"], v
+    print(f"  FIN16: LIVE solve — board max {r['board_max_temp_c']} C, "
+          f"U1 case {temps['U1']['t_case_c']} C / Tj {temps['U1']['tj_c']} C; "
+          f"verify: {v['verdict']!r}")
+    print("  [fin16_live_solve] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     _restore_provider = _disable_live_provider()
@@ -1406,6 +1631,11 @@ def _run_all() -> None:
     test_fin13_run_pdn(tools)
     # T-FIN11 FPGA support pack
     test_fin11_fpga_check_and_constraints(tools)
+    # T-FIN16 ECAD -> thermal FEA handoff
+    test_fin16_dry_run_handoff()
+    test_fin16_trace_heating_toggle()
+    test_fin16_verify_thermal()
+    test_fin16_live_solve()
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

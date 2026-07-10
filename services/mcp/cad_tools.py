@@ -1448,9 +1448,9 @@ solve from tripping the transport timeout (which would otherwise drop the sessio
 restart, recover_parts() reloads auto-saved docs.
 
 CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
-  When one physics domain feeds another (1D piping → 3D CFD and hydraulic → piping /
-  hydraulic → FEA today; ECAD → thermal FEA, motion → FEA reaction loads, thermal → CFD
-  conjugate as they land),
+  When one physics domain feeds another (1D piping → 3D CFD, hydraulic → piping /
+  hydraulic → FEA, motion → FEA and ECAD → thermal FEA today; thermal → CFD
+  conjugate as it lands),
   the coupling follows one seam: a HANDOFF tool solves the source domain, derives geometry
   + boundary conditions with explicit units and provenance, and runs (or stages) the target
   study; a VERIFY tool then cross-checks a shared quantity between the two solvers at a
@@ -1475,6 +1475,19 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   forces on the selected component's mate faces and runs run_fea_static on it — "is this
   link strong enough at the worst instant" in one call. Conditions are `case`-labelled
   per frame; dry_run=True builds loads + envelope without solving.
+  ECAD → thermal FEA (LIVE, T-FIN16): ecad_thermal_handoff(environment='still_air'|
+  'forced_air'|'cold_plate'|custom h/t_amb, include_trace_heating=…) takes the ACTIVE
+  routed board to a solved board-level thermal study in one call — fused board+component
+  FEA solid with the FR4/copper stackup HOMOGENIZED to one effective material (in-plane
+  rule-of-mixtures k, every assumption listed in the result), one heat_source condition
+  PER component from its boardphys power metadata (components without power_w get NO
+  source and are named in coverage.unpowered_refs), optional PDN I2R trace heating from
+  ecad_run_pdn as distributed flux, environment-preset convection, quasi-steady core
+  transient solve, then per-component case temp + Tj (case + P*theta_jc) map-back.
+  ecad_verify_thermal() gives the per-component Tj-vs-limit margin table and a theta_ja
+  hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
+  board; minor power contributors get advisories, not pass/fail — neighbor heating is
+  invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
   Helper builders/validator: services/mcp/simhandoff.py.
 """
 

@@ -733,3 +733,230 @@ def board_to_part_doc(board: dict, step_path: str) -> dict:
             }
         ],
     }
+
+
+# --------------------------------------------------------------------------- FEA variant (T-FIN16)
+#
+# ``board_to_fea_step`` is the thermal-FEA-ready sibling of :func:`board_to_step`:
+# ONE fused solid (substrate + simplified component bodies) that the tet mesher can
+# chew, plus the layer-homogenized effective material and per-component placement
+# rectangles so the caller can build face-sample BC point sets without a CAD doc.
+#
+# Deliberate simplifications (each documented in the returned ``assumptions``):
+#   * drill/via holes are OMITTED — negligible for board-level conduction, hugely
+#     expensive for meshing;
+#   * component bodies use library package box/cylinder dims (else the pad-extent
+#     proxy box) and NEVER the real model_3d STEP — detailed leads/fillets don't
+#     change a case-temperature answer but explode mesh cost;
+#   * everything is fused into ONE solid with ONE effective material — the FR4/copper
+#     stackup is homogenized (below) and component packages inherit the same material
+#     (a mold-compound k≈0.9 W/m·K vs board k≈15-20 makes components slightly
+#     OPTIMISTIC spreaders; theta_jc mapping happens downstream).
+
+# Handbook conductivities (W/m·K) and thermo-physical nominals for the homogenization.
+_K_COPPER = 385.0
+_K_FR4 = 0.30
+_RHO_COPPER_KG_M3 = 8960.0
+_RHO_FR4_KG_M3 = 1850.0
+_CP_COPPER_J_KGK = 385.0
+_CP_FR4_J_KGK = 1100.0
+_CU_LAYER_T_MM = 0.035          # 1 oz copper per layer
+_CU_COVERAGE = 0.5              # assumed residual copper coverage per layer (routed board)
+# Component bodies in the FEA solid are FLATTENED to at most this height (mm). Package
+# power is generated at the die, millimeters from the board; the handoff injects it as a
+# flux on the body's top face, so a full-height body would add a fictitious conduction
+# column (a 4.5 mm tall 2x2 mm proxy at board-k is >100 K/W of pure artifact). A thin
+# cap keeps the footprint's spreading area without that column.
+_FEA_MAX_BODY_H_MM = 1.0
+
+
+def homogenize_stackup(board: dict) -> dict:
+    """Effective (homogenized) material for an FR4 + copper stackup.
+
+    The board is modeled as ONE isotropic solid. Copper volume fraction
+    f = n_cu_layers x 35 um x coverage / thickness (coverage assumed 0.5 — a typical
+    routed board with pours; a solid-plane board is nearer 0.9, a sparse one 0.2).
+
+    * IN-PLANE conductivity (parallel/rule-of-mixtures): k = f*k_cu + (1-f)*k_fr4 —
+      dominated by the copper, typically 10-25 W/m·K. THIS is the value used for the
+      isotropic solve, because lateral heat SPREADING from component hot spots is the
+      first-order board-thermal mechanism.
+    * THROUGH-PLANE (series): k = 1/(f/k_cu + (1-f)/k_fr4) ≈ 0.3-0.4 W/m·K — reported
+      for reference; an isotropic solve OVERESTIMATES top-to-bottom conduction (i.e. is
+      optimistic about bottom-side cooling). Documented, not hidden.
+
+    rho is volume-weighted; cp is mass-weighted. Returns the material dict + the
+    assumption strings (surface these in tool output — DoD requirement).
+    """
+    stack = board.get("stackup", {}) or {}
+    t = float(stack.get("thickness", 1.6) or 1.6)
+    n_cu = int(stack.get("copper_layers", 2) or 2)
+    f = min((n_cu * _CU_LAYER_T_MM * _CU_COVERAGE) / max(t, 1e-6), 0.5)
+    k_in = f * _K_COPPER + (1.0 - f) * _K_FR4
+    k_thru = 1.0 / (f / _K_COPPER + (1.0 - f) / _K_FR4)
+    rho = f * _RHO_COPPER_KG_M3 + (1.0 - f) * _RHO_FR4_KG_M3
+    cp = ((f * _RHO_COPPER_KG_M3 * _CP_COPPER_J_KGK
+           + (1.0 - f) * _RHO_FR4_KG_M3 * _CP_FR4_J_KGK) / rho)
+    return {
+        "name": f"FR4+Cu homogenized ({n_cu} layer)",
+        "k_w_mk": round(k_in, 3),                 # used by the isotropic solve (in-plane)
+        "k_through_plane_w_mk": round(k_thru, 4),  # reference only
+        "cp_j_kgk": round(cp, 1),
+        "rho_kg_m3": round(rho, 1),
+        "copper_volume_fraction": round(f, 5),
+        "copper_layers": n_cu,
+        "copper_coverage_assumed": _CU_COVERAGE,
+        "assumptions": [
+            f"stackup homogenized to one isotropic solid: {n_cu} copper layers x "
+            f"{_CU_LAYER_T_MM} mm x {_CU_COVERAGE:.0%} assumed coverage over {t} mm FR4 "
+            f"-> copper volume fraction {f:.4f}",
+            f"IN-PLANE rule-of-mixtures k = {k_in:.2f} W/m-K used for the solve "
+            "(lateral spreading dominates board thermals)",
+            f"through-plane series k = {k_thru:.3f} W/m-K NOT separately modeled — the "
+            "isotropic solve overestimates top-to-bottom conduction (optimistic for "
+            "bottom-side cooling)",
+            "component packages inherit the board's effective material (mold compound "
+            "k~0.9 W/m-K is lower; component bodies act as slightly optimistic spreaders)",
+        ],
+    }
+
+
+def _world_rect(fp: dict, w: float, h: float) -> list:
+    """Axis-aligned world bbox [x0, y0, x1, y1] of a w x h footprint-local extent
+    rotated by the footprint angle and centered at its position."""
+    px, py = float(fp["pos"][0]), float(fp["pos"][1])
+    a = math.radians(float(fp.get("angle", 0.0)))
+    hx = abs(w / 2.0 * math.cos(a)) + abs(h / 2.0 * math.sin(a))
+    hy = abs(w / 2.0 * math.sin(a)) + abs(h / 2.0 * math.cos(a))
+    return [px - hx, py - hy, px + hx, py + hy]
+
+
+def board_to_fea_step(board: dict, out_path: str, opts: Any = None) -> dict:
+    """Build the thermal-FEA-ready fused solid for ``board`` and write it as STEP.
+
+    Returns::
+
+        {"step_path", "summary", "material": <homogenize_stackup()>,
+         "assumptions": [...],
+         "board": {"bbox_mm": [x0,y0,x1,y1], "z_top_mm", "z_bot_mm", "thickness_mm",
+                   "outline_area_mm2"},
+         "components": [<boardphys record> + {"fea": {"rect_mm": [x0,y0,x1,y1],
+                        "z_top_mm", "z_bot_mm", "top_area_mm2"}}, ...]}
+
+    Component records follow contracts/ecad/boardphys.md (power/theta/limits honest
+    nulls). Raises :class:`BoardGeometryError` for an empty/open outline.
+    """
+    from build123d import Plane, extrude, export_step
+
+    opts = BoardToStepOpts.coerce(opts)
+    summary = _Summary()
+
+    stack = board.get("stackup", {}) or {}
+    thickness = float(stack.get("thickness", 1.6) or 1.6)
+    if thickness <= 0.0:
+        raise BoardGeometryError(f"stackup.thickness must be > 0, got {thickness}")
+    face, area = _outline_face(board.get("outline", {}) or {})
+    summary.outline_area = area
+    summary.thickness = thickness
+    zb = _z_base(opts, thickness)
+    # Slab WITHOUT drill holes (FEA simplification #1).
+    solid = extrude(Plane.XY.offset(zb) * face, amount=thickness)
+
+    bb = solid.bounding_box()
+    board_bbox = [float(bb.min.X), float(bb.min.Y), float(bb.max.X), float(bb.max.Y)]
+
+    records: list = []
+    n_fused = 0
+    for fp in board.get("footprints", []):
+        if not _is_on_board(fp):
+            continue
+        eng = eng_metadata.eng_for_footprint(fp)
+        rec = _phys_record(fp, eng)
+        records.append(rec)
+        if not fp.get("pads"):
+            summary.warnings.append(
+                f"footprint {fp.get('ref', fp.get('id'))!r} has no pads — skipped.")
+            summary.n_skipped += 1
+            continue
+        # Simplified body only (FEA simplification #2): package dims else proxy box.
+        _shape_probe, body_desc = _package_shape(fp, eng)
+        if body_desc is None:
+            body_desc = _proxy_body_descriptor(fp)
+            summary.n_proxies += 1
+        # Local extent for the world rect: package l/w when known, else pad extent.
+        if body_desc.get("shape") == "cylinder":
+            w = h = float(body_desc["d_mm"])
+        elif body_desc.get("l_mm"):
+            w, h = float(body_desc["l_mm"]), float(body_desc["w_mm"])
+        else:
+            w, h = _footprint_extent(fp)
+        ht_full = float(body_desc.get("h_mm") or _proxy_height(fp))
+        # FEA simplification #4: flatten the body to a thin cap (see _FEA_MAX_BODY_H_MM).
+        ht = min(ht_full, _FEA_MAX_BODY_H_MM)
+        from build123d import Pos, Box, Cylinder
+        if body_desc.get("shape") == "cylinder":
+            shape = Pos(0, 0, ht / 2.0) * Cylinder(radius=w / 2.0, height=ht)
+        else:
+            shape = Pos(0, 0, ht / 2.0) * Box(w, h, ht)
+        try:
+            placed = _place_component(shape, fp, thickness, zb)
+            solid = solid + placed           # fuse (FEA simplification #3: one solid)
+            n_fused += 1
+            summary.n_components += 1
+            label = str(fp.get("ref") or fp.get("id") or "CMP")
+            rec["solid_label"] = label
+            rec["body"] = body_desc
+            side = fp.get("side", "top")
+            z_top = zb + thickness + ht if side != "bottom" else zb
+            z_bot = zb + thickness if side != "bottom" else zb - ht
+            rect = _world_rect(fp, w, h)
+            rec["fea"] = {
+                "h_full_mm": ht_full,
+                "h_fea_mm": ht,
+                "rect_mm": [round(v, 4) for v in rect],
+                "z_top_mm": round(z_top, 4),
+                "z_bot_mm": round(z_bot, 4),
+                "top_area_mm2": round((rect[2] - rect[0]) * (rect[3] - rect[1]), 4),
+                "side": side,
+            }
+        except Exception as exc:  # noqa: BLE001
+            summary.warnings.append(
+                f"component {fp.get('ref', fp.get('id'))!r} fuse failed: {exc}")
+            summary.n_skipped += 1
+
+    try:
+        summary.board_volume = float(solid.volume)
+    except Exception:  # noqa: BLE001
+        summary.board_volume = 0.0
+
+    solid.label = str(board.get("name") or "PCB") + "_FEA"
+    out_path = os.path.abspath(out_path)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    export_step(solid, out_path)
+
+    material = homogenize_stackup(board)
+    assumptions = list(material["assumptions"]) + [
+        "drill/via holes omitted from the FEA solid (negligible for conduction, "
+        "expensive for meshing)",
+        "component bodies are library package box/cylinder dims or pad-extent proxy "
+        "boxes — never detailed model_3d STEPs",
+        f"component bodies flattened to <= {_FEA_MAX_BODY_H_MM} mm caps: package power "
+        "is generated at the die next to the board; injecting the top-face flux on a "
+        "full-height body would add a fictitious conduction column (>100 K/W for a "
+        "tall small-footprint package)",
+        f"substrate + {n_fused} component bodies fused into ONE solid for meshing",
+    ]
+    return {
+        "step_path": out_path,
+        "summary": summary.asdict(),
+        "material": material,
+        "assumptions": assumptions,
+        "board": {
+            "bbox_mm": [round(v, 4) for v in board_bbox],
+            "z_top_mm": round(zb + thickness, 4),
+            "z_bot_mm": round(zb, 4),
+            "thickness_mm": thickness,
+            "outline_area_mm2": summary.outline_area,
+        },
+        "components": records,
+    }

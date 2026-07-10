@@ -246,3 +246,35 @@ THERMAL FEA HANDOFF (T-FIN16; aicad.simhandoff/1 coupling ecad_to_thermal_fea):
   Typical flow: ecad_make_board -> ecad_run_pdn('+5V') -> ecad_thermal_handoff(
       include_trace_heating=True) -> ecad_verify_thermal() -> widen copper / add
       vias / forced_air and re-run until margins clear.
+
+VIBRATION RELIABILITY SCREEN (T-FIN21; aicad.simhandoff/1 coupling ecad_to_structural_fea):
+  ecad_vibe_check([band_lo_hz=20], [band_hi_hz=2000], [psd_breakpoints],
+                  [mount_holes], [zeta=0.05], [dry_run])
+      One call from the ACTIVE routed board to a mounted-board vibration screen —
+      zero manual BC setup. Pipeline: T-FIN16 fused board+components FEA solid
+      (reused) with a MASS-CORRECTED effective density (component masses from
+      package dims x a mold-compound density assumption, eng mass metadata wins;
+      mass_model lists every number) -> mount holes detected (mounting-hole
+      footprints, NPTH pads >= 1.5 mm, un-netted plated holes >= 2 mm; or pass
+      mount_holes=[[x,y],[x,y,drill_d],...]) and FIXED (screw-land patches on both
+      faces) -> core modal solve -> every natural frequency inside the excitation
+      band FLAGGED (default 20-2000 Hz random-vibe screening band) -> Miles'
+      random response at the worst in-band mode -> 3-sigma board deflection
+      (Z = 9.8*G/f^2) screened per component against Steinberg's
+      0.00022*B/(C*h*r*sqrt(L)) deflection limit.
+  HEURISTIC + CITED: the deflection screen is Steinberg (Vibration Analysis for
+      Electronic Equipment, 3e, Wiley 2000) — a solder-joint fatigue RISK screen
+      for ~20e6 random-vibe cycles, NOT a life prediction; the citation rides in
+      deflection_screen.citation. Components without body dims are UNCHECKED,
+      never assumed OK.
+  DEFAULT PSD: flat 0.04 g^2/Hz across the band (NAVMAT P-9492-class screening
+      level, simplified flat — echoed as a warning). Pass
+      psd_breakpoints=[[f_hz, g2_per_hz], ...] for the real qualification
+      spectrum before sign-off. zeta damping default 0.05 (assumed, echoed).
+  READ THE RESULT: modes[] (freq + in_band flags), band.verdict (FLAG/CLEAR),
+      response.worst_mode + total_grms, deflection_screen.table (per-component
+      Z_allow vs Z_est margins) + verdict, mass_model, simhandoff envelope with
+      one fixed_support condition PER mount hole + the base_excitation PSD.
+  Typical flow: ecad_make_board -> ecad_vibe_check() -> if FLAG/FAIL: add a mount
+      / thicken laminate / move heavy parts toward mounts -> re-run -> re-screen
+      with the real spec PSD.

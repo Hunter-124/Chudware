@@ -1488,6 +1488,20 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
   board; minor power contributors get advisories, not pass/fail — neighbor heating is
   invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
+  ECAD → structural FEA (LIVE, T-FIN21): ecad_vibe_check(band_lo_hz=20, band_hi_hz=2000,
+  psd_breakpoints=…, mount_holes=…) — vibration reliability screen of the mounted board:
+  reuses the T-FIN16 fused board+components solid with a mass-corrected effective
+  density (component masses from package dims x a mold-compound density assumption, or
+  eng mass metadata), detects mounting holes (mounting-hole footprints / NPTH pads /
+  large un-netted plated holes, or explicit mount_holes=[[x,y],…]) and fixes them, runs
+  the core modal solve, FLAGS every natural frequency inside the excitation band
+  (default 20-2000 Hz random-vibe screening), then estimates the 3-sigma board
+  deflection at the worst in-band mode (Miles' response, Z=9.8*G/f^2) and screens each
+  component against Steinberg's 0.00022*B/(C*h*r*sqrt(L)) deflection limit — a CITED
+  HEURISTIC for solder-joint fatigue risk, not a life prediction. Default PSD is a
+  flat 0.04 g^2/Hz screening level (echoed as an assumption); pass the qualification
+  spectrum for a spec-true screen. dry_run=True builds mounts + mass model + envelope
+  without solving.
   Helper builders/validator: services/mcp/simhandoff.py.
 """
 

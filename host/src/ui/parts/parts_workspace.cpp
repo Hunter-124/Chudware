@@ -318,7 +318,98 @@ static void fillSearchParams(nlohmann::json& p) {
     if (!facets.empty()) p["facets"] = std::move(facets);
 }
 
+// Update S().liveVendors from a live-search start/poll payload's "vendors" array and kick a live
+// logo (favicon) fetch for each. Replaces the list each poll so per-vendor status stays current.
+static void applyLiveVendors(AppState& st, const nlohmann::json& res) {
+    if (!res.contains("vendors") || !res["vendors"].is_array()) return;
+    std::vector<LiveVendor> next;
+    next.reserve(res["vendors"].size());
+    for (auto& v : res["vendors"]) {
+        LiveVendor lv;
+        lv.site = v.value("site", "");
+        if (lv.site.empty()) continue;
+        lv.label  = v.value("label", lv.site);
+        lv.domain = v.value("domain", "");
+        lv.status = v.value("status", std::string("queued"));
+        requestVendorLogo(st, lv.site, lv.domain);
+        next.push_back(std::move(lv));
+    }
+    if (!next.empty()) S().liveVendors = std::move(next);
+}
+
+// Inline vendor logos + per-vendor progress bars, drawn right after the "Parts(N)" header while a
+// live search fans out. Progress is an HONEST 3-state (queued/loading/done/error): the vendor
+// scrape is a single blocking fetch with no incremental page-load signal, so "loading" shows an
+// animated indeterminate bar rather than a fabricated percentage.
+static void drawLiveVendorStrip(AppState& st) {
+    if (!S().liveSearching || S().liveVendors.empty()) return;
+    const float s = ui::uiScale;
+    const auto& pal = ui::palette;
+    ImGui::SameLine();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float logo = 18.0f * s, barH = 3.0f * s, gap = 8.0f * s;
+    const float cellH = logo + 3.0f * s + barH;
+    const float tsec = (float)ImGui::GetTime();
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    float x = base.x;
+    const float y = base.y - 3.0f * s;   // nudge up to sit with the header text
+    float trackC4[4];
+    ui::Palette::withAlpha(pal.border, trackC4, 0.45f);
+    const ImU32 trackCol = ui::Palette::toU32(trackC4);
+    for (auto& lv : S().liveVendors) {
+        const std::string id = "vendorlogo:" + lv.site;
+        const ImVec2 l0(x, y), l1(x + logo, y + logo);
+        auto it = S().thumbs.find(id);
+        if (it != S().thumbs.end() && it->second.tex) {
+            dl->AddImage((ImTextureID)(intptr_t)it->second.tex, l0, l1);
+        } else {
+            // Lettered fallback until the favicon loads (or if it never does).
+            float bg[4];
+            ui::Palette::withAlpha(pal.accent, bg, 0.16f);
+            dl->AddRectFilled(l0, l1, ui::Palette::toU32(bg), 4.0f * s);
+            char c = lv.label.empty() ? '?' : lv.label[0];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            char L[2] = {c, 0};
+            const ImVec2 ts = ImGui::CalcTextSize(L);
+            dl->AddText(ImVec2(x + (logo - ts.x) * 0.5f, y + (logo - ts.y) * 0.5f),
+                        ui::Palette::toU32(pal.text), L);
+        }
+        // Progress track + fill.
+        const ImVec2 b0(x, y + logo + 3.0f * s), b1(x + logo, y + logo + 3.0f * s + barH);
+        dl->AddRectFilled(b0, b1, trackCol, barH * 0.5f);
+        if (lv.status == "done") {
+            dl->AddRectFilled(b0, b1, ui::Palette::toU32(pal.statusOk), barH * 0.5f);
+        } else if (lv.status == "error") {
+            dl->AddRectFilled(b0, b1, ui::Palette::toU32(pal.axisX), barH * 0.5f);
+        } else if (lv.status == "loading") {
+            // Indeterminate sweep (no real % available from a blocking scrape).
+            const float w = logo, segW = w * 0.42f;
+            float t = tsec * 0.9f;
+            t -= (float)(long)t;                       // fractional part (t >= 0)
+            const float sx = b0.x - segW + t * (w + segW);
+            const float xa = sx < b0.x ? b0.x : sx;
+            const float xb = (sx + segW) > b1.x ? b1.x : (sx + segW);
+            if (xb > xa)
+                dl->AddRectFilled(ImVec2(xa, b0.y), ImVec2(xb, b1.y),
+                                  ui::Palette::toU32(pal.accent), barH * 0.5f);
+        }  // queued → track only
+        ImGui::SetCursorScreenPos(l0);
+        ImGui::InvisibleButton((std::string("##lv_") + lv.site).c_str(), ImVec2(logo, cellH));
+        if (ImGui::IsItemHovered()) {
+            const char* stxt = lv.status == "done" ? "done"
+                             : lv.status == "error" ? "failed"
+                             : lv.status == "loading" ? "searching…" : "queued";
+            ImGui::SetTooltip("%s — %s", lv.label.c_str(), stxt);
+        }
+        x += logo + gap;
+    }
+    // Leave the ImGui cursor past the strip so following content doesn't overlap.
+    ImGui::SetCursorScreenPos(ImVec2(x, base.y));
+    ImGui::Dummy(ImVec2(1.0f, cellH));
+}
+
 void startLiveSearch(AppState& st) {
+    S().liveVendors.clear();       // fresh fan-out — drop the previous search's vendor strip
     nlohmann::json p;
     fillSearchParams(p);
     st.rpc.call("parts_search_live_start", p, [&st](const core::RpcResult& r) {
@@ -329,6 +420,7 @@ void startLiveSearch(AppState& st) {
         S().liveCursor    = 0;
         S().liveSearching = true;
         S().lastLivePoll  = 0.0;   // poll on the next tick
+        applyLiveVendors(st, r.result);
     });
 }
 
@@ -340,7 +432,7 @@ void pollLiveSearch(AppState& st) {
     p["token"]  = S().liveToken;
     p["cursor"] = S().liveCursor;
     const std::string token = S().liveToken;
-    st.rpc.call("parts_search_live_poll", p, [token](const core::RpcResult& r) {
+    st.rpc.call("parts_search_live_poll", p, [token, &st](const core::RpcResult& r) {
         S().livePolling = false;
         // Drop results from a superseded job (a newer query changed the token).
         if (token != S().liveToken) return;
@@ -356,6 +448,7 @@ void pollLiveSearch(AppState& st) {
                 appended = true;
             }
         collectNotices(r.result);
+        applyLiveVendors(st, r.result);
         S().liveCursor = r.result.value("cursor", S().liveCursor);
         if (appended) applyResultSort();
         if (r.result.value("done", false)) {
@@ -707,9 +800,11 @@ void drawPartsLibraryWorkspace(AppState& st) {
                 std::snprintf(hdr, sizeof(hdr), "Parts");
             sectionHeader(hdr, /*firstInPane=*/true);
         }
-        // While the background vendor fan-out is still running, show a subtle
-        // "loading more" line so the user knows more results are on the way.
-        if (S().liveSearching && !S().results.empty()) {
+        // While the background vendor fan-out is still running, show each vendor being searched
+        // (its live logo + a per-vendor progress bar) inline to the right of the "Parts(N)" title.
+        if (!S().liveVendors.empty()) {
+            drawLiveVendorStrip(st);
+        } else if (S().liveSearching && !S().results.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("· loading more from vendors…");
         }

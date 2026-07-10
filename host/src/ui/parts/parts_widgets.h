@@ -60,6 +60,7 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 // Runs inside rpc.drain() on the GL thread — safe to create GL textures here.
 void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes);
 void requestThumb(AppState& st, const PartsItem& item);
+void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain);
 
 }  // namespace parts
 }  // namespace ui

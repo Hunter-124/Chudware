@@ -359,5 +359,30 @@ void requestThumb(AppState& st, const PartsItem& item) {
     });
 }
 
+void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain) {
+    // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as
+    // part thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC.
+    const std::string id = "vendorlogo:" + site;
+    if (site.empty() || domain.empty() ||
+        S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
+        return;
+    S().thumbBusy.insert(id);
+    nlohmann::json p;
+    p["item_id"] = id;
+    // The vendor's live favicon via a PNG-returning resolver — stb_image has no ICO decoder,
+    // so a raw <domain>/favicon.ico would fetch but fail to decode. Cached by item_id.
+    p["image_url"] = "https://www.google.com/s2/favicons?domain=" + domain + "&sz=64";
+    st.rpc.call("parts_thumbnail", p, [id](const core::RpcResult& r) {
+        S().thumbBusy.erase(id);
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            S().thumbFailed.insert(id);
+            return;
+        }
+        std::string b64 = r.result.value("image_b64", "");
+        if (b64.empty()) { S().thumbFailed.insert(id); return; }
+        storeThumb(id, b64decode(b64));
+    });
+}
+
 }  // namespace parts
 }  // namespace ui

@@ -52,6 +52,16 @@ struct VendorEntry {
     std::string lastLogin;
 };
 
+// One vendor in an in-flight live search: its logo + inline progress state. Shown after the
+// "Parts(N)" header while a search fans out. (Logo texture lives in S().thumbs under
+// "vendorlogo:"+site; status drives the little per-vendor progress bar.)
+struct LiveVendor {
+    std::string site;                 // site key (e.g. "mcmaster")
+    std::string label;                // friendly name (tooltip)
+    std::string domain;               // registrable domain (favicon source)
+    std::string status = "queued";    // queued | loading | done | error
+};
+
 struct ApiProvider {
     std::string id;
     std::string label;
@@ -140,6 +150,7 @@ struct PartsState {
     std::string liveToken;              // current job token; stale-poll guard
     int         liveCursor    = 0;      // results already drained from the job
     double      lastLivePoll  = 0.0;
+    std::vector<LiveVendor> liveVendors; // vendors this search is fanning out to (logos + progress)
 
     // ---- filters (sent with parts_search) ----
     float priceMin = 0.0f;

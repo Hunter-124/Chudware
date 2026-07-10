@@ -83,6 +83,38 @@ def _site_label(key: str, adapter: Any = None) -> str:
     return lbl or _SITE_LABELS.get(key, key.replace("_", " ").title())
 
 
+# Registrable-domain per browser-catalog site, for pulling the vendor's live logo (favicon).
+_SITE_DOMAINS: dict[str, str] = {
+    "mcmaster": "mcmaster.com", "grabcad": "grabcad.com", "traceparts": "traceparts.com",
+    "amazon": "amazon.com", "jlcpcb": "jlcpcb.com", "pcbway": "pcbway.com",
+    "misumi": "misumi.com", "lcsc": "lcsc.com", "digikey": "digikey.com",
+    "snapeda": "snapeda.com", "content3d": "3dcontentcentral.com",
+    "3dcontentcentral": "3dcontentcentral.com", "homedepot": "homedepot.com",
+    "lowes": "lowes.com", "acehardware": "acehardware.com", "grainger": "grainger.com",
+    "fastenal": "fastenal.com", "harborfreight": "harborfreight.com",
+    "tractorsupply": "tractorsupply.com", "onlinemetals": "onlinemetals.com",
+    "metalsdepot": "metalsdepot.com",
+}
+
+
+def _site_domain(site: str) -> str:
+    """Registrable domain for a site key — the static map first, then the browser
+    adapter's BASE_URL netloc, else ``<site>.com``. Feeds the live favicon URL."""
+    if site in _SITE_DOMAINS:
+        return _SITE_DOMAINS[site]
+    try:
+        import importlib
+        import urllib.parse
+        mod = importlib.import_module(f"services.browser.adapters.{site}")
+        base = getattr(mod, "BASE_URL", "")
+        host = urllib.parse.urlparse(base).netloc
+        if host:
+            return host[4:] if host.startswith("www.") else host
+    except Exception:  # noqa: BLE001 — no adapter module / no BASE_URL
+        pass
+    return f"{site}.com"
+
+
 # ---- record → GUI item mapping ----------------------------------------------------
 
 def _first_price(rec: dict) -> tuple[float, str]:
@@ -363,10 +395,17 @@ _LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
     from engine_oracle.parts_hub import search as _search
+    # Flip this vendor's inline status to "loading" before the blocking scrape starts.
+    with _live_lock:
+        v = job.get("vendors", {}).get(site)
+        if v is not None:
+            v["status"] = "loading"
+    site_status = "done"
     try:
         recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
     except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
         recs = []
+        site_status = "error"
     prefix = f"catalog:{site}::"
     recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
             or r.get("ok") is False]
@@ -389,6 +428,9 @@ def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
         job["pending"] -= 1
         if job["pending"] <= 0:
             job["done"] = True
+        v = job.get("vendors", {}).get(site)
+        if v is not None:
+            v["status"] = site_status
 
 
 def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
@@ -402,8 +444,11 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
         rt = _compute_routing(p)
         sites = list(rt["route_sites"])
         token = uuid.uuid4().hex
+        vendors = {s: {"site": s, "label": _site_label(s), "domain": _site_domain(s),
+                       "status": "queued"} for s in sites}
         job = {"results": [], "notices": [], "seen_ids": set(), "seen_notices": set(),
-               "pending": len(sites), "done": not sites, "cancelled": False}
+               "pending": len(sites), "done": not sites, "cancelled": False,
+               "vendors": vendors}
         with _live_lock:
             _live_jobs[token] = job
             # Evict oldest tokens beyond the cap (dicts preserve insertion order).
@@ -412,7 +457,8 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
         for s in sites:
             threading.Thread(target=_run_live_site, args=(s, rt, limit, p, job),
                              name=f"parts-live-{s}", daemon=True).start()
-        return {"ok": True, "token": token, "sites": sites, "done": job["done"]}
+        return {"ok": True, "token": token, "sites": sites,
+                "vendors": list(vendors.values()), "done": job["done"]}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search_live_start failed: {exc}"}
 
@@ -433,10 +479,13 @@ def _parts_search_live_poll(params: dict, _emit: Callable) -> dict:
             notices = list(job["notices"])
             done = job["done"]
             new_cursor = len(job["results"])
+            # Snapshot per-vendor states BEFORE the pop so the terminal states ride the
+            # same payload that carries done:true (else they'd be lost).
+            vendors = list(job.get("vendors", {}).values())
             if done:
                 _live_jobs.pop(token, None)
         return {"ok": True, "results": new_items, "notices": notices,
-                "cursor": new_cursor, "done": done}
+                "cursor": new_cursor, "vendors": vendors, "done": done}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search_live_poll failed: {exc}"}
 

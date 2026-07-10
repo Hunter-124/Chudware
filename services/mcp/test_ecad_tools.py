@@ -72,6 +72,8 @@ def test_register() -> dict:
         "ecad_check_impedance", "ecad_tf", "ecad_make_board",
         # Wave-L new tools
         "ecad_run_dfm", "ecad_check_diff_impedance",
+        # T-FIN11 FPGA support pack
+        "ecad_fpga_check",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -1163,6 +1165,45 @@ def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
     print("  [fin8_to_3d_boardphys_sidecar] PASS")
 
 
+def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
+    """T-FIN11: place the iCE40 starter symbol, run the bank-aware checks, export
+    constraints (LPF + neutral CSV) — and confirm the no-FPGA guard teaches."""
+    import os
+    import tempfile
+
+    d = _call(tools, "ecad_new_schematic", name="fpga_fin11")
+    doc_id = d["doc_id"]
+    # guard first: no FPGA on the sheet yet -> teaching error
+    e = _call(tools, "ecad_fpga_check", doc_id=doc_id)
+    # (empty sheet: no FPGA found)
+    assert not e["ok"] and "FPGA" in (e.get("error") or e.get("hint") or "")
+    _assert_context(e, "ecad_fpga_check")
+
+    p = _call(tools, "ecad_place_symbol", libid="FPGA:iCE40UP5K-SG48", x=100, y=100,
+              doc_id=doc_id)
+    assert p["ok"], p
+    r = _call(tools, "ecad_fpga_check", doc_id=doc_id)
+    _assert_context(r, "ecad_fpga_check")
+    assert r["devices"] and r["devices"][0]["device"] == "iCE40UP5K-SG48"
+    # nothing wired -> CRESET_B (required config pin) must be flagged
+    assert not r["ok"] and any(v["check"] == "config" for v in r["violations"]), r
+    print(f"  FIN11: check found {len(r['violations'])} violation(s) on the bare FPGA "
+          f"(config CRESET_B unwired) — as designed")
+
+    with tempfile.TemporaryDirectory() as td:
+        x = _call(tools, "ecad_export", kind="constraints", path=td, doc_id=doc_id)
+        _assert_context(x, "ecad_export(constraints)")
+        assert x["ok"] and x["kind"] == "constraints", x
+        exts = sorted(os.path.splitext(f)[1] for f in x["files"])
+        assert exts == [".csv", ".lpf"], f"expected LPF+CSV for a Lattice part, got {exts}"
+        csv_file = next(f for f in x["files"] if f.endswith(".csv"))
+        with open(csv_file, encoding="utf-8") as fh:
+            head = fh.readline()
+        assert head.startswith("pin,net,port,site,bank"), head
+    print("  FIN11: ecad_export('constraints') wrote LPF + CSV pinout")
+    print("  [fin11_fpga_check_and_constraints] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     tools = test_register()
@@ -1207,6 +1248,8 @@ def main() -> None:
     test_fin8_metadata_roundtrip(tools)
     test_fin8_missing_metadata_degrades(tools)
     test_fin8_to_3d_boardphys_sidecar(tools)
+    # T-FIN11 FPGA support pack
+    test_fin11_fpga_check_and_constraints(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

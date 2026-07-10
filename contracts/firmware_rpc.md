@@ -98,3 +98,58 @@ The CMake template sets `CMAKE_EXPORT_COMPILE_COMMANDS ON`, so a real configure 
 `fw_new_project` **guarantees the file exists** even without CMake: if a configure is not possible
 it writes a synthetic `compile_commands.json` enumerating the template sources, which a later real
 configure overwrites. The artifact is always present after `fw_new_project`.
+
+## 7. Simulation trace artifact — `aicad.firmware.trace/1` (T-FIN1, appended)
+
+`fw_sim_run` now emits a structured JSON trace artifact next to the emulated ELF
+(`<elf>.trace.json`, atomic tmp+replace; best-effort — a write failure yields
+`trace_path: null`, never an error). It is the stable seam for later GUI/scenario work.
+
+| field | type | notes |
+|---|---|---|
+| `schema` | str | `"aicad.firmware.trace/1"` |
+| `source` | str | `"renode"` \| `"qemu"` |
+| `generated_at` | float | epoch seconds |
+| `events` | [event] | interleaved pin + UART events, ordered by `seq` (log line order) |
+| `gpio_final` | {str: int} | end-of-run pin → level snapshot (same data as SimResult `gpio_states`) |
+
+Event object:
+
+| field | type | notes |
+|---|---|---|
+| `type` | str | `"gpio"` \| `"uart"` |
+| `seq` | int | source log line index — total order across both event types |
+| `t_ms` | float \| null | virtual-time milliseconds when the emitting side supplied one, else null |
+| `pin` | str | gpio only — pin name, e.g. `"PA5"` |
+| `level` | int | gpio only — 0 or 1 |
+| `text` | str | uart only — the log line (trace marker lines are excluded) |
+
+### 7.1 SimResult additions (extends §4, append-only)
+
+| field | type | notes |
+|---|---|---|
+| `gpio_events` | [event] | the gpio-type events (same shape as §7), time-ordered |
+| `trace_path` | str \| null | absolute path to the trace artifact, null when not written |
+
+### 7.2 GPIO extraction sources
+
+- **Renode**: the generated `.resc` registers a per-pin `AddStateChangedHook` for every pin
+  referenced by a `gpio:P<X><n>...` assertion (only when the platform declares `gpioPort<X>`;
+  `stm32f4_discovery.repl` now declares ports A–E), each printing an
+  `AICAD_GPIO_EVT <PIN>=<level>` line; after the run sleep it reads each referenced port's
+  ODR between `AICAD_GPIO_ODR_BEGIN/END <port>` echo markers for the final snapshot
+  (snapshot wins over the last event on merge). Hook prints carry no timestamp
+  (`t_ms: null`); ordering is preserved via `seq`.
+- **QEMU** (semihosting shim): QEMU exposes no external pin observer, so the firmware
+  reports its own transitions via `AICAD_GPIO_TRACE(pin_str, level, t_ms)` /
+  `AICAD_GPIO_TRACE_NT(pin_str, level)` from the project template header
+  `include/aicad_trace.h` — a printf of the same `AICAD_GPIO_EVT` line
+  (optionally `t=<n>ms`, also accepting `us`/`s`) over the semihosting console.
+
+### 7.3 Timeline assertion form (extends the `fw_sim_run` assertion grammar)
+
+`gpio:<PIN>=<level>@><T>ms` (after T ms), `gpio:<PIN>=<level>@<<T>ms` (before),
+`gpio:<PIN>=<level>@<T>ms` (at-or-after). Evaluated against **time-stamped** gpio events
+only; when the pin has none, the assertion fails with detail
+`"no time-stamped events for pin '<PIN>'"`. The plain `gpio:<PIN>=<level>` form keeps its
+§4 meaning: end-of-run level.

@@ -129,8 +129,16 @@ def fw_sim_run(params: dict) -> dict:
 
     ``assertions`` is a list of assertion strings:
     - ``"uart:<text>"`` — passes when the text appears in the captured UART/semihosting log.
-    - ``"gpio:<PIN>=<level>"`` — passes when the GPIO pin is at the given logic level.
+    - ``"gpio:<PIN>=<level>"`` — passes when the GPIO pin is at the given logic level at end
+      of run (Renode: per-pin state-change hooks + ODR snapshot on stm32f4_discovery;
+      QEMU: the firmware-side ``aicad_trace.h`` semihosting shim reports pin events).
+    - ``"gpio:<PIN>=<level>@><T>ms"`` (also ``@<``/``@``) — timeline form: a time-stamped
+      pin event at that level after/before/at-or-after ``T`` ms.
     - plain string — treated as ``"uart:<text>"``.
+
+    The result includes ``gpio_events`` (time-ordered pin timeline) and ``trace_path`` —
+    a structured JSON trace artifact (``aicad.firmware.trace/1``, contract §7) written
+    next to the ELF with interleaved pin + UART events and the final GPIO snapshot.
     """
     project_id = params.get("project_id")
     if not project_id:

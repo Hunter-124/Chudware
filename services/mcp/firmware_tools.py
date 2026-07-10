@@ -72,11 +72,21 @@ def register_firmware_tools(mcp) -> None:
                    assertions: Optional[list[str]] = None) -> str:
         """Run the firmware emulation loop via Renode or QEMU and return SimResult.
 
-        SimResult fields: ``{passed, uart_log, gpio_states, assertion_results, ms}``.
-        ``passed`` is True iff every assertion matched. Assertions:
+        SimResult fields: ``{passed, uart_log, gpio_states, assertion_results, ms,
+        gpio_events, trace_path}``. ``passed`` is True iff every assertion matched.
+        Assertions:
         - ``"uart:<text>"`` — UART/semihosting output contains ``<text>``.
         - ``"gpio:<PIN>=<level>"`` — GPIO pin is at the given logic level at end of run.
+          Renode observes pins directly (state-change hooks + ODR snapshot, e.g. PA5 on
+          stm32f4_discovery); on the QEMU fallback the firmware must report events via the
+          ``AICAD_GPIO_TRACE(pin, level, t_ms)`` macro from the project's ``aicad_trace.h``.
+        - ``"gpio:<PIN>=<level>@><T>ms"`` (also ``@<`` / ``@``) — timeline assertion:
+          a time-stamped event shows the pin at that level after/before/at-or-after T ms.
         - plain string — treated as uart match.
+
+        ``gpio_events`` is the time-ordered pin timeline; ``trace_path`` points at a JSON
+        trace artifact (schema ``aicad.firmware.trace/1``, contracts/firmware_rpc.md §7)
+        with interleaved pin + UART events, written next to the ELF.
 
         Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
         ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.

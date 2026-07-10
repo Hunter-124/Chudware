@@ -32,6 +32,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
+# Per-run temp dir for stage logs. Stage output used to go to fixed paths under
+# /tmp (gate_check.out, gate_host_build.out, …), so two gate runs on one box (e.g. a
+# worktree run alongside the main checkout) silently
+# clobbered each other's stage output. Key the dir to AICAD_INSTANCE_KEY (the daemon
+# instance a run already isolates on) when set, else this gate's PID; GATE_TMPDIR
+# overrides. Everything below writes under $GATE_TMP.
+GATE_TMP="${GATE_TMPDIR:-/tmp/aicad-gate-${AICAD_INSTANCE_KEY:-$$}}"
+mkdir -p "$GATE_TMP"
+echo "gate temp dir: $GATE_TMP"
+
 CHECK_PY_FATAL=0   # 1 = check.py failure fails the gate; 0 = record only (pre-existing red)
 
 declare -a SUMMARY
@@ -42,19 +52,19 @@ record() { SUMMARY+=("$1"); }   # arg: "STAGE  RESULT  detail"
 # ---- Stage 1: stdlib gate ---------------------------------------------------
 stage_check() {
     echo "=== [1/6] scripts/check.py (stdlib gate) ==="
-    if python3 scripts/check.py > /tmp/gate_check.out 2>&1; then
+    if python3 scripts/check.py > ${GATE_TMP}/check.out 2>&1; then
         record "check.py            PASS    all stdlib gates green"
         echo "  PASS"
     else
         local rc=$?
         if [ "$CHECK_PY_FATAL" -eq 1 ]; then
-            record "check.py            FAIL    exit $rc (fatal — see /tmp/gate_check.out)"
+            record "check.py            FAIL    exit $rc (fatal — see ${GATE_TMP}/check.out)"
             fail_fatal=1
         else
             record "check.py            FAIL-RECORDED  exit $rc (pre-existing, non-fatal — see docs/REFACTOR_LOG.md)"
         fi
-        echo "  FAIL (exit $rc) — /tmp/gate_check.out:"
-        tail -n 8 /tmp/gate_check.out | sed 's/^/    /'
+        echo "  FAIL (exit $rc) — ${GATE_TMP}/check.out:"
+        tail -n 8 ${GATE_TMP}/check.out | sed 's/^/    /'
     fi
 }
 
@@ -71,13 +81,13 @@ stage_manual_gen() {
         echo "  SKIP: python3 not installed"
         return 0
     fi
-    if python3 -m tools.manual_gen --check > /tmp/gate_manual.out 2>&1; then
+    if python3 -m tools.manual_gen --check > ${GATE_TMP}/manual.out 2>&1; then
         record "manual regen clean  PASS    docs/manual/*.md matches a fresh regen"
         echo "  PASS"
     else
-        record "manual regen clean  FAIL-RECORDED  drift or missing coverage (non-fatal — see /tmp/gate_manual.out)"
-        echo "  FAIL (non-fatal) — /tmp/gate_manual.out:"
-        tail -n 8 /tmp/gate_manual.out | sed 's/^/    /'
+        record "manual regen clean  FAIL-RECORDED  drift or missing coverage (non-fatal — see ${GATE_TMP}/manual.out)"
+        echo "  FAIL (non-fatal) — ${GATE_TMP}/manual.out:"
+        tail -n 8 ${GATE_TMP}/manual.out | sed 's/^/    /'
     fi
 }
 
@@ -93,13 +103,13 @@ stage_ui_style_check() {
         echo "  SKIP: python3 not installed"
         return 0
     fi
-    if python3 scripts/ui_style_check.py > /tmp/gate_ui_style.out 2>&1; then
+    if python3 scripts/ui_style_check.py > ${GATE_TMP}/ui_style.out 2>&1; then
         record "ui_style_check.py   PASS    no new panel-conformance drift"
         echo "  PASS"
     else
-        record "ui_style_check.py   FAIL-RECORDED  new drift (non-fatal — see /tmp/gate_ui_style.out)"
-        echo "  FAIL (non-fatal) — /tmp/gate_ui_style.out:"
-        tail -n 8 /tmp/gate_ui_style.out | sed 's/^/    /'
+        record "ui_style_check.py   FAIL-RECORDED  new drift (non-fatal — see ${GATE_TMP}/ui_style.out)"
+        echo "  FAIL (non-fatal) — ${GATE_TMP}/ui_style.out:"
+        tail -n 8 ${GATE_TMP}/ui_style.out | sed 's/^/    /'
     fi
 }
 
@@ -142,15 +152,15 @@ stage_core_build() {
     # build type), and the `--config Release` on the build/ctest lines below is a NO-OP on
     # single-config Ninja. Omitting it shipped an unoptimized libaicad — the FEA solver ran
     # ~16x slower (sim ctests 34s -> 2s once Release was set). See docs/REFACTOR_LOG.md.
-    if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DAICAD_WITH_OCCT=ON -G Ninja > /tmp/gate_cfg.out 2>&1; then
-        record "core build          FAIL    cmake configure failed (see /tmp/gate_cfg.out)"
-        echo "  FAIL: configure"; tail -n 15 /tmp/gate_cfg.out | sed 's/^/    /'
+    if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DAICAD_WITH_OCCT=ON -G Ninja > ${GATE_TMP}/cfg.out 2>&1; then
+        record "core build          FAIL    cmake configure failed (see ${GATE_TMP}/cfg.out)"
+        echo "  FAIL: configure"; tail -n 15 ${GATE_TMP}/cfg.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    if ! CCACHE_DISABLE=1 cmake --build "$build_dir" --config Release > /tmp/gate_build.out 2>&1; then
-        record "core build          FAIL    cmake build failed (see /tmp/gate_build.out)"
-        echo "  FAIL: build"; tail -n 15 /tmp/gate_build.out | sed 's/^/    /'
+    if ! CCACHE_DISABLE=1 cmake --build "$build_dir" --config Release > ${GATE_TMP}/build.out 2>&1; then
+        record "core build          FAIL    cmake build failed (see ${GATE_TMP}/build.out)"
+        echo "  FAIL: build"; tail -n 15 ${GATE_TMP}/build.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
@@ -170,15 +180,15 @@ stage_ui_abstract() {
         return 0
     fi
     local host_build="$REPO/host/build-linux"
-    if ! CCACHE_DISABLE=1 cmake -S "$REPO/host" -B "$host_build" -G Ninja -DCMAKE_BUILD_TYPE=Release > /tmp/gate_host_cfg.out 2>&1; then
-        record "host build          FAIL    cmake configure (see /tmp/gate_host_cfg.out)"
-        echo "  FAIL: configure"; tail -n 15 /tmp/gate_host_cfg.out | sed 's/^/    /'
+    if ! CCACHE_DISABLE=1 cmake -S "$REPO/host" -B "$host_build" -G Ninja -DCMAKE_BUILD_TYPE=Release > ${GATE_TMP}/host_cfg.out 2>&1; then
+        record "host build          FAIL    cmake configure (see ${GATE_TMP}/host_cfg.out)"
+        echo "  FAIL: configure"; tail -n 15 ${GATE_TMP}/host_cfg.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    if ! ninja -C "$host_build" Billet > /tmp/gate_host_build.out 2>&1; then
-        record "host build          FAIL    ninja Billet (see /tmp/gate_host_build.out)"
-        echo "  FAIL: build"; tail -n 20 /tmp/gate_host_build.out | sed 's/^/    /'
+    if ! ninja -C "$host_build" Billet > ${GATE_TMP}/host_build.out 2>&1; then
+        record "host build          FAIL    ninja Billet (see ${GATE_TMP}/host_build.out)"
+        echo "  FAIL: build"; tail -n 20 ${GATE_TMP}/host_build.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
@@ -200,14 +210,14 @@ stage_ctest() {
         echo "  SKIP: ctest not installed"
         return 0
     fi
-    if ! ctest --test-dir core/build-linux -C Release --output-on-failure > /tmp/gate_ctest.out 2>&1; then
-        record "ctest               FAIL    ctest failures (see /tmp/gate_ctest.out)"
-        echo "  FAIL: ctest"; tail -n 20 /tmp/gate_ctest.out | sed 's/^/    /'
+    if ! ctest --test-dir core/build-linux -C Release --output-on-failure > ${GATE_TMP}/ctest.out 2>&1; then
+        record "ctest               FAIL    ctest failures (see ${GATE_TMP}/ctest.out)"
+        echo "  FAIL: ctest"; tail -n 20 ${GATE_TMP}/ctest.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
     local passed
-    passed="$(rg -o '[0-9]+% tests passed' /tmp/gate_ctest.out | head -1 || true)"
+    passed="$(rg -o '[0-9]+% tests passed' ${GATE_TMP}/ctest.out | head -1 || true)"
     record "ctest               PASS    ${passed:-all tests passed}"
     echo "  PASS (${passed:-ok})"
 }
@@ -228,12 +238,12 @@ stage_hostd_smoke() {
         echo "  SKIP: no aicad-hostd binary"
         return 0
     fi
-    if python3 scripts/hostd_smoke.py "$hostd" > /tmp/gate_hostd.out 2>&1; then
+    if python3 scripts/hostd_smoke.py "$hostd" > ${GATE_TMP}/hostd.out 2>&1; then
         record "hostd smoke         PASS    lifecycle + race + stop + recovery"
         echo "  PASS"
     else
-        record "hostd smoke         FAIL    see /tmp/gate_hostd.out"
-        echo "  FAIL: hostd smoke"; tail -n 12 /tmp/gate_hostd.out | sed 's/^/    /'
+        record "hostd smoke         FAIL    see ${GATE_TMP}/hostd.out"
+        echo "  FAIL: hostd smoke"; tail -n 12 ${GATE_TMP}/hostd.out | sed 's/^/    /'
         fail_fatal=1
     fi
 }
@@ -257,12 +267,12 @@ stage_appimage_smoke() {
         echo "  SKIP: xvfb-run not installed"
         return 0
     fi
-    local out=/tmp/gate_appimage
+    local out=${GATE_TMP}/appimage
     rm -rf "$out"; mkdir -p "$out"
     if ! packaging/linux/build_appimage.sh --out "$out" --skip-wheels \
-            > /tmp/gate_appimage.out 2>&1; then
-        record "appimage smoke      WARN    AppImage build failed (see /tmp/gate_appimage.out)"
-        echo "  WARN: build failed"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+            > ${GATE_TMP}/appimage.out 2>&1; then
+        record "appimage smoke      WARN    AppImage build failed (see ${GATE_TMP}/appimage.out)"
+        echo "  WARN: build failed"; tail -n 10 ${GATE_TMP}/appimage.out | sed 's/^/    /'
         return 0
     fi
     local img
@@ -271,15 +281,15 @@ stage_appimage_smoke() {
         record "appimage smoke      WARN    build reported success but no .AppImage produced"
         echo "  WARN: no artifact"; return 0
     fi
-    local shot=/tmp/appimage_shot.png key="gateimg$$"
+    local shot=${GATE_TMP}/appimage_shot.png key="gateimg$$"
     rm -f "$shot"
     local rc=0
     AI_CAD_ENGINE_DAEMON=1 AICAD_HOSTD_LINGER_SECS=5 AICAD_INSTANCE_KEY="$key" \
         xvfb-run -a "$img" --appimage-extract-and-run --ui-screenshot "$shot" \
-        >> /tmp/gate_appimage.out 2>&1 || rc=$?
+        >> ${GATE_TMP}/appimage.out 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
-        record "appimage smoke      WARN    AppImage exited rc=$rc (see /tmp/gate_appimage.out)"
-        echo "  WARN: run rc=$rc"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+        record "appimage smoke      WARN    AppImage exited rc=$rc (see ${GATE_TMP}/appimage.out)"
+        echo "  WARN: run rc=$rc"; tail -n 10 ${GATE_TMP}/appimage.out | sed 's/^/    /'
         return 0
     fi
     if [ ! -s "$shot" ]; then
@@ -382,7 +392,7 @@ stage_pytest() {
             continue
         fi
 
-        local out_file="/tmp/gate_pytest_${dir//\//_}.out"
+        local out_file="${GATE_TMP}/pytest_${dir//\//_}.out"
 
         # Build the ignore flags (only for dirs that have the relevant files).
         local ignore_args=()
@@ -425,7 +435,7 @@ stage_pytest() {
         elif [ "$rc" -eq 1 ]; then
             # rc=1 = tests failed (not a crash); pre-existing failures are RECORDED, not fatal
             echo "FAIL-RECORDED  ($summary_line)"
-            record "pytest/$dir         FAIL-RECORDED  $summary_line (pre-existing — see /tmp/gate_pytest_${dir//\//_}.out; T-V2 owns cleanup)"
+            record "pytest/$dir         FAIL-RECORDED  $summary_line (pre-existing — see ${GATE_TMP}/pytest_${dir//\//_}.out; T-V2 owns cleanup)"
         else
             # rc=2+ = collection crash or internal error → hard failure
             echo "HARD-FAIL (rc=$rc)"
@@ -464,7 +474,7 @@ stage_ui_imgui() {
         fi
         return 0
     fi
-    local shot="/tmp/aicad-gate-host-shot.png"
+    local shot="${GATE_TMP}/host-shot.png"
     local libaicad="${AI_CAD_LIBAICAD:-$REPO/core/build-occt-linux/bin/libaicad.so}"
     local shot_cmd="env AI_CAD_NO_FILE_DIALOGS=1 AI_CAD_SHOT=m1"
     [ -f "$libaicad" ] && shot_cmd="$shot_cmd AI_CAD_LIBAICAD=$libaicad"
@@ -473,9 +483,9 @@ stage_ui_imgui() {
     if [ "${AI_CAD_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
         shot_cmd="xvfb-run -a $shot_cmd"
     fi
-    if ! eval "$shot_cmd" > /tmp/gate_host_shot.out 2>&1; then
-        record "host shot           FAIL    --ui-screenshot smoke (see /tmp/gate_host_shot.out)"
-        echo "  FAIL: host shot"; tail -n 15 /tmp/gate_host_shot.out | sed 's/^/    /'
+    if ! eval "$shot_cmd" > ${GATE_TMP}/host_shot.out 2>&1; then
+        record "host shot           FAIL    --ui-screenshot smoke (see ${GATE_TMP}/host_shot.out)"
+        echo "  FAIL: host shot"; tail -n 15 ${GATE_TMP}/host_shot.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
@@ -483,7 +493,7 @@ stage_ui_imgui() {
         record "host shot           PASS    AI_CAD_SHOT=m1 headless screenshot written"
         echo "  PASS ($shot)"
     else
-        record "host shot           FAIL    shot PNG not written (see /tmp/gate_host_shot.out)"
+        record "host shot           FAIL    shot PNG not written (see ${GATE_TMP}/host_shot.out)"
         echo "  FAIL: $shot not created"
         fail_fatal=1
     fi
@@ -506,14 +516,14 @@ stage_bench() {
         echo "  SKIP: python3 not installed"
         return 0
     fi
-    if ! python3 -m tools.flywheel.bench.runner --smoke --all --no-write > /tmp/gate_bench.out 2>&1; then
-        record "bench (T-H8)        FAIL    a smoke bench errored (see /tmp/gate_bench.out)"
-        echo "  FAIL: bench smoke"; tail -n 15 /tmp/gate_bench.out | sed 's/^/    /'
+    if ! python3 -m tools.flywheel.bench.runner --smoke --all --no-write > ${GATE_TMP}/bench.out 2>&1; then
+        record "bench (T-H8)        FAIL    a smoke bench errored (see ${GATE_TMP}/bench.out)"
+        echo "  FAIL: bench smoke"; tail -n 15 ${GATE_TMP}/bench.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    record "bench (T-H8)        PASS    smoke benches ran ($(rg -c 'baselines\[' /tmp/gate_bench.out 2>/dev/null || echo '?') reported)"
-    echo "  PASS"; tail -n 8 /tmp/gate_bench.out | sed 's/^/    /'
+    record "bench (T-H8)        PASS    smoke benches ran ($(rg -c 'baselines\[' ${GATE_TMP}/bench.out 2>/dev/null || echo '?') reported)"
+    echo "  PASS"; tail -n 8 ${GATE_TMP}/bench.out | sed 's/^/    /'
 }
 
 # ---- Stage 7: modeling perf-regression (tools/perf_regression.py) -----------
@@ -542,13 +552,13 @@ stage_perf() {
     fi
     local rc=0
     "$perf_py" "$REPO/tools/perf_regression.py" --iters "${AICAD_PERF_ITERS:-5}" \
-        --json /tmp/gate_perf.json > /tmp/gate_perf.out 2>&1 || rc=$?
-    tail -n 16 /tmp/gate_perf.out | sed 's/^/    /'
+        --json ${GATE_TMP}/perf.json > ${GATE_TMP}/perf.out 2>&1 || rc=$?
+    tail -n 16 ${GATE_TMP}/perf.out | sed 's/^/    /'
     if [ "$rc" -eq 0 ]; then
         record "perf-regression     PASS    no median regressions vs baseline"
         echo "  PASS"
     elif [ "$rc" -eq 1 ]; then
-        record "perf-regression     $([ "${AICAD_PERF_FATAL:-0}" = 1 ] && echo FAIL || echo WARN)    median regression vs baseline (see /tmp/gate_perf.out)"
+        record "perf-regression     $([ "${AICAD_PERF_FATAL:-0}" = 1 ] && echo FAIL || echo WARN)    median regression vs baseline (see ${GATE_TMP}/perf.out)"
         echo "  REGRESSION detected"
         [ "${AICAD_PERF_FATAL:-0}" = 1 ] && fail_fatal=1
     else
@@ -602,9 +612,9 @@ stage_vv() {
 
     export AICAD_RUN_VV
     if PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" -m pytest \
-            "${pytest_args[@]}" -q --tb=short > /tmp/gate_vv.out 2>&1; then
+            "${pytest_args[@]}" -q --tb=short > ${GATE_TMP}/vv.out 2>&1; then
         local summary_line
-        summary_line="$(grep -E '[0-9]+ passed' /tmp/gate_vv.out | tail -1 || echo 'ok')"
+        summary_line="$(grep -E '[0-9]+ passed' ${GATE_TMP}/vv.out | tail -1 || echo 'ok')"
         record "vv-bench (T-BL01)   PASS    $summary_line"
         echo "  PASS ($summary_line)"
     else
@@ -613,9 +623,9 @@ stage_vv() {
             record "vv-bench (T-BL01)   SKIP    no tests collected (check venv + deps)"
             echo "  SKIP: no tests collected"
         else
-            record "vv-bench (T-BL01)   FAIL    pytest exit $rc (see /tmp/gate_vv.out)"
-            echo "  FAIL: V&V suite (see /tmp/gate_vv.out):"
-            tail -n 15 /tmp/gate_vv.out | sed 's/^/    /'
+            record "vv-bench (T-BL01)   FAIL    pytest exit $rc (see ${GATE_TMP}/vv.out)"
+            echo "  FAIL: V&V suite (see ${GATE_TMP}/vv.out):"
+            tail -n 15 ${GATE_TMP}/vv.out | sed 's/^/    /'
             fail_fatal=1
         fi
     fi
@@ -666,9 +676,9 @@ stage_modeling() {
     fi
 
     if PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" -m pytest \
-            "${pytest_args[@]}" -q --tb=short > /tmp/gate_modeling.out 2>&1; then
+            "${pytest_args[@]}" -q --tb=short > ${GATE_TMP}/modeling.out 2>&1; then
         local summary_line
-        summary_line="$(grep -E '[0-9]+ passed' /tmp/gate_modeling.out | tail -1 || echo 'ok')"
+        summary_line="$(grep -E '[0-9]+ passed' ${GATE_TMP}/modeling.out | tail -1 || echo 'ok')"
         record "modeling (T-BL19)   PASS    $summary_line"
         echo "  PASS ($summary_line)"
     else
@@ -677,9 +687,9 @@ stage_modeling() {
             record "modeling (T-BL19)   SKIP    no tests collected (check venv + deps)"
             echo "  SKIP: no tests collected"
         else
-            record "modeling (T-BL19)   FAIL    pytest exit $rc (see /tmp/gate_modeling.out)"
-            echo "  FAIL: modeling battery (see /tmp/gate_modeling.out):"
-            tail -n 15 /tmp/gate_modeling.out | sed 's/^/    /'
+            record "modeling (T-BL19)   FAIL    pytest exit $rc (see ${GATE_TMP}/modeling.out)"
+            echo "  FAIL: modeling battery (see ${GATE_TMP}/modeling.out):"
+            tail -n 15 ${GATE_TMP}/modeling.out | sed 's/^/    /'
             fail_fatal=1
         fi
     fi

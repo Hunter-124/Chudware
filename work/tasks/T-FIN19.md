@@ -2,8 +2,8 @@
 id: T-FIN19
 title: Board/enclosure airflow handoff - thermal to conjugate-HT CFD
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN19-board-airflow-handoff
 depends_on: [T-FIN16, T-SIM5]
 lane: simulation

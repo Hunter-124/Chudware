@@ -99,16 +99,16 @@ graph TD
     T_FIN13["T-FIN13: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map"]:::done
     T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::done
     T_FIN15["T-FIN15: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract"]:::done
-    T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::doing
-    T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::todo
+    T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::done
+    T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::doing
     T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::done
-    T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::todo
+    T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::doing
     T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::done
     T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::done
-    T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::todo
+    T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::doing
     T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::done
     T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::doing
-    T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::todo
+    T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::doing
     T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::todo
     T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
     T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::done

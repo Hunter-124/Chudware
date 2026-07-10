@@ -2,8 +2,8 @@
 id: T-FIN17
 title: Heatsink selection loop - parts-library candidates solved to a Tj target
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN17-heatsink-selection-loop
 depends_on: [T-FIN16]
 lane: simulation

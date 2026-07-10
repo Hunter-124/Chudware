@@ -2,8 +2,8 @@
 id: T-FIN24
 title: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN24-simulate-tab-multiphysics
 depends_on: [T-FIN1, T-FIN15, T-FIN16]
 lane: app-gui

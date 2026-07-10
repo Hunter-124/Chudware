@@ -102,6 +102,13 @@ public:
     // Row offsets / has_soft are re-finalized lazily on the next solve/analyze.
     void clear_soft_targets();
 
+    // Interactive-mode flag (T-PERF8). When true, the LM step uses LDLT-first with
+    // an SVD fallback, the damping trial loop honours the wall-clock deadline, and
+    // analyze() attributes redundant rows via a single ColPivQR instead of repeated
+    // growing QRs. Default false keeps the exact Python-oracle parity path.
+    void set_interactive(bool on) { interactive_ = on; }
+    bool interactive() const { return interactive_; }
+
     // Levenberg-Marquardt solve with adaptive damping. x0 empty uses the
     // registered initial guess; pass the previous solution to warm-start. tol is
     // the convergence threshold on the max absolute residual. time_budget_ms, if
@@ -160,11 +167,17 @@ private:
     Result drag_solve(Eigen::VectorXd x, double tol, int max_iter,
                       double deadline);
 
+    // Min-norm step for the normal equations. Exact path = always SVD (oracle);
+    // interactive = LDLT-first + rcond gate, SVD fallback.
+    Eigen::VectorXd solve_step(const Eigen::MatrixXd& A,
+                               const Eigen::VectorXd& b) const;
+
     std::vector<double> init_;
     std::vector<Block> blocks_;
     int n_rows_ = 0;
     bool has_soft_ = false;
     bool dirty_ = true;
+    bool interactive_ = false;
 };
 
 }  // namespace aicad::solver

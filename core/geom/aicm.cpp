@@ -62,9 +62,9 @@ std::vector<uint8_t> encode_body(const AicmBody& bt) {
     put_f32(p, bt.color[2]);
     put_u32(p, bt.n_verts());
     put_u32(p, bt.n_tris());
-    put_f32_array(p, bt.pos);
-    put_f32_array(p, bt.nrm);
-    put_u32_array(p, bt.idx);
+    put_f32_array(p, bt.pos.vec());
+    put_f32_array(p, bt.nrm.vec());
+    put_u32_array(p, bt.idx.vec());
     // C32-A material trailer (metallic, roughness) appended after idx.
     put_f32(p, bt.metallic);
     put_f32(p, bt.roughness);
@@ -93,7 +93,7 @@ std::vector<uint8_t> encode_edge(const AicmBody& bt) {
         put_u8(p, er.curve_type);
     }
     put_u32(p, bt.total_edge_pts());
-    put_f32_array(p, bt.edge_pts);
+    put_f32_array(p, bt.edge_pts.vec());
     return p;
 }
 

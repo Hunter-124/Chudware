@@ -12,6 +12,7 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -568,26 +569,40 @@ double extremum_param(const CurveFn& curve, const VectorXd& cv, double nx, doubl
 
 // Params (p, q) at the mutual closest approach of two curves: 25x25 coarse scan
 // then 8 alternating closest-point projections. Port of _mutual_closest.
+// When `warm_pq` is non-null and holds a finite prior (p,q) from an earlier residual
+// evaluation in the same solve (T-PERF8d interactive path), the expensive 25×25
+// scan is skipped and Newton continues from the warm seed — same attractor for a
+// smoothly moving geometry, much cheaper under LM's many residual probes.
 std::pair<double, double> mutual_closest(const CurveFn& curve0, const VectorXd& cv0,
                                          const ScanFn& scan0, const CurveFn& curve1,
-                                         const VectorXd& cv1, const ScanFn& scan1) {
-    VectorXd ps = scan0(cv0, 25);
-    VectorXd qs = scan1(cv1, 25);
-    std::vector<Vector2d> q_pts;
-    q_pts.reserve(qs.size());
-    for (int j = 0; j < qs.size(); ++j) q_pts.push_back(curve1(cv1, qs(j)).first);
-    double best = std::numeric_limits<double>::infinity();
-    double bp = ps(0), bq = qs(0);
-    for (int i = 0; i < ps.size(); ++i) {
-        Vector2d P0 = curve0(cv0, ps(i)).first;
-        for (int j = 0; j < qs.size(); ++j) {
-            const Vector2d& Q1 = q_pts[j];
-            double d = (P0(0) - Q1(0)) * (P0(0) - Q1(0)) +
-                       (P0(1) - Q1(1)) * (P0(1) - Q1(1));
-            if (d < best) {
-                best = d;
-                bp = ps(i);
-                bq = qs(j);
+                                         const VectorXd& cv1, const ScanFn& scan1,
+                                         std::pair<double, double>* warm_pq = nullptr) {
+    double bp, bq;
+    const bool have_warm = warm_pq && std::isfinite(warm_pq->first) &&
+                           std::isfinite(warm_pq->second);
+    if (have_warm) {
+        bp = warm_pq->first;
+        bq = warm_pq->second;
+    } else {
+        VectorXd ps = scan0(cv0, 25);
+        VectorXd qs = scan1(cv1, 25);
+        std::vector<Vector2d> q_pts;
+        q_pts.reserve(qs.size());
+        for (int j = 0; j < qs.size(); ++j) q_pts.push_back(curve1(cv1, qs(j)).first);
+        double best = std::numeric_limits<double>::infinity();
+        bp = ps(0);
+        bq = qs(0);
+        for (int i = 0; i < ps.size(); ++i) {
+            Vector2d P0 = curve0(cv0, ps(i)).first;
+            for (int j = 0; j < qs.size(); ++j) {
+                const Vector2d& Q1 = q_pts[j];
+                double d = (P0(0) - Q1(0)) * (P0(0) - Q1(0)) +
+                           (P0(1) - Q1(1)) * (P0(1) - Q1(1));
+                if (d < best) {
+                    best = d;
+                    bp = ps(i);
+                    bq = qs(j);
+                }
             }
         }
     }
@@ -598,6 +613,7 @@ std::pair<double, double> mutual_closest(const CurveFn& curve0, const VectorXd& 
         Vector2d Q1 = curve1(cv1, q).first;
         p = newton_project([&](double u) { return curve0(cv0, u); }, p, Q1);
     }
+    if (warm_pq) *warm_pq = {p, q};
     return {p, q};
 }
 
@@ -605,10 +621,11 @@ std::pair<double, double> mutual_closest(const CurveFn& curve0, const VectorXd& 
 // (k0 + k1 vars). Returns a scalar. Port of _curve_gap_residual.
 double curve_gap_residual(const VectorXd& v, int k0, int k1, const CurveFn& curve0,
                           const ScanFn& scan0, const CurveFn& curve1,
-                          const ScanFn& scan1) {
+                          const ScanFn& scan1,
+                          std::pair<double, double>* warm_pq = nullptr) {
     VectorXd cv0 = v.head(k0);
     VectorXd cv1 = v.segment(k0, k1);
-    auto pq = mutual_closest(curve0, cv0, scan0, curve1, cv1, scan1);
+    auto pq = mutual_closest(curve0, cv0, scan0, curve1, cv1, scan1, warm_pq);
     double p = pq.first, q = pq.second;
     CurvePair c0 = curve0(cv0, p);
     Vector2d P0 = c0.first, dP0 = c0.second;
@@ -1806,9 +1823,12 @@ void add_tangent_line_curve(System& sys, const std::string& cid,
 // excluding line-circle and circle-circle handled above). Single scalar residual
 // = signed gap at the mutual closest point. Numeric Jacobian. Range-free for
 // trimmed curves. Port of _add_tangent_curve_curve.
+// `interactive`: T-PERF8(d) — warm-start the mutual-closest (p,q) across residual
+// evaluations within one solve (shared across residual + numeric Jacobian probes).
 void add_tangent_curve_curve(System& sys, const std::string& cid,
                              const std::string& eid0, const std::string& eid1,
-                             const EntMap& entities, const VarMap& var_map) {
+                             const EntMap& entities, const VarMap& var_map,
+                             bool interactive = false) {
     CurveDescriptor d0 = curve_descriptor(entities.at(eid0).at("type"), var_map.at(eid0));
     CurveDescriptor d1 = curve_descriptor(entities.at(eid1).at("type"), var_map.at(eid1));
     if (!d0.ok || !d1.ok) return;  // unsupported entity type -> skip silently
@@ -1816,8 +1836,16 @@ void add_tangent_curve_curve(System& sys, const std::string& cid,
     ScanFn scan0 = d0.scan, scan1 = d1.scan;
     int k0 = static_cast<int>(d0.idx.size()), k1 = static_cast<int>(d1.idx.size());
     std::vector<int> combined = concat(d0.idx, d1.idx);
-    auto rfn = [k0, k1, curve0, scan0, curve1, scan1](const VectorXd& v) {
-        return curve_gap_residual(v, k0, k1, curve0, scan0, curve1, scan1);
+    // Shared (p,q) seed for this residual block. NaN => cold scan on first eval.
+    // Only attached when interactive so the exact path never skips the 25×25 scan.
+    auto warm_pq = interactive
+                       ? std::make_shared<std::pair<double, double>>(
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN())
+                       : std::shared_ptr<std::pair<double, double>>{};
+    auto rfn = [k0, k1, curve0, scan0, curve1, scan1, warm_pq](const VectorXd& v) {
+        return curve_gap_residual(v, k0, k1, curve0, scan0, curve1, scan1,
+                                  warm_pq.get());
     };
     sys.add_residual(
         [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
@@ -1881,7 +1909,8 @@ void add_symmetric(System& sys, const std::string& cid, const std::string& h0,
 }
 
 void add_constraint(System& sys, const json& c, const EntMap& entities,
-                    const VarMap& var_map, const json& env) {
+                    const VarMap& var_map, const json& env,
+                    bool interactive = false) {
     const std::string ctype = c.at("type");
     std::vector<std::string> refs;
     if (c.contains("refs"))
@@ -1955,7 +1984,7 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
         else if (is_spline(t0) && t1 == "line")
             add_tangent_line_curve(sys, cid, e1, e0, entities, var_map);
         else if (is_generic(t0) && is_generic(t1))
-            add_tangent_curve_curve(sys, cid, e0, e1, entities, var_map);
+            add_tangent_curve_curve(sys, cid, e0, e1, entities, var_map, interactive);
         // line-line tangent (ill-defined) stays deferred; skip.
     } else if (ctype == "distance") {
         std::string axis;
@@ -2222,7 +2251,8 @@ double measure_cond_adj(const json& constraint, const std::vector<std::string>& 
 
 SketchSolution solve_sketch(const json& sketch, const json& env,
                             const std::optional<SolveState>& warm,
-                            std::optional<double> time_budget_ms) {
+                            std::optional<double> time_budget_ms,
+                            bool interactive) {
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
 
@@ -2230,6 +2260,7 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
     for (const auto& e : entities_list) entities[e["id"]] = e;
 
     System sys;
+    sys.set_interactive(interactive);
     VarMap var_map;
     for (const auto& e : entities_list) {
         try {
@@ -2246,7 +2277,7 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
         int before = sys.n_vars();  // (unused, kept for clarity)
         (void)before;
         try {
-            add_constraint(sys, c, entities, var_map, env);
+            add_constraint(sys, c, entities, var_map, env, interactive);
         } catch (...) {
             // forward-tolerant: skip malformed/unsupported constraints
         }
@@ -2682,6 +2713,10 @@ json drag(const SolveState& state, const std::string& handle,
     std::shared_ptr<DragContext> ctx = fast ? *ctx_io : nullptr;
     if (!ctx) {
         ctx = std::make_shared<DragContext>();
+        // Drag is always interactive (T-PERF8): LDLT-first, in-trial deadline,
+        // single-QR redundancy, tangency (p,q) warm-start. Parity/oracle paths
+        // never call drag(), so the exact solve path is unaffected.
+        ctx->sys.set_interactive(true);
         ctx->entities_list = sketch.value("entities", json::array());
         ctx->constraints_list = sketch.value("constraints", json::array());
         for (const auto& e : ctx->entities_list) ctx->entities[e["id"]] = e;
@@ -2694,7 +2729,8 @@ json drag(const SolveState& state, const std::string& handle,
         }
         for (const auto& c : ctx->constraints_list) {
             try {
-                add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env);
+                add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env,
+                               /*interactive=*/true);
             } catch (...) {
                 // forward-tolerant
             }
@@ -2705,6 +2741,7 @@ json drag(const SolveState& state, const std::string& handle,
         // re-registration below the block set is IDENTICAL to a fresh build
         // (hard blocks in registration order, then this frame's soft targets).
         ctx->sys.clear_soft_targets();
+        ctx->sys.set_interactive(true);
     }
     System& sys = ctx->sys;
     const json& entities_list = ctx->entities_list;

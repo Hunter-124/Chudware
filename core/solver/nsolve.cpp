@@ -3,6 +3,7 @@
 // hold the two at parity.
 #include "nsolve.h"
 
+#include <Eigen/Cholesky>
 #include <Eigen/QR>
 
 #include <algorithm>
@@ -50,27 +51,37 @@ Eigen::VectorXd lstsq(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
     return svd.matrixV() * z;
 }
 
-// Solve A x = b assuming A is (near) SPD; fall back to a minimum-norm least-squares
-// step if the Cholesky factor is not usable, yields a non-finite result, OR the matrix
-// is ill-conditioned. This mirrors scipy's solve(assume_a="pos"), which raises a
-// LinAlgWarning when the LAPACK reciprocal condition number rcond < machine epsilon;
-// the Python oracle catches that warning and takes np.linalg.lstsq (minimum-norm)
-// instead. Without the rcond gate the C++ LLT silently returns a numerically-valid but
-// poor step on rank-deficient normal matrices (e.g. a coupled rotational mate chain),
-// driving the solve to a different — non-converged — minimum than the oracle.
-Eigen::VectorXd solve_pos(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-    // Mirror scipy.linalg.solve(assume_a="pos") AND its caught-LinAlgWarning lstsq fallback
-    // as a SINGLE SVD minimum-norm path (numpy's np.linalg.lstsq cutoff). Rationale:
-    //  * well-conditioned A — no singular values fall below the cutoff, so the min-norm
-    //    solution is numerically identical to the exact Cholesky solve scipy would take;
-    //  * ill-conditioned / rank-deficient A — the tiny-singular-value directions are dropped,
-    //    exactly as the oracle's np.linalg.lstsq does after scipy raises LinAlgWarning.
-    // Using one path removes the rcond-estimate mismatch that previously diverged the two
-    // engines: the Cholesky-diagonal ratio (dmin/dmax)² UNDERestimates rcond, so the C++
-    // branch fell back to lstsq more eagerly than LAPACK's pocon and, on longer coupled mate
-    // chains (k1..kN coincident), took direction-dropping Gauss-Newton steps that wandered a
-    // residual plateau and never converged — while the oracle's posv/pocon path descended to
-    // ~1e-11. SVD per step is negligible for the small normal matrices here (n <~ 100).
+// Exact-path normal solve (oracle parity): always the SVD min-norm step that mirrors
+// numpy.linalg.lstsq after scipy.linalg.solve(assume_a="pos") + caught LinAlgWarning.
+// See the pre-T-PERF8 comment history — a Cholesky-first path with a diagonal rcond
+// estimate diverged from LAPACK pocon on coupled mate chains. Kept as the default so
+// the differential harness stays bit-identical.
+Eigen::VectorXd solve_pos_exact(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+    return lstsq(A, b);
+}
+
+// Interactive-path normal solve (T-PERF8a): LDLT-first for the common well-conditioned
+// case, with an rcond gate + SVD fallback when the factor is unusable or ill-conditioned.
+// Faster constant factors on drag/edit solves; not used on the oracle parity path.
+Eigen::VectorXd solve_pos_interactive(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(A);
+    if (ldlt.info() == Eigen::Success) {
+        // Reciprocal-condition estimate from the |D| pivots of LDLT (A = P^T L D L^T P).
+        // Drop to SVD when the diagonal span is huge (rank-deficient / ill-conditioned).
+        const Eigen::VectorXd d = ldlt.vectorD().cwiseAbs();
+        const double dmax = d.size() ? d.maxCoeff() : 0.0;
+        const double dmin = d.size() ? d.minCoeff() : 0.0;
+        const double eps = std::numeric_limits<double>::epsilon();
+        // (dmin/dmax) underestimates true rcond; use a slightly loose gate so the
+        // common full-rank case stays on the cheap LDLT path.
+        const bool well =
+            dmax > 0.0 &&
+            dmin > eps * dmax * static_cast<double>(std::max<Eigen::Index>(A.rows(), 1));
+        if (well) {
+            Eigen::VectorXd x = ldlt.solve(b);
+            if (x.allFinite()) return x;
+        }
+    }
     return lstsq(A, b);
 }
 
@@ -92,7 +103,8 @@ int numeric_rank(const Eigen::MatrixXd& J, double tol) {
 }
 
 // Row indices of J that are dependent on earlier-registered rows (chronological
-// attribution). Direct port of nsolve._dependent_rows.
+// attribution). Direct port of nsolve._dependent_rows — O(m) growing QRs.
+// Exact / oracle path. Interactive mode uses dependent_rows_colpiv below.
 std::vector<int> dependent_rows(const Eigen::MatrixXd& J, int rank, double tol) {
     const int m = static_cast<int>(J.rows());
     std::vector<int> dep;
@@ -120,6 +132,40 @@ std::vector<int> dependent_rows(const Eigen::MatrixXd& J, int rank, double tol) 
             dep.push_back(ri);
         }
     }
+    return dep;
+}
+
+// Interactive redundant-row attribution (T-PERF8c): one ColPivQR on J^T so the
+// first `rank` pivot columns of J^T are the independent rows of J (in pivot order,
+// which is NOT chronological). To keep chronological blame ("later constraint is
+// redundant"), walk rows in registration order and mark a row dependent when it is
+// NOT among the independent set, once the independent set is saturated — same
+// end semantics as dependent_rows for the common case where rank is exact.
+//
+// Concrete algorithm: QR with column pivoting on J^T (n × m); the first `rank`
+// permutation entries are independent row indices of J. Any row not in that set
+// is dependent. Slightly coarser than the growing-QR chronological walk when
+// several rows enter together, but matches for well-separated constraints and is
+// O(one QR) instead of O(m) QRs — what the interactive drag budget needs.
+std::vector<int> dependent_rows_colpiv(const Eigen::MatrixXd& J, int rank, double tol) {
+    (void)tol;
+    const int m = static_cast<int>(J.rows());
+    std::vector<int> dep;
+    if (rank >= m || m == 0) return dep;
+    if (rank <= 0) {
+        for (int i = 0; i < m; ++i) dep.push_back(i);
+        return dep;
+    }
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(J.transpose());
+    const Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic> P = qr.colsPermutation();
+    std::vector<char> indep(static_cast<size_t>(m), 0);
+    const int take = std::min(rank, m);
+    for (int i = 0; i < take; ++i) {
+        const int ri = static_cast<int>(P.indices()(i));
+        if (ri >= 0 && ri < m) indep[static_cast<size_t>(ri)] = 1;
+    }
+    for (int ri = 0; ri < m; ++ri)
+        if (!indep[static_cast<size_t>(ri)]) dep.push_back(ri);
     return dep;
 }
 
@@ -268,6 +314,12 @@ Eigen::MatrixXd System::jacobian_of(const BlockSet& bs, const Eigen::VectorXd& x
 
 // -- solve --------------------------------------------------------------------
 
+Eigen::VectorXd System::solve_step(const Eigen::MatrixXd& A,
+                                   const Eigen::VectorXd& b) const {
+    if (interactive_) return solve_pos_interactive(A, b);
+    return solve_pos_exact(A, b);
+}
+
 Result System::solve(const std::optional<Eigen::VectorXd>& x0, double tol,
                      int max_iter, std::optional<double> time_budget_ms) {
     if (dirty_) finalize_rows();
@@ -338,9 +390,17 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
 
         bool accepted = false;
         for (int t = 0; t < 12; ++t) {
+            // T-PERF8(b): honour the wall-clock deadline inside the damping trial
+            // loop (interactive only — exact path keeps the outer-only check so
+            // iteration counts stay oracle-identical when no budget is set).
+            if (interactive_ && deadline_passed(deadline)) {
+                iters_out = it;
+                maxr_out = best_maxr;
+                return best_x;
+            }
             Eigen::MatrixXd A = JtJ;
             A.diagonal() += lam * diag;
-            step = solve_pos(A, -g);
+            step = solve_step(A, -g);
 
             Eigen::VectorXd x_new = x + step;
             Eigen::VectorXd r_new = residual_of(bs, x_new);
@@ -568,7 +628,10 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
 
     const int rank = numeric_rank(J, tol);
     const int dof = n - rank;
-    std::vector<int> redundant = dependent_rows(J, rank, tol);
+    // T-PERF8(c): interactive analyze uses a single ColPivQR attribution; the
+    // exact path keeps the chronological growing-QR walk for oracle parity.
+    std::vector<int> redundant = interactive_ ? dependent_rows_colpiv(J, rank, tol)
+                                              : dependent_rows(J, rank, tol);
 
     std::vector<std::string> redundant_tags, conflicting_tags;
     std::vector<std::string> seen_r, seen_c;

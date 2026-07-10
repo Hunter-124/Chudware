@@ -69,10 +69,14 @@ struct SketchSolution {
 // that run under the global doc lock (the apply_ops auto-coincident pass); parity /
 // oracle-facing callers (check_sketch, the compile pipeline) leave it unset so their
 // convergence behavior is unchanged.
+// `interactive` (T-PERF8) enables LDLT-first LM steps, in-trial deadline checks,
+// single-QR redundancy attribution, and spline-tangency (p,q) warm-start. Default
+// false keeps the exact Python-oracle parity path byte-identical.
 SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& env);
 SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& env,
                             const std::optional<SolveState>& warm,
-                            std::optional<double> time_budget_ms = std::nullopt);
+                            std::optional<double> time_budget_ms = std::nullopt,
+                            bool interactive = false);
 
 // Current solved measurement for a DIMENSIONAL constraint, in canonical units —
 // C++ port of sketch_solver.py's measure_constraint. distance -> mm (point-point

@@ -18,3 +18,13 @@ docs/PERF_AUDIT_2026-07-10.md §5 P2. DECISION: all four relaxations must be gat
 
 - [ ] interactive flag plumbed; oracle/parity path byte-identical
 - [ ] 200-entity sketch drag solve <10ms budget actually held
+
+## Progress (2026-07-10)
+
+Landed (all gated on interactive flag; default/exact path unchanged):
+- `System::set_interactive` / `solve_sketch(..., interactive=false)`
+- drag always interactive; apply_ops auto-coincident (budgeted) interactive=true
+- (a) LDLT-first + rcond, SVD fallback in nsolve
+- (b) deadline check inside LM damping trial loop when interactive
+- (c) analyze uses single ColPivQR dependent-row attribution when interactive
+- (d) curve-curve tangency warm-starts mutual_closest (p,q) within a solve

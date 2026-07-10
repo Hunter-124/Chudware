@@ -28,6 +28,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -187,15 +188,69 @@ struct Sketch3DResult {
 using FeatureResult = std::variant<SketchResult, SolidResult, PlaneResult, AxisResult,
                                    PointResult, CurveResult, Sketch3DResult>;
 
+// Shared feature-result slot (T-PERF6a). Checkpoints share unchanged entries via
+// shared_ptr so capture_ckpt is O(entries) pointer traffic, not O(N²) value-copies
+// of SketchResult json / shape vectors. Mutable (non-const) so sanitize_solid can
+// heal an inverted solid in place before the result is frozen into a checkpoint.
+using FeatureResultPtr = std::shared_ptr<FeatureResult>;
+
+// Map wrapper: operator[] assignment always allocates a FRESH shared_ptr so a
+// later put never mutates a FeatureResult still shared with a prior checkpoint.
+// find/at/count match std::map so existing access sites only need to dereference
+// the shared_ptr (it->second / *results.at(id)).
+class FeatureResultMap {
+public:
+    using map_t = std::map<std::string, FeatureResultPtr>;
+    using iterator = map_t::iterator;
+    using const_iterator = map_t::const_iterator;
+
+    struct Slot {
+        FeatureResultPtr& ref;
+        template <typename T>
+        Slot& operator=(T&& v) {
+            ref = std::make_shared<FeatureResult>(FeatureResult(std::forward<T>(v)));
+            return *this;
+        }
+    };
+
+    Slot operator[](const std::string& id) { return Slot{m_[id]}; }
+    Slot operator[](std::string&& id) { return Slot{m_[std::move(id)]}; }
+
+    iterator find(const std::string& id) { return m_.find(id); }
+    const_iterator find(const std::string& id) const { return m_.find(id); }
+    iterator end() { return m_.end(); }
+    const_iterator end() const { return m_.end(); }
+    iterator begin() { return m_.begin(); }
+    const_iterator begin() const { return m_.begin(); }
+    std::size_t count(const std::string& id) const { return m_.count(id); }
+    FeatureResultPtr& at(const std::string& id) { return m_.at(id); }
+    const FeatureResultPtr& at(const std::string& id) const { return m_.at(id); }
+    void clear() { m_.clear(); }
+    std::size_t size() const { return m_.size(); }
+
+private:
+    map_t m_;
+};
+
+// Import-cache key: FNV-1a of the embedded_brep blob (T-PERF6a). Keying by the
+// multi-MB blob string itself forced every checkpoint map node to carry a full
+// copy of the key; a 64-bit hash is enough for content-addressing within one
+// compile (identical blobs → identical shapes).
+using ImportCache = std::map<uint64_t, std::vector<TopoDS_Shape>>;
+
+// Per-solid face/edge owner maps (T-PERF7a): sid -> (topo_index -> owning feature id).
+// Folded into CompileCkpt so incremental rebuilds don't re-diff the whole history.
+using OwnerTopoMap = std::map<std::string, std::map<int, std::string>>;
+
 // ------------------------------------------------ incremental-rebuild prefix cache
 // One checkpoint = the compiler's complete loop-carried state after feature i ran.
-// Everything here is either a small value map or a refcounted OCCT handle, so a
-// checkpoint copy is O(entries) pointer-sized copies, never a geometry deep-copy.
+// Results / statuses / import_cache / owner maps are shared_ptr-backed so a checkpoint
+// capture is O(entries) pointer-sized copies of UNCHANGED slots (T-PERF6a / T-PERF7a).
 // If compile_document grows a NEW piece of loop-carried state, it MUST be added here
 // and to the capture/restore sites below — that invariant is what keeps a restored
 // prefix bit-identical to re-executing it.
 struct CompileCkpt {
-    std::map<std::string, FeatureResult> results;
+    FeatureResultMap results;
     std::set<std::string> consumed;
     std::map<std::string, std::string> superseded_by;
     std::vector<std::string> solid_order;
@@ -208,12 +263,16 @@ struct CompileCkpt {
     bool sheet_active = false;
     double sheet_thickness = 0.0, sheet_k_factor = 0.0, sheet_default_bend_radius = 0.0;
     std::vector<::geom::BendRecord> bend_records;
-    std::map<std::string, std::vector<TopoDS_Shape>> import_cache;
-    // result accumulators the loop appends to
-    std::vector<FeatureStatus> statuses;
+    ImportCache import_cache;
+    // Per-status shared_ptr so appending status N does not re-copy statuses 0..N-1
+    // into every subsequent checkpoint (T-PERF6a).
+    std::vector<std::shared_ptr<const FeatureStatus>> statuses;
     std::vector<ToolRec> tool_recs;
     nlohmann::json weld_members;
     nlohmann::json sheet_metal_flat;
+    // Incremental owner maps (T-PERF7a) — face/edge attribution per solid id.
+    OwnerTopoMap face_owners;
+    OwnerTopoMap edge_owners;
 };
 
 // FNV-1a over a string, chainable through `seed` (h[i+1] = fnv(feature_json, h[i])).
@@ -350,16 +409,16 @@ aicad::geom::SketchPlane plane_from_name(const std::string& name) {
 // Look up a referenced feature result by id, requiring it be a SOLID body. Throws a
 // descriptive error (consumed by the per-feature try/catch) when the id is missing
 // or refers to a sketch rather than a body.
-const TopoDS_Shape& require_solid(const std::map<std::string, FeatureResult>& results,
+const TopoDS_Shape& require_solid(const FeatureResultMap& results,
                                   const std::string& ref_id, const char* slot) {
     auto it = results.find(ref_id);
     if (it == results.end())
         throw std::runtime_error(std::string("ref '") + slot + "' -> '" + ref_id +
                                  "' not found");
-    if (!std::holds_alternative<SolidResult>(it->second))
+    if (!std::holds_alternative<SolidResult>(*it->second))
         throw std::runtime_error(std::string("ref '") + slot + "' -> '" + ref_id +
                                  "' is a sketch, not a solid body");
-    const TopoDS_Shape& s = std::get<SolidResult>(it->second).shape;
+    const TopoDS_Shape& s = std::get<SolidResult>(*it->second).shape;
     // Bug N1 (defensive) — a body that compiled to a NULL shape must not be handed to a
     // downstream kernel op (face/edge resolvers and OCCT booleans dereference the
     // TShape; a null one is a likely access-violation source). Fail loudly instead.
@@ -371,16 +430,16 @@ const TopoDS_Shape& require_solid(const std::map<std::string, FeatureResult>& re
 
 // Look up a referenced SKETCH result by id (for extrude/revolve profiles). Throws
 // when missing or it refers to a solid body rather than a sketch.
-const SketchResult& require_sketch(const std::map<std::string, FeatureResult>& results,
+const SketchResult& require_sketch(const FeatureResultMap& results,
                                    const std::string& ref_id, const char* slot) {
     auto it = results.find(ref_id);
     if (it == results.end())
         throw std::runtime_error(std::string("profile '") + slot + "' -> '" + ref_id +
                                  "' not found");
-    if (!std::holds_alternative<SketchResult>(it->second))
+    if (!std::holds_alternative<SketchResult>(*it->second))
         throw std::runtime_error(std::string("profile '") + slot + "' -> '" + ref_id +
                                  "' is a solid body, not a sketch");
-    return std::get<SketchResult>(it->second);
+    return std::get<SketchResult>(*it->second);
 }
 
 // Pick ONE wire chain out of a Sketch3DResult for a sweep path/guide ref. A plain
@@ -941,7 +1000,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
     // The shared rebuild context: per-feature results keyed by id, plus the set of
     // solids consumed by a later feature (they no longer survive as standalone bodies).
-    std::map<std::string, FeatureResult> results;
+    // FeatureResultMap = shared_ptr slots so checkpoints share unchanged entries (T-PERF6a).
+    FeatureResultMap results;
     std::set<std::string> consumed;
     // Lineage of an in-place transform: when a `copy:false` transform CONSUMES a source body
     // and produces a moved replacement, record source-id -> new-id here. A LATER transform that
@@ -1111,8 +1171,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         if (fid == "origin" || fid == "point.origin") return Eigen::Vector3d(0, 0, 0);
         if (!fid.empty()) {
             auto it = results.find(fid);
-            if (it != results.end() && std::holds_alternative<PointResult>(it->second))
-                return std::get<PointResult>(it->second).pt;
+            if (it != results.end() && std::holds_alternative<PointResult>(*it->second))
+                return std::get<PointResult>(*it->second).pt;
         }
         throw std::runtime_error(std::string(slot) +
             ": expected a point datum (geometry vertex selectors not yet ported here)");
@@ -1130,8 +1190,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             fid = ref["feature"].get<std::string>();
         if (!fid.empty()) {
             auto it = results.find(fid);
-            if (it != results.end() && std::holds_alternative<AxisResult>(it->second)) {
-                const AxisResult& a = std::get<AxisResult>(it->second);
+            if (it != results.end() && std::holds_alternative<AxisResult>(*it->second)) {
+                const AxisResult& a = std::get<AxisResult>(*it->second);
                 return std::make_pair(a.point, a.dir);
             }
         }
@@ -1148,8 +1208,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             fid = ref["feature"].get<std::string>();
         if (!fid.empty()) {
             auto it = results.find(fid);
-            if (it != results.end() && std::holds_alternative<PlaneResult>(it->second))
-                return std::get<PlaneResult>(it->second).plane;
+            if (it != results.end() && std::holds_alternative<PlaneResult>(*it->second))
+                return std::get<PlaneResult>(*it->second).plane;
         }
         std::string name = fid;
         if (name.rfind("plane.", 0) == 0) name = name.substr(6);
@@ -1237,8 +1297,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     auto surf_sketch_wire = [&](const json& ref, const char* slot) -> TopoDS_Wire {
         const std::string sk = selector_owner_id(ref);
         auto it = sk.empty() ? results.end() : results.find(sk);
-        if (it != results.end() && std::holds_alternative<SketchResult>(it->second)) {
-            const SketchResult& src = std::get<SketchResult>(it->second);
+        if (it != results.end() && std::holds_alternative<SketchResult>(*it->second)) {
+            const SketchResult& src = std::get<SketchResult>(*it->second);
             TopoDS_Wire w = aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
             if (w.IsNull())
                 throw std::runtime_error(std::string("surf: ") + slot + " sketch produced no wire");
@@ -1484,14 +1544,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     // the solid was already valid. Throws when the solid is invalid AND unhealable.
     auto sanitize_solid = [&](const std::string& sid, const std::string& fname) -> bool {
         auto rit = results.find(sid);
-        if (rit == results.end() || !std::holds_alternative<SolidResult>(rit->second))
+        if (rit == results.end() || !std::holds_alternative<SolidResult>(*rit->second))
             return false;
         // SURFACE (open sheet) bodies have no meaningful enclosed volume — the signed
         // value VolumeProperties returns for an open shell is not an inversion signal.
         // Skip them; only closed SOLID bodies are validated for negative volume.
         auto kit = body_kinds.find(sid);
         if (kit != body_kinds.end() && kit->second == "surface") return false;
-        TopoDS_Shape& shape = std::get<SolidResult>(rit->second).shape;
+        TopoDS_Shape& shape = std::get<SolidResult>(*rit->second).shape;
         if (shape.IsNull()) return false;
 
         auto signed_vol = [](const TopoDS_Shape& s) -> double {
@@ -1544,13 +1604,19 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     const json features = config_effective_features(base_features.is_array() ? base_features : empty,
                                                     active_cfg);
 
-    // Per-compile cache of deserialized embedded-BREP imports, keyed by the blob itself.
-    // An assembly that imports the same part N times (e.g. 4 identical wheels) carries N
-    // byte-identical `embedded_brep` blobs; deserializing once and SHARING the resulting
-    // TShape across all N imports means the later transform/tessellate/mass-prop steps
-    // operate on shared geometry and dedup automatically. The shapes are only ever read
-    // or rigidly relocated downstream (never mutated in place), so sharing is safe.
-    std::map<std::string, std::vector<TopoDS_Shape>> import_cache;
+    // Per-compile cache of deserialized embedded-BREP imports, keyed by FNV-1a of the
+    // blob (T-PERF6a) — not the multi-MB blob string itself. An assembly that imports
+    // the same part N times (e.g. 4 identical wheels) carries N byte-identical blobs;
+    // deserializing once and SHARING the resulting TShape across all N imports means
+    // the later transform/tessellate/mass-prop steps operate on shared geometry and
+    // dedup automatically. The shapes are only ever read or rigidly relocated
+    // downstream (never mutated in place), so sharing is safe.
+    ImportCache import_cache;
+    // Incremental owner maps (T-PERF7a) — rebuilt only for solids produced by executed
+    // features; restored from the checkpoint for the reused prefix.
+    OwnerTopoMap face_owners, edge_owners;
+    // Status chain as shared_ptrs so capture_ckpt does not re-copy prior statuses.
+    std::vector<std::shared_ptr<const FeatureStatus>> status_ptrs;
 
     // ------------------------------------------ incremental-rebuild cache probe
     // Hash the compile INPUTS into a chain (h0 = env + active config; h[i+1] = h[i]
@@ -1601,7 +1667,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             --match;
         if (match > 0) {
             const CompileCkpt& ck = *cache->snaps[match];
-            results = ck.results;
+            results = ck.results;  // shared_ptr map — O(entries) pointer copies
             consumed = ck.consumed;
             superseded_by = ck.superseded_by;
             solid_order = ck.solid_order;
@@ -1616,8 +1682,16 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             sheet_ctx.default_bend_radius = ck.sheet_default_bend_radius;
             bend_records = ck.bend_records;
             import_cache = ck.import_cache;
-            result.statuses = ck.statuses;
-            for (FeatureStatus& fst : result.statuses) fst.reused = true;
+            face_owners = ck.face_owners;
+            edge_owners = ck.edge_owners;
+            status_ptrs = ck.statuses;
+            result.statuses.clear();
+            result.statuses.reserve(status_ptrs.size());
+            for (const auto& sp : status_ptrs) {
+                FeatureStatus fst = *sp;
+                fst.reused = true;
+                result.statuses.push_back(std::move(fst));
+            }
             result.tool_recs = ck.tool_recs;
             result.weld_members = ck.weld_members;
             result.sheet_metal_flat = ck.sheet_metal_flat;
@@ -1632,6 +1706,51 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         for (std::size_t i = 1; i <= start_at && i < cache->snaps.size(); ++i)
             new_snaps[i] = cache->snaps[i];
     }
+    // T-PERF7a: owner attribution for one solid id. Diff against source_of[sid] by
+    // TShape identity (same logic as the historical full-history pass). Idempotent —
+    // re-running for a re-executed solid overwrites face_owners[sid]/edge_owners[sid].
+    auto update_owners_for = [&](const std::string& sid) {
+        auto rit = results.find(sid);
+        if (rit == results.end() || !std::holds_alternative<SolidResult>(*rit->second))
+            return;
+        const TopoDS_Shape& shape = std::get<SolidResult>(*rit->second).shape;
+        if (shape.IsNull()) return;
+        TopTools_IndexedMapOfShape fm, em;
+        TopExp::MapShapes(shape, TopAbs_FACE, fm);
+        TopExp::MapShapes(shape, TopAbs_EDGE, em);
+        const std::string src = source_of.count(sid) ? source_of[sid] : std::string();
+        const bool has_src = !src.empty() && results.count(src) &&
+                             std::holds_alternative<SolidResult>(*results.at(src)) &&
+                             !std::get<SolidResult>(*results.at(src)).shape.IsNull();
+        TopTools_IndexedMapOfShape sfm, sem;
+        if (has_src) {
+            const TopoDS_Shape& ss = std::get<SolidResult>(*results.at(src)).shape;
+            TopExp::MapShapes(ss, TopAbs_FACE, sfm);
+            TopExp::MapShapes(ss, TopAbs_EDGE, sem);
+        }
+        std::map<int, std::string> fo, eo;
+        for (int i = 1; i <= fm.Extent(); ++i) {
+            if (has_src && sfm.Contains(fm.FindKey(i))) {
+                int pi = sfm.FindIndex(fm.FindKey(i));
+                auto& s = face_owners[src];
+                auto it = s.find(pi);
+                fo[i] = (it != s.end()) ? it->second : sid;
+            } else fo[i] = sid;
+        }
+        for (int i = 1; i <= em.Extent(); ++i) {
+            if (has_src && sem.Contains(em.FindKey(i))) {
+                int pi = sem.FindIndex(em.FindKey(i));
+                auto& s = edge_owners[src];
+                auto it = s.find(pi);
+                eo[i] = (it != s.end()) ? it->second : sid;
+            } else eo[i] = sid;
+        }
+        face_owners[sid] = std::move(fo);
+        edge_owners[sid] = std::move(eo);
+    };
+
+    // Capture is O(map size) of SHARED pointers for results/statuses (T-PERF6a) —
+    // unchanged FeatureResult entries are not deep-copied into each checkpoint.
     auto capture_ckpt = [&](std::size_t after_idx) {
         if (!use_cache) return;
         auto ck = std::make_shared<CompileCkpt>();
@@ -1650,10 +1769,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         ck->sheet_default_bend_radius = sheet_ctx.default_bend_radius;
         ck->bend_records = bend_records;
         ck->import_cache = import_cache;
-        ck->statuses = result.statuses;
+        ck->statuses = status_ptrs;
         ck->tool_recs = result.tool_recs;
         ck->weld_members = result.weld_members;
         ck->sheet_metal_flat = result.sheet_metal_flat;
+        ck->face_owners = face_owners;
+        ck->edge_owners = edge_owners;
         new_snaps[after_idx] = std::move(ck);
     };
     result.features_reused = static_cast<int>(start_at);
@@ -1682,6 +1803,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // compiler: status ok, no body, topology unchanged). Skip it cleanly.
         if (raw.value("suppressed", false) || feat.value("suppressed", false)) {
             st.ok = true;
+            status_ptrs.push_back(std::make_shared<const FeatureStatus>(st));
             result.statuses.push_back(std::move(st));
             capture_ckpt(_fi + 1);
             continue;
@@ -2091,7 +2213,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (!a_is_point && !fid.empty()) {
                             auto it = results.find(fid);
                             a_is_point = it != results.end() &&
-                                std::holds_alternative<PointResult>(it->second);
+                                std::holds_alternative<PointResult>(*it->second);
                         }
                     } else {
                         a_is_point = aref.is_object() &&
@@ -2795,7 +2917,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const std::string embedded = str_field(feat, "embedded_brep", "");
                 if (!embedded.empty()) {
                     src_desc = "embedded geometry";
-                    auto cit = import_cache.find(embedded);
+                    // Key by content hash, not the multi-MB blob string (T-PERF6a).
+                    const uint64_t emb_key = cc_fnv1a(embedded);
+                    auto cit = import_cache.find(emb_key);
                     if (cit != import_cache.end()) {
                         solids = cit->second;  // SHARE the cached TShape(s) across identical imports
                     } else {
@@ -2805,7 +2929,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 solids.push_back(ex.Current());
                             if (solids.empty()) solids.push_back(baked);  // bare shell/solid
                         }
-                        import_cache.emplace(embedded, solids);
+                        import_cache.emplace(emb_key, solids);
                     }
                 }
                 if (solids.empty()) {
@@ -2871,8 +2995,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         // owning body is never split by its own face.
                         for (const std::string& cand : solid_order) {
                             if (consumed.count(cand)) continue;
-                            if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
-                            const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                            if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
+                            const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                             if (cb.IsNull()) continue;
                             aicad::doc::FacePicks fp =
                                 aicad::doc::resolve_face_picks(cb, tool, "tool");
@@ -2891,7 +3015,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         std::vector<std::string> targets;
                         for (const std::string& sid : solid_order)
                             if (!consumed.count(sid) &&
-                                std::holds_alternative<SolidResult>(results.at(sid)))
+                                std::holds_alternative<SolidResult>(*results.at(sid)))
                                 targets.push_back(sid);
                         if (targets.empty())
                             throw std::runtime_error("split: no body to split");
@@ -2903,7 +3027,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             // BOP returns it whole) — pass the owner through unchanged.
                             if (sid == owner_id) continue;
                             const TopoDS_Shape& body =
-                                std::get<SolidResult>(results.at(sid)).shape;
+                                std::get<SolidResult>(*results.at(sid)).shape;
                             std::vector<TopoDS_Shape> kept =
                                 ::geom::split_solid_by_surface(body, tool_face, keep);
                             if (kept.empty()) continue;  // surface missed/tangent
@@ -2945,7 +3069,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 std::vector<std::string> targets;
                 for (const std::string& sid : solid_order)
                     if (!consumed.count(sid) &&
-                        std::holds_alternative<SolidResult>(results.at(sid)))
+                        std::holds_alternative<SolidResult>(*results.at(sid)))
                         targets.push_back(sid);
                 if (targets.empty())
                     throw std::runtime_error("split: no body to split");
@@ -2955,7 +3079,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 double reach = 100.0;
                 for (const std::string& sid : targets) {
                     Bnd_Box bb;
-                    BRepBndLib::Add(std::get<SolidResult>(results.at(sid)).shape, bb);
+                    BRepBndLib::Add(std::get<SolidResult>(*results.at(sid)).shape, bb);
                     if (bb.IsVoid()) continue;
                     double xmn, ymn, zmn, xmx, ymx, zmx;
                     bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
@@ -2981,7 +3105,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 std::vector<std::pair<std::string, TopoDS_Shape>> new_pieces;  // (src_id, shape)
                 int split_count = 0;
                 for (const std::string& sid : targets) {
-                    const TopoDS_Shape& body = std::get<SolidResult>(results.at(sid)).shape;
+                    const TopoDS_Shape& body = std::get<SolidResult>(*results.at(sid)).shape;
                     TopoDS_Shape above = ::geom::common(body, half_space);
                     TopoDS_Shape below = ::geom::cut(body, half_space);
                     auto vol = [](const TopoDS_Shape& s) -> double {
@@ -3573,8 +3697,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 TopoDS_Wire spine;
                 auto path_it = results.find(path_id);
                 if (path_it != results.end() &&
-                    std::holds_alternative<CurveResult>(path_it->second)) {
-                    const CurveResult& cr = std::get<CurveResult>(path_it->second);
+                    std::holds_alternative<CurveResult>(*path_it->second)) {
+                    const CurveResult& cr = std::get<CurveResult>(*path_it->second);
                     // Lift local (x,y,z) -> origin + x*u + y*v + z*n (the base frame).
                     const aicad::geom::SketchPlane& b = cr.base;
                     gp_Trsf lift;
@@ -3584,10 +3708,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
                     spine = TopoDS::Wire(BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
                 } else if (path_it != results.end() &&
-                           std::holds_alternative<Sketch3DResult>(path_it->second)) {
+                           std::holds_alternative<Sketch3DResult>(*path_it->second)) {
                     // A 3D free-space sketch: its wires are already in world
                     // coordinates — no lift. Wire choice per sketch3d_ref_wire.
-                    spine = sketch3d_ref_wire(std::get<Sketch3DResult>(path_it->second),
+                    spine = sketch3d_ref_wire(std::get<Sketch3DResult>(*path_it->second),
                                               *pit, "path");
                 } else {
                     const SketchResult& pathsk = require_sketch(results, path_id, "path");
@@ -3634,8 +3758,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     TopoDS_Wire gw;
                     auto gres = results.find(gid);
                     if (gres != results.end() &&
-                        std::holds_alternative<CurveResult>(gres->second)) {
-                        const CurveResult& cr = std::get<CurveResult>(gres->second);
+                        std::holds_alternative<CurveResult>(*gres->second)) {
+                        const CurveResult& cr = std::get<CurveResult>(*gres->second);
                         const aicad::geom::SketchPlane& b = cr.base;
                         gp_Trsf lift;
                         lift.SetValues(
@@ -3645,8 +3769,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         gw = TopoDS::Wire(
                             BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
                     } else if (gres != results.end() &&
-                               std::holds_alternative<Sketch3DResult>(gres->second)) {
-                        gw = sketch3d_ref_wire(std::get<Sketch3DResult>(gres->second),
+                               std::holds_alternative<Sketch3DResult>(*gres->second)) {
+                        gw = sketch3d_ref_wire(std::get<Sketch3DResult>(*gres->second),
                                                gsel, "guide");
                     } else {
                         const SketchResult& gsk = require_sketch(results, gid, "guide");
@@ -5815,7 +5939,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     TopoDS_Face best;
                     double best_d = std::numeric_limits<double>::max();
                     for (const std::string& bid : live) {
-                        const TopoDS_Shape& body = std::get<SolidResult>(results.at(bid)).shape;
+                        const TopoDS_Shape& body = std::get<SolidResult>(*results.at(bid)).shape;
                         aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
                         for (const TopoDS_Face& fc : fp.faces) {
                             double d = 0.0;
@@ -6289,8 +6413,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 bool tool_ok = false;
                 const std::string tool_owner = selector_owner_id(*tit);
                 if (!tool_owner.empty() && results.count(tool_owner) &&
-                    std::holds_alternative<SketchResult>(results.at(tool_owner))) {
-                    const SketchResult& tsk = std::get<SketchResult>(results.at(tool_owner));
+                    std::holds_alternative<SketchResult>(*results.at(tool_owner))) {
+                    const SketchResult& tsk = std::get<SketchResult>(*results.at(tool_owner));
                     if (!tsk.faces.empty()) { tool_face = tsk.faces.front(); tool_ok = true; }
                 }
                 if (!tool_ok && tit->is_object() &&
@@ -6299,8 +6423,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // tool-face resolver scans all bodies); take the first that resolves.
                     for (const std::string& cand : solid_order) {
                         if (consumed.count(cand)) continue;
-                        if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
-                        const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                        if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
+                        const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                         if (cb.IsNull()) continue;
                         aicad::doc::FacePicks tp =
                             aicad::doc::resolve_face_picks(cb, *tit, "tool");
@@ -6355,15 +6479,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 TopoDS_Shape replacement;
                 const std::string surf_owner = selector_owner_id(*ssel);
                 if (!surf_owner.empty() && results.count(surf_owner) &&
-                    std::holds_alternative<SolidResult>(results.at(surf_owner)) &&
+                    std::holds_alternative<SolidResult>(*results.at(surf_owner)) &&
                     surf_owner != body_id) {
-                    replacement = std::get<SolidResult>(results.at(surf_owner)).shape;
+                    replacement = std::get<SolidResult>(*results.at(surf_owner)).shape;
                 } else if (ssel->is_object() &&
                            ssel->value("kind", std::string()) == "face") {
                     for (const std::string& cand : solid_order) {
                         if (cand == body_id || consumed.count(cand)) continue;
-                        if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
-                        const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                        if (!std::holds_alternative<SolidResult>(*results.at(cand))) continue;
+                        const TopoDS_Shape& cb = std::get<SolidResult>(*results.at(cand)).shape;
                         if (cb.IsNull()) continue;
                         aicad::doc::FacePicks rp =
                             aicad::doc::resolve_face_picks(cb, *ssel, "surface");
@@ -6931,9 +7055,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (consumed.count(nsid)) continue;
                     auto rit = results.find(nsid);
                     if (rit == results.end() ||
-                        !std::holds_alternative<SolidResult>(rit->second))
+                        !std::holds_alternative<SolidResult>(*rit->second))
                         continue;
-                    const TopoDS_Shape& sh = std::get<SolidResult>(rit->second).shape;
+                    const TopoDS_Shape& sh = std::get<SolidResult>(*rit->second).shape;
                     if (sh.IsNull() || ::geom::shape_face_count(sh) == 0)
                         fail_backstop(
                             type + " produced an empty/degenerate body (no geometry) — "
@@ -6983,7 +7107,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
         st.ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - _feat_t0).count();
+        status_ptrs.push_back(std::make_shared<const FeatureStatus>(st));
         result.statuses.push_back(std::move(st));
+        // T-PERF7a: attribute owners only for solids THIS feature produced (the
+        // reused prefix already carries face_owners/edge_owners from its checkpoint).
+        if (st.ok) {
+            for (std::size_t k = solids_before; k < solid_order.size(); ++k)
+                update_owners_for(solid_order[k]);
+        }
         capture_ckpt(_fi + 1);
     }
 
@@ -7030,7 +7161,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     };
     for (const std::string& sid : solid_order) {
         if (consumed.count(sid)) continue;
-        const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
+        const TopoDS_Shape& shape = std::get<SolidResult>(*results.at(sid)).shape;
         if (shape.IsNull()) continue;
         try {
             // Per-body appearance (C26 colour + C32-A material) baked into the AICM so the host
@@ -7061,7 +7192,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
 
             if (hit) {
-                // Reuse: copy the cached mesh + stats, re-stamp to this body's ordinal/id.
+                // Reuse: COW mesh buffers (T-PERF6c) — assignment shares pos/nrm/idx;
+                // only body_id/name are re-stamped (cheap scalars/string).
                 aicm::AicmBody b = hit->body;
                 b.body_id = body_num;
                 b.name = sid;
@@ -7078,9 +7210,35 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
 
             // Fresh tessellate + stats.
+            // T-PERF7(b) size-relative linear deflection:
+            //   lin = clamp(diag * k, floor, ceil)
+            //     k     = 1e-3   (0.1% of bbox diagonal)
+            //     floor = 0.05 mm  — same absolute default as before, so tiny parts
+            //                       keep prior visual quality / mesh density
+            //     ceil  = 2.0 mm  — caps facet size on multi-metre parts so a 2 m
+            //                       part (~diag 2000) meshes at O(100k) tris instead
+            //                       of millions at a fixed 0.05 mm
+            // Angular deflection stays 0.35 rad (tessellate_body clamps for display).
             g_cc_bodies_tessellated.fetch_add(1, std::memory_order_relaxed);
+            double lin_defl = 0.05;
+            try {
+                Bnd_Box bb;
+                BRepBndLib::Add(shape, bb);
+                if (!bb.IsVoid()) {
+                    double x0, y0, z0, x1, y1, z1;
+                    bb.Get(x0, y0, z0, x1, y1, z1);
+                    const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+                    const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (std::isfinite(diag) && diag > 0.0) {
+                        constexpr double kRel = 1e-3;
+                        constexpr double kFloor = 0.05;  // mm
+                        constexpr double kCeil = 2.0;    // mm
+                        lin_defl = std::min(kCeil, std::max(kFloor, diag * kRel));
+                    }
+                }
+            } catch (...) { /* keep 0.05 floor */ }
             aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, sid, bcolor,
-                                                       0.05, 0.35, bmetal, brough);
+                                                       lin_defl, 0.35, bmetal, brough);
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts
@@ -7143,56 +7301,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     const auto _owner_t0 = std::chrono::steady_clock::now();
 
     // -------------------------------------------------- owner map (host picking)
-    // Per surviving body, tag each face/edge with the feature that created it: diff
-    // the body's topology against the body it derived from (source_of) by TShape
-    // identity (existing topology keeps its owner; NEW topology is this feature's).
-    // Then invert into {fid:{bodies,faces,edges}} keyed by the AICM body ordinal +
-    // 1-based TopExp topo index (port of engine/doc/session.py::_owner_map).
+    // face_owners / edge_owners are maintained incrementally (T-PERF7a) and restored
+    // from CompileCkpt for the reused prefix — this phase only INVERTS them into the
+    // host-facing {fid:{bodies,faces,edges}} map for surviving AICM bodies. On a
+    // pure-prefix edit owner_ms collapses to this cheap inversion.
     {
-        std::map<std::string, std::map<int, std::string>> face_owners, edge_owners;
-        for (const std::string& sid : solid_order) {  // sources precede dependents
-            if (!std::holds_alternative<SolidResult>(results.at(sid))) continue;
-            const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
-            if (shape.IsNull()) continue;
-            TopTools_IndexedMapOfShape fm, em;
-            TopExp::MapShapes(shape, TopAbs_FACE, fm);
-            TopExp::MapShapes(shape, TopAbs_EDGE, em);
-            const std::string src = source_of.count(sid) ? source_of[sid] : std::string();
-            const bool has_src = !src.empty() && results.count(src) &&
-                                 std::holds_alternative<SolidResult>(results.at(src)) &&
-                                 !std::get<SolidResult>(results.at(src)).shape.IsNull();
-            TopTools_IndexedMapOfShape sfm, sem;
-            if (has_src) {
-                const TopoDS_Shape& ss = std::get<SolidResult>(results.at(src)).shape;
-                TopExp::MapShapes(ss, TopAbs_FACE, sfm);
-                TopExp::MapShapes(ss, TopAbs_EDGE, sem);
-            }
-            // Owner diff by TShape IDENTITY: a result face/edge that survived UNCHANGED
-            // (same TShape) keeps its source owner; a MODIFIED or NEW one belongs to this
-            // feature (matches the Python build123d attribution — a fillet owns every face
-            // it regenerated, not just the new round). The load-bearing requirement is that
-            // a MODIFYING feature has a `source_of` so this diff runs at all (the fillet/
-            // chamfer branch sets it; without it the whole body was attributed to the op).
-            std::map<int, std::string> fo, eo;
-            for (int i = 1; i <= fm.Extent(); ++i) {
-                if (has_src && sfm.Contains(fm.FindKey(i))) {
-                    int pi = sfm.FindIndex(fm.FindKey(i));
-                    auto& s = face_owners[src];
-                    auto it = s.find(pi);
-                    fo[i] = (it != s.end()) ? it->second : sid;
-                } else fo[i] = sid;
-            }
-            for (int i = 1; i <= em.Extent(); ++i) {
-                if (has_src && sem.Contains(em.FindKey(i))) {
-                    int pi = sem.FindIndex(em.FindKey(i));
-                    auto& s = edge_owners[src];
-                    auto it = s.find(pi);
-                    eo[i] = (it != s.end()) ? it->second : sid;
-                } else eo[i] = sid;
-            }
-            face_owners[sid] = std::move(fo);
-            edge_owners[sid] = std::move(eo);
-        }
         json om = json::object();
         auto ensure = [&](const std::string& fid) -> json& {
             if (!om.contains(fid))
@@ -7202,12 +7315,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         for (const aicm::AicmBody& b : bodies) {  // ordinal = b.body_id (AICM order)
             const std::string& sid = b.name;
             std::set<std::string> body_owners;
-            for (const auto& kv : face_owners[sid]) {
-                ensure(kv.second)["faces"].push_back({b.body_id, kv.first});
-                body_owners.insert(kv.second);
+            auto fo_it = face_owners.find(sid);
+            if (fo_it != face_owners.end()) {
+                for (const auto& kv : fo_it->second) {
+                    ensure(kv.second)["faces"].push_back({b.body_id, kv.first});
+                    body_owners.insert(kv.second);
+                }
             }
-            for (const auto& kv : edge_owners[sid])
-                ensure(kv.second)["edges"].push_back({b.body_id, kv.first});
+            auto eo_it = edge_owners.find(sid);
+            if (eo_it != edge_owners.end()) {
+                for (const auto& kv : eo_it->second)
+                    ensure(kv.second)["edges"].push_back({b.body_id, kv.first});
+            }
             for (const std::string& fid : body_owners)
                 ensure(fid)["bodies"].push_back(b.body_id);
         }
@@ -7227,27 +7346,27 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         auto rit = results.find(id);
         if (rit == results.end()) continue;
         json d;
-        if (std::holds_alternative<AxisResult>(rit->second)) {
-            const AxisResult& a = std::get<AxisResult>(rit->second);
+        if (std::holds_alternative<AxisResult>(*rit->second)) {
+            const AxisResult& a = std::get<AxisResult>(*rit->second);
             d = {{"kind", "axis"},
                  {"point", {a.point.x(), a.point.y(), a.point.z()}},
                  {"dir",   {a.dir.x(),   a.dir.y(),   a.dir.z()}}};
-        } else if (std::holds_alternative<PlaneResult>(rit->second)) {
-            const PlaneResult& p = std::get<PlaneResult>(rit->second);
+        } else if (std::holds_alternative<PlaneResult>(*rit->second)) {
+            const PlaneResult& p = std::get<PlaneResult>(*rit->second);
             const aicad::geom::SketchPlane& pl = p.plane;
             d = {{"kind", p.is_csys ? "csys" : "plane"},
                  {"origin", {pl.origin.x(), pl.origin.y(), pl.origin.z()}},
                  {"x_dir",  {pl.uAxis.x(),  pl.uAxis.y(),  pl.uAxis.z()}},
                  {"y_dir",  {pl.vAxis.x(),  pl.vAxis.y(),  pl.vAxis.z()}},
                  {"normal", {pl.normal.x(), pl.normal.y(), pl.normal.z()}}};
-        } else if (std::holds_alternative<PointResult>(rit->second)) {
-            const PointResult& pt = std::get<PointResult>(rit->second);
+        } else if (std::holds_alternative<PointResult>(*rit->second)) {
+            const PointResult& pt = std::get<PointResult>(*rit->second);
             d = {{"kind", "point"}, {"point", {pt.pt.x(), pt.pt.y(), pt.pt.z()}}};
-        } else if (std::holds_alternative<CurveResult>(rit->second)) {
+        } else if (std::holds_alternative<CurveResult>(*rit->second)) {
             // A curve feature (helix / spiral / spline) builds no body, so ship it
             // out-of-band like a datum: lift its local wire into world space and
             // sample it into a polyline the host can draw AND pick as a sweep path.
-            const CurveResult& cr = std::get<CurveResult>(rit->second);
+            const CurveResult& cr = std::get<CurveResult>(*rit->second);
             if (cr.wire.IsNull()) continue;
             const aicad::geom::SketchPlane& b = cr.base;
             gp_Trsf lift;

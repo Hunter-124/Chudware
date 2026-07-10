@@ -19,3 +19,11 @@ docs/PERF_AUDIT_2026-07-10.md §4 P1/P2. (a) capture_ckpt (document.cpp:1635-165
 - [ ] edit-last on 50-feature import-heavy doc: no MB-scale copies (profiled)
 - [ ] full rebuild of deep tree ≥5x faster on checkpoint capture
 - [ ] parity corpus green (bit-identical restore invariant kept)
+
+## Progress (2026-07-10)
+
+Landed in tree (status left todo for parent board):
+- (a) `FeatureResultMap` shared_ptr slots + shared status_ptrs in CompileCkpt; import_cache
+  keyed by FNV-1a(blob) not the blob string. Capture/restore share unchanged results.
+- (c) `aicm::CowVec` COW on AicmBody mesh buffers; body-cache hit is pointer-share + stamp.
+- (b) **deferred**: out-of-line content-addressed embedded_brep store (save/load/PLM schema).

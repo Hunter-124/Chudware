@@ -270,7 +270,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
             const uint8_t ct = curve_code(BRepAdaptor_Curve(edge).GetType());
             const uint32_t pt_count = static_cast<uint32_t>(pts.size() / 3);
             body.edges.push_back({static_cast<uint32_t>(ei), first_pt, pt_count, ct});
-            body.edge_pts.insert(body.edge_pts.end(), pts.begin(), pts.end());
+            body.edge_pts.insert_end(pts.begin(), pts.end());
         } else {
             body.edges.push_back({static_cast<uint32_t>(ei), first_pt, 0, 4});
         }

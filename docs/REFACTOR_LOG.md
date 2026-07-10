@@ -982,3 +982,37 @@ significant joint moments are recorded in the envelope + warned, not loaded; dyn
 uses the FIRST resolved ref of each mate for anchor/axis; pattern instances (`#`) are
 excluded from dynamics. Deferred: point-moment loads in static FEA; friction beyond
 viscous damping; live (non-dry-run) handoff FEA run needs a Netgen-enabled engine.
+
+## 2026-07-10 — T-PERF6/7/8: kernel copy amplification, owner-map ckpt, interactive solver
+
+Kernel-only perf pass (no host/, no commits).
+
+**T-PERF6** (`core/doc/document.cpp`, `core/geom/aicm.h`, `core/geom/tessellate.cpp`):
+(a) CompileCkpt `results` is now a `FeatureResultMap` of `shared_ptr<FeatureResult>` —
+assignment always allocates a fresh shared_ptr so checkpoints share unchanged feature
+results (no O(N²) deep copies of SketchResult json / shape vectors). Statuses stored as
+`vector<shared_ptr<const FeatureStatus>>` for the same reason. `import_cache` keyed by
+FNV-1a of the embedded_brep blob (not the multi-MB string). (b) full out-of-line
+content-addressed embedded_brep store **deferred** (schema/save/load/PLM touch).
+(c) `aicm::CowVec` COW buffers on `AicmBody` mesh arrays — body-cache hit re-stamps
+`body_id`/`name` without deep-copying pos/nrm/idx/edge_pts.
+
+**T-PERF7** (`core/doc/document.cpp`):
+(a) `face_owners`/`edge_owners` folded into CompileCkpt; `update_owners_for(sid)` runs only
+for solids produced by executed features; post-loop phase only inverts into the host
+owner_map (owner_ms ~0 on pure prefix reuse). (b) tess linear deflection is now
+bbox-diagonal-relative: `lin = clamp(diag * 1e-3, 0.05 mm, 2.0 mm)` — floor preserves
+tiny-part quality; large parts facet coarser. Formula documented at the tess callsite.
+
+**T-PERF8** (`core/solver/nsolve.{h,cpp}`, `core/sketch/sketch.{h,cpp}`,
+`core/doc/session.cpp`): interactive flag on `System` / `solve_sketch(..., interactive)`.
+Default false = exact oracle path. Drag + budgeted auto-coincident set interactive=true.
+(a) LDLT-first + rcond, SVD fallback; (b) deadline checked inside LM damping trial loop;
+(c) analyze redundant-row attribution via single ColPivQR; (d) curve-curve tangency
+warm-starts mutual_closest (p,q) within a solve.
+
+**T-PERF9** not started (depends on PERF8 solid + larger change).
+
+Files: `core/doc/document.cpp`, `core/geom/aicm.h`, `core/geom/tessellate.cpp`,
+`core/solver/nsolve.{h,cpp}`, `core/sketch/sketch.{h,cpp}`, `core/doc/session.cpp`,
+`docs/REFACTOR_LOG.md`, `work/backlog/T-PERF{6,7,8}.md`.

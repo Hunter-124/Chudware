@@ -11,16 +11,13 @@ Design contract
   process is long-lived (started once per app session); jobs survive normal RPC
   calls but are lost if the server restarts.  A persistent on-disk queue is a
   phase-2 concern (T-X4 scope).
-- **One worker thread, serialised per site** — browser sessions are single-
-  threaded within a site (Playwright launches one persistent context at a time).
-  The worker drains the FIFO and calls adapters sequentially; this is safe
-  because ``browser_login`` / ``browser_download`` are themselves synchronous
-  (no asyncio, no thread-safety assumptions in Playwright's sync API).
-- **Honest placeholder on permanent concurrency**: if `parts_tools.py`'s MCP
-  server is ever invoked from multiple simultaneous callers the worker thread
-  may block on a long login.  That is acceptable for the headless/desktop
-  single-user use-case this ships for; a multi-user/multi-worker upgrade is
-  explicitly out of scope (see advisory in ``contracts/license_debt.md``).
+- **Worker pool (T-PERF10), serialised per site** — a small pool of daemon
+  threads drains the FIFO. Browser sessions stay single-threaded *within* a
+  site (per-site lock + at most one RUNNING job per site). Independent sites
+  run in parallel so a slow McMaster scrape cannot stall Digi-Key.
+- **Honest placeholder on permanent concurrency**: Playwright contexts are still
+  process-global per site; multi-user MCP is out of scope (see
+  ``contracts/license_debt.md``).
 
 Public API (called by ``parts_tools.py`` register functions)
 ------------------------------------------------------------
@@ -75,6 +72,20 @@ _lock   = threading.Lock()
 _jobs: list[ScrapeJob] = []
 _cond   = threading.Condition(_lock)
 _worker_started = False
+# T-PERF10: small worker pool (not a single thread). Per-site locks keep Playwright
+# sessions single-threaded within a site while independent sites run in parallel.
+_POOL_SIZE = 4
+_site_locks: dict[str, threading.Lock] = {}
+_site_locks_guard = threading.Lock()
+
+
+def _site_lock(site: str) -> threading.Lock:
+    with _site_locks_guard:
+        lk = _site_locks.get(site)
+        if lk is None:
+            lk = threading.Lock()
+            _site_locks[site] = lk
+        return lk
 
 
 def enqueue(site: str, query: str, preset: Optional[dict] = None) -> dict:
@@ -216,26 +227,45 @@ def _run_job(job: ScrapeJob) -> None:
     # job.error already set from last attempt
 
 
-def _worker_loop() -> None:
+def _claim_next_job() -> Optional[ScrapeJob]:
+    """Oldest pending job whose site is not already being worked by another pool thread.
+
+    Sites with an in-flight RUNNING job are skipped so two workers never share one
+    Playwright context. Other sites remain eligible in parallel (T-PERF10 pool).
+    """
+    with _lock:
+        running_sites = {j.site for j in _jobs if j.status == JobStatus.RUNNING}
+        pending = [j for j in _jobs if j.status == JobStatus.PENDING]
+        for job in pending:
+            if job.site in running_sites:
+                continue
+            job.status = JobStatus.RUNNING
+            job.started_ts = time.time()
+            return job
+    return None
+
+
+def _worker_loop(worker_id: int) -> None:
     """Long-lived daemon thread: drain the job queue until process exit."""
     while True:
         with _cond:
             while True:
+                # Wake when any PENDING exists; claim may still return None if all
+                # pending sites are already RUNNING on sibling workers.
                 pending = [j for j in _jobs if j.status == JobStatus.PENDING]
                 if pending:
                     break
                 _cond.wait(timeout=5.0)
-        # Pick the oldest pending job.
-        with _lock:
-            pending = [j for j in _jobs if j.status == JobStatus.PENDING]
-            if not pending:
-                continue
-            job = pending[0]
-            job.status     = JobStatus.RUNNING
-            job.started_ts = time.time()
+
+        job = _claim_next_job()
+        if job is None:
+            # All pending jobs are blocked behind same-site RUNNING work — brief yield.
+            time.sleep(0.05)
+            continue
 
         try:
-            _run_job(job)
+            with _site_lock(job.site):
+                _run_job(job)
         except Exception as exc:  # noqa: BLE001
             job.status = JobStatus.ERROR
             job.error  = f"worker exception: {exc}"
@@ -245,13 +275,18 @@ def _worker_loop() -> None:
                     job.status = JobStatus.ERROR
                     job.error  = "job left in running state (unexpected)"
                 job.finished_ts = time.time()
+            with _cond:
+                _cond.notify_all()  # wake siblings waiting on same-site backlog
 
 
 def ensure_worker_started() -> None:
-    """Start the background worker thread exactly once (idempotent)."""
+    """Start the background worker pool exactly once (idempotent)."""
     global _worker_started
     if _worker_started:
         return
-    t = threading.Thread(target=_worker_loop, name="scrape-worker", daemon=True)
-    t.start()
+    for i in range(_POOL_SIZE):
+        t = threading.Thread(
+            target=_worker_loop, args=(i,), name=f"scrape-worker-{i}", daemon=True
+        )
+        t.start()
     _worker_started = True

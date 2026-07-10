@@ -13,7 +13,10 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aicm {
@@ -40,22 +43,84 @@ struct VertRec {
     float xyz[3] = {0, 0, 0};
 };
 
+// Copy-on-write vector: AicmBody assignment / cache-hit reuse is O(1) pointer
+// traffic until a mutator (push_back/resize/…) detaches. T-PERF6(c).
+template <typename T>
+class CowVec {
+public:
+    CowVec() : p_(std::make_shared<std::vector<T>>()) {}
+    CowVec(std::initializer_list<T> il)
+        : p_(std::make_shared<std::vector<T>>(il)) {}
+    CowVec(const CowVec&) = default;
+    CowVec& operator=(const CowVec&) = default;
+    CowVec(CowVec&&) noexcept = default;
+    CowVec& operator=(CowVec&&) noexcept = default;
+    CowVec& operator=(std::initializer_list<T> il) {
+        p_ = std::make_shared<std::vector<T>>(il);
+        return *this;
+    }
+
+    size_t size() const { return p_->size(); }
+    bool empty() const { return p_->empty(); }
+    void reserve(size_t n) { detach(); p_->reserve(n); }
+    void resize(size_t n) { detach(); p_->resize(n); }
+    void resize(size_t n, const T& v) { detach(); p_->resize(n, v); }
+    void clear() { detach(); p_->clear(); }
+    void assign(size_t n, const T& v) { detach(); p_->assign(n, v); }
+    void push_back(const T& v) { detach(); p_->push_back(v); }
+    void push_back(T&& v) { detach(); p_->push_back(std::move(v)); }
+    template <typename... Args>
+    void emplace_back(Args&&... args) {
+        detach();
+        p_->emplace_back(std::forward<Args>(args)...);
+    }
+    // Append range (tessellate: was insert(end(), first, last) on std::vector).
+    template <typename InputIt>
+    void insert_end(InputIt first, InputIt last) {
+        detach();
+        p_->insert(p_->end(), first, last);
+    }
+
+    T& operator[](size_t i) { detach(); return (*p_)[i]; }
+    const T& operator[](size_t i) const { return (*p_)[i]; }
+    T& back() { detach(); return p_->back(); }
+    const T& back() const { return p_->back(); }
+
+    typename std::vector<T>::iterator begin() { detach(); return p_->begin(); }
+    typename std::vector<T>::iterator end() { detach(); return p_->end(); }
+    typename std::vector<T>::const_iterator begin() const { return p_->begin(); }
+    typename std::vector<T>::const_iterator end() const { return p_->end(); }
+    typename std::vector<T>::const_iterator cbegin() const { return p_->cbegin(); }
+    typename std::vector<T>::const_iterator cend() const { return p_->cend(); }
+
+    // Const view — never detaches (encode/serialize path).
+    const std::vector<T>& vec() const { return *p_; }
+    operator const std::vector<T>&() const { return *p_; }
+
+private:
+    void detach() {
+        if (p_.use_count() != 1) p_ = std::make_shared<std::vector<T>>(*p_);
+    }
+    std::shared_ptr<std::vector<T>> p_;
+};
+
 // A fully tessellated body ready to serialize. Geometry is stored flat
 // (3*n_verts for pos/nrm, 3*n_tris for idx, 3*total_pts for edge_pts) — mirrors
-// the BODY/FACE/EDGE/VERT chunk payloads exactly.
+// the BODY/FACE/EDGE/VERT chunk payloads exactly. Heavy buffers are COW so a
+// body-cache hit re-stamps body_id/name without deep-copying mesh arrays.
 struct AicmBody {
     uint32_t body_id = 0;
     std::string name;
     float color[3] = {0.71f, 0.76f, 0.82f};
 
-    std::vector<float> pos;     // 3 * n_verts
-    std::vector<float> nrm;     // 3 * n_verts
-    std::vector<uint32_t> idx;  // 3 * n_tris
+    CowVec<float> pos;     // 3 * n_verts
+    CowVec<float> nrm;     // 3 * n_verts
+    CowVec<uint32_t> idx;  // 3 * n_tris
 
-    std::vector<FaceRec> faces;
-    std::vector<EdgeRec> edges;
-    std::vector<float> edge_pts;  // 3 * total_pts (polyline vertices)
-    std::vector<VertRec> verts;
+    CowVec<FaceRec> faces;
+    CowVec<EdgeRec> edges;
+    CowVec<float> edge_pts;  // 3 * total_pts (polyline vertices)
+    CowVec<VertRec> verts;
 
     // C32-A RealView material trailer (dielectric default == pre-C32 look).
     float metallic = 0.0f;

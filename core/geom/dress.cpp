@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -139,17 +140,45 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
         }
     } catch (const Standard_Failure&) { /* fall through to incremental */ }
 
-    std::vector<TopoDS_Edge> accepted;
-    accepted.reserve(good.size());
-    for (const TopoDS_Edge& e : good) {
+    // T-PERF10: bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
+    // Try the whole span first (common case: all edges succeed — one build). On failure, recurse
+    // into halves, then greedily merge right into left (same semantics as the old linear scan,
+    // but only on residual failing edges). Typical partial-fail is log-depth rather than E full
+    // rebuilds.
+    auto try_build = [&](const std::vector<TopoDS_Edge>& edges) -> bool {
+        if (edges.empty()) return true;
         try {
             Builder mk(shape);
-            for (const TopoDS_Edge& a : accepted) add(mk, a);
-            add(mk, e);
+            for (const TopoDS_Edge& e : edges) add(mk, e);
             mk.Build();
-            if (mk.IsDone() && blend_is_watertight(mk.Shape())) accepted.push_back(e);
-        } catch (const Standard_Failure&) { /* skip this edge */ }
-    }
+            return mk.IsDone() && blend_is_watertight(mk.Shape());
+        } catch (const Standard_Failure&) {
+            return false;
+        }
+    };
+    std::function<std::vector<TopoDS_Edge>(const std::vector<TopoDS_Edge>&)> select;
+    select = [&](const std::vector<TopoDS_Edge>& span) -> std::vector<TopoDS_Edge> {
+        if (span.empty()) return {};
+        if (try_build(span)) return span;
+        if (span.size() == 1) return {};  // single edge fails — drop it
+        const size_t mid = span.size() / 2;
+        std::vector<TopoDS_Edge> left(span.begin(), span.begin() + (std::ptrdiff_t)mid);
+        std::vector<TopoDS_Edge> right(span.begin() + (std::ptrdiff_t)mid, span.end());
+        auto L = select(left);
+        auto R = select(right);
+        std::vector<TopoDS_Edge> merged = L;
+        merged.insert(merged.end(), R.begin(), R.end());
+        if (try_build(merged)) return merged;
+        // Halves don't compose — greedily fold R into L (old linear semantics, small residual).
+        merged = L;
+        for (const TopoDS_Edge& e : R) {
+            std::vector<TopoDS_Edge> trial = merged;
+            trial.push_back(e);
+            if (try_build(trial)) merged.push_back(e);
+        }
+        return merged;
+    };
+    std::vector<TopoDS_Edge> accepted = select(good);
     if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
     if (accepted.empty()) return TopoDS_Shape();
     try {

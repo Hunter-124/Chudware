@@ -1932,7 +1932,21 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     };
 
     while (!glfwWindowShouldClose(win)) {
-        glfwPollEvents();
+        // T-PERF10: idle render throttle. When nothing needs continuous redraw (no animation,
+        // no async RPCs, no camera tween, no headless shot), wait up to 50ms for an event
+        // instead of spinning at full vsync and burning a core. Input still wakes immediately.
+        // CEF's pump_if_due below still runs every frame after wait; when browsers are live the
+        // 20 Hz floor is enough for its deadline path, and note_browser_* still forces work.
+        {
+            const bool busy =
+                st.animActive || st.rebuildsInFlight > 0 || st.rpc.busy() ||
+                (st.simClient && st.simClient->busy());
+            if (busy || shot) {
+                glfwPollEvents();
+            } else {
+                glfwWaitEventsTimeout(0.05);  // 20 Hz idle floor
+            }
+        }
 #ifdef AI_CAD_ENABLE_CEF
         ui::cef::pump_if_due();   // drive CEF's message loop when its deadline is due
         {

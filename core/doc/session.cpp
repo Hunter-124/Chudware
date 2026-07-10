@@ -9727,8 +9727,12 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
         json sk;
         sk["entities"] = trial["entities"];
         sk["constraints"] = trial["constraints"];
+        // Interactive when a wall-clock budget is set (apply_ops auto-coincident);
+        // the explicit auto-constrain RPC leaves budget unset so the exact path is used.
+        const bool interactive = solve_budget_ms.has_value();
         aicad::sketch::SketchSolution sol =
-            aicad::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms);
+            aicad::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms,
+                                        interactive);
         bool conflicts = false;
         for (const std::string& t : sol.conflicting)
             if (t == cid) conflicts = true;
@@ -9771,7 +9775,8 @@ void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_
                 sk["constraints"] = params.value("constraints", json::array());
                 aicad::sketch::SketchSolution sol =
                     aicad::sketch::solve_sketch(sk, env, std::nullopt,
-                                                kInteractiveSolveBudgetMs);
+                                                kInteractiveSolveBudgetMs,
+                                                /*interactive=*/true);
                 if (!sol.converged) break;  // don't auto-touch a broken sketch
                 json proposals = coincident_proposals(sol.entities, sk["constraints"], tol_mm);
                 if (proposals.empty()) break;

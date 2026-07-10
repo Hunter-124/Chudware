@@ -65,6 +65,22 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes);
 //   {ok, temperature[n], n_nodes, n_dof, n_elems, mesh_type_used,
 //    summary:{max_temp_c, min_temp_c}, flux_summary:[...per convection/flux face...],
 //    solver_notes}.
+//
+// TRANSIENT (T-FIN18): when the study carries a "transient" object the run integrates
+// C dT/dt + K T = f(t) (backward Euler; see fea_thermal.h) instead of the steady solve:
+//   material: adds cp_j_kgk (specific heat, J/(kg·K)) + density_g_cm3 | rho_kg_m3
+//   transient: {t_end_s, dt_s, t_init_c (default 20), frame_times_s:[...],
+//               capacitance:"lumped"|"consistent" (default lumped)}
+//   loads: each "flux" load may add a time schedule (dimensionless multiplier on q):
+//       schedule: {duty:<0..1>, period_s:<s>}                    duty-cycle shorthand
+//       schedule: {points:[[t_s,scale],...], period_s:<s,opt>}   piecewise sample-and-hold
+//     This is the consumption shape for aicad.powerprofile/1 per-rail duty profiles
+//     (T-FIN7): rail duty d over period p -> {duty:d, period_s:p}; a residency timeline
+//     maps to points verbatim. Multiple flux loads keep INDEPENDENT schedules.
+// Returns {ok, transient:true, frames:[{t_s, temperature[n]}], envelope_max[n],
+//          n_steps, summary:{max_temp_c (peak over the run), max_temp_time_s,
+//          min_temp_c, final_max_temp_c}, flux_summary, solver_notes}. The steady path
+// (no "transient" key) is unchanged bit-for-bit.
 // Never throws: a bad mesh / singular model returns {ok:false, error}.
 nlohmann::json fea_run_thermal(const nlohmann::json& study);
 

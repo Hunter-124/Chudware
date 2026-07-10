@@ -263,3 +263,120 @@ def test_fw_sim_run_simresult_shape(tmp_path):
 
     for field in ("passed", "uart_log", "gpio_states", "assertion_results", "ms"):
         assert field in res, f"SimResult dict missing contract field '{field}'"
+
+
+# --------------------------------------------------------------------------- fw_status (T-FIN4)
+
+
+class TestFwStatus:
+    """Shape tests for the provisioning doctor — must pass with ANY tool availability,
+    so every probe path is mocked (shutil.which / subprocess.run in provision's namespace)."""
+
+    @staticmethod
+    def _status(which_map=None, version_text="ver 1.2.3"):
+        from unittest.mock import patch, MagicMock
+        from engine.firmware import provision
+
+        which_map = which_map or {}
+
+        def fake_which(alias):
+            return which_map.get(alias)
+
+        proc = MagicMock(stdout=version_text, stderr="")
+        with patch.object(provision.shutil, "which", side_effect=fake_which), \
+             patch.object(provision.subprocess, "run", return_value=proc):
+            return provision.fw_status()
+
+    def test_shape_all_missing(self):
+        res = self._status({})
+        assert res["ok"] is True                       # never fails
+        for key in ("tools", "families", "banners", "missing"):
+            assert key in res
+        for name in ("cmake", "ninja", "arm-none-eabi-gcc", "renode",
+                     "qemu-system-arm", "probe-rs", "esptool"):
+            t = res["tools"][name]
+            assert t["found"] is False
+            assert t["path"] is None and t["version"] is None
+            assert t["install_hint"]                    # actionable hint always present
+            assert isinstance(t["unlocks"], list)
+            assert name in res["missing"]
+        for family in ("cortex-m", "esp32", "avr"):
+            fam = res["families"][family]
+            for cap in ("can_build", "can_emulate", "can_flash"):
+                assert fam[cap] is False
+            assert isinstance(fam["missing"], list)
+        assert res["banners"]                           # fix-it guidance emitted
+
+    def test_cortex_m_fully_provisioned(self):
+        res = self._status({
+            "cmake": "/usr/bin/cmake",
+            "arm-none-eabi-gcc": "/usr/bin/arm-none-eabi-gcc",
+            "renode": "/usr/bin/renode",
+            "probe-rs": "/usr/bin/probe-rs",
+        })
+        fam = res["families"]["cortex-m"]
+        assert fam == {"can_build": True, "can_emulate": True,
+                       "can_flash": True, "missing": []}
+        assert res["tools"]["cmake"]["version"] == "1.2.3"
+        assert res["tools"]["cmake"]["path"] == "/usr/bin/cmake"
+        # esp32 remains honestly unprovisioned
+        assert res["families"]["esp32"]["can_build"] is False
+
+    def test_qemu_fallback_unlocks_emulation(self):
+        res = self._status({"qemu-system-arm": "/usr/bin/qemu-system-arm"})
+        assert res["families"]["cortex-m"]["can_emulate"] is True
+        assert res["families"]["cortex-m"]["can_build"] is False
+
+    def test_esptool_alias_resolution(self):
+        # esptool.py alias (pip install) must satisfy the "esptool" descriptor
+        res = self._status({"esptool.py": "/usr/local/bin/esptool.py"})
+        t = res["tools"]["esptool"]
+        assert t["found"] is True and t["path"].endswith("esptool.py")
+        assert res["families"]["esp32"]["can_flash"] is True
+        assert "esptool" not in res["missing"]
+
+    def test_version_probe_failure_degrades_not_raises(self):
+        from unittest.mock import patch
+        from engine.firmware import provision
+
+        with patch.object(provision.shutil, "which", return_value="/usr/bin/cmake"), \
+             patch.object(provision.subprocess, "run",
+                          side_effect=OSError("boom")):
+            res = provision.fw_status()
+        assert res["ok"] is True
+        assert res["tools"]["cmake"]["found"] is True
+        assert res["tools"]["cmake"]["version"] is None
+
+    def test_mcp_wrapper_returns_json_shape(self):
+        """The services/mcp fw_status tool returns the same shape as JSON."""
+        import json as _json
+        import sys
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "services" / "mcp"))
+        try:
+            import firmware_tools
+        finally:
+            sys.path.pop(0)
+
+        captured = {}
+
+        class StubMCP:
+            def tool(self):
+                def deco(fn):
+                    captured[fn.__name__] = fn
+                    return fn
+                return deco
+
+        firmware_tools.register_firmware_tools(StubMCP())
+        assert "fw_status" in captured
+
+        from engine.firmware import provision
+        proc = MagicMock(stdout="v9.9", stderr="")
+        with patch.object(provision.shutil, "which", return_value=None), \
+             patch.object(provision.subprocess, "run", return_value=proc):
+            payload = _json.loads(captured["fw_status"]())
+        assert payload["ok"] is True
+        assert "families" in payload and "tools" in payload

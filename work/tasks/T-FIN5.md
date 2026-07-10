@@ -2,8 +2,8 @@
 id: T-FIN5
 title: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN5-fw-gui-workspace
 depends_on: [T-FIN1, T-FIN4]
 lane: app-gui

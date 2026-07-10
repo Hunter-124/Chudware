@@ -2,8 +2,8 @@
 id: T-FIN1
 title: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN1-fw-gpio-extraction
 depends_on: []
 lane: ecad-firmware

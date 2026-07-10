@@ -92,7 +92,7 @@ graph TD
     T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::done
   end
   subgraph WS_FIN["workstream FIN"]
-    T_FIN1["T-FIN1: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU"]:::doing
+    T_FIN1["T-FIN1: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU"]:::done
     T_FIN10["T-FIN10: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout"]:::todo
     T_FIN11["T-FIN11: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)"]:::todo
     T_FIN12["T-FIN12: Stackup advisor - impedance-target-driven layer stackup solve"]:::doing
@@ -103,7 +103,7 @@ graph TD
     T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::todo
     T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::doing
     T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::todo
-    T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::todo
+    T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::doing
     T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::todo
     T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::todo
     T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::todo
@@ -113,7 +113,7 @@ graph TD
     T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
     T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::todo
     T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::done
-    T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::todo
+    T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::doing
     T_FIN6["T-FIN6: Firmware<->board co-verification - pinmap round-trip and emulated pin activity vs netlist"]:::todo
     T_FIN7["T-FIN7: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run"]:::todo
     T_FIN8["T-FIN8: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map"]:::doing

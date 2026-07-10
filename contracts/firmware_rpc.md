@@ -270,3 +270,72 @@ hint: `{rule, severity: "error"|"warning", net: str|null, pins: [str], xy: null,
 
 `summary` = `{n, errors, warnings, rules}`; `fw_pins` = the per-token scan
 `{reads, writes, refs, files}`; `dynamic` = `{ran, source: "trace"|"emulation"|null, reason?}`.
+
+## 11. Power/duty-cycle profile — `aicad.powerprofile/1` (T-FIN7, appended)
+
+A duty-cycle-weighted per-rail current profile derived from a §7 emulation trace plus
+the T-FIN8 per-component rail metadata (`contracts/ecad/boardphys.md` `eng.supply.rails`).
+**Bookkeeping, not SPICE** — datasheet envelope currents scaled by observed/derived
+activity; the artifact's `model` field states this. Producer:
+`engine/firmware/powerprofile.py` (`build_power_profile`). Consumers: system power
+budget (T-FIN23); each rail's `schedule` is exactly the `{duty, period_s}` /
+`{points:[[t_s,scale]], period_s}` heat-load schedule shape the transient-thermal path
+accepts (T-FIN18) — no re-parsing of raw traces downstream.
+
+Honesty rules (inherited from boardphys, binding): unknown currents stay `null`, never
+an invented 0 (gaps listed in `coverage.unknown_active_current`); every duty/residency
+figure names its source heuristic; unknowable activity is *assumed always active*
+(conservative) and labelled as such.
+
+| field | type | notes |
+|---|---|---|
+| `schema` | str | `"aicad.powerprofile/1"` |
+| `model` | str | fixed honesty label: duty-cycle bookkeeping, not SPICE |
+| `generated_at` | float | epoch seconds |
+| `trace_ref` | str \| null | path of the §7 trace artifact this was derived from |
+| `window_ms` | float \| null | run window (max stamped `t_ms`, or caller-supplied); null = no time axis |
+| `cpu` | residency | CPU run/sleep residency (below) |
+| `pins` | {pin: duty-record} | per-pin GPIO/PWM duty (below) |
+| `rails` | [rail] | per-rail current profile (below); `[]` when no board/metadata |
+| `coverage` | obj | `{components_total, components_with_rails, unknown_active_current:[ref:rail], notes:[str]}` |
+
+`cpu` residency — `{active_frac, sleep_frac, active_s|null, sleep_s|null, source, note}`.
+`source`: `"cpu_markers"` (optional firmware-side `AICAD_CPU_TRACE(state, t_ms)` macro in
+`aicad_trace.h` prints `AICAD_CPU_EVT <run|sleep> t=<n>ms`; integrated piecewise, state
+before the first marker assumed `run`) or `"assumed_active"` (no markers → 100 % active,
+never guessed from UART silence).
+
+`pins[pin]` duty-record — `{duty: float|null, period_s: float|null, toggles: int, source,
+note?}`. `source`: `"stamped_events"` (high-time integrated over the window; level before
+the first stamped event assumed 0 — ports reset low), `"unstamped_events"` (Renode hook
+prints carry no `t`; duty null, toggle count reported), `"final_state_only"` (duty = the
+end-of-run snapshot level), `"no_data"`. `period_s` = mean interval of ≥2 stamped rising
+edges, else null.
+
+`rails[*]`:
+
+| field | type | notes |
+|---|---|---|
+| `name` | str | rail/net name (ground rails excluded) |
+| `voltage_v_nom` | float \| null | first known nominal voltage among contributors |
+| `i_avg_a` | float \| null | Σ per-component `duty·i_active + (1−duty)·i_sleep`; a null `i_sleep` omits the sleep term (avg is then a floor, noted in provenance); null when no contributor has a known active current |
+| `i_peak_a` | float \| null | Σ known active currents (all contributors simultaneously active) |
+| `residency` | obj | `{active_frac, sleep_frac, active_s, sleep_s}` (nulls when unknowable) — rail-level mean of contributor duties |
+| `schedule` | obj \| null | `{duty, period_s}` — the T-FIN18 transient-thermal heat-load schedule shape (`{points, period_s}` reserved for future piecewise producers); `period_s` = dominant measured pin period, else 1.0 s (noted) |
+| `provenance` | [str] | per-component lines: duty + its source heuristic + the currents used |
+
+Component→activity mapping: MCU footprints (`mcu_pinouts.component_family`) follow the
+CPU residency; a component whose pads sit on a net mapped to an observed trace pin
+(net name == pin name, or decoded pin-id equality via `pinmap.pin_model` — the T-FIN6
+rules) follows that pin's duty; everything else is assumed always active.
+
+Surfaces:
+- `fw_sim_run` — when the project is linked to a board (`board_doc_ref`) and a §7 trace
+  was written, it best-effort emits the profile next to the ELF as `<elf>.power.json`
+  and adds `power_profile_path: str|null` to its result (append-only extension of §4/§7.1;
+  never fails the sim).
+- `fw_power_profile` (MCP tool + engine handler `engine.firmware.mcp_tools.
+  fw_power_profile`) — `{trace_path, project_id?, board_doc_ref?, mcu_family?,
+  window_ms?}` → the profile dict (or the §1 error envelope for a missing/unreadable
+  trace or unknown project). Explicit `board_doc_ref` beats the project link; with no
+  board the activity half still returns (`rails: []`, coverage note).

@@ -100,8 +100,23 @@ public:
         // triggers EstablishGpuChannel. Force the software (SwiftShader) GL
         // backend up front so CreateGLContext never probes the real NVIDIA
         // driver at all.
-        cmd->AppendSwitchWithValue("use-gl", "angle");
-        cmd->AppendSwitchWithValue("use-angle", "swiftshader");
+        //
+        // BUT SwiftShader is the #1 residual bot-scan tell: a reCAPTCHA-grade scorer
+        // fingerprints the canvas/WebGL *pixels*, and a software-GL signature reads as
+        // a datacenter/headless browser — so invisible-reCAPTCHA login pages can reject
+        // the submission even though the widget renders. The crash that forces
+        // SwiftShader is specific to NVIDIA+Wayland EGL; an Intel/Mesa (or other
+        // non-crashing) box can drive its REAL GL context for canvas/WebGL and present
+        // an honest, consistent GPU fingerprint. Opt in with AI_CAD_CEF_GPU=1 to use the
+        // real GL backend (disable-gpu-compositing above keeps OSR presentation software,
+        // so paint is unaffected). Default stays SwiftShader — safe on the NVIDIA box this
+        // workaround targets. Validate in the HEADED GUI (a display-less daemon has no EGL
+        // surface and hangs at CefInitialize under real GL).
+        const char* real_gpu = std::getenv("AI_CAD_CEF_GPU");
+        if (!(real_gpu && real_gpu[0] && real_gpu[0] != '0')) {
+            cmd->AppendSwitchWithValue("use-gl", "angle");
+            cmd->AppendSwitchWithValue("use-angle", "swiftshader");
+        }
         // Linux: the zygote's fd-passing breaks ICU/resource loading for the
         // separate-helper layout ("Invalid file descriptor to ICU data
         // received"). Disable it so each subprocess loads resources from disk.
@@ -127,11 +142,16 @@ public:
         //   no-first-run / no-default-browser-check / disable-infobars → no
         //     "Chrome is being controlled by automated software" banner or
         //     first-run state that fingerprinters key on.
-        // The document-start JS patches (window.chrome, plugins, languages) are
-        // injected per-browser via CDP in cef_web_view.cpp. NOTE: the software
-        // (SwiftShader) WebGL vendor is a residual tell we cannot remove without
-        // reintroducing the NVIDIA GPU-thread crash (see use-angle above); strict
-        // walls may still trip on it.
+        // The document-start JS patches (window.chrome, plugins, languages,
+        // webdriver, deviceMemory, WebGL spoof) are injected in the RENDER process at
+        // OnContextCreated (this file, below) from the ONE source of truth
+        // stealth_init_script()/kInitScript (cef_stealth.cpp) — it fires for every
+        // frame incl. cross-origin reCAPTCHA iframes, which a browser-process CDP
+        // addScript cannot reach. Do NOT re-add a per-browser CDP inject in
+        // cef_web_view.cpp; only the Sec-CH-UA override there genuinely needs CDP.
+        // NOTE: the software (SwiftShader) WebGL vendor is a residual tell removable
+        // only via AI_CAD_CEF_GPU=1 (see use-angle above) on non-NVIDIA boxes; strict
+        // walls may still trip on the software canvas pixels.
         // CLIPBOARD: DO NOT pin --ozone-platform=x11. It was tried as an OS
         // clipboard bridge (the default headless Ozone clipboard is an in-memory
         // stub) and CRASHED: pasting corrupted the heap ("malloc(): corrupted

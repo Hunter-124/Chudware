@@ -1,6 +1,10 @@
-// cef/cef_stealth.h — one place that applies our fingerprint hardening to a CEF
-// browser, so the headless fetch path, the --cef-shot self-test, and (eventually)
-// the interactive panel all present ONE consistent wire fingerprint.
+// cef/cef_stealth.h — the ONE place that defines our fingerprint hardening, so the
+// headless fetch path, the --cef-shot self-test, AND the interactive login panel all
+// present ONE consistent wire fingerprint. stealth_init_script() is the single source
+// of truth for the document-start JS (cef_web_view.cpp no longer keeps its own copy);
+// it is injected in the render process at OnContextCreated (cef_app.cpp) for every
+// frame. Do not fork this into a per-view CDP inject — that only reaches the main
+// frame and drifts out of sync.
 //
 // Everything here uses CEF's IN-PROCESS DevTools invocation (ExecuteDevToolsMethod)
 // for Network.setUserAgentOverride + Page.addScriptToEvaluateOnNewDocument only.

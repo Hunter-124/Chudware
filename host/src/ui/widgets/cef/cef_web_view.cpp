@@ -81,6 +81,21 @@ bool cefTrace() {
         }                                                                \
     } while (0)
 
+// DIAGNOSTIC: capture the real reCAPTCHA / login network verdict. OFF by default
+// (opt-in AI_CAD_CEF_NETLOG=1) because it enables the CDP Network domain, which we
+// otherwise keep quiet — it never touches Runtime.enable, so it does not reintroduce
+// the automation tell, but it is strictly a debugging aid. When on, OnDevToolsEvent
+// logs Network.responseReceived for the reCAPTCHA token exchange and login POST so we
+// can see (server-side status/mime) whether a token was issued and scored-low vs.
+// blocked outright — instead of inferring the failure from an absent console error.
+bool cefNetLog() {
+    static const bool on = [] {
+        const char* v = std::getenv("AI_CAD_CEF_NETLOG");
+        return v && v[0] && v[0] != '0';   // default OFF; opt-in only
+    }();
+    return on;
+}
+
 // --- ImGui → CEF modifier / key mapping ---------------------------------------
 uint32_t cefModifiers() {
     const ImGuiIO& io = ImGui::GetIO();
@@ -362,13 +377,22 @@ public:
         browser_ = browser;
         cef::note_browser_opened();   // frame loop pumps every frame while alive
         CEF_TRACE("OnAfterCreated (browser id=%d)", browser ? browser->GetIdentifier() : -1);
-        // Copy-out: observe CDP replies so a Ctrl+C selection query can come back.
+        // Copy-out: observe CDP replies so a Ctrl+C selection query can come back;
+        // also carries the opt-in Network.responseReceived netlog (OnDevToolsEvent).
         if (browser) devtoolsReg_ = browser->GetHost()->AddDevToolsMessageObserver(this);
-        // Order matters: align UA client-hints and inject the fingerprint patches
-        // BEFORE draining pendingNav, or the first vendor page loads with the raw
-        // "Chromium"-only Sec-CH-UA (the obvious-CEF tell).
+        // Align UA client-hints BEFORE draining pendingNav, or the first vendor page
+        // loads with the raw "Chromium"-only Sec-CH-UA (the obvious-CEF tell). The
+        // document-start fingerprint patches (window.chrome/plugins/languages/
+        // webdriver/deviceMemory + WebGL spoof) are NOT injected here anymore: they
+        // live in the ONE source of truth kInitScript (cef_stealth.cpp), injected in
+        // the render process at OnContextCreated (cef_app.cpp) for EVERY frame — incl.
+        // cross-origin reCAPTCHA iframes — which a browser-process CDP addScript can't
+        // reach. The old per-view injectStealthScript() duplicated a SUBSET of that
+        // blob (no WebGL spoof) and only the main frame, so it was redundant + a
+        // divergence risk; removed. Sec-CH-UA still needs CDP, so applyUaClientHints stays.
         applyUaClientHints(browser);
-        injectStealthScript(browser);
+        if (cefNetLog() && browser)
+            browser->GetHost()->ExecuteDevToolsMethod(/*message_id=*/0, "Network.enable", nullptr);
         // Drain any navigation requested while the create was in flight.
         std::string pending;
         { std::lock_guard<std::mutex> lk(s_->mtx); pending.swap(s_->pendingNav); }
@@ -376,50 +400,6 @@ public:
             CEF_TRACE("OnAfterCreated: draining pendingNav → LoadURL %s", pending.c_str());
             browser->GetMainFrame()->LoadURL(pending);
         }
-    }
-
-    // ANTI-DETECTION: install the document-start fingerprint patches (mirrors
-    // services/browser/stealth.INIT_SCRIPT) via the SAME CDP mechanism the
-    // Playwright path uses — Page.addScriptToEvaluateOnNewDocument runs before any
-    // page script on EVERY navigation, so bot-walls see window.chrome, a plausible
-    // plugin list, a multi-entry navigator.languages, and webdriver=false. The
-    // --disable-blink-features=AutomationControlled flag already flips webdriver;
-    // this re-asserts it defensively and fills the tells a flag can't.
-    void injectStealthScript(CefRefPtr<CefBrowser> browser) {
-        if (!browser) return;
-        static const char* kStealth =
-            "(() => {"
-            "  const patch=(fn)=>{try{fn();}catch(e){}};"
-            "  patch(()=>{ if(!window.chrome) window.chrome={runtime:{}}; });"
-            "  patch(()=>{ Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']}); });"
-            "  patch(()=>{"
-            "    if(navigator.plugins&&navigator.plugins.length) return;"
-            "    const mk=(name)=>({name,description:'Portable Document Format',"
-            "                       filename:'internal-pdf-viewer',length:1});"
-            "    const plugins=[mk('PDF Viewer'),mk('Chrome PDF Viewer'),mk('Chromium PDF Viewer')];"
-            "    Object.defineProperty(navigator,'plugins',{get:()=>plugins});"
-            "    Object.defineProperty(navigator,'mimeTypes',"
-            "                          {get:()=>[{type:'application/pdf',suffixes:'pdf'}]});"
-            "  });"
-            "  patch(()=>{ if(navigator.webdriver)"
-            "    Object.defineProperty(navigator,'webdriver',{get:()=>false}); });"
-            // navigator.deviceMemory: real Chrome HARD-CAPS this at 8 (privacy);
-            // CEF leaks the host's true RAM (we saw 32), an impossible value that
-            // flags us as a non-standard build. Clamp to the max a real Chrome
-            // would ever report — consistency, not mimicry.
-            "  patch(()=>{ if(navigator.deviceMemory>8)"
-            "    Object.defineProperty(navigator,'deviceMemory',{get:()=>8}); });"
-            // NB: NO WebGL vendor/renderer spoof (mirror stealth.py). A
-            // getParameter override is itself a tell (toString ≠ "[native
-            // code]") and claiming an Intel GPU while the canvas rasterises via
-            // SwiftShader is a canvas-readback inconsistency — worse than the
-            // honest software string. Consistency over mimicry.
-            "})();";
-        CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
-        params->SetString("source", kStealth);
-        browser->GetHost()->ExecuteDevToolsMethod(
-            /*message_id=*/0, "Page.addScriptToEvaluateOnNewDocument", params);
-        CEF_TRACE("injectStealthScript: addScriptToEvaluateOnNewDocument sent");
     }
 
     // ANTI-DETECTION (Sec-CH-UA): CEF's native User-Agent header is a genuine
@@ -575,6 +555,40 @@ public:
         std::lock_guard<std::mutex> lk(s_->mtx);
         s_->copyMsgId = -1;
         if (!text.empty()) s_->pendingClipboardOut = text;
+    }
+
+    // DIAGNOSTIC (opt-in AI_CAD_CEF_NETLOG=1): surface the real bot-wall verdict.
+    // With the Network domain enabled in OnAfterCreated, this fires for every
+    // response; we log only the reCAPTCHA token exchange + the login endpoint so a
+    // failed sign-in shows whether a token was issued and scored-low (recaptcha
+    // /userverify + /reload return 200, then the vendor login POST comes back 200
+    // with an error page) vs. blocked outright (recaptcha or login returns 4xx/5xx).
+    // Metadata only (URL/status/mime) — no response bodies, no credentials.
+    void OnDevToolsEvent(CefRefPtr<CefBrowser>, const CefString& method,
+                         const void* params, size_t params_size) override {
+        if (!cefNetLog() || method != "Network.responseReceived" || !params || !params_size)
+            return;
+        std::string json(static_cast<const char*>(params), params_size);
+        CefRefPtr<CefValue> v = CefParseJSON(json, JSON_PARSER_RFC);
+        if (!v || v->GetType() != VTYPE_DICTIONARY) return;
+        CefRefPtr<CefDictionaryValue> d = v->GetDictionary();
+        if (!d || !d->HasKey("response")) return;
+        CefRefPtr<CefDictionaryValue> resp = d->GetDictionary("response");
+        if (!resp) return;
+        const std::string url = resp->GetString("url").ToString();
+        const int status = resp->HasKey("status") ? resp->GetInt("status") : 0;
+        const std::string mime = resp->GetString("mimeType").ToString();
+        auto has = [&](const char* s) { return url.find(s) != std::string::npos; };
+        const bool interesting = has("recaptcha") || has("/login") ||
+                                 has("customer/account") || has("/userverify") ||
+                                 has("gstatic.com/recaptcha") || status >= 400;
+        if (!interesting) return;
+        char tb[900];
+        std::snprintf(tb, sizeof(tb), "[cef-netlog] status=%d mime=%s %s",
+                      status, mime.c_str(), url.c_str());
+        ::ui::cef::trace_file_line(tb);
+        std::fprintf(stderr, "%s\n", tb);
+        std::fflush(stderr);
     }
 
 private:

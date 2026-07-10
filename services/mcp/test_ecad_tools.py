@@ -1322,8 +1322,42 @@ def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
     print("  [fin11_fpga_check_and_constraints] PASS")
 
 
+def _disable_live_provider():
+    """Force ecad_design onto its deterministic recipe path for the whole suite.
+
+    ``ecad_design`` calls ``agent.config.get_provider()`` and, when a real provider (e.g. a live
+    Gemini key) is configured and reachable, plans the topology with the LLM. That plan is
+    NON-deterministic: it usually fails the strict schema and falls back to the recipe (green), but
+    occasionally emits a valid design whose self-check expectation is model-mismatched — e.g. an LED
+    driver probing ``I(LED1)`` against a real-LED current while the generic Shockley model conducts
+    at a different drop — which MISSes and flips ``d['ok']`` to False. That is the source of the
+    flaky ``I(LED1)=nan`` / recipe-mismatch failures. These tests assert ``recipe_used`` and exist to
+    exercise the RECIPE, not the planner, so we pin the provider to None (also stops the suite making
+    paid API calls on every run). Returns a restore() callable. Best-effort: a no-op if agent.config
+    is absent.
+    """
+    try:
+        from agent import config as _cfg  # type: ignore
+    except Exception:  # noqa: BLE001 -- agent package not importable in this env
+        return lambda: None
+    _orig = getattr(_cfg, "get_provider", None)
+    _cfg.get_provider = lambda *a, **k: None  # type: ignore[attr-defined]
+    def _restore():
+        if _orig is not None:
+            _cfg.get_provider = _orig  # type: ignore[attr-defined]
+    return _restore
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
+    _restore_provider = _disable_live_provider()
+    try:
+        _run_all()
+    finally:
+        _restore_provider()
+
+
+def _run_all() -> None:
     tools = test_register()
     test_find_part(tools)
     test_place_and_wire(tools)

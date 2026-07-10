@@ -49,7 +49,36 @@ def _wrap(fn: Callable[[dict], dict]) -> Callable[[dict, Callable], dict]:
 def _heatsink_endpoint() -> Optional[Callable]:
     """Forward probe for the T-FIN17 heatsink selection loop. Returns the callable
     when the tool has landed as an importable impl, else None — the GUI's 'Pick
-    heatsink' button is wired behind this check and lights up when T-FIN17 merges."""
+    heatsink' button is wired behind this check and lights up when T-FIN17 merges.
+
+    Prefers services.mcp.heatsink (where T-FIN17 actually landed) over a historical
+    probe on ecad_thermal. Worker adapters accept a params-dict and return a dict.
+    """
+    try:
+        from services.mcp import heatsink as hs
+        fn = getattr(hs, "heatsink_select_from_params", None)
+        if callable(fn):
+            return fn
+        # Fallback: kwargs-style impl wrapped as params-dict
+        impl = getattr(hs, "heatsink_select_impl", None)
+        if callable(impl):
+            def _wrap_impl(params: dict) -> dict:
+                p = params or {}
+                return impl(
+                    component_ref=str(p.get("component_ref") or ""),
+                    tj_target_c=p.get("tj_target_c"),
+                    t_case_target_c=p.get("t_case_target_c"),
+                    tim_t_mm=float(p.get("tim_t_mm") if p.get("tim_t_mm") is not None
+                                   else hs.TIM_T_MM_DEFAULT),
+                    tim_k_w_mk=float(p.get("tim_k_w_mk") if p.get("tim_k_w_mk") is not None
+                                     else hs.TIM_K_W_MK_DEFAULT),
+                    include_library=bool(p.get("include_library", True)),
+                    include_parametric=bool(p.get("include_parametric", True)),
+                    max_candidates=int(p.get("max_candidates") or 8),
+                )
+            return _wrap_impl
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from services.mcp import ecad_thermal as et
     except Exception:  # noqa: BLE001

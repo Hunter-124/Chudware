@@ -274,6 +274,273 @@ def gather_candidates(env_name: str, h_w_m2k: float,
     return cands, notices
 
 
+# --------------------------------------------------------------------------- implementation
+
+
+def heatsink_select_impl(component_ref: str,
+                         tj_target_c: Optional[float] = None,
+                         t_case_target_c: Optional[float] = None,
+                         tim_t_mm: float = TIM_T_MM_DEFAULT,
+                         tim_k_w_mk: float = TIM_K_W_MK_DEFAULT,
+                         include_library: bool = True,
+                         include_parametric: bool = True,
+                         max_candidates: int = 8) -> dict:
+    """Pick a heatsink for a hot component: candidates re-solved to a Tj target.
+
+    Returns a dict (not JSON). Worker seam (T-FIN24 multiphysics_rpc) and the MCP
+    tool both call this; the MCP tool wraps with json.dumps.
+    """
+    warnings: list = []
+    ctx = et._THERMAL.get("last_ctx")
+    if not isinstance(ctx, dict):
+        return {"ok": False, "error": "no thermal context — run ecad_thermal_handoff() first",
+                "warnings": [],
+                "hint": "heatsink_select re-solves the last handoff's study; "
+                        "there is nothing cached yet.",
+                "next_actions": ["ecad_thermal_handoff()",
+                                 "heatsink_select('U1', tj_target_c=85)"]}
+    if tj_target_c is None and t_case_target_c is None:
+        return {"ok": False, "error": "pass a target: tj_target_c or t_case_target_c",
+                "warnings": [], "hint": "pass a target: tj_target_c or t_case_target_c",
+                "next_actions": []}
+
+    env = ctx["env"]
+    t_amb = float(env["t_amb_c"])
+    components = ctx["components"]
+    rec = next((r for r in components
+                if (r.get("ref") or r.get("id")) == component_ref), None)
+    if rec is None or not rec.get("fea"):
+        known = [r.get("ref") or r.get("id") for r in components if r.get("fea")]
+        return {"ok": False,
+                "error": f"component {component_ref!r} not found in the last handoff",
+                "warnings": [], "hint": f"components with bodies: {known}",
+                "next_actions": []}
+    p_w = et.component_power_w(rec)
+    if p_w is None:
+        return {"ok": False,
+                "error": f"{component_ref} has no power metadata — nothing to sink",
+                "warnings": [],
+                "hint": "seed power_w via library eng blocks or sim_params.eng.",
+                "next_actions": []}
+    fea = rec["fea"]
+    rect = fea["rect_mm"]
+    fp_l, fp_w = rect[2] - rect[0], rect[3] - rect[1]
+    a_top_mm2 = float(fea["top_area_mm2"])
+    theta_jc = (rec.get("theta_c_per_w") or {}).get("jc")
+
+    target_kind = "tj" if tj_target_c is not None else "t_case"
+    target_c = float(tj_target_c if tj_target_c is not None else t_case_target_c)
+    if target_kind == "tj" and not isinstance(theta_jc, (int, float)):
+        warnings.append(f"{component_ref} has no theta_jc — Tj target checked "
+                        "against CASE temperature (Tj >= case; optimistic by the "
+                        "unknown junction-to-case rise).")
+    if target_c <= t_amb:
+        return {"ok": False,
+                "error": f"target {target_c} C is at/below ambient {t_amb} C — no "
+                         "passive heatsink can cool below ambient",
+                "warnings": warnings,
+                "hint": "lower t_amb_c / change environment, or use active "
+                        "cooling (TEC) which is out of this tool's scope.",
+                "next_actions": []}
+
+    cands, notices = gather_candidates(
+        env.get("name", "custom"), float(env["h_w_m2k"]), fp_l, fp_w,
+        include_library=include_library, include_parametric=include_parametric,
+        max_candidates=max_candidates)
+    warnings.extend(notices)
+    if not cands:
+        return {"ok": False, "error": "no heatsink candidates available",
+                "warnings": warnings,
+                "hint": "enable include_parametric=True or check the parts "
+                        "library (domain 'thermal').",
+                "next_actions": []}
+
+    # ── solve leg: FEA re-solve with cached mesh, else network estimate ──
+    mesh = ctx.get("mesh")
+    cb = None
+    if mesh is not None:
+        try:
+            from mcp_server import core_bridge as _cb
+            cb = _cb
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"core bridge unavailable ({exc}) — network estimate.")
+    mode = "fea_resolve" if (mesh is not None and cb is not None) else \
+           "network_estimate"
+    if mode == "network_estimate":
+        warnings.append(
+            "network_estimate mode: Tj = Ta + P*(theta_jc + R_tim + R_sa) — "
+            "board spreading and NEIGHBOR HEATING are ignored (optimistic). "
+            "Run ecad_thermal_handoff() live (sim-enabled libaicad) for the "
+            "FEA re-solve per candidate.")
+
+    conv_base, fixtures = _base_convection(ctx)
+    material = ctx["material"]
+    rows: list = []
+    winner_solve: Optional[dict] = None
+    for cand in cands:
+        a_contact = min(a_top_mm2,
+                        float(cand["base_l_mm"]) * float(cand["base_w_mm"]))
+        r_tim = tim_resistance_c_per_w(tim_t_mm, tim_k_w_mk, a_contact)
+        r_total = r_tim + float(cand["theta_sa_c_per_w"])
+        row = {"candidate": cand["id"], "source": cand["source"],
+               "title": cand.get("title"),
+               "theta_sa_c_per_w": cand["theta_sa_c_per_w"],
+               "theta_basis": cand.get("theta_basis"),
+               "r_tim_c_per_w": round(r_tim, 4),
+               "mass_g": cand.get("mass_g"), "cost_usd": cand.get("cost_usd"),
+               "achieved_tj_c": None, "achieved_t_case_c": None,
+               "basis": None, "solve": None}
+        if mode == "fea_resolve":
+            solved = _resolve_candidate(cb, ctx, conv_base, fixtures, material,
+                                        rec, r_total, a_top_mm2)
+            if not solved.get("ok"):
+                row["solve"] = f"solve failed: {solved.get('error')}"
+                rows.append(row)
+                continue
+            row["achieved_t_case_c"] = solved["t_case_c"]
+            row["achieved_tj_c"] = solved["tj_c"]
+            row["board_max_temp_c"] = solved["board_max_temp_c"]
+            row["solve"] = "fea"
+            row["_study"] = solved
+        else:
+            jc = theta_jc if isinstance(theta_jc, (int, float)) else 0.0
+            t_case = t_amb + p_w * r_total
+            row["achieved_t_case_c"] = round(t_case, 2)
+            row["achieved_tj_c"] = round(t_case + p_w * jc, 2)
+            row["solve"] = "network"
+        achieved = (row["achieved_tj_c"] if target_kind == "tj"
+                    else row["achieved_t_case_c"])
+        if achieved is None and target_kind == "tj":
+            achieved = row["achieved_t_case_c"]
+            row["basis"] = "case (theta_jc unknown)"
+        row["achieved_c"] = achieved
+        row["delta_vs_target_c"] = (round(achieved - target_c, 2)
+                                    if achieved is not None else None)
+        row["meets_target"] = (achieved is not None and achieved <= target_c)
+        rows.append(row)
+
+    solved_rows = [r for r in rows if r.get("achieved_c") is not None]
+    if not solved_rows:
+        return {"ok": False, "error": "every candidate solve failed",
+                "warnings": warnings,
+                "hint": "inspect the per-candidate 'solve' errors in table.",
+                "table": [{k: v for k, v in r.items() if k != "_study"}
+                          for r in rows],
+                "next_actions": []}
+    meeting = [r for r in solved_rows if r["meets_target"]]
+    best = min(solved_rows, key=lambda r: r["achieved_c"])
+    if meeting:
+        # Winner = lightest that meets target (cost tiebreak when known).
+        winner = min(meeting, key=lambda r: (r.get("mass_g") or 1e9,
+                                             r.get("cost_usd") or 1e9))
+        target_met = True
+    else:
+        winner = best
+        target_met = False
+        warnings.append(
+            f"IMPOSSIBLE TARGET in this environment: no candidate reaches "
+            f"{target_kind} <= {target_c} C; best achievable is "
+            f"{best['achieved_c']} C with {best['candidate']!r}. Consider "
+            f"forced air / cold plate, lower ambient, or spreading the load.")
+    winner_solve = winner.pop("_study", None)
+    for r in rows:
+        r.pop("_study", None)
+    rows.sort(key=lambda r: (r.get("achieved_c") is None,
+                             r.get("achieved_c") if r.get("achieved_c") is not None
+                             else 1e9))
+
+    if winner_solve is not None:
+        _HEATSINK["winner_study"] = {"component_ref": component_ref,
+                                     "candidate": winner["candidate"],
+                                     "study": winner_solve}
+
+    # ── simhandoff verify envelope: target vs achieved on the winner ────
+    achieved = winner["achieved_c"]
+    dev_pct = abs(achieved - target_c) / max(abs(target_c - t_amb), 1e-9) * 100.0
+    verdict = (f"{'PASS' if target_met else 'FAIL'}: "
+               f"{winner['candidate']!r} achieves {target_kind} {achieved} C vs "
+               f"target {target_c} C ({'meets' if target_met else 'misses by '}"
+               f"{'' if target_met else str(round(achieved - target_c, 2)) + ' C'})"
+               f" in {env.get('name')} [{mode}]")
+    envelope = sh.build_verify(
+        "ecad_heatsink_to_thermal_fea",
+        sh.study_ref("ecad", "heatsink_select", doc_id=ctx.get("doc_id"),
+                     handoff_id=ctx.get("handoff_envelope_id")),
+        sh.study_ref("thermal_fea", "sim_run_thermal" if mode == "fea_resolve"
+                     else "network_estimate"),
+        [sh.check(f"{target_kind}_{component_ref}_c", "C",
+                  target_c, achieved, round(dev_pct, 1),
+                  0.0 if not target_met else round(dev_pct, 1) + 1.0,
+                  target_met)],
+        verdict,
+        advisories=warnings or None,
+        warnings=[f"mount model: h_eff over the component top "
+                  f"(single-material solver); TIM {tim_t_mm} mm @ "
+                  f"{tim_k_w_mk} W/m-K; sink-base overhang spreading not "
+                  "modeled (conservative)"])
+    errs = sh.validate_envelope(envelope)
+    if errs:  # never ship a malformed envelope silently
+        warnings.append(f"simhandoff envelope validation: {errs}")
+
+    result = sh.attach({
+        "ok": True,
+        "component_ref": component_ref,
+        "power_w": p_w,
+        "target": {"kind": target_kind, "value_c": target_c},
+        "environment": env,
+        "mode": mode,
+        "mesh_cached": bool(mesh is not None),
+        "tim": {"t_mm": tim_t_mm, "k_w_mk": tim_k_w_mk,
+                "note": "bonded contact through a TIM bondline; "
+                        "R_tim = t/(k*A_contact)"},
+        "target_met": target_met,
+        "winner": {k: v for k, v in winner.items()},
+        "best_achievable": {"candidate": best["candidate"],
+                            "achieved_c": best["achieved_c"]},
+        "table": rows,
+        "assumptions": [
+            "mounted sink modeled as effective convection h_eff = "
+            "1/((R_tim+R_sa)*A_top) over the component top face (core solver is "
+            "single-material) — board spreading + neighbor heating stay in the "
+            "solve" if mode == "fea_resolve" else
+            "network estimate: series resistances only, board coupling ignored",
+            "sink-base overhang spreading beyond the component footprint not "
+            "modeled (conservative)",
+            "parametric theta_sa from the plain-fin efficiency estimate; library "
+            "theta_sa from curated datasheet-class nominals — verify the chosen "
+            "part's datasheet before release",
+        ],
+        "warnings": warnings,
+        "hint": verdict,
+        "next_actions": ([f"part_source('{winner.get('candidate')}')  # source it"
+                          if winner["source"] == "library" else
+                          "services.mcp.heatsink.sink_ops(winner spec) via "
+                          "add_features to model the chosen parametric sink"]
+                         if target_met else
+                         ["ecad_thermal_handoff(environment='forced_air') then "
+                          "heatsink_select(...) again",
+                          "lower the target or reduce component power"]),
+    }, envelope)
+    return result
+
+
+def heatsink_select_from_params(params: dict) -> dict:
+    """Worker-friendly params-dict entry for multiphysics_rpc (T-FIN24)."""
+    p = params or {}
+    return heatsink_select_impl(
+        component_ref=str(p.get("component_ref") or ""),
+        tj_target_c=p.get("tj_target_c"),
+        t_case_target_c=p.get("t_case_target_c"),
+        tim_t_mm=float(p.get("tim_t_mm") if p.get("tim_t_mm") is not None
+                       else TIM_T_MM_DEFAULT),
+        tim_k_w_mk=float(p.get("tim_k_w_mk") if p.get("tim_k_w_mk") is not None
+                         else TIM_K_W_MK_DEFAULT),
+        include_library=bool(p.get("include_library", True)),
+        include_parametric=bool(p.get("include_parametric", True)),
+        max_candidates=int(p.get("max_candidates") or 8),
+    )
+
+
 # --------------------------------------------------------------------------- registration
 
 
@@ -317,223 +584,14 @@ def register_heatsink_tools(mcp) -> None:
         Target: tj_target_c (junction, needs theta_jc — falls back to case with a
         warning when jc is unknown) or t_case_target_c (case temperature).
         """
-        warnings: list = []
-        ctx = et._THERMAL.get("last_ctx")
-        if not isinstance(ctx, dict):
-            return _err("no thermal context — run ecad_thermal_handoff() first",
-                        hint="heatsink_select re-solves the last handoff's study; "
-                             "there is nothing cached yet.",
-                        next_actions=["ecad_thermal_handoff()",
-                                      "heatsink_select('U1', tj_target_c=85)"])
-        if tj_target_c is None and t_case_target_c is None:
-            return _err("pass a target: tj_target_c or t_case_target_c")
-
-        env = ctx["env"]
-        t_amb = float(env["t_amb_c"])
-        components = ctx["components"]
-        rec = next((r for r in components
-                    if (r.get("ref") or r.get("id")) == component_ref), None)
-        if rec is None or not rec.get("fea"):
-            known = [r.get("ref") or r.get("id") for r in components if r.get("fea")]
-            return _err(f"component {component_ref!r} not found in the last handoff",
-                        hint=f"components with bodies: {known}")
-        p_w = et.component_power_w(rec)
-        if p_w is None:
-            return _err(f"{component_ref} has no power metadata — nothing to sink",
-                        hint="seed power_w via library eng blocks or sim_params.eng.")
-        fea = rec["fea"]
-        rect = fea["rect_mm"]
-        fp_l, fp_w = rect[2] - rect[0], rect[3] - rect[1]
-        a_top_mm2 = float(fea["top_area_mm2"])
-        theta_jc = (rec.get("theta_c_per_w") or {}).get("jc")
-
-        target_kind = "tj" if tj_target_c is not None else "t_case"
-        target_c = float(tj_target_c if tj_target_c is not None else t_case_target_c)
-        if target_kind == "tj" and not isinstance(theta_jc, (int, float)):
-            warnings.append(f"{component_ref} has no theta_jc — Tj target checked "
-                            "against CASE temperature (Tj >= case; optimistic by the "
-                            "unknown junction-to-case rise).")
-        if target_c <= t_amb:
-            return _err(f"target {target_c} C is at/below ambient {t_amb} C — no "
-                        "passive heatsink can cool below ambient",
-                        hint="lower t_amb_c / change environment, or use active "
-                             "cooling (TEC) which is out of this tool's scope.")
-
-        cands, notices = gather_candidates(
-            env.get("name", "custom"), float(env["h_w_m2k"]), fp_l, fp_w,
-            include_library=include_library, include_parametric=include_parametric,
+        result = heatsink_select_impl(
+            component_ref=component_ref, tj_target_c=tj_target_c,
+            t_case_target_c=t_case_target_c, tim_t_mm=tim_t_mm,
+            tim_k_w_mk=tim_k_w_mk, include_library=include_library,
+            include_parametric=include_parametric,
             max_candidates=max_candidates)
-        warnings.extend(notices)
-        if not cands:
-            return _err("no heatsink candidates available",
-                        hint="enable include_parametric=True or check the parts "
-                             "library (domain 'thermal').")
-
-        # ── solve leg: FEA re-solve with cached mesh, else network estimate ──
-        mesh = ctx.get("mesh")
-        cb = None
-        if mesh is not None:
-            try:
-                from mcp_server import core_bridge as _cb
-                cb = _cb
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"core bridge unavailable ({exc}) — network estimate.")
-        mode = "fea_resolve" if (mesh is not None and cb is not None) else \
-               "network_estimate"
-        if mode == "network_estimate":
-            warnings.append(
-                "network_estimate mode: Tj = Ta + P*(theta_jc + R_tim + R_sa) — "
-                "board spreading and NEIGHBOR HEATING are ignored (optimistic). "
-                "Run ecad_thermal_handoff() live (sim-enabled libaicad) for the "
-                "FEA re-solve per candidate.")
-
-        conv_base, fixtures = _base_convection(ctx)
-        material = ctx["material"]
-        rows: list = []
-        winner_solve: Optional[dict] = None
-        for cand in cands:
-            a_contact = min(a_top_mm2,
-                            float(cand["base_l_mm"]) * float(cand["base_w_mm"]))
-            r_tim = tim_resistance_c_per_w(tim_t_mm, tim_k_w_mk, a_contact)
-            r_total = r_tim + float(cand["theta_sa_c_per_w"])
-            row = {"candidate": cand["id"], "source": cand["source"],
-                   "title": cand.get("title"),
-                   "theta_sa_c_per_w": cand["theta_sa_c_per_w"],
-                   "theta_basis": cand.get("theta_basis"),
-                   "r_tim_c_per_w": round(r_tim, 4),
-                   "mass_g": cand.get("mass_g"), "cost_usd": cand.get("cost_usd"),
-                   "achieved_tj_c": None, "achieved_t_case_c": None,
-                   "basis": None, "solve": None}
-            if mode == "fea_resolve":
-                solved = _resolve_candidate(cb, ctx, conv_base, fixtures, material,
-                                            rec, r_total, a_top_mm2)
-                if not solved.get("ok"):
-                    row["solve"] = f"solve failed: {solved.get('error')}"
-                    rows.append(row)
-                    continue
-                row["achieved_t_case_c"] = solved["t_case_c"]
-                row["achieved_tj_c"] = solved["tj_c"]
-                row["board_max_temp_c"] = solved["board_max_temp_c"]
-                row["solve"] = "fea"
-                row["_study"] = solved
-            else:
-                jc = theta_jc if isinstance(theta_jc, (int, float)) else 0.0
-                t_case = t_amb + p_w * r_total
-                row["achieved_t_case_c"] = round(t_case, 2)
-                row["achieved_tj_c"] = round(t_case + p_w * jc, 2)
-                row["solve"] = "network"
-            achieved = (row["achieved_tj_c"] if target_kind == "tj"
-                        else row["achieved_t_case_c"])
-            if achieved is None and target_kind == "tj":
-                achieved = row["achieved_t_case_c"]
-                row["basis"] = "case (theta_jc unknown)"
-            row["achieved_c"] = achieved
-            row["delta_vs_target_c"] = (round(achieved - target_c, 2)
-                                        if achieved is not None else None)
-            row["meets_target"] = (achieved is not None and achieved <= target_c)
-            rows.append(row)
-
-        solved_rows = [r for r in rows if r.get("achieved_c") is not None]
-        if not solved_rows:
-            return _err("every candidate solve failed",
-                        hint="inspect the per-candidate 'solve' errors in table.",
-                        table=[{k: v for k, v in r.items() if k != "_study"}
-                               for r in rows])
-        meeting = [r for r in solved_rows if r["meets_target"]]
-        best = min(solved_rows, key=lambda r: r["achieved_c"])
-        if meeting:
-            # Winner = lightest that meets target (cost tiebreak when known).
-            winner = min(meeting, key=lambda r: (r.get("mass_g") or 1e9,
-                                                 r.get("cost_usd") or 1e9))
-            target_met = True
-        else:
-            winner = best
-            target_met = False
-            warnings.append(
-                f"IMPOSSIBLE TARGET in this environment: no candidate reaches "
-                f"{target_kind} <= {target_c} C; best achievable is "
-                f"{best['achieved_c']} C with {best['candidate']!r}. Consider "
-                f"forced air / cold plate, lower ambient, or spreading the load.")
-        winner_solve = winner.pop("_study", None)
-        for r in rows:
-            r.pop("_study", None)
-        rows.sort(key=lambda r: (r.get("achieved_c") is None,
-                                 r.get("achieved_c") if r.get("achieved_c") is not None
-                                 else 1e9))
-
-        if winner_solve is not None:
-            _HEATSINK["winner_study"] = {"component_ref": component_ref,
-                                         "candidate": winner["candidate"],
-                                         "study": winner_solve}
-
-        # ── simhandoff verify envelope: target vs achieved on the winner ────
-        achieved = winner["achieved_c"]
-        dev_pct = abs(achieved - target_c) / max(abs(target_c - t_amb), 1e-9) * 100.0
-        verdict = (f"{'PASS' if target_met else 'FAIL'}: "
-                   f"{winner['candidate']!r} achieves {target_kind} {achieved} C vs "
-                   f"target {target_c} C ({'meets' if target_met else 'misses by '}"
-                   f"{'' if target_met else str(round(achieved - target_c, 2)) + ' C'})"
-                   f" in {env.get('name')} [{mode}]")
-        envelope = sh.build_verify(
-            "ecad_heatsink_to_thermal_fea",
-            sh.study_ref("ecad", "heatsink_select", doc_id=ctx.get("doc_id"),
-                         handoff_id=ctx.get("handoff_envelope_id")),
-            sh.study_ref("thermal_fea", "sim_run_thermal" if mode == "fea_resolve"
-                         else "network_estimate"),
-            [sh.check(f"{target_kind}_{component_ref}_c", "C",
-                      target_c, achieved, round(dev_pct, 1),
-                      0.0 if not target_met else round(dev_pct, 1) + 1.0,
-                      target_met)],
-            verdict,
-            advisories=warnings or None,
-            warnings=[f"mount model: h_eff over the component top "
-                      f"(single-material solver); TIM {tim_t_mm} mm @ "
-                      f"{tim_k_w_mk} W/m-K; sink-base overhang spreading not "
-                      "modeled (conservative)"])
-        errs = sh.validate_envelope(envelope)
-        if errs:  # never ship a malformed envelope silently
-            warnings.append(f"simhandoff envelope validation: {errs}")
-
-        result = sh.attach({
-            "ok": True,
-            "component_ref": component_ref,
-            "power_w": p_w,
-            "target": {"kind": target_kind, "value_c": target_c},
-            "environment": env,
-            "mode": mode,
-            "mesh_cached": bool(mesh is not None),
-            "tim": {"t_mm": tim_t_mm, "k_w_mk": tim_k_w_mk,
-                    "note": "bonded contact through a TIM bondline; "
-                            "R_tim = t/(k*A_contact)"},
-            "target_met": target_met,
-            "winner": {k: v for k, v in winner.items()},
-            "best_achievable": {"candidate": best["candidate"],
-                                "achieved_c": best["achieved_c"]},
-            "table": rows,
-            "assumptions": [
-                "mounted sink modeled as effective convection h_eff = "
-                "1/((R_tim+R_sa)*A_top) over the component top face (core solver is "
-                "single-material) — board spreading + neighbor heating stay in the "
-                "solve" if mode == "fea_resolve" else
-                "network estimate: series resistances only, board coupling ignored",
-                "sink-base overhang spreading beyond the component footprint not "
-                "modeled (conservative)",
-                "parametric theta_sa from the plain-fin efficiency estimate; library "
-                "theta_sa from curated datasheet-class nominals — verify the chosen "
-                "part's datasheet before release",
-            ],
-            "warnings": warnings,
-            "hint": verdict,
-            "next_actions": ([f"part_source('{winner.get('candidate')}')  # source it"
-                              if winner["source"] == "library" else
-                              "services.mcp.heatsink.sink_ops(winner spec) via "
-                              "add_features to model the chosen parametric sink"]
-                             if target_met else
-                             ["ecad_thermal_handoff(environment='forced_air') then "
-                              "heatsink_select(...) again",
-                              "lower the target or reduce component power"]),
-        }, envelope)
         return _dumps(result)
+
 
 
 # --------------------------------------------------------------------------- solve leg

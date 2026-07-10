@@ -243,7 +243,17 @@ def daemon_socket_alive(hostd_bin: Optional[Path] = None) -> bool:
         return False
 
 
-def _spawn_hostd_detached(hostd: Path) -> None:
+# Every hostd we ever spawn, so exited children (e.g. flock-singleton race
+# losers) get reaped instead of lingering as zombies in this process — 12 such
+# zombies were observed parented to MCP servers (docs/PERF_AUDIT_2026-07-10.md §1).
+_SPAWNED: list = []
+
+
+def _reap_spawned() -> None:
+    _SPAWNED[:] = [p for p in _SPAWNED if p.poll() is None]
+
+
+def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
     """Launch the daemon so it outlives this client.
 
     POSIX: start_new_session detaches enough for a daemon that self-manages via
@@ -259,10 +269,11 @@ def _spawn_hostd_detached(hostd: Path) -> None:
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000
         try:
-            subprocess.Popen([str(hostd)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB,
-                             close_fds=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
+            p = subprocess.Popen([str(hostd)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB,
+                                 close_fds=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _SPAWNED.append(p)
+            return p
         except OSError:
             print(
                 "[daemon_bridge] WARNING: job breakaway denied — aicad-hostd will die "
@@ -270,16 +281,19 @@ def _spawn_hostd_detached(hostd: Path) -> None:
                 "Start the AI-CAD GUI first for a durable daemon.",
                 file=sys.stderr,
             )
-            subprocess.Popen([str(hostd)], creationflags=flags, close_fds=True,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            return
-    subprocess.Popen(
+            p = subprocess.Popen([str(hostd)], creationflags=flags, close_fds=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            _SPAWNED.append(p)
+            return p
+    p = subprocess.Popen(
         [str(hostd)],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _SPAWNED.append(p)
+    return p
 
 
 class DaemonClient:
@@ -301,13 +315,19 @@ class DaemonClient:
     # ---------------------------------------------------------------- connect
 
     def connect(self, spawn: bool = True, budget_s: float = 15.0) -> None:
+        _reap_spawned()
         hostd = resolve_hostd_bin()
         self._sock_path = socket_path(hostd)
         if not self._sock_path:
             raise DaemonError("cannot resolve hostd socket (no binary / AICAD_HOSTD_BIN)")
+        try:
+            budget_s = float(os.environ.get("AICAD_HOSTD_CONNECT_BUDGET_S", "") or budget_s)
+        except ValueError:
+            pass
         deadline = time.monotonic() + budget_s
         backoff = 0.05
-        spawned = False
+        child = None
+        child_gone_at = 0.0
         while True:
             try:
                 if sys.platform == "win32":
@@ -325,13 +345,34 @@ class DaemonClient:
             except OSError as e:
                 if not spawn:
                     raise DaemonError(f"hostd not running ({e})") from e
-                if not spawned:
+                if child is None:
                     if not hostd:
                         raise DaemonError(
                             "aicad-hostd binary not found (set AICAD_HOSTD_BIN or build core)"
                         ) from e
-                    _spawn_hostd_detached(hostd)
-                    spawned = True
+                    try:
+                        child = _spawn_hostd_detached(hostd)
+                    except OSError as se:
+                        raise DaemonError(f"cannot spawn {hostd}: {se}") from se
+                    child_spawned_at = time.monotonic()
+                else:
+                    # Broken-rendezvous fast-fail (observed in the wild: a daemon
+                    # holds the singleton flock but serves no socket). Two shapes:
+                    # our spawn EXITED (lost the flock race) and the incumbent's
+                    # socket still refuses after a 2 s grace, or our spawn is
+                    # ALIVE but stuck waiting on the flock — a healthy cold spawn
+                    # binds its socket well under 5 s (bind precedes OCCT load).
+                    now = time.monotonic()
+                    exited = child.poll() is not None
+                    if exited and not child_gone_at:
+                        child_gone_at = now
+                    if (exited and now - child_gone_at > 2.0) or (
+                            not exited and now - child_spawned_at > 5.0):
+                        raise DaemonError(
+                            "hostd rendezvous broken: a daemon holds the singleton "
+                            f"lock but its socket is unreachable ({e}). "
+                            "`pkill aicad-hostd` and retry."
+                        ) from e
                 if time.monotonic() > deadline:
                     raise DaemonError(f"hostd spawn timed out ({e})") from e
                 time.sleep(backoff)
@@ -430,6 +471,10 @@ class DaemonClient:
         while True:
             msg = self._read_msg()
             if "event" in msg:
+                # Bounded: nothing drains _events unless poll_events() is wired
+                # up, so a chatty daemon must not grow this list forever.
+                if len(self._events) >= 1000:
+                    del self._events[:100]
                 self._events.append(msg)
                 continue
             if msg.get("id") == rid:

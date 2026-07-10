@@ -331,7 +331,13 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     returned as-is so the caller can surface it without an exception.
     """
     global _DAEMON_FALLBACK_WARNED
-    if _daemon_mode():
+    # STICKY fallback: once a transport failure demotes us to the in-process
+    # engine we stay there for the life of this process. Retrying the daemon
+    # per-call re-pays the full connect/spawn budget (~15 s) on EVERY engine
+    # call — measured 150x slowdown (docs/PERF_AUDIT_2026-07-10.md §1) — and
+    # switching back mid-session would strand doc_ids created in the in-process
+    # engine. Recovery = restart the server (the warning says so).
+    if _daemon_mode() and not _DAEMON_FALLBACK_WARNED:
         from .daemon_bridge import DaemonError
 
         try:
@@ -339,13 +345,13 @@ def call(method: str, params: Optional[dict] = None) -> dict:
         except DaemonError as e:
             # Transport-level failure only (spawn/connect/EOF-after-retry) — RPC
             # errors surface above as CoreError and must NOT trigger fallback.
-            if not _DAEMON_FALLBACK_WARNED:
-                _DAEMON_FALLBACK_WARNED = True
-                print(
-                    f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
-                    "the legacy in-process engine. Doc sharing with the GUI is OFF.",
-                    file=sys.stderr,
-                )
+            _DAEMON_FALLBACK_WARNED = True
+            print(
+                f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
+                "the legacy in-process engine for the REST OF THIS SESSION. Doc "
+                "sharing with the GUI is OFF; restart this server to retry hostd.",
+                file=sys.stderr,
+            )
     dll = _load()
     out = ctypes.c_char_p()
     # NOTE: native stdout (OCCT statistics etc.) is kept off the MCP JSON-RPC channel by a

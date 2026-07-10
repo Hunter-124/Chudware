@@ -40,8 +40,9 @@ has non-GUI tentacles (e.g. a new command needs a worker RPC).
 
 ## Dispatch table
 
-All production GUI code lives in `host/src/` (the `ui/imgui`+`ui/abstract` layering in
-ARCHITECTURE.md is a future refactor — do not send agents there). Each subsystem has a
+All production GUI code lives in `host/src/` — per `build.sh`, "the ui/imgui / ui/abstract
+(AI-CAD2) app is retired; host/ is the single cross-platform GUI target". Ignore AGENTS.md's
+claim that host/ was deleted (stale, T-G11 was reverted); do not send agents to `ui/imgui`. Each subsystem has a
 specialist skill with the deep map; subagent prompts must say **"Read <skill path> first"**
 so workers load only their own subsystem's knowledge.
 

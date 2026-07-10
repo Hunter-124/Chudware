@@ -1,6 +1,13 @@
 // ESP32 stub platform description for Renode (MIT)
-// Minimal stub — ESP32 support in Renode is experimental.
 // License: MIT — see templates/renode_platforms/LICENSE
+//
+// T-FIN2 DECISION — ESP32 is BUILD + FLASH ONLY, no emulation.
+// Renode's Xtensa/ESP32 support is experimental and ships no usable UART/GPIO
+// peripheral models; QEMU-xtensa (espressif fork) is not packaged for our
+// supported distros. platform_db reports esp32 with emulation="none" and
+// fw_sim_run refuses honestly instead of pretending. The build (idf.py) and
+// flash (esptool) paths remain fully supported — see provision.FW_FAMILY_RULES.
+// This stub is kept only so a future Renode with real ESP32 support has a seat.
 
 cpu0: CPU.Xtensa @ sysbus
     cpuType: "esp32"

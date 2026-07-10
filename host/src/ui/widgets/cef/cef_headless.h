@@ -40,6 +40,10 @@ FetchResult headless_fetch(const std::string& url, int settle_ms = 1200,
 bool headless_download(const std::string& url, const std::string& dest_path,
                        const std::string& profile_dir = "");
 
+// Close all pooled headless browsers (reused across fetches). Call before
+// shutdown() so CefShutdown doesn't race live browsers. No-op if none are open.
+void headless_close_all();
+
 // Clean exit for the one-shot CEF CLI modes. Calls shutdown() to flush cookies,
 // but arms a watchdog that hard-_exit()s the process after a few seconds if CEF's
 // single-process teardown hangs (a known CEF issue) — so `--cef-fetch` and friends

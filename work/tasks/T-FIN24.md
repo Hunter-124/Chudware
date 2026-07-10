@@ -3,7 +3,7 @@ id: T-FIN24
 title: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN24-simulate-tab-multiphysics
 depends_on: [T-FIN1, T-FIN15, T-FIN16]
 lane: app-gui
@@ -35,3 +35,6 @@ are one click in the GUI, and study provenance shown on results.
 - Disclosure matrix verified by headless shots (both cases)
 - ECAD->thermal handoff round trip works from the GUI including heatsink pick
 - EM forms run against the live backend (toast-only gap closed); light+dark verified
+
+## Progress log
+- 2026-07-10 20:35 UTC [grok] Merged to master (35b69f25) + heatsink worker seam wired to T-FIN17 heatsink_select_impl; host build green; FIN16/17 + simhandoff/fea/power/hydraulic tests pass.

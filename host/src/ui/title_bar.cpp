@@ -24,6 +24,7 @@
 #include "../ui_theme.h"   // ui::uiScale, ui::palette
 #include "metrics.h"           // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"          // ui::openNewDocChooser (File > New)
+#include "firmware/fw_workspace.h"  // T-FIN5: ui::firmwareTabVisible
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
 
@@ -99,6 +100,7 @@ static ImVec4 titleBar_chromeTint(const float base[4]) {
 enum class TbIcon {
     File, Search, Settings,
     Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI,
+    Firmware,   // T-FIN5: firmware workspace tab (progressive disclosure)
 };
 
 static void drawTbIcon(ImDrawList* dl, TbIcon icon, ImVec2 c, float sz, ImU32 col) {
@@ -196,6 +198,27 @@ static void drawTbIcon(ImDrawList* dl, TbIcon icon, ImVec2 c, float sz, ImU32 co
             dl->AddLine(ImVec2(c.x + d, c.y - b), ImVec2(c.x + d, c.y - pe), col, th);
             dl->AddLine(ImVec2(c.x + d, c.y + b), ImVec2(c.x + d, c.y + pe), col, th);
         }
+        break;
+    }
+    case TbIcon::Firmware: {
+        // MCU chip with a waveform through it (firmware = code on silicon).
+        const float b = r * 0.55f;
+        dl->AddRect(ImVec2(c.x - b, c.y - b), ImVec2(c.x + b, c.y + b), col, r * 0.12f, 0, th);
+        const float o = r * 0.30f, pe = r * 0.95f;
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            const float d = (float)sgn * o;
+            dl->AddLine(ImVec2(c.x - b, c.y + d), ImVec2(c.x - pe, c.y + d), col, th);
+            dl->AddLine(ImVec2(c.x + b, c.y + d), ImVec2(c.x + pe, c.y + d), col, th);
+        }
+        // Step waveform inside the body (GPIO trace motif).
+        const float wy0 = c.y + b * 0.45f, wy1 = c.y - b * 0.45f;
+        dl->PathLineTo(ImVec2(c.x - b * 0.70f, wy0));
+        dl->PathLineTo(ImVec2(c.x - b * 0.25f, wy0));
+        dl->PathLineTo(ImVec2(c.x - b * 0.25f, wy1));
+        dl->PathLineTo(ImVec2(c.x + b * 0.25f, wy1));
+        dl->PathLineTo(ImVec2(c.x + b * 0.25f, wy0));
+        dl->PathLineTo(ImVec2(c.x + b * 0.70f, wy0));
+        dl->PathStroke(col, 0, th);
         break;
     }
     case TbIcon::Manufacture: {
@@ -602,6 +625,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary},
             {"AI",           AppState::Workspace::AI,           TbIcon::AI},
             {"Reverse Eng",  AppState::Workspace::ReverseEng,   TbIcon::Search},
+            {"Firmware",     AppState::Workspace::Firmware,     TbIcon::Firmware},
         };
         constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
 
@@ -610,10 +634,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float tabPadX  = 10.0f * s;   // horizontal text padding inside each tab
 
         // Measure total width of all tabs.
+        const bool fwTabVisible = ui::firmwareTabVisible(st);   // T-FIN5 disclosure
         float totalTabsW = 0.0f;
         for (int i = 0; i < kTabCount; ++i) {
+            if (kTabs[i].ws == AppState::Workspace::Firmware && !fwTabVisible) continue;
+            if (totalTabsW > 0.0f) totalTabsW += tabGapX;
             totalTabsW += chipMeasureW(kTabs[i].label, tabPadX, boldFont, iconSz, iconGap);
-            if (i < kTabCount - 1) totalTabsW += tabGapX;
         }
 
         // Available center zone, window-relative.
@@ -633,6 +659,10 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         float tx = winX + tabsStartRelX;  // current tab x, screen-absolute
 
         for (int i = 0; i < kTabCount; ++i) {
+            // T-FIN5 progressive disclosure: the Firmware tab is offered only when a
+            // firmware project exists / ECAD is in play (Simulate-tab disclosure rules).
+            if (kTabs[i].ws == AppState::Workspace::Firmware && !fwTabVisible)
+                continue;
             const bool isActive = (st.activeWorkspace == kTabs[i].ws);
             const float chipW = chipMeasureW(kTabs[i].label, tabPadX, boldFont, iconSz, iconGap);
 

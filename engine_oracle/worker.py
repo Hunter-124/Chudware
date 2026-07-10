@@ -330,6 +330,21 @@ except Exception as _plm_import_err:  # noqa: BLE001
         _plm_import_err)
 # === end PLM vault ===
 
+# === Firmware seam (T-FIN5) — fw_status/projects/new_project/build/sources/sim_run/flash/debug ===
+# GUI-facing mirror of the fw_* MCP tools (contracts/firmware_rpc.md §8): the desktop
+# Firmware workspace drives the SAME engine.firmware implementation as the MCP server.
+# Gracefully absent when engine.firmware can't import; the GUI shows its honest
+# "firmware tools unavailable" state instead.
+try:
+    from engine.firmware.worker_rpc import WORKER_METHODS as _FW_METHODS  # noqa: E402
+    _METHODS.update(_FW_METHODS)
+except Exception as _fw_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine.firmware.worker_rpc unavailable — fw_* worker methods not registered: %s",
+        _fw_import_err)
+# === end Firmware seam ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

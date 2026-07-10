@@ -153,3 +153,24 @@ Event object:
 only; when the pin has none, the assertion fails with detail
 `"no time-stamped events for pin '<PIN>'"`. The plain `gpio:<PIN>=<level>` form keeps its
 §4 meaning: end-of-run level.
+
+## 8. Worker endpoints — GUI seam (T-FIN5, appended)
+
+The desktop Firmware workspace (host GUI) talks to the engine over the JSON-RPC worker
+(`contracts/worker_rpc.md`), not MCP. `engine/firmware/worker_rpc.py` registers a
+GUI-facing mirror of the fw_* tools into `engine_oracle/worker.py`; every method is a thin
+adapter over the SAME `engine.firmware.mcp_tools` implementation the MCP server uses, so
+tool and GUI behavior can never drift.
+
+Registered methods: `fw_new_project`, `fw_build`, `fw_sources`, `fw_sim_run`, `fw_flash`,
+`fw_debug_start`, `fw_debug_halt`, `fw_debug_read_mem` — identical params/results to §5 —
+plus two GUI conveniences:
+
+| method | params | result |
+|---|---|---|
+| `fw_status` | `{}` | the T-FIN4 provisioning doctor payload `{ok, tools, families, banners, missing}` — the GUI gates Build/Emulate/Flash/Debug buttons on `families.*.can_*` and shows `banners` verbatim as install guidance |
+| `fw_projects` | `{}` | `{projects: [FirmwareProject dict (§2) + "root_dir": absolute path]}`, newest first; unreadable sidecars skipped |
+
+Error posture is unchanged from §1: expected failures come back inside the result
+(`{code, message, detail}` envelope or `success=False` / `passed=False`), never a raised
+worker error.

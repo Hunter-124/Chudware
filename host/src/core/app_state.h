@@ -725,7 +725,8 @@ struct AppState {
     // the central region (viewport / sketcher / sim / ecad / cam / plm / parts / ai) and which
     // ribbon set is visible. Title bar writes it; app.cpp routes on it; ribbon filters by it.
     // RE-ANCHOR(reveng): append ReverseEng after AI (RE-03 workspace tab shell).
-    enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng };
+    // T-FIN5: append Firmware after ReverseEng (append-only — status_bar indexes by value).
+    enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng, Firmware };
     Workspace activeWorkspace = Workspace::Model;
     // Parts Library → Reverse Engineering handoff seam. The parts panel's
     // "Reverse-engineer this part" action creates a session (reveng_start_session

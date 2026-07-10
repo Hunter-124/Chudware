@@ -32,7 +32,8 @@ static std::string prettySimStage(const std::string& s) {
 
 // Title-bar workspace names, indexed by AppState::Workspace.
 static const char* kWsName[] = {"Model", "Drawing", "Simulate", "Electronics",
-                                "Manufacture", "PLM", "Parts Library", "AI"};
+                                "Manufacture", "PLM", "Parts Library", "AI",
+                                "Reverse Eng", "Firmware"};
 
 void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                    ImGuiWindowFlags hostFlags) {

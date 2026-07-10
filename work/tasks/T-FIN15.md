@@ -2,8 +2,8 @@
 id: T-FIN15
 title: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN15-simhandoff-contract
 depends_on: []
 lane: simulation

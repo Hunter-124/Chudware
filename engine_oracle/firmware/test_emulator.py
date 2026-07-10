@@ -330,7 +330,9 @@ def test_run_simulation_prefers_renode_when_platform_exists():
         mock_cm.__enter__.return_value.name = "/tmp/test_fake.resc"
         mock_ntf.return_value = mock_cm
 
-        result = run_simulation("fake.elf", "cortex-m4", ["uart:BOOT_OK"])
+        # T-FIN2: use a family with a real UART-capable platform (the generic cortex-m
+        # platform has no UART model, so a uart assertion there now falls back/refuses).
+        result = run_simulation("fake.elf", "stm32f407", ["uart:BOOT_OK"])
 
     assert result.passed is True
 
@@ -598,3 +600,223 @@ def test_live_qemu_graceful_on_bogus_elf(tmp_path):
     result = QEMUEmulator().run(str(elf), timeout_s=10, assertions=["gpio:PA5=1"])
     assert isinstance(result, SimResult)
     assert result.passed is False  # bogus ELF can't satisfy the assertion
+
+
+# ---------------------------------------------------------------------------
+# T-FIN2: platform pack — structure tests (renode absent on this machine, so
+# canned-output + structure tests carry the load; live smoke below is gated)
+# ---------------------------------------------------------------------------
+
+_PLATFORM_DIR = Path(platform_db.__file__).parent / "templates" / "renode_platforms"
+
+# family → peripherals its .repl must declare (name substrings)
+_EXPECTED_DECLS = {
+    "stm32f4": ["usart1", "usart2", "gpioPortA", "gpioPortE", "i2c1", "spi1", "timer2", "nvic", "cpu"],
+    "stm32f1": ["usart1", "usart5", "gpioPortA", "gpioPortG", "i2c1", "timer2", "nvic", "cpu"],
+    "nrf52":   ["uart0", "gpio0", "gpiote", "twi0", "spi2", "timer0", "nvic", "cpu"],
+    "rp2040":  ["uart0", "uart1", "nvic", "cpu", "flash", "sram"],
+    "esp32":   ["cpu0", "flash", "sram"],
+    "cortex-m": ["nvic", "cpu", "flash", "sram"],
+}
+
+import re  # noqa: E402
+
+# .repl top-level declaration / continuation grammar sanity (comment, blank, decl, indented attr)
+_REPL_LINE_RE = re.compile(
+    r"^($|//|\w[\w]*\s*:\s*\S|sysbus:$|[a-zA-Z_]\w*:$|\s+\S)")
+
+
+@pytest.mark.parametrize("family", sorted(platform_db.PLATFORM_CAPS))
+def test_platform_file_exists_and_structure(family):
+    caps = platform_db.PLATFORM_CAPS[family]
+    path = _PLATFORM_DIR / caps["file"]
+    assert path.exists(), f"missing platform file for {family}: {caps['file']}"
+    text = path.read_text(encoding="utf-8")
+    assert "\t" not in text, ".repl files must be space-indented"
+    assert "ApplySVD @http" not in text, "no network fetches at machine-load time"
+    for line in text.splitlines():
+        assert _REPL_LINE_RE.match(line), f"{caps['file']}: suspicious .repl line: {line!r}"
+
+
+@pytest.mark.parametrize("family,decls", sorted(_EXPECTED_DECLS.items()))
+def test_platform_declares_expected_peripherals(family, decls):
+    path = _PLATFORM_DIR / platform_db.PLATFORM_CAPS[family]["file"]
+    text = path.read_text(encoding="utf-8")
+    for name in decls:
+        assert re.search(rf"^{name}\s*:", text, re.MULTILINE), \
+            f"{family}: platform must declare '{name}'"
+
+
+def test_capability_matrix_shape_and_honesty():
+    matrix = platform_db.capability_matrix()
+    assert set(matrix) == {"stm32f4", "stm32f1", "nrf52", "rp2040", "esp32", "cortex-m"}
+    for family, caps in matrix.items():
+        for key in ("file", "emulation", "uart", "gpio", "gpio_observe",
+                    "adc", "i2c", "spi", "timers", "notes"):
+            assert key in caps, f"{family} missing '{key}'"
+        # honesty: no family claims an ADC — upstream Renode ships no ADC model here
+        assert caps["adc"] is False
+    assert matrix["esp32"]["emulation"] == "none"
+    assert matrix["rp2040"]["emulation"] == "renode-minimal"
+    assert matrix["nrf52"]["gpio_observe"] is False   # observation wiring is STM32-only
+    assert matrix["stm32f4"]["gpio_observe"] is True
+
+
+@pytest.mark.parametrize("raw,family", [
+    ("STM32F407VG", "stm32f4"), ("stm32f103c8", "stm32f1"),
+    ("nRF52840_xxAA", "nrf52"), ("RP2040", "rp2040"), ("pico", "rp2040"),
+    ("esp32-wroom", "esp32"), ("cortex-m4", "cortex-m"), ("weird-mcu", "cortex-m"),
+])
+def test_canonical_family(raw, family):
+    assert platform_db.canonical_family(raw) == family
+
+
+def test_gpio_regmap_stm32f1_differs_from_f4():
+    f4 = platform_db.gpio_regmap_for("stm32f4")
+    f1 = platform_db.gpio_regmap_for("stm32f103")
+    assert f4 == {"base": 0x40020000, "stride": 0x400, "odr_offset": 0x14}
+    assert f1 == {"base": 0x40010800, "stride": 0x400, "odr_offset": 0x0C}
+    assert platform_db.gpio_regmap_for("nrf52") is None
+
+
+def test_build_resc_uses_first_uart_name(tmp_path):
+    repl = tmp_path / "p.repl"
+    repl.write_text("uart0: UART.NRF52840_UART @ sysbus 0x40002000\n", encoding="utf-8")
+    script = emu._build_resc("fw.elf", str(repl))
+    assert "showAnalyzer sysbus.uart0" in script
+    assert "usart1" not in script
+
+
+def test_build_resc_stm32f1_odr_addresses(tmp_path):
+    repl = tmp_path / "p.repl"
+    repl.write_text("usart1: UART.STM32_UART @ sysbus\n"
+                    "gpioPortA: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010800, +0x400>\n",
+                    encoding="utf-8")
+    script = emu._build_resc("fw.elf", str(repl), gpio_pins=[("A", 5)],
+                             gpio_regmap=platform_db.gpio_regmap_for("stm32f1"))
+    assert "readdoubleword 0x4001080c" in script.lower()
+
+
+# ---------------------------------------------------------------------------
+# T-FIN2: honest refusals in run_simulation
+# ---------------------------------------------------------------------------
+
+def test_run_simulation_esp32_refuses_honestly():
+    # Even with renode "installed", esp32 has emulation="none" — refuse before dispatch.
+    with patch("engine.firmware.emulator.shutil.which", return_value="/usr/bin/renode"), \
+         patch("engine.firmware.emulator.subprocess.run") as mock_run:
+        result = run_simulation("fake.elf", "esp32", ["uart:BOOT_OK", "gpio:PA5=1"])
+    mock_run.assert_not_called()
+    assert result.passed is False
+    assert "platform_capability" in result.uart_log
+    assert "build + flash only" in result.uart_log
+    assert len(result.assertion_results) == 2
+    assert all(not a.passed for a in result.assertion_results)
+    assert "unsupported on platform" in result.assertion_results[0].detail
+
+
+def test_run_simulation_gpio_on_nrf52_refuses_without_qemu():
+    def which(binary):
+        return "/usr/bin/renode" if binary == "renode" else None
+    with patch("engine.firmware.emulator.shutil.which", side_effect=which), \
+         patch("engine.firmware.emulator.subprocess.run") as mock_run:
+        result = run_simulation("fake.elf", "nrf52840", ["gpio:PA5=1", "uart:BOOT_OK"])
+    mock_run.assert_not_called()
+    assert result.passed is False
+    assert "gpio observation" in result.uart_log
+    by_name = {a.name: a for a in result.assertion_results}
+    assert "unsupported on platform" in by_name["gpio:PA5=1"].detail
+    assert "not evaluated" in by_name["uart:BOOT_OK"].detail
+
+
+def test_run_simulation_gpio_on_nrf52_falls_back_to_qemu():
+    mock_proc = MagicMock()
+    mock_proc.stdout = "AICAD_GPIO_EVT PA5=1\n"
+    mock_proc.returncode = 0
+    with patch("engine.firmware.emulator.shutil.which",
+               side_effect=lambda b: "/usr/bin/" + b), \
+         patch("engine.firmware.emulator.subprocess.run", return_value=mock_proc):
+        result = run_simulation("fake.elf", "nrf52840", ["gpio:PA5=1"])
+    assert result.passed is True   # semihosting shim path handled it
+
+
+def test_run_simulation_uart_on_generic_cortex_m_refuses_without_qemu():
+    def which(binary):
+        return "/usr/bin/renode" if binary == "renode" else None
+    with patch("engine.firmware.emulator.shutil.which", side_effect=which), \
+         patch("engine.firmware.emulator.subprocess.run") as mock_run:
+        result = run_simulation("fake.elf", "cortex-m4", ["uart:BOOT_OK"])
+    mock_run.assert_not_called()
+    assert result.passed is False
+    assert "UART model" in result.uart_log
+
+
+def test_run_simulation_no_assertions_still_runs_renode():
+    mock_proc = MagicMock()
+    mock_proc.stdout = "Machine started\n"
+    mock_proc.stderr = ""
+    mock_proc.returncode = 0
+    def which(binary):
+        return "/usr/bin/renode" if binary == "renode" else None
+    with patch("engine.firmware.emulator.shutil.which", side_effect=which), \
+         patch("engine.firmware.emulator.subprocess.run", return_value=mock_proc), \
+         patch("engine.firmware.emulator.tempfile.NamedTemporaryFile") as mock_ntf:
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=MagicMock(name="f"))
+        mock_cm.__exit__ = MagicMock(return_value=False)
+        mock_cm.__enter__.return_value.name = "/tmp/test_fake.resc"
+        mock_ntf.return_value = mock_cm
+        result = run_simulation("fake.elf", "cortex-m4", [])
+    assert result.passed is True   # no assertions → boot smoke is allowed on any platform
+
+
+# ---------------------------------------------------------------------------
+# T-FIN2: per-platform live boot smoke — skips cleanly when renode is absent
+# (it IS absent on this machine; .repl syntax historically only fails live, so
+# these are the real gate on a provisioned box)
+# ---------------------------------------------------------------------------
+
+_LOAD_FAIL_MARKERS = ("Could not create machine", "ParsingError", "parsing error",
+                      "Could not find suitable constructor",
+                      "expected attribute list end")
+
+
+@pytest.mark.skipif(_shutil.which("renode") is None, reason="renode not installed")
+@pytest.mark.parametrize("family", ["stm32f4", "stm32f103", "nrf52840", "rp2040"])
+def test_live_platform_boots(family, tmp_path):
+    """[~] live: each curated platform must load in Renode without a .repl error."""
+    elf = tmp_path / "empty.elf"
+    elf.write_bytes(b"")
+    platform = platform_db.get_platform_file(family)
+    assert platform is not None
+    result = RenodeEmulator().run(str(elf), str(platform), [], timeout_s=20)
+    assert isinstance(result, SimResult)
+    for marker in _LOAD_FAIL_MARKERS:
+        assert marker not in result.uart_log, \
+            f"{family}: platform failed to load live: ...{marker}..."
+
+
+@pytest.mark.skipif(_shutil.which("renode") is None or
+                    _shutil.which("arm-none-eabi-gcc") is None,
+                    reason="renode + arm-none-eabi-gcc required")
+def test_live_stm32f4_hello_uart(tmp_path):
+    """[~] live: bare-metal USART1 hello prints over Renode's console analyzer."""
+    import subprocess as sp
+    src = tmp_path / "hello.c"
+    src.write_text(
+        "typedef unsigned int u32;\n"
+        "static void send(const char *s){volatile u32 *dr=(u32*)0x40011004;"
+        "while(*s){*dr=(u32)*s++;}}\n"
+        "void _start(void){send(\"HELLO_UART\\n\");for(;;){}}\n"
+        "__attribute__((section(\".vtab\"),used)) static void(*v[2])(void)="
+        "{(void(*)(void))0x20004000,_start};\n",
+        encoding="utf-8")
+    elf = tmp_path / "hello.elf"
+    ld = tmp_path / "link.ld"
+    ld.write_text("SECTIONS{ .text 0x08000000 : { KEEP(*(.vtab)) *(.text*) *(.rodata*) } }\n",
+                  encoding="utf-8")
+    sp.run(["arm-none-eabi-gcc", "-mcpu=cortex-m4", "-mthumb", "-nostdlib",
+            "-ffreestanding", "-T", str(ld), "-o", str(elf), str(src)], check=True)
+    platform = platform_db.get_platform_file("stm32f4")
+    result = RenodeEmulator().run(str(elf), str(platform), ["uart:HELLO_UART"], timeout_s=25)
+    assert result.passed, result.uart_log

@@ -28,4 +28,15 @@
 #define AICAD_GPIO_TRACE_NT(pin_str, level) \
     printf("AICAD_GPIO_EVT %s=%d\n", (pin_str), ((level) ? 1 : 0))
 
+/* CPU run/sleep residency markers (T-FIN7, optional). Print around sleep entry/exit
+ * (e.g. before/after __WFI()) so the power-profile derivation (aicad.powerprofile/1)
+ * can integrate measured run/sleep residency instead of assuming always-active:
+ *
+ *     AICAD_CPU_TRACE("sleep", millis());  __WFI();  AICAD_CPU_TRACE("run", millis());
+ *
+ * state_str must be "run" or "sleep". Works on both backends (plain UART/semihosting
+ * text); the host parser is engine/firmware/powerprofile.py. */
+#define AICAD_CPU_TRACE(state_str, t_ms) \
+    printf("AICAD_CPU_EVT %s t=%lums\n", (state_str), (unsigned long)(t_ms))
+
 #endif /* AICAD_TRACE_H */

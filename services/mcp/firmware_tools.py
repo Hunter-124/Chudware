@@ -141,6 +141,13 @@ def register_firmware_tools(mcp) -> None:
         peripheral the platform lacks, the run refuses honestly: ``passed=False`` with a
         ``platform_capability`` explanation per assertion (see fw_status ``platforms``).
 
+        T-FIN7: when the project is linked to an ECAD board (``board_doc_ref``) and a
+        trace was written, the result also carries ``power_profile_path`` — an
+        ``aicad.powerprofile/1`` artifact (``<elf>.power.json``, contract §11): duty-
+        cycle-weighted per-rail current profile (CPU run/sleep residency + per-pin GPIO
+        duty x the board's T-FIN8 ``eng.supply.rails`` currents). Bookkeeping, not
+        SPICE. Use fw_power_profile to derive one from an existing trace.
+
         Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
         ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.
         """
@@ -197,6 +204,51 @@ def register_firmware_tools(mcp) -> None:
         if emulate:
             p["emulate"] = True
         return _dumps(_fw.fw_verify_board(p))
+
+    @mcp.tool()
+    def fw_power_profile(trace_path: str, project_id: str = "",
+                         board_doc_ref: str = "", mcu_family: str = "",
+                         window_ms: float = 0.0) -> str:
+        """Derive an ``aicad.powerprofile/1`` power/duty-cycle profile (T-FIN7,
+        contracts/firmware_rpc.md §11) from an EXISTING emulation trace — no live
+        emulation needed.
+
+        ``trace_path`` is the ``aicad.firmware.trace/1`` artifact a previous fw_sim_run
+        returned (``<elf>.trace.json``). The profile combines:
+        - CPU run/sleep residency — integrated from optional firmware-side
+          ``AICAD_CPU_TRACE(state, t_ms)`` markers (aicad_trace.h); no markers →
+          honestly assumed 100 % active (``source: "assumed_active"``).
+        - Per-pin GPIO/PWM duty cycles — time-stamped events integrated over the run
+          window (unstamped Renode hook events → duty null + toggle count; no events →
+          the final-snapshot level).
+        - Per-rail currents — each board component's T-FIN8 ``eng.supply.rails``
+          active/sleep currents (contracts/ecad/boardphys.md) weighted by its activity
+          (MCU → CPU residency; loads on nets mapped to observed pins → pin duty; else
+          assumed always active). Unknown currents stay null and are listed in
+          ``coverage`` — never an invented 0.
+
+        Returns ``{schema, model, trace_ref, window_ms, cpu, pins, rails:[{name,
+        voltage_v_nom, i_avg_a, i_peak_a, residency, schedule, provenance}], coverage}``.
+        BOOKKEEPING, not SPICE — ``model`` says so. Each rail's ``schedule`` is the
+        direct ``{"duty", "period_s"}`` heat-load schedule run_fea_thermal transient
+        studies accept (duty-cycle heat loads), and the rails feed the system power
+        budget without re-parsing raw traces.
+
+        ``board_doc_ref`` (an open ECAD doc_id or ``.ecad+``/``.json`` path) beats the
+        project's linked board; with neither, the activity half still returns
+        (``rails: []`` + coverage note). ``window_ms`` overrides the run window when the
+        trace has no time-stamped events.
+        """
+        p: dict = {"trace_path": trace_path}
+        if project_id:
+            p["project_id"] = project_id
+        if board_doc_ref:
+            p["board_doc_ref"] = board_doc_ref
+        if mcu_family:
+            p["mcu_family"] = mcu_family
+        if window_ms:
+            p["window_ms"] = window_ms
+        return _dumps(_fw.fw_power_profile(p))
 
     # -----------------------------------------------------------------------
     # Hardware path (T-C4): probe-rs flash/debug + esptool ESP32 flash

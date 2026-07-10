@@ -241,7 +241,8 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     },
     "firmware": {
         "fw_new_project", "fw_build", "fw_sources", "fw_sim_run", "fw_verify_board",
-        "fw_flash", "fw_debug_start", "fw_debug_halt", "fw_debug_read_mem",
+        "fw_power_profile", "fw_flash", "fw_debug_start", "fw_debug_halt",
+        "fw_debug_read_mem",
     },
     "structural": {
         "struct_analyze", "struct_check", "struct_estimate",

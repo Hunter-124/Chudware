@@ -1476,6 +1476,21 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   link strong enough at the worst instant" in one call. Conditions are `case`-labelled
   per frame; dry_run=True builds loads + envelope without solving.
   Helper builders/validator: services/mcp/simhandoff.py.
+
+SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
+  Bookkeeping (NOT SPICE) rail-tree energy budget composing three seams: an
+  aicad.boardphys/1 sidecar (ecad_to_3d — per-component supply-rail currents, sequencing,
+  optional PDN block from ecad_run_pdn) supplies the LOADS; an aicad.powerprofile/1
+  artifact (fw_sim_run / fw_power_profile — firmware emulation duty cycle) supplies the
+  WEIGHTING; you supply the TREE: source {battery|supply, voltage_v, capacity_mah} →
+  converters [{input, output, topology ldo|buck|boost, efficiency: fixed eta or
+  [[load_frac, eta]] curve points, i_out_max_a}]. Verdict: battery life for the scenario,
+  per-rail avg/peak vs converter rating with margins + worst-rail warning, PDN
+  cross-check (copper drop / hotspots / stale-analysis), sequencing sanity note.
+  No firmware profile → DEGRADED mode: datasheet-typ currents assumed always active,
+  explicitly labelled; unknown currents stay null (sums become labelled floors), every
+  number carries provenance. Also runs inside verify_battery as the 'power_budget'
+  check (kwargs power_source / power_converters / board_path / power_profile_path).
 """
 
 _MOTION_GUIDE = """\

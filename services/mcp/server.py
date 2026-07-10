@@ -293,6 +293,11 @@ register_photo_recon_tools(mcp)
 from mcp_server.firmware_tools import register_firmware_tools
 register_firmware_tools(mcp)
 
+# System power/energy budget (T-FIN23): rail tree (source → converters → boardphys loads),
+# duty-cycle weighting from aicad.powerprofile/1, PDN cross-check, battery-life verdict.
+from mcp_server.power_budget import register_power_budget_tools
+register_power_budget_tools(mcp)
+
 # Structural (T-D2): PyNite member forces & deflections for aicad.structure/1 docs.
 from mcp_server.structural_tools import register_structural_tools
 register_structural_tools(mcp)

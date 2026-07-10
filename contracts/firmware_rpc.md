@@ -223,3 +223,50 @@ canned .resc-generation + schema tests carry coverage, per the §7 precedent.
 
 `toggles:`/`period:` require the `gpio_observe` capability (like `gpio:`);
 `uart_within:` requires `uart`.
+
+## 10. Firmware ↔ board co-verification — `fw_verify_board` (T-FIN6, appended)
+
+Closes the §2 one-way board link: the board generated `pinmap.h`; `fw_verify_board` checks the
+firmware BACK against the board before fab. Engine handler `engine.firmware.mcp_tools.
+fw_verify_board` (checks in `engine.firmware.coverify`), mirrored as an MCP tool and a §8 worker
+method. **Advisory** — findings never block, same posture as ERC/DRC.
+
+`{board_doc_ref, project_id?, sources?:{name:text}, sch_doc_ref?, mcu_family?, trace_path?,
+emulate?:bool}` → `{ok, mcu_family, findings, summary, fw_pins, dynamic}` (or the §1 error
+envelope for an unresolvable board/project or missing sources).
+
+- Firmware pin references (`PIN_<TOKEN>` uses + read/write direction heuristics over the GPIO
+  call vocabulary: STM32 HAL, `gpio_*`, Arduino, RP2040 SDK) come from `sources` when given,
+  else the project's own source files; `pinmap.h` is excluded (declarations, not uses).
+- **Static pass** (always): pin-map token resolution reuses `pinmap.pin_model` — the enriched
+  per-pin record `{net, token, pin_id, positional, strap, input_only, direction, mux}` built
+  with the exact net selection/dedup rules of `generate_pinmap`, so header and model can never
+  disagree. `strap` / `input_only` come from per-family tables in `mcu_pinouts`
+  (`strap_pins()`: STM32 BOOT0/BOOT1/NRST, ESP32 EN/GPIO0/2/12/15, AVR RESET; input-only:
+  ESP32 GPIO34–39). Direction expectations need `sch_doc_ref` (pin types live on symbol pins);
+  without it those checks are skipped honestly. Decoupling rails come from the T-FIN8 eng
+  metadata (`supply.rails`, `contracts/ecad/boardphys.md`) plus power-named nets on the MCU's
+  own pads.
+- **Dynamic pass**: runs when `trace_path` points at a §7 `aicad.firmware.trace/1` artifact,
+  or `emulate=true` launches the project's built ELF through `run_simulation` live (synthetic
+  `gpio:` assertions install pin hooks for every firmware-written positional pin; only the
+  observed events are consumed). Observed pin transitions are mapped back to board nets (exact
+  net-name match, then decoded-pin-id equality) and diffed against netlist expectations.
+  Missing emulators degrade gracefully (`dynamic = {ran:false, reason}`).
+
+Findings use the ERC violation shape (`engine.ecad.erc`) extended append-only with a `fix`
+hint: `{rule, severity: "error"|"warning", net: str|null, pins: [str], xy: null, message, fix}`.
+
+| rule | severity | meaning |
+|---|---|---|
+| `fw_pin_unknown_net` | error | firmware references `PIN_<X>` but no board net produces that token |
+| `fw_pin_not_on_mcu` | warning | the net exists but touches no MCU footprint pad |
+| `fw_strap_repurposed` | error | a boot-strap / reset pin is used as a general GPIO by firmware |
+| `fw_direction_clash` | error | firmware drives a net that already has another push-pull driver (schematic netlist) |
+| `fw_drive_input_only` | error | firmware drives a physical pin with no output driver (e.g. ESP32 GPIO34–39) |
+| `fw_missing_decouple` | warning | an MCU supply rail has no decoupling capacitor footprint on it |
+| `fw_trace_drive_conflict` | error | emulation observed the firmware driving a strap / externally-driven / input-only net |
+| `fw_trace_unmapped_pin` | warning | emulation observed activity on a pin with no corresponding board net |
+
+`summary` = `{n, errors, warnings, rules}`; `fw_pins` = the per-token scan
+`{reads, writes, refs, files}`; `dynamic` = `{ran, source: "trace"|"emulation"|null, reason?}`.

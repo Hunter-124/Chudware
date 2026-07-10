@@ -153,6 +153,51 @@ def register_firmware_tools(mcp) -> None:
             p["assertions"] = assertions
         return _dumps(_fw.fw_sim_run(p))
 
+    @mcp.tool()
+    def fw_verify_board(board_doc_ref: str, project_id: str = "",
+                        sch_doc_ref: str = "", mcu_family: str = "",
+                        trace_path: str = "", emulate: bool = False) -> str:
+        """Firmware↔board co-verification (T-FIN6): check the firmware BACK against the
+        PCB before fab and return ERC/DRC-shaped findings.
+
+        STATIC checks (always run): every firmware-referenced ``PIN_<NET>`` exists as a
+        board net and lands on the MCU footprint; boot-strap/reset pins (BOOT0/NRST,
+        ESP32 GPIO0/2/12/15/EN...) not repurposed as signals; firmware never drives a net
+        that already has another push-pull driver or an input-only pin (needs
+        ``sch_doc_ref`` for netlist pin types — skipped honestly without it); every MCU
+        supply rail has a decoupling capacitor (rails from the T-FIN8 eng metadata +
+        power nets on the MCU's pads).
+
+        DYNAMIC check: pass ``trace_path`` (an ``aicad.firmware.trace/1`` artifact from a
+        previous fw_sim_run, ``<elf>.trace.json``) OR ``emulate=true`` (runs the project's
+        built ELF through Renode/QEMU live) to diff OBSERVED pin activity against the
+        netlist — e.g. the firmware toggling a pin whose net is driven by a peripheral.
+
+        Firmware pin references come from the project's sources (``project_id``);
+        ``pinmap.h`` itself is excluded. ``board_doc_ref``/``sch_doc_ref`` accept an open
+        ECAD doc_id or a ``.ecad+``/``.json`` path.
+
+        Rule ids: fw_pin_unknown_net, fw_pin_not_on_mcu, fw_strap_repurposed,
+        fw_direction_clash, fw_drive_input_only, fw_missing_decouple,
+        fw_trace_drive_conflict, fw_trace_unmapped_pin. Each finding is
+        ``{rule, severity, net, pins, xy, message, fix}`` (the ERC violation shape plus a
+        fix hint). Returns ``{ok, mcu_family, findings, summary, fw_pins, dynamic}``.
+        Advisory — findings never block; missing emulators degrade gracefully
+        (``dynamic.reason``).
+        """
+        p: dict = {"board_doc_ref": board_doc_ref}
+        if project_id:
+            p["project_id"] = project_id
+        if sch_doc_ref:
+            p["sch_doc_ref"] = sch_doc_ref
+        if mcu_family:
+            p["mcu_family"] = mcu_family
+        if trace_path:
+            p["trace_path"] = trace_path
+        if emulate:
+            p["emulate"] = True
+        return _dumps(_fw.fw_verify_board(p))
+
     # -----------------------------------------------------------------------
     # Hardware path (T-C4): probe-rs flash/debug + esptool ESP32 flash
     # -----------------------------------------------------------------------

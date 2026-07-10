@@ -75,6 +75,55 @@ def net_names(doc: dict) -> list[str]:
     return []
 
 
+def pin_model(board_doc: dict, *, mcu_family: Optional[str] = None) -> list[dict]:
+    """Enriched pin model for the co-verification loop (T-FIN6).
+
+    One record per emitted ``PIN_<token>`` (same net selection, ordering, and dedup rules as
+    :func:`generate_pinmap`, so the model and the header can never disagree):
+
+    ``{"net", "token", "pin_id", "positional", "strap", "input_only", "direction", "mux"}``
+
+    ``direction`` / ``mux`` are honest ``None`` here — the board doc alone does not know them;
+    :mod:`engine.firmware.coverify` fills direction expectations from the linked schematic's
+    netlist pin types when one is supplied. ``strap`` / ``input_only`` come from the per-family
+    tables in :mod:`engine.firmware.mcu_pinouts`.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for n in net_names(board_doc):
+        if n and n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    ordered.sort()
+
+    out: list[dict] = []
+    seq = 0
+    used_tokens: set[str] = set()
+    for name in ordered:
+        if is_power_net(name):
+            continue
+        token = _macro_token(name)
+        if token in used_tokens:
+            continue
+        used_tokens.add(token)
+        pin = mcu_pinouts.resolve_pin(name, mcu_family)
+        positional = pin is not None
+        if pin is None:
+            pin = mcu_pinouts.LOGICAL_PIN_BASE + seq
+            seq += 1
+        out.append({
+            "net": name,
+            "token": token,
+            "pin_id": pin,
+            "positional": positional,
+            "strap": mcu_pinouts.is_strap_net(name, mcu_family),
+            "input_only": mcu_pinouts.is_input_only_pin(name, mcu_family),
+            "direction": None,
+            "mux": None,
+        })
+    return out
+
+
 def generate_pinmap(board_doc: dict, *, mcu_family: Optional[str] = None,
                     guard: str = "AICAD_PINMAP_H") -> str:
     """Produce a C header mapping ECAD net names to firmware pin ids.

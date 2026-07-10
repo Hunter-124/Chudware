@@ -345,6 +345,21 @@ except Exception as _fw_import_err:  # noqa: BLE001
         _fw_import_err)
 # === end Firmware seam ===
 
+# Multi-physics Simulate-tab seam (T-FIN24): advanced FEA proxies (ccx buckling /
+# contact), frequency-response post-processing, and cross-sim handoff mirrors
+# (ecad_thermal_handoff / piping_verify_cfd / heatsink_select forward seam) so the
+# desktop Simulate workspace drives the SAME implementations as the MCP tools.
+# Gracefully absent; the GUI's sim_caps doctor shows honest guidance instead.
+try:
+    from engine.sim.multiphysics_rpc import WORKER_METHODS as _MPHYS_METHODS  # noqa: E402
+    _METHODS.update(_MPHYS_METHODS)
+except Exception as _mphys_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine.sim.multiphysics_rpc unavailable — sim_caps/handoff worker methods "
+        "not registered: %s", _mphys_import_err)
+# === end multi-physics seam ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

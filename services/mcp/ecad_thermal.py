@@ -65,10 +65,17 @@ def _dumps(payload: dict) -> str:
 
 def _err(reason: str, hint: str = "", next_actions: Optional[list] = None,
          **extra: Any) -> str:
+    return _dumps(_err_d(reason, hint, next_actions, **extra))
+
+
+def _err_d(reason: str, hint: str = "", next_actions: Optional[list] = None,
+           **extra: Any) -> dict:
+    """Dict-shaped error envelope (thermal_handoff_impl returns dicts; the MCP tool
+    and the GUI worker endpoint each serialize/relay as their transport needs)."""
     out: dict = {"ok": False, "error": reason, "warnings": [],
                  "hint": hint or reason, "next_actions": next_actions or []}
     out.update(extra)
-    return _dumps(out)
+    return out
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -373,6 +380,265 @@ def theta_ja_checks(rows: list, t_amb_c: float, tolerance_pct: float) -> tuple:
 # --------------------------------------------------------------------------- registration
 
 
+# --------------------------------------------------------------------------- shared impl
+# Session-free implementation of the ECAD -> thermal FEA handoff (T-FIN24). The MCP tool
+# below wraps it with the server's session lookup / output-dir conventions; the desktop
+# GUI's worker endpoint (engine_oracle/sim/multiphysics_rpc.py) wraps it with an
+# explicitly-passed board document. ONE pipeline, two transports — the fw_* pattern.
+def thermal_handoff_impl(board_doc: dict, *,
+                         doc_id: str = "",
+                         environment: str = "still_air",
+                         h_w_m2k: Optional[float] = None,
+                         t_amb_c: Optional[float] = None,
+                         include_trace_heating: bool = False,
+                         transient: Optional[dict] = None,
+                         mesh_fineness: float = 0.35,
+                         dry_run: bool = False,
+                         out_path: str = "",
+                         find_pdn=None) -> dict:
+    """Board doc (aicad ECAD board JSON) -> solved thermal FEA study dict.
+
+    Returns the same payload shape as the ecad_thermal_handoff MCP tool (dict, not
+    JSON string), with a validated aicad.simhandoff/1 envelope under "simhandoff".
+    ``find_pdn`` is an optional callable ``(board_name, step_path) -> Optional[dict]``
+    supplying the boardphys PDN block for include_trace_heating (the MCP wrapper
+    injects its sidecar scan; callers without one degrade with a warning).
+    """
+    warnings: list = []
+    if not isinstance(board_doc, dict) or not board_doc:
+        return _err_d("no board document supplied",
+                      hint="thermal handoff needs a routed board's document JSON.",
+                      next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
+
+    try:
+        env = resolve_environment(environment, h_w_m2k, t_amb_c)
+    except ValueError as e:
+        return _err_d(str(e))
+
+    if not out_path:
+        import tempfile
+        out_path = os.path.join(tempfile.gettempdir(),
+                                f"aicad_board_fea_{os.getpid()}.step")
+
+    # ── 1. FEA solid + homogenized material ─────────────────────────────
+    try:
+        from engine.ecad.threed import board_to_fea_step, BoardGeometryError
+    except ImportError as e:
+        return _err_d(f"3D kernel unavailable (ImportError: {e})",
+                      hint="OCP/build123d not installed — the FEA solid cannot be built.",
+                      next_actions=["pip install build123d"], available=False)
+    try:
+        built = board_to_fea_step(board_doc, out_path)
+    except BoardGeometryError as e:
+        return _err_d(f"board geometry failed: {e}",
+                      hint="the board needs a closed Edge.Cuts outline.",
+                      next_actions=["ecad_run_drc()", "ecad_status()"])
+    except Exception as e:  # noqa: BLE001
+        return _err_d(f"FEA solid build failed: {type(e).__name__}: {e}")
+
+    material = built["material"]
+    board_geo = built["board"]
+    components = built["components"]
+    warnings.extend(built["summary"].get("warnings", []))
+
+    # ── 2. heat sources from power metadata ─────────────────────────────
+    schedules = (transient or {}).get("schedules") if isinstance(transient, dict) else None
+    loads, conditions, sources, unpowered = build_heat_loads(components, schedules)
+    coverage = {"n_components": len(components),
+                "n_heat_sources": len(sources),
+                "unpowered_refs": unpowered,
+                "note": ("all components carry power metadata" if not unpowered else
+                         f"{len(unpowered)} component(s) have NO power metadata and "
+                         f"got NO heat source: {', '.join(unpowered)} — seed power_w "
+                         "via library eng blocks or sim_params.eng overrides")}
+    if not sources:
+        return _err_d("no component carries power metadata — nothing to heat",
+                      hint="seed power_w on at least one component "
+                           "(contracts/ecad/boardphys.md eng blocks).",
+                      next_actions=["ecad_status()"], coverage=coverage)
+
+    # ── 3. optional PDN I2R trace heating ───────────────────────────────
+    trace_info = {"included": False}
+    if include_trace_heating:
+        pdn = find_pdn(board_doc.get("name", "board"), out_path) if find_pdn else None
+        if pdn is None:
+            warnings.append("include_trace_heating=True but no PDN I2R map found — "
+                            "run ecad_run_pdn first; continuing without trace heating.")
+        else:
+            i2r_loads, i2r_cond, trace_info = build_i2r_loads(pdn, board_geo)
+            loads.extend(i2r_loads)
+            if i2r_cond:
+                conditions.append(i2r_cond)
+            if trace_info.get("omitted_w"):
+                warnings.append(
+                    f"I2R map truncated to the {trace_info['n_cell_loads']} hottest "
+                    f"cells; {trace_info['omitted_w']} W omitted.")
+
+    # ── 4. convection BCs ───────────────────────────────────────────────
+    comp_rects_top = [c["fea"]["rect_mm"] for c in components
+                      if c.get("fea") and c["fea"].get("side", "top") != "bottom"]
+    top_pts = _rect_grid(board_geo["bbox_mm"], board_geo["z_top_mm"],
+                         exclude=comp_rects_top)
+    for c in components:
+        fea = c.get("fea")
+        if fea and fea.get("side", "top") != "bottom":
+            top_pts += _rect_grid(fea["rect_mm"], fea["z_top_mm"], max_step=1.0)
+    fixtures: list = []
+    conv_loads: list = [
+        {"faces": _faceset(top_pts, [0.0, 0.0, 1.0]), "type": "convection",
+         "h": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]}]
+    if env.get("cold_plate"):
+        fixtures.append({**_faceset(_rect_grid(board_geo["bbox_mm"],
+                                               board_geo["z_bot_mm"]),
+                                    [0.0, 0.0, -1.0]),
+                         "temp_c": env["t_amb_c"]})
+        conditions.append(sh.condition(
+            "cold_plate_bottom", "fixed_temperature", env["t_amb_c"], "C",
+            "environment preset 'cold_plate'", applied_to="board bottom face"))
+    else:
+        conv_loads.append(
+            {"faces": _faceset(_rect_grid(board_geo["bbox_mm"], board_geo["z_bot_mm"]),
+                               [0.0, 0.0, -1.0]),
+             "type": "convection", "h": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]})
+    conditions.append(sh.condition(
+        "convection_env", "convection",
+        {"h_w_m2k": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]},
+        "W/m2-K", f"environment preset {env['name']!r}",
+        applied_to="board top/bottom + component top faces"))
+    warnings.append("component SIDE faces carry no convection (conservative — "
+                    "solved temps run slightly hot)")
+
+    # ── transient spec ──────────────────────────────────────────────────
+    if isinstance(transient, dict) and transient.get("t_end_s"):
+        tr = {"t_end_s": float(transient["t_end_s"]),
+              "dt_s": float(transient.get("dt_s") or 0.0),
+              "t_init_c": float(transient.get("t_init_c", env["t_amb_c"])),
+              "capacitance": transient.get("capacitance", "lumped")}
+        quasi_steady = False
+    else:
+        tr = quasi_steady_transient(board_geo, material, env)
+        tr.pop("_quasi_steady", None)
+        quasi_steady = True
+
+    # ── expectations (theta_ja hand-calc, when known) ───────────────────
+    expectations = []
+    for rec in components:
+        ja = (rec.get("theta_c_per_w") or {}).get("ja")
+        p = component_power_w(rec)
+        if isinstance(ja, (int, float)) and isinstance(p, (int, float)):
+            expectations.append(sh.expectation(
+                f"tj_{rec.get('ref')}_c", round(env["t_amb_c"] + p * ja, 2), "C",
+                f"hand calc Ta + P*theta_ja (JEDEC theta_ja = {ja} C/W; layout-"
+                "dependent seed — generous tolerance applies)"))
+
+    envelope = sh.build_handoff(
+        "ecad_to_thermal_fea",
+        sh.study_ref("ecad", "ecad_thermal_handoff", doc_id=doc_id or None),
+        sh.study_ref("thermal_fea", "run_fea_thermal"),
+        geometry=[sh.geometry_ref("board", "step", path=built["step_path"],
+                                  derived_by="engine.ecad.threed.board_to_fea_step",
+                                  meta={"fused_single_solid": True})],
+        conditions=conditions,
+        expectations=expectations or None,
+        warnings=warnings or None,
+        meta={"environment": env, "material": material,
+              "assumptions": built["assumptions"],
+              "transient": tr, "quasi_steady": quasi_steady})
+
+    base = {
+        "ok": True, "doc_id": doc_id,
+        "step_path": built["step_path"],
+        "environment": env,
+        "material": material,
+        "assumptions": built["assumptions"],
+        "coverage": coverage,
+        "sources": sources,
+        "trace_heating": trace_info,
+        "transient_spec": tr,
+        "quasi_steady": quasi_steady,
+        "warnings": warnings,
+    }
+
+    if dry_run:
+        return sh.attach({
+            **base, "solved": False, "dry_run": True,
+            "n_flux_loads": len(loads), "n_convection_loads": len(conv_loads),
+            "n_fixtures": len(fixtures),
+            "hint": "dry run: geometry + generated BCs + envelope only (no solve). "
+                    f"{len(sources)} heat source(s), env {env['name']!r}.",
+            "next_actions": ["ecad_thermal_handoff(dry_run=False)  # solve"],
+        }, envelope)
+
+    # ── 5. mesh + solve via the core thermal solver ─────────────────────
+    try:
+        from mcp_server import core_bridge as cb
+    except Exception as e:  # noqa: BLE001
+        cb = None
+        mesh_err = f"core bridge import failed: {e}"
+    if cb is not None:
+        try:
+            mesh = cb.call("sim_mesh", {"step_path": built["step_path"],
+                                        "fineness": float(mesh_fineness)})
+        except Exception as e:  # noqa: BLE001
+            mesh = {"ok": False, "error": str(e)}
+        mesh_err = None if mesh.get("ok") else mesh.get("error", "mesh failed")
+    if cb is None or mesh_err:
+        return sh.attach({
+            **base, "solved": False, "dry_run": False,
+            "error_solve": f"FEA leg unavailable: {mesh_err}",
+            "hint": "geometry + BCs + envelope are valid; the mesher/solver "
+                    "(libaicad with Netgen) is not available in this environment.",
+            "next_actions": ["set AI_CAD_LIBAICAD to a sim-enabled libaicad build "
+                             "and retry"],
+        }, envelope)
+
+    study = {"points": mesh["points"], "tets": mesh["tets"],
+             "nodes_per_elem": mesh.get("nodes_per_elem", 4),
+             "material": {"name": material["name"], "k_w_mk": material["k_w_mk"],
+                          "cp_j_kgk": material["cp_j_kgk"],
+                          "rho_kg_m3": material["rho_kg_m3"]},
+             "fixtures": fixtures,
+             "loads": [{k: v for k, v in ld.items() if k != "_ref"} for ld in loads]
+                      + conv_loads,
+             "transient": tr}
+    try:
+        res = cb.call("sim_run_thermal", {"study": study})
+    except Exception as e:  # noqa: BLE001
+        res = {"ok": False, "error": str(e)}
+    if not res.get("ok"):
+        return _err_d(f"thermal solve failed: {res.get('error')}",
+                      hint="try a coarser mesh (mesh_fineness=0.2) or dry_run=True "
+                           "to inspect the generated BCs.",
+                      step_path=built["step_path"])
+
+    rows = map_component_temps(components, mesh["points"],
+                               res.get("temperature") or [],
+                               res.get("envelope_max"))
+    summary = res.get("summary", {})
+    return sh.attach({
+        **base, "solved": True, "dry_run": False,
+        "solver": "C++ core transient conduction (backward Euler, quasi-steady "
+                  "final frame)" if quasi_steady else
+                  "C++ core transient conduction (backward Euler)",
+        "n_nodes": res.get("n_nodes"), "n_elems": res.get("n_elems"),
+        "n_steps": res.get("n_steps"),
+        "board_max_temp_c": summary.get("final_max_temp_c",
+                                        summary.get("max_temp_c")),
+        "board_peak_temp_c": summary.get("max_temp_c"),
+        "summary": summary,
+        "components": rows,
+        "solver_notes": res.get("solver_notes", []),
+        "hint": (f"solved: board max {summary.get('final_max_temp_c', summary.get('max_temp_c'))} C "
+                 f"in {env['name']} (h={env['h_w_m2k']} W/m2K, Ta={env['t_amb_c']} C); "
+                 f"{len(sources)} heat source(s). Run ecad_verify_thermal() for the "
+                 "per-component Tj/limits verdict."),
+        "next_actions": ["ecad_verify_thermal()",
+                         "ecad_thermal_handoff(include_trace_heating=True)  # add "
+                         "copper I2R heating" if not trace_info.get("included") else
+                         "ecad_thermal_handoff(environment='forced_air')  # compare"],
+    }, envelope)
+
+
 def register_ecad_thermal_tools(mcp) -> None:
     """Register ecad_thermal_handoff / ecad_verify_thermal on ``mcp`` (FastMCP)."""
 
@@ -438,242 +704,21 @@ def register_ecad_thermal_tools(mcp) -> None:
         BCs and the aicad.simhandoff/1 envelope (coupling 'ecad_to_thermal_fea') for
         inspection. Then run ecad_verify_thermal() for the Tj/limits verdict.
         """
-        warnings: list = []
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="thermal handoff needs an open routed board.",
                         next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
         board_doc = session.doc
-
-        try:
-            env = resolve_environment(environment, h_w_m2k, t_amb_c)
-        except ValueError as e:
-            return _err(str(e))
-
         out_path = path or str(_default_out_dir(board_doc.get("name", "board"))
                                / "board_fea.step")
-
-        # ── 1. FEA solid + homogenized material ─────────────────────────────
-        try:
-            from engine.ecad.threed import board_to_fea_step, BoardGeometryError
-        except ImportError as e:
-            return _err(f"3D kernel unavailable (ImportError: {e})",
-                        hint="OCP/build123d not installed — the FEA solid cannot be built.",
-                        next_actions=["pip install build123d"], available=False)
-        try:
-            built = board_to_fea_step(board_doc, out_path)
-        except BoardGeometryError as e:
-            return _err(f"board geometry failed: {e}",
-                        hint="the board needs a closed Edge.Cuts outline.",
-                        next_actions=["ecad_run_drc()", "ecad_status()"])
-        except Exception as e:  # noqa: BLE001
-            return _err(f"FEA solid build failed: {type(e).__name__}: {e}")
-
-        material = built["material"]
-        board_geo = built["board"]
-        components = built["components"]
-        warnings.extend(built["summary"].get("warnings", []))
-
-        # ── 2. heat sources from power metadata ─────────────────────────────
-        schedules = (transient or {}).get("schedules") if isinstance(transient, dict) else None
-        loads, conditions, sources, unpowered = build_heat_loads(components, schedules)
-        coverage = {"n_components": len(components),
-                    "n_heat_sources": len(sources),
-                    "unpowered_refs": unpowered,
-                    "note": ("all components carry power metadata" if not unpowered else
-                             f"{len(unpowered)} component(s) have NO power metadata and "
-                             f"got NO heat source: {', '.join(unpowered)} — seed power_w "
-                             "via library eng blocks or sim_params.eng overrides")}
-        if not sources:
-            return _err("no component carries power metadata — nothing to heat",
-                        hint="seed power_w on at least one component "
-                             "(contracts/ecad/boardphys.md eng blocks).",
-                        next_actions=["ecad_status()"], coverage=coverage)
-
-        # ── 3. optional PDN I2R trace heating ───────────────────────────────
-        trace_info = {"included": False}
-        if include_trace_heating:
-            pdn = _find_pdn_block(board_doc.get("name", "board"), out_path)
-            if pdn is None:
-                warnings.append("include_trace_heating=True but no PDN I2R map found — "
-                                "run ecad_run_pdn first; continuing without trace heating.")
-            else:
-                i2r_loads, i2r_cond, trace_info = build_i2r_loads(pdn, board_geo)
-                loads.extend(i2r_loads)
-                if i2r_cond:
-                    conditions.append(i2r_cond)
-                if trace_info.get("omitted_w"):
-                    warnings.append(
-                        f"I2R map truncated to the {trace_info['n_cell_loads']} hottest "
-                        f"cells; {trace_info['omitted_w']} W omitted.")
-
-        # ── 4. convection BCs ───────────────────────────────────────────────
-        comp_rects_top = [c["fea"]["rect_mm"] for c in components
-                          if c.get("fea") and c["fea"].get("side", "top") != "bottom"]
-        top_pts = _rect_grid(board_geo["bbox_mm"], board_geo["z_top_mm"],
-                             exclude=comp_rects_top)
-        for c in components:
-            fea = c.get("fea")
-            if fea and fea.get("side", "top") != "bottom":
-                top_pts += _rect_grid(fea["rect_mm"], fea["z_top_mm"], max_step=1.0)
-        fixtures: list = []
-        conv_loads: list = [
-            {"faces": _faceset(top_pts, [0.0, 0.0, 1.0]), "type": "convection",
-             "h": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]}]
-        if env.get("cold_plate"):
-            fixtures.append({**_faceset(_rect_grid(board_geo["bbox_mm"],
-                                                   board_geo["z_bot_mm"]),
-                                        [0.0, 0.0, -1.0]),
-                             "temp_c": env["t_amb_c"]})
-            conditions.append(sh.condition(
-                "cold_plate_bottom", "fixed_temperature", env["t_amb_c"], "C",
-                "environment preset 'cold_plate'", applied_to="board bottom face"))
-        else:
-            conv_loads.append(
-                {"faces": _faceset(_rect_grid(board_geo["bbox_mm"], board_geo["z_bot_mm"]),
-                                   [0.0, 0.0, -1.0]),
-                 "type": "convection", "h": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]})
-        conditions.append(sh.condition(
-            "convection_env", "convection",
-            {"h_w_m2k": env["h_w_m2k"], "t_amb_c": env["t_amb_c"]},
-            "W/m2-K", f"environment preset {env['name']!r}",
-            applied_to="board top/bottom + component top faces"))
-        warnings.append("component SIDE faces carry no convection (conservative — "
-                        "solved temps run slightly hot)")
-
-        # ── transient spec ──────────────────────────────────────────────────
-        if isinstance(transient, dict) and transient.get("t_end_s"):
-            tr = {"t_end_s": float(transient["t_end_s"]),
-                  "dt_s": float(transient.get("dt_s") or 0.0),
-                  "t_init_c": float(transient.get("t_init_c", env["t_amb_c"])),
-                  "capacitance": transient.get("capacitance", "lumped")}
-            quasi_steady = False
-        else:
-            tr = quasi_steady_transient(board_geo, material, env)
-            tr.pop("_quasi_steady", None)
-            quasi_steady = True
-
-        # ── expectations (theta_ja hand-calc, when known) ───────────────────
-        expectations = []
-        for rec in components:
-            ja = (rec.get("theta_c_per_w") or {}).get("ja")
-            p = component_power_w(rec)
-            if isinstance(ja, (int, float)) and isinstance(p, (int, float)):
-                expectations.append(sh.expectation(
-                    f"tj_{rec.get('ref')}_c", round(env["t_amb_c"] + p * ja, 2), "C",
-                    f"hand calc Ta + P*theta_ja (JEDEC theta_ja = {ja} C/W; layout-"
-                    "dependent seed — generous tolerance applies)"))
-
-        envelope = sh.build_handoff(
-            "ecad_to_thermal_fea",
-            sh.study_ref("ecad", "ecad_thermal_handoff", doc_id=session.doc_id),
-            sh.study_ref("thermal_fea", "run_fea_thermal"),
-            geometry=[sh.geometry_ref("board", "step", path=built["step_path"],
-                                      derived_by="engine.ecad.threed.board_to_fea_step",
-                                      meta={"fused_single_solid": True})],
-            conditions=conditions,
-            expectations=expectations or None,
-            warnings=warnings or None,
-            meta={"environment": env, "material": material,
-                  "assumptions": built["assumptions"],
-                  "transient": tr, "quasi_steady": quasi_steady})
-
-        base = {
-            "ok": True, "doc_id": session.doc_id,
-            "step_path": built["step_path"],
-            "environment": env,
-            "material": material,
-            "assumptions": built["assumptions"],
-            "coverage": coverage,
-            "sources": sources,
-            "trace_heating": trace_info,
-            "transient_spec": tr,
-            "quasi_steady": quasi_steady,
-            "warnings": warnings,
-        }
-
-        if dry_run:
-            _THERMAL["last_handoff"] = None
-            return _dumps(sh.attach({
-                **base, "solved": False, "dry_run": True,
-                "n_flux_loads": len(loads), "n_convection_loads": len(conv_loads),
-                "n_fixtures": len(fixtures),
-                "hint": "dry run: geometry + generated BCs + envelope only (no solve). "
-                        f"{len(sources)} heat source(s), env {env['name']!r}.",
-                "next_actions": ["ecad_thermal_handoff(dry_run=False)  # solve"],
-            }, envelope))
-
-        # ── 5. mesh + solve via the core thermal solver ─────────────────────
-        try:
-            from mcp_server import core_bridge as cb
-        except Exception as e:  # noqa: BLE001
-            cb = None
-            mesh_err = f"core bridge import failed: {e}"
-        if cb is not None:
-            try:
-                mesh = cb.call("sim_mesh", {"step_path": built["step_path"],
-                                            "fineness": float(mesh_fineness)})
-            except Exception as e:  # noqa: BLE001
-                mesh = {"ok": False, "error": str(e)}
-            mesh_err = None if mesh.get("ok") else mesh.get("error", "mesh failed")
-        if cb is None or mesh_err:
-            _THERMAL["last_handoff"] = None
-            return _dumps(sh.attach({
-                **base, "solved": False, "dry_run": False,
-                "error_solve": f"FEA leg unavailable: {mesh_err}",
-                "hint": "geometry + BCs + envelope are valid; the mesher/solver "
-                        "(libaicad with Netgen) is not available in this environment.",
-                "next_actions": ["set AI_CAD_LIBAICAD to a sim-enabled libaicad build "
-                                 "and retry"],
-            }, envelope))
-
-        study = {"points": mesh["points"], "tets": mesh["tets"],
-                 "nodes_per_elem": mesh.get("nodes_per_elem", 4),
-                 "material": {"name": material["name"], "k_w_mk": material["k_w_mk"],
-                              "cp_j_kgk": material["cp_j_kgk"],
-                              "rho_kg_m3": material["rho_kg_m3"]},
-                 "fixtures": fixtures,
-                 "loads": [{k: v for k, v in ld.items() if k != "_ref"} for ld in loads]
-                          + conv_loads,
-                 "transient": tr}
-        try:
-            res = cb.call("sim_run_thermal", {"study": study})
-        except Exception as e:  # noqa: BLE001
-            res = {"ok": False, "error": str(e)}
-        if not res.get("ok"):
-            return _err(f"thermal solve failed: {res.get('error')}",
-                        hint="try a coarser mesh (mesh_fineness=0.2) or dry_run=True "
-                             "to inspect the generated BCs.",
-                        step_path=built["step_path"])
-
-        rows = map_component_temps(components, mesh["points"],
-                                   res.get("temperature") or [],
-                                   res.get("envelope_max"))
-        summary = res.get("summary", {})
-        result = sh.attach({
-            **base, "solved": True, "dry_run": False,
-            "solver": "C++ core transient conduction (backward Euler, quasi-steady "
-                      "final frame)" if quasi_steady else
-                      "C++ core transient conduction (backward Euler)",
-            "n_nodes": res.get("n_nodes"), "n_elems": res.get("n_elems"),
-            "n_steps": res.get("n_steps"),
-            "board_max_temp_c": summary.get("final_max_temp_c",
-                                            summary.get("max_temp_c")),
-            "board_peak_temp_c": summary.get("max_temp_c"),
-            "summary": summary,
-            "components": rows,
-            "solver_notes": res.get("solver_notes", []),
-            "hint": (f"solved: board max {summary.get('final_max_temp_c', summary.get('max_temp_c'))} C "
-                     f"in {env['name']} (h={env['h_w_m2k']} W/m2K, Ta={env['t_amb_c']} C); "
-                     f"{len(sources)} heat source(s). Run ecad_verify_thermal() for the "
-                     "per-component Tj/limits verdict."),
-            "next_actions": ["ecad_verify_thermal()",
-                             "ecad_thermal_handoff(include_trace_heating=True)  # add "
-                             "copper I2R heating" if not trace_info.get("included") else
-                             "ecad_thermal_handoff(environment='forced_air')  # compare"],
-        }, envelope)
-        _THERMAL["last_handoff"] = result
+        result = thermal_handoff_impl(
+            board_doc, doc_id=session.doc_id, environment=environment,
+            h_w_m2k=h_w_m2k, t_amb_c=t_amb_c,
+            include_trace_heating=include_trace_heating, transient=transient,
+            mesh_fineness=mesh_fineness, dry_run=dry_run, out_path=out_path,
+            find_pdn=_find_pdn_block)
+        _THERMAL["last_handoff"] = result if result.get("solved") else None
         return _dumps(result)
 
     @mcp.tool()

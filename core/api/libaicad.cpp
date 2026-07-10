@@ -2591,7 +2591,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (m == "doc_render_png")
                 return emit(aicad::doc::doc_render_png(
                                 params.value("doc_id", std::string()),
-                                params.value("out_path", std::string())),
+                                params.value("out_path", std::string()),
+                                params.value("annotate", true)),
                             out_json, 0);
             if (m == "doc_render_view")
                 return emit(aicad::doc::doc_render_view(

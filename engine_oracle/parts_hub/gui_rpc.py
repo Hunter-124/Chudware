@@ -865,6 +865,40 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
     return None
 
 
+def _family_material(family: str) -> tuple[list[float], float, float]:
+    """(base color, metallic, roughness) for a realistic look. Most mechanical hardware is
+    steel; a few families read better as brass. (The thumbnail rasterizer currently shades on
+    base color only — metallic/roughness are stored for when it gains PBR.)"""
+    fam = family.lower()
+    if "brass" in fam or "bronze" in fam:
+        return ([0.80, 0.62, 0.28], 0.9, 0.35)
+    return ([0.66, 0.67, 0.69], 0.9, 0.38)   # steel grey
+
+
+def _fastener_thread_op(family: str, size: str) -> dict | None:
+    """A `thread` op for a threaded fastener family, else None. External for screws/bolts/studs/
+    rod (threads the shank = the smallest-radius cylinder, since heads are larger Ø), internal for
+    nuts (threads the sole bore cylinder). cut_thread degrades to the plain cylinder on any failure,
+    so a mis-resolved face never breaks the thumbnail."""
+    fam = family.lower()
+    external = fam in ("shcs", "bhcs", "fhcs", "hex_bolt", "socket_set_screw", "threaded_rod") \
+        or any(k in fam for k in ("screw", "bolt", "stud", "rod"))
+    internal = fam == "hex_nut" or "nut" in fam
+    if not (external or internal):
+        return None
+    face: dict = {"of": "face", "surf": "cylindrical"}
+    if not internal:
+        face["pick"] = "inner"   # smallest-radius cylinder = the shank (heads are larger Ø)
+    # add_feature keeps only type/params/refs (normalize_feature flattens both to top level for the
+    # thread handler): scalar options under params, the face selector under refs.target_face.
+    return {"op": "add_feature", "feature": {
+        "type": "thread",
+        "params": {"size": size, "mode": "cut",
+                   "style": "internal" if internal else "external"},
+        "refs": {"target_face": face},
+    }}
+
+
 def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
     """Render a standard (mech_family) library part's actual 3D CAD model to a PNG,
     via the native core: ``parts_make`` (instantiate the parametric family+size — the
@@ -897,7 +931,22 @@ def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
         doc_id = str(r.get("doc_id") or "")
         if not doc_id:
             return None
-        rr = cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(tmp_png)})
+        # Make the (cached) thumbnail look like the real part: a realistic material, and — for
+        # threaded fasteners — real modeled threads via the built-in thread tool. Best-effort and
+        # scoped to THIS render doc; placement is unchanged. A failure renders the plain part.
+        color, metal, rough = _family_material(family)
+        ops: list[dict] = [{"op": "set_appearance", "id": "b1",
+                            "color": color, "metallic": metal, "roughness": rough}]
+        thread_op = _fastener_thread_op(family, size)
+        if thread_op is not None:
+            ops.append(thread_op)
+        try:
+            cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
+        except Exception:  # noqa: BLE001 — material/thread best-effort; render the plain part
+            pass
+        # annotate=False → clean product shot (no face labels / triad / orientation tint).
+        rr = cb.call("doc_render_png",
+                     {"doc_id": doc_id, "out_path": str(tmp_png), "annotate": False})
         if not isinstance(rr, dict) or not rr.get("ok"):
             return None
         p = _pathlib.Path(str(tmp_png))

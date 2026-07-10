@@ -23,6 +23,7 @@
 #include <thread>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <cmath>
@@ -141,6 +142,14 @@ struct SketchState {
     json last_statuses = json::object();   // id -> "under"|"full"|"over"
     std::string last_overall_status;       // "under"|"full"|"over"
     std::vector<double> plane_frame;       // 16 floats, row-major
+
+    // Drag-path solve cache (PERF): the built sketch System + variable layout reused
+    // across the mouse-move frames of ONE drag (doc_sketch_drag). Valid only while
+    // drag_ctx_revision == the session revision it was built at — every applied op
+    // batch (and undo/redo) bumps the revision monotonically, so a stale revision
+    // means "rebuild". No extra locking: drag/commit/apply all run under DocLock.
+    std::shared_ptr<aicad::sketch::DragContext> drag_ctx;
+    long drag_ctx_revision = -1;
 };
 
 struct Session {
@@ -602,22 +611,29 @@ void op_reorder_feature(json& doc, const json& op) {
 
 // Forward declarations (defined later in this TU — same unnamed namespace) so
 // op_sketch_convert can project against compiled geometry from inside the ops path (T-BL43).
-aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat);
+// `pre` (optional) is an already-compiled result of THIS doc — passing it serves the
+// datums/face lookup without another full recompile.
+aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
+                                                  const CompileResult* pre = nullptr);
 json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plane,
                            const json& refs, const CompileResult* pre = nullptr,
                            bool strict = false);
 // T-BL49 associative Convert Entities — re-resolve + re-project every sketch's
 // params.external_refs against the current model state (defined near
 // project_external_refs below; called from apply_ops_locked / doc_rebuild).
-void refresh_sketch_external_refs(json& doc);
+// `cache` (optional) is the owning session's incremental-rebuild CompileCache: the
+// refresh compiles the doc it is HANDED (the session's live tree or apply_ops' working
+// tree of the same doc), and the cache is content-addressed by the env/config/feature
+// hash chain (document.cpp), so a diverged tree simply misses — never served stale.
+void refresh_sketch_external_refs(json& doc, CompileCache* cache = nullptr);
 // sketch3d counterpart (external model references — vertex targets, doc_schema §3B):
 // re-resolve every sketch3d feature's params.external_refs vertex selectors against
 // the current model, writing back last_point + stale so compile_document's sketch3d
 // branch can inject them as fixed ground points (see document.cpp). v1 resolves
 // against the FINAL compiled body/bodies (same convention refresh_sketch_external_refs
 // uses for face/edge selectors) rather than the body-as-of-that-feature — a documented
-// v1 simplification.
-void refresh_sketch3d_external_refs(json& doc);
+// v1 simplification. `cache` as above.
+void refresh_sketch3d_external_refs(json& doc, CompileCache* cache = nullptr);
 void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
@@ -2860,15 +2876,21 @@ json env_from_doc(const json& doc) {
 // CompileCache). Every "compile s.doc now" callsite in this file funnels through
 // here so the whole RPC surface — edits, undo/redo, rebuilds, exports, measures —
 // benefits uniformly. Caller must hold the doc lock (they all do).
-CompileResult compile_session(Session& s) {
-    // Kill-switch: AICAD_INC_REBUILD=0 forces the old always-full-rebuild path
-    // (safety valve while the cache is young; also the A/B lever for benchmarks).
-    static const bool inc_enabled = []() {
+// Kill-switch: AICAD_INC_REBUILD=0 forces the old always-full-rebuild path
+// (safety valve while the cache is young; also the A/B lever for benchmarks).
+// Shared by compile_session and the external-ref refresh compiles (apply_ops_locked /
+// doc_rebuild), so ONE env var disables every cached compile path uniformly.
+bool inc_rebuild_enabled() {
+    static const bool enabled = []() {
         const char* v = std::getenv("AICAD_INC_REBUILD");
         return !(v && v[0] == '0' && v[1] == '\0');
     }();
+    return enabled;
+}
+
+CompileResult compile_session(Session& s) {
     return compile_document(s.doc, env_from_doc(s.doc),
-                            inc_enabled ? s.compile_cache.get() : nullptr);
+                            inc_rebuild_enabled() ? s.compile_cache.get() : nullptr);
 }
 
 const CompileResult& ensure_compiled(Session& s) {
@@ -3241,11 +3263,16 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     // in place (per-ref failures are already absorbed inside as stale marks). Skipped for
     // read-only batches (they leave the doc untouched and return early below).
     if (!is_readonly_batch(ops)) {
+        // Thread the session's incremental-rebuild cache through the refresh compiles:
+        // `working` is THIS doc's tree (s.doc + this batch), and the cache is
+        // content-addressed, so the unchanged feature prefix restores from checkpoints
+        // instead of recompiling the whole tree on every external-ref-bearing batch.
+        CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
         try {
-            refresh_sketch_external_refs(working);
+            refresh_sketch_external_refs(working, cache);
         } catch (...) { /* keep last-good projections */ }
         try {
-            refresh_sketch3d_external_refs(working);
+            refresh_sketch3d_external_refs(working, cache);
         } catch (...) { /* keep last-good ground points */ }
     }
 
@@ -3367,7 +3394,8 @@ json sketch_params(const json& feat) {
 // now surfaces per-feature plane geometry — origin + x_dir/y_dir/normal). Only the
 // reserved factory frames are tried first; an unknown ref falls back to TOP. Throws on
 // no plane ref.
-aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat) {
+aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
+                                                  const CompileResult* pre) {
     json plane_ref;
     if (feat.contains("refs") && feat["refs"].is_object() && feat["refs"].contains("plane"))
         plane_ref = feat["refs"]["plane"];
@@ -3391,7 +3419,12 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
     // lands ON that plane (origin + offset) instead of silently falling back to TOP — which
     // was the long-standing "offset plane sketches on the base plane" bug.
     if (!name.empty()) {
-        CompileResult r = compile_document(doc, env_from_doc(doc));
+        // Serve from the caller's already-compiled result when it has one (the warm
+        // read-cache / refresh_sketch_external_refs' `pre`) — datums are part of every
+        // CompileResult, so this lookup needs no recompile of its own.
+        std::optional<CompileResult> local;
+        if (!pre) local = compile_document(doc, env_from_doc(doc));
+        const CompileResult& r = pre ? *pre : *local;
         if (r.datums.is_array()) {
             auto v3 = [](const json& a, const Eigen::Vector3d& dflt) -> Eigen::Vector3d {
                 if (a.is_array() && a.size() == 3 && a[0].is_number())
@@ -3421,7 +3454,9 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
     // through the origin — the reported bug. Any failure falls through to top() (below).
     if (plane_ref.is_object() && plane_ref.value("kind", std::string()) == "face") {
         try {
-            CompileResult r = compile_document(doc, env_from_doc(doc));
+            std::optional<CompileResult> local;
+            if (!pre) local = compile_document(doc, env_from_doc(doc));
+            const CompileResult& r = pre ? *pre : *local;
             if (!r.shapes.empty()) {
                 const TopoDS_Shape& body = r.shapes.back();
                 TopoDS_Face face;
@@ -3472,8 +3507,14 @@ aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& f
 }
 
 // Session convenience wrapper (the original entry point — all pre-T-BL43 callers).
+// PERF: a valid read-cache compile (compiled_rev == revision, never stale — every
+// geometry-changing op bumps revision) already carries the datums side-channel and the
+// surviving shapes this resolution reads, so serve it instead of recompiling the tree
+// per plane lookup.
 aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
-    return resolve_sketch_plane_doc(s.doc, feat);
+    const CompileResult* pre =
+        (s.compiled && s.compiled_rev == s.revision) ? s.compiled.get() : nullptr;
+    return resolve_sketch_plane_doc(s.doc, feat, pre);
 }
 
 // session.py::_plane_frame — 16-float row-major matrix mapping sketch (u,v,0,1) ->
@@ -3884,11 +3925,12 @@ json doc_rebuild(const std::string& doc_id) {
     // T-BL49 — an explicit rebuild also re-syncs associative Convert Entities (covers
     // mutation paths that bypass doc_apply_ops, e.g. sketch_drag_commit). No revision
     // bump: re-projection is derived data; the compile below sees the refreshed tree.
+    CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
     try {
-        refresh_sketch_external_refs(s.doc);
+        refresh_sketch_external_refs(s.doc, cache);
     } catch (...) { /* keep last-good projections */ }
     try {
-        refresh_sketch3d_external_refs(s.doc);
+        refresh_sketch3d_external_refs(s.doc, cache);
     } catch (...) { /* keep last-good ground points */ }
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
@@ -5005,7 +5047,8 @@ ResolvedView resolve_view_spec(const nlohmann::json& v) {
 // the contact sheet — one renderer, so headless and on-screen stay consistent (CLAUDE.md rule 3).
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
-                        const std::string& header, std::vector<unsigned char>& outImg) {
+                        const std::string& header, std::vector<unsigned char>& outImg,
+                        bool annotate = true) {
     RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
     bool any = false;
     for (const auto& b : bodies)
@@ -5117,7 +5160,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             } else if (orient_tint(fn.x, fn.y, fn.z, tint)) {
                 use_tint = true;  // raw mesh body (no FaceRec) -> legacy per-triangle behaviour
             }
-            if (use_tint) {
+            if (use_tint && annotate) {   // orientation tint is an annotation — off for clean shots
                 const double mix = 0.55;
                 cr = (1 - mix) * br + mix * (tint[0] / 255.0);
                 cg = (1 - mix) * bg + mix * (tint[1] / 255.0);
@@ -5176,8 +5219,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     }
     // (b) ORIENTATION GIZMO bottom-left: the three world axes drawn through the SAME camera so
     //     the model can read which way is +X/+Y/+Z (and thus right/back/top). Fixed screen
-    //     anchor; only the projected screen direction of each axis is used.
-    {
+    //     anchor; only the projected screen direction of each axis is used. Annotation only —
+    //     suppressed for clean product shots.
+    if (annotate) {
         int ox = 40, oy = H - 36;
         const int axlen = 26;
         struct Ax { RV3 v; unsigned char c[3]; const char* n; };
@@ -5206,9 +5250,10 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
 // Thin wrapper over render_view_to_rgb so there is exactly ONE renderer.
 bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
                     const std::vector<RenderLabel>& labels = {},
-                    int W = 512, int H = 400) {
+                    int W = 512, int H = 400, bool annotate = true) {
     std::vector<unsigned char> img;
-    if (!render_view_to_rgb(bodies, labels, W, H, rnorm({1.0, 1.0, 0.8}), std::string(), img))
+    if (!render_view_to_rgb(bodies, labels, W, H, rnorm({1.0, 1.0, 0.8}), std::string(), img,
+                            annotate))
         return false;
     std::string png = encode_png_rgb(W, H, img);
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -5334,14 +5379,17 @@ static std::vector<RenderLabel> principal_face_labels(Session& s) {
     return labels;
 }
 
-json doc_render_png(const std::string& doc_id, const std::string& out_path) {
+json doc_render_png(const std::string& doc_id, const std::string& out_path, bool annotate) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
         std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
-        std::vector<RenderLabel> labels = principal_face_labels(s);
-        bool ok = render_iso_png(bodies, out_path, labels);
+        // annotate=false → a CLEAN product shot: no face callouts, no orientation triad, no
+        // orientation tint (so the true material colour shows). Used for parts-library thumbnails.
+        std::vector<RenderLabel> labels = annotate ? principal_face_labels(s)
+                                                   : std::vector<RenderLabel>{};
+        bool ok = render_iso_png(bodies, out_path, labels, 512, 400, annotate);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
     } catch (const OpError& e) {
         // Bug K8 (P2): a CLOSED/missing doc made require_session throw unknown_doc, which the
@@ -8800,17 +8848,28 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
         throw OpError("invalid_op", "sketch could not be solved for drag",
                       {{"reason", "no solve state"}});
 
-    json env = env_from_doc(s.doc);
+    // Drag-path solve cache: reuse ONE built System across the mouse-move frames of a
+    // drag. Keyed by the session revision — every committed op batch (and undo/redo)
+    // bumps it monotonically, so a stale revision forces a rebuild against the fresh
+    // doc. Only the ctx-BUILD frame needs the sketch json + env (the cached System
+    // already embeds both); later frames skip that re-extraction entirely.
+    SketchState& st = *s.active_sketch;
+    if (st.drag_ctx && st.drag_ctx_revision != s.revision) st.drag_ctx.reset();
     json params = sketch_params(feat);
-    json sk;
-    sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
-    sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
+    json env, sk;
+    if (!st.drag_ctx) {
+        env = env_from_doc(s.doc);
+        sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
+        sk["constraints"] =
+            params.contains("constraints") ? params["constraints"] : json::array();
+    }
 
     std::pair<double, double> target_xy{0.0, 0.0};
     if (xy.is_array() && xy.size() == 2)
         target_xy = {xy[0].get<double>(), xy[1].get<double>()};
-    json res = aicad::sketch::drag(*s.active_sketch->solve_state, handle, target_xy, sk, env,
-                                   targets.is_null() ? json() : targets);
+    json res = aicad::sketch::drag(*st.solve_state, handle, target_xy, sk, env,
+                                   targets.is_null() ? json() : targets, &st.drag_ctx);
+    st.drag_ctx_revision = s.revision;
 
     // Build the entity-coord array from the drag result REGARDLESS of ok/fail. drag() always
     // returns `entities` (live coords on success, frozen coords on a rejected/empty drag), so
@@ -8849,12 +8908,15 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     }
 
     // Remember dragged coords so commit can persist them (transient; no warm churn).
-    s.active_sketch->last_entities = res_entities;
-    s.active_sketch->last_statuses = res.contains("statuses") ? res["statuses"] : json::object();
+    st.last_entities = res_entities;
+    // Statuses are DIAGNOSTICS: the cached drag fast path no longer recomputes them
+    // per frame (topology cannot change mid-drag), so keep serving the drag-start
+    // snapshot already in st.last_statuses (set by enter/solve/previous commit).
+    // Full diagnostics run once in doc_sketch_drag_commit's post-apply re-solve.
 
     json out;
     out["entities"] = entities;
-    out["statuses"] = res.contains("statuses") ? res["statuses"] : json::object();
+    out["statuses"] = st.last_statuses;
     out["solve_rejected"] = false;
     out["constraints"] = sketch_constraints(feat, res_entities);
     out["external"] = sketch_external_map(feat);  // keep converted-entity styling alive mid-drag
@@ -8889,6 +8951,12 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
     }
 
     json resp = apply_ops_locked(s, -1, ops, /*coalesce=*/false);
+
+    // The drag is over: release the cached drag solve context now (the revision bump
+    // above already invalidates it — this just frees the built System promptly). The
+    // re-solve below is where the FULL diagnostics (analyze + per-entity statuses)
+    // run once for the whole drag, so post-release state matches a per-frame solve.
+    if (s.active_sketch) s.active_sketch->drag_ctx.reset();
 
     // Re-solve so warm state matches the freshly persisted doc + refresh constraints.
     if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid) {
@@ -9506,26 +9574,27 @@ bool sketch_auto_coincident_enabled(const json& doc) {
 // Entity id of a handle ("L4.p2" -> "L4"; bare "P3" -> "P3").
 std::string handle_eid(const std::string& h) { return h.substr(0, h.find('.')); }
 
-// Do the sketch's constraints ALREADY coincident-link the two handles? A coincident
-// constraint pins a pair of point handles; we treat a pair as already linked when a
-// `coincident` constraint references BOTH handles (exact-handle match, the granularity
-// the auto pass proposes at). Cheap O(constraints) scan.
-bool already_coincident(const json& constraints, const std::string& ha,
-                        const std::string& hb) {
-    if (!constraints.is_array()) return false;
+// All handle pairs the sketch's constraints ALREADY coincident-link, as an
+// order-normalized "min\x1fmax" hash set. A coincident constraint pins point handles;
+// a pair is linked when ONE `coincident` constraint references BOTH handles
+// (exact-handle match, the granularity the auto pass proposes at). Built ONCE per
+// sketch so the O(E²) proximity loop in coincident_proposals queries in O(1) instead
+// of rescanning the constraint list for every candidate pair.
+std::unordered_set<std::string> coincident_pair_set(const json& constraints) {
+    std::unordered_set<std::string> linked;
+    if (!constraints.is_array()) return linked;
     for (const json& c : constraints) {
         if (!c.is_object() || c.value("type", std::string()) != "coincident") continue;
         if (!c.contains("refs") || !c["refs"].is_array()) continue;
-        bool a = false, b = false;
-        for (const json& r : c["refs"]) {
-            if (!r.is_string()) continue;
-            const std::string s = r.get<std::string>();
-            if (s == ha) a = true;
-            if (s == hb) b = true;
-        }
-        if (a && b) return true;
+        std::vector<std::string> hs;
+        for (const json& r : c["refs"])
+            if (r.is_string()) hs.push_back(r.get<std::string>());
+        for (size_t a = 0; a < hs.size(); ++a)
+            for (size_t b = a + 1; b < hs.size(); ++b)
+                linked.insert(hs[a] < hs[b] ? hs[a] + '\x1f' + hs[b]
+                                            : hs[b] + '\x1f' + hs[a]);
     }
-    return false;
+    return linked;
 }
 
 // Proximity scan: pairs of coincidence-eligible endpoints within tol_mm that are NOT
@@ -9537,6 +9606,7 @@ json coincident_proposals(const json& solved_coords, const json& constraints,
                           double tol_mm) {
     std::vector<aicad::sketch::Endpoint> eps =
         aicad::sketch::entity_endpoints(solved_coords);
+    const std::unordered_set<std::string> linked = coincident_pair_set(constraints);
     struct Cand { int i, j; double gap; };
     std::vector<Cand> cands;
     for (size_t i = 0; i < eps.size(); ++i)
@@ -9545,7 +9615,9 @@ json coincident_proposals(const json& solved_coords, const json& constraints,
             double dx = eps[i].x - eps[j].x, dy = eps[i].y - eps[j].y;
             double gap = std::sqrt(dx * dx + dy * dy);
             if (gap > tol_mm) continue;
-            if (already_coincident(constraints, eps[i].handle, eps[j].handle)) continue;
+            const std::string& ha = eps[i].handle;
+            const std::string& hb = eps[j].handle;
+            if (linked.count(ha < hb ? ha + '\x1f' + hb : hb + '\x1f' + ha)) continue;
             cands.push_back({(int)i, (int)j, gap});
         }
     std::sort(cands.begin(), cands.end(),
@@ -9630,8 +9702,12 @@ aicad::sketch::SketchSolution solve_feat_cold(Session& s, const json& feat) {
 // REDUNDANT (the loop is already pinned) is KEPT — redundant coincidents are harmless
 // and are exactly what closes a touching-corner profile. `gen` mints constraint ids.
 // Returns {applied:[cids], skipped_conflicting:int}. Mutates params IN PLACE on success.
+// `solve_budget_ms` (optional) caps each trial solve's wall clock — set ONLY by the
+// apply_ops edit path (see kInteractiveSolveBudgetMs below); the explicit
+// doc_sketch_auto_constrain RPC keeps the unbudgeted default.
 json apply_coincident_proposals(json& params, const json& proposals, const json& env,
-                                IdGen& gen) {
+                                IdGen& gen,
+                                std::optional<double> solve_budget_ms = std::nullopt) {
     if (!params.contains("constraints") || !params["constraints"].is_array())
         params["constraints"] = json::array();
     json applied = json::array();
@@ -9651,7 +9727,7 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
         sk["entities"] = trial["entities"];
         sk["constraints"] = trial["constraints"];
         aicad::sketch::SketchSolution sol =
-            aicad::sketch::solve_sketch(sk, env, std::nullopt);
+            aicad::sketch::solve_sketch(sk, env, std::nullopt, solve_budget_ms);
         bool conflicts = false;
         for (const std::string& t : sol.conflicting)
             if (t == cid) conflicts = true;
@@ -9674,6 +9750,13 @@ void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_
     if (!sketch_auto_coincident_enabled(working)) return;
     if (!working.contains("features") || !working["features"].is_array()) return;
     const double tol_mm = 1e-4;
+    // Wall-clock budget for the solves this pass runs: it executes INSIDE every
+    // sketch-mutating apply_ops batch under the global doc lock (the drag path has had
+    // a 10 ms budget since day one — see sketch.cpp drag). A pathological sketch now
+    // degrades to "no auto pins this edit" (best-effort, like every other failure here)
+    // instead of stalling all RPC traffic behind the lock. Parity/oracle-facing solves
+    // (check_sketch, doc_sketch_health, the compile pipeline) remain unbudgeted.
+    const double kInteractiveSolveBudgetMs = 100.0;
     json env = env_from_doc(working);
     for (const std::string& fid : sketch_fids) {
         for (json& feat : working["features"]) {
@@ -9686,11 +9769,13 @@ void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_
                 sk["entities"] = params.value("entities", json::array());
                 sk["constraints"] = params.value("constraints", json::array());
                 aicad::sketch::SketchSolution sol =
-                    aicad::sketch::solve_sketch(sk, env, std::nullopt);
+                    aicad::sketch::solve_sketch(sk, env, std::nullopt,
+                                                kInteractiveSolveBudgetMs);
                 if (!sol.converged) break;  // don't auto-touch a broken sketch
                 json proposals = coincident_proposals(sol.entities, sk["constraints"], tol_mm);
                 if (proposals.empty()) break;
-                json res = apply_coincident_proposals(params, proposals, env, gen);
+                json res = apply_coincident_proposals(params, proposals, env, gen,
+                                                      kInteractiveSolveBudgetMs);
                 if (res["applied"].is_array() && !res["applied"].empty())
                     feat["params"] = params;  // write the pinned constraints back
             } catch (...) { /* best-effort: leave the feature untouched */ }
@@ -9789,7 +9874,9 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     if (mregions >= 0) closure["material_regions"] = mregions;
 
     // ---- free-variable narration -------------------------------------------
-    std::vector<aicad::sketch::FreeVar> fvs = aicad::sketch::free_variables(sk, env);
+    // Reuse the cold solve above (sol.x) — free_variables rebuilds the identical
+    // system, so handing it the solved vector skips its redundant second cold solve.
+    std::vector<aicad::sketch::FreeVar> fvs = aicad::sketch::free_variables(sk, env, sol.x);
     json free_vars = json::array();
     // Group per entity for a readable phrase ("line L4: end x, end y").
     std::map<std::string, std::vector<std::string>> by_ent;
@@ -10277,7 +10364,7 @@ void reconcile_external_ref_entities(json& params, json& xr, const json& new_ent
 // geometry only feeds downstream features, so one refresh pass converges in a single step
 // for the supported upstream-source cases; a pathological self-referential loop simply
 // settles on the next rebuild).
-void refresh_sketch_external_refs(json& doc) {
+void refresh_sketch_external_refs(json& doc, CompileCache* cache) {
     if (!doc.contains("features") || !doc["features"].is_array()) return;
     bool any = false;
     for (const json& f : doc["features"]) {
@@ -10290,8 +10377,10 @@ void refresh_sketch_external_refs(json& doc) {
     if (!any) return;
 
     // One compile of the whole doc serves every ref (selectors resolve against the LAST
-    // body, same convention as sketch_convert creation / doc_sketch_project_entities).
-    CompileResult pre = compile_document(doc, env_from_doc(doc));
+    // body, same convention as sketch_convert creation / doc_sketch_project_entities) —
+    // and every per-sketch plane resolution below (passed as `&pre`). Runs through the
+    // session's incremental-rebuild cache when the caller supplied it.
+    CompileResult pre = compile_document(doc, env_from_doc(doc), cache);
     IdGen gen(doc);
     for (json& f : doc["features"]) {
         if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
@@ -10303,7 +10392,7 @@ void refresh_sketch_external_refs(json& doc) {
 
         std::optional<aicad::geom::SketchPlane> plane;
         try {
-            plane = resolve_sketch_plane_doc(doc, f);
+            plane = resolve_sketch_plane_doc(doc, f, &pre);
         } catch (...) { /* dangling plane -> every ref of this sketch goes stale below */ }
 
         for (json& xr : params["external_refs"]) {
@@ -10366,7 +10455,7 @@ json* sketch3d_external_refs_slot(json& f) {
     return nullptr;
 }
 
-void refresh_sketch3d_external_refs(json& doc) {
+void refresh_sketch3d_external_refs(json& doc, CompileCache* cache) {
     if (!doc.contains("features") || !doc["features"].is_array()) return;
     bool any = false;
     for (json& f : doc["features"]) {
@@ -10377,7 +10466,7 @@ void refresh_sketch3d_external_refs(json& doc) {
     }
     if (!any) return;
 
-    CompileResult pre = compile_document(doc, env_from_doc(doc));
+    CompileResult pre = compile_document(doc, env_from_doc(doc), cache);
     if (pre.shapes.empty()) {
         // No body yet (e.g. sketch3d is the very first feature) — every vertex ref
         // goes stale, kept at its last-good point.

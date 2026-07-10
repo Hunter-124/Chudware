@@ -199,7 +199,11 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
 // the model can SEE its current model and self-correct. Returns {"ok": bool, "path": <out>}.
 // Fail-soft: {"ok": false} on no bodies / tessellation or render failure (caller falls back to
 // text-only review). Never throws.
-nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path);
+// annotate=false renders a CLEAN product shot (no face callouts / orientation triad / orientation
+// tint) so the true material colour shows — used for parts-library thumbnails. Default true keeps
+// the legacy annotated iso for the agent vision review.
+nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path,
+                              bool annotate = true);
 
 // doc_render_view: render ONE on-request view to a labelled PNG (task 03). `view` is a view spec:
 // a named view ("front"|"back"|"top"|"bottom"|"left"|"right"|"iso"), an {"azimuth","elevation"}

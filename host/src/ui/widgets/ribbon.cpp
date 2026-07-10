@@ -1648,6 +1648,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                                    isAct ? 0.42f : (tabHov ? 0.34f : 0.20f));
             const float strength = isAct ? 0.30f : (tabHov ? 0.20f : 0.12f);
             ui::coloredRowWash(dl, tp0, tp1, 4.0f, palette.accent, strength, /*selected*/isAct);
+            if (!isAct) {
+                // Resting border on every non-active tab so each tool tab reads as a discrete
+                // button even when not selected/highlighted. A thin hairline, clearly lighter and
+                // thinner than the active tab's colored glow frame (coloredRowWash selected=true).
+                float bc[4];
+                Palette::withAlpha(palette.border, bc, tabHov ? 0.60f : 0.42f);
+                dl->AddRect(tp0, tp1, Palette::toU32(bc), 4.0f, 0, ui::metrics::stroke(1.0f));
+            }
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])

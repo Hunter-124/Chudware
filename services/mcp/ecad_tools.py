@@ -26,6 +26,7 @@ Tools (each returns ``{ok, ...result, warnings:[], hint:"...", next_actions:[...
   ecad_run_drc                        PCB DRC summary with the worst offenders
   ecad_export / ecad_to_3d            wrap fab writers / 3D export (lazy import, clean if unavailable)
   ecad_check_impedance                Z0 + delay for a routed trace vs. target; plain-English reading
+  ecad_stackup_solve                  invert IPC-2141A: targets + fab profile -> stackup + net-class widths
   ecad_tf                             DC .tf: gain/Rin/Rout with a plain-English reading
   ecad_make_board                     one-shot sync->route->fill->DRC; sets current_pcb
 """
@@ -2204,6 +2205,152 @@ def register_ecad_tools(mcp) -> None:
                       + ([f"skew {skew_mm:.3f}mm > 0.2mm"] if skew_mm > 0.2 else []),
             "reading": reading,
             "hint": reading + " " + adj,
+            "next_actions": next_actions,
+        })
+
+    # ---------------------------------------------------------------- stackup advisor
+
+    @mcp.tool()
+    def ecad_stackup_solve(copper_layers: int = 4,
+                           targets: Optional[Union[dict, str]] = None,
+                           profile: str = "auto",
+                           net_map: Optional[Union[dict, str]] = None,
+                           apply: bool = True,
+                           doc_id: str = "") -> str:
+        """Solve a controlled-impedance layer stackup + the trace geometries that hit each
+        impedance target, from a fab-capability profile — then wire the result into the active
+        board so autoroute and DRC honour it.
+
+        ``targets`` maps net-class names to impedance targets: a bare number means single-ended
+        ohms; a dict allows differential pairs. Default (omitted):
+        ``{"se_50": 50, "diff_100": {"type": "diff", "z0": 100}}``.
+        Example: ``{"clk": 50, "usb": {"type": "diff", "z0": 90}}``.
+
+        ``profile`` picks the fab menu (canned data files): 'jlc_4layer_7628' (validated against
+        JLCPCB's published JLC04161H-7628 stackup), 'jlc_6layer_3313', 'generic_2layer', or
+        'auto' (first profile matching ``copper_layers``).
+
+        ``net_map`` optionally assigns existing nets to the solved classes, e.g.
+        ``{"usb": ["USB_DP", "USB_DN"]}`` — those nets then route at the solved width/gap.
+
+        With ``apply=True`` and an active board, the solved stackup replaces the board stackup
+        and each target becomes a net class carrying the solved ``track_width`` (+ ``diff_gap``)
+        — exactly what ecad_autoroute and ecad_run_drc read. With no board open the solve is
+        still returned (design-ahead mode).
+
+        The solver inverts the SAME validated IPC-2141A models ecad_check_impedance uses
+        (microstrip on outer layers, stripline inner), so a solved geometry reads back at target.
+        Infeasible targets fail honestly naming the binding constraint (min_trace / max_trace /
+        min_space).
+        """
+        try:
+            from engine.ecad import stackup as stackup_mod  # lazy import
+        except ImportError as e:  # noqa: BLE001
+            return _err(f"stackup engine unavailable ({e})",
+                        hint="engine.ecad.stackup could not be imported.",
+                        next_actions=["ecad_status()"])
+
+        # --- parse the loose inputs (weak-model friendly: accept JSON strings) ----
+        if isinstance(targets, str) and targets.strip():
+            try:
+                targets = json.loads(targets)
+            except json.JSONDecodeError as e:
+                return _err(f"targets is not valid JSON: {e}",
+                            hint='Pass e.g. {"clk": 50, "usb": {"type": "diff", "z0": 90}}.',
+                            next_actions=["ecad_stackup_solve(targets={'se_50': 50})"])
+        if not targets:
+            targets = {"se_50": 50.0, "diff_100": {"type": "diff", "z0": 100.0}}
+        if isinstance(net_map, str) and net_map.strip():
+            try:
+                net_map = json.loads(net_map)
+            except json.JSONDecodeError as e:
+                return _err(f"net_map is not valid JSON: {e}",
+                            hint='Pass e.g. {"usb": ["USB_DP", "USB_DN"]}.')
+
+        # --- solve -----------------------------------------------------------------
+        try:
+            sol = stackup_mod.solve_stackup(copper_layers, targets, profile=profile)
+        except stackup_mod.StackupInfeasible as e:
+            return _err(str(e),
+                        hint=f"Binding constraint: {e.binding}. Relax the target, pick a "
+                             "profile with a thinner outer dielectric, or accept the nearest "
+                             "feasible impedance.",
+                        next_actions=[
+                            "ecad_stackup_solve(copper_layers=4, "
+                            "profile='jlc_4layer_7628')  # thin 7628 outer dielectric",
+                            "ecad_check_impedance()  # see what the current geometry gives",
+                        ])
+        except ValueError as e:
+            return _err(str(e),
+                        hint="Available fab profiles: "
+                             f"{', '.join(stackup_mod.list_profiles())}.",
+                        next_actions=["ecad_stackup_solve(copper_layers=4, profile='auto')"])
+
+        # --- narrate the solve -------------------------------------------------------
+        lines: list[str] = []
+        for name, geo in sol["geometries"].items():
+            g0 = geo["layers"][sol["signal_layers"][0]]
+            if geo["type"] == "diff":
+                lines.append(
+                    f"{name}: {geo['z0_target']:.0f} ohm differential -> "
+                    f"w={geo['track_width']:.3f} mm, gap={geo['diff_gap']:.3f} mm "
+                    f"({g0['kind']} on {sol['signal_layers'][0]}, h={g0['h']:.4f} mm)")
+            else:
+                lines.append(
+                    f"{name}: {geo['z0_target']:.0f} ohm single-ended -> "
+                    f"w={geo['track_width']:.3f} mm "
+                    f"({g0['kind']} on {sol['signal_layers'][0]}, h={g0['h']:.4f} mm)")
+        reading = (f"Stackup '{sol['profile']}' ({copper_layers} layers, "
+                   f"{sol['stackup']['thickness']:.2f} mm): " + "; ".join(lines))
+
+        # --- wire into the active board -----------------------------------------------
+        applied = False
+        wired: dict = {}
+        session = None
+        if apply:
+            try:
+                session = _get_pcb(doc_id or None)
+            except OpError:
+                session = None
+        if session is not None:
+            import copy as _copy
+            new_doc = _copy.deepcopy(session.doc)
+            try:
+                wired = stackup_mod.apply_solution(new_doc, sol, net_map=net_map or None)
+                ecad_session.swap_doc(session, new_doc)
+                applied = True
+            except (ValueError, OpError) as e:
+                return _err(f"solved OK but could not apply to the board: {e}",
+                            hint="The solve result is valid; fix the net_map / board and retry.",
+                            next_actions=["ecad_status()"])
+
+        if applied:
+            hint = (reading + " Applied to the board: stackup replaced and net classes "
+                    "updated — ecad_autoroute()/ecad_run_drc() now use the solved widths.")
+            next_actions = ["ecad_autoroute()  # routes at the solved widths/gaps",
+                            "ecad_check_impedance()  # verify routed traces read back at target",
+                            "ecad_run_drc()"]
+        else:
+            hint = (reading + " No active board (or apply=False) — solve returned for "
+                    "design-ahead; open a board and re-run with apply=True to wire it in.")
+            next_actions = ["ecad_new_pcb('myboard')",
+                            f"ecad_stackup_solve(copper_layers={copper_layers}, "
+                            f"profile='{sol['profile']}')"]
+
+        return _dumps({
+            "ok": True,
+            "doc_id": session.doc_id if session is not None else None,
+            "applied": applied,
+            "profile": sol["profile"],
+            "stackup": sol["stackup"],
+            "layer_roles": sol["layer_roles"],
+            "signal_layers": sol["signal_layers"],
+            "geometries": sol["geometries"],
+            "net_classes_written": wired.get("classes", []),
+            "nets_assigned": wired.get("assigned", {}),
+            "warnings": [],
+            "reading": reading,
+            "hint": hint,
             "next_actions": next_actions,
         })
 

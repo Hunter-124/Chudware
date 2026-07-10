@@ -89,10 +89,11 @@ Reproduce/profile (harness sources in the session scratchpad, or rebuild — see
 ## Build / deploy / profile recipes
 - **Core lib**: `ninja -C core/build-occt-linux libaicad.so` (Release -O3). `document.cpp` is in
   `aicad_doc`; thread geom is in `aicad_geom_occt` (NOT `aicad_geom` — that archive is stale).
-- **Deploy to the MCP engine** (memory: NEVER `cp` over a live `.so` → SIGBUS; temp+rename):
-  `cp core/build-occt-linux/bin/libaicad.so services/dist/AI-CAD/libaicad.so.new && mv -f
-  services/dist/AI-CAD/libaicad.so.new services/dist/AI-CAD/libaicad.so`. The running MCP engine
-  only reloads on respawn (doc_id counter resets to 1).
+- **Deploy to the MCP engine**: `./build.sh stage` — stages libaicad.so + its Netgen/lib3mf
+  siblings AND aicad-hostd from `core/build-occt-linux/bin` into `services/dist/AI-CAD/` via
+  copy-to-temp + atomic rename (memory: NEVER `cp` over a live `.so` → SIGBUS; the script does
+  the temp+rename for you). The running MCP engine only reloads on respawn (doc_id counter
+  resets to 1); a running hostd daemon self-drains on the mtime flip.
 - **Host GUI**: `ninja -C host/build-linux CMakeFiles/AI-CAD.dir/src/ui/pm_forms.cpp.o` to
   compile-check one TU; `ninja -C host/build-linux AI-CAD` for the full app.
 - **Clean perf harness** (bypasses server/autosave/multi-doc confound — the ONLY reliable way to

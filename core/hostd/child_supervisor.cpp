@@ -43,7 +43,14 @@ void ChildSupervisor::shutdown() {
         if (!started_) return;
     }
     stopAll();
-    stopping_ = true;
+    {
+        // Under mtx_: the reaper's idle cv_.wait re-checks stopping_ under this
+        // same lock, so flipping it locked + notifying cannot lose the wakeup
+        // (an unlocked write could land between the predicate check and the
+        // block, leaving the reaper asleep forever).
+        std::lock_guard<std::mutex> lk(mtx_);
+        stopping_ = true;
+    }
     cv_.notify_all();
     if (reaper_.joinable()) reaper_.join();
     std::lock_guard<std::mutex> lk(mtx_);
@@ -117,7 +124,19 @@ void ChildSupervisor::reaperLoop() {
             }
             reapLocked(cur, WNOHANG);
         }
-        cv_.wait_for(lk, std::chrono::milliseconds(200));
+        if (children_.empty() && pendingSpawns_.empty()) {
+            // Idle: nothing to reap and no kill deadline to enforce — sleep
+            // until an event notifies instead of spinning at 200 ms forever.
+            // Every mutation that ends the idle state notify_all()s under mtx_:
+            // agent_spawn (pendingSpawns_ push), agent_stop (deadline arm),
+            // doSpawn (children_ insert) and shutdown (stopping_, set locked).
+            cv_.wait(lk, [this] {
+                return stopping_.load() || !children_.empty() || !pendingSpawns_.empty();
+            });
+        } else {
+            // Children live: the 200 ms cadence IS the reap / kill-deadline poll.
+            cv_.wait_for(lk, std::chrono::milliseconds(200));
+        }
     }
     // Shutting down: fail any spawn still queued so its caller doesn't hang.
     while (!pendingSpawns_.empty()) {

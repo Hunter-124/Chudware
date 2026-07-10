@@ -158,6 +158,15 @@ outliving its binaries:
   `docs/PACKAGING_WINDOWS.md` manual checklist.
 - **Upgrades**: installers stop the daemon before replacing binaries; deploys
   must always be temp-file + RENAME, never `cp` over a live .so (SIGBUS).
+- **Dev tree (Linux)**: `./build.sh stage` deploys `libaicad.so` (+ Netgen/
+  lib3mf siblings) AND `aicad-hostd` from `core/build-occt-linux/bin` into
+  `services/dist/AI-CAD/` (the `$AI_CAD_DIST` dir both `core_bridge` and
+  `daemon_bridge.resolve_hostd_bin` try first), each file via copy-to-temp +
+  atomic rename. Always stage the pair together: the daemon instance key is
+  the fnv of the hostd binary's realpath, so a dist libaicad.so with only a
+  build-dir hostd silently splits clients across two engines. On Windows,
+  `build.bat` stages `aicad-hostd.exe` into `dist\AI-CAD` alongside the core
+  DLLs (warn+skip when not built, like `build_release.py`).
 
 ## Troubleshooting
 

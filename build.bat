@@ -99,6 +99,23 @@ if /i not "%MODE%"=="app" (
       echo [build]        running AI-CAD MCP server ^(both load libaicad.dll / OCCT TK*.dll^), then rerun.
       goto :fail
     )
+    rem --- stage aicad-hostd.exe from the SAME build tree as libaicad.dll: clients key
+    rem     the daemon instance on the hostd binary path (fnv of realpath), so a dist
+    rem     libaicad without a dist hostd silently splits clients across two engines
+    rem     (daemon_bridge.resolve_hostd_bin tries %AI_CAD_DIST%\aicad-hostd.exe FIRST).
+    rem     Mirrors build_release.py's payload staging; warn+skip when not built.
+    if exist "%CORE_BIN%\aicad-hostd.exe" (
+      robocopy "%CORE_BIN%" "%DIST%" aicad-hostd.exe aicad-hostd.pdb /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+      if errorlevel 8 (
+        echo [build] ERROR: could not stage aicad-hostd.exe -- it is locked ^(daemon running^).
+        echo [build]        Stop it first:  "%DIST%\aicad-hostd.exe" --stop   then rerun.
+        goto :fail
+      )
+    ) else (
+      echo [build] WARNING: aicad-hostd.exe not found in %CORE_BIN% -- engine daemon NOT staged.
+      echo [build]          MCP clients resolving %DIST% cannot spawn/share the hostd engine.
+      echo [build]          Build it:  cmake --build --preset windows-occt --target aicad-hostd
+    )
   ) else (
     echo [build] WARNING: libaicad.dll not found in core\build-occt\bin\Release OR build\windows-occt\bin
     echo [build]          -- C++ core NOT staged. Doc/sketch/extrude ops have NO engine (the Python

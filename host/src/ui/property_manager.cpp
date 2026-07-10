@@ -23,12 +23,51 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "engine_backend.h"   // Phase 4: daemon edit_hold/edit_release (services/worker)
+#include "ipc_client.h"       // services/ipc EngineClient
 #include "../render/id_pass.h"
 
 namespace ui {
 
 // C37-F: Debounce window for live preview (was 0.40 s; reduced for snappier feel).
 static const double kDebounceSec = 0.25;
+
+// ---- Phase 4: daemon edit-hold helpers (no-ops in legacy in-process mode) ----
+// Take/refresh the exclusive edit-hold on `docId` so foreign clients (MCP
+// agents) get a retriable busy_preview while this form previews. Returns false
+// only on a busy rejection (another client holds it).
+static bool pmEditHold(const std::string& docId, std::string* holderOut = nullptr) {
+    if (!engine::daemonMode() || docId.empty()) return true;
+    auto* c = engine::client();
+    if (!c) return true;
+    nlohmann::json r; std::string e;
+    if (c->call("edit_hold", {{"doc_id", docId}}, r, e)) return true;
+    if (r.is_object() && r.value("code", std::string()) == "busy_preview") {
+        if (holderOut) *holderOut = r.value("holder", std::string("another client"));
+        return false;
+    }
+    return true;  // transport hiccup: don't block the human's edit
+}
+static void pmEditRelease(const std::string& docId) {
+    if (!engine::daemonMode() || docId.empty()) return;
+    if (auto* c = engine::client()) {
+        nlohmann::json r; std::string e;
+        c->call("edit_release", {{"doc_id", docId}}, r, e);
+    }
+}
+// Open-time hold: busy is surfaced as a warning toast but does NOT block the
+// form (human steering wins; the CAS overlap guard covers a real race).
+static std::string pmTakeOpenHold(AppState& st) {
+    if (!engine::daemonMode() || !st.docMirror.hasDoc()) return std::string();
+    const std::string docId = st.docMirror.docId();
+    std::string holder;
+    if (!pmEditHold(docId, &holder)) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Another client (" + holder + ") is editing this part — previews may conflict");
+        return std::string();
+    }
+    return docId;
+}
 
 // ---- field enable helpers -------------------------------------------------
 
@@ -435,6 +474,9 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
+    // Phase 4: exclusive daemon edit-hold while this form previews (released in close()).
+    holdDocId_ = pmTakeOpenHold(st);
+    lastHoldTime_ = ImGui::GetTime();
 
     ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
@@ -645,6 +687,9 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
+    // Phase 4: exclusive daemon edit-hold while this form previews (released in close()).
+    holdDocId_ = pmTakeOpenHold(st);
+    lastHoldTime_ = ImGui::GetTime();
 
     ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
@@ -915,6 +960,8 @@ void PropertyManager::reformatDimDisplays() {
 }
 
 void PropertyManager::close() {
+    pmEditRelease(holdDocId_);   // Phase 4: both OK and Cancel funnel through here
+    holdDocId_.clear();
     active_ = false;
     editMode_ = false;
     form_ = nullptr;
@@ -2043,6 +2090,13 @@ bool PropertyManager::applyPreview(AppState& st) {
 }
 
 void PropertyManager::tick(AppState& st) {
+    // Phase 4: keep the daemon edit-hold fresh while the form is open. The
+    // daemon already refreshes it on every preview op; this covers an open-but-
+    // idle form, rate-limited to once/second.
+    if (active_ && !holdDocId_.empty() && ImGui::GetTime() - lastHoldTime_ > 1.0) {
+        pmEditHold(holdDocId_);
+        lastHoldTime_ = ImGui::GetTime();
+    }
     if (!active_ || !dirty_) return;
     double now = ImGui::GetTime();
     if (now - lastEditTime_ < kDebounceSec) return;

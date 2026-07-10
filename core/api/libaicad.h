@@ -60,6 +60,12 @@ AICAD_API void aicad_free(char* s);
 // a stale/incompatible libaicad.dll before routing real calls to it.
 AICAD_API const char* aicad_abi_version(void);
 
+// The git-describe build id captured at CMake configure time (same value
+// aicad-hostd reports as its own build id — both are configured from ONE
+// version header, so a hostd/libaicad pair from the same build always match).
+// Drives the version drain-replace staleness check (see docs/HOSTD.md).
+AICAD_API const char* aicad_build_id(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

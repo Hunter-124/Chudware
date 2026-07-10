@@ -83,7 +83,13 @@ _ECAD_SESSION_ID = _uuid_ecad.uuid4().hex[:12]
 
 def enable_ecad_autosave() -> None:
     """Arm ECAD crash-recovery autosave for this server process. Called once from
-    server._warm_core at startup. Best-effort."""
+    server._warm_core at startup. Best-effort.
+
+    NOTE (daemon mode): unlike the C++ part-doc autosave — which moved into
+    aicad-hostd (core/hostd/autosave.cpp) and is DISABLED in cad_tools when
+    AI_CAD_ENGINE_DAEMON=1 — ECAD docs are pure Python living in THIS process,
+    invisible to the daemon, and engine.ecad.autosave is mutation-hooked (no
+    threading.Timer chain). So it stays armed in both modes."""
     try:
         from engine.ecad import autosave as _eauto
         _eauto.enable(_ECAD_SESSION_ID)

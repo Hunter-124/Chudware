@@ -23,6 +23,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "AI-CAD.exe"
+# Engine host daemon (core/hostd). MSVC builds of aicad-hostd are new — absence is a
+# warning + skip, not a failure (the app falls back to legacy in-process engine mode).
+HOSTD_EXE_CANDIDATES = (
+    REPO / "core" / "build" / "bin" / "Release" / "aicad-hostd.exe",
+    REPO / "core" / "build" / "bin" / "aicad-hostd.exe",
+)
 _IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "samples", "test_*", ".ready.json")
 
 
@@ -77,6 +83,20 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
         manifest["components"]["exe"] = True
     else:
         manifest["components"]["exe"] = False  # build it with: cmake --build host/build --config Release
+
+    # aicad-hostd.exe (+ .pdb when present) — staged next to AI-CAD.exe/libaicad.dll so
+    # install.ps1 can stop/replace it and register_mcp can pin AICAD_HOSTD_BIN at it.
+    hostd = next((p for p in HOSTD_EXE_CANDIDATES if p.exists()), None)
+    if hostd is not None:
+        shutil.copy2(hostd, dst / "aicad-hostd.exe")
+        pdb = hostd.with_suffix(".pdb")
+        if pdb.exists():
+            shutil.copy2(pdb, dst / "aicad-hostd.pdb")
+        manifest["components"]["hostd"] = True
+    else:
+        print("warning: aicad-hostd.exe not found (cmake --build core\\build --config Release "
+              "--target aicad-hostd) — payload ships without the engine daemon", file=sys.stderr)
+        manifest["components"]["hostd"] = False
 
     # brand + font assets (loaded by the GUI from <exedir>/assets)
     assets_src = REPO / "host" / "assets"

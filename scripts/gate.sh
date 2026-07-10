@@ -212,6 +212,100 @@ stage_ctest() {
     echo "  PASS (${passed:-ok})"
 }
 
+# ---- Stage 3b: aicad-hostd smoke ---------------------------------------------
+# The shared engine-host daemon (core/hostd): spawn -> connect -> engine call ->
+# idle-exit, dual-client race -> one daemon, --stop, kill -9 stale-socket
+# recovery. Uses a scratch AICAD_INSTANCE_KEY so a live dev/installed daemon is
+# never touched. FATAL when the binary exists and the suite fails.
+stage_hostd_smoke() {
+    echo "=== [3b/6] hostd smoke ==="
+    local hostd=""
+    for cand in core/build-occt-linux/bin/aicad-hostd core/build-linux/bin/aicad-hostd; do
+        [ -x "$cand" ] && { hostd="$cand"; break; }
+    done
+    if [ -z "$hostd" ]; then
+        record "hostd smoke         SKIP    aicad-hostd not built"
+        echo "  SKIP: no aicad-hostd binary"
+        return 0
+    fi
+    if python3 scripts/hostd_smoke.py "$hostd" > /tmp/gate_hostd.out 2>&1; then
+        record "hostd smoke         PASS    lifecycle + race + stop + recovery"
+        echo "  PASS"
+    else
+        record "hostd smoke         FAIL    see /tmp/gate_hostd.out"
+        echo "  FAIL: hostd smoke"; tail -n 12 /tmp/gate_hostd.out | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+
+# ---- Stage 3c: AppImage smoke (advisory, env-gated) ---------------------------
+# Builds the AppImage (wheelhouse skipped for speed — provisioning isn't what this
+# stage tests) and boots it headless in daemon mode: screenshot must render, exit 0,
+# and the bundled aicad-hostd must idle-exit after its linger. ADVISORY: failures are
+# RECORDED as WARN, never fatal (packaging tooling + xvfb are machine-dependent).
+# Opt in with AICAD_GATE_APPIMAGE=1. A scratch AICAD_INSTANCE_KEY isolates the run
+# from any live dev/installed daemon.
+stage_appimage_smoke() {
+    echo "=== [3c/6] AppImage smoke (advisory) ==="
+    if [ "${AICAD_GATE_APPIMAGE:-0}" != "1" ]; then
+        record "appimage smoke      SKIP    set AICAD_GATE_APPIMAGE=1 to build + boot the AppImage"
+        echo "  SKIP: AICAD_GATE_APPIMAGE not set"
+        return 0
+    fi
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+        record "appimage smoke      SKIP    xvfb-run not on PATH"
+        echo "  SKIP: xvfb-run not installed"
+        return 0
+    fi
+    local out=/tmp/gate_appimage
+    rm -rf "$out"; mkdir -p "$out"
+    if ! packaging/linux/build_appimage.sh --out "$out" --skip-wheels \
+            > /tmp/gate_appimage.out 2>&1; then
+        record "appimage smoke      WARN    AppImage build failed (see /tmp/gate_appimage.out)"
+        echo "  WARN: build failed"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+        return 0
+    fi
+    local img
+    img="$(ls "$out"/AI-CAD-*.AppImage 2>/dev/null | head -1)"
+    if [ -z "$img" ]; then
+        record "appimage smoke      WARN    build reported success but no .AppImage produced"
+        echo "  WARN: no artifact"; return 0
+    fi
+    local shot=/tmp/appimage_shot.png key="gateimg$$"
+    rm -f "$shot"
+    local rc=0
+    AI_CAD_ENGINE_DAEMON=1 AICAD_HOSTD_LINGER_SECS=5 AICAD_INSTANCE_KEY="$key" \
+        xvfb-run -a "$img" --appimage-extract-and-run --ui-screenshot "$shot" \
+        >> /tmp/gate_appimage.out 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        record "appimage smoke      WARN    AppImage exited rc=$rc (see /tmp/gate_appimage.out)"
+        echo "  WARN: run rc=$rc"; tail -n 10 /tmp/gate_appimage.out | sed 's/^/    /'
+        return 0
+    fi
+    if [ ! -s "$shot" ]; then
+        record "appimage smoke      WARN    screenshot not produced ($shot)"
+        echo "  WARN: no screenshot"; return 0
+    fi
+    # Daemon hygiene: the GUI exits after the shot; its hostd (scratch key) must
+    # idle-exit within linger (5 s) + grace.
+    sleep 9
+    local leftover
+    leftover="$(pgrep -af aicad-hostd | grep -F "$key" || true)"
+    if [ -z "$leftover" ]; then
+        # Instance key travels via env, not argv — also check any hostd running out of
+        # an AppImage extraction dir (this run's daemon path is unique to the extract).
+        leftover="$(pgrep -af 'appimage.*aicad-hostd|aicad-hostd.*appimage_extracted' || true)"
+    fi
+    if [ -n "$leftover" ]; then
+        record "appimage smoke      WARN    aicad-hostd still running after linger+grace"
+        echo "  WARN: leftover daemon:"; echo "$leftover" | sed 's/^/    /'
+        pkill -f 'appimage_extracted.*aicad-hostd' 2>/dev/null || true
+        return 0
+    fi
+    record "appimage smoke      PASS    built $(basename "$img") + xvfb screenshot + daemon idle-exit"
+    echo "  PASS ($(du -h "$img" | cut -f1) image, shot at $shot)"
+}
+
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 # Uses the mcp-venv (~/.local/share/AI-CAD/mcp-venv/bin/python) when present — that
 # venv has all service/oracle deps installed. Falls back to the old venv search and
@@ -422,6 +516,47 @@ stage_bench() {
     echo "  PASS"; tail -n 8 /tmp/gate_bench.out | sed 's/^/    /'
 }
 
+# ---- Stage 7: modeling perf-regression (tools/perf_regression.py) -----------
+# Times the geometry kernel against tools/perf_baseline.json and flags median slowdowns.
+# Env-gated (perf timings are machine + load sensitive, so this is NOT a hard blocker by
+# default): set AICAD_RUN_PERF=1 to run. A regression is RECORDED (non-fatal) unless
+# AICAD_PERF_FATAL=1. Needs a loadable .so — prefers the freshly built build-occt-linux
+# engine (the profiler/contention RPCs live there); falls back to whatever core_bridge
+# resolves. Update the baseline deliberately with `python tools/perf_regression.py --update`.
+stage_perf() {
+    echo "=== [7/7] modeling perf-regression ==="
+    if [ "${AICAD_RUN_PERF:-0}" != "1" ]; then
+        record "perf-regression     SKIP    set AICAD_RUN_PERF=1 to time the modeling kernel"
+        echo "  SKIP: AICAD_RUN_PERF not set"
+        return 0
+    fi
+    local perf_py="$HOME/.local/share/AI-CAD/mcp-venv/bin/python"
+    [ -x "$perf_py" ] || perf_py="$(command -v python3)"
+    if [ -z "$perf_py" ]; then
+        record "perf-regression     SKIP    no python for perf harness"
+        echo "  SKIP: no python"; return 0
+    fi
+    # Prefer the just-built OCCT engine so the contention/per-feature diagnostics are captured.
+    if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$REPO/core/build-occt-linux/bin/libaicad.so" ]; then
+        export AI_CAD_LIBAICAD="$REPO/core/build-occt-linux/bin/libaicad.so"
+    fi
+    local rc=0
+    "$perf_py" "$REPO/tools/perf_regression.py" --iters "${AICAD_PERF_ITERS:-5}" \
+        --json /tmp/gate_perf.json > /tmp/gate_perf.out 2>&1 || rc=$?
+    tail -n 16 /tmp/gate_perf.out | sed 's/^/    /'
+    if [ "$rc" -eq 0 ]; then
+        record "perf-regression     PASS    no median regressions vs baseline"
+        echo "  PASS"
+    elif [ "$rc" -eq 1 ]; then
+        record "perf-regression     $([ "${AICAD_PERF_FATAL:-0}" = 1 ] && echo FAIL || echo WARN)    median regression vs baseline (see /tmp/gate_perf.out)"
+        echo "  REGRESSION detected"
+        [ "${AICAD_PERF_FATAL:-0}" = 1 ] && fail_fatal=1
+    else
+        record "perf-regression     SKIP    harness could not run (rc=$rc; likely no loadable .so)"
+        echo "  SKIP: harness rc=$rc"
+    fi
+}
+
 # ---- Stage 4.5: V&V benchmark smoke (T-BL01) --------------------------------
 # Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode
 # (pure-Python families only — no .so required for the smoke subset).
@@ -559,11 +694,14 @@ stage_ui_style_check
 stage_core_build
 stage_ui_abstract
 stage_ctest
+stage_hostd_smoke
+stage_appimage_smoke
 stage_pytest
 stage_vv
 stage_modeling
 stage_ui_imgui
 stage_bench
+stage_perf
 
 echo
 echo "============================================================"

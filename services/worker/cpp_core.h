@@ -29,6 +29,12 @@ public:
     bool ensureLoaded(std::string& err);
     bool available() const { return loaded_; }
     std::string abiVersion() const { return abi_; }
+    // git-describe build id of the loaded engine ("" until loaded, or when the
+    // .so predates the aicad_build_id export — callers tolerate absence).
+    std::string buildId() const { return build_id_; }
+    // Absolute path of the loaded library ("" until loaded). The hostd stale-
+    // binary self-drain stats this file for mtime changes.
+    std::string loadedPath() const { return path_; }
 
     // Dispatch a call into the C++ core. Returns true iff the core HANDLED the
     // method (aicad_call returned 0); `result` then holds its result object. On
@@ -43,6 +49,8 @@ private:
     bool tried_ = false;
     bool loaded_ = false;
     std::string abi_;
+    std::string build_id_;
+    std::string path_;
     void* dll_ = nullptr;  // HMODULE
     int (*call_)(const char*, const char*, char**) = nullptr;
     void (*free_)(char*) = nullptr;

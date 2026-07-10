@@ -23,7 +23,8 @@
 #include <string>
 
 #include "bootstrap.h"
-#include "cpp_core.h"  // P16: route C++-backed documents in-process to libaicad
+#include "cpp_core.h"        // P16: legacy in-process libaicad (InProcCore backend)
+#include "engine_backend.h"  // Phase 4: InProcCore vs DaemonConn seam (AI_CAD_ENGINE_DAEMON)
 
 using nlohmann::json;
 
@@ -167,7 +168,7 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     // back to a static catalog if the core is unavailable).
     if (method == "agent_list_models") {
         std::string lerr;
-        return core::cpp_core().ensureLoaded(lerr);
+        return engine::ensureLoaded(lerr);
     }
     if (!cppAgentFlag()) return false;
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
@@ -181,7 +182,7 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     // agent never hard-breaks. For a doc-cpp doc the DLL is already loaded (it minted the
     // doc); for get_prompts_v2 this triggers the lazy load on first use.
     std::string lerr;
-    return core::cpp_core().ensureLoaded(lerr);
+    return engine::ensureLoaded(lerr);
 }
 // --- C++ SIM (FEA) routing (opt-in, default OFF) ----------------------------
 // Route the host's FEA simulation RPCs (sim_mesh / sim_run_static / sim_run_modal)
@@ -206,11 +207,11 @@ bool routeSimToCpp(const std::string& method, const json& /*params*/) {
     if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal" ||
           method == "sim_run_fatigue"))
         return false;  // sim_run_flow (LBM) + sim_cancel + everything else stays Python
-    if (!core::cpp_core().available()) {
+    if (!engine::available()) {
         // Lazily try to load the core DLL; if it can't load, fall through to Python so
         // sim never hard-breaks. ensureLoaded is idempotent (loads once).
         std::string lerr;
-        if (!core::cpp_core().ensureLoaded(lerr)) return false;
+        if (!engine::ensureLoaded(lerr)) return false;
     }
     return true;
 }
@@ -265,9 +266,9 @@ bool routeEcadToCpp(const std::string& method, const json& params) {
     // the Python worker so document creation never hard-breaks.
     if (!cppEcadFlag()) return false;
     if (method != "ecad_new" && method != "ecad_open") return false;  // minting only
-    if (!core::cpp_core().available()) {
+    if (!engine::available()) {
         std::string lerr;
-        if (!core::cpp_core().ensureLoaded(lerr)) return false;  // can't load -> Python
+        if (!engine::ensureLoaded(lerr)) return false;  // can't load -> Python
     }
     return true;
 }
@@ -614,7 +615,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 }
             }
             if (!options.empty()) p["options"] = options;
-            ok = core::cpp_core().call("agent_run", p, cppResult, cerr);
+            ok = engine::call("agent_run", p, cppResult, cerr);
             // Replay captured events through onEvent so the Copilot/Activity pane updates.
             // (Batched after the run for this opt-in v1 — live streaming is a later step.)
             if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
@@ -636,7 +637,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 }
             }
             if (!options.empty()) p["options"] = options;
-            ok = core::cpp_core().call("agent_mission_v1", p, cppResult, cerr);
+            ok = engine::call("agent_mission_v1", p, cppResult, cerr);
             // Replay captured events (mission_* + sub-run stage events) — batched after the run
             // for this opt-in v1, exactly like agent_run_v2.
             if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
@@ -647,18 +648,18 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             // {question, doc_id, ...} -> agent_answer_question {question, doc_id}.
             json p = {{"question", params.value("question", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
-            ok = core::cpp_core().call("agent_answer_question", p, cppResult, cerr);
+            ok = engine::call("agent_answer_question", p, cppResult, cerr);
         } else if (method == "agent_clarify_v1") {
             // {request, doc_id, ...} -> agent_clarify {request, doc_id}. Returns
             // {ready, questions:[{key,ask,unit,suggested}], assumptions:[...]}.
             json p = {{"request", params.value("request", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
-            ok = core::cpp_core().call("agent_clarify", p, cppResult, cerr);
+            ok = engine::call("agent_clarify", p, cppResult, cerr);
         } else if (method == "agent_pm_assist_v1") {
             // The host's PM payload (doc_id, intent, form_schema, current, selected_refs)
             // IS the params object the C++ assist expects under "params".
             json p = {{"params", params}, {"doc_id", params.value("doc_id", std::string())}};
-            ok = core::cpp_core().call("agent_pm_assist", p, cppResult, cerr);
+            ok = engine::call("agent_pm_assist", p, cppResult, cerr);
             // C++ returns {validated:{...}}; the host consumes the assist result object
             // directly (patches/activate_well/...). Unwrap so the caller sees the same
             // shape the Python agent_pm_assist_v1 returns.
@@ -666,14 +667,14 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 cppResult = cppResult["validated"];
         } else if (method == "get_prompts_v2") {
             // -> agent_get_prompts_v2 {} (C++ default/env resolves the prompts dir).
-            ok = core::cpp_core().call("agent_get_prompts_v2", json::object(), cppResult, cerr);
+            ok = engine::call("agent_get_prompts_v2", json::object(), cppResult, cerr);
         } else if (method == "agent_list_models") {
             // {provider, base_url?, api_key?} -> {ok, models:[...]} (pass-through probe).
-            ok = core::cpp_core().call("agent_list_models", params, cppResult, cerr);
+            ok = engine::call("agent_list_models", params, cppResult, cerr);
         } else if (method == "agent_simulate_v1") {
             // {doc_id, request} -> {ok, answer, drag_n, lift_n, ...}: run a wind-tunnel CFD on the
             // current geometry (pass-through; the core parses the flow condition + runs LBM).
-            ok = core::cpp_core().call("agent_simulate_v1", params, cppResult, cerr);
+            ok = engine::call("agent_simulate_v1", params, cppResult, cerr);
         }
         if (ok) {
             result = std::move(cppResult);
@@ -707,7 +708,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     if (routeSimToCpp(method, params)) {
         std::string cerr;
         json cppResult;
-        if (core::cpp_core().call(method, params, cppResult, cerr)) {
+        if (engine::call(method, params, cppResult, cerr)) {
             result = std::move(cppResult);  // ok: result holds {summary, overlay_aicm, ...}
             return true;
         }
@@ -734,7 +735,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         // existing ecadcpp doc (no Python doc to fall back to => fail loud on hard error).
         const bool minting = (method == "ecad_new" || method == "ecad_open");
         std::string cerr;
-        if (core::cpp_core().call(method, params, result, cerr))
+        if (engine::call(method, params, result, cerr))
             return true;  // handled (rc==0); `result` holds {doc_id, revision, tree, ...}
         // Nonzero rc: a structured OpError carries {code,message,detail} in `result`.
         if (result.is_object() && result.contains("code")) {
@@ -762,7 +763,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     // its result (an OpError surfaces as {code,message,detail}); never fall back to Python.
     if (method.rfind("cam_", 0) == 0) {
         std::string cerr;
-        if (core::cpp_core().call(method, params, result, cerr))
+        if (engine::call(method, params, result, cerr))
             return true;  // handled (rc==0)
         if (result.is_object() && result.contains("code")) {
             err = result.value("message", std::string("cpp-cam error"));
@@ -779,7 +780,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     if (routeDocToCpp(method, params)) {
         const bool minting = isMintingMethod(method, params);
         std::string cerr;
-        if (core::cpp_core().call(method, params, result, cerr))
+        if (engine::call(method, params, result, cerr))
             return true;  // handled (aicad_call rc==0); `result` holds the ops-response
         // Nonzero rc: a structured OpError carries {code,message,detail} in `result`.
         if (result.is_object() && result.contains("code")) {
@@ -797,7 +798,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             err = "cpp-core (" + method + "): " + cerr;
             if (errorSink_) errorSink_(method, err);
             return false;
-        } else if (core::cpp_core().available()) {
+        } else if (engine::available()) {
             // MINTING call failed with an UNSTRUCTURED core error while the DLL is
             // loaded (e.g. doc_open: "no such file: live.step+"). That is a real
             // failure, not an "unsupported container" decline — falling through to
@@ -860,11 +861,11 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             // open sessions. Gated on available() — the DLL only loads once a C++-backed
             // doc exists, so when the cutover flag is off this is byte-for-byte today's
             // behavior (no C++ docs, no merge).
-            if (method == "doc_list" && core::cpp_core().available() &&
+            if (method == "doc_list" && engine::available() &&
                 result.is_object() && result.contains("docs") && result["docs"].is_array()) {
                 json cppList;
                 std::string cerr;
-                if (core::cpp_core().call("doc_list", json::object(), cppList, cerr) &&
+                if (engine::call("doc_list", json::object(), cppList, cerr) &&
                     cppList.is_object() && cppList.contains("docs") && cppList["docs"].is_array()) {
                     for (auto& d : cppList["docs"]) result["docs"].push_back(d);
                 }

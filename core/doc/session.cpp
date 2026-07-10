@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -163,6 +164,15 @@ struct Session {
     std::shared_ptr<CompileResult> compiled;
     long compiled_rev = -1;
 
+    // Incremental-rebuild prefix cache (see CompileCache in document.h). Complements
+    // `compiled` above: `compiled` short-circuits WHOLE compiles on an unchanged
+    // revision, while this cache makes the compiles that DO run start from the deepest
+    // unchanged feature checkpoint instead of feature 1 — editing feature k of N
+    // recompiles k..N only. Content-addressed (env+config+feature hashes), so undo/
+    // redo/config switches can never be served stale geometry. Accessed only under
+    // g_mtx like everything else in the session.
+    std::shared_ptr<aicad::doc::CompileCache> compile_cache = aicad::doc::make_compile_cache();
+
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
     std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
@@ -194,23 +204,95 @@ std::mutex g_mtx;
 std::atomic<bool> g_mtx_held{false};
 std::thread::id g_mtx_owner;  // guarded by g_mtx (only read/written while held)
 
+// --- g_mtx contention meters (Phase 1b perf visibility) ----------------------------
+// Every modeling RPC serialises through DocLock/g_mtx. With many subagents on ONE engine
+// the dominant cost is time spent BLOCKED waiting for this lock — which the on-CPU sampling
+// profiler cannot see. These meters make that queueing visible. Overhead is one steady_clock
+// read per lock acquire/release (RPC granularity, not an inner loop), so they are always on.
+// Read + reset via aicad::doc::contention_report(). Per-caller attribution uses a thread-local
+// current-method pointer stamped by the dispatch boundary (set_current_rpc_method).
+struct ContentionMeters {
+    std::atomic<unsigned long long> acquisitions{0};
+    std::atomic<unsigned long long> contended{0};       // acquires that had to wait (>threshold)
+    std::atomic<unsigned long long> total_wait_ns{0};
+    std::atomic<unsigned long long> max_wait_ns{0};
+    std::atomic<unsigned long long> total_hold_ns{0};
+    std::atomic<unsigned long long> max_hold_ns{0};
+    std::atomic<long long> waiters{0};                  // threads currently blocked on acquire
+    std::atomic<long long> max_waiters{0};              // peak simultaneous contenders
+};
+ContentionMeters g_cont;
+std::chrono::steady_clock::time_point g_cont_since = std::chrono::steady_clock::now();
+constexpr unsigned long long kContendedWaitNs = 20'000;  // >20µs waited => genuinely contended
+
+// Current RPC method for the calling thread (for per-caller contention attribution). A raw
+// interned pointer set by the dispatch boundary; never dereferenced after the call returns.
+thread_local const char* t_cur_method = nullptr;
+// Per-method aggregates (wait/hold ns + count), guarded by its own light mutex — updated once
+// per lock release (RPC granularity), never in a hot path.
+struct MethodContention { unsigned long long count{0}, wait_ns{0}, hold_ns{0}, max_wait_ns{0}; };
+std::mutex g_cont_map_mtx;
+std::map<std::string, MethodContention> g_cont_map;
+
+inline void atomic_max(std::atomic<unsigned long long>& a, unsigned long long v) {
+    unsigned long long cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+
 // RAII lock for the process-global session store. Behaves exactly like
 // std::lock_guard<std::mutex> on g_mtx for the normal (success / C++-exception)
 // paths — the destructor releases on stack unwind — while additionally stamping
 // the owning thread so an SEH-orphaned lock is recoverable (force_release_doc_lock).
+// Also feeds the g_mtx contention meters above.
 class DocLock {
 public:
     DocLock() {
+        const auto w0 = std::chrono::steady_clock::now();
+        const long long q = g_cont.waiters.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+            long long mw = g_cont.max_waiters.load(std::memory_order_relaxed);
+            while (q > mw && !g_cont.max_waiters.compare_exchange_weak(mw, q,
+                                                                       std::memory_order_relaxed)) {}
+        }
         g_mtx.lock();
+        g_cont.waiters.fetch_sub(1, std::memory_order_relaxed);
+        const auto w1 = std::chrono::steady_clock::now();
+        wait_ns_ = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       w1 - w0).count();
+        hold_t0_ = w1;
+        method_ = t_cur_method;
         g_mtx_owner = std::this_thread::get_id();
         g_mtx_held.store(true, std::memory_order_release);
     }
     ~DocLock() {
+        const unsigned long long hold_ns =
+            (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - hold_t0_).count();
         g_mtx_held.store(false, std::memory_order_release);
         g_mtx.unlock();
+        // Record AFTER releasing so meter bookkeeping never extends the critical section.
+        g_cont.acquisitions.fetch_add(1, std::memory_order_relaxed);
+        g_cont.total_wait_ns.fetch_add(wait_ns_, std::memory_order_relaxed);
+        g_cont.total_hold_ns.fetch_add(hold_ns, std::memory_order_relaxed);
+        atomic_max(g_cont.max_wait_ns, wait_ns_);
+        atomic_max(g_cont.max_hold_ns, hold_ns);
+        if (wait_ns_ > kContendedWaitNs)
+            g_cont.contended.fetch_add(1, std::memory_order_relaxed);
+        if (method_) {
+            std::lock_guard<std::mutex> lk(g_cont_map_mtx);
+            MethodContention& mc = g_cont_map[method_];
+            mc.count += 1;
+            mc.wait_ns += wait_ns_;
+            mc.hold_ns += hold_ns;
+            if (wait_ns_ > mc.max_wait_ns) mc.max_wait_ns = wait_ns_;
+        }
     }
     DocLock(const DocLock&) = delete;
     DocLock& operator=(const DocLock&) = delete;
+private:
+    unsigned long long wait_ns_ = 0;
+    std::chrono::steady_clock::time_point hold_t0_;
+    const char* method_ = nullptr;
 };
 
 std::map<std::string, Session> g_sessions;
@@ -953,6 +1035,86 @@ void drop_constraints_touching(json& sk, const std::set<std::string>& eids) {
     }
     cons = kept;
 }
+
+// --- trim constraint preservation ------------------------------------------
+// The sub-handle part of a constraint ref ("e3.start" -> "start"; "e3" -> "").
+std::string handle_sub(const std::string& h) {
+    auto p = h.find('.');
+    return p == std::string::npos ? std::string() : h.substr(p + 1);
+}
+// The 2D point a POINT sub-handle refers to on a stored entity geom, or nullopt for
+// whole-entity / scalar handles (parallel/tangent/radius/angle drag) that carry no point.
+std::optional<std::array<double, 2>> handle_point(const json& geom, const std::string& sub) {
+    const std::string t = geom.value("type", std::string());
+    if (t == "line") {
+        std::array<double, 2> p1{geom["p1"][0], geom["p1"][1]};
+        std::array<double, 2> p2{geom["p2"][0], geom["p2"][1]};
+        if (sub == "p1" || sub == "start") return p1;
+        if (sub == "p2" || sub == "end") return p2;
+        if (sub == "mid") return std::array<double, 2>{(p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5};
+        return std::nullopt;
+    }
+    // circle / arc
+    double cx = geom["center"][0], cy = geom["center"][1];
+    if (sub.empty() || sub == "center") return std::array<double, 2>{cx, cy};
+    if (t == "arc" && (sub == "start" || sub == "end")) {
+        double r = geom.value("radius", 0.0);
+        double ang = geom.value(sub, 0.0) * M_PI / 180.0;
+        return std::array<double, 2>{cx + r * std::cos(ang), cy + r * std::sin(ang)};
+    }
+    return std::nullopt;  // rim / start_angle / end_angle scalar drag handles
+}
+// The named endpoints of a surviving span, for matching an old point handle to it.
+struct SpanEnd { std::array<double, 2> p; std::string sub; };
+std::vector<SpanEnd> span_ends(const json& geom) {
+    const std::string t = geom.value("type", std::string());
+    if (t == "line")
+        return {{{geom["p1"][0], geom["p1"][1]}, "p1"}, {{geom["p2"][0], geom["p2"][1]}, "p2"}};
+    if (t == "arc") {
+        auto s = handle_point(geom, "start"), e = handle_point(geom, "end");
+        return {{*s, "start"}, {*e, "end"}};
+    }
+    return {};
+}
+bool pt_near(const std::array<double, 2>& a, const std::array<double, 2>& b) {
+    return std::hypot(a[0] - b[0], a[1] - b[1]) < 1e-6;
+}
+
+// Rewrite every constraint that referenced the trimmed entity `eid` onto whichever
+// surviving span still carries the referenced point, instead of blindly dropping them
+// (the old behaviour spiked DOF). survivors = (id, geom) for each span, in emit order;
+// survivors[0].id == eid. A constraint is dropped only when its point vanished with the
+// removed span. Whole-entity direction/center refs stay on `eid` (span[0] is co-geometric).
+void remap_constraints_after_trim(json& sk, const std::string& eid, const json& old_geom,
+                                  const std::vector<std::pair<std::string, json>>& survivors) {
+    json& cons = sk["params"]["constraints"];
+    json kept = json::array();
+    for (json c : cons) {
+        if (!c.contains("refs") || !c["refs"].is_array()) { kept.push_back(c); continue; }
+        bool drop = false;
+        for (json& hh : c["refs"]) {
+            if (!hh.is_string()) continue;
+            std::string h = hh.get<std::string>();
+            if (handle_base(h) != eid) continue;
+            std::string sub = handle_sub(h);
+            auto p = handle_point(old_geom, sub);
+            // Whole-entity / scalar handles (direction, center, radius, angle): span[0]
+            // keeps id `eid` and the same line direction / centre+radius, so these stay valid.
+            if (!p || sub.empty() || sub == "center") continue;
+            // Point handle: find the survivor whose endpoint still sits at that point.
+            bool matched = false;
+            for (const auto& [sid, geom] : survivors) {
+                for (const SpanEnd& se : span_ends(geom)) {
+                    if (pt_near(se.p, *p)) { hh = sid + "." + se.sub; matched = true; break; }
+                }
+                if (matched) break;
+            }
+            if (!matched) { drop = true; break; }  // the referenced point was trimmed away
+        }
+        if (!drop) kept.push_back(c);
+    }
+    cons = kept;
+}
 json* find_sketch_entity(json& sk, const std::string& eid) {
     for (json& e : sk["params"]["entities"])
         if (e.value("id", std::string()) == eid) return &e;
@@ -975,24 +1137,43 @@ void op_sketch_trim(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     if (!op.contains("point") || !op["point"].is_array() || op["point"].size() != 2)
         throw OpError("invalid_op", "sketch_trim requires 'point': [u, v]");
     double px = op["point"][0].get<double>(), py = op["point"][1].get<double>();
+    // Keep the trimmed-away span as construction geometry instead of deleting it, so its
+    // reference relations survive (SolidWorks "keep as construction geometry" trim option).
+    const bool keep_construction = op.value("keep_construction", false);
     std::size_t pos = 0;
     for (std::size_t i = 0; i < ents.size(); ++i)
         if (ents[i].value("id", std::string()) == eid) { pos = i; break; }
     bool construction = target->value("construction", false);
+    json old_geom = geom_view(*target);
+    // Cutters: EVERY other line/circle/arc — construction geometry included — matching the GUI
+    // power-trim preview (sketch_mode.cpp trimDoomedSpan). Excluding construction here made the
+    // engine trim past a construction boundary the preview had already cut at (over-trim
+    // regression); non-curve entities (points/text/splines) can't bound a trim, so skip them
+    // exactly as the preview does rather than letting split_entity reject the whole op.
     std::vector<json> others;
-    for (const json& e : ents)
-        if (e.value("id", std::string()) != eid && !e.value("construction", false))
-            others.push_back(geom_view(e));
-    std::vector<json> spans;
+    for (const json& e : ents) {
+        if (e.value("id", std::string()) == eid) continue;
+        const std::string t = e.value("type", std::string());
+        if (t == "line" || t == "circle" || t == "arc") others.push_back(geom_view(e));
+    }
+    sg::SplitResult split;
     try {
-        spans = sg::split_entity(geom_view(*target), others, px, py);
+        split = sg::split_entity_ex(old_geom, others, px, py);
     } catch (const sg::UnsupportedEntity& exc) {
         throw OpError("unsupported_entity",
                       "op[" + std::to_string(idx) + "]: sketch_trim involves an unsupported entity (" +
                           exc.etype + ")",
                       {{"index", idx}, {"reason", "unsupported entity '" + exc.etype + "'"}});
     }
-    if (spans.empty()) {
+    if (split.survivors.empty()) {
+        // No interior crossing: the whole entity is doomed.
+        if (keep_construction && split.removed) {
+            // Demote it to construction in place — geometry unchanged, so every constraint
+            // that referenced it stays valid.
+            (*target)["construction"] = true;
+            id_map["$" + std::to_string(idx)] = eid;
+            return;
+        }
         json kept = json::array();
         for (const json& e : ents)
             if (e.value("id", std::string()) != eid) kept.push_back(e);
@@ -1001,13 +1182,24 @@ void op_sketch_trim(json& doc, const json& op, std::size_t idx, IdGen& gen, json
         id_map["$" + std::to_string(idx)] = "";
         return;
     }
+    // Emit the survivors: survivors[0] keeps `eid`, the rest get fresh ids.
     std::vector<json> new_ents;
-    new_ents.push_back(stamp_entity(spans[0], eid, construction));
+    std::vector<std::pair<std::string, json>> survivor_ids;  // (id, geom) for constraint remap
+    new_ents.push_back(stamp_entity(split.survivors[0], eid, construction));
+    survivor_ids.emplace_back(eid, split.survivors[0]);
     std::vector<std::string> extra_ids;
-    for (std::size_t i = 1; i < spans.size(); ++i) {
+    for (std::size_t i = 1; i < split.survivors.size(); ++i) {
         std::string neid = gen.next("e");
         extra_ids.push_back(neid);
-        new_ents.push_back(stamp_entity(spans[i], neid, construction));
+        new_ents.push_back(stamp_entity(split.survivors[i], neid, construction));
+        survivor_ids.emplace_back(neid, split.survivors[i]);
+    }
+    // Optionally re-emit the doomed span as construction geometry (keeps it defined against
+    // the surrounding sketch instead of destroying it).
+    std::string kept_con_id;
+    if (keep_construction && split.removed) {
+        kept_con_id = gen.next("e");
+        new_ents.push_back(stamp_entity(*split.removed, kept_con_id, true));
     }
     json spliced = json::array();
     for (std::size_t i = 0; i < ents.size(); ++i) {
@@ -1017,10 +1209,14 @@ void op_sketch_trim(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             spliced.push_back(ents[i]);
     }
     ents = spliced;
-    drop_constraints_touching(sk, {eid});
+    // Preserve relations: re-anchor constraints onto the surviving spans by geometry rather
+    // than dropping every ref to `eid` (that blind drop was the DOF-explosion regression).
+    remap_constraints_after_trim(sk, eid, old_geom, survivor_ids);
     id_map["$" + std::to_string(idx)] = eid;
     for (std::size_t k = 0; k < extra_ids.size(); ++k)
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k + 1)] = extra_ids[k];
+    if (!kept_con_id.empty())
+        id_map["$" + std::to_string(idx) + "#c"] = kept_con_id;
 }
 
 void op_sketch_extend(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
@@ -2507,6 +2703,16 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
         json* f = find_feature(doc, op.value("id", std::string()));
         if (!f) throw OpError("invalid_op", "set_suppressed: no feature");
         (*f)["suppressed"] = op.value("value", false);
+    } else if (k == "set_folder") {
+        // FeatureManager folder grouping ("Add Folder" / "Name & group" / "Remove from folder").
+        // `folder` is a plain display-only tag on the feature (never affects geometry or rebuild);
+        // an empty/absent value clears it. Kept alongside the feature so it round-trips on save.
+        json* f = find_feature(doc, op.value("id", std::string()));
+        if (!f) throw OpError("invalid_op", "set_folder: no feature '" +
+                              op.value("id", std::string()) + "'");
+        const std::string folder = op.value("folder", std::string());
+        if (folder.empty()) f->erase("folder");
+        else (*f)["folder"] = folder;
     } else if (k == "rename") {
         json* f = find_feature(doc, op.value("id", std::string()));
         if (!f) throw OpError("invalid_op", "rename: no feature");
@@ -2649,10 +2855,25 @@ json env_from_doc(const json& doc) {
 // face into its edges, refreshing the owner map) from "recompile the whole feature tree each
 // time" into a single compile amortized across the whole interaction. Part docs only — the
 // assembly path compiles via rebuild_assembly / asm_result, not compile_document.
+// Compile the session's live doc THROUGH its incremental-rebuild cache: unchanged
+// feature prefixes restore from checkpoints instead of recompiling (document.h
+// CompileCache). Every "compile s.doc now" callsite in this file funnels through
+// here so the whole RPC surface — edits, undo/redo, rebuilds, exports, measures —
+// benefits uniformly. Caller must hold the doc lock (they all do).
+CompileResult compile_session(Session& s) {
+    // Kill-switch: AICAD_INC_REBUILD=0 forces the old always-full-rebuild path
+    // (safety valve while the cache is young; also the A/B lever for benchmarks).
+    static const bool inc_enabled = []() {
+        const char* v = std::getenv("AICAD_INC_REBUILD");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return compile_document(s.doc, env_from_doc(s.doc),
+                            inc_enabled ? s.compile_cache.get() : nullptr);
+}
+
 const CompileResult& ensure_compiled(Session& s) {
     if (!s.compiled || s.compiled_rev != s.revision) {
-        s.compiled =
-            std::make_shared<CompileResult>(compile_document(s.doc, env_from_doc(s.doc)));
+        s.compiled = std::make_shared<CompileResult>(compile_session(s));
         s.compiled_rev = s.revision;
     }
     return *s.compiled;
@@ -2688,7 +2909,8 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     for (const FeatureStatus& st : r.statuses) {
         fs.push_back({{"id", st.id},
                       {"ok", st.ok},
-                      {"ms", 0.0},
+                      {"ms", st.ms},
+                      {"reused", st.reused},  // served from the incremental-rebuild cache
                       {"error", st.ok ? json(nullptr) : json(st.error)},
                       {"warning", st.warning.empty() ? json(nullptr) : json(st.warning)},
                       {"dangling_refs", json::array()},
@@ -2709,7 +2931,17 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
         resp["rebuild"] = {{"feature_status", fs},
                            {"doc_status", {{"active_sketch", active_sketch_status},
                                            {"mates", nullptr},
-                                           {"active_configuration", r.active_configuration}}}};
+                                           {"active_configuration", r.active_configuration},
+                                           // incremental-rebuild accounting (CompileCache)
+                                           {"features_reused", r.features_reused},
+                                           {"features_executed", r.features_executed},
+                                           // compile phase split: what an edit paid for
+                                           {"phase_ms", {{"features", r.loop_ms},
+                                                         {"tessellation", r.tess_ms},
+                                                         {"tess_mesh", r.tess_mesh_ms},
+                                                         {"tess_extract", r.tess_extract_ms},
+                                                         {"tess_write", r.tess_write_ms},
+                                                         {"owner_map", r.owner_ms}}}}}};
         std::string aicm_path;
         if (!r.aicm.empty()) {
             std::filesystem::path target = aicm_file(s.doc_id, s.revision);
@@ -2913,7 +3145,7 @@ json config_commit(Session& s, json&& working) {
     s.revision += 1;
     s.dirty = true;
     if (s.active_sketch) s.active_sketch->solve_state.reset();  // session.py::_config_commit
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -3036,7 +3268,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
             rebuild_assembly(s);
             return ops_response_assembly(s, id_map);
         }
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         return ops_response(s, r, id_map, /*with_tess=*/true);
     }
 
@@ -3075,7 +3307,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         rebuild_assembly(s);
         return ops_response_assembly(s, id_map);
     }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (!r.ok) {
         // Rejected batch: restore the document AND the undo/redo stacks to exactly their
         // pre-batch state — no ghost revision, no errored feature persisted, stacks untouched
@@ -3494,7 +3726,7 @@ json doc_new(const std::string& kind, const std::string& name) {
         return resp;
     }
     Session& stored = new_part_session_locked(name);
-    CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
+    CompileResult r = compile_session(stored);
     json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
     return resp;
@@ -3586,7 +3818,7 @@ json doc_undo(const std::string& doc_id) {
         rebuild_assembly(s);
         return ops_response_assembly(s, json::object());
     }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -3607,7 +3839,7 @@ json doc_redo(const std::string& doc_id) {
         rebuild_assembly(s);
         return ops_response_assembly(s, json::object());
     }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -3658,7 +3890,7 @@ json doc_rebuild(const std::string& doc_id) {
     try {
         refresh_sketch3d_external_refs(s.doc);
     } catch (...) { /* keep last-good ground points */ }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -3824,7 +4056,7 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
         // still wants to see where each body sits in the shared frame. Compile and report each
         // surviving body's bbox — already in world coordinates (a part's transforms place
         // bodies absolutely). explode is an assembly-only concept here, so it is ignored.
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         json out = json::array();
         for (std::size_t i = 0; i < r.shapes.size(); ++i) {
             const TopoDS_Shape& world = r.shapes[i];
@@ -3951,7 +4183,7 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     s.doc = json::parse(it->second);
     s.revision += 1;
     s.dirty = true;
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -4005,7 +4237,7 @@ json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
     }
 
     if (groups.empty()) {
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
         resp["derived"] = {{"groups", json::array()}, {"note", "no derived features in document"}};
         return resp;
@@ -4072,7 +4304,7 @@ json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
     if (!any_change) {
         // Pure no-op: drop the snapshot we pushed and do NOT bump the revision.
         s.undo_stack.pop_back();
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
         resp["derived"] = {{"groups", summaries}};
         return resp;
@@ -4081,7 +4313,7 @@ json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
     if (s.active_sketch) s.active_sketch->solve_state.reset();
     s.revision += 1;
     s.dirty = true;
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
     resp["derived"] = {{"groups", summaries}};
     return resp;
@@ -4456,7 +4688,7 @@ static std::vector<TopoDS_Shape> gather_export_shapes(Session& s) {
             }
         return shapes;
     }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return r.shapes;
 }
 
@@ -5031,7 +5263,7 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
             }
         return bodies;
     }
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     uint32_t id = 1;
     const float color[3] = {0.62f, 0.70f, 0.82f};
     for (const auto& shp : r.shapes) {
@@ -5069,7 +5301,7 @@ static std::vector<RenderLabel> principal_face_labels(Session& s) {
     std::vector<RenderLabel> labels;
     if (s.is_assembly()) return labels;
     try {
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         if (r.shapes.empty()) return labels;
         const TopoDS_Shape& shp = r.shapes.back();
         struct Dir { const char* side; const char* label; RV3 nrm; unsigned char c[3]; };
@@ -5554,7 +5786,7 @@ static std::string rebuild_failure_detail(const CompileResult& r) {
 json doc_query(const std::string& doc_id, const json& query) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "query");
     // Default: query the LAST body (bridge.py policy: bodies[-1]). An optional 1-based
@@ -5588,7 +5820,7 @@ json doc_query(const std::string& doc_id, const json& query) {
 json doc_adjacency(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "adjacency");
     const TopoDS_Shape& shape = r.shapes.back();
@@ -5830,7 +6062,7 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 json doc_bbox(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "bound");
     Bnd_Box box;
@@ -5855,7 +6087,7 @@ json doc_bbox(const std::string& doc_id) {
 json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "evaluate");
 
@@ -6235,7 +6467,7 @@ json doc_weld_cut_list(const std::string& doc_id) {
     if (s.doc.value("kind", std::string()) == "assembly" ||
         s.doc.value("is_assembly", false))
         return build_cut_list(json::object());
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return build_cut_list(r.weld_members);
 }
 
@@ -6530,7 +6762,7 @@ TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double
 json doc_eval_check(const std::string& doc_id, int body_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
 
     json issues = json::array();
@@ -6668,7 +6900,7 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
 json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "evaluate");
     const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
@@ -6906,7 +7138,7 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
 json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane_ref) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
     gp_Pln pln = eval_resolve_plane(plane_ref);
 
@@ -7078,7 +7310,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
                 members.emplace_back(body.name, world);
             }
     } else {
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         for (std::size_t i = 0; i < r.shapes.size(); ++i)
             members.emplace_back("b" + std::to_string(i + 1), r.shapes[i]);
     }
@@ -7234,7 +7466,7 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
 TopoDS_Shape eval_compare_pick_shape(const std::string& doc_id, const json& params,
                                      const char* body_key) {
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw OpError("invalid_op", "eval_compare: document '" + doc_id + "' has no bodies",
                       {{"doc_id", doc_id}});
@@ -7309,7 +7541,7 @@ TopoDS_Face doc_face_wires_resolve(const TopoDS_Shape& body, const json& face_re
 json doc_face_wires(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw OpError("invalid_op", "doc_face_wires: document '" + doc_id + "' has no bodies",
                       {{"doc_id", doc_id}});
@@ -7328,7 +7560,7 @@ json doc_face_wires(const std::string& doc_id, const json& params) {
 json doc_eval_measure(const std::string& doc_id, const json& refs) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     if (r.shapes.empty())
         throw OpError("invalid_op", "no bodies for measure", {{"reason", "no bodies"}});
     const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
@@ -7499,7 +7731,7 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
                     double angle_deg) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
                                  ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
@@ -7612,7 +7844,7 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
 json doc_eval_curvature(const std::string& doc_id, int body_id, const std::string& kind) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
                                  ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
@@ -7713,7 +7945,7 @@ json doc_eval_curvature(const std::string& doc_id, int body_id, const std::strin
 json doc_eval_thickness(const std::string& doc_id, int body_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
                                  ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
@@ -7808,7 +8040,7 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     // A zero-distance drag is a no-op preview: report the plan + a fresh rebuild, no
     // mutation / no revision bump.
     if (std::abs(plan.new_value - plan.old_value) < 1e-12) {
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult r = compile_session(s);
         json out = {{"ok", true}, {"draggable", true}};
         add_plan_fields(out);
         merge(out, ops_response(s, r, json::object(), /*with_tess=*/true));
@@ -7845,7 +8077,7 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     s.revision += 1;
     s.dirty = true;
 
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
 
     // A value that collapses the body (no surviving solid) rolls back fully — the body
     // stays at its last valid size (instant3d.py _result_is_degenerate / _rollback_edit).
@@ -7854,7 +8086,7 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
         s.revision += 1;  // the rollback is itself a revision step (Python contract)
         if (commit && !s.undo_stack.empty() && s.undo_stack.back() == pre_snapshot)
             s.undo_stack.pop_back();
-        CompileResult rb = compile_document(s.doc, env_from_doc(s.doc));
+        CompileResult rb = compile_session(s);
         json out = {{"ok", true}, {"draggable", false},
                     {"reason", "the new value removes all material (the body would vanish) — "
                                "drag limited to the last valid size"},
@@ -8315,6 +8547,36 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     // Make every imported body self-contained before writing (Bug N-8).
     bake_import_features(s.doc);
 
+    // Persisted geometry cache (fast cold-open): embed the compiled tessellation + ops-response
+    // as additive cache.* entries so a later doc_open can skip the full compile_document rebuild.
+    // DISPLAY-ONLY + SAFE: document.json (the parametric source of truth) is untouched; open uses
+    // the cache ONLY when the doc hash + engine key still match, and the first edit recompiles
+    // from features. Always erase first so a failed/again-uncached save never ships a stale cache.
+    s.extra_entries.erase("cache.json");
+    s.extra_entries.erase("cache.aicm");
+    try {
+        if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1") {
+            const CompileResult& cr = ensure_compiled(s);
+            bool all_ok = !cr.aicm.empty();
+            for (const FeatureStatus& st : cr.statuses)
+                if (!st.ok) { all_ok = false; break; }
+            if (all_ok) {
+                json cached = ops_response(s, cr, json::object(), /*with_tess=*/true);
+                if (cached.contains("tess") && cached["tess"].is_object())
+                    cached["tess"].erase("aicm_path");  // machine/temp-specific; rebuilt on open
+                json header = {{"engine", stepplus_cache_engine_key()},
+                               {"doc_hash", stepplus_doc_hash(s.doc)},
+                               {"response", cached}};
+                s.extra_entries["cache.json"] = header.dump();
+                s.extra_entries["cache.aicm"] =
+                    std::string(reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
+            }
+        }
+    } catch (...) {
+        s.extra_entries.erase("cache.json");  // never let cache generation break a save
+        s.extra_entries.erase("cache.aicm");
+    }
+
     std::string out = stepplus_save(s.doc, target, s.extra_entries);
     s.path = out;
     s.dirty = false;
@@ -8359,8 +8621,48 @@ json doc_open(const std::string& path, bool as_solid) {
     if (s.doc.is_object()) s.doc["id"] = s.doc_id;
     Session& stored = g_sessions[s.doc_id] = std::move(s);
 
-    CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
-    resp = warm_and_respond(stored, std::move(r), json::object(), /*with_tess=*/true);
+    // Fast cold-open via the persisted geometry cache: if the container carries a valid
+    // cache.json/cache.aicm (engine key + doc hash both match the loaded tree), return the
+    // cached ops-response + mesh WITHOUT re-running compile_document. stored.compiled is left
+    // empty, so the FIRST edit/pick recompiles from features (document.json is authoritative).
+    bool cache_hit = false;
+    {
+        auto cj = stored.extra_entries.find("cache.json");
+        auto ca = stored.extra_entries.find("cache.aicm");
+        if (cj != stored.extra_entries.end() && ca != stored.extra_entries.end()) {
+            try {
+                json header = json::parse(cj->second);
+                if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                    header.value("doc_hash", std::string()) == stepplus_doc_hash(stored.doc) &&
+                    header.contains("response") && header["response"].is_object()) {
+                    resp = header["response"];
+                    // Re-materialize the mesh to this session's temp aicm path at revision 0.
+                    std::filesystem::path ap = aicm_file(stored.doc_id, stored.revision);
+                    std::ofstream f(ap, std::ios::binary | std::ios::trunc);
+                    if (f) {
+                        f.write(ca->second.data(),
+                                static_cast<std::streamsize>(ca->second.size()));
+                        f.close();
+                        if (!resp.contains("tess") || !resp["tess"].is_object())
+                            resp["tess"] = json::object();
+                        resp["tess"]["aicm_path"] = std::filesystem::absolute(ap).string();
+                    }
+                    resp["revision"] = stored.revision;  // override the cached (save-time) revision
+                    resp["tree"] = stored.doc;
+                    resp["cache_hit"] = true;
+                    cache_hit = true;
+                }
+            } catch (...) {
+                cache_hit = false;  // any parse/IO hiccup -> fall through to a full rebuild
+            }
+        }
+    }
+
+    CompileResult r;
+    if (!cache_hit) {
+        r = compile_session(stored);
+        resp = warm_and_respond(stored, std::move(r), json::object(), /*with_tess=*/true);
+    }
     resp["doc_id"] = stored.doc_id;
     if (stored.doc.is_object())
         resp["name"] = stored.doc.value("name", std::string());
@@ -8655,7 +8957,7 @@ json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
         }
     }
     s.active_sketch.reset();
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -9456,7 +9758,7 @@ json doc_sketch_auto_constrain(const std::string& doc_id, const std::string& ske
         s.dirty = true;
         if (s.active_sketch) s.active_sketch->solve_state.reset();
         try {
-            CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+            CompileResult r = compile_session(s);
             (void)r;
         } catch (...) { /* closure count below still reflects the constraints */ }
     }
@@ -10149,7 +10451,7 @@ json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch
         return json::array({d.dot(u), d.dot(v)});
     };
 
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    CompileResult r = compile_session(s);
 
     // ---- datum plane -> intersection line ----
     if (ref.contains("datum")) {
@@ -10790,6 +11092,82 @@ json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,
                                          ? res["rejected_handles"] : json::array()},
                 {"converged", res.value("converged", true)},
                 {"budget_exceeded", res.value("budget_exceeded", false)}};
+}
+
+// --- g_mtx contention reporting (Phase 1b) -----------------------------------------
+// Stamp the calling thread's current RPC method so DocLock can attribute lock wait/hold to
+// the caller. Pass a pointer with process-lifetime stability (the dispatch boundary passes an
+// interned/stack std::string's c_str for the call duration; cleared to nullptr after). The
+// pointer is only stored + used while the lock is held during THIS call.
+void set_current_rpc_method(const char* m) { t_cur_method = m; }
+
+// Snapshot (and optionally reset) the g_mtx contention meters. `%blocked` is aggregate
+// thread-time spent waiting on the lock over the window wall-clock — it can exceed 100% when
+// several threads block at once, which is exactly the multi-subagent serialization signal.
+nlohmann::json contention_report(bool reset) {
+    const auto now = std::chrono::steady_clock::now();
+    const double window_ms =
+        std::chrono::duration<double, std::milli>(now - g_cont_since).count();
+    const unsigned long long acq = g_cont.acquisitions.load(std::memory_order_relaxed);
+    const unsigned long long contended = g_cont.contended.load(std::memory_order_relaxed);
+    const double total_wait_ms = g_cont.total_wait_ns.load(std::memory_order_relaxed) / 1e6;
+    const double total_hold_ms = g_cont.total_hold_ns.load(std::memory_order_relaxed) / 1e6;
+
+    nlohmann::json top = nlohmann::json::array();
+    {
+        std::lock_guard<std::mutex> lk(g_cont_map_mtx);
+        std::vector<std::pair<std::string, MethodContention>> rows(g_cont_map.begin(),
+                                                                   g_cont_map.end());
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            return a.second.wait_ns > b.second.wait_ns;
+        });
+        int n = 0;
+        for (const auto& [name, mc] : rows) {
+            if (n++ >= 20) break;
+            top.push_back({{"method", name},
+                           {"calls", mc.count},
+                           {"total_wait_ms", mc.wait_ns / 1e6},
+                           {"total_hold_ms", mc.hold_ns / 1e6},
+                           {"max_wait_ms", mc.max_wait_ns / 1e6},
+                           {"avg_wait_ms", mc.count ? (mc.wait_ns / 1e6) / mc.count : 0.0}});
+        }
+    }
+
+    nlohmann::json out = {
+        {"ok", true},
+        {"window_ms", window_ms},
+        {"acquisitions", acq},
+        {"contended", contended},
+        {"contended_pct", acq ? (100.0 * contended / acq) : 0.0},
+        {"total_wait_ms", total_wait_ms},
+        {"total_hold_ms", total_hold_ms},
+        {"avg_wait_ms", acq ? total_wait_ms / acq : 0.0},
+        {"avg_hold_ms", acq ? total_hold_ms / acq : 0.0},
+        {"max_wait_ms", g_cont.max_wait_ns.load(std::memory_order_relaxed) / 1e6},
+        {"max_hold_ms", g_cont.max_hold_ns.load(std::memory_order_relaxed) / 1e6},
+        {"pct_wall_blocked", window_ms > 0 ? (100.0 * total_wait_ms / window_ms) : 0.0},
+        {"max_waiters", g_cont.max_waiters.load(std::memory_order_relaxed)},
+        {"waiters_now", g_cont.waiters.load(std::memory_order_relaxed)},
+        {"top_methods", top},
+        // Incremental-rebuild cache effectiveness (process-wide, since engine start):
+        // full_hits = whole compiles served from cache; features_reused vs _executed =
+        // per-feature skip ratio across every compile (document.h CompileCache).
+        {"compile_cache", compile_cache_stats()},
+    };
+
+    if (reset) {
+        g_cont.acquisitions.store(0, std::memory_order_relaxed);
+        g_cont.contended.store(0, std::memory_order_relaxed);
+        g_cont.total_wait_ns.store(0, std::memory_order_relaxed);
+        g_cont.total_hold_ns.store(0, std::memory_order_relaxed);
+        g_cont.max_wait_ns.store(0, std::memory_order_relaxed);
+        g_cont.max_hold_ns.store(0, std::memory_order_relaxed);
+        g_cont.max_waiters.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_cont_map_mtx);
+        g_cont_map.clear();
+        g_cont_since = now;
+    }
+    return out;
 }
 
 }  // namespace aicad::doc

@@ -81,7 +81,7 @@ CONTRACT_NAMES: list[str] = [
     "weld_member", "weld_gusset", "weld_end_cap",
     # Appearance
     "color_picker", "appr_metal", "appr_plastic", "appr_glass",
-    "appr_paint", "appr_default",
+    "appr_paint", "appr_default", "appr_steel", "appr_brass", "appr_dark",
     # Sketch shape drop-ins (polygon dropdown variants + star) and airfoil
     "poly_triangle", "poly_square", "poly_pentagon", "poly_octagon", "poly_star",
     "airfoil",
@@ -2910,6 +2910,35 @@ def draw_appr_metal(d, cell, p):
         half = (r * r - (r * frac) ** 2) ** 0.5
         d.line([(cx - half, yb), (cx + half, yb)], fill=_rgba((255, 255, 255), a), width=max(2, lw))
     filled_circle(d, cx - r * 0.30, cy - r * 0.35, r * 0.16, _rgba((255, 255, 255), 170))
+
+def _appr_metal_variant(d, cell, p, tint, band=(255, 255, 255)):
+    """Banded metallic sphere in a specific alloy tint — shared body for steel/brass/dark so the
+    appearance material buttons read as distinct alloys instead of three identical spheres."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy, r = s * 0.50, s * 0.50, s * 0.32
+    filled_circle(d, cx, cy, r, _rgba(tint, 200))
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    for frac, a in [(-0.45, 45), (-0.15, 165), (0.15, 80), (0.45, 130)]:
+        yb = cy + r * frac
+        half = (r * r - (r * frac) ** 2) ** 0.5
+        d.line([(cx - half, yb), (cx + half, yb)], fill=_rgba(band, a), width=max(2, lw))
+    filled_circle(d, cx - r * 0.30, cy - r * 0.35, r * 0.16, _rgba(band, 190))
+
+@icon("appr_steel")
+def draw_appr_steel(d, cell, p):
+    """Steel appearance — cool blue-grey banded metallic sphere."""
+    _appr_metal_variant(d, cell, p, (120, 140, 165))
+
+@icon("appr_brass")
+def draw_appr_brass(d, cell, p):
+    """Brass appearance — warm golden banded metallic sphere."""
+    _appr_metal_variant(d, cell, p, (198, 158, 70), band=(255, 240, 185))
+
+@icon("appr_dark")
+def draw_appr_dark(d, cell, p):
+    """Dark-metal appearance — charcoal sphere with light reflection bands."""
+    _appr_metal_variant(d, cell, p, (58, 64, 72), band=(205, 214, 226))
 
 @icon("appr_plastic")
 def draw_appr_plastic(d, cell, p):

@@ -262,6 +262,22 @@ void popGlassChildStyle();
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
                         bool stripe = false, bool selected = false, float washAlpha = 0.42f);
 
+// Selection emphasis = a thin GLOW BORDER around [mn,mx] (no fill, no left accent bar). A soft
+// wide low-alpha stroke on the pill edge reads as a glow, with a crisp thin border on top. `accent`
+// is a palette RGBA float[4] — pass palette.accent for the app color, or any per-element color to
+// get a color-coded selection. This is the single source of the "selected" look across the app;
+// recolor by passing a different `accent`.
+void glassSelectionGlow(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, const float accent[4]);
+
+// Reusable COLOR-CODED row/element background — the "Layers"-style wash used across the app. Paints
+// a translucent left->right tint of `tint` (RGB 0..1) over the frosted glass, bounded to the rounded
+// pill. `strength` scales the tint alpha (0..1; the left edge is `strength`, the right edge fades to
+// ~15%). When `selected`, a glow border in `tint` frames the element (via glassSelectionGlow). This
+// is the single abstraction for color-coded surfaces — change the color simply by passing a different
+// `tint`. Pass tint=palette.accent for the neutral app color.
+void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
+                    const float tint[3], float strength = 0.34f, bool selected = false);
+
 // The "liquid glass" tinted card wash: frosted glassBackground() base plus a top-bright ->
 // bottom-faint vertical gradient in `tint` (palette float[3], RGB 0..1). This is the exact
 // style used for PLM Task/Issue/Milestone cards (see plmCardBegin/plmCardEnd in plm_pages.cpp)
@@ -434,5 +450,20 @@ ImU32 glassIconHalo(const AdaptiveSurface& surf, float alphaMul = 1.0f);
 // split, same 0.5 threshold as adaptiveSurface's tone pick). Use for text painted on a custom
 // tint that did not come from adaptiveSurface/adaptivePanel — those already carry textPrimary.
 ImVec4 maxContrastTextOn(const ImVec4& surface);
+
+// Shared "pill on a hairline track" scrollbar look — a thin full-length track line with a thicker
+// rounded pill thumb riding on it. PURE draw (no interaction): the caller owns the geometry + any
+// drag handling. `trackMin`/`trackMax` bound the full track rect; `thumbA`/`thumbB` are the pill's
+// start/end along the scroll axis (screen coords). `vertical` picks the axis. Used by the doc-tab
+// file strip and the FeatureManager body so both scrollbars read identically.
+void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackMax,
+                    float thumbA, float thumbB, bool vertical, bool hovered,
+                    const AdaptiveSurface& surf);
+
+// FeatureManager-style custom vertical scrollbar for the CURRENT window/child. Call just before
+// EndChild; reads GetScrollY/GetScrollMaxY + the window rect, draws the pill overlay on the right
+// edge and handles drag (SetScrollY). No-op when the content doesn't overflow. Requires the child
+// to carry ImGuiWindowFlags_NoScrollbar (so it replaces, not doubles, the default bar).
+void drawWindowPillScrollbarV(const AdaptiveSurface& surf);
 
 }  // namespace ui

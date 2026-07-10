@@ -160,10 +160,13 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
                          {"guides", RefForm::SelList, false}}}},
     {"helix", {{"pitch", "height"}, {{"base", RefForm::SelOrDatum, true}}}},
     // thread: cut a real helical ISO-60° thread into a cylindrical face. `length` (the
-    // thread run, mm) is always required; the SIZE comes from a `size` ("M8") param OR a
-    // bare major_dia + pitch (the compiler enforces that either/or, so neither is listed
-    // as a universally-required param). target_face = the cylindrical face to thread.
-    {"thread", {{"length"}, {{"target_face", RefForm::Sel, true}}}},
+    // thread run, mm) is OPTIONAL — blank/omitted means the thread spans the whole
+    // cylindrical face (the compiler derives the run from the face's axial extent). The
+    // SIZE comes from a `size` ("M8") param OR a bare major_dia + pitch (the compiler
+    // enforces that either/or, so neither is a universally-required param). An optional
+    // `from` start reference and `flip` direction are validated by the compiler.
+    // target_face = the cylindrical face to thread.
+    {"thread", {{}, {{"target_face", RefForm::Sel, true}}}},
     // text: emboss/engrave a string onto a planar face. `text` (the string) is always
     // required; height/depth/mode/font/align are optional (compiler defaults). target_face
     // = the planar face to mark.

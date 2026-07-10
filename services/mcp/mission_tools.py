@@ -14,6 +14,13 @@ These mirror the ``register_<family>_tools(mcp)`` + nested ``@mcp.tool()`` patte
 used by ``services/dag/mcp_tools.py`` and ``services/mcp/ledger_tools.py``.  The
 in-app path (``services.agent.loop.run_mission``) is the primary integration
 target; these tools expose the same capability to external MCP clients.
+
+Process model (Phase-5 note): missions planned here execute IN-PROCESS —
+``dag_run`` drives the compiled graph inside the calling MCP/GUI-worker
+process; nothing here spawns worker subprocesses. Any future subprocess-based
+agent worker must go through ``daemon_bridge.spawn_agent_worker`` so it runs
+as a supervised child of aicad-hostd (survives client exit, dies with the
+daemon, blocks daemon idle-exit while running).
 """
 from __future__ import annotations
 

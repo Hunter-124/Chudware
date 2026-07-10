@@ -20,6 +20,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -179,6 +183,104 @@ struct Sketch3DResult {
 
 using FeatureResult = std::variant<SketchResult, SolidResult, PlaneResult, AxisResult,
                                    PointResult, CurveResult, Sketch3DResult>;
+
+// ------------------------------------------------ incremental-rebuild prefix cache
+// One checkpoint = the compiler's complete loop-carried state after feature i ran.
+// Everything here is either a small value map or a refcounted OCCT handle, so a
+// checkpoint copy is O(entries) pointer-sized copies, never a geometry deep-copy.
+// If compile_document grows a NEW piece of loop-carried state, it MUST be added here
+// and to the capture/restore sites below — that invariant is what keeps a restored
+// prefix bit-identical to re-executing it.
+struct CompileCkpt {
+    std::map<std::string, FeatureResult> results;
+    std::set<std::string> consumed;
+    std::map<std::string, std::string> superseded_by;
+    std::vector<std::string> solid_order;
+    std::map<std::string, std::string> body_kinds;
+    std::map<std::string, std::string> source_of;
+    std::map<std::string, TopoDS_Shape> tool_body_of;
+    std::map<std::string, std::string> feature_op_of;
+    std::set<std::string> seen_names;
+    // sheet-metal context (flattened SheetCtx) + bend history
+    bool sheet_active = false;
+    double sheet_thickness = 0.0, sheet_k_factor = 0.0, sheet_default_bend_radius = 0.0;
+    std::vector<::geom::BendRecord> bend_records;
+    std::map<std::string, std::vector<TopoDS_Shape>> import_cache;
+    // result accumulators the loop appends to
+    std::vector<FeatureStatus> statuses;
+    std::vector<ToolRec> tool_recs;
+    nlohmann::json weld_members;
+    nlohmann::json sheet_metal_flat;
+};
+
+// FNV-1a over a string, chainable through `seed` (h[i+1] = fnv(feature_json, h[i])).
+static uint64_t cc_fnv1a(const std::string& s, uint64_t seed = 1469598103934665603ULL) {
+    uint64_t h = seed;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Above this many features we skip checkpointing (memory guard; a doc this deep is
+// far outside every real workload — the cache degrades to the old full rebuild).
+constexpr std::size_t kCompileCacheMaxFeatures = 1024;
+
+// Process-wide cache accounting for the profiler (all docs, since engine start).
+static std::atomic<uint64_t> g_cc_compiles{0};
+static std::atomic<uint64_t> g_cc_full_hits{0};
+static std::atomic<uint64_t> g_cc_features_reused{0};
+static std::atomic<uint64_t> g_cc_features_executed{0};
+static std::atomic<uint64_t> g_cc_bodies_reused{0};    // tessellation+stats served from body cache
+static std::atomic<uint64_t> g_cc_bodies_tessellated{0};
+
+}  // namespace (hop out: CompileCache is the aicad::doc::CompileCache the header
+   // forward-declares — inside the anonymous namespace it would be a DIFFERENT,
+   // ambiguous type. Its CompileCkpt members are internal-linkage types, which is
+   // fine: this TU is the only place the struct is ever complete.)
+
+// A fully-tessellated body + its mass/area stats, cached across compiles so an
+// UNCHANGED surviving body (same TShape) skips BRepMesh + extraction + the
+// VolumeProperties/area Gauss integrations + AICM-body build on the next compile.
+// Geometry-only (mesh + stats depend solely on the TShape + appearance), so this is
+// bit-identical to recomputing. body_id is re-stamped to the current ordinal on reuse.
+struct CachedBody {
+    aicm::AicmBody body;  // body_id is a placeholder; the reuse site re-stamps it
+    BodyInfo info;        // name is re-stamped to the reusing feature's id
+};
+
+struct CompileCache {
+    // chain[0] = env+config seed; chain[i+1] = chain[i] folded with feature i's json.
+    std::vector<uint64_t> chain;
+    // snaps[i] = state after the first i features (snaps[0] stays null — empty state).
+    // Entries are shared_ptr so an unchanged prefix is carried forward across compiles
+    // without copying.
+    std::vector<std::shared_ptr<const CompileCkpt>> snaps;
+    // Full-compile fast path: the last CompileResult + its key (chain tail folded with
+    // the doc's appearances, which only affect post-loop tessellation colors).
+    std::shared_ptr<const CompileResult> last_result;
+    uint64_t full_key = 0;
+    // Per-body tessellation+stats cache. Key = (TShape*, is_surface, appearance hash).
+    // Only bodies at an IDENTITY top-level location are cached (the part-compile path;
+    // located assembly instances are recomputed). Replaced wholesale each compile with
+    // the set that survived, so a discarded body's mesh is freed.
+    std::map<std::tuple<const void*, bool, uint64_t>,
+             std::shared_ptr<const CachedBody>> body_cache;
+};
+
+std::shared_ptr<CompileCache> make_compile_cache() { return std::make_shared<CompileCache>(); }
+
+nlohmann::json compile_cache_stats() {
+    return {{"compiles", g_cc_compiles.load(std::memory_order_relaxed)},
+            {"full_hits", g_cc_full_hits.load(std::memory_order_relaxed)},
+            {"features_reused", g_cc_features_reused.load(std::memory_order_relaxed)},
+            {"features_executed", g_cc_features_executed.load(std::memory_order_relaxed)},
+            {"bodies_reused", g_cc_bodies_reused.load(std::memory_order_relaxed)},
+            {"bodies_tessellated", g_cc_bodies_tessellated.load(std::memory_order_relaxed)}};
+}
+
+namespace {  // hop back into the file-local helpers
 
 // -------------------------------------------------------------------- env parsing
 // Flatten the env json object into name -> double. Non-numeric entries are skipped
@@ -830,7 +932,7 @@ void apply_doc_appearance(const json& doc, uint32_t body_num,
     }
 }
 
-CompileResult compile_document(const json& doc, const json& env_json) {
+CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache) {
     CompileResult result;
     const EnvMap env = parse_env(env_json);
 
@@ -1447,7 +1549,118 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // or rigidly relocated downstream (never mutated in place), so sharing is safe.
     std::map<std::string, std::vector<TopoDS_Shape>> import_cache;
 
-    for (const json& raw : features.is_array() ? features : empty) {
+    // ------------------------------------------ incremental-rebuild cache probe
+    // Hash the compile INPUTS into a chain (h0 = env + active config; h[i+1] = h[i]
+    // folded with feature i's json — the loop's only per-feature inputs, verified: the
+    // loop body reads nothing else from `doc`). Then (a) an identical chain + identical
+    // appearances returns the previous CompileResult outright, and (b) otherwise the
+    // deepest checkpoint whose chain prefix still matches is RESTORED and the loop
+    // starts after it — editing feature k recompiles only k..N. Content-addressed:
+    // undo/redo/config switches/rolled-back failed compiles all just hash to whatever
+    // prefix genuinely still matches.
+    const std::size_t n_features = features.is_array() ? features.size() : 0;
+    const bool use_cache = cache != nullptr && n_features > 0 &&
+                           n_features <= kCompileCacheMaxFeatures;
+    g_cc_compiles.fetch_add(1, std::memory_order_relaxed);
+    std::vector<uint64_t> chain;
+    std::size_t start_at = 0;
+    if (use_cache) {
+        chain.reserve(n_features + 1);
+        uint64_t h = cc_fnv1a(env_json.is_object() && !env_json.empty() ? env_json.dump()
+                                                                        : std::string());
+        h = cc_fnv1a(result.active_configuration, h);
+        chain.push_back(h);
+        for (std::size_t i = 0; i < n_features; ++i)
+            chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
+        // (a) FULL match — same env/config/features and same appearances (they bake into
+        // the post-loop AICM colors) -> serve the whole previous result.
+        const uint64_t full_key = cc_fnv1a(
+            doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
+            chain.back());
+        if (cache->last_result && cache->full_key == full_key &&
+            cache->chain == chain) {
+            CompileResult out = *cache->last_result;
+            for (FeatureStatus& fst : out.statuses) fst.reused = true;
+            out.features_reused = static_cast<int>(out.statuses.size());
+            out.features_executed = 0;
+            g_cc_full_hits.fetch_add(1, std::memory_order_relaxed);
+            g_cc_features_reused.fetch_add(out.statuses.size(), std::memory_order_relaxed);
+            return out;
+        }
+        // (b) PREFIX match — longest i with chain[i] equal and a live checkpoint.
+        std::size_t match = 0;
+        const std::size_t lim = std::min(chain.size(), cache->chain.size());
+        for (std::size_t i = 0; i < lim; ++i) {
+            if (chain[i] != cache->chain[i]) break;
+            match = i;  // chain[i] matched => the state after i features is reusable
+        }
+        while (match > 0 && (match >= cache->snaps.size() || !cache->snaps[match]))
+            --match;
+        if (match > 0) {
+            const CompileCkpt& ck = *cache->snaps[match];
+            results = ck.results;
+            consumed = ck.consumed;
+            superseded_by = ck.superseded_by;
+            solid_order = ck.solid_order;
+            body_kinds = ck.body_kinds;
+            source_of = ck.source_of;
+            tool_body_of = ck.tool_body_of;
+            feature_op_of = ck.feature_op_of;
+            seen_names = ck.seen_names;
+            sheet_ctx.active = ck.sheet_active;
+            sheet_ctx.thickness = ck.sheet_thickness;
+            sheet_ctx.k_factor = ck.sheet_k_factor;
+            sheet_ctx.default_bend_radius = ck.sheet_default_bend_radius;
+            bend_records = ck.bend_records;
+            import_cache = ck.import_cache;
+            result.statuses = ck.statuses;
+            for (FeatureStatus& fst : result.statuses) fst.reused = true;
+            result.tool_recs = ck.tool_recs;
+            result.weld_members = ck.weld_members;
+            result.sheet_metal_flat = ck.sheet_metal_flat;
+            start_at = match;
+        }
+    }
+    // Checkpoints for THIS compile: the reused prefix is carried forward by pointer;
+    // each executed feature appends its own snapshot at the end of its iteration.
+    std::vector<std::shared_ptr<const CompileCkpt>> new_snaps;
+    if (use_cache) {
+        new_snaps.resize(n_features + 1);
+        for (std::size_t i = 1; i <= start_at && i < cache->snaps.size(); ++i)
+            new_snaps[i] = cache->snaps[i];
+    }
+    auto capture_ckpt = [&](std::size_t after_idx) {
+        if (!use_cache) return;
+        auto ck = std::make_shared<CompileCkpt>();
+        ck->results = results;
+        ck->consumed = consumed;
+        ck->superseded_by = superseded_by;
+        ck->solid_order = solid_order;
+        ck->body_kinds = body_kinds;
+        ck->source_of = source_of;
+        ck->tool_body_of = tool_body_of;
+        ck->feature_op_of = feature_op_of;
+        ck->seen_names = seen_names;
+        ck->sheet_active = sheet_ctx.active;
+        ck->sheet_thickness = sheet_ctx.thickness;
+        ck->sheet_k_factor = sheet_ctx.k_factor;
+        ck->sheet_default_bend_radius = sheet_ctx.default_bend_radius;
+        ck->bend_records = bend_records;
+        ck->import_cache = import_cache;
+        ck->statuses = result.statuses;
+        ck->tool_recs = result.tool_recs;
+        ck->weld_members = result.weld_members;
+        ck->sheet_metal_flat = result.sheet_metal_flat;
+        new_snaps[after_idx] = std::move(ck);
+    };
+    result.features_reused = static_cast<int>(start_at);
+    result.features_executed = static_cast<int>(n_features - start_at);
+    g_cc_features_reused.fetch_add(start_at, std::memory_order_relaxed);
+    g_cc_features_executed.fetch_add(n_features - start_at, std::memory_order_relaxed);
+
+    const auto _loop_t0 = std::chrono::steady_clock::now();
+    for (std::size_t _fi = start_at; _fi < n_features; ++_fi) {
+        const json& raw = features[_fi];
         // Accept the host's canonical {params,refs} shape OR the simplified flat
         // shape, normalizing to flat so the compilers below read either (see
         // normalize_feature / docs/CPP_MIGRATION.md schema convergence).
@@ -1458,12 +1671,16 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         FeatureStatus st;
         st.id = id;
         st.type = type;
+        // Per-feature rebuild timing (surfaced in ops_response.feature_status[].ms). Cheap:
+        // one steady_clock read per feature — feature compiles are milliseconds-scale.
+        const auto _feat_t0 = std::chrono::steady_clock::now();
 
         // A SUPPRESSED feature contributes no geometry but is OK (mirrors the Python
         // compiler: status ok, no body, topology unchanged). Skip it cleanly.
         if (raw.value("suppressed", false) || feat.value("suppressed", false)) {
             st.ok = true;
             result.statuses.push_back(std::move(st));
+            capture_ckpt(_fi + 1);
             continue;
         }
 
@@ -6300,10 +6517,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("thread: major_dia and pitch must be > 0");
                 }
 
-                const double length =
+                // LENGTH is OPTIONAL: blank / <= 0 ⇒ the thread spans the WHOLE cylindrical
+                // face (its full axial extent, computed once the face is resolved below). A
+                // positive value is an explicit run length (mm) from the start plane.
+                double length =
                     feat.contains("length") ? num_or_expr(feat.at("length"), env) : 0.0;
-                if (!(length > 0.0))
-                    throw std::runtime_error("thread: 'length' (thread run, mm) must be > 0");
                 int starts = 1;
                 if (feat.contains("starts")) {
                     double sv = num_or_expr(feat.at("starts"), env);
@@ -6384,25 +6602,92 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     gp_Pnt axis_loc = cyl_axis.Location();
                     gp_Dir axis_dir = cyl_axis.Direction();
 
-                    // Anchor the thread start at the LOWER end of the face along the axis,
-                    // so a `length` shorter than the cylinder threads from one end rather
-                    // than from the (arbitrary) surface parametric origin.
+                    // ── Thread START anchor, RUN direction, and LENGTH ──────────────────
+                    // The thread runs from a start plane along the cylinder axis for
+                    // `length` mm. Three optional inputs shape it:
+                    //   from / start_ref  a vertex / edge / face / datum whose axial position
+                    //                     is the thread START (default: the lower face end).
+                    //   flip / reverse    run toward the OTHER end (start from the far end
+                    //                     when there's no explicit `from`, reversing the dir);
+                    //                     lets the user flip when the start reference isn't an
+                    //                     auto-termination end of the face.
+                    //   length            explicit run (mm); blank ⇒ span to the far face end.
+                    // cut_thread clamps the band to the body, so an over-long run is safe.
+                    const gp_Pnt cyl_loc = axis_loc;             // a point on the axis
+                    const gp_Vec ad_v(axis_dir);
+                    // Resolve a start-reference selector (vertex/edge/face/datum) to a point.
+                    auto thread_ref_point = [&](const json& sref, gp_Pnt& out) -> bool {
+                        auto center_of = [&](const TopoDS_Shape& sh) -> bool {
+                            Bnd_Box b; BRepBndLib::Add(sh, b);
+                            if (b.IsVoid()) return false;
+                            double x0, y0, z0, x1, y1, z1; b.Get(x0, y0, z0, x1, y1, z1);
+                            out = gp_Pnt((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5);
+                            return true;
+                        };
+                        const std::string of = (sref.is_object() && sref.contains("of"))
+                                                   ? sref.value("of", std::string())
+                                                   : std::string();
+                        try {
+                            if (of == "edge")   return center_of(resolve_edge_sel(sref, "from"));
+                            if (of == "face")   return center_of(resolve_face_sel(sref, "from"));
+                            if (of == "vertex" || is_datum_ref(sref)) {
+                                Eigen::Vector3d v = vertex_point(sref, "from");
+                                out = gp_Pnt(v.x(), v.y(), v.z()); return true;
+                            }
+                            // Unknown/absent kind: try vertex, then edge, then face.
+                            try { Eigen::Vector3d v = vertex_point(sref, "from");
+                                  out = gp_Pnt(v.x(), v.y(), v.z()); return true; } catch (...) {}
+                            try { return center_of(resolve_edge_sel(sref, "from")); } catch (...) {}
+                            return center_of(resolve_face_sel(sref, "from"));
+                        } catch (...) { return false; }
+                    };
+                    // Face axial extent [s_min, s_max] (signed distance along axis_dir from cyl_loc).
+                    double s_min = 1e300, s_max = -1e300;
                     {
                         Bnd_Box fb;
                         BRepBndLib::Add(tface, fb);
                         double x0, y0, z0, x1, y1, z1;
                         fb.Get(x0, y0, z0, x1, y1, z1);
-                        gp_Pnt lo(x0, y0, z0), hi(x1, y1, z1);
-                        gp_Vec ad_v(axis_dir);
-                        // Project both bbox corners onto the axis; start from the lower one.
-                        gp_Vec to_lo(axis_loc, lo), to_hi(axis_loc, hi);
-                        double s_lo = to_lo.Dot(ad_v), s_hi = to_hi.Dot(ad_v);
-                        double s_start = std::min(s_lo, s_hi);
-                        axis_loc = axis_loc.Translated(ad_v.Multiplied(s_start));
+                        for (int i = 0; i < 8; ++i) {
+                            gp_Pnt c((i & 1) ? x1 : x0, (i & 2) ? y1 : y0, (i & 4) ? z1 : z0);
+                            const double s = gp_Vec(cyl_loc, c).Dot(ad_v);
+                            s_min = std::min(s_min, s); s_max = std::max(s_max, s);
+                        }
                     }
+                    // Optional START reference → clamped axial coordinate.
+                    bool have_from = false; double s_from = 0.0;
+                    {
+                        const json& sref = feat.contains("from") ? feat.at("from")
+                                         : (feat.contains("start_ref") ? feat.at("start_ref")
+                                         : (feat.contains("start") ? feat.at("start") : json()));
+                        gp_Pnt rp;
+                        if (!sref.is_null() && thread_ref_point(sref, rp)) {
+                            s_from = gp_Vec(cyl_loc, rp).Dot(ad_v);
+                            s_from = std::max(s_min, std::min(s_max, s_from));
+                            have_from = true;
+                        }
+                    }
+                    const bool flip = feat.value("flip", false) ||
+                                      feat.value("reverse", false) ||
+                                      feat.value("flip_direction", false);
+                    double s_start; gp_Dir run_dir;
+                    if (!flip) {
+                        run_dir = axis_dir;
+                        s_start = have_from ? s_from : s_min;
+                        if (!(length > 0.0)) length = s_max - s_start;   // span to the far end
+                    } else {
+                        run_dir = axis_dir.Reversed();
+                        s_start = have_from ? s_from : s_max;
+                        if (!(length > 0.0)) length = s_start - s_min;   // span to the far end
+                    }
+                    if (!(length > 1e-6))
+                        throw std::runtime_error(
+                            "thread: computed a zero-length run — the start reference sits at "
+                            "the end of the face, or the face has no axial extent");
+                    axis_loc = cyl_loc.Translated(ad_v.Multiplied(s_start));
 
                     ::geom::ThreadResult tr = ::geom::cut_thread(
-                        body, axis_loc, axis_dir, cyl_radius, pitch, major_dia, length,
+                        body, axis_loc, run_dir, cyl_radius, pitch, major_dia, length,
                         starts, lefthand, internal, raised, turns_cap, tform);
                     if (tr.shape.IsNull())
                         throw std::runtime_error(
@@ -6646,12 +6931,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             }
         }
 
+        st.ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _feat_t0).count();
         result.statuses.push_back(std::move(st));
+        capture_ckpt(_fi + 1);
     }
+
+    result.loop_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _loop_t0).count();
 
     // -------------------------------------------------- tessellate surviving bodies
     // Surviving = solid results whose id was never consumed by a later feature, in
     // first-produced order. body_id runs 1..N; the feature id is the body name.
+    const auto _tess_t0 = std::chrono::steady_clock::now();
+    ::geom::tess_timing_reset();
     std::vector<aicm::AicmBody> bodies;
     const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey
     uint32_t body_num = 1;
@@ -6662,6 +6955,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // geometry never crosses wires. (Tessellation dedups for free — BRepMesh is incremental,
     // so meshing the second instance finds the shared faces already triangulated and skips.)
     std::map<std::pair<const void*, bool>, std::tuple<double, double, int, int>> body_stats_cache;
+    // Cross-compile per-body cache (see CachedBody/CompileCache). `use_cache` already
+    // gates the whole incremental machinery; AICAD_TESS_CACHE=0 disables just this layer
+    // for A/B. new_body_cache holds the bodies THIS compile produced/reused (replaces the
+    // old set wholesale so a discarded body's mesh is freed).
+    static const bool tess_cache_on = []() {
+        const char* v = std::getenv("AICAD_TESS_CACHE");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    CompileCache* bc = (use_cache && tess_cache_on) ? cache : nullptr;
+    std::map<std::tuple<const void*, bool, uint64_t>,
+             std::shared_ptr<const CachedBody>> new_body_cache;
+    // Bit-exact hash of a body's baked appearance (color+metal+rough) so a set_appearance
+    // change is a cache miss but geometry-identical bodies with identical appearance hit.
+    auto appearance_hash = [](const float col[3], float metal, float rough) -> uint64_t {
+        uint64_t h = 1469598103934665603ULL;
+        const float vals[5] = {col[0], col[1], col[2], metal, rough};
+        for (float f : vals) {
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(bits));
+            h = (h ^ bits) * 1099511628211ULL;
+        }
+        return h;
+    };
     for (const std::string& sid : solid_order) {
         if (consumed.count(sid)) continue;
         const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
@@ -6673,8 +6989,48 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             float bcolor[3] = {color[0], color[1], color[2]};
             float bmetal = 0.0f, brough = 0.5f;
             if (has_appearances) apply_doc_appearance(doc, body_num, bcolor, bmetal, brough);
-            bodies.push_back(::geom::tessellate_body(shape, body_num, sid, bcolor,
-                                                     0.05, 0.35, bmetal, brough));
+
+            auto kit = body_kinds.find(sid);
+            const std::string kind = (kit != body_kinds.end()) ? kit->second : std::string("solid");
+            const bool is_surface = (kind == "surface");
+
+            // Cacheable iff we have a cache AND the body sits at an identity top-level
+            // location with forward orientation (the part-compile norm) — so its extracted
+            // mesh (which bakes per-face locations) is a pure function of the TShape.
+            const bool cacheable = bc != nullptr && shape.Location().IsIdentity() &&
+                                   shape.Orientation() == TopAbs_FORWARD;
+            std::tuple<const void*, bool, uint64_t> ck;
+            if (cacheable)
+                ck = std::make_tuple(static_cast<const void*>(shape.TShape().get()),
+                                     is_surface, appearance_hash(bcolor, bmetal, brough));
+
+            std::shared_ptr<const CachedBody> hit;
+            if (cacheable) {
+                auto it = bc->body_cache.find(ck);
+                if (it != bc->body_cache.end()) hit = it->second;
+            }
+
+            if (hit) {
+                // Reuse: copy the cached mesh + stats, re-stamp to this body's ordinal/id.
+                aicm::AicmBody b = hit->body;
+                b.body_id = body_num;
+                b.name = sid;
+                bodies.push_back(std::move(b));
+                result.shapes.push_back(shape);
+                BodyInfo bi = hit->info;
+                bi.name = sid;
+                result.volume += bi.volume;
+                result.bodies_info.push_back(bi);
+                new_body_cache.emplace(ck, hit);
+                g_cc_bodies_reused.fetch_add(1, std::memory_order_relaxed);
+                ++body_num;
+                continue;
+            }
+
+            // Fresh tessellate + stats.
+            g_cc_bodies_tessellated.fetch_add(1, std::memory_order_relaxed);
+            aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, sid, bcolor,
+                                                       0.05, 0.35, bmetal, brough);
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts
@@ -6684,9 +7040,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             // solid fixtures are unaffected (default kind "solid" -> volume accumulates).
             BodyInfo bi;
             bi.name = sid;
-            auto kit = body_kinds.find(sid);
-            bi.kind = (kit != body_kinds.end()) ? kit->second : std::string("solid");
-            const bool is_surface = (bi.kind == "surface");
+            bi.kind = kind;
             double vol = 0.0, area = 0.0;
             int nf = 0, ne = 0;
             const auto bkey = std::make_pair(
@@ -6710,14 +7064,33 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             bi.area = area;
             bi.n_faces = nf;
             bi.n_edges = ne;
+            if (cacheable) {
+                auto cbdy = std::make_shared<CachedBody>();
+                cbdy->body = b;  // copy the just-tessellated mesh before it is moved out
+                cbdy->info = bi;
+                new_body_cache.emplace(ck, std::move(cbdy));
+            }
+            bodies.push_back(std::move(b));
             result.bodies_info.push_back(std::move(bi));
         } catch (...) {
             // A tessellation failure must not crash the rebuild; skip this body.
         }
     }
+    if (bc) bc->body_cache = std::move(new_body_cache);
 
     result.body_count = static_cast<int>(bodies.size());
+    const auto _write_t0 = std::chrono::steady_clock::now();
     result.aicm = aicm::write_aicm(bodies);
+    result.tess_write_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - _write_t0).count();
+    result.tess_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _tess_t0).count();
+    {
+        const ::geom::TessTiming tt = ::geom::tess_timing_read();
+        result.tess_mesh_ms = tt.mesh_ms;
+        result.tess_extract_ms = tt.extract_ms;
+    }
+    const auto _owner_t0 = std::chrono::steady_clock::now();
 
     // -------------------------------------------------- owner map (host picking)
     // Per surviving body, tag each face/edge with the feature that created it: diff
@@ -6790,6 +7163,8 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         }
         result.owner_map = std::move(om);
     }
+    result.owner_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - _owner_t0).count();
 
     // --- displayable reference geometry (datum axis/plane/point/csys) -----------
     // Datums build no body, so they never reach the AICM. Surface each resolved datum's geometry
@@ -6856,6 +7231,24 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     result.ok = true;
     for (const FeatureStatus& s : result.statuses)
         if (!s.ok) { result.ok = false; break; }
+
+    // Commit this compile into the cache: the new chain + per-feature checkpoints
+    // replace the old wholesale (content-addressed, so replacing never loses anything
+    // a future compile could still legally reuse — a diverged prefix can't match), and
+    // the full result is kept for the identical-inputs fast path. Stored statuses are
+    // scrubbed of the `reused` flag so a later restore re-marks exactly its own prefix.
+    if (use_cache) {
+        auto stored = std::make_shared<CompileResult>(result);
+        for (FeatureStatus& fst : stored->statuses) fst.reused = false;
+        stored->features_reused = 0;
+        stored->features_executed = static_cast<int>(n_features);
+        cache->chain = std::move(chain);
+        cache->snaps = std::move(new_snaps);
+        cache->full_key = cc_fnv1a(
+            doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
+            cache->chain.back());
+        cache->last_result = std::move(stored);
+    }
 
     return result;
 }

@@ -26,7 +26,11 @@ namespace ui {
 // selected) — pairs MUST balance. Call fmRowStripeReset() once at the top of a tab body so the
 // alternating stripe phase restarts each frame.
 struct FmRowRect { ImVec2 mn, mx; };
-FmRowRect fmRowPill(bool selected = false);
+// `tint` (optional palette RGB, float[3]) dyes the row the "Layers"-style color wash (see
+// ui::coloredRowWash). Pass a section/element color for color-coded rows; leave null for the
+// neutral app-accent wash every row shares. Selection is a thin glow border in the tint color
+// (no blue vertical bar).
+FmRowRect fmRowPill(bool selected = false, const float* tint = nullptr);
 void      fmRowPillEnd(const FmRowRect& r, bool selected = false);
 void      fmRowStripeReset();
 
@@ -45,6 +49,10 @@ void fmSectionDivider(const char* label);
 // Section divider with a small square "+" button pinned at the right edge (the right hairline is cut
 // short to clear it). Returns true when the button is clicked. See feature_tree.cpp.
 bool fmSectionDividerAddButton(const char* label, const char* btnId, const char* tooltip);
+
+// Collapsible section header: centered label + hairlines with an end-of-line chevron. The whole row
+// toggles *open (returns *open). rightClicked, if non-null, reports a right-click for a context menu.
+bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked = nullptr);
 
 // 24px square glass icon button (FeatureManager top-toolbar style: resting 0.22 pill, 0.38 on
 // hover, 18px SDF-crisp glyph). Returns true on click; disabled renders dimmed and never fires.

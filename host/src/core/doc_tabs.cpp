@@ -16,6 +16,8 @@
 #include "app_state.h"
 
 #include "../worker_client.h"
+#include "engine_backend.h"           // Phase 4: daemon mirror tabs detach, not doc_close
+#include "ipc_client.h"               // services/ipc EngineClient (daemon detach_doc)
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
 #include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
 #include "../ui/evaluate_dialogs.h"   // per-document EvaluateDialogs (Measure/Mass/Section) owned by DocSession
@@ -181,6 +183,7 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
 
 void AppState::switchToTab(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
+    docTabs[idx].aiPulse = false;   // the user is now looking at it — stop the AI-activity glow
     // Already-active no-op early-out (part/asm: also require the mirror to match; drawing/ECAD: by
     // index, since they don't drive the DocMirror — their id lives in a separate worker registry).
     if (idx == activeTab) {
@@ -401,6 +404,15 @@ void AppState::closeDocTab(int idx) {
         // If this was the doc the editor is pointing at, drop the AppState reflection so a stale id
         // can't drive the panel after the tab is gone (a neighbor switch re-points it if needed).
         if (ecadDocId == closing.ecadDocId) { ecadDocId.clear(); ecadRevision = -1; }
+    } else if (closing.aiHandoff && engine::daemonMode()) {
+        // Phase 4: a daemon mirror tab VIEWS a doc another client (an agent) is
+        // still building in the SHARED engine — closing the tab must only drop
+        // our view (detach_doc), never doc_close the agent's document.
+        if (auto* c = engine::client()) {
+            nlohmann::json res;
+            std::string err;
+            c->call("detach_doc", {{"doc_id", closing.docId}}, res, err);
+        }
     } else {
         nlohmann::json res;
         std::string err;

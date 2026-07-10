@@ -63,7 +63,7 @@ def _iso_cube(draw: ImageDraw.ImageDraw, cx, cy, r, edge=True):
             draw.line([a, b], fill=EDGE, width=lw)
 
 
-def make_tile(px=256, radius_frac=0.235, with_spark=True):
+def make_tile(px=256, radius_frac=0.235, with_spark=False):
     s = px * SS
     grad = _vgrad((s, s), TILE_TOP, TILE_BOT)
     mask = Image.new("L", (s, s), 0)
@@ -72,7 +72,9 @@ def make_tile(px=256, radius_frac=0.235, with_spark=True):
     tile = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     tile.paste(grad, (0, 0), mask)
     d = ImageDraw.Draw(tile)
-    _iso_cube(d, s * 0.5, s * 0.53, s * 0.27)
+    # Cube centred on the tile (cy=0.5). The old 0.53 + a "spark" ellipse above the
+    # cube pushed the silhouette low and clipped the spark into a notch at the top edge.
+    _iso_cube(d, s * 0.5, s * 0.5, s * 0.27)
     if with_spark:
         sx, sy = s * 0.5, s * 0.53 - s * 0.27 * 2
         for rr, col in [(s * 0.055, (*SPARK, 60)), (s * 0.03, (*SPARK, 130)), (s * 0.016, (*SPARK, 255))]:
@@ -115,7 +117,7 @@ def make_ico(path):
     small entries (16/24/32) keep crisp rounded-corner + cube edges.
     """
     sizes = [256, 128, 64, 48, 32, 24, 16]
-    imgs = [make_tile(s, with_spark=(s >= 32)) for s in sizes]
+    imgs = [make_tile(s) for s in sizes]
     imgs[0].save(path, format="ICO", sizes=[(s, s) for s in sizes],
                  append_images=imgs[1:])
 

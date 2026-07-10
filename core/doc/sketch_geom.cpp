@@ -246,7 +246,9 @@ std::vector<json> drop_index(const std::vector<json>& spans, int drop) {
     return out;
 }
 
-std::vector<json> split_line(const json& line, const std::vector<double>& cuts, const V2& point) {
+// The full partition of `line` at every interior cut, in parameter order. Empty =>
+// no interior cut (caller treats the whole entity as doomed). No span is dropped here.
+std::vector<json> partition_line(const json& line, const std::vector<double>& cuts) {
     V2 p1 = pt(line, "p1"), p2 = pt(line, "p2");
     std::vector<double> inner = dedupe_sorted(cuts, 0.0, 1.0);
     if (inner.empty()) return {};
@@ -260,10 +262,10 @@ std::vector<json> split_line(const json& line, const std::vector<double>& cuts, 
         V2 b = add(p1, scale(d, bounds[i + 1]));
         spans.push_back({{"type", "line"}, {"p1", {a[0], a[1]}}, {"p2", {b[0], b[1]}}});
     }
-    return drop_index(spans, nearest_span_line(spans, point));
+    return spans;
 }
 
-std::vector<json> split_circle(const json& circle, const std::vector<double>& cuts, const V2& point) {
+std::vector<json> partition_circle(const json& circle, const std::vector<double>& cuts) {
     auto [c, r] = circle_params(circle);
     std::set<double> uniq;
     for (double a : cuts) uniq.insert(pymod(a, 360.0));
@@ -277,10 +279,10 @@ std::vector<json> split_circle(const json& circle, const std::vector<double>& cu
         spans.push_back({{"type", "arc"}, {"center", {c[0], c[1]}}, {"radius", r},
                          {"start", a0}, {"end", a1}, {"ccw", true}});
     }
-    return drop_index(spans, nearest_span_arc(spans, point));
+    return spans;
 }
 
-std::vector<json> split_arc(const json& arc, const std::vector<double>& cuts, const V2& point) {
+std::vector<json> partition_arc(const json& arc, const std::vector<double>& cuts) {
     auto [c, r] = circle_params(arc);
     double a0 = pymod(num(arc, "start"), 360.0);
     bool ccw = arc_ccw(arc);
@@ -303,7 +305,12 @@ std::vector<json> split_arc(const json& arc, const std::vector<double>& cuts, co
         spans.push_back({{"type", "arc"}, {"center", {c[0], c[1]}}, {"radius", r},
                          {"start", s}, {"end", e}, {"ccw", ccw}});
     }
-    return drop_index(spans, nearest_span_arc(spans, point));
+    return spans;
+}
+
+// Index of the span nearest (px,py) — the one a power-trim click removes.
+int doomed_index(const std::string& et, const std::vector<json>& spans, const V2& point) {
+    return et == "line" ? nearest_span_line(spans, point) : nearest_span_arc(spans, point);
 }
 
 // ---- offset helpers ----
@@ -425,8 +432,8 @@ Corner line_corner(const json& la, const json& lb) {
 }  // namespace
 
 // ----------------------------------------------------------------- public API
-std::vector<json> split_entity(const json& target, const std::vector<json>& others,
-                               double px, double py) {
+SplitResult split_entity_ex(const json& target, const std::vector<json>& others,
+                            double px, double py) {
     std::string et = require_supported(target);
     for (const json& o : others) require_supported(o);
     std::vector<double> cuts;
@@ -438,9 +445,26 @@ std::vector<json> split_entity(const json& target, const std::vector<json>& othe
         }
     }
     V2 point = {px, py};
-    if (et == "line") return split_line(target, cuts, point);
-    if (et == "circle") return split_circle(target, cuts, point);
-    return split_arc(target, cuts, point);
+    std::vector<json> spans = et == "line"   ? partition_line(target, cuts)
+                            : et == "circle" ? partition_circle(target, cuts)
+                                             : partition_arc(target, cuts);
+    SplitResult res;
+    if (spans.empty()) {           // no interior cut => the whole entity is doomed
+        res.whole = true;
+        res.removed = target;
+        return res;
+    }
+    int doomed = doomed_index(et, spans, point);
+    for (int i = 0; i < (int)spans.size(); ++i) {
+        if (i == doomed) res.removed = spans[i];
+        else res.survivors.push_back(spans[i]);
+    }
+    return res;
+}
+
+std::vector<json> split_entity(const json& target, const std::vector<json>& others,
+                               double px, double py) {
+    return split_entity_ex(target, others, px, py).survivors;
 }
 
 std::optional<json> extend_entity(const json& target, const std::string& end,

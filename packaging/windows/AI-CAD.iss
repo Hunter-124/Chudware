@@ -35,6 +35,13 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; No EULA/license file yet (commercial closed-source per CONTRIBUTING.md — add one before a
 ; real external release; a bare-bones installer is fine for internal dogfooding builds).
 WizardStyle=modern
+; Ask Windows Restart Manager to close apps holding files under {app} (AI-CAD.exe and any
+; aicad-hostd.exe daemon) before install/uninstall. Belt-and-braces with install.ps1's own
+; targeted daemon --stop step; the daemon is also staged/replaced by the payload copy below
+; (the [Files] {#PayloadDir}\* glob picks up aicad-hostd.exe/.pdb automatically once
+; build_release.py stages them — no extra [Files] entry needed).
+CloseApplications=yes
+RestartApplications=no
 
 [Files]
 ; Staged to {tmp} (Inno auto-cleans after setup exits) — install.ps1 reads from $PSScriptRoot

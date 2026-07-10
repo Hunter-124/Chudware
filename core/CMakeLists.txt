@@ -19,6 +19,29 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# Link-time optimization (IPO/LTO). OFF by default: it's a large link-time + memory hit with
+# the OCCT-linked libaicad, and normal dev/gate builds don't need it. Turn on for release
+# artifacts with -DAICAD_LTO=ON. Guarded by check_ipo_supported so an unsupported toolchain
+# degrades to a warning instead of a hard configure error. Only meaningful in a Release build
+# (where -O3/-DNDEBUG already apply); a no-op inliner across TU boundaries otherwise.
+option(AICAD_LTO "Enable interprocedural (link-time) optimization for release artifacts" OFF)
+if(AICAD_LTO)
+  # CMP0069 NEW makes INTERPROCEDURAL_OPTIMIZATION actually take effect (else it's silently
+  # ignored on targets whose effective policy is OLD); propagate the default to sub-projects.
+  if(POLICY CMP0069)
+    cmake_policy(SET CMP0069 NEW)
+    set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+  endif()
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)
+  if(_ipo_ok)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    message(STATUS "AICAD_LTO: interprocedural optimization ENABLED")
+  else()
+    message(WARNING "AICAD_LTO requested but IPO unsupported by this toolchain: ${_ipo_msg}")
+  endif()
+endif()
+
 # Wave 2: provision + link the OCCT 3D B-rep kernel. OFF keeps the fast solver
 # build (Wave 1) self-contained; -DAICAD_WITH_OCCT=ON auto-downloads OCCT and
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
@@ -1060,6 +1083,22 @@ if(AICAD_WITH_OCCT)
   add_test(NAME sketch_convert COMMAND test_sketch_convert)
   set_tests_properties(sketch_convert PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Sketch power-trim: over-trim + DOF-preservation regression -------------
+  # Guards the "swasi_test" report: construction geometry must act as a trim boundary
+  # (no over-trim past it) and trimming a free tip must re-anchor constraints onto the
+  # surviving spans (preserve DOF) instead of dropping every ref to the entity.
+  add_executable(test_sketch_trim
+    tests/test_sketch_trim.cpp)
+  target_include_directories(test_sketch_trim PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch_trim PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch_trim PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch_trim COMMAND test_sketch_trim)
+  set_tests_properties(sketch_trim PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
   # part. doc_new/doc_open compile the empty document through OCCT, so this is gated
@@ -1311,9 +1350,22 @@ if(AICAD_WITH_OCCT)
   # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libaicad.cpp are
   # compiled out unless AICAD_WITH_NETGEN, so the lib builds without the mesher (geometry,
   # sketch, features, STEP/IGES/STL still work — those need only OCCT).
+  # Build id (git describe), captured at CONFIGURE time and configured into ONE
+  # header shared by libaicad (aicad_build_id export) and aicad-hostd, so a
+  # matched-build engine + daemon report the SAME id (version drain-replace).
+  execute_process(COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE AICAD_HOSTD_BUILD_ID
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT AICAD_HOSTD_BUILD_ID)
+    set(AICAD_HOSTD_BUILD_ID "unknown")
+  endif()
+  configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
+
   add_library(aicad SHARED
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
   target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_prof)
   if(AICAD_WITH_NETGEN)
@@ -1361,6 +1413,42 @@ if(AICAD_WITH_OCCT)
   add_test(NAME probe COMMAND aicad_probe)
   # Same OCCT DLL PATH prepend as the other OCCT tests, as a backup to the staged DLLs.
   set_tests_properties(probe PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- aicad-hostd: the shared engine-host daemon -------------------------------
+  # Owns the ONE libaicad instance and serves it to the GUI + every MCP process
+  # over local IPC (unix socket / named pipe). Like aicad_probe it dlopens the
+  # engine (via services/worker/cpp_core.cpp) rather than linking it, so the
+  # daemon binary is tiny, engine-version-agnostic, and reuses the exact loader
+  # every other consumer runs. See the hostd plan + docs/HOSTD.md.
+  # (Build id header configured above, next to the aicad target — shared.)
+  # Both platform backends are always listed; each file self-selects via
+  # #ifdef _WIN32 / #ifndef _WIN32, so there is one source list to maintain.
+  add_executable(aicad-hostd
+    hostd/main.cpp
+    hostd/server.cpp
+    hostd/child_supervisor.cpp        # POSIX: fork/PDEATHSIG/execvpe
+    hostd/child_supervisor_win.cpp    # Windows: Job Objects, KILL_ON_JOB_CLOSE
+    hostd/doc_registry.cpp
+    hostd/autosave.cpp
+    hostd/hostd_log.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery_win.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_client.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
+  target_include_directories(aicad-hostd PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+  target_link_libraries(aicad-hostd PRIVATE nlohmann_json::nlohmann_json)
+  if(WIN32)
+    # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
+    # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
+    # Job Objects, CreateProcessW) is kernel32, linked by default.
+    target_link_libraries(aicad-hostd PRIVATE advapi32)
+  endif()
+  set_target_properties(aicad-hostd PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_dependencies(aicad-hostd aicad)  # engine staged before the daemon can serve it
 endif()
 
 # === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========

@@ -1,139 +1,72 @@
-# Workflow v2 — the automated scheme for this project (Hunter, 2026-07-03)
+# Workflow — task board policy (Hunter, solo dev)
 
-The single source of truth for how work gets planned, claimed, executed, reviewed,
-and steered. Supersedes scattered policy notes; autopilot.md and FOREMAN.md defer
-here on conflicts. Goal: **spend tokens where they buy product, spend human time
-only where a human is genuinely required, and never let a low-priority roadblock
-silently stall a high-priority lane.**
+The single source of truth for how work gets planned and tracked. This project
+is worked solo now (main WIP on this machine, remote is mainly a backup), so the
+board is a personal backlog, not a multi-agent claim queue: no ownership/claiming
+step, no foreman, no team-coordination MCP. Pick a task, do it, mark it done.
 
-## 1. Roles (who runs what model, and why)
+## 1. Board vocabulary (task frontmatter)
 
-| Role | Count | Model tier | Job |
-|---|---|---|---|
-| Human (Hunter) | 1 | — | Merges to `done`, answers human-only questions, sets priorities/defers. Everything else is delegable. |
-| Foreman | 1 | Fable | Cuts/steers tasks, reviews+merges review branches on master, answers `work/questions/`, triages roadblocks, keeps this doc honest. ONE foreman at a time (master writes serialize). |
-| Drivers | N | **Sonnet by default** | Claim → execute work order on a branch → `status: review` → next. Opus for gnarly C++/kernel/geometry or contract-freeze tasks the foreman flags. Never Fable — Fable is reserved for the one foreman session (usage conservation, Hunter 2026-07-03). Opus drivers still stop at `status: review` — merging stays foreman-only. |
-| Subagents | per driver | Sonnet/Haiku | Exploration, bulk reads, builds/tests, mechanical refactors. Drivers take back diffs/summaries only. |
-
-Token rules (binding, from FOREMAN.md "Context & cost discipline" — still in force):
-delegate downward, keep the main window linear/append-only for cache hits, push long
-waits to background subagents, commit-and-drop, HANDOFF at ~60-70% context.
-
-## 2. Board vocabulary (task frontmatter)
-
-- `status`: todo | doing | review | done | blocked | backlog — unchanged; `done` is
-  human-merge-time only.
-- `priority`: 1 (drop everything) … 5 (default). Claim order.
-- `lane`: user-facing feature area — the dashboard swim-row. One of: modeling-core,
-  assemblies-drawings, cam, ecad-firmware, simulation, parts-sourcing, ai-copilot,
-  app-gui, plm-projects, platform-infra, ml-flywheel.
+- `status`: todo | doing | review | done | blocked | backlog.
+- `priority`: 1 (drop everything) … 5 (default).
+- `lane`: user-facing feature area. One of: modeling-core, assemblies-drawings,
+  cam, ecad-firmware, simulation, parts-sourcing, ai-copilot, app-gui,
+  plm-projects, platform-infra, ml-flywheel.
 - `kind`: **fix** (issue with an existing feature) | **overhaul** (redesign of
-  existing) | **new** (not built yet). Within the same priority+day, claim order is
-  fix → overhaul → new: *we repair what users already touch before adding surface.*
-- `deferred: yes`: the plan is parked — invisible to `ready`/`claim` and hidden on
-  the dashboard by default. Un-park with `work.py set <id> --deferred no`.
+  existing) | **new** (not built yet). Prefer fixing what's already touched
+  before adding new surface.
+- `deferred: yes`: the plan is parked — invisible to `ready` by default.
+  Un-park with `work.py set <id> --deferred no`.
 
-Steering (human or foreman, no ownership needed — each writes one commit):
-`python3 work/tools/work.py set T-XX --owner <name> [--priority N] [--lane L]
-[--kind K] [--deferred yes|no] [--reason "..."]` — or the dashboard's detail
-drawer, or the `work_set` MCP tool.
+Steering: `python3 work/tools/work.py set T-XX [--priority N] [--lane L]
+[--kind K] [--deferred yes|no] [--reason "..."]`.
 
-## 3. Deferred plans registry (current)
+## 2. Deferred plans registry (current)
 
 | Plan | What's parked | Seam that stays |
 |---|---|---|
 | ML / custom-model training (Hunter 2026-07-03) | training/fine-tuning tasks (e.g. T-BL14); no new ML-track tasks cut | telemetry capture, eval benches, adapter serving stay as shipped; capture-now-train-later stands |
 | SaaS / cloud hosting (Hunter 2026-07-03) | any server build-out | AI-CAD Cloud stays a config-only provider/remote seam behind the Pillar-12 human gate (providers, PLM T-R7) |
 
-When cutting new tasks in a parked plan: create them `deferred: yes` so the ready
-queue stays honest.
+When cutting new tasks in a parked plan: create them `deferred: yes` so the
+ready queue stays honest.
 
-## 4. Roadblock triage (the anti-stall protocol)
+## 3. MCP freshness rule (standing, binding)
 
-`python3 work/tools/work.py roadblocks` (or the dashboard Mission view) computes,
-for every review/blocked/human-owned task, what it transitively holds up and a
-verdict:
-
-- **HIGH-IMPACT** (blocks P≤2 work): top of the human queue; the foreman may
-  fast-track the merge or `relink` dependents around it the same day.
-- **normal**: batch-merge in dependency-chain order (FOREMAN.md merge plan).
-- **low-impact** (P≥4 blocking nothing important): *do not let it queue* — the
-  foreman defers it (`set --deferred yes --reason`) or drops the dependency edge
-  (`relink`). A roadblock that isn't a big deal gets skipped, not waited on.
-  Deferring is reversible; stalling a lane isn't retroactively fixable.
-
-Questions in `work/questions/`: drivers answer driver-answerable ones best-effort
-inline; only genuinely human questions wait for Hunter (existing policy). The
-foreman sweeps open questions every session.
-
-## 5. Human session protocol (minimize Hunter's minutes)
-
-**One-time, once per checkout:** `python3 work/tools/work.py whoami --github <your-user>`
-(or `whoami(github=...)` via MCP). This stores a gitignored identity
-(`work/sync/identity.json`, GitHub-username-keyed, auto-filled from `gh`/`git config`)
-that (a) becomes the default `--owner` so you never re-type it, (b) authors your board
-commits as you — via per-commit `GIT_AUTHOR_*` env, **never** `git config` (see §0/identity
-rule), and (c) powers `work.py mine` / the `my_work` MCP tool. `work.py mine` = what's on
-your plate: in-progress, your review branches awaiting merge, your blocked tasks.
-
-When you sit down:
-1. `work/run_version_control.sh` → **Mission view**: the roadblocks strip is
-   ordered by impact — work top-down. Low-impact cards have one-click Defer.
-   (`work.py mine` gives the same "what's waiting on me" answer in the terminal.)
-2. Merge the review queue in the listed chain order (or tell the foreman to).
-3. Answer only the questions marked human-only.
-4. Adjust priorities/lanes/defers directly in the UI (or `work.py set`) — that IS
-   the steering interface; no meeting with the foreman needed.
-Everything else (claiming, building, reviewing branches for merge-readiness,
-question-answering) should already have happened without you.
-
-## 6. MCP freshness rule (standing, binding)
-
-The MCP surfaces ARE the product's AI harness. Any task that adds or changes an
+The MCP surface IS the product's AI harness. Any task that adds or changes an
 agent-facing workflow, tool, prompt, or context pack MUST, in the same branch:
-- update the relevant MCP server instructions (`services/mcp/` for ai-cad,
-  `work/tools/team_mcp.py` for team coordination),
+- update the relevant MCP server instructions (`services/mcp/` for ai-cad),
 - update `cad_guide` topics if modeling/CAM/ECAD-facing,
 - refresh the touched `work/context/` section pack (the `/ctx-*` skills read them),
 - run `graphify update .`.
-Tracked as a DoD convention; T-BL26 audits the current drift and adds a
-consistency check so this stays true mechanically.
 
-## 6b. Derived-asset honesty (DoD convention, Hunter 2026-07-03)
+## 3b. Derived-asset honesty (DoD convention, Hunter 2026-07-03)
 
 Screenshot-derived icons must show REAL engine output, never a stylized stand-in.
 In particular **CAM / Manufacture icons must render the real `cam_simulate` toolpath
 over the stock** — so each CAM icon doubles as a smoke check that the op chain
 (`cam_new_job` → `cam_add_tool` → `cam_add_operation` → `cam_simulate`) actually
 produces a valid toolpath. If an op won't produce a renderable toolpath, that is a
-**CAM bug to FILE (issue + backlog task), never an icon to skip or fake.** Tracked in
-T-BL29 (Manufacture group) and carried forward by T-BL34 (color + annotate the toolpath).
+**CAM bug to FILE (issue + backlog task), never an icon to skip or fake.**
 
-## 6c. GUI ownership policy (T-G24, 2026-07-05)
+## 3c. GUI ownership policy (T-G24, 2026-07-05)
 
 `ui/imgui/` is the **sole active GUI target**. `host/` is reference-only for T-G23
 (Chrome port) and is deleted by T-G11.
 
-Rules for all drivers:
 - **New GUI work goes in `ui/imgui/` only.** Do not touch `host/` for features or fixes.
-- **Double-patching both trees requires explicit lead approval.** If a task looks like
-  it needs both, stop and surface it before writing code.
-- `host/` is deleted by T-G11 — but only after T-G23 + T-G25 land AND a human Windows
+- `host/` is deleted by T-G11 — but only after T-G23 + T-G25 land AND a Windows
   build is verified. T-G11's `depends_on` reflects this.
 - Scripted shot launches (gate.sh, tools/gui_parity/run_all.py) use `xvfb-run` unless
   `AI_CAD_SHOT_HEADED=1` is set, even when `DISPLAY` is present. Set that env var for
   interactive/walkthrough runs.
 
-## 7. Command crib sheet
+## 4. Command crib sheet
 
 ```
-work.py ready [--include-deferred]      # what's claimable, in claim order
-work.py claim --owner NAME [--task ID]  # atomic claim (priority→day→fix-first)
-work.py roadblocks [--json]             # what's waiting on a human, with impact
+work.py ready [--include-deferred]      # what's unblocked, in priority order
+work.py roadblocks [--json]             # what's stuck / needs a decision
 work.py lanes [--json]                  # ship-readiness per feature lane
-work.py set ID --owner NAME ...         # steer priority/lane/kind/deferred
+work.py set ID ...                      # steer priority/lane/kind/deferred
 work.py board --lane app-gui --kind fix # filtered board
-work/run_version_control.sh             # the web dashboard (Mission/DAG/Graphify)
 ```
-MCP equivalents on aicad-team: work_ready, claim, work_roadblocks, work_lanes,
-work_set, work_board.

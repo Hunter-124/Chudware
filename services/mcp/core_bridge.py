@@ -174,6 +174,23 @@ def _load() -> ctypes.CDLL:
     with _lock:
         if _dll is not None:
             return _dll
+        # Mode-divergence guard: a legacy in-process engine editing docs while a
+        # live hostd serves the same docs to other clients = two sources of
+        # truth. Still a WARNING this release (the N+1 task upgrades it to a
+        # refusal once the legacy path is scheduled for deletion).
+        try:
+            from . import daemon_bridge
+
+            if not _daemon_mode() and daemon_bridge.daemon_socket_alive():
+                print(
+                    "[core_bridge] WARNING: an aicad-hostd daemon is running but this "
+                    "process is loading its OWN in-process engine "
+                    "(AI_CAD_ENGINE_DAEMON=0). Documents will NOT be shared with the "
+                    "daemon's clients. This becomes a hard refusal next release.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass  # the guard must never block a legacy load
         lib_path = _resolve_lib()
         lib_dir = lib_path.parent
         # The library's transitive deps (OCCT, Netgen, lib3mf, ...) live alongside it; put
@@ -253,6 +270,58 @@ def available() -> bool:
 
 # ---------------------------------------------------------------- the one RPC call
 
+# Engine backend mode (shared-engine refactor, see hostd plan). Phase-8 flip:
+#   AI_CAD_ENGINE_DAEMON unset / =1 -> DEFAULT: route through the shared
+#     aicad-hostd daemon (ONE engine for the GUI + every MCP process; live doc
+#     sharing, no per-process copy).
+#   AI_CAD_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
+#     (kept at least one release as the safety net; removal is a named N+1 task).
+# During release N a daemon TRANSPORT failure falls back to legacy with a loud
+# warning rather than bricking the session; N+1 makes it a hard error.
+_DAEMON_FALLBACK_WARNED = False
+
+
+def _daemon_mode() -> bool:
+    """Daemon mode is the default; only an explicit '0' selects legacy."""
+    return os.environ.get("AI_CAD_ENGINE_DAEMON", "1") != "0"
+
+
+def active_daemon_mode() -> bool:
+    """True when calls are ACTUALLY going through the daemon right now: daemon
+    mode is selected AND we have not fallen back to the legacy in-process engine
+    after a transport failure. Gates daemon-only behavior that would be wrong on
+    the fallback path (e.g. skipping the legacy .step+ handoff publisher)."""
+    return _daemon_mode() and not _DAEMON_FALLBACK_WARNED
+
+
+# Foreign-edit piggyback (Phase 3): the daemon injects "_foreign_edits":[...]
+# into a result when another client advanced the doc since OUR last touch. We
+# strip it off the engine result here (tool code never expects the key) and
+# buffer it; cad_tools._dumps appends a human-readable note to the next tool
+# output. Legacy mode never buffers anything, so this is purely additive.
+_FOREIGN_EDITS_PENDING: list = []
+
+
+def consume_foreign_edits() -> list:
+    """Drain buffered foreign-edit records ({doc_id, revision, source_kind, method})."""
+    out, _FOREIGN_EDITS_PENDING[:] = _FOREIGN_EDITS_PENDING[:], []
+    return out
+
+
+def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
+    from . import daemon_bridge  # local import: zero cost on the legacy path
+
+    result = daemon_bridge.client().call(method, params)
+    if isinstance(result, dict):
+        fe = result.pop("_foreign_edits", None)
+        if isinstance(fe, list):
+            _FOREIGN_EDITS_PENDING.extend(fe)
+    if isinstance(result, dict) and result.pop("_is_error", False):
+        msg = result.get("message") or result.get("error") or json.dumps(result)[:400]
+        raise CoreError(msg, code=str(result.get("code", "")), detail=result.get("detail"))
+    return result if isinstance(result, dict) else {"result": result}
+
+
 def call(method: str, params: Optional[dict] = None) -> dict:
     """Invoke one C++ core RPC. Returns the parsed JSON result dict.
 
@@ -261,6 +330,22 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     that the core reports at rc 0 (e.g. a sim returning ``{"ok": false, "error": ...}``) is
     returned as-is so the caller can surface it without an exception.
     """
+    global _DAEMON_FALLBACK_WARNED
+    if _daemon_mode():
+        from .daemon_bridge import DaemonError
+
+        try:
+            return _call_via_daemon(method, params)
+        except DaemonError as e:
+            # Transport-level failure only (spawn/connect/EOF-after-retry) — RPC
+            # errors surface above as CoreError and must NOT trigger fallback.
+            if not _DAEMON_FALLBACK_WARNED:
+                _DAEMON_FALLBACK_WARNED = True
+                print(
+                    f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
+                    "the legacy in-process engine. Doc sharing with the GUI is OFF.",
+                    file=sys.stderr,
+                )
     dll = _load()
     out = ctypes.c_char_p()
     # NOTE: native stdout (OCCT statistics etc.) is kept off the MCP JSON-RPC channel by a

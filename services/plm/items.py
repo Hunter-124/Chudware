@@ -107,12 +107,14 @@ def require_in_work_for_release(item: dict[str, Any]) -> None:
 def item_view(item: dict[str, Any]) -> dict[str, Any]:
     """The status/badge view of an item, including the derived working rev
     (the letter the next release will stamp) for "B · In work" chips."""
-    working = None
+    working = ""
     if item["lifecycle"] == manifest_mod.LIFECYCLE_IN_WORK:
-        working = manifest_mod.next_rev_letter(item.get("rev"))
+        working = manifest_mod.next_rev_letter(item.get("rev")) or ""
+    # Strings, never null: items predating part_number/rev stamping have None here,
+    # and a null string field crashes strict clients (GUI json::value type mismatch).
     view = {
         "item_id": item["item_id"], "path": item["path"], "kind": item["kind"],
-        "part_number": item.get("part_number"), "rev": item.get("rev"),
+        "part_number": item.get("part_number") or "", "rev": item.get("rev") or "",
         "lifecycle": item["lifecycle"], "working_rev": working,
     }
     if item.get("doc_type"):

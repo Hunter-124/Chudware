@@ -1,0 +1,253 @@
+#include "ipc_client.h"
+
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <map>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <process.h>  // _getpid
+#else
+#include <csignal>
+#include <unistd.h>
+#endif
+
+#include "ipc_discovery.h"
+
+namespace {
+long selfPid() {
+#ifdef _WIN32
+    return (long)_getpid();
+#else
+    return (long)::getpid();
+#endif
+}
+
+// True once `pid` no longer exists (drained daemon finished exiting).
+bool pidGone(long pid) {
+    if (pid <= 0) return true;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return true;
+    CloseHandle(h);
+    return false;
+#else
+    return ::kill((pid_t)pid, 0) == -1 && errno == ESRCH;
+#endif
+}
+
+// Build id of the hostd binary ON DISK: `aicad-hostd --version` prints
+// "aicad-hostd <git-describe id>". One subprocess per (path, mtime) — cached, so
+// steady-state reconnects never exec anything. "" on any failure (callers treat
+// unknown as not-stale). This is the client half of the version drain-replace:
+// hello.git_rev (the RUNNING daemon's configure-time id) vs what a fresh spawn
+// of the on-disk binary would report.
+std::string diskBuildId(const std::string& bin) {
+    if (bin.empty()) return "";
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(bin, ec);
+    const long long mtime =
+        ec ? 0
+           : std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch())
+                 .count();
+    static std::mutex m;
+    static std::map<std::string, std::pair<long long, std::string>> cache;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        auto it = cache.find(bin);
+        if (it != cache.end() && it->second.first == mtime) return it->second.second;
+    }
+    std::string out;
+#ifdef _WIN32
+    FILE* f = _popen(("\"" + bin + "\" --version").c_str(), "r");
+#else
+    FILE* f = ::popen(("'" + bin + "' --version 2>/dev/null").c_str(), "r");
+#endif
+    if (f) {
+        char buf[256] = {0};
+        if (std::fgets(buf, sizeof buf, f)) out = buf;
+#ifdef _WIN32
+        _pclose(f);
+#else
+        ::pclose(f);
+#endif
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    const size_t sp = out.find_last_of(" \t");
+    if (sp != std::string::npos) out = out.substr(sp + 1);
+    std::lock_guard<std::mutex> lk(m);
+    cache[bin] = {mtime, out};
+    return out;
+}
+}  // namespace
+
+namespace aicad_ipc {
+
+using nlohmann::json;
+
+bool EngineClient::tryConnect(std::string& err) {
+    conn_ = connectTo(sockPath_, err);
+    return conn_.valid();
+}
+
+bool EngineClient::hello(const std::string& kind, std::string& err) {
+    json params = {{"client", kind},
+                   {"pid", selfPid()},
+                   {"proto", 1}};
+    json result;
+    // Engine may still be loading; hello is a daemon-level method and answers
+    // immediately with state=loading|ready — that's fine for the handshake.
+    if (!call("hello", params, result, err)) return false;
+    serverInfo_ = result;
+    return true;
+}
+
+bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
+    if (!connectInner(opts, err)) return false;
+    if (!opts.allowSpawn) return true;  // control clients (--stop/--status) never drain
+
+    // Version drain-replace (Phase 8): the running daemon predates the hostd
+    // binary on disk -> ask it to drain (autosaves + exits), wait for exit, then
+    // respawn/reconnect so everyone lands on the new build. A refusal
+    // (mission_active) is a warn-and-continue: never kill running agent work.
+    const std::string running = serverInfo_.value("git_rev", std::string());
+    const std::string disk = diskBuildId(resolveHostdBin(opts.hostdBin));
+    if (running.empty() || disk.empty() || running == "unknown" || disk == "unknown" ||
+        running == disk)
+        return true;
+    nlohmann::json r;
+    std::string e;
+    if (!call("daemon_drain", nlohmann::json::object(), r, e)) {
+        std::fprintf(stderr,
+                     "[ipc] hostd on disk is %s but the running daemon is %s; drain "
+                     "refused (%s) — continuing on the old daemon\n",
+                     disk.c_str(), running.c_str(), e.c_str());
+        return true;
+    }
+    std::fprintf(stderr,
+                 "[ipc] hostd stale (running %s, on disk %s) — drained; respawning the "
+                 "new build\n",
+                 running.c_str(), disk.c_str());
+    const long oldPid = serverInfo_.value("daemon_pid", 0L);
+    disconnect();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!pidGone(oldPid) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return connectInner(opts, err);
+}
+
+bool EngineClient::connectInner(const Options& opts, std::string& err) {
+    const std::string key = instanceKey(opts.hostdBin);
+    sockPath_ = socketPath(key);
+    if (sockPath_.empty()) {
+        err = "no runtime dir for hostd socket";
+        return false;
+    }
+    std::string firstErr;
+    if (tryConnect(firstErr)) return hello(opts.clientKind, err);
+
+    if (!opts.allowSpawn) {
+        err = "hostd not running (" + firstErr + ")";
+        return false;
+    }
+    const std::string bin = resolveHostdBin(opts.hostdBin);
+    if (bin.empty()) {
+        err = "hostd binary not found (set AICAD_HOSTD_BIN); connect failed: " + firstErr;
+        return false;
+    }
+    if (!spawnDetached(bin, "", err)) return false;
+
+    // Retry-connect: 50 ms doubling capped at 500 ms, until the budget runs out.
+    // The daemon binds BEFORE loading the engine, so this only needs to cover
+    // process start + bind, not the (slow) OCCT load.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(opts.spawnBudgetMs);
+    int backoff = 50;
+    for (;;) {
+        std::string e;
+        if (tryConnect(e)) return hello(opts.clientKind, err);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            err = "hostd spawn timed out: " + e;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+        backoff = std::min(backoff * 2, 500);
+    }
+}
+
+bool EngineClient::readResponse(int id, json& out, std::string& err) {
+    std::string line;
+    for (;;) {
+        if (!conn_.readLine(line, -1)) {
+            err = conn_.eof() ? "daemon connection closed" : "daemon read failed";
+            return false;
+        }
+        json msg = json::parse(line, nullptr, /*allow_exceptions=*/false);
+        if (msg.is_discarded()) continue;  // tolerate stray non-JSON lines
+        if (msg.contains("event")) {
+            events_.push_back(std::move(msg));
+            continue;
+        }
+        if (msg.value("id", -1) == id) {
+            out = std::move(msg);
+            return true;
+        }
+        // A response for another id can't happen with one-outstanding-request;
+        // drop it rather than deadlock if the daemon misbehaves.
+    }
+}
+
+bool EngineClient::call(const std::string& method, const json& params, json& result,
+                        std::string& err) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!conn_.valid() || conn_.eof()) {
+        err = "not connected to hostd";
+        return false;
+    }
+    const int id = nextId_++;
+    json req = {{"id", id}, {"method", method}, {"params", params}};
+    if (!conn_.writeLine(req.dump())) {
+        err = "daemon write failed";
+        return false;
+    }
+    json resp;
+    if (!readResponse(id, resp, err)) return false;
+    if (resp.contains("result")) {
+        result = resp["result"];
+        return true;
+    }
+    result = resp.value("error", json::object());
+    err = result.is_object() ? result.value("message", result.dump()) : result.dump();
+    return false;
+}
+
+std::vector<json> EngineClient::drainEvents() {
+    // try_lock: the GUI thread drains per frame while call()s run on the async
+    // worker thread; a long solve holding mtx_ must never stall the render loop.
+    // Events arriving mid-call are queued by readResponse and picked up on the
+    // first uncontended frame after it returns.
+    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return {};
+    // Non-blocking poll for pushes that arrived while idle.
+    std::string line;
+    while (conn_.valid() && conn_.readLine(line, 0)) {
+        json msg = json::parse(line, nullptr, false);
+        if (!msg.is_discarded() && msg.contains("event")) events_.push_back(std::move(msg));
+        // Orphan responses (no waiter) are dropped.
+    }
+    std::vector<json> out;
+    out.swap(events_);
+    return out;
+}
+
+}  // namespace aicad_ipc

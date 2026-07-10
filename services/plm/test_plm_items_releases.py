@@ -433,3 +433,15 @@ def _assert_no_git_vocab(text: str) -> None:
     words = set(text.lower().replace(".", " ").replace(",", " ").replace(":", " ").split())
     leaked = words & _GIT_VOCAB
     assert not leaked, f"git vocabulary leaked: {leaked} in {text!r}"
+
+
+def test_item_view_never_emits_null_strings():
+    """Items predating part_number/rev stamping have None there; item_view must emit
+    "" not null — a null string field aborts the GUI's strict json parse (live crash
+    2026-07-09 opening swasi_test.step+)."""
+    legacy = {"item_id": "i1", "path": "a.step+", "kind": "part",
+              "lifecycle": "Released"}  # no part_number, no rev
+    view = items.item_view(legacy)
+    for key in ("part_number", "rev", "working_rev"):
+        assert view[key] == "", f"{key} must be '' for legacy items, got {view[key]!r}"
+    assert all(v is not None for v in view.values())

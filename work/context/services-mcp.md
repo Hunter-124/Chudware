@@ -92,7 +92,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/design_review_tools.py:32 `register_design_review_tools(mcp)` — one-call
   geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
 - services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
-- services/mcp/core_bridge.py:20 `call(method, params)` — thin ctypes RPC bridge to libaicad (JSON string-in/out); resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs
+- services/mcp/core_bridge.py:20 `call(method, params)` — the one engine funnel (JSON string-in/out). DEFAULT (Phase-8 flip): routes through the shared aicad-hostd daemon via daemon_bridge.py; explicit AI_CAD_ENGINE_DAEMON=0 = legacy in-process ctypes load (resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs)
 - services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 
 ## How it connects
@@ -107,8 +107,6 @@ dispatch. Default policy = everything allowed; DAG nodes + env can restrict it.
 
 Python engine_oracle modules (worker.py, kernel.py, formats.py) are called in-process by
 MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to_step).
-
-This is different from `work/tools/team_mcp.py` (dev-team coordination MCP server — separate).
 
 ## Debugging playbook
 

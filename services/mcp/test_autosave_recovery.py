@@ -28,6 +28,14 @@ import mcp_server.cad_tools as cad_tools
 import mcp_server.crash_bundle as crash_bundle
 
 
+@pytest.fixture(autouse=True)
+def _legacy_engine_mode(monkeypatch):
+    """This module tests the LEGACY in-process autosave/recovery path. Daemon
+    mode is the default since the Phase-8 flip (hostd owns autosave), so opt
+    out explicitly for every test here."""
+    monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "0")
+
+
 # ---------------------------------------------------------------------------
 # 1. _autosave_dir() path resolution
 # ---------------------------------------------------------------------------

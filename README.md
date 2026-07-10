@@ -10,67 +10,39 @@ sheet metal, CAM, ECAD, FEA/CFD, sourcing/BOM — one document model under all o
 
 ## 🤖 If you are an AI agent, start here
 
-Five rules put you on the right path instantly — everything else hangs off them:
+Four rules put you on the right path instantly — everything else hangs off them:
 
 1. **Orient with graphify, not grep.** This repo has a knowledge graph. Run
    `graphify query "<your question>"` (or `graphify explain` / `graphify path`) before reading
    source — a repo hook **enforces** this. Read raw files only after the graph orients you.
-2. **All work flows through the task board.** `python3 work/tools/work.py ready` shows what's
-   claimable; `claim --owner <your-name>` is the *only* legitimate way to take a task (atomic,
-   race-safe). Never work unclaimed, never merge to master, never set a task to `done` — humans
-   merge. The full loop: [work/prompts/autopilot.md](work/prompts/autopilot.md).
+2. **Solo dev — use the task board as a personal backlog.** `python3 work/tools/work.py ready`
+   shows what's unblocked; `work.py board` shows everything. No claim/coordination step is
+   needed (one contributor), so just pick a task, do it, and mark it done yourself.
 3. **The workflow policy is [work/WORKFLOW.md](work/WORKFLOW.md).** Priorities, lanes
    (feature areas), `kind: fix|overhaul|new` (fixes claim first), `deferred: yes` plans you must
-   not touch, the roadblock-skip protocol, and the MCP-freshness rule (ship a capability and its
-   discoverability in the same branch).
+   not touch, and the MCP-freshness rule (ship a capability and its discoverability in the same
+   branch).
 4. **Verify before review.** `bash scripts/gate.sh` (build + tests) must show no new reds;
    run `graphify update .` after code changes. GUI work verifies via the headless screenshot
    harness (`AI_CAD_SHOT=<scenario>`).
-5. **Coordinate, don't collide.** `work_board` / `issue_list` before touching anything;
-   questions go in `work/questions/<task-id>.md`; progress notes via `note`. Prefer the
-   `aicad-team` MCP tools (`whoami` once, then `claim`, `work_prompt`, `note`, `set_status`) —
-   same system as the CLI.
 
 New-to-a-subsystem? `section_context(section="core-cam")` (or the `/ctx-*` skills) loads a
 maintained source map instead of you re-exploring it.
 
 ## 🧑‍🔧 If you are a human, start here
 
-One-time, per-machine setup of the internal tooling (each contributor runs this locally;
-nothing touches shared repo state):
+One-time, per-machine setup:
 
 ```bash
 # 1. Build the code knowledge graph for your checkout (gitignored, regenerable)
 graphify .                               # once; `graphify hook install` keeps it fresh per-commit
 
-# 2. Register the team-coordination MCP server (Claude Code CLI + Claude Desktop)
-python3 work/tools/setup_team_tools.py   # then approve the one-time trust prompt in `claude`
-
-# 2a. Tell the tooling who you are (once) — GitHub username, auto-filled from gh/git
-python3 work/tools/work.py whoami --github <your-username>   # or whoami(github=...) via MCP
-#   stored gitignored in work/sync/identity.json; becomes your default task owner + the
-#   author of your board commits (via per-commit env, never `git config`) and powers
-#   `work.py mine` / the my_work MCP tool ("what's waiting on me")
-
-# 3. Register the ShopCraft CAD MCP server with your agent clients
+# 2. Register the ShopCraft CAD MCP server with your agent clients
 python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.bat)
 python3 services/installer/setup_mcp_clients.py --detect  # verify what's wired where
-
-# 4. Open Mission Control — the team dashboard
-work/run_version_control.sh              # (Windows: work\run_version_control.bat)
 ```
 
-**Mission Control** (`localhost:8787`) is the master view: what needs *you* right now
-(review-queue merges, stuck tasks, open questions — ordered by impact, with "safe to skip"
-verdicts), per-feature progress lanes sorted by closest-to-shipping, and a pan/zoom dependency
-map of every task. You steer from there too: priorities, feature areas, and pausing/unpausing
-plans write straight back to the board. Optional extras: `work/workd.sh <name>` (presence
-daemon) and `work/report.sh` (AI-guided bug/idea reporter → GitHub issue + backlog task).
-
-When you sit down to work the board, follow the human protocol in
-[work/WORKFLOW.md](work/WORKFLOW.md) §5 — check `work.py mine` for what's waiting on you,
-merge the review queue top-down, answer the human-only questions, adjust priorities.
-Everything else runs without you.
+Optional extras: `work/report.sh` (AI-guided bug/idea reporter → GitHub issue + backlog task).
 
 ---
 
@@ -136,27 +108,26 @@ ui/
 host/            legacy GUI (deprecated — deleted at T-G11; don't add code here)
 corpora/         test fixtures (sketch, render, sw_parity, sw_fixtures)
 docs/ tools/ scripts/ third_party/
-work/            task board + team tooling (WORKFLOW.md, tasks/, tools/, Mission Control)
+work/            task board (WORKFLOW.md, tasks/, tools/)
 ```
 
-## How work gets organized (Workflow v2)
+## How work gets organized
 
 Tasks are git-tracked markdown files in `work/tasks/` + `work/backlog/` with frontmatter:
-`priority` (1–5), `lane` (user-facing feature area — the dashboard swim-rows), `kind`
-(`fix` | `overhaul` | `new`; fixes claim first within a priority), `deferred: yes` (parked
-plans — currently ML training and SaaS hosting — invisible to claiming). Key commands:
+`priority` (1–5), `lane` (user-facing feature area), `kind` (`fix` | `overhaul` | `new`;
+fixes go first within a priority), `deferred: yes` (parked plans — currently ML training and
+SaaS hosting). Key commands:
 
 ```bash
-python3 work/tools/work.py ready        # what's claimable, in claim order
-python3 work/tools/work.py roadblocks   # what's waiting on a HUMAN, with impact verdicts
+python3 work/tools/work.py ready        # what's unblocked, in priority order
+python3 work/tools/work.py roadblocks   # what's stuck / needs a decision
 python3 work/tools/work.py lanes        # ship-readiness per feature area
-python3 work/tools/work.py set T-XX --owner you --priority 2 --deferred no   # steer
+python3 work/tools/work.py set T-XX --priority 2 --deferred no   # steer
 ```
 
-Roles: **Sonnet drivers** claim and execute; **one Fable foreman** reviews, merges, triages
-roadblocks (low-impact roadblocks get skipped/deferred, not queued); **humans** merge to done
-and answer human-only questions. Canonical policy: [work/WORKFLOW.md](work/WORKFLOW.md).
-Dependency graph: [work/DAG.md](work/DAG.md) (`work.py dag` regenerates).
+Solo dev — main WIP happens on this machine, remote is mainly a backup. Canonical policy:
+[work/WORKFLOW.md](work/WORKFLOW.md). Dependency graph: [work/DAG.md](work/DAG.md)
+(`work.py dag` regenerates).
 
 ## Build & run
 
@@ -173,7 +144,10 @@ dist\AI-CAD\AI-CAD.exe                             # run (first launch self-prov
 ```
 `build.bat host` compiles the exe only; `build.bat app` re-syncs Python-only changes.
 Headless smoke (no GUI): `AI-CAD.exe --design "a 30mm knurled hex standoff" out.png`.
-Package a release: `py -3.11 -m installer.build_release --zip`.
+Package a release: `py -3.11 -m installer.build_release --zip` (Windows walkthrough:
+`docs/PACKAGING_WINDOWS.md`; Linux AppImage: `packaging/linux/build_appimage.sh`).
+Both installers bundle the shared engine-host daemon — see `docs/HOSTD.md` for
+its lifecycle, env vars, and troubleshooting.
 
 **C++ core:**
 ```powershell
@@ -214,8 +188,7 @@ SaaS/cloud hosting — capture/eval seams stay, build-out waits.
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the rules (license guardrails, OSS-first, style);
-[work/README.md](work/README.md) documents the task system;
-[work/prompts/autopilot.md](work/prompts/autopilot.md) is the autonomous-driver loop.
+[work/README.md](work/README.md) documents the task system.
 
 **Model-author contract (v1 `script` features):** scripts run with the full `build123d`
 namespace in scope and assign the final shape to `result`; printed output is captured.

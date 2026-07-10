@@ -431,6 +431,17 @@ private:
     // (fallback: undo loop). revert(checkpointId_) is the single cancel call.
     std::string checkpointId_;
 
+    // Phase 4 (shared engine daemon): while this form previews, the daemon holds the doc for
+    // exclusive edit (edit_hold at open — foreign clients get retriable busy_preview) and the hold
+    // is released in close() (both OK and Cancel funnel there). The daemon auto-refreshes the hold
+    // on every preview op; tick() additionally re-holds at most once/second while the form is
+    // active so an idle-but-open form outlives brief pauses. If the hold is REJECTED busy at open
+    // (another client mid-edit), the form still opens with a warning toast — non-blocking, CAS +
+    // the other side's hold guard actual conflicts (documented Phase 4 choice). Empty = no hold
+    // (legacy mode / hold rejected).
+    std::string holdDocId_;
+    double lastHoldTime_ = 0.0;   // ImGui::GetTime() of the last edit_hold call
+
     // C37-F: true when the first field in the form has received SetKeyboardFocusHere.
     bool focusedOnOpen_ = false;
 

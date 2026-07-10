@@ -260,8 +260,12 @@ def _clone_doc(live_tree: dict, cb: Any) -> tuple[str, list[dict]]:
 
 
 def _close_clone(clone_id: str, cb: Any) -> None:
+    # cb.call dispatches ENGINE RPCs — the engine verb is `doc_close` (see cad_tools.close_part,
+    # which itself calls doc_close). `close_part` is an MCP *tool* name, not an engine RPC, so the
+    # old call raised "unknown method" every time and the throwaway preflight clone leaked forever
+    # (auto-preflight fires on every add_features → dozens of stale `_pf` docs pinned in the engine).
     try:
-        cb.call("close_part", {"doc_id": clone_id})
+        cb.call("doc_close", {"doc_id": clone_id})
     except Exception:  # noqa: BLE001
         pass
 

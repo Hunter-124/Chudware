@@ -366,6 +366,38 @@ static const std::vector<PMFormDef>& forms() {
             Dim     ("dx",       "Pitch X",          "Positions", 20.0),
             Dim     ("dy",       "Pitch Y",          "Positions", 20.0),
         }},
+        // --- thread (Thread Wizard) ---  ISO/Unified threads cut/raised on a picked CYLINDRICAL
+        //   face (core/geom/thread.cpp, compiled in core/doc/document.cpp). The engine reads params
+        //   top-level after document.cpp's params/refs flatten; target_face passes straight through
+        //   (like hole.face). `size` drives major+pitch from the standard table — but a size that
+        //   is NOT in the table THROWS, so "custom" can't be a dropdown value: a "Custom size" check
+        //   HIDES the Size dropdown (→ omitted from the op) and reveals Major Dia. + Pitch instead.
+        //   mode has 3 options (Cut/Raised/Cosmetic) so it's a dropdown, not a 2-way segmented pill.
+        //   turns is a Text field: blank ⇒ omitted ⇒ engine's default cap (24); a typed number caps
+        //   the helix (num_or_expr parses it). Helical booleans can fall back to the plain cylinder
+        //   plus a non-fatal FeatureStatus.warning, which the PM surfaces amber automatically.
+        { "thread", "Thread", "thread", {
+            Well    ("target_face", "Cylindrical Face", "Thread", K_FACE, false),
+            Check   ("custom_size", "Custom size",      "Thread", false),
+            ComboLIf("size",  "Size",  "Thread",
+                     "M3|M4|M5|M6|M8|M10|M12|M16|M20|M24|M8x1|M10x1.25|M12x1.5|"
+                     "#10-24|#10-32|1/4-20|5/16-18|3/8-16|1/2-13",
+                     "M3|M4|M5|M6|M8|M10|M12|M16|M20|M24|M8x1 (fine)|M10x1.25 (fine)|M12x1.5 (fine)|"
+                     "#10-24 UNC|#10-32 UNF|1/4-20 UNC|5/16-18 UNC|3/8-16 UNC|1/2-13 UNC",
+                     "custom_size", "false"),
+            DimIf   ("major_dia", "Major Dia.", "Thread", 12.0,  "custom_size", "true", /*omit=*/true),
+            DimIf   ("pitch",     "Pitch",      "Thread", 1.75,  "custom_size", "true", /*omit=*/true),
+            Dim     ("length",    "Length",     "Thread", 12.0),
+            ComboL  ("form",  "Profile", "Thread",
+                     "v|acme|trap|square", "V (60 deg)|ACME|Trapezoidal|Square"),
+            ComboL  ("mode",  "Mode", "Thread",
+                     "cut|raised|cosmetic", "Cut|Raised|Cosmetic"),
+            ComboL  ("style", "Style", "Advanced",
+                     "external|internal", "External (shaft)|Internal (bore)"),
+            Int     ("starts",     "Starts",     "Advanced", 1),
+            ComboL  ("handedness", "Handedness", "Advanced", "right|left", "Right|Left"),
+            Text    ("turns",      "Turns cap",  "Advanced", "(auto)"),
+        }},
         // --- mirror ---  plane (datum/face) + features[] (seeded from selection)
         //   Engine (pattern.py compile_mirror): reflects each seed feature's tool body across the
         //   plane with the same boolean; empty features => whole-body mirror + union.
@@ -779,6 +811,7 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "loft_cut")      { mode = "cut";  return pmFindForm("loft"); }
     // Hole wizard, draft, and the feature pattern/mirror family (no boss/cut mode).
     if (cmdId == "hole_wizard")      return pmFindForm("hole");
+    if (cmdId == "thread")           return pmFindForm("thread");
     if (cmdId == "draft")            return pmFindForm("draft");
     if (cmdId == "mirror_feature")   return pmFindForm("mirror");
     if (cmdId == "linear_pattern")   return pmFindForm("linear_pattern");

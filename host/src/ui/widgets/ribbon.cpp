@@ -816,22 +816,49 @@ static const float* ribbon_matSwatchColor(const char* cmd_id) {
 //            don't share a pixel and merge into a solid grid line.
 //
 // All layers scale down when !enabled so disabled buttons keep a low-contrast ghost.
+// Vertical top->bottom gradient with ROUNDED corners covering the full [a,b] rounded rect (so a
+// tinted button fill reaches into the rounded corners instead of a square gradient stopping short).
+// Mirrors ui::glassCardWash's rounded-fill technique: rounded base in the bottom color, a
+// rounded-top strip in the top color, then a straight multicolor band for the interior.
+static void ribbon_vGradRounded(ImDrawList* dl, ImVec2 a, ImVec2 b, float rnd, ImU32 top, ImU32 bot) {
+    if (b.x <= a.x || b.y <= a.y) return;
+    rnd = ImClamp(rnd, 0.0f, ImMin((b.x - a.x), (b.y - a.y)) * 0.5f);
+    dl->AddRectFilled(a, b, bot, rnd);
+    dl->AddRectFilled(a, ImVec2(b.x, a.y + rnd), top, rnd, ImDrawFlags_RoundCornersTop);
+    if (b.y - rnd > a.y + rnd)
+        dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + rnd), ImVec2(b.x, b.y - rnd), top, top, bot, bot);
+}
+
 static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled,
                             bool inset = false, bool hovered = false) {
     const float* t = ui::palette.text;
-    float fillA    = !enabled ? 0.04f : (hovered ? 0.16f : 0.08f);
-    float lineA    = !enabled ? 0.20f : (hovered ? 0.70f : 0.45f);
-    float shineMul = !enabled ? 0.45f : (hovered ? 1.60f : 1.00f);
-    ImU32 fill   = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
-                             (int)(fillA * 255));
+    const float* a = ui::palette.accent;   // colored-glass tint (goes with the app color scheme)
+    // Keep a clearly-visible border at rest (not just on hover) so every button reads as a discrete
+    // key, and keep the top shine restrained so the gradient never blows out to near-white.
+    float lineA    = !enabled ? 0.24f : (hovered ? 0.72f : 0.55f);
+    float shineMul = !enabled ? 0.35f : (hovered ? 0.95f : 0.55f);
     ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(lineA * 255));
     if (inset) { p0.y += 1.0f; p1.y -= 1.0f; }
-    dl->AddRectFilled(p0, p1, fill, rounding);
-    // Vertical shine gradient — lighter top, fading to transparent by ~55% height. Drawn 1px
-    // inside the outline so the square gradient corners never poke past the rounded border.
+    // Colored gradient background: a faint neutral base plus a top->bottom accent wash so every
+    // button reads as tinted "liquid glass" in the app color, brightening on hover.
+    float baseA    = !enabled ? 0.04f : (hovered ? 0.10f : 0.06f);
+    float tintTopA = !enabled ? 0.05f : (hovered ? 0.18f : 0.12f);
+    ImU32 base = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255), (int)(baseA * 255));
+    dl->AddRectFilled(p0, p1, base, rounding);
+    const float ix = 1.0f * ui::uiScale;
+    const float rIn = ImMax(0.0f, rounding - ix);   // inner rounding for the 1px-inset fills
     {
-        const float ix = 1.0f * ui::uiScale;
+        ImVec2 g0(p0.x + ix, p0.y + ix), g1(p1.x - ix, p1.y - ix);
+        ImU32 aTop = IM_COL32((int)(a[0]*255), (int)(a[1]*255), (int)(a[2]*255),
+                              (int)(tintTopA * 255));
+        ImU32 aBtm = IM_COL32((int)(a[0]*255), (int)(a[1]*255), (int)(a[2]*255),
+                              (int)(tintTopA * 0.28f * 255));
+        ribbon_vGradRounded(dl, g0, g1, rIn, aTop, aBtm);   // rounded: reaches the corners
+    }
+    // Vertical shine gradient — lighter top, fading to transparent by ~55% height. Rounded top so
+    // it hugs the button's rounded corners instead of poking a square edge past them.
+    {
         ImVec2 g0(p0.x + ix, p0.y + ix);
         ImVec2 g1(p1.x - ix, p0.y + (p1.y - p0.y) * 0.55f);
         if (g1.x > g0.x && g1.y > g0.y) {
@@ -839,7 +866,7 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
             ui::Palette::withAlpha(ui::palette.glassHighlight, hc, shineMul);
             ImU32 top = ui::Palette::toU32(hc);
             ImU32 btm = top & 0x00FFFFFFu;  // same RGB, alpha=0 (ABGR: bits 24-31 = A)
-            dl->AddRectFilledMultiColor(g0, g1, top, top, btm, btm);
+            ribbon_vGradRounded(dl, g0, g1, rIn, top, btm);
         }
     }
     dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
@@ -1103,14 +1130,18 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
-        float ix = snap(p0.x + 2.0f * s + (matRgb ? 6.0f * s : 0.0f));
+        // Center the icon+text block horizontally within the main (non-arrow) area.
+        const float matPad   = matRgb ? 6.0f * s : 0.0f;
+        const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
+        const float xoff     = snap(ImMax(2.0f * s, (mainW - contentW) * 0.5f));
+        float ix = snap(p0.x + xoff + matPad);
         float iy = snap(p0.y + (rowH - iconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, enabled,
                     ribbon_isActive(cmd_id));
         if (matRgb) {
             // Vertical color swatch strip to the left of the icon (compact row layout).
             float stW = 4.0f * s, stH = 14.0f * s;
-            float stx = snap(p0.x + 2.0f * s);
+            float stx = snap(p0.x + xoff);
             float sty = snap(p0.y + (rowH - stH) * 0.5f);
             ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
                                    (int)(matRgb[1] * 255.0f + 0.5f),
@@ -1375,13 +1406,15 @@ static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
 
 // Draw a small button. Returns true if clicked.
 static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
-                          const char* label, bool enabled) {
+                          const char* label, bool enabled, float wOverride = -1.0f) {
     float s      = ui::uiScale;
     float rowH   = kSmRowH * s;
     float iconSz = kSmIconSz * s;
     // §2.2: drive the drawn/hit width from the SAME helper the packer measures with, so measure
     // and draw never disagree (previously the helper returned text+18*s but this drew text+10*s).
-    float totalW = ribbon_smBtnW(label);
+    // wOverride >= 0 draws at the COLUMN width so every small button in a stacked column shares one
+    // edge (clean, aligned display) instead of each hugging its own label width.
+    float totalW = wOverride >= 0.0f ? wOverride : ribbon_smBtnW(label);
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::PushID(cmd_id);
@@ -1418,14 +1451,18 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float snappedIconSz = snap(iconSz);
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
-        float ix  = snap(p0.x + (matRgb ? 6.0f * s : 0.0f));
+        // Center the icon+text block horizontally within the (column-wide) button.
+        const float matPad   = matRgb ? 6.0f * s : 0.0f;
+        const float contentW = matPad + snappedIconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
+        const float xoff     = snap(ImMax(0.0f, (totalW - contentW) * 0.5f));
+        float ix  = snap(p0.x + xoff + matPad);
         float iy  = snap(p0.y + (rowH - snappedIconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + snappedIconSz * 0.5f, iy + snappedIconSz * 0.5f,
                     snappedIconSz, enabled, ribbon_isActive(cmd_id));
         if (matRgb) {
             // Vertical color swatch strip to the left of the icon.
             float stW = 4.0f * s, stH = 14.0f * s;
-            float stx = snap(p0.x);
+            float stx = snap(p0.x + xoff);
             float sty = snap(p0.y + (rowH - stH) * 0.5f);
             ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
                                    (int)(matRgb[1] * 255.0f + 0.5f),
@@ -1603,16 +1640,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         bool tabHov = ImGui::IsItemHovered();
         ImGui::PopID();
 
-        if (isAct || tabHov) {
-            // Shared glass pill: the active tab gets the restrained accent card (selected=true),
-            // a hovered tab a light frosted wash. Same helper as the Copilot/FeatureManager rows.
-            ui::glassRowBackground(dl, tp0, tp1, 4.0f, /*stripe*/false, /*selected*/isAct);
-        }
-        if (isAct) {
-            // Bold outline box — matches the tool-button active cue (deliverable 3).
-            // glassRowBackground already filled the pill; this adds the perimeter accent stroke.
-            dl->AddRect(tp0, tp1, Palette::toU32(palette.accent), 4.0f,
-                        0, ui::metrics::stroke(2.0f));
+        {
+            // Colored gradient background on EVERY tab (the same Layers-style wash the rows/buttons
+            // use), stronger on the active tab and on hover. The active tab is framed by the glow
+            // border (coloredRowWash selected=true) — no separate bold outline box.
+            ui::glassRowBackground(dl, tp0, tp1, 4.0f, /*stripe*/false, /*selected*/false,
+                                   isAct ? 0.42f : (tabHov ? 0.34f : 0.20f));
+            const float strength = isAct ? 0.30f : (tabHov ? 0.20f : 0.12f);
+            ui::coloredRowWash(dl, tp0, tp1, 4.0f, palette.accent, strength, /*selected*/isAct);
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])
@@ -1818,7 +1853,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     for (int r = 0; r < col.count; ++r) {
                         const auto* cmd = grp.smCmds[col.first + r];
                         ImGui::SetCursorPos(ImVec2(sx, sy));
-                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd));
+                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
+                                     col.width);
                         sy += kSmRowH * s;
                     }
                     sx += col.width;
@@ -1853,9 +1889,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         // Finish Sketch degraded row: keep its Cancel dropdown (dedicated flyout,
                         // not runFlyout — see the big-layout branch above for why).
                         if (ribbon_isSketchFinish(cmd)) {
+                            // Draw at the COLUMN width so every row in this stack shares one edge.
                             ribbon_bigBtnAsSmall(cmd->cmd_id, cmd->icon, cmd->label,
-                                                 true, /*hasDrop=*/true,
-                                                 ribbon_bigBtnAsSmallWMax(grp, cmd, true));
+                                                 true, /*hasDrop=*/true, col.width);
                             ribbon_sketchFinishFlyout(cmd);
                             sy += ribbon_bigBtnAsSmallRowH();
                             continue;
@@ -1863,13 +1899,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
                         resolveFace(cmd, drop, showIcon, showLabel);
-                        // N1-N5: draw at the same widest-variant width the packer reserved.
+                        // Uniform column width (the packer already reserved the widest variant).
                         ribbon_bigBtnAsSmall(cmd->cmd_id, showIcon, showLabel,
-                                             ribbon_cmdEnabled(cmd), drop,
-                                             ribbon_bigBtnAsSmallWMax(grp, cmd, drop));
+                                             ribbon_cmdEnabled(cmd), drop, col.width);
                         if (drop) runFlyout(cmd);
                     } else {
-                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd));
+                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
+                                     col.width);
                     }
                     // §2.3: degraded big rows are taller than kSmRowH — advance by the actual height.
                     sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : kSmRowH * s;

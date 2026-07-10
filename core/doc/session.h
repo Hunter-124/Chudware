@@ -567,4 +567,19 @@ nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    bool check_interference,
                                    double min_clearance_mm = 0.0);
 
+// --- g_mtx contention meters (Phase 1b perf visibility) ----------------------------
+// The single global session lock every modeling RPC serialises through is instrumented to
+// measure lock wait/hold/queue-depth. This is the primary bottleneck signal when many
+// subagents drive ONE engine (blocked-on-lock time is invisible to the on-CPU sampler).
+
+// Stamp the calling thread's current RPC method name so DocLock can attribute wait/hold to
+// the caller. The pointer must stay valid for the duration of the call (the dispatch boundary
+// passes the method string's c_str, then clears it with nullptr on return).
+void set_current_rpc_method(const char* method);
+
+// Snapshot the contention meters as JSON (acquisitions, %contended, total/avg/max wait+hold,
+// pct_wall_blocked, peak waiters, and the top methods by cumulative wait). reset=true zeroes
+// the counters and restarts the window — call it right before a measured run.
+nlohmann::json contention_report(bool reset);
+
 }  // namespace aicad::doc

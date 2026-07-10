@@ -40,4 +40,21 @@ std::string stepplus_save(const nlohmann::json& doc, const std::string& path,
 // Throws OpError("io_error", ...) if the file is missing/corrupt or not a .step+ .
 StepPlusDoc stepplus_open(const std::string& path);
 
+// --- persisted-geometry cache keys (fast cold-open) --------------------------------
+// doc_save may embed the compiled tessellation + ops-response as extra `cache.aicm` /
+// `cache.json` entries so a later doc_open can return them WITHOUT re-running
+// compile_document (rebuild-on-open is the dominant cold-open cost). The cache is
+// display-only: it never touches document.json (the parametric source of truth), and the
+// first edit recompiles from features. Validity is gated on TWO stable keys:
+
+// A run-stable 64-bit FNV-1a hash of the CANONICAL document json (same canonicalization
+// stepplus_save writes), so open can prove the geometry matches the exact saved tree. Not
+// std::hash (which is not guaranteed stable across runs/platforms — the value is persisted).
+std::string stepplus_doc_hash(const nlohmann::json& doc);
+
+// An engine/kernel identity string (OCCT version + a cache-format schema constant). Any
+// change to the geometry compiler that could alter output MUST bump the schema constant so
+// stale caches from older engines are rejected. Mismatch on open -> full rebuild.
+std::string stepplus_cache_engine_key();
+
 }  // namespace aicad::doc

@@ -188,9 +188,7 @@ const char* resolveIconAlias(const char* name) {
         {"name_group_features", "folder_new"},         // group selected features into a named folder
         {"new_part",            "part"},
         {"open_part",           "open"},
-        {"appr_steel",          "appr_metal"},         // appearance metals share the polished-metal render
-        {"appr_brass",          "appr_metal"},
-        {"appr_dark",           "appr_metal"},
+        // (appr_steel/brass/dark now have their own distinct tinted-metal atlas glyphs — aliases removed.)
     };
     for (const Alias& a : kAliases)
         if (std::strcmp(name, a.from) == 0) return a.to;

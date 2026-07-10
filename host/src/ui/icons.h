@@ -29,6 +29,10 @@ void freeIcons();
 // Returns a placeholder (magenta) and emits one stderr warning if name is unknown.
 IconUV getIcon(const char* name, int size = 32);
 
+// Maps a referenced icon name to an existing atlas glyph when it has no dedicated cell (single
+// source of truth for icon fallbacks; see icons.cpp). Returns `name` unchanged if not aliased.
+const char* resolveIconAlias(const char* name);
+
 // Call after applyTheme() — swaps the active texture ID so all subsequent getIcon()
 // calls use the new atlas.  UVs stay constant.
 void syncIconTheme();

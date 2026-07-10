@@ -86,3 +86,21 @@ NOTES:
     impedance from the fab's coupon service for critical interfaces.
   * No board open? ecad_stackup_solve(apply=False) still returns the full solve
     (design-ahead mode) so you can plan the stackup before layout starts.
+
+PDN / IR-DROP (T-FIN13; DC resistive solve of power-net copper):
+  ecad_run_pdn()                     analyze every net with a detectable source
+  ecad_run_pdn(net='+5V', source_refs='U3')   one net, explicit regulator/connector ref
+  ecad_run_pdn(net='+5V', sink_overrides='{"U2": 0.35}', vsrc=5.0, resolution_mm=0.5)
+  Meshes the net's pours/tracks/pads into a 2.5D resistor grid (sheet R from stackup
+  copper thickness; vias as annular barrel resistors) and sparse-solves DC voltages.
+  Sources = pads held at vsrc: auto-detected from power_out symbol pins, or source_refs.
+  Sinks = per-component supply currents from the T-FIN8 rail metadata (supply.rails
+  current_a_active); components WITHOUT current data are reported in
+  unknown_current_refs — never silently modelled as 0 A (honesty rule).
+  REPORTS: per-component drop vs the rail's voltage_v_min (within_tolerance),
+  current-density hotspots vs j_limit_a_mm2 (default 30 A/mm2), open PDN paths.
+  I2R HEAT MAP: the per-element dissipation field is written as the `pdn` block of the
+  aicad.boardphys/1 sidecar (merged into board.step.boardphys.json when ecad_to_3d ran,
+  else pdn.boardphys.json) — the trace-heating input for the thermal handoff.
+  BIAS: run after routing + zone fill (unrouted copper = "not connected" violations);
+  fix drops by widening copper / adding a pour / stitching vias, then re-run.

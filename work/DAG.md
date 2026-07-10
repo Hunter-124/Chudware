@@ -95,9 +95,9 @@ graph TD
     T_FIN1["T-FIN1: Firmware emulation GPIO state extraction - real pin-level assertions from Renode/QEMU"]:::done
     T_FIN10["T-FIN10: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout"]:::todo
     T_FIN11["T-FIN11: FPGA support pack - I/O bank validation and constraint export (XDC/LPF/CSV)"]:::todo
-    T_FIN12["T-FIN12: Stackup advisor - impedance-target-driven layer stackup solve"]:::doing
+    T_FIN12["T-FIN12: Stackup advisor - impedance-target-driven layer stackup solve"]:::done
     T_FIN13["T-FIN13: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map"]:::todo
-    T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::doing
+    T_FIN14["T-FIN14: Optional ngspice backend - provisioned pass-through beside the internal MNA solver"]:::done
     T_FIN15["T-FIN15: Freeze aicad.simhandoff/1 - generalized cross-sim handoff and verify contract"]:::done
     T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::todo
     T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::todo

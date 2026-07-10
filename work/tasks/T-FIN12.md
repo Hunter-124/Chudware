@@ -2,8 +2,8 @@
 id: T-FIN12
 title: Stackup advisor - impedance-target-driven layer stackup solve
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN12-ecad-stackup-advisor
 depends_on: []
 lane: ecad-firmware

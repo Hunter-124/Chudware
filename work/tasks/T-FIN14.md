@@ -2,8 +2,8 @@
 id: T-FIN14
 title: Optional ngspice backend - provisioned pass-through beside the internal MNA solver
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN14-ecad-ngspice-backend
 depends_on: []
 lane: ecad-firmware

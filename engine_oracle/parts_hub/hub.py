@@ -58,6 +58,8 @@ class PartsHub:
         from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        # T-FIN17 curated heatsink catalog (thermal metadata for heatsink_select)
+        from engine_oracle.parts_hub.adapters.heatsinks_adapter import HeatsinksAdapter
         # T-P2 live-vendor adapter (non-indexed, search-only)
         from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
 
@@ -67,6 +69,7 @@ class PartsHub:
         self.register(PipingFittingsAdapter())
         self.register(HydraulicComponentsAdapter())
         self.register(EcadKicadAdapter())
+        self.register(HeatsinksAdapter())
         self.register(EcadVendorAdapter())
         self._register_browser_catalog_adapters()
         # Build the index immediately so first search is fast.

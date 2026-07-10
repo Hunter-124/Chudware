@@ -404,4 +404,467 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     return res;
 }
 
+// ═════════════════════════════ Transient (T-FIN18) ═══════════════════════════════════════
+//
+// NOTE ON DUPLICATION: the conductivity/surface assembly below intentionally repeats the
+// steady solver's loops instead of refactoring them into a shared helper. The steady path
+// is under a HARD bit-for-bit regression gate; keeping fea_thermal_solve() byte-identical
+// (same triplet emission order, same summation order) is worth ~100 duplicated lines.
+
+namespace {
+
+// Element capacitance matrices (constant-Jacobian straight tets; mid-edge nodes at edge
+// midpoints — what both the box promoter and the mesher produce; curved boundary tet10s
+// see a small, mesh-converging approximation).
+//
+// tet4 consistent: C = rho_cp·V/20 · (1+δij). Row-sum lumped: rho_cp·V/4 per node.
+//
+// tet10: shape functions are quadratics in the volume coordinates L0..L3, so every entry
+// ∫ N_i N_j dV is an exact volume-coordinate moment  ∫ L0^a L1^b L2^c L3^d dV =
+// 6V·a!b!c!d!/(a+b+c+d+3)!  — evaluated below by expanding each N as monomial terms
+// (corner: 2L² − L; mid(a,b): 4·La·Lb). No quadrature, no tabulated magic matrix.
+//
+// tet10 LUMPED uses HRZ (diagonal scaling): row-sum lumping fails for tet10 because
+// ∫N_corner dV = −V/20 < 0. HRZ: lump_i = diag_i · V/Σdiag. With diag_corner = ∫N_c² = V/70
+// and diag_mid = ∫N_m² = 8V/105, Σdiag = 18V/35, so lump_corner = V/36, lump_mid = 4V/27
+// (checks: 4·V/36 + 6·4V/27 = V).
+struct Tet10Term {
+    double coef;
+    int e[4];  // exponents of L0..L3
+};
+
+std::vector<Tet10Term> tet10_shape_terms(int n) {
+    if (n < 4) {
+        Tet10Term a{2.0, {0, 0, 0, 0}}, b{-1.0, {0, 0, 0, 0}};
+        a.e[n] = 2;
+        b.e[n] = 1;
+        return {a, b};
+    }
+    static const int LE[6][2] = {{0, 1}, {1, 2}, {2, 0}, {3, 0}, {3, 2}, {3, 1}};
+    Tet10Term m{4.0, {0, 0, 0, 0}};
+    m.e[LE[n - 4][0]] += 1;
+    m.e[LE[n - 4][1]] += 1;
+    return {m};
+}
+
+// ∫ L0^a L1^b L2^c L3^d dV over a straight tet of volume V.
+double tet_moment(int a, int b, int c, int d, double V) {
+    auto fact = [](int n) {
+        double f = 1.0;
+        for (int i = 2; i <= n; ++i) f *= i;
+        return f;
+    };
+    return 6.0 * V * fact(a) * fact(b) * fact(c) * fact(d) / fact(a + b + c + d + 3);
+}
+
+// Consistent tet10 capacitance/V template  T_ij = (1/V) ∫ N_i N_j dV, computed once.
+const Eigen::Matrix<double, 10, 10>& tet10_mass_template() {
+    static const Eigen::Matrix<double, 10, 10> T = [] {
+        Eigen::Matrix<double, 10, 10> M;
+        for (int i = 0; i < 10; ++i) {
+            const auto ti = tet10_shape_terms(i);
+            for (int j = i; j < 10; ++j) {
+                const auto tj = tet10_shape_terms(j);
+                double v = 0.0;
+                for (const auto& a : ti)
+                    for (const auto& b : tj)
+                        v += a.coef * b.coef *
+                             tet_moment(a.e[0] + b.e[0], a.e[1] + b.e[1], a.e[2] + b.e[2],
+                                        a.e[3] + b.e[3], 1.0);
+                M(i, j) = v;
+                M(j, i) = v;
+            }
+        }
+        return M;
+    }();
+    return T;
+}
+
+}  // namespace
+
+double thermal_schedule_scale(const ThermalSchedule& sched, double t) {
+    if (sched.times.empty()) return 1.0;
+    double tt = t;
+    if (sched.period > 0.0) {
+        tt = std::fmod(t, sched.period);
+        if (tt < 0.0) tt += sched.period;
+    }
+    // Hold the scale of the last breakpoint <= tt (times start at 0, ascending).
+    double s = sched.scales.front();
+    for (size_t i = 0; i < sched.times.size(); ++i) {
+        if (sched.times[i] <= tt + 1e-12) s = sched.scales[i];
+        else break;
+    }
+    return s;
+}
+
+ThermalTransientResult fea_thermal_transient(
+    const std::vector<double>& points, const std::vector<int>& tets, double k_cond,
+    const std::vector<int>& fixed_nodes, const std::vector<double>& fixed_temps,
+    const std::vector<ThermalFluxLoad>& fluxes, const std::vector<ThermalConvection>& convections,
+    const ThermalTransientOptions& opts, int nodes_per_elem) {
+    ThermalTransientResult res;
+    const int n_nodes = static_cast<int>(points.size() / 3);
+    res.n_nodes = n_nodes;
+    if (n_nodes == 0 || tets.empty()) { res.error = "fea_thermal_transient: empty mesh"; return res; }
+    if (points.size() % 3 != 0) {
+        res.error = "fea_thermal_transient: points length must be divisible by 3";
+        return res;
+    }
+    if (nodes_per_elem != 4 && nodes_per_elem != 10) {
+        res.error = "fea_thermal_transient: nodes_per_elem must be 4 (tet4) or 10 (tet10)";
+        return res;
+    }
+    if (tets.size() % static_cast<size_t>(nodes_per_elem) != 0) {
+        res.error = "fea_thermal_transient: tets length must be divisible by nodes_per_elem";
+        return res;
+    }
+    if (!std::isfinite(k_cond) || k_cond <= 0.0) {
+        res.error = "fea_thermal_transient: conductivity k must be finite and > 0";
+        return res;
+    }
+    if (!std::isfinite(opts.rho_cp) || opts.rho_cp <= 0.0) {
+        res.error = "fea_thermal_transient: volumetric heat capacity rho_cp must be > 0";
+        return res;
+    }
+    if (!std::isfinite(opts.dt) || opts.dt <= 0.0) {
+        res.error = "fea_thermal_transient: time step dt must be > 0";
+        return res;
+    }
+    if (!std::isfinite(opts.t_end) || opts.t_end < opts.dt) {
+        res.error = "fea_thermal_transient: t_end must be >= dt";
+        return res;
+    }
+    const long long n_steps_ll = static_cast<long long>(std::ceil(opts.t_end / opts.dt - 1e-9));
+    if (n_steps_ll > 1000000) {
+        res.error = "fea_thermal_transient: t_end/dt exceeds 1e6 steps — coarsen dt";
+        return res;
+    }
+    if (fixed_nodes.size() != fixed_temps.size()) {
+        res.error = "fea_thermal_transient: fixed_nodes and fixed_temps length mismatch";
+        return res;
+    }
+    if (!opts.init_temps.empty() && opts.init_temps.size() != static_cast<size_t>(n_nodes)) {
+        res.error = "fea_thermal_transient: init_temps must have one entry per node";
+        return res;
+    }
+    for (double x : points)
+        if (!std::isfinite(x)) { res.error = "fea_thermal_transient: mesh coordinates must be finite"; return res; }
+    for (int nid : tets)
+        if (nid < 0 || nid >= n_nodes) { res.error = "fea_thermal_transient: tet node index out of range"; return res; }
+    for (const auto& fl : fluxes) {
+        if (fl.schedule.times.size() != fl.schedule.scales.size()) {
+            res.error = "fea_thermal_transient: schedule times/scales length mismatch";
+            return res;
+        }
+        for (size_t i = 1; i < fl.schedule.times.size(); ++i)
+            if (!(fl.schedule.times[i] > fl.schedule.times[i - 1])) {
+                res.error = "fea_thermal_transient: schedule times must be strictly ascending";
+                return res;
+            }
+        if (!fl.schedule.times.empty() && fl.schedule.times.front() != 0.0) {
+            res.error = "fea_thermal_transient: schedule times must start at 0";
+            return res;
+        }
+    }
+
+    const bool tet10 = (nodes_per_elem == 10);
+    const int stride = nodes_per_elem;
+    const int n_elems = static_cast<int>(tets.size() / stride);
+    res.n_elems = n_elems;
+
+    auto node_pt = [&](int nid) {
+        return Vec3(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
+    };
+
+    // Dirichlet map + free-DOF numbering (constant-in-time prescribed temperatures).
+    std::vector<char> is_fixed(n_nodes, 0);
+    std::vector<double> pres_temp(n_nodes, 0.0);
+    for (size_t i = 0; i < fixed_nodes.size(); ++i) {
+        const int nid = fixed_nodes[i];
+        if (nid < 0 || nid >= n_nodes) { res.error = "fea_thermal_transient: fixed node out of range"; return res; }
+        if (!std::isfinite(fixed_temps[i])) { res.error = "fea_thermal_transient: fixed temperature not finite"; return res; }
+        is_fixed[nid] = 1;
+        pres_temp[nid] = fixed_temps[i];
+    }
+    std::vector<int> reduced(n_nodes, -1);
+    int n_free = 0;
+    for (int i = 0; i < n_nodes; ++i)
+        if (!is_fixed[i]) reduced[i] = n_free++;
+    res.n_dof = n_free;
+
+    // ── Assembly: Kff + constant base load (Dirichlet move + convection), capacitance C,
+    // and one load vector PER scheduled flux (so only scale factors change per step).
+    std::vector<Eigen::Triplet<double>> ktrips;
+    std::vector<Eigen::Triplet<double>> ctrips;                 // consistent C only
+    Eigen::VectorXd c_lump = Eigen::VectorXd::Zero(n_free);     // lumped C diagonal
+    Eigen::VectorXd f_base = Eigen::VectorXd::Zero(n_free);
+    const TetGauss4 gauss;
+
+    auto add_K = [&](int a_node, int b_node, double kab) {
+        const int ra = reduced[a_node];
+        if (ra < 0) return;
+        const int rb = reduced[b_node];
+        if (rb >= 0) ktrips.emplace_back(ra, rb, kab);
+        else f_base(ra) -= kab * pres_temp[b_node];
+    };
+    // Capacitance couplings to fixed nodes vanish (C multiplies dT/dt and prescribed
+    // temperatures are constant), so only the free-free block is kept.
+    auto add_C = [&](int a_node, int b_node, double cab) {
+        const int ra = reduced[a_node];
+        const int rb = reduced[b_node];
+        if (ra < 0 || rb < 0) return;
+        if (opts.lumped) { if (ra == rb) c_lump(ra) += cab; }
+        else ctrips.emplace_back(ra, rb, cab);
+    };
+
+    if (tet10) {
+        const auto& Tm = tet10_mass_template();
+        for (int e = 0; e < n_elems; ++e) {
+            std::array<Vec3, 10> ep;
+            std::array<int, 10> tn;
+            for (int j = 0; j < 10; ++j) { tn[j] = tets[e * 10 + j]; ep[j] = node_pt(tn[j]); }
+            Eigen::Matrix<double, 10, 10> Ke = Eigen::Matrix<double, 10, 10>::Zero();
+            bool ok_elem = true;
+            double vol6 = 0.0;  // Σ|detJ|·w over the rule = element volume
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 10, 3> dNxyz;
+                double detJ;
+                if (!tet10_grad_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], dNxyz, detJ)) {
+                    ok_elem = false;
+                    break;
+                }
+                Ke += (dNxyz * dNxyz.transpose()) * (k_cond * std::abs(detJ) * gauss.w[g]);
+                vol6 += std::abs(detJ) * gauss.w[g];
+            }
+            if (!ok_elem) continue;
+            const double V = vol6;
+            for (int a = 0; a < 10; ++a)
+                for (int b = 0; b < 10; ++b) add_K(tn[a], tn[b], Ke(a, b));
+            if (opts.lumped) {
+                // HRZ diagonal (derivation in the comment above): corners V/36, mids 4V/27.
+                for (int a = 0; a < 10; ++a)
+                    add_C(tn[a], tn[a], opts.rho_cp * V * (a < 4 ? 1.0 / 36.0 : 4.0 / 27.0));
+            } else {
+                for (int a = 0; a < 10; ++a)
+                    for (int b = 0; b < 10; ++b) add_C(tn[a], tn[b], opts.rho_cp * V * Tm(a, b));
+            }
+        }
+    } else {
+        for (int e = 0; e < n_elems; ++e) {
+            std::array<Vec3, 4> ep;
+            std::array<int, 4> tn;
+            for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
+            Eigen::Matrix<double, 4, 3> dNxyz;
+            double vol;
+            if (!tet4_grad(ep, dNxyz, vol)) continue;
+            Eigen::Matrix<double, 4, 4> Ke = (dNxyz * dNxyz.transpose()) * (k_cond * vol);
+            for (int a = 0; a < 4; ++a)
+                for (int b = 0; b < 4; ++b) add_K(tn[a], tn[b], Ke(a, b));
+            if (opts.lumped) {
+                for (int a = 0; a < 4; ++a) add_C(tn[a], tn[a], opts.rho_cp * vol / 4.0);
+            } else {
+                for (int a = 0; a < 4; ++a)
+                    for (int b = 0; b < 4; ++b)
+                        add_C(tn[a], tn[b], opts.rho_cp * vol / 20.0 * (a == b ? 2.0 : 1.0));
+            }
+        }
+    }
+
+    // Surface terms. Convection is time-constant here (matrix into K, load into f_base);
+    // each flux load gets its OWN consistent load vector for per-step scaling.
+    auto surface_flux_vec = [&](const std::vector<int>& nodes, double q) {
+        Eigen::VectorXd fv = Eigen::VectorXd::Zero(n_free);
+        std::unordered_set<int> node_set(nodes.begin(), nodes.end());
+        for (int e = 0; e < n_elems; ++e) {
+            const int* el = &tets[e * stride];
+            for (int fidx = 0; fidx < 4; ++fidx) {
+                const FaceTab& ft = kTetFaces[fidx];
+                int cn[3];
+                bool all_in = true;
+                for (int i = 0; i < 3; ++i) {
+                    cn[i] = el[ft.corner[i]];
+                    if (!node_set.count(cn[i])) { all_in = false; break; }
+                }
+                if (!all_in) continue;
+                const double A = tri_area(node_pt(cn[0]), node_pt(cn[1]), node_pt(cn[2]));
+                if (A < 1e-12) continue;
+                int fn[6] = {cn[0], cn[1], cn[2], -1, -1, -1};
+                if (tet10) for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
+                const int nfn = tet10 ? 6 : 3;
+                double wc[3], wm[3];
+                tri_load_weights(tet10, A, wc, wm);
+                const double w[6] = {wc[0], wc[1], wc[2], wm[0], wm[1], wm[2]};
+                for (int i = 0; i < nfn; ++i) {
+                    const int ri = reduced[fn[i]];
+                    if (ri >= 0) fv(ri) += q * w[i];
+                }
+            }
+        }
+        return fv;
+    };
+
+    for (const auto& cv : convections) {
+        if (cv.h <= 0.0 || cv.nodes.empty() || !std::isfinite(cv.h) || !std::isfinite(cv.t_amb))
+            continue;
+        std::unordered_set<int> cs(cv.nodes.begin(), cv.nodes.end());
+        for (int e = 0; e < n_elems; ++e) {
+            const int* el = &tets[e * stride];
+            for (int fidx = 0; fidx < 4; ++fidx) {
+                const FaceTab& ft = kTetFaces[fidx];
+                int cn[3];
+                bool all_in = true;
+                for (int i = 0; i < 3; ++i) {
+                    cn[i] = el[ft.corner[i]];
+                    if (!cs.count(cn[i])) { all_in = false; break; }
+                }
+                if (!all_in) continue;
+                const double A = tri_area(node_pt(cn[0]), node_pt(cn[1]), node_pt(cn[2]));
+                if (A < 1e-12) continue;
+                int fn[6] = {cn[0], cn[1], cn[2], -1, -1, -1};
+                if (tet10) for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
+                const int nfn = tet10 ? 6 : 3;
+                double wc[3], wm[3];
+                tri_load_weights(tet10, A, wc, wm);
+                const double w[6] = {wc[0], wc[1], wc[2], wm[0], wm[1], wm[2]};
+                Eigen::Matrix<double, 6, 6> Ms;
+                tri_surface_mass(tet10, A, Ms);
+                for (int i = 0; i < nfn; ++i) {
+                    const int ri = reduced[fn[i]];
+                    if (ri >= 0) f_base(ri) += cv.h * cv.t_amb * w[i];
+                    for (int j = 0; j < nfn; ++j) add_K(fn[i], fn[j], cv.h * Ms(i, j));
+                }
+            }
+        }
+    }
+
+    std::vector<Eigen::VectorXd> flux_vecs;
+    flux_vecs.reserve(fluxes.size());
+    for (const auto& fl : fluxes) {
+        if (fl.nodes.empty() || !std::isfinite(fl.q) || fl.q == 0.0)
+            flux_vecs.emplace_back(Eigen::VectorXd::Zero(n_free));
+        else
+            flux_vecs.push_back(surface_flux_vec(fl.nodes, fl.q));
+    }
+
+    // ── Initial field ─────────────────────────────────────────────────────────────────────
+    std::vector<double> T_full(n_nodes, opts.t_init);
+    if (!opts.init_temps.empty()) T_full = opts.init_temps;
+    for (int i = 0; i < n_nodes; ++i)
+        if (is_fixed[i]) T_full[i] = pres_temp[i];
+
+    res.envelope_max = T_full;
+    double gmax = T_full[0], gmin = T_full[0], gmax_t = 0.0;
+    for (double v : T_full) { gmax = std::max(gmax, v); gmin = std::min(gmin, v); }
+
+    // Requested frame times, sorted; t=0 records the initial field.
+    std::vector<double> want = opts.frame_times;
+    std::sort(want.begin(), want.end());
+    size_t want_i = 0;
+    while (want_i < want.size() && want[want_i] <= 0.0) {
+        res.frames.push_back({0.0, T_full});
+        // collapse duplicate <=0 requests into one initial frame
+        while (want_i < want.size() && want[want_i] <= 0.0) ++want_i;
+    }
+
+    const int n_steps = static_cast<int>(n_steps_ll);
+    res.n_steps = n_steps;
+
+    if (n_free == 0) {
+        // Fully prescribed field: nothing evolves; frames are the Dirichlet data.
+        for (; want_i < want.size(); ++want_i) res.frames.push_back({want[want_i], T_full});
+        if (res.frames.empty() || res.frames.back().time != opts.t_end)
+            res.frames.push_back({opts.t_end, T_full});
+        res.max_temp = gmax; res.min_temp = gmin; res.max_temp_time = 0.0;
+        res.ok = true;
+        return res;
+    }
+
+    // ── Iteration matrix A = Kff + Cff/dt, factored ONCE (Cholesky → SparseLU fallback,
+    // matching the steady solver's convention). Fixed dt + constant material + constant
+    // Dirichlet data keep A constant for the whole run even under scheduled loads.
+    Eigen::SparseMatrix<double> A(n_free, n_free);
+    {
+        std::vector<Eigen::Triplet<double>> atrips = ktrips;
+        if (opts.lumped) {
+            for (int i = 0; i < n_free; ++i)
+                if (c_lump(i) != 0.0) atrips.emplace_back(i, i, c_lump(i) / opts.dt);
+        } else {
+            for (const auto& t : ctrips)
+                atrips.emplace_back(t.row(), t.col(), t.value() / opts.dt);
+        }
+        A.setFromTriplets(atrips.begin(), atrips.end());
+        A.makeCompressed();
+    }
+    if (A.nonZeros() == 0) {
+        res.error = "fea_thermal_transient: no valid elements contributed";
+        return res;
+    }
+    Eigen::SparseMatrix<double> Cff(n_free, n_free);
+    if (!opts.lumped) {
+        Cff.setFromTriplets(ctrips.begin(), ctrips.end());
+        Cff.makeCompressed();
+    }
+
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
+    bool use_ldlt = false;
+    ldlt.compute(A);
+    if (ldlt.info() == Eigen::Success) {
+        use_ldlt = true;
+    } else {
+        lu.analyzePattern(A);
+        lu.factorize(A);
+        if (lu.info() != Eigen::Success) {
+            res.error = "fea_thermal_transient: iteration-matrix factorization failed";
+            return res;
+        }
+    }
+
+    Eigen::VectorXd Tf(n_free);
+    for (int i = 0; i < n_nodes; ++i)
+        if (reduced[i] >= 0) Tf(reduced[i]) = T_full[i];
+
+    for (int n = 1; n <= n_steps; ++n) {
+        const double t_next = std::min(static_cast<double>(n) * opts.dt, opts.t_end);
+        Eigen::VectorXd rhs = f_base;
+        if (opts.lumped) rhs += (c_lump.array() * Tf.array()).matrix() / opts.dt;
+        else rhs += (Cff * Tf) / opts.dt;
+        for (size_t k = 0; k < fluxes.size(); ++k) {
+            const double s = thermal_schedule_scale(fluxes[k].schedule, t_next);
+            if (s != 0.0) rhs += s * flux_vecs[k];
+        }
+        if (use_ldlt) Tf = ldlt.solve(rhs);
+        else Tf = lu.solve(rhs);
+        if ((use_ldlt && ldlt.info() != Eigen::Success) || (!use_ldlt && lu.info() != Eigen::Success)) {
+            res.error = "fea_thermal_transient: sparse solve failed at step " + std::to_string(n);
+            return res;
+        }
+        if (!Tf.allFinite()) {
+            res.error = "fea_thermal_transient: non-finite temperature at step " + std::to_string(n);
+            return res;
+        }
+        for (int i = 0; i < n_nodes; ++i)
+            if (reduced[i] >= 0) T_full[i] = Tf(reduced[i]);
+        for (int i = 0; i < n_nodes; ++i) {
+            if (T_full[i] > res.envelope_max[i]) res.envelope_max[i] = T_full[i];
+            if (T_full[i] > gmax) { gmax = T_full[i]; gmax_t = t_next; }
+            if (T_full[i] < gmin) gmin = T_full[i];
+        }
+        const bool last = (n == n_steps);
+        bool record = last;
+        while (want_i < want.size() && want[want_i] <= t_next + 1e-12) {
+            record = true;
+            ++want_i;
+        }
+        if (record) res.frames.push_back({t_next, T_full});
+    }
+
+    res.max_temp = gmax;
+    res.min_temp = gmin;
+    res.max_temp_time = gmax_t;
+    res.ok = true;
+    return res;
+}
+
 }  // namespace aicad::sim

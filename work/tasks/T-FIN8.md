@@ -2,8 +2,8 @@
 id: T-FIN8
 title: Component engineering metadata layer + ecad_to_3d with bodies and thermal/power map
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: done
 branch: task/T-FIN8-ecad-component-metadata
 depends_on: []
 lane: ecad-firmware

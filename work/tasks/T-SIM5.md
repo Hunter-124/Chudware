@@ -2,8 +2,8 @@
 id: T-SIM5
 title: OpenFOAM accurate-CFD integration - run_cfd_accurate live path with GPL2 subprocess isolation
 workstream: SIM
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 deferred: yes
 branch: task/T-SIM5-openfoam
 depends_on: []

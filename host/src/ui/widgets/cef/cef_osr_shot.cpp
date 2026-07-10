@@ -31,6 +31,7 @@
 #include "stb_image_write.h"  // implementation lives in stb_impl.cpp (linked into AI-CAD)
 
 #include "cef_app.h"
+#include "cef_stealth.h"
 
 namespace ui::cef {
 namespace {
@@ -150,47 +151,9 @@ public:
     // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
-        // Mirror the interactive path's anti-detection so --cef-shot reflects the
-        // real wire fingerprint: align Sec-CH-UA brands (add "Google Chrome") and
-        // cap deviceMemory. Keeps CEF's reduced UA; versions from CHROME_VERSION_*.
-        if (!browser) return;
-        const std::string major = std::to_string(CHROME_VERSION_MAJOR);
-        const std::string full  = major + "." + std::to_string(CHROME_VERSION_MINOR) +
-                                  "." + std::to_string(CHROME_VERSION_BUILD) +
-                                  "." + std::to_string(CHROME_VERSION_PATCH);
-        const std::string reducedUa =
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/" + major + ".0.0.0 Safari/537.36";
-        auto brand = [](const char* n, const std::string& v) {
-            CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
-            d->SetString("brand", n); d->SetString("version", v); return d;
-        };
-        CefRefPtr<CefListValue> brands = CefListValue::Create();
-        brands->SetDictionary(0, brand("Chromium", major));
-        brands->SetDictionary(1, brand("Google Chrome", major));
-        brands->SetDictionary(2, brand("Not)A;Brand", "24"));
-        CefRefPtr<CefListValue> fullList = CefListValue::Create();
-        fullList->SetDictionary(0, brand("Chromium", full));
-        fullList->SetDictionary(1, brand("Google Chrome", full));
-        fullList->SetDictionary(2, brand("Not)A;Brand", "24.0.0.0"));
-        CefRefPtr<CefDictionaryValue> meta = CefDictionaryValue::Create();
-        meta->SetList("brands", brands); meta->SetList("fullVersionList", fullList);
-        meta->SetString("fullVersion", full); meta->SetString("platform", "Linux");
-        meta->SetString("platformVersion", ""); meta->SetString("architecture", "x86");
-        meta->SetString("model", ""); meta->SetBool("mobile", false);
-        meta->SetString("bitness", "64"); meta->SetBool("wow64", false);
-        CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
-        params->SetString("userAgent", reducedUa);
-        params->SetString("acceptLanguage", "en-US,en");
-        params->SetString("platform", "Linux x86_64");
-        params->SetDictionary("userAgentMetadata", meta);
-        browser->GetHost()->ExecuteDevToolsMethod(0, "Network.setUserAgentOverride", params);
-        static const char* kCap =
-            "(()=>{try{if(navigator.deviceMemory>8)"
-            "Object.defineProperty(navigator,'deviceMemory',{get:()=>8});}catch(e){}})();";
-        CefRefPtr<CefDictionaryValue> sp = CefDictionaryValue::Create();
-        sp->SetString("source", kCap);
-        browser->GetHost()->ExecuteDevToolsMethod(0, "Page.addScriptToEvaluateOnNewDocument", sp);
+        // Same fingerprint hardening the headless-fetch path applies, so --cef-shot
+        // reflects the real wire fingerprint (see cef_stealth.h).
+        apply_stealth(browser);
     }
 
     // CefLoadHandler

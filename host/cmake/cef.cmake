@@ -43,6 +43,9 @@ target_sources(AI-CAD PRIVATE
   src/ui/widgets/cef/cef_web_view.cpp
   src/ui/widgets/cef/cef_rpc_bridge.cpp        # AppState/RPC side — NO CEF headers, stays C++17
   src/ui/widgets/cef/cef_osr_shot.cpp          # headless OSR render-to-PNG (--cef-shot)
+  src/ui/widgets/cef/cef_stealth.cpp           # shared UA/hints + JS hardening
+  src/ui/widgets/cef/cef_headless.cpp          # headless fetch/download (--cef-fetch/--cef-download)
+  src/ui/widgets/cef/cef_daemon.cpp            # CEF host daemon over aicad_ipc (--cef-daemon)
   src/ui/widgets/cef/cef_app.cpp
   src/ui/widgets/cef/cef_platform_linux.cpp)   # Windows swaps this in cef.cmake's WIN32 branch below
 if(WIN32)
@@ -71,6 +74,9 @@ set_property(TARGET AI-CAD APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
 set_source_files_properties(
   src/ui/widgets/cef/cef_web_view.cpp
   src/ui/widgets/cef/cef_osr_shot.cpp
+  src/ui/widgets/cef/cef_stealth.cpp
+  src/ui/widgets/cef/cef_headless.cpp
+  src/ui/widgets/cef/cef_daemon.cpp
   src/ui/widgets/cef/cef_app.cpp
   src/ui/widgets/cef/cef_platform_linux.cpp
   src/ui/widgets/cef/cef_platform_windows.cpp

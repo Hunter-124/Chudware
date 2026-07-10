@@ -30,6 +30,8 @@
 #ifdef AI_CAD_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"
 #include "ui/widgets/cef/cef_osr_shot.h"
+#include "ui/widgets/cef/cef_headless.h"
+#include "ui/widgets/cef/cef_daemon.h"
 #endif
 
 #ifdef _WIN32
@@ -319,6 +321,40 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[cef-shot] %s -> %s\n", ok ? "OK" : "FAILED", argv[3]);
         ui::cef::shutdown();
         return ok ? 0 : 1;
+    }
+    // Headless page fetch: `AI-CAD --cef-fetch <url> [out.html]` drives CEF (not
+    // Playwright) to load a page and print/write its post-JS HTML. This is the
+    // production headless path the Python scraper calls via RPC; the CLI form is
+    // the standalone/one-off entry. Prints HTML to stdout when no file is given.
+    if (argc >= 3 && std::strcmp(argv[1], "--cef-fetch") == 0) {
+        if (!ui::cef::initialize()) { ui::cef::shutdown(); return 1; }
+        ui::cef::FetchResult r = ui::cef::headless_fetch(argv[2]);
+        if (r.ok) {
+            if (argc >= 4) {
+                std::ofstream f(argv[3], std::ios::binary);
+                f.write(r.html.data(), static_cast<std::streamsize>(r.html.size()));
+            } else {
+                std::fwrite(r.html.data(), 1, r.html.size(), stdout);
+            }
+        }
+        std::fprintf(stderr, "[cef-fetch] %s status=%d %s\n",
+                     r.ok ? "OK" : "FAILED", r.status, r.final_url.c_str());
+        ui::cef::shutdown_and_exit(r.ok ? 0 : 1);  // watchdog'd; does not return
+    }
+    // Headless file download: `AI-CAD --cef-download <url> <dest>` pulls raw bytes
+    // (datasheet/CAD) through CEF's network stack with the profile's cookies.
+    if (argc >= 4 && std::strcmp(argv[1], "--cef-download") == 0) {
+        const bool ok = ui::cef::initialize() &&
+                        ui::cef::headless_download(argv[2], argv[3]);
+        std::fprintf(stderr, "[cef-download] %s -> %s\n", ok ? "OK" : "FAILED", argv[3]);
+        ui::cef::shutdown_and_exit(ok ? 0 : 1);  // watchdog'd; does not return
+    }
+    // CEF host daemon: `AI-CAD --cef-daemon <sock> [idle_secs]` serves headless
+    // fetch/download to the Python scraper over the socket and idle-exits. Lazily
+    // spawned by services/browser/cef_client.py; the sole CEF owner (Phase 2).
+    if (argc >= 3 && std::strcmp(argv[1], "--cef-daemon") == 0) {
+        const int idle = argc >= 4 ? std::atoi(argv[3]) : 120;
+        return ui::cef::run_cef_daemon(argv[2], idle);
     }
 #endif
     installCrashHandler();  // symbolized stack + minidump on any unhandled fault

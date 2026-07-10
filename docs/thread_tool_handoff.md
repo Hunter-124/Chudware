@@ -53,7 +53,18 @@ compute real geometry only on commit.
 
 Reproduce/profile (harness sources in the session scratchpad, or rebuild — see recipe below).
 
-## REMAINING work (needs the live GUI to verify — "Hunter verifies UI himself")
+## DONE 2026-07-10 (commit bfa4974d) — all three items below shipped, awaiting live red-pen
+- **#2 SAE default**: IPS docs open the thread form with Size = 1/4-20 UNC.
+- **#3 auto-size**: picking a cylindrical face snaps Size via the selector's kernel-computed
+  `radius` (GSL Stage 0) — NO engine RPC needed. Shaft matches major Ø, bore matches basic minor.
+- **#1 draft preview**: PM sends `params.preview=true` during live edits; the engine thread
+  compiler renders a plain turned band (measured 18–50 ms vs 4.4 s real full-span). commit()
+  re-applies without the flag (committing_), so OK always produces real geometry. The old
+  length-shorten proxy was removed (the full-length default bypassed it anyway).
+- Deployed to services/dist (temp+rename). Verify in the GUI: drag length/flip → band updates
+  live; OK → real thread after the one-time boolean.
+
+## Original remaining-work notes (historical)
 1. **#2 SAE default in IPS** — in `host/src/ui/property_manager.cpp` `initField`/`beginXxx`
    (`ips_` = `st.ips()` is available, ~L481/L694). When the thread form opens and `ips_` is true,
    default the `size` combo to an SAE size (e.g. `1/4-20`); metric otherwise. Low risk.

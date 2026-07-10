@@ -1404,6 +1404,23 @@ Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate 
 background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
 solve from tripping the transport timeout (which would otherwise drop the session). After a
 restart, recover_parts() reloads auto-saved docs.
+
+CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
+  When one physics domain feeds another (1D piping → 3D CFD today; ECAD → thermal FEA,
+  motion → FEA reaction loads, hydraulic → piping, thermal → CFD conjugate as they land),
+  the coupling follows one seam: a HANDOFF tool solves the source domain, derives geometry
+  + boundary conditions with explicit units and provenance, and runs (or stages) the target
+  study; a VERIFY tool then cross-checks a shared quantity between the two solvers at a
+  tolerance and returns a PASS/FAIL verdict.
+  Conforming tools embed a validated envelope under the reserved "simhandoff" key of their
+  result: kind:"handoff" carries {source/target study refs, geometry[], conditions[] (each
+  {name, kind, value, units, applied_to, provenance}), expectations[]}; kind:"verify"
+  carries {checks[] ({quantity, units, source_value, target_value, deviation_pct,
+  tolerance_pct, pass}), pass, verdict, advisories}. Study refs {domain, tool, doc_id?,
+  study?, handoff_id?} let any sim result name exactly what produced it.
+  Proven pair: piping_cfd_handoff (one-call 1D solve → bore STEP → run_cfd_flow with
+  1D-derived BCs) then piping_verify_cfd (1D vs 3D pressure-drop verdict + velocity-limit
+  advisories). Helper builders/validator: services/mcp/simhandoff.py.
 """
 
 _MOTION_GUIDE = """\

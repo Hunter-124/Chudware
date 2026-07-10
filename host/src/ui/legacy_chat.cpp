@@ -5,8 +5,9 @@
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
 // + status + Sessions), the conversation log with a per-turn transparent activity timeline (what
 // the AI is doing / thinking, expandable), and a bottom composer (segmented Design|Edit|Ask
-// toggle + Permissions + context meter; transparent prompt; model/thinking/send toolbar). The AI
-// settings render as an inline view inside the column (gShowSettingsView; opened by the gear).
+// toggle + Permissions + context meter; transparent prompt with an in-box send button; model/
+// thinking toolbar). The header gear opens a compact AI-settings popover (drawAISettingsBody);
+// the full form lives in the Settings modal's AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
 // as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
 // H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
@@ -160,13 +161,15 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     return 0;
 }
 }  // namespace
+// rightReserve narrows the widget (and its wrap width) so composer overlays anchored at the
+// input's right edge — the in-box send button — never sit over the text.
 static bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
-                          int maxLines) {
+                          int maxLines, float rightReserve = 0.0f) {
     if (buf.empty()) return false;
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lineH = ImGui::GetTextLineHeight();
-    float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f -
-                  style.ScrollbarSize;
+    float wrapW = ImGui::GetContentRegionAvail().x - rightReserve -
+                  style.FramePadding.x * 2.0f - style.ScrollbarSize;
     if (wrapW < 1.0f) wrapW = 1.0f;
 
     // When the widget is NOT active it is safe to rewrap the backing buffer directly — this
@@ -185,7 +188,8 @@ static bool drawChatInput(const char* id, std::vector<char>& buf, const char* pl
 
     ChatInputCb cb;
     cb.wrapW = wrapW;
-    ImGui::InputTextMultiline(id, buf.data(), buf.size(), ImVec2(-1, h),
+    ImGui::InputTextMultiline(id, buf.data(), buf.size(),
+        ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         ImGuiInputTextFlags_CallbackEdit, chatInputEditCallback, &cb);
     s_activeLast[wid] = ImGui::IsItemActive();
     // Enter sends, Shift+Enter does not. Detect the KEY (not a trailing '\n') so a newline the
@@ -1536,15 +1540,31 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 // restarts.
 static bool s_cpCollapsed = false;
 
+// Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
+// defined below with the picker helpers, hosted by the header gear's popup.
+static void drawAISettingsBody(AppState& st, bool busy);
+
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float lh = ImGui::GetTextLineHeight();
+
+    // One shared row height — the wordmark (heading font) is the tallest element; every fixed-size
+    // control centers on it, so the row stays aligned at any DPI without per-item pixel nudges.
+    ImFont* wordF = st.fonts.h2 ? st.fonts.h2 : st.fonts.medium;
+    float wordLh = lh;
+    if (wordF) { ImGui::PushFont(wordF); wordLh = ImGui::GetTextLineHeight(); ImGui::PopFont(); }
+    const float rowH   = std::max(wordLh, lh);
+    const float rowTop = ImGui::GetCursorPosY();
+    auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
 
     // Collapse chevron LEADS the header row (in-flow, so it never overlaps the logo). "»" tucks
     // the column's body away, rolling the column up to just this header row (T-G21); the same
     // chevron toggles it back open.
     {
-        const float cb = ImGui::GetTextLineHeight();
+        const float cb = lh;
+        centerY(cb);
         const ImVec2 c0 = ImGui::GetCursorScreenPos();
         const bool clk = ImGui::InvisibleButton("##cp_collapse", ImVec2(cb, cb));
         const bool hov = ImGui::IsItemHovered();
@@ -1557,8 +1577,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float a = 3.0f * sc;
         for (int i = 0; i < 2; ++i) {   // "»"
             const float ox = (i == 0 ? -2.2f : 2.2f) * sc;
-            wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, 1.6f * sc);
-            wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, 1.6f * sc);
+            wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, ui::metrics::stroke(1.6f));
+            wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, ui::metrics::stroke(1.6f));
         }
         if (hov) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
         if (clk) {
@@ -1570,46 +1590,58 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
 
     if (st.logoIcon.id) {
-        float h = ImGui::GetTextLineHeight();
-        ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(h, h));
+        centerY(lh);
+        ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    // Right-side control cluster: [Sessions|< Chat toggle] [settings gear] [status dot]. Its width
-    // is measured from the CURRENT label each frame and the cluster is hard-anchored to the column's
-    // right edge, so every control is ALWAYS on-screen and clickable at any tab width. (T-G17: the
-    // settings gear + status dot used to overflow off the right edge on a normal-width column.)
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float lh = ImGui::GetTextLineHeight();
-    const float gearW = lh + 2 * sc;
+    // Right-side control cluster: [Sessions|< Chat toggle] [settings gear] [status dot], hard-
+    // anchored to the column's right edge so every control is ALWAYS on-screen and clickable at
+    // any tab width (T-G17). Width is measured from the WIDER of the two session labels so the
+    // wordmark never reflows when toggling chat <-> sessions (one brand in both views).
+    const float gearW = lh;
     const bool sessionsOpen = st.showSessionsPicker;
     const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
-    const float sessW = ImGui::CalcTextSize(sessLabel).x + style.FramePadding.x * 2.0f;
+    const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
+                                 ImGui::CalcTextSize("< Chat").x) + style.FramePadding.x * 2.0f;
     const float dotW  = lh;
+    const float rightInset = ui::metrics::U(1);
     const float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + dotW;
+    const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
 
-    // Anchor the cluster to the column's right edge, held off the very edge by a small inset so the
-    // status dot is never clipped. The title takes whatever room is left up to the cluster and shows
-    // the best-fitting brand label (full -> "Copilot" -> logo only) rather than a hard mid-word clip.
-    const float rightInset = 4.0f * sc;
-    const float anchorX     = ImGui::GetContentRegionMax().x - cluster - rightInset;
-    const float titleStartX = ImGui::GetCursorPosX();
-    const float titleAvail  = anchorX - titleStartX - style.ItemSpacing.x;
-    ImGui::PushFont(st.fonts.medium);
-    const float fullW  = ImGui::CalcTextSize("ShopCraft Copilot").x;
-    const float shortW = ImGui::CalcTextSize("Copilot").x;
-    const char* useTitle = (titleAvail >= fullW)  ? "ShopCraft Copilot"
-                         : (titleAvail >= shortW) ? "Copilot"
-                                                  : nullptr;
-    if (useTitle) {
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        ImGui::TextUnformatted(useTitle);
-        ImGui::PopStyleColor();
+    // Wordmark: "AI-CAD" in the heading font, "Copilot" as a baseline-aligned secondary-ink
+    // suffix. Degrades whole-word (drop the suffix, then the wordmark) — never a mid-word clip.
+    {
+        const float titleAvail = anchorX - ImGui::GetCursorPosX() - style.ItemSpacing.x;
+        float wmW = 0.0f;
+        if (wordF) ImGui::PushFont(wordF);
+        wmW = ImGui::CalcTextSize("AI-CAD").x;
+        if (wordF) ImGui::PopFont();
+        const float sufGap = ui::metrics::U(1.5f);
+        const float sufW   = sufGap + ImGui::CalcTextSize("Copilot").x;
+        if (titleAvail >= wmW) {
+            centerY(wordLh);
+            if (wordF) ImGui::PushFont(wordF);
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+            ImGui::TextUnformatted("AI-CAD");
+            ImGui::PopStyleColor();
+            if (wordF) ImGui::PopFont();
+            if (titleAvail >= wmW + sufW) {
+                ImGui::SameLine(0, sufGap);
+                // Align the smaller suffix on the wordmark's BASELINE (ascent difference), not
+                // its box top — mixed-size text sitting off-baseline reads as a bug.
+                const float dy = (wordF && wordF != ImGui::GetFont())
+                                     ? wordF->Ascent - ImGui::GetFont()->Ascent : 0.0f;
+                ImGui::SetCursorPosY(rowTop + (rowH - wordLh) * 0.5f + dy);
+                ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
+                ImGui::TextUnformatted("Copilot");
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::SameLine();
     }
-    ImGui::PopFont();
 
-    ImGui::SameLine();
     if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
-
+    centerY(lh);
     if (busy) ImGui::BeginDisabled();
     if (ImGui::SmallButton(sessLabel)) st.showSessionsPicker = !st.showSessionsPicker;
     if (busy) ImGui::EndDisabled();
@@ -1618,18 +1650,34 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                                        : "Sessions — switch between chats.");
 
     ImGui::SameLine();
+    centerY(gearW);
     IconUV gear = ui::getIcon("settings", 20);
-    bool openSettings = false;
+    bool openPopover = false;
+    // Frame padding sized so image + padding == one text-line square, centering like its neighbors.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * sc, 2 * sc));
     if (gear.valid)
-        openSettings = ImGui::ImageButton("##aiheadergear", gear.texId,
-                                          ImVec2(gearW - 4 * sc, gearW - 4 * sc),
-                                          gear.uv0, gear.uv1);
+        openPopover = ImGui::ImageButton("##aiheadergear", gear.texId,
+                                         ImVec2(gearW - 4 * sc, gearW - 4 * sc),
+                                         gear.uv0, gear.uv1);
     else
-        openSettings = ImGui::SmallButton("set");
-    if (openSettings) st.focusSettingsTab = true;
+        openPopover = ImGui::SmallButton("set");
+    ImGui::PopStyleVar();
+    if (openPopover) ImGui::OpenPopup("##cp_ai_popover");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
+    // Compact quick-settings popover — provider/model/effort + "All settings..." (the old full-
+    // page inline settings view inside the column is gone).
+    {
+        const float popW = std::max(240.0f * sc,
+                                    std::min(340.0f * sc, ImGui::GetWindowWidth() - 16.0f * sc));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
+        if (ImGui::BeginPopup("##cp_ai_popover")) {
+            drawAISettingsBody(st, busy);
+            ImGui::EndPopup();
+        }
+    }
 
     ImGui::SameLine();
+    centerY(lh);
     const float* dot = pal.accentMid;  const char* tip = "Idle";
     if (st.statusKind == 2) { dot = pal.statusErr; tip = "Error"; }
     else if (busy || st.agentV2Running || activeConversationRunning(st)) {
@@ -1643,6 +1691,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                         ImGui::ColorConvertFloat4ToU32(dotCol));
     ImGui::Dummy(ImVec2(lh, lh));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    // Close the row at its full shared height so the divider below sits under the tallest element.
+    ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), rowTop + rowH));
 }
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
@@ -1658,11 +1708,11 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
 
-    ImGui::Dummy(ImVec2(0, 6 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted("Switch sessions — running ones keep working in the background.");
+    ImGui::TextWrapped("Switch sessions — running ones keep working in the background.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 6 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
 
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2539,44 +2589,25 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     // uses the same widget, so the two never diverge). Persist on change — this popover has no
     // Save button; run mode, units, and theme live in their canonical Settings-modal tabs
     // (Agent / General / Appearance) instead of duplicating here with divergent persistence.
-    // slim=true: the in-tab view is a quick picker only. The full "Manage models" management UI is
-    // reachable via "Advanced settings..." below (opens the Settings window's AI tab).
+    // slim=true: quick picker only. The full form (keys, endpoints, Manage models) lives in the
+    // Settings window's AI tab, reached by "All settings..." below — no full-page settings form
+    // renders inside the Copilot column anymore.
     if (ui::drawProviderModelPicker(st, busy, /*slim=*/true)) saveSettings(settings);
 
-    if (ImGui::Button("Advanced settings...", ImVec2(-1, 0))) st.openSettings = true;
-    if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
-        !st.setupRunning.load() && !st.job.running.load()) {
-        st.startSetup(true);
-    }
-}
-
-// Session-only: the inline AI-settings view is open (replaces the conversation, like the
-// Sessions list). Set by st.focusSettingsTab (composer gear / model-dropdown gear).
-static bool gShowSettingsView = false;
-
-// Inline AI-settings view — hosted INSIDE the Copilot column. The old docked "Settings" sibling
-// tab went away with the docked layout (overlay glass columns are the only layout). The settings
-// body's widgets are theme-paired (combos / inputs / checkboxes with theme FrameBg), so the view
-// draws over a near-opaque theme wash instead of raw glass — mixing adaptive ink with theme
-// fills is the audit's black-on-black pattern.
-static void drawSettingsView(AppState& st, bool busy) {
-    const auto& pal = ui::palette;
-    if (ImGui::SmallButton("< Back to chat")) gShowSettingsView = false;
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::metrics::rounding(8.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 0.92f));
-    ImGui::BeginChild("##aisetview", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
-    drawAISettingsBody(st, busy);
-    // Transparency toggle: show/hide the AI's reasoning ("Thoughts") blocks inline. File-static
-    // gShowThinking, default on (DESIGN §5).
     ImGui::Separator();
     ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the AI's reasoning steps inline (like Claude Code verbose mode).");
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+
+    if (ImGui::Button("All settings...", ImVec2(-1, 0))) {
+        st.openSettings    = true;
+        st.openSettingsTab = 2;   // jump straight to the Settings modal's AI tab
+        ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
+        !st.setupRunning.load() && !st.job.running.load()) {
+        st.startSetup(true);
+    }
 }
 
 // ============================ searchable model dropdown ============================
@@ -2810,7 +2841,7 @@ static void drawModelDropdown(AppState& st, bool busy) {
                              gear.uv0, gear.uv1)
         : ImGui::SmallButton("settings");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
-    if (openSet) { st.focusSettingsTab = true; ImGui::CloseCurrentPopup(); }
+    if (openSet) { st.openSettings = true; st.openSettingsTab = 2; ImGui::CloseCurrentPopup(); }
     if (picked) {
         // CRITICAL: persist the pick to config.json NOW. The in-app run (agent_run_v2) resolves its
         // provider from config.json in the C++ core — NOT from in-memory st.settings — so a pick that
@@ -3245,9 +3276,19 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     // M22 (Hunter's mockup): row 1 = `Permissions ▾` alone on top (context meter rides the same
     // row right-aligned as a passive readout); row 2 = the Design|Edit|Ask segmented toggle. The
     // large prompt box and the [model][effort][paperclip]…[send] rail follow in drawComposer.
-    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline \xe2\x96\xbe"
-                                                    : "Permissions \xe2\x96\xbe";
+    // Trailing spaces reserve room for a DRAWN dropdown caret — the UI font has no U+25BE glyph
+    // (it rendered as a floating "?").
+    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline   "
+                                                    : "Permissions   ";
     if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##cmpperm");
+    {
+        const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+        const float a = 3.0f * sc;
+        const ImVec2 c(bmx.x - 8.0f * sc - a, (bmn.y + bmx.y) * 0.5f - a * 0.4f);
+        ImGui::GetWindowDrawList()->AddTriangleFilled(
+            ImVec2(c.x - a, c.y), ImVec2(c.x + a, c.y), ImVec2(c.x, c.y + a),
+            ImGui::ColorConvertFloat4ToU32(surf.textSecondary));
+    }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Privacy and run permissions for the copilot.");
     if (ImGui::BeginPopup("##cmpperm")) {
@@ -3305,12 +3346,12 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
 
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar();
-    ImGui::Dummy(ImVec2(0, 4 * sc));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
 }
 
-// Toolbar row below the prompt: model picker + thinking effort ... send/stop.
-static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool active,
-                                bool& submit, bool& stopReq, bool embedded = false) {
+// Toolbar row below the prompt: model picker + thinking effort + paperclip. The send/stop
+// control moved INSIDE the input box (drawComposerSendStop) — flagship-composer pattern.
+static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -3332,6 +3373,9 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
+    // Even chip gaps on this row (the composer stack zeroes ItemSpacing.y; keep that).
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ui::metrics::U(1.5f), ImGui::GetStyle().ItemSpacing.y));
     // Translucent chips over the glass composer (opaque fills fought the adaptive text).
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
@@ -3339,57 +3383,75 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,
         ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
 
+    // Thinking effort — ALWAYS present (it used to vanish for models without a native effort
+    // control and on narrow rows). Models without options get a generic Low/Medium/High set;
+    // s.reasoningEffort rides every agent RPC whenever non-empty (agentProviderOverride).
+    Settings& s = st.settings;
+    const char* effLabels[8] = {};
+    const char* effValues[8] = {};
+    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+    if (nEff <= 0) {
+        static const char* kFbLabels[] = {"Low", "Medium", "High"};
+        static const char* kFbValues[] = {"low", "medium", "high"};
+        for (int i = 0; i < 3; ++i) { effLabels[i] = kFbLabels[i]; effValues[i] = kFbValues[i]; }
+        nEff = 3;
+    }
+    int effIdx = -1;
+    for (int i = 0; i < nEff; ++i)
+        if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+    char effBtn[48];
+    std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s",
+                  effIdx >= 0 ? effLabels[effIdx] : "Default");
+
+    // Width budget for [model][thinking][paperclip]: the MODEL label ellipsizes first when the
+    // row is tight — the Thinking chip and paperclip are never dropped for width.
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
+    {
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float padX2  = style.FramePadding.x * 2.0f;
+        const float clipSz = ImGui::GetFrameHeight();
+        const float effW   = ImGui::CalcTextSize(effBtn).x + padX2;
+        const float maxModelW =
+            availW - effW - clipSz - 2.0f * style.ItemSpacing.x - padX2;
+        if (maxModelW > 0.0f && ImGui::CalcTextSize(modelLabel).x > maxModelW) {
+            const float dotsW = ImGui::CalcTextSize("...").x;
+            size_t len = std::strlen(modelLabel);
+            while (len > 1 &&
+                   ImGui::CalcTextSize(modelLabel, modelLabel + len).x + dotsW > maxModelW) {
+                --len;
+                while (len > 1 && (modelLabel[len] & 0xC0) == 0x80) --len;  // keep UTF-8 whole
+            }
+            std::snprintf(modelLabel + len, sizeof(modelLabel) - len, "...");
+        }
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
 
     ImGui::SameLine();
-    Settings& s = st.settings;
-    const char* effLabels[8] = {};
-    const char* effValues[8] = {};
-    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
-    // The chip renders ONLY when the model exposes an effort control AND the row has room for it
-    // before the send button — the old always-on "Thinking: n/a" placeholder overflowed the
-    // composer's rounded border and read as faint clipped junk (visual-review fix).
-    if (nEff > 0) {
-        int effIdx = 0;
-        for (int i = 0; i < nEff; ++i)
-            if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-        char effBtn[48];
-        std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
-        const float chipW = ImGui::CalcTextSize(effBtn).x + 16 * sc;   // + FramePadding (8dp x2)
-        // Reserve room for the paperclip AND the send button at the row's right edge (M22/M23).
-        const float sendReserve =
-            2.0f * (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
-        if (ImGui::GetCursorPosX() + chipW <= ImGui::GetContentRegionMax().x - sendReserve) {
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-            if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Thinking effort for the selected model.");
-        }
-        if (ImGui::BeginPopup("##cmpeffort")) {
-            for (int i = 0; i < nEff; ++i) {
-                if (ImGui::Selectable(effLabels[i], effIdx == i)) {
-                    std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
-                    saveSettings(st.settings);   // the core reads config.json — persist immediately
-                }
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Thinking effort for the selected model.");
+    if (ImGui::BeginPopup("##cmpeffort")) {
+        for (int i = 0; i < nEff; ++i) {
+            if (ImGui::Selectable(effLabels[i], effIdx == i)) {
+                std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
+                saveSettings(st.settings);   // the core reads config.json — persist immediately
             }
-            ImGui::EndPopup();
         }
+        ImGui::EndPopup();
     }
 
     // M23: paperclip — attach files to the NEXT message via the native open dialog (the same
     // openFileDialog mechanism as FeatureManager Open/Import). Chips render above the input.
     {
         const float clipSz = ImGui::GetFrameHeight();
-        const float clipReserve = clipSz + ImGui::GetStyle().ItemSpacing.x;
         ImGui::SameLine();
-        if (ImGui::GetCursorPosX() + clipSz <=
-            ImGui::GetContentRegionMax().x - clipReserve) {
+        if (ImGui::GetCursorPosX() + clipSz <= ImGui::GetContentRegionMax().x) {
             if (ImGui::Button("##attach", ImVec2(clipSz, clipSz))) {
                 if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
                     st.toast(ui::ToastLevel::Info,
@@ -3428,60 +3490,8 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
         }
     }
 
-    const float sendSz = ImGui::GetFrameHeight();
-    ImGui::SameLine();
-    float rightX = ImGui::GetContentRegionMax().x - sendSz;
-    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
-
-    if (active) {
-        // Stop button: statusErr fill with derived hover/active weights (no color literals).
-        const ImVec4 errC(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1);
-        ImGui::PushStyleColor(ImGuiCol_Button, errC);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(std::min(errC.x * 1.12f, 1.0f), std::min(errC.y * 1.12f, 1.0f),
-                   std::min(errC.z * 1.12f, 1.0f), 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-            ImVec4(errC.x * 0.85f, errC.y * 0.85f, errC.z * 0.85f, 1));
-        if (ImGui::Button("##stop", ImVec2(sendSz, sendSz))) stopReq = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
-                                               : "Stop the current run");
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        float h = sendSz * 0.18f;
-        ImVec4 stopInk = ui::maxContrastTextOn(errC);
-        stopInk.w = 0.92f;
-        dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
-                          ImGui::ColorConvertFloat4ToU32(stopInk), 1.5f * sc);
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            canStart ? ui::Palette::toU32(pal.accent) : ui::Palette::toU32(pal.button));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            canStart ? ui::Palette::toU32(pal.accentDim) : ui::Palette::toU32(pal.buttonHovered));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.accentDim));
-        if (ImGui::Button("##send", ImVec2(sendSz, sendSz)) && canStart) submit = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(canStart ? "Send  (Enter)"
-                              : !canStart ? "Runtime/worker not ready yet." : "Type a message first.");
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        float t = sendSz * 0.22f;
-        // Glyph ink pairs with the button's own fill: max-contrast on accent when armed, the
-        // theme's dim ink on the theme button fill when idle.
-        ImU32 ac = canStart ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(
-                                  ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)))
-                            : ui::Palette::toU32(pal.textDim);
-        dl->AddTriangleFilled(ImVec2(c.x, c.y - t), ImVec2(c.x - t, c.y + t * 0.55f),
-                              ImVec2(c.x + t, c.y + t * 0.55f), ac);
-        dl->AddRectFilled(ImVec2(c.x - t * 0.30f, c.y - t * 0.1f),
-                          ImVec2(c.x + t * 0.30f, c.y + t * 0.9f), ac);
-    }
-    ImGui::PopStyleColor(3);
-
     ImGui::PopStyleColor(3);   // button base / hovered / active
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);     // FramePadding + row ItemSpacing
 
     // Clamp the dropdown to the Copilot column's width (minus a small inset) so a narrow column
     // never overhangs the pinned bubble; 300dp stays the cap for wide columns.
@@ -3532,8 +3542,79 @@ static void requestStopRun(AppState& st) {
     st.addLog("[..] stop requested by user");
 }
 
-// ---- the composer: a rounded input box + inline toolbar (+, model chip, settings, send) ----
-// Submits on Enter or the send button. Returns nothing; runs the turn directly.
+// The send/stop control, drawn INSIDE the message input box at its bottom-right (flagship
+// composer pattern — the input reserves right padding so text never runs under it). Idle: a
+// rounded accent button with an enter/return-key glyph (Enter submits). During a turn the same
+// button becomes the stop control (square glyph, statusErr fill).
+static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2& inMax,
+                                 float rightEdgeX, bool canRun, bool canStart, bool active,
+                                 bool& submit, bool& stopReq) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const float sz = ImGui::GetFrameHeight();
+    const float inset = 6.0f * sc;   // clear of the composer's rounded border
+    // Bottom-right anchor; a short (one-row) input centers the button vertically instead.
+    float y0 = inMax.y - sz;
+    if (y0 < inMin.y) y0 = (inMin.y + inMax.y - sz) * 0.5f;
+    const ImVec2 bMin(rightEdgeX - inset - sz, y0);
+    const ImVec2 bMax(bMin.x + sz, bMin.y + sz);
+
+    const ImVec2 keep = ImGui::GetCursorPos();
+    ImGui::SetCursorScreenPos(bMin);
+    const bool clicked = ImGui::InvisibleButton("##cp_sendstop", ImVec2(sz, sz));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float round = ui::metrics::rounding(7.0f);
+    const ImVec2 c((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
+
+    if (active) {
+        // Stop: statusErr fill with derived hover weight (no color literals).
+        ImVec4 fill(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1);
+        if (hov) fill = ImVec4(std::min(fill.x * 1.12f, 1.0f), std::min(fill.y * 1.12f, 1.0f),
+                               std::min(fill.z * 1.12f, 1.0f), 1);
+        dl->AddRectFilled(bMin, bMax, ImGui::ColorConvertFloat4ToU32(fill), round);
+        ImVec4 stopInk = ui::maxContrastTextOn(fill);
+        stopInk.w = 0.92f;
+        const float h = sz * 0.18f;
+        dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
+                          ImGui::ColorConvertFloat4ToU32(stopInk), 1.5f * sc);
+        if (hov)
+            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
+                                               : "Stop the current run");
+        if (clicked) stopReq = true;
+    } else {
+        const ImVec4 accC(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+        const ImVec4 fill = canStart
+            ? (hov ? ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1) : accC)
+            : ImVec4(pal.button[0], pal.button[1], pal.button[2], 1);
+        dl->AddRectFilled(bMin, bMax, ImGui::ColorConvertFloat4ToU32(fill), round);
+        // Enter/return-key glyph: stem down from the top-right into a horizontal run ending in a
+        // left-pointing arrowhead. Ink pairs with the button's own fill (same rule as before).
+        const ImU32 ink = canStart
+            ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(accC))
+            : ui::Palette::toU32(pal.textDim);
+        const float g  = sz * 0.24f;
+        const float by = c.y + g * 0.55f;              // the horizontal run's y
+        const float th = ui::metrics::stroke(1.6f);
+        dl->PathClear();
+        dl->PathLineTo(ImVec2(c.x + g, c.y - g));      // stem top (right side)
+        dl->PathLineTo(ImVec2(c.x + g, by));           // down
+        dl->PathLineTo(ImVec2(c.x - g, by));           // across to the left
+        dl->PathStroke(ink, 0, th);
+        const float a = g * 0.62f;                     // arrowhead, pointing LEFT
+        dl->AddLine(ImVec2(c.x - g, by), ImVec2(c.x - g + a, by - a), ink, th);
+        dl->AddLine(ImVec2(c.x - g, by), ImVec2(c.x - g + a, by + a), ink, th);
+        if (hov)
+            ImGui::SetTooltip(canStart ? "Send  (Enter)"
+                              : canRun ? "Type a message first."
+                                       : "Runtime/worker not ready yet.");
+        if (clicked && canStart) submit = true;
+    }
+    ImGui::SetCursorPos(keep);
+}
+
+// ---- the composer: a rounded input box (in-box send) + inline toolbar (model, thinking, +) ----
+// Submits on Enter or the in-box send button. Returns nothing; runs the turn directly.
 static void drawComposer(AppState& st, bool busy, bool canRun) {
     const bool hasDoc = st.docMirror.hasDoc();
 
@@ -3639,12 +3720,21 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    // Symmetric glass padding: match the toolbar's bottom breathing room above the input.
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+    // Reserve the in-box send button's footprint on the input's right so text never runs under it.
+    const float sendSz    = ImGui::GetFrameHeight();
+    const float sendInset = 6.0f * ui::uiScale;
     bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
-                                     ui::metrics::copilotInputMaxLines());
+                                     ui::metrics::copilotInputMaxLines(),
+                                     sendSz + sendInset * 2.0f);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(6);
+    // Send/stop rides INSIDE the input box, anchored bottom-right of the composer glass.
+    drawComposerSendStop(st, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                         composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
 
-    drawComposerToolbar(st, busy, canStart, active, submit, stopReq, true);
+    drawComposerToolbar(st, busy, true);
     ImGui::PopStyleVar();
 
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
@@ -3836,11 +3926,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::SetCursorPos(keep);
     }
 
-    // Route the composer/model-picker gear to the INLINE settings view (the docked sibling
-    // Settings tab is gone with the docked layout).
+    // Any leftover focus-AI-settings request routes to the MAIN Settings window (AI tab) — the
+    // full-page inline settings view inside the column is gone; quick knobs live in the header
+    // gear's compact popover (drawAISettingsBody).
     if (st.focusSettingsTab) {
-        gShowSettingsView = true;
-        st.showSessionsPicker = false;
+        st.openSettings    = true;
+        st.openSettingsTab = 2;
         st.focusSettingsTab = false;
     }
 
@@ -3864,10 +3955,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             st.conversations.push_back(std::move(cx));
         }
         if (std::strcmp(cpView, "sessions") == 0) {
-            st.showSessionsPicker = true;  gShowSettingsView = false;
-        } else if (std::strcmp(cpView, "settings") == 0) {
-            gShowSettingsView = true;  st.showSessionsPicker = false;
+            st.showSessionsPicker = true;
         }
+        // ("settings" no longer forces a view — the inline settings page was consolidated into
+        // the header gear's popover + the Settings modal's AI tab.)
     }
 
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
@@ -3893,9 +3984,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
-        if (gShowSettingsView) {
-            drawSettingsView(st, busy);
-        } else if (st.showSessionsPicker) {
+        if (st.showSessionsPicker) {
             drawSessionsPanel(st, busy);
         } else {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back

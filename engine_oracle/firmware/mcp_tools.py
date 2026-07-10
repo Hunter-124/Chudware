@@ -199,7 +199,77 @@ def fw_sim_run(params: dict) -> dict:
         timeout_s=float(params.get("timeout_s", 30)),
         scenario=scenario,
     )
-    return result.to_dict()
+    out = result.to_dict()
+
+    # T-FIN7: emit the aicad.powerprofile/1 artifact (contract §11) when the project is
+    # linked to a board and a trace was written. Best-effort — never fails the sim.
+    if result.trace_path and project.board_doc_ref:
+        try:
+            from engine.firmware import powerprofile
+            board = mcu_pinouts.resolve_board_doc(project.board_doc_ref)
+            if board is not None:
+                trace = powerprofile.load_trace(result.trace_path)
+                if trace is not None:
+                    profile = powerprofile.build_power_profile(
+                        trace, board=board, mcu_family=project.mcu_family,
+                        trace_ref=result.trace_path)
+                    out["power_profile_path"] = powerprofile.write_profile_artifact(
+                        profile, str(elf_path))
+        except Exception:  # pragma: no cover - artifact emission is a convenience
+            pass
+    return out
+
+
+def fw_power_profile(params: dict) -> dict:
+    """``{trace_path, project_id?, board_doc_ref?, mcu_family?, window_ms?}`` →
+    ``aicad.powerprofile/1`` dict (contract §11, T-FIN7).
+
+    Derives a duty-cycle activity profile from an EXISTING emulation trace
+    (``aicad.firmware.trace/1`` — the ``trace_path`` a previous ``fw_sim_run`` returned)
+    and, when a board resolves (explicit ``board_doc_ref`` beats the linked project's),
+    weights each component's T-FIN8 ``eng.supply.rails`` currents by its derived duty:
+
+    - CPU run/sleep residency: ``AICAD_CPU_EVT`` UART markers (opt-in AICAD_CPU_TRACE
+      macro) integrated over the run window; NO markers → honestly assumed 100 % active.
+    - Per-pin GPIO duty: time-stamped events integrated (pins assumed to start low);
+      unstamped events → duty null with toggle count; else the final-snapshot level.
+    - Rail currents: per-component active/sleep currents scaled by the component's
+      activity (MCU → CPU residency; loads on nets mapped to observed pins → pin duty;
+      everything else assumed always active). ``null`` currents stay null and are
+      listed in ``coverage`` — never an invented 0 (boardphys honesty rule).
+
+    BOOKKEEPING, not SPICE — the artifact's ``model`` field says so. ``rails[*].schedule``
+    is the direct ``{"duty", "period_s"}`` heat-load shape run_fea_thermal transient
+    studies accept (T-FIN18). No board → activity-only profile with empty ``rails``.
+    """
+    trace_path = params.get("trace_path")
+    if not trace_path:
+        return _err("invalid_request", "fw_power_profile requires 'trace_path'")
+
+    from engine.firmware import powerprofile
+    trace = powerprofile.load_trace(str(trace_path))
+    if trace is None:
+        return _err("invalid_trace",
+                    f"trace_path {trace_path!r} is not a readable JSON trace artifact")
+
+    project = None
+    if params.get("project_id"):
+        try:
+            project = fw_project.load(str(params["project_id"]))
+        except FileNotFoundError as e:
+            return _err("unknown_project", str(e))
+
+    board_ref = params.get("board_doc_ref") or \
+        (project.board_doc_ref if project else None)
+    board = mcu_pinouts.resolve_board_doc(str(board_ref)) if board_ref else None
+    mcu_family = (params.get("mcu_family") or
+                  (project.mcu_family if project else None) or
+                  (mcu_pinouts.select_mcu_family(board) if board else None))
+
+    window = params.get("window_ms")
+    return powerprofile.build_power_profile(
+        trace, board=board, mcu_family=mcu_family, trace_ref=str(trace_path),
+        window_ms=float(window) if window else None)
 
 
 def fw_verify_board(params: dict) -> dict:

@@ -2183,12 +2183,13 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  hydraulic_piping_handoff replaces per-hose loss estimates with a real solve."
         )
     if topic in ("firmware", "fw", "embedded", "mcu", "fw_build", "fw_new_project",
-                 "flash", "debug", "fw_sim_run", "fw_verify_board", "coverify"):
+                 "flash", "debug", "fw_sim_run", "fw_verify_board", "coverify",
+                 "fw_power_profile", "powerprofile", "power_profile"):
         return (
             "FIRMWARE — embedded compile loop: build, sim, flash, debug\n\n"
             "Tools: fw_status / fw_new_project / fw_build / fw_sources / fw_sim_run /\n"
-            "       fw_verify_board / fw_flash / fw_debug_start / fw_debug_halt /\n"
-            "       fw_debug_read_mem\n\n"
+            "       fw_verify_board / fw_power_profile / fw_flash / fw_debug_start /\n"
+            "       fw_debug_halt / fw_debug_read_mem\n\n"
             "WORKFLOW:\n"
             "  fw_status()                          FIRST CALL — provisioning doctor. Reports\n"
             "                                       each toolchain/emulator/flasher (found,\n"
@@ -2218,6 +2219,20 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       Findings use the ERC/DRC violation shape\n"
             "                                       {rule, severity, net, pins, message, fix}.\n"
             "                                       Pass sch_doc_ref for direction checks.\n"
+            "  fw_power_profile(trace_path, ...)    Power/duty-cycle profile (T-FIN7,\n"
+            "                                       aicad.powerprofile/1, contract §11) from\n"
+            "                                       an existing trace: CPU run/sleep residency\n"
+            "                                       (AICAD_CPU_TRACE markers, else assumed\n"
+            "                                       active), per-pin GPIO duty, and per-rail\n"
+            "                                       i_avg/i_peak from the board's T-FIN8\n"
+            "                                       eng.supply.rails currents weighted by duty.\n"
+            "                                       BOOKKEEPING not SPICE; nulls stay null.\n"
+            "                                       rails[*].schedule = {duty, period_s} — feed\n"
+            "                                       it straight to run_fea_thermal transient\n"
+            "                                       heat-load schedules (duty-cycle heating).\n"
+            "                                       fw_sim_run auto-emits <elf>.power.json\n"
+            "                                       (power_profile_path) for board-linked\n"
+            "                                       projects.\n"
             "  fw_flash(elf_path, chip, port)       Flash ELF to target hardware.\n"
             "  fw_debug_start/halt/read_mem(chip)   GDB-over-SWD debug session controls.\n\n"
             "SUPPORTED TARGETS (T-FIN2 Renode platform pack — what the bundled platform\n"

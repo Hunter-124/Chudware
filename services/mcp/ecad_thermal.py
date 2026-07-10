@@ -763,3 +763,533 @@ def register_ecad_thermal_tools(mcp) -> None:
                 advisories=advisories or None,
                 warnings=result["warnings"]))
         return _dumps(result)
+
+
+# =============================================================================
+# T-FIN19: board/enclosure airflow handoff — ECAD board -> OpenFOAM conjugate
+# heat transfer (CHT), verifying the T-FIN16 preset-h film-coefficient solve.
+#
+# COUPLING ID: ``ecad_to_cht`` (new, justified): nothing from the T-FIN16 FEA
+# *solution* is transferred to the CFD side — the CHT study is built directly
+# from the ECAD board (geometry + boardphys powers), exactly like
+# ``ecad_to_thermal_fea`` but with a different target solver. ``thermal_to_cfd``
+# would wrongly imply the thermal FEA RESULT generates the CFD BCs; instead the
+# preset-h solve only supplies EXPECTATIONS that ecad_verify_airflow checks.
+# =============================================================================
+
+_AIRFLOW: dict = {"last": None}          # session state for ecad_verify_airflow
+
+# Effective isotropic conductivity for a simplified component body (molded package
+# with die/leadframe smeared in) — an engineering nominal, overridable per call.
+_COMPONENT_KAPPA_W_MK = 10.0
+# Component boxes are sunk this far INTO the board slab so the solid regions share a
+# robust interface after snappyHexMesh/splitMeshRegions (coincident faces are fragile).
+_EMBED_MM = 0.2
+
+_REGION_BAD = __import__("re").compile(r"[^A-Za-z0-9_]")
+_REGION_TEMP_RE = __import__("re").compile(
+    r"([A-Za-z0-9_]+): (-?\d+(?:\.\d+)?) C mean, (-?\d+(?:\.\d+)?) C peak")
+
+
+def _region_name(ref: str, taken: set) -> str:
+    """OpenFOAM-word region name for a component ref, unique among ``taken``."""
+    base = "c_" + (_REGION_BAD.sub("_", str(ref)).strip("_") or "x")
+    name, i = base, 1
+    while name in taken or name in ("fluid", "board"):
+        i += 1
+        name = f"{base}_{i}"
+    taken.add(name)
+    return name
+
+
+def write_box_stl(path: str, x0: float, y0: float, z0: float,
+                  x1: float, y1: float, z1: float) -> str:
+    """Write an axis-aligned watertight box as ASCII STL (world mm), outward normals."""
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    # (normal, [i, j, k]) x 12 — two CCW-outward triangles per face.
+    faces = [((0, 0, -1), (0, 2, 1)), ((0, 0, -1), (0, 3, 2)),
+             ((0, 0, 1), (4, 5, 6)), ((0, 0, 1), (4, 6, 7)),
+             ((0, -1, 0), (0, 1, 5)), ((0, -1, 0), (0, 5, 4)),
+             ((0, 1, 0), (2, 3, 7)), ((0, 1, 0), (2, 7, 6)),
+             ((-1, 0, 0), (0, 4, 7)), ((-1, 0, 0), (0, 7, 3)),
+             ((1, 0, 0), (1, 2, 6)), ((1, 0, 0), (1, 6, 5))]
+    lines = ["solid box"]
+    for n, tri in faces:
+        lines.append(f"  facet normal {n[0]} {n[1]} {n[2]}")
+        lines.append("    outer loop")
+        for i in tri:
+            lines.append(f"      vertex {v[i][0]:.6f} {v[i][1]:.6f} {v[i][2]:.6f}")
+        lines.append("    endloop")
+        lines.append("  endfacet")
+    lines.append("endsolid box")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="ascii") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+def build_airflow_solids(board_geo: dict, material: dict, components: list,
+                         out_dir: str,
+                         component_kappa_w_mk: float = _COMPONENT_KAPPA_W_MK,
+                         embed_mm: float = _EMBED_MM) -> dict:
+    """Board + powered-component watertight STL solids for the CHT ``solids`` seam.
+
+    Pure and engine-free: consumes the ``board``/``components`` blocks of a
+    board_to_fea_step() result and writes box STLs (world mm). Returns
+    ``{solids, conditions, sources, unpowered_refs, region_map, assumptions}`` where
+    ``solids`` is the exact T-SIM5 seam shape [{name, stl_path, kappa_w_mk, power_w}]
+    and ``region_map`` maps component ref -> CHT region name."""
+    x0, y0, x1, y1 = [float(v) for v in board_geo["bbox_mm"]]
+    zb, zt = float(board_geo["z_bot_mm"]), float(board_geo["z_top_mm"])
+    solids = [{"name": "board",
+               "stl_path": write_box_stl(os.path.join(out_dir, "board.stl"),
+                                         x0, y0, zb, x1, y1, zt),
+               "kappa_w_mk": float(material["k_w_mk"]), "power_w": 0.0}]
+    conditions: list = []
+    sources: list = []
+    unpowered: list = []
+    region_map: dict = {}
+    taken: set = set()
+    for rec in components:
+        ref = rec.get("ref") or rec.get("id") or "?"
+        fea = rec.get("fea")
+        if not fea:
+            continue                      # body never placed — in summary warnings
+        p_w = component_power_w(rec)
+        if p_w is None or float(fea.get("top_area_mm2", 0)) <= 0:
+            unpowered.append(ref)
+            continue
+        rx0, ry0, rx1, ry1 = [float(v) for v in fea["rect_mm"]]
+        czb = min(fea["z_bot_mm"], fea["z_top_mm"])
+        czt = max(fea["z_bot_mm"], fea["z_top_mm"])
+        # Sink the body into the board slab so the regions share an interface.
+        if fea.get("side", "top") != "bottom":
+            czb -= embed_mm
+        else:
+            czt += embed_mm
+        name = _region_name(ref, taken)
+        region_map[ref] = name
+        solids.append({"name": name,
+                       "stl_path": write_box_stl(
+                           os.path.join(out_dir, f"{name}.stl"),
+                           rx0, ry0, czb, rx1, ry1, czt),
+                       "kappa_w_mk": float(component_kappa_w_mk),
+                       "power_w": p_w})
+        which = "typ" if (rec.get("power_w") or {}).get("typ") else "max"
+        conditions.append(sh.condition(
+            f"heat_{ref}", "heat_source", p_w, "W",
+            f"boardphys.components[{ref}].power_w.{which}", applied_to=ref))
+        sources.append({"ref": ref, "region": name, "power_w": p_w})
+    assumptions = [
+        "board modeled as its bounding-box slab with the homogenized in-plane k "
+        f"({material['k_w_mk']} W/mK) applied ISOTROPICALLY (the CHT solid model is "
+        "isotropic; through-plane conduction is over-estimated)",
+        "component bodies are their FEA cap boxes with an effective isotropic "
+        f"k = {component_kappa_w_mk} W/mK (molded package nominal), sunk "
+        f"{embed_mm} mm into the board so solid regions share a meshable interface",
+        "each powered component dissipates power_w as a volumetric source over its "
+        "whole body (no die/junction detail — compare CASE temperatures)",
+    ]
+    return {"solids": solids, "conditions": conditions, "sources": sources,
+            "unpowered_refs": unpowered, "region_map": region_map,
+            "assumptions": assumptions}
+
+
+def build_enclosure_walls(board_geo: dict, enclosure: dict, out_dir: str) -> tuple:
+    """Optional enclosure: a rectangular DUCT of four passive wall slabs around the
+    board, open along +/-x (the flow axis) — fan-through-enclosure topology.
+
+    ``enclosure`` keys (mm): clearance_mm (board->inner wall, default 10),
+    wall_mm (default 2), kappa_w_mk (default 0.2, ABS). Returns
+    ``(wall_solids, assumptions)``."""
+    c = float(enclosure.get("clearance_mm", 10.0))
+    t = float(enclosure.get("wall_mm", 2.0))
+    k = float(enclosure.get("kappa_w_mk", 0.2))
+    x0, y0, x1, y1 = [float(v) for v in board_geo["bbox_mm"]]
+    zb, zt = float(board_geo["z_bot_mm"]), float(board_geo["z_top_mm"])
+    ix0, ix1 = x0 - c, x1 + c                    # duct is open at both x ends
+    iy0, iy1, iz0, iz1 = y0 - c, y1 + c, zb - c, zt + c
+    walls = [
+        ("encl_bottom", ix0, iy0 - t, iz0 - t, ix1, iy1 + t, iz0),
+        ("encl_top",    ix0, iy0 - t, iz1,     ix1, iy1 + t, iz1 + t),
+        ("encl_left",   ix0, iy0 - t, iz0,     ix1, iy0,     iz1),
+        ("encl_right",  ix0, iy1,     iz0,     ix1, iy1 + t, iz1),
+    ]
+    solids = [{"name": n,
+               "stl_path": write_box_stl(os.path.join(out_dir, f"{n}.stl"),
+                                         a, b, cz, d, e, f),
+               "kappa_w_mk": k, "power_w": 0.0}
+              for n, a, b, cz, d, e, f in walls]
+    assumptions = [
+        f"enclosure modeled as a passive 4-wall duct (wall {t} mm, k={k} W/mK, "
+        f"clearance {c} mm) open along the flow axis; the tunnel domain extends "
+        "beyond it, so some inlet flow bypasses OUTSIDE the duct — inside-duct "
+        "velocity is lower than the nominal inlet velocity (conservative)",
+        "no radiation, no fan curve — inlet velocity is imposed, not solved",
+    ]
+    return solids, assumptions
+
+
+def parse_region_temps(solver_notes: list) -> dict:
+    """{region: {'mean_c': x, 'peak_c': y}} from postprocess_cht solver notes
+    ('per-region: board: 41 C mean, 44 C peak; c_U1: ...'). Integer-degree
+    resolution — that's the note format; fine for a %-rise verify."""
+    out: dict = {}
+    for note in solver_notes or []:
+        s = str(note)
+        if "per-region" not in s and " C mean" not in s:
+            continue
+        for m in _REGION_TEMP_RE.finditer(s):
+            out[m.group(1)] = {"mean_c": float(m.group(2)),
+                               "peak_c": float(m.group(3))}
+    return out
+
+
+def airflow_deviation_table(preset_rows: list, cht_rows: list,
+                            t_amb_preset_c: float, inlet_temp_c: float,
+                            h_preset_w_m2k: Optional[float],
+                            tolerance_pct: float) -> tuple:
+    """Per-component preset-h vs CHT deviation table — 'was the film-coefficient
+    assumption sane?'.
+
+    Compares temperature RISE above each study's own ambient (absolute temps would
+    launder error through the shared ambient). Returns ``(table, checks, guidance)``:
+    ``checks`` are simhandoff verify checks (|deviation| vs tolerance on the rise);
+    ``guidance`` strings are emitted when the preset was OPTIMISTIC (CHT hotter),
+    including an effective-h suggestion h_eff ~= h_preset * rise_preset/rise_cht."""
+    by_ref = {r.get("ref"): r for r in preset_rows or []}
+    table: list = []
+    checks: list = []
+    guidance: list = []
+    for row in cht_rows:
+        ref = row["ref"]
+        pre = by_ref.get(ref)
+        t_pre = pre.get("t_case_c") if isinstance(pre, dict) else None
+        entry = {"ref": ref, "power_w": row.get("power_w"),
+                 "preset_t_case_c": t_pre, "cht_t_peak_c": row.get("t_peak_c"),
+                 "cht_t_mean_c": row.get("t_mean_c"),
+                 "rise_preset_c": None, "rise_cht_c": None,
+                 "deviation_pct": None, "verdict": "no preset solve to compare"}
+        t_cht = row.get("t_peak_c")
+        if isinstance(t_pre, (int, float)) and isinstance(t_cht, (int, float)):
+            rise_p = t_pre - t_amb_preset_c
+            rise_c = t_cht - inlet_temp_c
+            dev = (rise_c - rise_p) / max(abs(rise_p), 1e-9) * 100.0
+            entry.update(rise_preset_c=round(rise_p, 2), rise_cht_c=round(rise_c, 2),
+                         deviation_pct=round(dev, 1))
+            if dev > tolerance_pct:
+                entry["verdict"] = "preset OPTIMISTIC (CHT runs hotter)"
+                h_eff = (h_preset_w_m2k * rise_p / max(rise_c, 1e-9)
+                         if isinstance(h_preset_w_m2k, (int, float)) else None)
+                guidance.append(
+                    f"{ref}: CHT rise {rise_c:.1f} C vs preset {rise_p:.1f} C "
+                    f"(+{dev:.0f} %) — the film coefficient was optimistic"
+                    + (f"; effective h ~= {h_eff:.1f} W/m2-K — re-run "
+                       f"ecad_thermal_handoff(h_w_m2k={h_eff:.1f}) for a preset-"
+                       "path study that matches the airflow" if h_eff else ""))
+            elif dev < -tolerance_pct:
+                entry["verdict"] = "preset conservative (CHT runs cooler)"
+            else:
+                entry["verdict"] = "sane (within tolerance)"
+            checks.append(sh.check(f"t_rise_{ref}", "C", round(rise_p, 2),
+                                   round(rise_c, 2), round(abs(dev), 1),
+                                   tolerance_pct, abs(dev) <= tolerance_pct))
+        table.append(entry)
+    return table, checks, guidance
+
+
+def register_ecad_airflow_tools(mcp) -> None:
+    """Register ecad_airflow_handoff / ecad_verify_airflow on ``mcp`` (FastMCP)."""
+
+    from mcp_server.ecad_tools import _get_pcb, _default_out_dir
+    from engine.ecad.ops import OpError
+
+    def _openfoam_runner():
+        try:
+            from engine.sim.foam_runner import get_runner
+            r = get_runner()
+            return r if (r is not None and r.available()) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @mcp.tool()
+    def ecad_airflow_handoff(doc_id: str = "",
+                             inlet_mps: float = 2.0,
+                             inlet_temp_c: float = 25.0,
+                             preset: str = "coarse",
+                             enclosure: Optional[dict] = None,
+                             component_kappa_w_mk: float = _COMPONENT_KAPPA_W_MK,
+                             dry_run: bool = False,
+                             path: str = "") -> str:
+        """Hand the active board's thermal problem to OpenFOAM conjugate heat transfer
+        (CHT) — the check for when convection PRESETS aren't enough (enclosures, fans).
+
+        Pipeline:
+        1. Reuses the T-FIN16 FEA geometry (board_to_fea_step) for footprints/powers,
+           then exports the board slab + every POWERED component as separate watertight
+           STL solids (world mm; components sunk 0.2 mm into the board so the regions
+           couple). Components without power metadata get no solid (honesty).
+        2. Air domain: open ambient by default; pass enclosure={"clearance_mm":10,
+           "wall_mm":2} for a passive 4-wall duct open along the flow (+x) axis.
+        3. Runs chtMultiRegionFoam via the T-SIM5 seam (run_openfoam_tunnel thermal=
+           {mode:'conjugate', solids:[...]}) with the given inlet velocity/temperature;
+           per-region volumetric heat sources carry each component's power_w.
+        4. Maps per-region mean/peak temperatures back to component refs.
+        Then run ecad_verify_airflow() to quantify the T-FIN16 preset-h error
+        ('was the film-coefficient assumption sane?').
+
+        Without OpenFOAM (or with dry_run=True) it still returns the full case inputs
+        + a VALID aicad.simhandoff/1 envelope (coupling 'ecad_to_cht') with
+        skipped=true, and offers the LBM wind tunnel as a qualitative-flow ADVISORY —
+        clearly labeled NON-THERMAL, never a temperature verdict.
+
+        Budget note: even 'coarse' CHT is minutes of meshing+solving; finer presets
+        grow fast.
+        """
+        warnings: list = []
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="airflow handoff needs an open routed board.",
+                        next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
+        board_doc = session.doc
+
+        out_dir = path or str(_default_out_dir(board_doc.get("name", "board")) / "airflow")
+        try:
+            from engine.ecad.threed import board_to_fea_step, BoardGeometryError
+        except ImportError as e:
+            return _err(f"3D kernel unavailable (ImportError: {e})",
+                        hint="OCP/build123d not installed — board geometry cannot be built.",
+                        next_actions=["pip install build123d"], available=False)
+        try:
+            built = board_to_fea_step(board_doc, os.path.join(out_dir, "board_ref.step"))
+        except BoardGeometryError as e:
+            return _err(f"board geometry failed: {e}",
+                        hint="the board needs a closed Edge.Cuts outline.",
+                        next_actions=["ecad_run_drc()", "ecad_status()"])
+        except Exception as e:  # noqa: BLE001
+            return _err(f"board geometry build failed: {type(e).__name__}: {e}")
+        warnings.extend(built["summary"].get("warnings", []))
+
+        case = build_airflow_solids(built["board"], built["material"],
+                                    built["components"], out_dir,
+                                    component_kappa_w_mk=float(component_kappa_w_mk))
+        if not case["sources"]:
+            return _err("no component carries power metadata — nothing to heat",
+                        hint="seed power_w on at least one component "
+                             "(contracts/ecad/boardphys.md eng blocks).",
+                        next_actions=["ecad_status()"])
+        assumptions = list(case["assumptions"])
+        solids = list(case["solids"])
+        air_domain = {"mode": "open_ambient"}
+        if isinstance(enclosure, dict):
+            walls, encl_assum = build_enclosure_walls(built["board"], enclosure, out_dir)
+            solids += walls
+            assumptions += encl_assum
+            air_domain = {"mode": "enclosure_duct", **{k: float(enclosure.get(k, d))
+                          for k, d in (("clearance_mm", 10.0), ("wall_mm", 2.0),
+                                       ("kappa_w_mk", 0.2))}}
+
+        conditions = list(case["conditions"]) + [
+            sh.condition("inlet_velocity", "inlet_velocity", float(inlet_mps), "m/s",
+                         "caller inlet_mps (fan/ambient flow)", applied_to="domain inlet"),
+            sh.condition("inlet_temperature", "inlet_temperature", float(inlet_temp_c),
+                         "C", "caller inlet_temp_c", applied_to="domain inlet"),
+        ]
+
+        # Expectations from the T-FIN16 preset-h solve, when one is in session.
+        pre = _THERMAL.get("last_handoff")
+        expectations = []
+        preset_env: dict = {}
+        if isinstance(pre, dict) and pre.get("solved"):
+            preset_env = pre.get("environment") or {}
+            for r in pre.get("components") or []:
+                if isinstance(r.get("t_case_c"), (int, float)):
+                    expectations.append(sh.expectation(
+                        f"t_case_{r['ref']}_c", r["t_case_c"], "C",
+                        f"ecad_thermal_handoff preset-h solve "
+                        f"(h={preset_env.get('h_w_m2k')} W/m2-K)"))
+
+        envelope = sh.build_handoff(
+            "ecad_to_cht",
+            sh.study_ref("ecad", "ecad_airflow_handoff", doc_id=session.doc_id),
+            sh.study_ref("cfd_cht", "run_openfoam_tunnel"),
+            geometry=[sh.geometry_ref(
+                          "board" if s["name"] == "board" else
+                          ("enclosure_wall" if s["name"].startswith("encl_")
+                           else "component_body"),
+                          "stl", path=s["stl_path"],
+                          derived_by="mcp_server.ecad_thermal.build_airflow_solids",
+                          meta={"region": s["name"], "kappa_w_mk": s["kappa_w_mk"],
+                                "power_w": s["power_w"]})
+                      for s in solids],
+            conditions=conditions,
+            expectations=expectations or None,
+            warnings=warnings or None,
+            meta={"air_domain": air_domain, "preset": preset,
+                  "assumptions": assumptions,
+                  "coupling_note": "new id ecad_to_cht: the CHT study is built from "
+                                   "the ECAD board directly; the preset-h FEA result "
+                                   "is only an expectation, not a BC source"})
+
+        base = {"ok": True, "doc_id": session.doc_id,
+                "air_domain": air_domain,
+                "solids": [{k: s[k] for k in ("name", "stl_path", "kappa_w_mk",
+                                              "power_w")} for s in solids],
+                "sources": case["sources"],
+                "coverage": {"n_components": len(built["components"]),
+                             "n_heat_sources": len(case["sources"]),
+                             "unpowered_refs": case["unpowered_refs"]},
+                "inlet": {"speed_mps": float(inlet_mps),
+                          "temp_c": float(inlet_temp_c)},
+                "preset": preset,
+                "assumptions": assumptions,
+                "warnings": warnings}
+
+        runner_ok = _openfoam_runner() is not None
+        lbm_advisory = ("run_cfd_flow(direction=[1,0,0], speed_mps=%g)  # ADVISORY "
+                        "LBM flow render — qualitative airflow ONLY, NON-THERMAL, "
+                        "never a temperature verdict" % float(inlet_mps))
+        if dry_run or not runner_ok:
+            _AIRFLOW["last"] = None
+            reason = ("dry run requested" if dry_run else
+                      "OpenFOAM not available (provision with tools/provision_openfoam.py "
+                      "or install the conda-forge 'openfoam' package)")
+            return _dumps(sh.attach({
+                **base, "solved": False, "skipped": True, "skip_reason": reason,
+                "openfoam_available": runner_ok,
+                "hint": f"case inputs + envelope built; CHT solve skipped: {reason}.",
+                "next_actions": ([] if dry_run and runner_ok else [lbm_advisory])
+                                + (["ecad_airflow_handoff(dry_run=False)"]
+                                   if runner_ok else []),
+            }, envelope))
+
+        # ── live CHT via the T-SIM5 seam ────────────────────────────────────
+        try:
+            from engine.sim.openfoam import run_openfoam_tunnel
+            res = run_openfoam_tunnel(
+                None, direction=(1.0, 0.0, 0.0), speed_mps=float(inlet_mps),
+                preset=preset,
+                thermal={"enabled": True, "mode": "conjugate",
+                         "inlet_temp_c": float(inlet_temp_c), "solids": solids})
+        except Exception as e:  # noqa: BLE001
+            _AIRFLOW["last"] = None
+            return _dumps(sh.attach({
+                **base, "solved": False, "skipped": True,
+                "skip_reason": f"CHT run failed: {type(e).__name__}: {e}",
+                "openfoam_available": True,
+                "hint": "case inputs + envelope are valid; the OpenFOAM run itself "
+                        "failed — see skip_reason.",
+                "next_actions": [lbm_advisory,
+                                 "set AICAD_FOAM_KEEP=1 and retry to inspect the case"],
+            }, envelope))
+
+        region_temps = parse_region_temps(list(res.solver_notes or []))
+        rows = []
+        for src in case["sources"]:
+            rt = region_temps.get(src["region"]) or {}
+            rows.append({"ref": src["ref"], "region": src["region"],
+                         "power_w": src["power_w"],
+                         "t_mean_c": rt.get("mean_c"), "t_peak_c": rt.get("peak_c")})
+        board_rt = region_temps.get("board") or {}
+        result = sh.attach({
+            **base, "solved": True, "skipped": False,
+            "solver": "OpenFOAM chtMultiRegionFoam (conjugate solid+fluid)",
+            "reynolds": res.reynolds,
+            "board_t_mean_c": board_rt.get("mean_c"),
+            "board_t_peak_c": board_rt.get("peak_c"),
+            "components": rows,
+            "region_temps": region_temps,
+            "overlay_path": res.overlay_path,
+            "solver_notes": list(res.solver_notes or []),
+            "hint": (res.reynolds_note or "CHT solved")
+                    + " Run ecad_verify_airflow() to check the preset-h assumption.",
+            "next_actions": ["ecad_verify_airflow()"],
+        }, envelope)
+        _AIRFLOW["last"] = result
+        return _dumps(result)
+
+    @mcp.tool()
+    def ecad_verify_airflow(airflow_result: Union[str, dict, None] = None,
+                            preset_result: Union[str, dict, None] = None,
+                            tolerance_pct: float = 40.0) -> str:
+        """Was the T-FIN16 film-coefficient assumption sane? Compare the preset-h FEA
+        component temperatures against the CHT (airflow) solve, per component.
+
+        Deviation is measured on the temperature RISE above each study's own ambient.
+        Default tolerance 40 %: a convection preset is an engineering nominal, not a
+        flow solve — the check flags assumption-breaking environments (enclosed board,
+        starved fan), not solver noise. Guidance is emitted whenever the preset was
+        OPTIMISTIC (CHT hotter), including an effective-h to re-run the preset path
+        with. Uses the last solved ecad_airflow_handoff / ecad_thermal_handoff in the
+        session unless results are passed explicitly.
+        """
+        def _load(v, fallback):
+            if isinstance(v, str) and v.strip():
+                try:
+                    return json.loads(v)
+                except ValueError:
+                    return None
+            return v if isinstance(v, dict) else fallback
+
+        air = _load(airflow_result, _AIRFLOW.get("last"))
+        pre = _load(preset_result, _THERMAL.get("last_handoff"))
+        if not isinstance(air, dict) or not air.get("solved"):
+            return _err("no solved ecad_airflow_handoff result available",
+                        hint="run ecad_airflow_handoff() (with OpenFOAM available) "
+                             "first, or pass its result.",
+                        next_actions=["ecad_airflow_handoff()"])
+        if not isinstance(pre, dict) or not pre.get("solved"):
+            return _err("no solved ecad_thermal_handoff (preset-h) result to verify "
+                        "against",
+                        hint="run ecad_thermal_handoff() first — the verify quantifies "
+                             "ITS film-coefficient error.",
+                        next_actions=["ecad_thermal_handoff()"])
+
+        env = pre.get("environment") or {}
+        t_amb = float(env.get("t_amb_c", 25.0))
+        h_pre = env.get("h_w_m2k")
+        inlet_c = float((air.get("inlet") or {}).get("temp_c", 25.0))
+        table, checks, guidance = airflow_deviation_table(
+            pre.get("components") or [], air.get("components") or [],
+            t_amb, inlet_c, h_pre, float(tolerance_pct))
+        if not checks:
+            return _err("no component appears in both solves — nothing to compare",
+                        hint="both studies must run on the same board/session.")
+
+        optimistic = [g for g in guidance]
+        all_pass = all(c["pass"] for c in checks)
+        verdict = (f"{'SANE' if all_pass else 'NOT SANE'}: preset h="
+                   f"{h_pre} W/m2-K vs CHT — {sum(1 for c in checks if c['pass'])}/"
+                   f"{len(checks)} component rise(s) within {tolerance_pct:.0f} %"
+                   + ("" if not optimistic else
+                      f"; preset OPTIMISTIC for {len(optimistic)} component(s)"))
+        result: dict = {
+            "ok": True, "pass": all_pass, "verdict": verdict,
+            "preset_env": {"h_w_m2k": h_pre, "t_amb_c": t_amb},
+            "inlet_temp_c": inlet_c,
+            "table": table,
+            "guidance": guidance,
+            "warnings": ["CHT peak (case) temp vs preset max nodal temp — both are "
+                         "case-level; junction detail is out of scope for either",
+                         "region temps carry integer-degree resolution (parsed from "
+                         "the CHT per-region notes)"],
+            "hint": verdict + (" — see guidance for the effective-h re-run."
+                               if guidance else ""),
+            "next_actions": ([g.split("re-run ")[-1] for g in guidance
+                              if "re-run " in g][:1] or
+                             ["margins look consistent — preset path is trustworthy "
+                              "for this environment"]),
+        }
+        sh.attach(result, sh.build_verify(
+            "ecad_to_cht",
+            sh.study_ref("thermal_fea", "ecad_thermal_handoff",
+                         doc_id=pre.get("doc_id")),
+            sh.study_ref("cfd_cht", "ecad_airflow_handoff",
+                         doc_id=air.get("doc_id")),
+            checks, verdict,
+            handoff_id=(air.get("simhandoff") or {}).get("id"),
+            advisories=guidance or None,
+            warnings=result["warnings"]))
+        return _dumps(result)

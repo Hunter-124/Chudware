@@ -102,10 +102,10 @@ graph TD
     T_FIN16["T-FIN16: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify"]:::done
     T_FIN17["T-FIN17: Heatsink selection loop - parts-library candidates solved to a Tj target"]:::doing
     T_FIN18["T-FIN18: Transient thermal FEA - capacitance matrix, time integration, duty-cycle loads"]:::done
-    T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::doing
+    T_FIN19["T-FIN19: Board/enclosure airflow handoff - thermal to conjugate-HT CFD"]:::done
     T_FIN2["T-FIN2: Emulation platform pack - UART+GPIO+ADC+I2C+SPI+timer peripherals across MCU families"]:::done
     T_FIN20["T-FIN20: Motion dynamics upgrade + motion->FEA load handoff"]:::done
-    T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::doing
+    T_FIN21["T-FIN21: PCB reliability - board assembly modal + vibration screening"]:::done
     T_FIN22["T-FIN22: Hydraulic<->piping<->FEA couplings - hose runs solve + actuator loads to FEA"]:::done
     T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::done
     T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::doing

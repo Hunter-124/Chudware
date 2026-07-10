@@ -411,6 +411,17 @@ def _eval_probe(sim: _Sim, mna: MnaSystem, x: np.ndarray, probe: str):
                 b = sim.node_index.get(d.node_names[1], -1)
                 r = float(d.value) if d.value else 1e-9
                 return (_val(x, a) - _val(x, b)) / r
+        # Two-terminal nonlinear device current: I(D1)/I(LED1) = the junction current at the
+        # operating point (into node_names[0], matching the resistor sign convention). Without
+        # this, a diode current probe fell through to None and _safe() mapped it to NaN, so an
+        # op-point probe like I(LED1) read NaN even on a perfectly converged solve.
+        for d in sim.devices:
+            if d.name == name and hasattr(d, "_linearize") and hasattr(d, "_vd"):
+                try:
+                    idd, _gd = d._linearize(d._vd(mna, x))
+                    return float(idd)
+                except Exception:  # noqa: BLE001 — a probe must never raise
+                    return None
     return None
 
 

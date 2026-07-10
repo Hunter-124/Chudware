@@ -29,6 +29,8 @@ Tools (each returns ``{ok, ...result, warnings:[], hint:"...", next_actions:[...
   ecad_export / ecad_to_3d            wrap fab writers / 3D export (lazy import, clean if unavailable)
   ecad_check_impedance                Z0 + delay for a routed trace vs. target; plain-English reading
   ecad_stackup_solve                  invert IPC-2141A: targets + fab profile -> stackup + net-class widths
+  ecad_set_net_class                  declare net-class SI rules: match groups, termination, rise time
+  ecad_run_sicheck                    SI rule pack: length match, pair skew, termination, via stubs, BGA fanout
   ecad_tf                             DC .tf: gain/Rin/Rout with a plain-English reading
   ecad_make_board                     one-shot sync->route->fill->DRC; sets current_pcb
 """
@@ -2388,6 +2390,127 @@ def register_ecad_tools(mcp) -> None:
             "reading": reading,
             "hint": reading + " " + adj,
             "next_actions": next_actions,
+        })
+
+    # ---------------------------------------------------------------- SI rule pack (T-FIN10)
+
+    @mcp.tool()
+    def ecad_set_net_class(name: str, params: Optional[Union[dict, str]] = None,
+                           nets: Optional[Union[list, str]] = None,
+                           doc_id: str = "") -> str:
+        """Declare/extend a net class on the active board and assign nets to it — THE
+        declaration path for high-speed SI rules (match groups, termination policy, edge rate).
+
+        ``params`` keys merge ADDITIVELY into ``board['net_classes'][name]`` — the same schema
+        ecad_stackup_solve writes (track_width / diff_gap / via dims / clearance), extended with
+        the SI keys ecad_run_sicheck reads:
+
+          match_tolerance_mm  the class IS a length-match group (e.g. a DDR byte lane): every
+                              assigned net's routed length must be within this of the group median
+          pair_skew_mm        intra-pair skew limit; diff pairs inferred from _P/_N, +/-, P/N
+          termination         {"scheme": "series"|"parallel"|"thevenin"|"none",
+                               "value_ohm": 33, "max_dist_mm": 10, "driver_ref": "U1"}
+          rise_time_ps        signal edge rate — enables the via-stub length check
+
+        ``nets`` is the list of net names to assign to the class (created if new).
+
+        Example — declare a DDR byte lane:
+          ecad_set_net_class('ddr_byte0', params={'match_tolerance_mm': 0.5},
+                             nets=['DQ0','DQ1','DQ2','DQ3','DQ4','DQ5','DQ6','DQ7','DQS_P','DQS_N'])
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Open a board first.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                return _err(f"params is not valid JSON: {params!r}")
+        if isinstance(nets, str):
+            try:
+                nets = json.loads(nets) if nets.strip().startswith("[") else \
+                    [n.strip() for n in nets.split(",") if n.strip()]
+            except Exception:
+                return _err(f"nets is not a valid list: {nets!r}")
+        try:
+            import copy as _copy
+            from engine.ecad import si_rules as si_mod
+            new_doc = _copy.deepcopy(session.doc)
+            res = si_mod.set_net_class(new_doc, str(name), params or {}, nets or [])
+            ecad_session.swap_doc(session, new_doc)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"set_net_class failed: {e}", hint="Inspect with ecad_status().")
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "class": res["class"], "params": res["params"], "assigned": res["assigned"],
+            "warnings": [],
+            "hint": f"net class {name!r} now has {len(res['params'])} key(s); "
+                    f"{len(res['assigned'])} net(s) assigned.",
+            "next_actions": ["ecad_run_sicheck()  # verify the declared SI rules",
+                             "ecad_autoroute()  # routes honour track_width/diff_gap"],
+        })
+
+    @mcp.tool()
+    def ecad_run_sicheck(doc_id: str = "") -> str:
+        """Run the high-speed / signal-integrity rule pack on the active board: length-match
+        groups (per-net deltas vs the group median), diff-pair intra-pair skew, termination
+        presence/topology (series R near driver, parallel/Thevenin at the end), via-stub length
+        vs rise time (tr/3 heuristic), and BGA fanout (via-in-pad, escape feasibility, courtyard
+        congestion). Rules fire from the net-class declarations made with ecad_set_net_class
+        (match_tolerance_mm / pair_skew_mm / termination / rise_time_ps).
+
+        HONEST LIMITS (also in the response's ``limitations``): closed-form IPC-2141A math +
+        topology heuristics only — NOT a field solver and NOT an IBIS simulation; no crosstalk,
+        return-path, or eye-diagram analysis. Treat a clean result as "no classic layout
+        mistakes", not a sign-off for multi-gigabit interfaces.
+
+        Advisory like ecad_run_drc: returns grouped violations + a per-group length-match table
+        (``match_report``) with each net's length and delta.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Open a board first.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        try:
+            from engine.ecad import si_rules as si_mod
+            res = si_mod.run_sicheck(session.doc)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"SI check engine error: {e}", hint="Inspect with ecad_status().")
+        violations = res["violations"]
+        summary = _erc_summary(violations)
+        lines = _erc_lines(violations)
+        worst = lines[:5]
+        declared = sorted(
+            k for k, v in (session.doc.get("net_classes") or {}).items()
+            if isinstance(v, dict) and any(key in v for key in (
+                "match_tolerance_mm", "pair_skew_mm", "termination", "rise_time_ps")))
+        verdict = (f"{summary['errors']} error(s), {summary['warnings']} warning(s) across "
+                   f"{len(declared)} SI class(es)."
+                   + (" worst: " + " | ".join(worst) if worst else " SI-clean board.")
+                   + ("" if declared else
+                      " NOTE: no SI rules declared — declare match groups / termination / "
+                      "rise time with ecad_set_net_class first."))
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "errors": summary["errors"], "warning_count": summary["warnings"],
+            "verdict": verdict,
+            "violations": lines, "by_rule": summary["groups"],
+            "match_report": res["match_report"],
+            "si_classes": declared,
+            "limitations": res["limitations"],
+            "warnings": worst[:3],
+            "hint": verdict,
+            "next_actions": (
+                ["Fix the worst SI offenders (lengthen short match-group nets, add/relocate "
+                 "termination Rs, back-drill or re-layer stubbed vias), then re-run "
+                 "ecad_run_sicheck()."] if violations else
+                (["ecad_run_drc()  # SI pack clean — confirm physical rules too"] if declared else
+                 ["ecad_set_net_class('ddr_byte0', params={'match_tolerance_mm': 0.5}, "
+                  "nets=[...])  # declare SI rules, then re-run"])
+            ),
         })
 
     # ---------------------------------------------------------------- stackup advisor

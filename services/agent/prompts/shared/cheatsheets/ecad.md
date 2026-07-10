@@ -116,3 +116,49 @@ HOST-BOARD RULE PACK (T-FIN9) — MCU/FPGA device-level checks above DRC/ERC:
       sequencing [] = known none required; null = unknown (honest silence).
     * Thresholds tune per board: board rules 'hostcheck' dict (decoupling_dist_mm,
       decoupling_min_f/max_f, bulk_min_f, xtal_loop_dist_mm, xtal_keepout_mm).
+
+HIGH-SPEED / SIGNAL-INTEGRITY RULE PACK (formula + heuristic — T-FIN10):
+  ecad_set_net_class(name, params, nets)
+      THE declaration path for SI rules. Merges keys ADDITIVELY into the same
+      board net_classes entries ecad_stackup_solve writes (track_width/diff_gap/
+      via dims), extended with:
+        match_tolerance_mm   the class IS a length-match group (e.g. a DDR byte
+                             lane): every assigned net's routed length must sit
+                             within this of the group median
+        pair_skew_mm         intra-pair skew limit; diff pairs inferred from
+                             net-name suffixes (_P/_N, +/-, P/N)
+        termination          {"scheme": "series"|"parallel"|"thevenin"|"none",
+                              "value_ohm": 33, "max_dist_mm": 10, "driver_ref": "U1"}
+        rise_time_ps         signal edge rate — arms the via-stub check
+  ecad_run_sicheck()
+      Runs the pack: si_match_length (per-net deltas vs group median),
+      si_pair_skew, si_termination (series R near driver / parallel R to GND-VTT
+      / Thevenin pair — presence + topology from resistor footprints),
+      si_via_stub (round-trip stub delay > tr/3 → warn, suggests back-drill),
+      si_bga_via_in_pad / si_bga_escape / si_bga_congestion (BGA fanout).
+      Advisory like ecad_run_drc; returns violations by rule + a match_report
+      table of every group member's length and delta.
+
+WORKED EXAMPLE — verify a DDR-ish byte lane + a series-terminated clock:
+    ecad_set_net_class('ddr_byte0',
+                       params={'match_tolerance_mm': 0.5, 'pair_skew_mm': 0.1,
+                               'rise_time_ps': 100},
+                       nets=['DQ0','DQ1','DQ2','DQ3','DQS_P','DQS_N'])
+    ecad_set_net_class('clk50',
+                       params={'termination': {'scheme': 'series', 'value_ohm': 33,
+                                               'max_dist_mm': 10, 'driver_ref': 'U1'}},
+                       nets=['CLK'])
+    ecad_run_sicheck()
+      -> si_match_length: "net 'DQ3' in match group 'ddr_byte0' is -2.050mm vs the
+         group median 30.000mm (tolerance ±0.500mm)" + match_report per-net table
+      -> si_termination: "net 'CLK' requires a SERIES termination resistor near the
+         driver but no 2-pin R joins it to a companion net"
+    # lengthen DQ3 (autoroute meanders), place R near U1, re-run until SI-clean.
+
+SI HONESTY (stated in every ecad_run_sicheck response):
+  * Closed-form IPC-2141A + topology heuristics ONLY — no 2-D/3-D field solver,
+    no IBIS/behavioural models, no crosstalk/return-path/eye analysis. A clean
+    result means "no classic layout mistakes", not multi-gigabit sign-off.
+  * Termination checks are presence/topology (a ref-R* 2-pad footprint in the
+    right place), not a waveform simulation.
+  * Via-stub math ignores back-drilling — a flagged stub may be fine if drilled.

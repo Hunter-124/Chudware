@@ -57,6 +57,7 @@
 #include "ui/legacy_chat.h"
 #include "ui/ai/ai_workspace.h"   // AI workspace full-body hub (sessions + DAG + chat + settings)
 #include "ui/reveng/reveng_workspace.h"  // Reverse Engineering workspace full-body shell (RE-03)
+#include "ui/firmware/fw_workspace.h"    // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/reveng/reveng_internal.h"   // RE-22: S() + Stage enum for shot seeding
 #include "ui/reveng/dim_review.h"        // RE-22 dimension-confirm review + deviation panels
 #include "ui/settings_modal.h"
@@ -1523,6 +1524,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // AI_CAD_SHOT=aiws: open the AI workspace full-body hub for headless visual verification.
     if (shot && shotMode && std::strcmp(shotMode, "aiws") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::AI;
+    }
+    // AI_CAD_SHOT=firmware: open the Firmware workspace with the canned project + build
+    // console + emulation UART log + GPIO trace fixture — headless visual verification of
+    // T-FIN5 (project visible, build console output, emulation trace rendered). fw_status /
+    // fw_projects still hit the live worker, so the backend rail shows the REAL doctor state.
+    if (shot && shotMode && std::strcmp(shotMode, "firmware") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::Firmware;
+        ui::firmware::seedFirmwareShotFixture();
     }
     // AI_CAD_SHOT=reveng: open the Reverse Engineering full-body workspace shell (RE-03) for
     // headless visual verification of the new tab. Same inline flag pattern as aiws — the
@@ -3040,7 +3049,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         const WS ws = st.activeWorkspace;
         // Workspaces that own the ENTIRE central region — no left pane, no viewport, no cam/ecad.
         const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI
-                                 || ws == WS::ReverseEng);
+                                 || ws == WS::ReverseEng || ws == WS::Firmware);
         // Effective left-pane tab override (derived this frame; never written to st).
         // Simulate forces the Simulation tab so the sim tree shows.
         // Non-Simulate workspaces must NOT show the sim tree: clamp LP_Simulation back to
@@ -3252,6 +3261,26 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoSavedSettings);
                 ui::drawRevEngWorkspace(st);
+                ImGui::End();
+            }
+        } else if (ws == WS::Firmware) {
+            // T-FIN5: full-body Firmware workspace (project rail | build/emulation/trace |
+            // fw_status-gated backend rail). Same borderless central-band host as PLM/RevEng.
+            const ui::OverlayBand& band = ui::overlayBand();
+            if (band.valid) {
+                const float m = 12.0f;
+                float rightX = ui::overlayColumnEdge(1);
+                if (rightX <= band.minX + m) rightX = band.maxX;
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2((rightX - band.minX) - 2.0f * m,
+                                                (band.maxY - band.minY) - 2.0f * m),
+                                         ImGuiCond_Always);
+                ImGui::Begin("##FirmwareWorkspace", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoSavedSettings);
+                ui::drawFirmwareWorkspace(st);
                 ImGui::End();
             }
         }

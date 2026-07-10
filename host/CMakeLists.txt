@@ -184,6 +184,7 @@ add_executable(Billet
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/ai/ai_workspace.cpp
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
+  src/ui/firmware/fw_workspace.cpp    # T-FIN5 Firmware workspace (projects/build/emulation/trace)
   src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels
   src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
   src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay

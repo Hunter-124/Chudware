@@ -249,6 +249,194 @@ RECIPES: dict[str, dict] = {
         accent(),
     ]},
 
+    # ws_drawing: the title-bar "Drawing" workspace exemplar tile. The iconpipe render
+    # path is SHADED-only (renderThumbnail has no display-style arg — see scenarios.cpp
+    # runIconPipe), so we CANNOT ask the engine for a true HLR/wireframe view here. To
+    # keep this tile from reading as a second ws_model iso bracket, we render the same
+    # class of part but with a FLAT, face-on ORTHOGRAPHIC camera (yaw~0/pitch~0) — a clean
+    # front elevation, which is exactly how a part appears on a drawing sheet. A slotted
+    # gusset plate (rectangular plate + a central slot + two bolt holes) gives a
+    # recognizable, drawing-like silhouette when viewed straight-on. Steel-grey appearance
+    # (not app teal) so it reads as a neutral "drawing", distinct from the teal 3D tiles.
+    "ws_drawing": {"yaw": 0, "pitch": 0, "steps": [
+        # Plate profile on plane.front (XZ) so face-on camera sees the elevation.
+        *sketch_with_id([
+            {"type": "line", "p1": [-24, -16], "p2": [24, -16], "id": "pl1"},
+            {"type": "line", "p1": [24, -16], "p2": [24, 16], "id": "pl2"},
+            {"type": "line", "p1": [24, 16], "p2": [-24, 16], "id": "pl3"},
+            {"type": "line", "p1": [-24, 16], "p2": [-24, -16], "id": "pl4"},
+        ], plane="plane.front", name="PlateSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Plate",
+            "params": {"mode": "boss", "depth": dim(8)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Central rounded slot (two arcs would need pick topo; a plain rectangle slot reads
+        # fine face-on) cut through the plate.
+        *sketch_with_id([
+            {"type": "line", "p1": [-9, -4], "p2": [9, -4], "id": "s1"},
+            {"type": "line", "p1": [9, -4], "p2": [9, 4], "id": "s2"},
+            {"type": "line", "p1": [9, 4], "p2": [-9, 4], "id": "s3"},
+            {"type": "line", "p1": [-9, 4], "p2": [-9, -4], "id": "s4"},
+        ], plane="plane.front", name="SlotSk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Slot",
+            "params": {"mode": "cut", "depth": dim(12)},
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        # Two bolt holes flanking the slot.
+        *sketch_with_id([
+            {"type": "circle", "center": [-17, 0], "radius": 3, "id": "bh1"},
+        ], plane="plane.front", name="Bolt1Sk", fid="f5"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Bolt1",
+            "params": {"mode": "cut", "depth": dim(12)},
+            "refs": {"profile": [region("f5", -17, 0)]}}},
+        *sketch_with_id([
+            {"type": "circle", "center": [17, 0], "radius": 3, "id": "bh2"},
+        ], plane="plane.front", name="Bolt2Sk", fid="f7"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Bolt2",
+            "params": {"mode": "cut", "depth": dim(12)},
+            "refs": {"profile": [region("f7", 17, 0)]}}},
+        # Neutral steel-grey (NOT teal) so it reads as a drawing sheet, not a 3D body.
+        {"op": "set_appearance", "id": "b1", "color": [0.62, 0.66, 0.70],
+         "metallic": 0.1, "roughness": 0.6},
+    ]},
+
+    # ws_electronics: the title-bar "Electronics" workspace exemplar tile. A small PCB:
+    # a thin GREEN board (b1) with two dark component boxes (b2, b3) and two copper-colored
+    # pads (b4, b5). Body ids are assigned in first-produced order (document.cpp
+    # apply_doc_appearance: appearances["bN"] -> Nth surviving body), so each separate
+    # extrude gets its own body we can color independently. Iso camera so the board's
+    # thickness + components read as 3D. Must read as "a circuit board".
+    "ws_electronics": {"yaw": 32, "pitch": 34, "steps": [
+        # Board: thin wide rectangle on plane.top, small extrude for PCB thickness.
+        *sketch_with_id([
+            {"type": "line", "p1": [-26, -18], "p2": [26, -18], "id": "bd1"},
+            {"type": "line", "p1": [26, -18], "p2": [26, 18], "id": "bd2"},
+            {"type": "line", "p1": [26, 18], "p2": [-26, 18], "id": "bd3"},
+            {"type": "line", "p1": [-26, 18], "p2": [-26, -18], "id": "bd4"},
+        ], plane="plane.top", name="BoardSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Board",
+            "params": {"mode": "boss", "depth": dim(3)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Chip 1: dark box sitting on the board (Z=3 top face), big central IC.
+        *sketch_with_id([
+            {"type": "line", "p1": [-10, -8], "p2": [10, -8], "id": "c1a"},
+            {"type": "line", "p1": [10, -8], "p2": [10, 8], "id": "c1b"},
+            {"type": "line", "p1": [10, 8], "p2": [-10, 8], "id": "c1c"},
+            {"type": "line", "p1": [-10, 8], "p2": [-10, -8], "id": "c1d"},
+        ], plane="plane.top", name="Chip1Sk", fid="f3", offset=3),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Chip1",
+            "params": {"mode": "boss", "depth": dim(4)}, "merge": False,
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        # Chip 2: smaller component to the side.
+        *sketch_with_id([
+            {"type": "line", "p1": [15, -14], "p2": [22, -14], "id": "c2a"},
+            {"type": "line", "p1": [22, -14], "p2": [22, -6], "id": "c2b"},
+            {"type": "line", "p1": [22, -6], "p2": [15, -6], "id": "c2c"},
+            {"type": "line", "p1": [15, -6], "p2": [15, -14], "id": "c2d"},
+        ], plane="plane.top", name="Chip2Sk", fid="f5", offset=3),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Chip2",
+            "params": {"mode": "boss", "depth": dim(3)}, "merge": False,
+            "refs": {"profile": [region("f5", 18, -10)]}}},
+        # Pad 1: small copper pad.
+        *sketch_with_id([
+            {"type": "circle", "center": [-19, 12], "radius": 2.6, "id": "pd1"},
+        ], plane="plane.top", name="Pad1Sk", fid="f7", offset=3),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Pad1",
+            "params": {"mode": "boss", "depth": dim(1.2)}, "merge": False,
+            "refs": {"profile": [region("f7", -19, 12)]}}},
+        # Pad 2: second copper pad.
+        *sketch_with_id([
+            {"type": "circle", "center": [18, 13], "radius": 2.6, "id": "pd2"},
+        ], plane="plane.top", name="Pad2Sk", fid="f9", offset=3),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Pad2",
+            "params": {"mode": "boss", "depth": dim(1.2)}, "merge": False,
+            "refs": {"profile": [region("f9", 18, 13)]}}},
+        # Color each body by its 1..N production order.
+        {"op": "set_appearance", "id": "b1", "color": [0.11, 0.45, 0.22],
+         "metallic": 0.05, "roughness": 0.55},  # green PCB
+        {"op": "set_appearance", "id": "b2", "color": [0.10, 0.10, 0.12],
+         "metallic": 0.2, "roughness": 0.5},    # black IC
+        {"op": "set_appearance", "id": "b3", "color": [0.10, 0.10, 0.12],
+         "metallic": 0.2, "roughness": 0.5},    # black component
+        {"op": "set_appearance", "id": "b4", "color": [0.80, 0.52, 0.24],
+         "metallic": 0.85, "roughness": 0.35},  # copper pad
+        {"op": "set_appearance", "id": "b5", "color": [0.80, 0.52, 0.24],
+         "metallic": 0.85, "roughness": 0.35},  # copper pad
+    ]},
+
+    # ws_parts: the title-bar "Parts Library" workspace exemplar tile. A standard hex-head
+    # bolt — a fastener reads instantly as "parts / library hardware". Hex head (6-sided
+    # polygon prism) on top of a cylindrical shank, with two shallow thread grooves near
+    # the tip. Metallic steel appearance. Iso camera to match the 3D family. f1=hex sketch,
+    # f2=head extrude; f3=shank circle, f4=shank extrude (downward); grooves are thin
+    # revolve-cuts around the shank axis.
+    "ws_parts": {"yaw": 35, "pitch": 26, "steps": [
+        # Hex head: regular hexagon on plane.top, extruded up for the head.
+        *sketch_with_id([
+            {"type": "line", "p1": [14, 0], "p2": [7, 12.12], "id": "hx1"},
+            {"type": "line", "p1": [7, 12.12], "p2": [-7, 12.12], "id": "hx2"},
+            {"type": "line", "p1": [-7, 12.12], "p2": [-14, 0], "id": "hx3"},
+            {"type": "line", "p1": [-14, 0], "p2": [-7, -12.12], "id": "hx4"},
+            {"type": "line", "p1": [-7, -12.12], "p2": [7, -12.12], "id": "hx5"},
+            {"type": "line", "p1": [7, -12.12], "p2": [14, 0], "id": "hx6"},
+        ], plane="plane.top", name="HexSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Head",
+            "params": {"mode": "boss", "depth": dim(9)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Shank: circle on the head's TOP face (Z=9), extruded UP +30 (all-positive; a
+        # negative depth silently no-ops). Fuses to the head as one bolt body (b1). The
+        # head-below/shank-above orientation reads fine as a bolt in an iso icon.
+        *sketch_with_id([
+            {"type": "circle", "center": [0, 0], "radius": 6.5, "id": "sk1"},
+        ], plane="plane.top", name="ShankSk", fid="f3", offset=9),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Shank",
+            "params": {"mode": "boss", "depth": dim(30)},
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        # Two thread grooves: thin rectangles on plane.front revolved around Z to cut a
+        # shallow ring near the shank free end (now high Z, sketch-y ~30-36). Unique axis
+        # ids per sketch (ids are doc-scoped).
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [0, 42], "id": "axis1", "construction": True},
+            {"type": "line", "p1": [5.5, 30], "p2": [6.6, 30], "id": "g1a"},
+            {"type": "line", "p1": [6.6, 30], "p2": [6.6, 32], "id": "g1b"},
+            {"type": "line", "p1": [6.6, 32], "p2": [5.5, 32], "id": "g1c"},
+            {"type": "line", "p1": [5.5, 32], "p2": [5.5, 30], "id": "g1d"},
+        ], plane="plane.front", name="Groove1Sk", fid="f5"),
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Groove1",
+            "params": {"mode": "cut", "angle": dim(360)},
+            "refs": {
+                "profile": [region("f5", 6.0, 31)],
+                "axis": datum("axis.z"),
+            }}},
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [0, 42], "id": "axis2", "construction": True},
+            {"type": "line", "p1": [5.5, 35], "p2": [6.6, 35], "id": "g2a"},
+            {"type": "line", "p1": [6.6, 35], "p2": [6.6, 37], "id": "g2b"},
+            {"type": "line", "p1": [6.6, 37], "p2": [5.5, 37], "id": "g2c"},
+            {"type": "line", "p1": [5.5, 37], "p2": [5.5, 35], "id": "g2d"},
+        ], plane="plane.front", name="Groove2Sk", fid="f7"),
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Groove2",
+            "params": {"mode": "cut", "angle": dim(360)},
+            "refs": {
+                "profile": [region("f7", 6.0, 36)],
+                "axis": datum("axis.z"),
+            }}},
+        # Steel appearance (metallic grey) so it reads as hardware, not app teal.
+        {"op": "set_appearance", "id": "b1", "color": [0.70, 0.72, 0.75],
+         "metallic": 0.9, "roughness": 0.35},
+    ]},
+
     # extrude_cut: solid block with a deep rectangular pocket cut into its TOP face,
     # so material is obviously REMOVED (reads as an extruded cut). f1=block sketch,
     # f2=block extrude, f3=pocket sketch on top face, f4=extrude-cut.

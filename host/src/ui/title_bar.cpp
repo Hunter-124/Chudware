@@ -657,12 +657,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                        const char* rasterCell; };
         static const WsTab kTabs[] = {
             {"Model",        AppState::Workspace::Model,        TbIcon::Model,        "ws_model"},
-            {"Drawing",      AppState::Workspace::Drawing,      TbIcon::Drawing,      nullptr},
-            {"Simulate",     AppState::Workspace::Simulate,     TbIcon::Simulate,     nullptr},
-            {"Electronics",  AppState::Workspace::Electronics,  TbIcon::Electronics,  nullptr},
+            {"Drawing",      AppState::Workspace::Drawing,      TbIcon::Drawing,      "ws_drawing"},
+            {"Simulate",     AppState::Workspace::Simulate,     TbIcon::Simulate,     "ws_simulate"},
+            {"Electronics",  AppState::Workspace::Electronics,  TbIcon::Electronics,  "ws_electronics"},
             {"Manufacture",  AppState::Workspace::Manufacture,  TbIcon::Manufacture,  "ws_manufacture"},
             {"PLM",          AppState::Workspace::PLM,          TbIcon::PLM,          nullptr},
-            {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary, nullptr},
+            {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary, "ws_parts"},
             {"AI",           AppState::Workspace::AI,           TbIcon::AI,           nullptr},
             {"Reverse Eng",  AppState::Workspace::ReverseEng,   TbIcon::Search,       nullptr},
             {"Firmware",     AppState::Workspace::Firmware,     TbIcon::Firmware,     nullptr},

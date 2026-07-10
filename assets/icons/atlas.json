@@ -1,7 +1,7 @@
 {
  "atlas_px": [
   56,
-  7990
+  8126
  ],
  "cell": {
   "app@32": {
@@ -2823,6 +2823,54 @@
    "y": 7963,
    "w": 20,
    "h": 20
+  },
+  "ws_drawing@32": {
+   "x": 0,
+   "y": 7991,
+   "w": 32,
+   "h": 32
+  },
+  "ws_drawing@20": {
+   "x": 34,
+   "y": 7997,
+   "w": 20,
+   "h": 20
+  },
+  "ws_electronics@32": {
+   "x": 0,
+   "y": 8025,
+   "w": 32,
+   "h": 32
+  },
+  "ws_electronics@20": {
+   "x": 34,
+   "y": 8031,
+   "w": 20,
+   "h": 20
+  },
+  "ws_parts@32": {
+   "x": 0,
+   "y": 8059,
+   "w": 32,
+   "h": 32
+  },
+  "ws_parts@20": {
+   "x": 34,
+   "y": 8065,
+   "w": 20,
+   "h": 20
+  },
+  "ws_simulate@32": {
+   "x": 0,
+   "y": 8093,
+   "w": 32,
+   "h": 32
+  },
+  "ws_simulate@20": {
+   "x": 34,
+   "y": 8099,
+   "w": 20,
+   "h": 20
   }
  },
  "raster_only": [
@@ -2874,7 +2922,11 @@
   "subtract",
   "sweep",
   "sweep_cut",
+  "ws_drawing",
+  "ws_electronics",
   "ws_manufacture",
-  "ws_model"
+  "ws_model",
+  "ws_parts",
+  "ws_simulate"
  ]
 }

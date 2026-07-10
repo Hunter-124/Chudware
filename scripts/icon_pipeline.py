@@ -889,8 +889,8 @@ RECIPES: dict[str, dict] = {
     ]},
 
     # -----------------------------------------------------------------------
-    # Sheet Metal -> Create  (sm_edge_flange/sm_hem/sm_jog parked -- need
-    # resolved edge selector not available in iconpipe runner; see T-BL29.md)
+    # Sheet Metal -> Create  (sm_edge_flange/sm_hem/sm_jog now live below as baked
+    # cross-section extrudes -- the draft precedent, no edge selector needed)
     # -----------------------------------------------------------------------
 
     # sm_base_flange: rect blank, t=2mm. f1=profile sketch, f2=base_flange.
@@ -921,6 +921,289 @@ RECIPES: dict[str, dict] = {
             "refs": {"profile": [region("f1", 0, 0)]}}},
         {"op": "add_feature", "feature": {
             "type": "sm_flat_pattern", "name": "Flat", "params": {}}},
+    ]},
+
+    # -----------------------------------------------------------------------
+    # Features -> Hole / Thread / Split  (T-BL: procedural glyphs -> real renders)
+    # -----------------------------------------------------------------------
+
+    # hole_wizard: a block with a COUNTERBORED hole bored down through its top face.
+    # A wide shallow counterbore (top) over a narrower through bore reads as the Hole
+    # Wizard's stepped hole. Pitch bumped above the family 26 so we look DOWN into the
+    # bore. f1=block sketch, f2=extrude; f3=cbore circle (top face) + cut; f5=thru circle
+    # + deep cut. Both cut centroids sit on the hole axis (0,0) inside the block.
+    "hole_wizard": {"yaw": 35, "pitch": 40, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-24, -20], "p2": [24, -20], "id": "b1"},
+            {"type": "line", "p1": [24, -20], "p2": [24, 20], "id": "b2"},
+            {"type": "line", "p1": [24, 20], "p2": [-24, 20], "id": "b3"},
+            {"type": "line", "p1": [-24, 20], "p2": [-24, -20], "id": "b4"},
+        ], plane="plane.top", name="HWBlockSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "HWBlock",
+            "params": {"mode": "boss", "depth": dim(26)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Counterbore: wide circle on the top face (Z=26), shallow cut.
+        *sketch_with_id([
+            {"type": "circle", "center": [0, 0], "radius": 11, "id": "cb1"},
+        ], plane="plane.top", name="CboreSk", fid="f3", offset=26),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Cbore",
+            "params": {"mode": "cut", "depth": dim(8)},
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        # Through bore: narrower circle from the top face, cut deep through the block.
+        *sketch_with_id([
+            {"type": "circle", "center": [0, 0], "radius": 6, "id": "tb1"},
+        ], plane="plane.top", name="ThruSk", fid="f5", offset=26),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Thru",
+            "params": {"mode": "cut", "depth": dim(30)},
+            "refs": {"profile": [region("f5", 0, 0)]}}},
+        accent(),
+    ]},
+
+    # thread: a short cylindrical stud with several external thread grooves near the top,
+    # so it reads as "thread". Proven ws_parts technique: cylinder + thin revolve-cut rings
+    # around the Z axis. Steel appearance (threads read as hardware, not app teal).
+    # f1=circle sketch, f2=cylinder; f3/f5/f7=groove sketches + revolve-cuts.
+    "thread": {"yaw": 35, "pitch": 24, "steps": [
+        *sketch_with_id([
+            {"type": "circle", "center": [0, 0], "radius": 10, "id": "sc1"},
+        ], plane="plane.top", name="StudSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Stud",
+            "params": {"mode": "boss", "depth": dim(40)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Four shallow ring grooves spaced up the shank (world-Z 12..30). Thin rect on
+        # plane.front revolved 360 about Z. Unique ids per sketch (doc-scoped).
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis1", "construction": True},
+            {"type": "line", "p1": [9, 12], "p2": [11, 12], "id": "t1a"},
+            {"type": "line", "p1": [11, 12], "p2": [11, 15], "id": "t1b"},
+            {"type": "line", "p1": [11, 15], "p2": [9, 15], "id": "t1c"},
+            {"type": "line", "p1": [9, 15], "p2": [9, 12], "id": "t1d"},
+        ], plane="plane.front", name="Thd1Sk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Thd1",
+            "params": {"mode": "cut", "angle": dim(360)},
+            "refs": {"profile": [region("f3", 10, 13.5)], "axis": datum("axis.z")}}},
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis2", "construction": True},
+            {"type": "line", "p1": [9, 18], "p2": [11, 18], "id": "t2a"},
+            {"type": "line", "p1": [11, 18], "p2": [11, 21], "id": "t2b"},
+            {"type": "line", "p1": [11, 21], "p2": [9, 21], "id": "t2c"},
+            {"type": "line", "p1": [9, 21], "p2": [9, 18], "id": "t2d"},
+        ], plane="plane.front", name="Thd2Sk", fid="f5"),
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Thd2",
+            "params": {"mode": "cut", "angle": dim(360)},
+            "refs": {"profile": [region("f5", 10, 19.5)], "axis": datum("axis.z")}}},
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [0, 44], "id": "taxis3", "construction": True},
+            {"type": "line", "p1": [9, 24], "p2": [11, 24], "id": "t3a"},
+            {"type": "line", "p1": [11, 24], "p2": [11, 27], "id": "t3b"},
+            {"type": "line", "p1": [11, 27], "p2": [9, 27], "id": "t3c"},
+            {"type": "line", "p1": [9, 27], "p2": [9, 24], "id": "t3d"},
+        ], plane="plane.front", name="Thd3Sk", fid="f7"),
+        {"op": "add_feature", "feature": {
+            "type": "revolve", "name": "Thd3",
+            "params": {"mode": "cut", "angle": dim(360)},
+            "refs": {"profile": [region("f7", 10, 25.5)], "axis": datum("axis.z")}}},
+        # Metallic steel so it reads as a threaded fastener.
+        {"op": "set_appearance", "id": "b1", "color": [0.70, 0.72, 0.75],
+         "metallic": 0.9, "roughness": 0.35},
+    ]},
+
+    # split: a block cleaved into TWO separate bodies by a central plane, drawn apart a
+    # little and colored differently (accent teal + grey) so the split reads. Two half
+    # blocks with merge=False on either side of a small gap at X=0. b1=left (teal via
+    # accent), b2=right (grey). Iso family camera.
+    "split": {"yaw": 35, "pitch": 26, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-24, -18], "p2": [-2, -18], "id": "l1"},
+            {"type": "line", "p1": [-2, -18], "p2": [-2, 18], "id": "l2"},
+            {"type": "line", "p1": [-2, 18], "p2": [-24, 18], "id": "l3"},
+            {"type": "line", "p1": [-24, 18], "p2": [-24, -18], "id": "l4"},
+        ], plane="plane.top", name="LeftSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "LeftHalf",
+            "params": {"mode": "boss", "depth": dim(26)},
+            "merge": False,
+            "refs": {"profile": [region("f1", -13, 0)]}}},
+        *sketch_with_id([
+            {"type": "line", "p1": [2, -18], "p2": [24, -18], "id": "r1"},
+            {"type": "line", "p1": [24, -18], "p2": [24, 18], "id": "r2"},
+            {"type": "line", "p1": [24, 18], "p2": [2, 18], "id": "r3"},
+            {"type": "line", "p1": [2, 18], "p2": [2, -18], "id": "r4"},
+        ], plane="plane.top", name="RightSk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "RightHalf",
+            "params": {"mode": "boss", "depth": dim(26)},
+            "merge": False,
+            "refs": {"profile": [region("f3", 13, 0)]}}},
+        accent("b1"),   # left half in app teal
+        {"op": "set_appearance", "id": "b2", "color": [0.62, 0.66, 0.70],
+         "metallic": 0.1, "roughness": 0.6},   # right half grey
+    ]},
+
+    # -----------------------------------------------------------------------
+    # Sheet Metal -> Edge Flange / Hem / Jog
+    # The real sm_edge_flange/sm_hem/sm_jog features fold a flange on a PICKED edge, which
+    # the iconpipe runner can't resolve (region + canned selrefs only). So (draft
+    # precedent) we BAKE each into a thin cross-section profile extruded along the part
+    # width: one closed loop, one extrude, accent(). Reads as the folded sheet without any
+    # edge selector. Thin (t~2mm) sheet bodies in app teal.
+    # -----------------------------------------------------------------------
+
+    # sm_edge_flange: base flat with an extra flange folded UP on one edge -> L section.
+    # Profile on plane.front (XZ): base runs X=-24..24 at Z=0 (t=2), then the right end
+    # rises Z=0..18 (the folded-up edge flange). Extruded along Y for the sheet width.
+    "sm_edge_flange": {"yaw": 40, "pitch": 26, "steps": [
+        *sketch_with_id([
+            # closed L: base strip + upstand on the +X edge, thickness 2mm.
+            {"type": "line", "p1": [-24, 0], "p2": [24, 0], "id": "e1"},
+            {"type": "line", "p1": [24, 0], "p2": [24, 18], "id": "e2"},
+            {"type": "line", "p1": [24, 18], "p2": [22, 18], "id": "e3"},
+            {"type": "line", "p1": [22, 18], "p2": [22, 2], "id": "e4"},
+            {"type": "line", "p1": [22, 2], "p2": [-24, 2], "id": "e5"},
+            {"type": "line", "p1": [-24, 2], "p2": [-24, 0], "id": "e6"},
+        ], plane="plane.front", name="EdgeFlSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "EdgeFlange",
+            "params": {"mode": "boss", "depth": dim(36)},
+            "refs": {"profile": [region("f1", 0, 1)]}}},
+        accent(),
+    ]},
+
+    # sm_hem: a flat strip whose edge is folded BACK parallel onto itself (a hem) -> a thin
+    # hairpin/J section. Profile on plane.front: base strip Z=0..2, then the right edge
+    # wraps up and folds back over the top creating a doubled-over lip. Extruded along Y.
+    "sm_hem": {"yaw": 40, "pitch": 26, "steps": [
+        *sketch_with_id([
+            # base strip bottom
+            {"type": "line", "p1": [-24, 0], "p2": [20, 0], "id": "h1"},
+            # up the return end
+            {"type": "line", "p1": [20, 0], "p2": [20, 9], "id": "h2"},
+            # fold back over the top (parallel lip pointing -X)
+            {"type": "line", "p1": [20, 9], "p2": [4, 9], "id": "h3"},
+            {"type": "line", "p1": [4, 9], "p2": [4, 7], "id": "h4"},
+            {"type": "line", "p1": [4, 7], "p2": [18, 7], "id": "h5"},
+            {"type": "line", "p1": [18, 7], "p2": [18, 2], "id": "h6"},
+            {"type": "line", "p1": [18, 2], "p2": [-24, 2], "id": "h7"},
+            {"type": "line", "p1": [-24, 2], "p2": [-24, 0], "id": "h8"},
+        ], plane="plane.front", name="HemSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Hem",
+            "params": {"mode": "boss", "depth": dim(36)},
+            "refs": {"profile": [region("f1", -10, 1)]}}},
+        accent(),
+    ]},
+
+    # sm_jog: a flat strip with two close bends making an OFFSET step -> a thin Z/S section.
+    # Profile on plane.front: left strip at Z=0..2, a short riser at X~2..4 up to Z=12,
+    # then the right strip at Z=12..14 -- an offset step. Extruded along Y.
+    "sm_jog": {"yaw": 40, "pitch": 26, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-24, 0], "p2": [2, 0], "id": "j1"},   # left strip bottom
+            {"type": "line", "p1": [2, 0], "p2": [2, 12], "id": "j2"},     # riser (outer)
+            {"type": "line", "p1": [2, 12], "p2": [24, 12], "id": "j3"},   # right strip bottom
+            {"type": "line", "p1": [24, 12], "p2": [24, 14], "id": "j4"},  # right end
+            {"type": "line", "p1": [24, 14], "p2": [4, 14], "id": "j5"},   # right strip top
+            {"type": "line", "p1": [4, 14], "p2": [4, 2], "id": "j6"},     # riser (inner)
+            {"type": "line", "p1": [4, 2], "p2": [-24, 2], "id": "j7"},    # left strip top
+            {"type": "line", "p1": [-24, 2], "p2": [-24, 0], "id": "j8"},  # left end
+        ], plane="plane.front", name="JogSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Jog",
+            "params": {"mode": "boss", "depth": dim(36)},
+            "refs": {"profile": [region("f1", -10, 1)]}}},
+        accent(),
+    ]},
+
+    # -----------------------------------------------------------------------
+    # Weldments -> Structural Member / Gusset / End Cap  (adapt `sweep`)
+    # -----------------------------------------------------------------------
+
+    # weld_member: an I-beam profile swept along a straight path -- a structural member.
+    # Single closed I-section loop (one region) on plane.right, path a straight line on
+    # plane.top (copies the sweep recipe structure). accent() = app teal beam.
+    "weld_member": {"yaw": 38, "pitch": 26, "steps": [
+        *sketch_with_id([
+            # I-beam: bottom flange, web, top flange -- one closed loop.
+            {"type": "line", "p1": [-12, -14], "p2": [12, -14], "id": "i1"},   # bottom flange base
+            {"type": "line", "p1": [12, -14], "p2": [12, -10], "id": "i2"},
+            {"type": "line", "p1": [12, -10], "p2": [3, -10], "id": "i3"},
+            {"type": "line", "p1": [3, -10], "p2": [3, 10], "id": "i4"},        # web right
+            {"type": "line", "p1": [3, 10], "p2": [12, 10], "id": "i5"},
+            {"type": "line", "p1": [12, 10], "p2": [12, 14], "id": "i6"},       # top flange
+            {"type": "line", "p1": [12, 14], "p2": [-12, 14], "id": "i7"},
+            {"type": "line", "p1": [-12, 14], "p2": [-12, 10], "id": "i8"},
+            {"type": "line", "p1": [-12, 10], "p2": [-3, 10], "id": "i9"},
+            {"type": "line", "p1": [-3, 10], "p2": [-3, -10], "id": "i10"},     # web left
+            {"type": "line", "p1": [-3, -10], "p2": [-12, -10], "id": "i11"},
+            {"type": "line", "p1": [-12, -10], "p2": [-12, -14], "id": "i12"},
+        ], plane="plane.right", name="IBeamSk", fid="f1"),
+        *sketch_with_id([
+            {"type": "line", "p1": [0, 0], "p2": [60, 0], "id": "p1"},
+        ], plane="plane.top", name="MemberPath", fid="f2"),
+        {"op": "add_feature", "feature": {
+            "type": "sweep", "name": "Member",
+            "params": {"mode": "boss"},
+            "refs": {"profile": [region("f1", 0, 0)], "path": region("f2", 30, 0)}}},
+        accent(),
+    ]},
+
+    # weld_gusset: a triangular corner gusset plate -- a right-triangle plate extruded
+    # thin. A closed right triangle on plane.front, extruded a small depth for the plate
+    # thickness. accent() = app teal plate.
+    "weld_gusset": {"yaw": 35, "pitch": 24, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-18, -16], "p2": [18, -16], "id": "g1"},   # base leg
+            {"type": "line", "p1": [18, -16], "p2": [-18, 16], "id": "g2"},     # hypotenuse
+            {"type": "line", "p1": [-18, 16], "p2": [-18, -16], "id": "g3"},    # vertical leg
+        ], plane="plane.front", name="GussetSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Gusset",
+            "params": {"mode": "boss", "depth": dim(5)},
+            "refs": {"profile": [region("f1", -10, -10)]}}},
+        accent(),
+    ]},
+
+    # weld_end_cap: a box member with a cap plate closing one end. Two separate bodies
+    # (member b1 grey + end cap b2 accent teal) via merge=False, colored per-body like
+    # ws_electronics/combine -- avoids the hollow-tube two-loop problem. Member is a box
+    # along X; cap is a thin plate on the +X end face.
+    "weld_end_cap": {"yaw": 38, "pitch": 26, "steps": [
+        # Member: rectangular tube stand-in (solid box) on plane.right, swept/extruded
+        # along X via a box primitive is simplest -- use a sketch+extrude along Y? Keep it
+        # a box primitive offset so the cap sits on the +X end.
+        *sketch_with_id([
+            {"type": "line", "p1": [-14, -12], "p2": [14, -12], "id": "m1"},
+            {"type": "line", "p1": [14, -12], "p2": [14, 12], "id": "m2"},
+            {"type": "line", "p1": [14, 12], "p2": [-14, 12], "id": "m3"},
+            {"type": "line", "p1": [-14, 12], "p2": [-14, -12], "id": "m4"},
+        ], plane="plane.right", name="TubeSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Tube",
+            "params": {"mode": "boss", "depth": dim(50)},
+            "merge": False,
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # End cap: a slightly larger plate on the +X end face (Z=50 along the extrude dir),
+        # thin. Sketch on the same plane offset to the far end, extruded a small depth.
+        *sketch_with_id([
+            {"type": "line", "p1": [-16, -14], "p2": [16, -14], "id": "cp1"},
+            {"type": "line", "p1": [16, -14], "p2": [16, 14], "id": "cp2"},
+            {"type": "line", "p1": [16, 14], "p2": [-16, 14], "id": "cp3"},
+            {"type": "line", "p1": [-16, 14], "p2": [-16, -14], "id": "cp4"},
+        ], plane="plane.right", name="CapSk", fid="f3", offset=50),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Cap",
+            "params": {"mode": "boss", "depth": dim(4)},
+            "merge": False,
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        {"op": "set_appearance", "id": "b1", "color": [0.62, 0.66, 0.70],
+         "metallic": 0.4, "roughness": 0.45},   # grey member
+        accent("b2"),   # end cap in app teal
     ]},
 
     # -----------------------------------------------------------------------

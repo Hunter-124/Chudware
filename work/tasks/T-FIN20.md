@@ -3,7 +3,7 @@ id: T-FIN20
 title: Motion dynamics upgrade + motion->FEA load handoff
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN20-motion-dynamics-fea
 depends_on: [T-FIN15]
 lane: simulation

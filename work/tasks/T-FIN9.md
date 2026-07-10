@@ -3,7 +3,7 @@ id: T-FIN9
 title: MCU host-board rule pack - decoupling, power sequencing, crystal, boot-strap checks
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN9-ecad-host-board-rules
 depends_on: [T-FIN8]
 lane: ecad-firmware

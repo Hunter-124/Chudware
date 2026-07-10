@@ -3,7 +3,7 @@ id: T-FIN13
 title: PDN v1 - DC IR-drop solve on copper with current-density and I2R heat map
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN13-ecad-pdn-irdrop
 depends_on: [T-FIN8]
 lane: ecad-firmware

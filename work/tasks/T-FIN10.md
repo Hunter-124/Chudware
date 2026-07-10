@@ -3,7 +3,7 @@ id: T-FIN10
 title: High-speed/SI rule pack - length matching, termination, via stubs, BGA fanout
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN10-ecad-highspeed-rules
 depends_on: [T-FIN8]
 lane: ecad-firmware

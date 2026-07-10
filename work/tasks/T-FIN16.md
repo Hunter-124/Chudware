@@ -2,8 +2,8 @@
 id: T-FIN16
 title: ECAD->thermal FEA handoff - board study with auto heat sources, budget verify
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN16-ecad-thermal-handoff
 depends_on: [T-FIN8, T-FIN13, T-FIN15]
 lane: simulation

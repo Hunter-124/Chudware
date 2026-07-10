@@ -2,8 +2,8 @@
 id: T-FIN7
 title: Emulation power/duty-cycle profile - per-rail activity profile artifact from fw_sim_run
 workstream: FIN
-owner: unassigned
-status: todo
+owner: fable-fin
+status: doing
 branch: task/T-FIN7-fw-power-profile
 depends_on: [T-FIN3]
 lane: ecad-firmware

@@ -95,6 +95,7 @@
 #include <memory>
 
 #include "doc/assembly.h"
+#include "doc/motion_dynamics.h"
 #include "doc/document.h"
 #include "doc/recon.h"    // C1/C2 WS-C reverse-engineering kernel primitives
 #include "doc/formats.h"
@@ -10799,6 +10800,245 @@ json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind) 
 }
 
 // ============================================================ kinematic motion study
+// (+ optional rigid-body inverse dynamics on the swept trajectory — T-FIN20;
+//  the math lives in doc/motion_dynamics.{h,cpp}, this file only gathers mass
+//  properties, resolved mate geometry and poses, and serialises the result.)
+
+namespace {
+
+// Mate type -> motiondyn joint type (the wrench subspace that mate transmits).
+// Dimensional (drivable) mates transmit their generalized drive force/torque along
+// the driven direction; kinematic mates transmit their constrained directions.
+std::string mate_to_joint_type(const std::string& mate_type, const std::string& geom_kind) {
+    if (mate_type == "angle" || mate_type == "angle_limit" || mate_type == "gear")
+        return "drive_moment";
+    if (mate_type == "distance" || mate_type == "distance_limit" ||
+        mate_type == "rack_pinion" || mate_type == "screw")
+        return "drive_force";
+    if (mate_type == "hinge") return "revolute";
+    if (mate_type == "concentric") return "cylindrical";
+    if (mate_type == "slot") return "prismatic";
+    if (mate_type == "coincident")
+        return geom_kind == "plane" ? "planar" : "spherical";
+    if (mate_type == "tangent" || mate_type == "cam_follower") return "planar";
+    if (mate_type == "parallel" || mate_type == "perpendicular") return "parallel";
+    return "fixed";  // lock / width / symmetric / profile_center / unknown
+}
+
+// Build + solve the inverse-dynamics problem for a swept trajectory.
+// `poses` is one map per KEPT trajectory frame: component_id -> world 4x4 (row-major
+// values already parsed into an Eigen matrix; translation in mm). `opts` is the
+// caller's `dynamics` object (see session.h).
+json build_motion_dynamics(const std::string& doc_id,
+                           const std::vector<std::map<std::string, Eigen::Matrix4d>>& poses,
+                           double dt_s, const json& opts) {
+    namespace md = aicad::doc::motiondyn;
+    json warnings = json::array();
+    std::vector<md::BodyProps> bodies;
+    std::vector<md::JointDef> joints;
+    std::map<std::string, int> body_idx;
+    json bodies_j = json::array();
+    json joints_j = json::array();
+
+    const size_t nf = poses.size();
+    if (nf < 2)
+        return json{{"warnings", json::array({"fewer than 2 solved frames — dynamics skipped"})}};
+
+    {
+        DocLock lk;
+        Session& s = require_session(doc_id);
+        if (!s.asm_result)
+            return json{{"warnings", json::array({"no assembly result — dynamics skipped"})}};
+
+        std::map<std::string, bool> fixed_of;
+        if (s.doc.contains("components") && s.doc["components"].is_array())
+            for (const json& c : s.doc["components"])
+                fixed_of[c.value("id", std::string())] = c.value("fixed", false);
+
+        const double def_dens = opts.value("default_density_g_cm3", 7.85);
+        const json dens = opts.contains("densities") && opts["densities"].is_object()
+                              ? opts["densities"] : json::object();
+        const json masses = opts.contains("masses") && opts["masses"].is_object()
+                                ? opts["masses"] : json::object();
+
+        // ---- per-component mass properties (geometry × density) -------------
+        for (const AsmBodyOut& b : s.asm_result->bodies) {
+            const std::string& cid = b.component_id;
+            if (cid.find('#') != std::string::npos) continue;  // pattern instance
+            if (!poses[0].count(cid)) continue;                // not in the trajectory
+            GProp_GProps vp;
+            BRepGProp::VolumeProperties(b.shape_local, vp);  // unit density: Mass()==mm³
+            const double vol_mm3 = vp.Mass();
+            double density_g_mm3 = dens.value(cid, def_dens) * 1e-3;
+            double mass_kg = vol_mm3 * density_g_mm3 * 1e-3;  // g -> kg
+            if (masses.contains(cid) && masses[cid].is_number()) {
+                mass_kg = masses[cid].get<double>();
+                density_g_mm3 = vol_mm3 > 0 ? mass_kg * 1e3 / vol_mm3 : 0.0;
+            }
+            const gp_Pnt com = vp.CentreOfMass();
+            const Eigen::Vector3d c_m(com.X() * 1e-3, com.Y() * 1e-3, com.Z() * 1e-3);
+            // Inertia about the ORIGIN at unit density (mm^5) -> SI (kg·m²) about the
+            // COM: mm^5 × g/mm³ = g·mm²; × 1e-3 (g->kg) × 1e-6 (mm²->m²) = ×1e-9.
+            const gp_Mat im = vp.MatrixOfInertia();
+            Eigen::Matrix3d Io;
+            for (int r = 1; r <= 3; ++r)
+                for (int cc = 1; cc <= 3; ++cc)
+                    Io(r - 1, cc - 1) = im.Value(r, cc) * density_g_mm3 * 1e-9;
+            const Eigen::Matrix3d Icom =
+                Io - mass_kg * (c_m.squaredNorm() * Eigen::Matrix3d::Identity() -
+                                c_m * c_m.transpose());
+
+            md::BodyProps bp;
+            bp.id = cid;
+            bp.mass_kg = mass_kg;
+            bp.com_local = c_m;
+            bp.inertia_local = 0.5 * (Icom + Icom.transpose());
+            bp.fixed = fixed_of.count(cid) ? fixed_of[cid] : false;
+            bp.poses.reserve(nf);
+            for (const auto& frame : poses) {
+                Eigen::Matrix4d T = frame.at(cid);
+                T.block<3, 1>(0, 3) *= 1e-3;  // mm -> m
+                bp.poses.push_back(T);
+            }
+            body_idx[cid] = (int)bodies.size();
+            bodies.push_back(std::move(bp));
+            bodies_j.push_back({{"component", cid},
+                                {"mass_kg", mass_kg},
+                                {"volume_mm3", vol_mm3},
+                                {"density_g_cm3", density_g_mm3 * 1e3},
+                                {"com_local_mm", {com.X(), com.Y(), com.Z()}},
+                                {"fixed", bp.fixed}});
+        }
+
+        // ---- joints from mates + resolved geometry --------------------------
+        const json& mates = s.doc.contains("mates") && s.doc["mates"].is_array()
+                                ? s.doc["mates"] : json::array();
+        for (const json& m : mates) {
+            if (m.value("suppressed", false)) continue;
+            const std::string mid = m.value("id", std::string());
+            const std::string mtype = m.value("type", std::string());
+            auto git = s.asm_result->mate_geometry.find(mid);
+            if (git == s.asm_result->mate_geometry.end() || git->second.empty()) {
+                warnings.push_back("mate '" + mid + "' (" + mtype +
+                                   ") has no resolved geometry — reactions not computed for it");
+                continue;
+            }
+            const AsmMateRefGeom& g0 = git->second.front();
+            auto ia = body_idx.find(g0.component);
+            if (ia == body_idx.end()) {
+                warnings.push_back("mate '" + mid + "' anchors on unknown component '" +
+                                   g0.component + "' — skipped");
+                continue;
+            }
+            int ib = -1;
+            if (m.contains("refs") && m["refs"].is_array())
+                for (const json& r : m["refs"]) {
+                    const std::string rc = r.is_object() ? r.value("component", std::string())
+                                                         : std::string();
+                    if (rc != g0.component && body_idx.count(rc)) { ib = body_idx[rc]; break; }
+                }
+            md::JointDef jd;
+            jd.id = mid;
+            jd.type = mate_to_joint_type(mtype, g0.geom.kind);
+            jd.body_a = ia->second;
+            jd.body_b = ib;
+            jd.anchor_local = g0.geom.point * 1e-3;  // mm -> m (component local frame)
+            jd.axis_local = g0.geom.dir_vector();
+            if (jd.type == "fixed")
+                warnings.push_back("mate '" + mid + "' (" + mtype +
+                                   ") modeled as a rigid (full-wrench) joint");
+            joints_j.push_back({{"mate_id", mid}, {"mate_type", mtype},
+                                {"joint_type", jd.type}});
+            joints.push_back(std::move(jd));
+        }
+    }  // DocLock released — the solve below is pure math
+
+    // ---- options -------------------------------------------------------------
+    md::Options o;
+    o.dt = dt_s;
+    if (opts.contains("gravity") && opts["gravity"].is_array() && opts["gravity"].size() == 3)
+        o.gravity = Eigen::Vector3d(opts["gravity"][0].get<double>(),
+                                    opts["gravity"][1].get<double>(),
+                                    opts["gravity"][2].get<double>());
+    if (opts.contains("damping") && opts["damping"].is_object()) {
+        o.damping_lin = opts["damping"].value("linear_ns_per_m", 0.0);
+        o.damping_ang = opts["damping"].value("angular_nms_per_rad", 0.0);
+    }
+    if (opts.contains("loads") && opts["loads"].is_array())
+        for (const json& L : opts["loads"]) {
+            if (!L.is_object()) continue;
+            const std::string cid = L.value("component", std::string());
+            auto it = body_idx.find(cid);
+            if (it == body_idx.end()) {
+                warnings.push_back("applied load on unknown component '" + cid + "' ignored");
+                continue;
+            }
+            md::AppliedLoad al;
+            al.body = it->second;
+            if (L.contains("force_n") && L["force_n"].is_array() && L["force_n"].size() == 3)
+                al.force_n = Eigen::Vector3d(L["force_n"][0].get<double>(),
+                                             L["force_n"][1].get<double>(),
+                                             L["force_n"][2].get<double>());
+            if (L.contains("torque_nm") && L["torque_nm"].is_array() &&
+                L["torque_nm"].size() == 3)
+                al.torque_nm = Eigen::Vector3d(L["torque_nm"][0].get<double>(),
+                                               L["torque_nm"][1].get<double>(),
+                                               L["torque_nm"][2].get<double>());
+            o.loads.push_back(al);
+        }
+
+    // ---- solve + serialise -----------------------------------------------------
+    md::DynResult dr = md::solve_inverse_dynamics(bodies, joints, o);
+    for (const std::string& w : dr.warnings) warnings.push_back(w);
+
+    json frames_j = json::array();
+    json per_joint_worst = json::object();
+    json worst_case = nullptr;
+    double worst_mag = -1.0;
+    for (size_t f = 0; f < dr.frames.size(); ++f) {
+        const md::FrameDyn& fd = dr.frames[f];
+        json reactions = json::array();
+        for (size_t j = 0; j < joints.size(); ++j) {
+            const md::JointReaction& r = fd.reactions[j];
+            const double mag = r.force_n.norm();
+            reactions.push_back({{"mate_id", joints[j].id},
+                                 {"force_n", {r.force_n.x(), r.force_n.y(), r.force_n.z()}},
+                                 {"moment_nm",
+                                  {r.moment_nm.x(), r.moment_nm.y(), r.moment_nm.z()}},
+                                 {"force_mag_n", mag}});
+            const std::string& mid = joints[j].id;
+            if (!per_joint_worst.contains(mid) ||
+                per_joint_worst[mid].value("force_mag_n", -1.0) < mag)
+                per_joint_worst[mid] = {{"frame", (int)f},
+                                        {"t_s", fd.t},
+                                        {"force_mag_n", mag},
+                                        {"force_n",
+                                         {r.force_n.x(), r.force_n.y(), r.force_n.z()}},
+                                        {"moment_nm",
+                                         {r.moment_nm.x(), r.moment_nm.y(), r.moment_nm.z()}}};
+            if (mag > worst_mag) {
+                worst_mag = mag;
+                worst_case = {{"frame", (int)f}, {"t_s", fd.t}, {"mate_id", mid},
+                              {"force_mag_n", mag}};
+            }
+        }
+        frames_j.push_back({{"i", (int)f}, {"t_s", fd.t},
+                            {"residual_n", fd.residual}, {"reactions", reactions}});
+    }
+
+    return json{{"dt_s", dt_s},
+                {"duration_s", dt_s * (double)(nf - 1)},
+                {"gravity", {o.gravity.x(), o.gravity.y(), o.gravity.z()}},
+                {"bodies", bodies_j},
+                {"joints", joints_j},
+                {"frames", frames_j},
+                {"per_joint_worst", per_joint_worst},
+                {"worst_case", worst_case},
+                {"warnings", warnings}};
+}
+
+}  // namespace
+
 // Mate types whose scalar `value` field can be swept as a motion driver.
 // Mirrors services/mcp/cad_tools.py::_DRIVABLE_MATE_TYPES.
 static const std::map<std::string, std::string> k_drivable_mate_types = {
@@ -10826,9 +11066,13 @@ json doc_simulate_motion(const std::string& doc_id,
                          const std::string& mate_id_in,
                          double start, double stop, int steps,
                          bool check_interference,
-                         double min_clearance_mm) {
+                         double min_clearance_mm,
+                         const json& dynamics) {
     if (steps < 2)
         throw OpError("invalid_op", "simulate_motion: steps must be >= 2");
+    const bool want_dyn = dynamics.is_object();
+    // Raw row-major poses per KEPT frame (dynamics only; kinematics path untouched).
+    std::vector<std::map<std::string, Eigen::Matrix4d>> dyn_poses;
 
     // ---- 1. Resolve the driven mate ----------------------------------------
     std::string mate_id = mate_id_in;
@@ -10929,6 +11173,7 @@ json doc_simulate_motion(const std::string& doc_id,
             DocLock lk2;
             Session& s2 = require_session(doc_id);
             if (s2.asm_result) {
+                std::map<std::string, Eigen::Matrix4d> frame_poses;
                 for (const AsmBodyOut& body : s2.asm_result->bodies) {
                     // Emit column-major 4×4 float matrix (viewport convention).
                     auto cm = row_to_col_major(body.transform);
@@ -10939,7 +11184,16 @@ json doc_simulate_motion(const std::string& doc_id,
                         {"component", body.component_id},
                         {"transform", t},
                     });
+                    if (want_dyn && body.transform.size() >= 16 &&
+                        body.component_id.find('#') == std::string::npos) {
+                        Eigen::Matrix4d T;
+                        for (int r = 0; r < 4; ++r)
+                            for (int c = 0; c < 4; ++c)
+                                T(r, c) = body.transform[(size_t)(r * 4 + c)];
+                        frame_poses[body.component_id] = T;
+                    }
                 }
+                if (want_dyn) dyn_poses.push_back(std::move(frame_poses));
             }
         }
 
@@ -11008,7 +11262,7 @@ json doc_simulate_motion(const std::string& doc_id,
                       "%d frames | driver %s | no interference detected",
                       (int)trajectory.size(), mate_id.c_str());
 
-    return json{
+    json result = json{
         {"ok",           true},
         {"doc_id",       doc_id},
         {"mate_id",      mate_id},
@@ -11021,6 +11275,18 @@ json doc_simulate_motion(const std::string& doc_id,
         {"interference", interference},
         {"summary",      std::string(summary_buf)},
     };
+
+    // ---- 6. Optional rigid-body inverse dynamics (T-FIN20) -----------------
+    // Only when the caller asked: the kinematics-only result above is untouched.
+    if (want_dyn) {
+        const double duration_s = dynamics.value("duration_s", 1.0) > 0
+                                      ? dynamics.value("duration_s", 1.0) : 1.0;
+        const double dt_s = dyn_poses.size() > 1
+                                ? duration_s / (double)(dyn_poses.size() - 1)
+                                : duration_s;
+        result["dynamics"] = build_motion_dynamics(doc_id, dyn_poses, dt_s, dynamics);
+    }
+    return result;
 }
 
 // ============================================================ sketch3d RPCs

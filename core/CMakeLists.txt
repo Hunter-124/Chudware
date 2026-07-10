@@ -933,6 +933,7 @@ if(AICAD_WITH_OCCT)
     doc/selectors.cpp
     doc/picks.cpp
     doc/session.cpp
+    doc/motion_dynamics.cpp
     doc/recon.cpp
     doc/assembly.cpp
     doc/sketch_geom.cpp
@@ -1493,4 +1494,16 @@ if(TARGET test_nsolve)
   set_target_properties(test_mate_corpus PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mate_corpus COMMAND test_mate_corpus)
+
+  # Motion inverse dynamics (T-FIN20): OCCT-free analytic V&V — pendulum + slider-crank
+  # joint-reaction cross-checks against closed-form mechanics on synthetic trajectories.
+  add_executable(test_motion_dynamics
+    tests/test_motion_dynamics.cpp
+    doc/motion_dynamics.cpp)
+  target_include_directories(test_motion_dynamics PRIVATE
+    ${doctest_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(test_motion_dynamics PRIVATE aicad_mate)
+  set_target_properties(test_motion_dynamics PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME motion_dynamics COMMAND test_motion_dynamics)
 endif()

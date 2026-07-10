@@ -183,11 +183,74 @@ const char* kRecaptchaLoginHelper = R"JS(
 })();
 )JS";
 
+// DIAGNOSTIC (opt-in, injected only when AI_CAD_CEF_NETLOG=1): a main-frame logger
+// that captures the REAL captcha flow of a live panel login into the app trace file
+// (via console '[RC]…' → OnConsoleMessage → trace_file). Answers the three open
+// questions at once: (1) does reCAPTCHA raise a CHALLENGE (bframe) iframe that can't
+// render/receive input in our OSR panel; (2) does grecaptcha return a token or error;
+// (3) what verdict the server sends back — captured from Magento's customer-data
+// /section/load/ channel (where "reCAPTCHA verification failed" actually lives, hidden
+// from the page HTML) and the login POST status. Read-only observation; never blocks.
+const char* kRecaptchaTrace = R"JS(
+(() => {
+  if (window.__aicadRcTrace) return; window.__aicadRcTrace = true;
+  const L = (m) => { try { console.log('[RC] ' + m); } catch (e) {} };
+  try {
+    L('trace@' + location.pathname + ' grecaptcha=' + (typeof grecaptcha));
+    // (1) Watch every reCAPTCHA iframe — flag a CHALLENGE (bframe) and its geometry.
+    const seen = new Set();
+    const scan = () => {
+      for (const f of document.querySelectorAll('iframe')) {
+        const src = f.src || ''; if (!/recaptcha/.test(src)) continue;
+        const kind = /bframe/.test(src) ? 'CHALLENGE(bframe)' : /anchor/.test(src) ? 'anchor' : 'other';
+        const key = kind + ':' + (f.id || '') + ':' + src.slice(0, 40);
+        if (seen.has(key)) continue; seen.add(key);
+        let r = { width: 0, height: 0 }; try { r = f.getBoundingClientRect(); } catch (e) {}
+        let vis = '?'; try { const cs = getComputedStyle(f); vis = cs.visibility + '/' + cs.display + '/op' + cs.opacity; } catch (e) {}
+        L('iframe ' + kind + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' ' + vis);
+      }
+    };
+    try { new MutationObserver(scan).observe(document.documentElement,
+      { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'style'] }); } catch (e) {}
+    setTimeout(scan, 600); setTimeout(scan, 2500);
+    // (2)+(3) Log the login POST + the customer-data verdict channel (fetch + XHR).
+    const hot = (u) => /loginPost|customer\/section\/load|userverify|recaptcha\/api2/.test(u || '');
+    const of = window.fetch;
+    if (of) window.fetch = function (...a) {
+      const u = (a[0] && a[0].url) || a[0] || '';
+      return of.apply(this, a).then((r) => {
+        try {
+          if (hot(u)) { L('fetch ' + r.status + ' ' + String(u).slice(0, 80));
+            if (/section\/load/.test(u)) r.clone().text().then((t) => L('verdict ' + t.slice(0, 260))).catch(() => {}); }
+        } catch (e) {}
+        return r;
+      });
+    };
+    const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__rcu = u; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function () {
+      try { this.addEventListener('load', () => { const u = this.__rcu || '';
+        if (hot(u)) { L('xhr ' + this.status + ' ' + String(u).slice(0, 80));
+          if (/section\/load/.test(u)) L('verdict ' + String(this.responseText || '').slice(0, 260)); } }); } catch (e) {}
+      return os.apply(this, arguments);
+    };
+    // Note the reCAPTCHA-response field's token length at submit time (main frame).
+    document.addEventListener('submit', (ev) => {
+      try { const f = ev.target; if (!f || f.tagName !== 'FORM') return;
+        const t = f.querySelector('[name="g-recaptcha-response"]');
+        L('submit form=' + (f.getAttribute('action') || '').slice(-24) + ' tokenLen=' + (t ? (t.value || '').length : 'none')); } catch (e) {}
+    }, true);
+  } catch (e) { try { console.log('[RC] trace-install-err ' + e); } catch (_) {} }
+})();
+)JS";
+
 }  // namespace
 
 const char* stealth_init_script() { return kInitScript; }
 
 const char* recaptcha_login_helper_script() { return kRecaptchaLoginHelper; }
+
+const char* recaptcha_trace_script() { return kRecaptchaTrace; }
 
 CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
     if (!browser) return nullptr;

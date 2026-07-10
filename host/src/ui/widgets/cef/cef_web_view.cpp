@@ -546,9 +546,16 @@ public:
     bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
                           const CefString& message, const CefString& source,
                           int line) override {
+        const std::string msg = message.ToString();
+        // Injected diagnostics (the reCAPTCHA-flow logger in cef_stealth) tag their
+        // lines "[RC] …". Persist those to the trace FILE unconditionally so a panel
+        // login attempt leaves a readable root-cause trail (stderr is invisible in the
+        // GUI). Everything else stays stderr-only under the trace gate.
+        if (msg.rfind("[RC]", 0) == 0)
+            ::ui::cef::trace_file_line(msg.c_str());
         if (cefTrace())
             std::fprintf(stderr, "[cef-console] sev=%d %s (%s:%d)\n", (int)level,
-                         message.ToString().c_str(), source.ToString().c_str(), line);
+                         msg.c_str(), source.ToString().c_str(), line);
         return false;   // do not suppress default handling
     }
     // CefResourceRequestHandler

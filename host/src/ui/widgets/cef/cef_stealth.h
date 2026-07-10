@@ -49,4 +49,11 @@ const char* stealth_init_script();
 // MAIN FRAME ONLY (never the reCAPTCHA challenge iframe).
 const char* recaptcha_login_helper_script();
 
+// DIAGNOSTIC (opt-in): a main-frame reCAPTCHA-flow logger. Inject ONLY when
+// AI_CAD_CEF_NETLOG=1, main frame only. Emits console '[RC] …' lines (routed to the
+// trace file by CefWebView's OnConsoleMessage) capturing challenge-iframe appearance,
+// login-POST status, and Magento's customer-data verdict — the root-cause trail for a
+// live panel login. Pure observation; not part of the production stealth surface.
+const char* recaptcha_trace_script();
+
 }  // namespace ui::cef

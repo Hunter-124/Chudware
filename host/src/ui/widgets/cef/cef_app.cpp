@@ -74,8 +74,13 @@ public:
         // reCAPTCHA login fix (NOT anti-detection) — MAIN FRAME ONLY, so it never runs
         // in the reCAPTCHA challenge iframe. Attaches a fresh token to a reCAPTCHA-
         // protected login form whose token field is empty at submit; no-op otherwise.
-        if (frame->IsMain())
+        if (frame->IsMain()) {
             frame->ExecuteJavaScript(recaptcha_login_helper_script(), frame->GetURL(), 0);
+            // Opt-in captcha-flow trace (AI_CAD_CEF_NETLOG=1): logs the real reCAPTCHA
+            // verdict of a live panel login to the trace file. Off by default.
+            if (const char* nl = std::getenv("AI_CAD_CEF_NETLOG"); nl && nl[0] && nl[0] != '0')
+                frame->ExecuteJavaScript(recaptcha_trace_script(), frame->GetURL(), 0);
+        }
     }
 
     void OnBeforeCommandLineProcessing(const CefString& /*process_type*/,

@@ -364,15 +364,15 @@ graph TD
   end
   subgraph WS_perf["workstream perf"]
     T_PERF1["T-PERF1: GUI async applyOps conversions (never block GL thread on edits)"]:::done
-    T_PERF10["T-PERF10: Perf odds & ends — auto-coincide scoping, fillet bisect, unify skip, AICM shared-mem, CEF lazy init, idle render throttle, profiler fix, scrape pool"]:::todo
-    T_PERF2["T-PERF2: Async latest-wins drag pipelines (sketch/3D/push-pull/asm/explode)"]:::todo
+    T_PERF10["T-PERF10: Perf odds & ends — auto-coincide scoping, fillet bisect, unify skip, AICM shared-mem, CEF lazy init, idle render throttle, profiler fix, scrape pool"]:::done
+    T_PERF2["T-PERF2: Async latest-wins drag pipelines (sketch/3D/push-pull/asm/explode)"]:::done
     T_PERF3["T-PERF3: Mesh load off the GL thread (loader worker + meshGen)"]:::done
-    T_PERF4["T-PERF4: Async tab switch, file open/save, sim_mesh, drawing HLR"]:::todo
-    T_PERF5["T-PERF5: Per-doc engine locking (split g_mtx)"]:::todo
-    T_PERF6["T-PERF6: Kernel copy amplification — checkpoint O(N²), blob out-of-line, hit-path copies"]:::todo
-    T_PERF7["T-PERF7: Owner-map checkpointing + size-relative tess deflection (DECISION)"]:::todo
-    T_PERF8["T-PERF8: Sketcher solver interactive mode — LDLT-first, in-trial deadline, single-QR redundancy, tangency warm-start"]:::todo
-    T_PERF9["T-PERF9: Sketch connected-component decomposition"]:::todo
+    T_PERF4["T-PERF4: Async tab switch, file open/save, sim_mesh, drawing HLR"]:::done
+    T_PERF5["T-PERF5: Per-doc engine locking (split g_mtx)"]:::done
+    T_PERF6["T-PERF6: Kernel copy amplification — checkpoint O(N²), blob out-of-line, hit-path copies"]:::done
+    T_PERF7["T-PERF7: Owner-map checkpointing + size-relative tess deflection (DECISION)"]:::done
+    T_PERF8["T-PERF8: Sketcher solver interactive mode — LDLT-first, in-trial deadline, single-QR redundancy, tangency warm-start"]:::done
+    T_PERF9["T-PERF9: Sketch connected-component decomposition"]:::done
   end
   subgraph WS_setup["workstream setup"]
     T_S1["T-S1: Apply for vendor API keys"]:::todo

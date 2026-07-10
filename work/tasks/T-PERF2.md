@@ -2,8 +2,8 @@
 id: T-PERF2
 title: Async latest-wins drag pipelines (sketch/3D/push-pull/asm/explode)
 workstream: perf
-owner: unassigned
-status: todo
+owner: grok
+status: done
 branch: task/T-PERF2-async-drag-pipelines
 depends_on: []
 lane: app-gui

@@ -216,6 +216,11 @@ register_interaction_tools(mcp)
 from mcp_server.ecad_tools import register_ecad_tools
 register_ecad_tools(_reg.view(mcp, "ecad"))
 
+# ECAD -> thermal FEA handoff (T-FIN16, aicad.simhandoff/1 coupling ecad_to_thermal_fea):
+# one call from a routed board to a solved board-level thermal study + Tj/limits verify.
+from mcp_server.ecad_thermal import register_ecad_thermal_tools
+register_ecad_thermal_tools(_reg.view(mcp, "ecad"))
+
 # CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(_reg.view(mcp, "cam"))

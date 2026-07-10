@@ -209,3 +209,40 @@ FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
       byte-deterministic (golden-tested in engine/ecad/test_fpga.py).
   Typical flow: place FPGA symbol -> wire IO/power/config -> ecad_run_erc() ->
   ecad_fpga_check() -> fix -> ecad_export('constraints') -> feed XDC/LPF to Vivado/nextpnr.
+
+THERMAL FEA HANDOFF (T-FIN16; aicad.simhandoff/1 coupling ecad_to_thermal_fea):
+  ecad_thermal_handoff([environment], [include_trace_heating], [transient], [dry_run])
+      One call from the ACTIVE routed board to a solved thermal FEA study — zero
+      manual BC setup. Pipeline: fused board+component FEA solid (substrate slab +
+      flattened package/proxy bodies, drills omitted) -> stackup HOMOGENIZED to one
+      effective material (in-plane rule-of-mixtures k ~10-25 W/mK; through-plane
+      ~0.3 W/mK reported but not separately modeled; assumptions[] lists every
+      simplification) -> one heat source PER component from boardphys power_w
+      (typ else max) as top-face flux -> convection from the environment preset ->
+      quasi-steady core transient solve -> per-component case temp + Tj map-back
+      (Tj = Tcase + P*theta_jc when jc is known, honest null otherwise).
+  ENVIRONMENTS: 'still_air' (h=10 W/m2K), 'forced_air' (h=50), 'cold_plate' (board
+      bottom held at t_amb + still air on top), or custom h_w_m2k/t_amb_c. Default
+      ambient 25 C.
+  HONESTY: components WITHOUT power metadata get NO heat source and are named in
+      coverage.unpowered_refs (never invented watts) — seed power_w via library eng
+      blocks or sim_params.eng overrides. The steady answer is the final frame of a
+      5-time-constant transient (the steady kernel aggregates flux magnitudes;
+      per-component powers need the transient path).
+  TRACE HEATING: include_trace_heating=True pulls the ecad_run_pdn I2R map in as
+      distributed flux cells (hottest cells first, omitted remainder reported) —
+      run ecad_run_pdn on the supply nets first.
+  DUTY CYCLES: transient={"t_end_s":..., "schedules": {"U1": {"duty":0.25,
+      "period_s":1.0}}} runs a true transient with per-component T-FIN18 schedules.
+  ecad_verify_thermal([handoff_result], [tolerance_pct=75])
+      Per-component Tj-vs-tj_max margin table (components without limits listed
+      UNCHECKED, never assumed OK) + theta_ja hand-calc cross-check on the
+      temperature RISE (Tj-Ta vs P*theta_ja). Tolerance is GENEROUS by design:
+      JEDEC theta_ja assumes a standard 2s2p board; the check catches setup
+      blunders, not layout accuracy. Minor power contributors (<25% of board
+      power) get advisories instead of pass/fail — their temperature is neighbor
+      heating, invisible to theta_ja. Result carries the verify envelope
+      (checks[], computed pass, verdict).
+  Typical flow: ecad_make_board -> ecad_run_pdn('+5V') -> ecad_thermal_handoff(
+      include_trace_heating=True) -> ecad_verify_thermal() -> widen copper / add
+      vias / forced_air and re-run until margins clear.

@@ -1055,24 +1055,52 @@ void AsmPanels::drawPatternForm(AppState& st) {
 // Exploded View
 // ===========================================================================
 
-bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
-    if (!st.docMirror.hasDoc()) return false;
-    nlohmann::json res; std::string err;
-    nlohmann::json params = {{"doc_id", st.docMirror.docId()},
-                             {"active", active}, {"factor", factor}};
-    if (!st.worker.call("doc_set_explode_state", params, res, err)) {
-        st.addLog("[err] explode: " + err); return false;
-    }
-    if (res.is_object() && res.contains("code")) {
-        st.addLog("[err] explode: " + res.value("message", std::string())); return false;
-    }
-    // View-only: the engine re-tessellated IN PLACE — reload the (same) aicm path it returns.
-    std::string aicm;
-    if (res.contains("tess") && res["tess"].is_object())
-        aicm = res["tess"].value("aicm_path", std::string());
-    if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+void AsmPanels::kickExplodeAsync(AppState& st) {
+    if (explodeInFlight_ || !explodePending_) return;
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    explodePending_ = false;
+    explodeInFlight_ = true;
+    const int gen = ++explodeGen_;
+    const bool active = explodePendingActive_;
+    const float factor = explodePendingFactor_;
+    // Optimistic UI: slider already owns explodeFactor_; keep active flag in step with pending.
     explodeActive_ = active;
     explodeFactor_ = factor;
+    nlohmann::json params = {{"doc_id", st.docMirror.docId()},
+                             {"active", active}, {"factor", factor}};
+    st.rpc.call("doc_set_explode_state", std::move(params),
+                [this, &st, gen, active, factor](const core::RpcResult& r) {
+                    explodeInFlight_ = false;
+                    if (gen != explodeGen_) {
+                        if (explodePending_) kickExplodeAsync(st);
+                        return;
+                    }
+                    if (!r.ok) {
+                        st.addLog("[err] explode: " + r.err);
+                    } else if (r.result.is_object() && r.result.contains("code")) {
+                        st.addLog("[err] explode: " +
+                                  r.result.value("message", std::string()));
+                    } else {
+                        std::string aicm;
+                        if (r.result.contains("tess") && r.result["tess"].is_object())
+                            aicm = r.result["tess"].value("aicm_path", std::string());
+                        if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+                        explodeActive_ = active;
+                        explodeFactor_ = factor;
+                    }
+                    if (explodePending_) kickExplodeAsync(st);
+                }, /*timeoutMs=*/60000);
+}
+
+bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
+    if (!st.docMirror.hasDoc()) return false;
+    // T-PERF2: coalesce rapid slider samples to latest factor; never block GL.
+    explodePendingActive_ = active;
+    explodePendingFactor_ = factor;
+    explodePending_ = true;
+    explodeFactor_ = factor;  // slider tracks immediately
+    explodeActive_ = active;
+    kickExplodeAsync(st);
     return true;
 }
 

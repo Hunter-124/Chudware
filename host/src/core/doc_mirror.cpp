@@ -390,6 +390,59 @@ OpsResponse DocMirror::redo(WorkerClient& w) {
 }
 
 // Instant3D push-pull (doc_push_pull). See the header for the live-drag envelope. -------------
+PushPullResult DocMirror::ingestPushPullResponse(const nlohmann::json& res) {
+    PushPullResult r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message");
+        return r;
+    }
+    r.ok = true;
+    r.draggable = res.value("draggable", false);
+    r.reason        = jstr(res, "reason");
+    r.feature_id    = jstr(res, "feature_id");
+    r.feature_type  = jstr(res, "feature_type");
+    if (!r.draggable) return r;   // no doc mutation — nothing to ingest
+
+    r.committed = res.value("committed", false);
+    r.clamped   = res.value("clamped", false);
+    r.param     = jstr(res, "param");
+    r.axis      = jstr(res, "axis");
+    if (auto it = res.find("old_value"); it != res.end() && it->is_number())
+        r.old_value = it->get<double>();
+    if (auto it = res.find("new_value"); it != res.end() && it->is_number())
+        r.new_value = it->get<double>();
+    if (auto it = res.find("distance"); it != res.end() && it->is_number())
+        r.distance = it->get<double>();
+
+    r.ops = parseOpsResponse(res);
+    if (r.ops.ok) {
+        revision_ = r.ops.revision;
+        if (!r.ops.tree.is_null()) tree_ = r.ops.tree;
+        if (!r.ops.feature_status.is_null()) featureStatus_ = r.ops.feature_status;
+        storeOwnerMap(r.ops.owner_map);
+        notify();
+    }
+    return r;
+}
+
+OpsResponse DocMirror::ingestOpsResponse(const nlohmann::json& res) {
+    OpsResponse r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message"); return r;
+    }
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);
+        notify();
+    }
+    return r;
+}
+
 PushPullResult DocMirror::pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
                                    double distance, bool commit) {
     PushPullResult r;
@@ -412,35 +465,7 @@ PushPullResult DocMirror::pushPull(WorkerClient& w, uint32_t body_id, uint32_t t
         if (r.error_code == "stale_revision") resyncTree(w);
         return r;
     }
-    r.ok = true;
-    r.draggable = res.value("draggable", false);
-    r.reason        = jstr(res, "reason");
-    r.feature_id    = jstr(res, "feature_id");
-    r.feature_type  = jstr(res, "feature_type");
-    if (!r.draggable) return r;   // no doc mutation — nothing to ingest
-
-    r.committed = res.value("committed", false);
-    r.clamped   = res.value("clamped", false);
-    r.param     = jstr(res, "param");
-    r.axis      = jstr(res, "axis");
-    if (auto it = res.find("old_value"); it != res.end() && it->is_number())
-        r.old_value = it->get<double>();
-    if (auto it = res.find("new_value"); it != res.end() && it->is_number())
-        r.new_value = it->get<double>();
-    if (auto it = res.find("distance"); it != res.end() && it->is_number())
-        r.distance = it->get<double>();
-
-    // The draggable response embeds the same ops block apply_ops returns — ingest it so the mirror
-    // (revision/tree/owner_map) stays in step and the listener repaints the tree.
-    r.ops = parseOpsResponse(res);
-    if (r.ops.ok) {
-        revision_ = r.ops.revision;
-        if (!r.ops.tree.is_null()) tree_ = r.ops.tree;
-        if (!r.ops.feature_status.is_null()) featureStatus_ = r.ops.feature_status;
-        storeOwnerMap(r.ops.owner_map);
-        notify();
-    }
-    return r;
+    return ingestPushPullResponse(res);
 }
 
 std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
@@ -505,18 +530,7 @@ OpsResponse DocMirror::revert(WorkerClient& w, const std::string& checkpointId) 
     if (!w.call("doc_revert", {{"doc_id", docId_}, {"checkpoint", checkpointId}}, res, err)) {
         r.error_code = "transport"; r.error_message = err; return r;
     }
-    if (res.contains("code")) {
-        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message"); return r;
-    }
-    r = parseOpsResponse(res);
-    if (r.ok) {
-        revision_ = r.revision;
-        if (!r.tree.is_null()) tree_ = r.tree;
-        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
-        storeOwnerMap(r.owner_map);
-        notify();
-    }
-    return r;
+    return ingestOpsResponse(res);
 }
 
 bool DocMirror::save(WorkerClient& w, const std::string& path, std::string& err) {

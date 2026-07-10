@@ -844,11 +844,44 @@ void Sketch3DMode::drawDimPopup(AppState& st) {
 // drag
 // ---------------------------------------------------------------------------
 
+void Sketch3DMode::queueSketch3dDrag(AppState& st, nlohmann::json extra) {
+    dragPendingExtra_ = std::move(extra);
+    dragPending_ = true;
+    kickSketch3dDragAsync(st);
+}
+
+void Sketch3DMode::kickSketch3dDragAsync(AppState& st) {
+    if (dragInFlight_ || !dragPending_) return;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || fid_.empty()) return;
+    dragPending_ = false;
+    dragInFlight_ = true;
+    const int gen = ++dragGen_;
+    nlohmann::json params = dragPendingExtra_;
+    params["doc_id"] = st.docMirror.docId();
+    params["sketch"] = fid_;
+    st.rpc.call("sketch3d_drag", std::move(params),
+                [this, &st, gen](const core::RpcResult& r) {
+                    dragInFlight_ = false;
+                    if (gen != dragGen_) {
+                        if (dragPending_ && dragging_) kickSketch3dDragAsync(st);
+                        return;
+                    }
+                    if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+                        r.result.value("ok", false)) {
+                        applyEntities(r.result);
+                        if (r.result.contains("entities")) dragEntities_ = r.result["entities"];
+                    } else if (!r.ok) {
+                        st.addLog(std::string("[sketch3d] sketch3d_drag transport error: ") + r.err);
+                    }
+                    if (dragPending_ && dragging_) kickSketch3dDragAsync(st);
+                }, /*timeoutMs=*/30000);
+}
+
 void Sketch3DMode::updateDrag(AppState& st, const ImVec2& mouse, const ImVec2& imgMin, int vw,
                               int vh) {
     if (!st.renderer) return;
     int frame = ImGui::GetFrameCount();
-    if (frame == dragFrame_) return;   // once per frame (repo rule: throttled sync call)
+    if (frame == dragFrame_) return;   // once per frame UI sample rate
     dragFrame_ = frame;
     // Target = cursor ray ∩ the screen-parallel plane through the handle's press position, so
     // the point tracks the cursor at constant depth (standard 3D handle drag).
@@ -861,17 +894,14 @@ void Sketch3DMode::updateDrag(AppState& st, const ImVec2& mouse, const ImVec2& i
     float t = dot(n, dragOrig_ - ro) / denom;
     if (t < 0) return;
     Vec3 target = ro + rd * t;
-    nlohmann::json res;
-    nlohmann::json extra = {{"handle", dragHandle_}, {"xyz", vj(target)}};
-    if (callSk3(st, "sketch3d_drag", extra, res)) {
-        if (res.value("ok", false)) {
-            applyEntities(res);
-            if (res.contains("entities")) dragEntities_ = res["entities"];
-        }
-    }
+    // T-PERF2: latest-wins async — viewport keeps last solved entities while RPCs catch up.
+    queueSketch3dDrag(st, {{"handle", dragHandle_}, {"xyz", vj(target)}});
 }
 
 void Sketch3DMode::commitDrag(AppState& st) {
+    ++dragGen_;
+    dragPending_ = false;
+    dragInFlight_ = false;
     if (dragEntities_.is_array() && !dragEntities_.empty()) {
         // Contract §4.3: commit = plain edit_feature with the last drag response's entities.
         commitParams(st, &dragEntities_, nullptr, "Drag");

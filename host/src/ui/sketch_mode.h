@@ -570,7 +570,16 @@ private:
     // drag state
     std::string dragHandle_;
     bool dragging_ = false;
-    int dragFrame_ = -1;             // last frame a sketch_drag was issued (throttle: once/frame)
+    int dragFrame_ = -1;             // last frame a sketch_drag sample was *queued* (UI throttle)
+    // T-PERF2: single-in-flight latest-wins sketch_drag. Each mouse sample overwrites
+    // dragPendingExtra_; when no RPC is open, kickSketchDragAsync submits it. Completions with
+    // gen != dragGen_ are dropped; a pending overwrite re-kicks after drain.
+    int  dragGen_ = 0;
+    bool dragInFlight_ = false;
+    bool dragPending_ = false;
+    nlohmann::json dragPendingExtra_;
+    void queueSketchDrag(AppState& st, nlohmann::json extra);
+    void kickSketchDragAsync(AppState& st);
     // C50: click-vs-drag on a point handle. Mouse-down near an endpoint/center ARMS a potential
     // drag; moving past kDragThreshPx starts the drag, releasing without moving SELECTS that point
     // handle (so vertices can be picked for coincident / alignment relations, SolidWorks-style).

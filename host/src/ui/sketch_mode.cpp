@@ -722,6 +722,10 @@ static void resyncMirror(AppState& st) {
 }
 
 void SketchMode::commitDrag(AppState& st) {
+    // Drop any in-flight / pending transient drag samples — commit is the authority.
+    ++dragGen_;
+    dragPending_ = false;
+    dragInFlight_ = false;
     nlohmann::json res;
     if (!callSketch(st, "sketch_drag_commit", nlohmann::json::object(), res)) return;
     if (res.contains("tess") && res["tess"].is_object()) {
@@ -2741,8 +2745,43 @@ void SketchMode::beginGroupDrag(const std::vector<std::string>& ids, float start
     groupDragging_ = true;
 }
 
+// T-PERF2: latest-wins async sketch_drag — never block the GL thread on a solve.
+void SketchMode::queueSketchDrag(AppState& st, nlohmann::json extra) {
+    dragPendingExtra_ = std::move(extra);
+    dragPending_ = true;
+    kickSketchDragAsync(st);
+}
+
+void SketchMode::kickSketchDragAsync(AppState& st) {
+    if (dragInFlight_ || !dragPending_) return;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || fid_.empty()) return;
+    dragPending_ = false;
+    dragInFlight_ = true;
+    const int gen = ++dragGen_;
+    nlohmann::json params = dragPendingExtra_;
+    params["doc_id"] = st.docMirror.docId();
+    params["sketch"] = fid_;
+    st.rpc.call("sketch_drag", std::move(params),
+                [this, &st, gen](const core::RpcResult& r) {
+                    // Always clear in-flight so a superseded drag can re-kick if still pending.
+                    dragInFlight_ = false;
+                    if (gen != dragGen_) {
+                        // Bumped by cancel/exit — drop; re-kick only if still pending for a live drag.
+                        if (dragPending_ && (dragging_ || groupDragging_)) kickSketchDragAsync(st);
+                        return;
+                    }
+                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
+                        applyEnterResult(r.result);
+                    else if (!r.ok)
+                        st.addLog(std::string("[sketch] sketch_drag transport error: ") + r.err);
+                    // Next sample (or the one that arrived while this was in flight).
+                    if (dragPending_ && (dragging_ || groupDragging_)) kickSketchDragAsync(st);
+                }, /*timeoutMs=*/30000);
+}
+
 // Push one transient frame of the group translation: every captured handle soft-targeted at its
-// original (u,v) plus the cursor delta. Throttled to once per frame by the caller (dragFrame_).
+// original (u,v) plus the cursor delta. Throttled to once per frame by the caller (dragFrame_);
+// the RPC itself is latest-wins async (T-PERF2).
 void SketchMode::updateGroupDrag(AppState& st, float curU, float curV) {
     if (groupDragTargets_.empty()) return;
     float dx = curU - groupDragStartUV_.x, dy = curV - groupDragStartUV_.y;
@@ -2750,8 +2789,7 @@ void SketchMode::updateGroupDrag(AppState& st, float curU, float curV) {
     for (const auto& t : groupDragTargets_)
         targets.push_back({{"handle", t.first},
                            {"xy", nlohmann::json::array({t.second.x + dx, t.second.y + dy})}});
-    nlohmann::json res;
-    if (callSketch(st, "sketch_drag", {{"targets", targets}}, res)) applyEnterResult(res);
+    queueSketchDrag(st, {{"targets", targets}});
 }
 
 // ---------------------------------------------------------------------------
@@ -6064,7 +6102,6 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             int frame = ImGui::GetFrameCount();
             if (frame != dragFrame_ && imgHovered) {
                 dragFrame_ = frame;
-                nlohmann::json res;
                 // Most handles target the cursor model point (u,v). The new scalar handles
                 // (.rim / .start_angle / .end_angle) instead target a single solver variable, so the
                 // scalar goes in xy[0]; xy[1] is ignored by the engine's 1-variable soft-target drag.
@@ -6092,7 +6129,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     extra = {{"handle", dragHandle_},
                              {"xy", nlohmann::json::array({(double)mu, (double)mv})}};
                 }
-                if (callSketch(st, "sketch_drag", extra, res)) applyEnterResult(res);
+                queueSketchDrag(st, std::move(extra));
             }
         }
         // ---- Drag edge auto-pan (Hunter UX). While an entity/handle/group is being LMB-dragged,

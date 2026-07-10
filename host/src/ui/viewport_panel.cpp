@@ -494,13 +494,19 @@ struct PushPullDrag {
     ImVec2    pressPos    = {0, 0};    // screen pos at press (drag origin)
     float     nsx = 0, nsy = 0;       // unit screen-space direction of the face OUTWARD normal
     float     worldPerPx  = 1.0f;     // world(mm) per screen pixel at the face depth (this frame)
-    double    lastApplied = 1e30f;    // last cumulative distance actually sent (skip dup samples)
+    double    lastApplied = 1e30f;    // last cumulative distance actually applied (readout)
     double    curDist     = 0.0;      // current cumulative signed distance (mm)
     // Live readout from the most recent draggable response (shown near the cursor).
     bool        haveReadout = false;
     std::string param;                // e.g. "depth"
     double      newValue  = 0.0;
     bool        clamped   = false;
+    // T-PERF2: single-in-flight latest-wins (revert+push_pull pair on AsyncRpc FIFO).
+    uint64_t  gen         = 0;
+    bool      inFlight    = false;
+    bool      pending     = false;    // curDist changed while a sample was open
+    bool      wantCommit  = false;    // next kick uses commit=true
+    bool      finishing   = false;    // mouse-up seen; don't re-queue every frame
     // Persists across the frame so the readout chip can draw even on a no-op sample.
     void reset() { *this = PushPullDrag{}; }
 };
@@ -568,7 +574,14 @@ struct AsmDrag {
     Vec3        startPos;             // component world origin at press (transform translation)
     Vec3        camR, camU;           // camera screen-right / screen-up (world) captured at press
     float       worldPerPx = 1.0f;    // world(mm) per screen pixel at the component depth (at press)
-    ImVec2      lastSent = {1e30f, 1e30f};  // last cursor delta actually solved (throttle)
+    ImVec2      lastSent = {1e30f, 1e30f};  // last cursor sample actually kicked (throttle)
+    ImVec2      curPos   = {0, 0};    // latest mouse (for pending)
+    // T-PERF2: single-in-flight latest-wins (revert + doc_solve_mates pair).
+    uint64_t    gen      = 0;
+    bool        inFlight = false;
+    bool        pending  = false;
+    bool        wantCommit = false;
+    bool        finishing  = false;   // mouse-up seen; don't re-queue every frame
     void reset() { *this = AsmDrag{}; }
 };
 static AsmDrag s_asmDrag;
@@ -1384,38 +1397,103 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
     return true;
 }
 
-// Run ONE push-pull sample at the given cumulative distance (revert to checkpoint, then apply).
-// Returns false (and leaves s_pp.active as the caller set it) on a hard transport failure. On a
-// non-draggable first response the caller aborts the drag (handled at press time instead).
-static void ppApplySample(AppState& st, double cumulative, bool commit) {
+// T-PERF2: queue a latest-wins push-pull sample. The kick issues doc_revert then doc_push_pull
+// back-to-back on AsyncRpc FIFO so the checkpoint envelope stays paired without blocking GL.
+static void ppKickAsync(AppState& st);
+
+static void ppQueueSample(AppState& st, double cumulative, bool commit) {
     if (!st.docMirror.hasDoc()) return;
-    // Revert to the pre-drag checkpoint so previews never compound, then apply the cumulative.
-    if (!s_pp.checkpoint.empty()) {
-        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    if (s_pp.finishing && !commit) return;  // no more previews after mouse-up
+    s_pp.curDist = cumulative;
+    if (commit) {
+        if (s_pp.finishing) return;  // commit already queued this gesture
+        s_pp.wantCommit = true;
+        s_pp.finishing = true;
     }
-    auto r = st.docMirror.pushPull(st.worker, s_pp.bodyId, s_pp.topoId, cumulative, commit);
-    if (!r.ok) {
-        st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.error_message);
-        return;
-    }
-    if (!r.draggable) {
-        // Shouldn't happen mid-drag (we validated draggability on press), but guard anyway.
-        st.toast(ui::ToastLevel::Warn, "This face can't be dragged — " + r.reason);
-        return;
-    }
-    if (!r.ops.aicm_path.empty()) { std::string le; st.loadDocMesh(r.ops.aicm_path, le); }
-    s_pp.haveReadout = true;
-    s_pp.param    = r.param;
-    s_pp.newValue = r.new_value;
-    s_pp.clamped  = r.clamped;
-    s_pp.lastApplied = cumulative;
+    s_pp.pending = true;
+    ppKickAsync(st);
+}
+
+static void ppKickAsync(AppState& st) {
+    if (s_pp.inFlight || !s_pp.pending) return;
+    if (!st.docMirror.hasDoc() || s_pp.checkpoint.empty()) return;
+    s_pp.pending = false;
+    s_pp.inFlight = true;
+    const uint64_t gen = ++s_pp.gen;
+    const double dist = s_pp.curDist;
+    const bool commit = s_pp.wantCommit;
+    if (commit) s_pp.wantCommit = false;
+    const std::string docId = st.docMirror.docId();
+    const std::string cp = s_pp.checkpoint;
+    const int bodyId = (int)s_pp.bodyId;
+    const int topoId = (int)s_pp.topoId;
+
+    // Pair: revert then push_pull. Only the push_pull drain callback clears inFlight / re-kicks.
+    st.rpc.call("doc_revert",
+                nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
+                [gen, &st](const core::RpcResult& r) {
+                    if (gen != s_pp.gen) return;  // cancelled
+                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
+                        st.docMirror.ingestOpsResponse(r.result);
+                    // Mesh refresh deferred to the push_pull result (same sample).
+                }, /*timeoutMs=*/60000);
+
+    nlohmann::json ppParams = {
+        {"doc_id", docId},
+        {"body_id", bodyId},
+        {"topo_id", topoId},
+        {"distance", dist},
+        {"commit", commit}
+    };
+    st.rpc.call("doc_push_pull", std::move(ppParams),
+                [gen, dist, commit, &st](const core::RpcResult& r) {
+                    s_pp.inFlight = false;
+                    if (gen != s_pp.gen) {
+                        // Cancelled mid-flight — re-kick only if a live drag still wants work.
+                        if (s_pp.pending && s_pp.active) ppKickAsync(st);
+                        return;
+                    }
+                    if (!r.ok) {
+                        st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.err);
+                    } else {
+                        auto pr = st.docMirror.ingestPushPullResponse(r.result);
+                        if (!pr.ok) {
+                            st.toast(ui::ToastLevel::Error, "Push-pull failed: " + pr.error_message);
+                        } else if (!pr.draggable) {
+                            st.toast(ui::ToastLevel::Warn,
+                                     "This face can't be dragged — " + pr.reason);
+                        } else {
+                            if (!pr.ops.aicm_path.empty()) {
+                                std::string le; st.loadDocMesh(pr.ops.aicm_path, le);
+                            }
+                            s_pp.haveReadout = true;
+                            s_pp.param = pr.param;
+                            s_pp.newValue = pr.new_value;
+                            s_pp.clamped = pr.clamped;
+                            s_pp.lastApplied = dist;
+                        }
+                    }
+                    if (commit) {
+                        // Final sample of this drag — clear envelope (checkpoint already consumed).
+                        s_pp.active = false;
+                        s_pp.checkpoint.clear();
+                        s_pp.haveReadout = false;
+                        s_pp.pending = false;
+                        s_pp.wantCommit = false;
+                        return;
+                    }
+                    if (s_pp.pending || s_pp.wantCommit) ppKickAsync(st);
+                }, /*timeoutMs=*/60000);
 }
 
 // Cancel an in-flight push-pull drag: revert to the checkpoint and clear all drag state. Safe to
 // call when no drag is active (no-op). Leaves NO zombie checkpoint/flag behind.
 static void ppCancel(AppState& st) {
     if (!s_pp.active && s_pp.checkpoint.empty()) { s_pp.reset(); return; }
+    ++s_pp.gen;  // drop in-flight async completions
+    s_pp.inFlight = false;
+    s_pp.pending = false;
+    s_pp.wantCommit = false;
     if (!s_pp.checkpoint.empty() && st.docMirror.hasDoc()) {
         auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
         if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
@@ -1459,19 +1537,35 @@ static Vec3 asmComponentOrigin(AppState& st, const nlohmann::json* comp, uint32_
     return Vec3(0, 0, 0);
 }
 
-// Run ONE move-component solve at the given cursor delta from press (revert to checkpoint so
-// transient solves never compound, then solve with the drag target). On the committed sample the
-// engine's revision bump makes this drag a single undo step. `commit` is informational here (the
-// envelope is identical) — we always revert-then-solve so exactly one solve survives at the end.
-static void asmDragSample(AppState& st, const ImVec2& cur, bool /*commit*/) {
+// T-PERF2: latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
+static void asmDragKickAsync(AppState& st);
+
+static void asmDragQueue(AppState& st, const ImVec2& cur, bool commit) {
     if (!st.docMirror.hasDoc() || s_asmDrag.component.empty()) return;
-    // Revert to the pre-drag checkpoint so each transient solve starts from the original pose.
-    if (!s_asmDrag.checkpoint.empty()) {
-        auto rv = st.docMirror.revert(st.worker, s_asmDrag.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    if (s_asmDrag.finishing && !commit) return;
+    s_asmDrag.curPos = cur;
+    if (commit) {
+        if (s_asmDrag.finishing) return;
+        s_asmDrag.wantCommit = true;
+        s_asmDrag.finishing = true;
     }
-    // Cursor delta -> world target: project onto the camera screen-plane at the component depth.
-    // dx along screen-right (+camR), dy DOWN the screen maps to -camU (screen y is down).
+    s_asmDrag.pending = true;
+    asmDragKickAsync(st);
+}
+
+static void asmDragKickAsync(AppState& st) {
+    if (s_asmDrag.inFlight || !s_asmDrag.pending) return;
+    if (!st.docMirror.hasDoc() || s_asmDrag.checkpoint.empty()) return;
+    s_asmDrag.pending = false;
+    s_asmDrag.inFlight = true;
+    const uint64_t gen = ++s_asmDrag.gen;
+    const ImVec2 cur = s_asmDrag.curPos;
+    const bool commit = s_asmDrag.wantCommit;
+    if (commit) s_asmDrag.wantCommit = false;
+    const std::string docId = st.docMirror.docId();
+    const std::string cp = s_asmDrag.checkpoint;
+    const std::string component = s_asmDrag.component;
+
     float dx = cur.x - s_asmDrag.pressPos.x;
     float dy = cur.y - s_asmDrag.pressPos.y;
     float k = s_asmDrag.worldPerPx;
@@ -1479,34 +1573,64 @@ static void asmDragSample(AppState& st, const ImVec2& cur, bool /*commit*/) {
         s_asmDrag.startPos.x + (s_asmDrag.camR.x * dx - s_asmDrag.camU.x * dy) * k,
         s_asmDrag.startPos.y + (s_asmDrag.camR.y * dx - s_asmDrag.camU.y * dy) * k,
         s_asmDrag.startPos.z + (s_asmDrag.camR.z * dx - s_asmDrag.camU.z * dy) * k);
+
+    st.rpc.call("doc_revert",
+                nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
+                [gen, &st](const core::RpcResult& r) {
+                    if (gen != s_asmDrag.gen) return;
+                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
+                        st.docMirror.ingestOpsResponse(r.result);
+                }, /*timeoutMs=*/60000);
+
     nlohmann::json params = {
-        {"doc_id", st.docMirror.docId()},
-        {"drag", {{"component", s_asmDrag.component},
+        {"doc_id", docId},
+        {"drag", {{"component", component},
                   {"target", {target.x, target.y, target.z}}}}};
-    nlohmann::json res; std::string err;
-    if (!st.worker.call("doc_solve_mates", params, res, err)) {
-        st.toast(ui::ToastLevel::Error, "Move component failed: " + err);
-        return;
-    }
-    if (res.is_object() && res.contains("code")) {
-        st.toast(ui::ToastLevel::Error,
-                 "Move component: " + res.value("message", std::string()));
-        return;
-    }
-    // doc_solve_mates bumped the worker revision; resync the mirror so the tree (and the next
-    // checkpoint/undo bookkeeping) stays in step, then reload the re-tessellated mesh.
-    st.docMirror.resync(st.worker);
-    std::string aicm;
-    if (res.contains("tess") && res["tess"].is_object())
-        aicm = res["tess"].value("aicm_path", std::string());
-    if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-    s_asmDrag.lastSent = cur;
+    st.rpc.call("doc_solve_mates", std::move(params),
+                [gen, cur, commit, &st](const core::RpcResult& r) {
+                    s_asmDrag.inFlight = false;
+                    if (gen != s_asmDrag.gen) {
+                        if (s_asmDrag.pending && s_asmDrag.active) asmDragKickAsync(st);
+                        return;
+                    }
+                    if (!r.ok) {
+                        st.toast(ui::ToastLevel::Error, "Move component failed: " + r.err);
+                    } else if (r.result.is_object() && r.result.contains("code")) {
+                        st.toast(ui::ToastLevel::Error,
+                                 "Move component: " + r.result.value("message", std::string()));
+                    } else {
+                        // Prefer ops-shaped ingest; fall back to resync for older envelopes.
+                        if (r.result.is_object() &&
+                            (r.result.contains("revision") || r.result.contains("tree"))) {
+                            st.docMirror.ingestOpsResponse(r.result);
+                        } else {
+                            st.docMirror.resync(st.worker);
+                        }
+                        std::string aicm;
+                        if (r.result.contains("tess") && r.result["tess"].is_object())
+                            aicm = r.result["tess"].value("aicm_path", std::string());
+                        if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+                        s_asmDrag.lastSent = cur;
+                    }
+                    if (commit) {
+                        s_asmDrag.active = false;
+                        s_asmDrag.checkpoint.clear();
+                        s_asmDrag.pending = false;
+                        s_asmDrag.wantCommit = false;
+                        return;
+                    }
+                    if (s_asmDrag.pending || s_asmDrag.wantCommit) asmDragKickAsync(st);
+                }, /*timeoutMs=*/60000);
 }
 
 // Cancel an in-flight move-component drag: revert to the checkpoint and clear state. No-op when no
 // drag is active.
 static void asmDragCancel(AppState& st) {
     if (!s_asmDrag.active && s_asmDrag.checkpoint.empty()) { s_asmDrag.reset(); return; }
+    ++s_asmDrag.gen;
+    s_asmDrag.inFlight = false;
+    s_asmDrag.pending = false;
+    s_asmDrag.wantCommit = false;
     if (!s_asmDrag.checkpoint.empty() && st.docMirror.hasDoc()) {
         auto rv = st.docMirror.revert(st.worker, s_asmDrag.checkpoint);
         if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
@@ -1765,11 +1889,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             bool ppPmNow = st.propertyManager && st.propertyManager->active();
             if (inSketch || st.sketchPlanePickActive || ppPmNow) {
                 ppCancel(st);
-            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                ppApplySample(st, s_pp.curDist, /*commit=*/true);
-                s_pp.active = false;
-                s_pp.checkpoint.clear();
-                s_pp.haveReadout = false;
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !s_pp.finishing) {
+                // T-PERF2: async commit; active clears when the commit sample drains.
+                ppQueueSample(st, s_pp.curDist, /*commit=*/true);
             }
         }
 
@@ -1796,10 +1918,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             bool asmPmNow = st.propertyManager && st.propertyManager->active();
             if (inSketch || st.sketchPlanePickActive || asmPmNow || !docIsAssembly(st)) {
                 asmDragCancel(st);
-            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                asmDragSample(st, io.MousePos, /*commit=*/true);
-                s_asmDrag.active = false;
-                s_asmDrag.checkpoint.clear();
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !s_asmDrag.finishing) {
+                // T-PERF2: async commit; active clears when the commit sample drains.
+                asmDragQueue(st, io.MousePos, /*commit=*/true);
             }
         }
 
@@ -2260,8 +2381,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                 }
 
-                // Drag: project cursor motion to a world target and solve (throttled ~3px).
-                if (s_asmDrag.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                // Drag: project cursor motion to a world target and solve (throttled ~3px;
+                // T-PERF2 latest-wins async — at most one pair in flight).
+                if (s_asmDrag.active && !s_asmDrag.finishing &&
+                    ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Hand);
                     cancelCameraAnimation();
                     ImVec2 mp = io.MousePos;
@@ -2269,14 +2392,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     float ddy = mp.y - s_asmDrag.lastSent.y;
                     if (s_asmDrag.lastSent.x > 1e29f ||
                         std::sqrt(ddx * ddx + ddy * ddy) >= 3.0f * ui::uiScale)
-                        asmDragSample(st, mp, /*commit=*/false);
+                        asmDragQueue(st, mp, /*commit=*/false);
                 }
 
-                // Release: one final solve (engine bumps revision = single undo) and clear state.
-                if (s_asmDrag.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                    asmDragSample(st, io.MousePos, /*commit=*/true);
-                    s_asmDrag.active = false;
-                    s_asmDrag.checkpoint.clear();
+                // Release: one final solve (engine bumps revision = single undo); state clears
+                // when the async commit sample drains.
+                if (s_asmDrag.active && !s_asmDrag.finishing &&
+                    ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    asmDragQueue(st, io.MousePos, /*commit=*/true);
                 }
 
                 // Esc cancels the drag (revert to the pre-drag pose).
@@ -2351,8 +2474,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                 }
 
-                // Drag: convert cursor motion to a cumulative signed distance and apply a sample.
-                if (s_pp.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                // Drag: convert cursor motion to a cumulative signed distance and queue a sample
+                // (T-PERF2 latest-wins async; ~0.05mm throttle so steady holds don't spam).
+                if (s_pp.active && !s_pp.finishing && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Crosshair);
                     cancelCameraAnimation();
                     float dx = io.MousePos.x - s_pp.pressPos.x;
@@ -2360,21 +2484,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     float px = dx * s_pp.nsx + dy * s_pp.nsy;   // signed px along the normal axis
                     double cumulative = (double)px * (double)s_pp.worldPerPx;
                     s_pp.curDist = cumulative;
-                    // Throttle: only call the worker when the cumulative distance changed enough to
-                    // matter (~0.05mm), so a steady hold doesn't queue a backlog of rebuilds. The
-                    // call is synchronous, so at most one is ever in flight.
                     if (std::fabs(cumulative - s_pp.lastApplied) >= 0.05)
-                        ppApplySample(st, cumulative, /*commit=*/false);
+                        ppQueueSample(st, cumulative, /*commit=*/false);
                 }
 
-                // Release: commit exactly one undo entry at the final distance.
-                if (s_pp.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                    ppApplySample(st, s_pp.curDist, /*commit=*/true);
-                    // Refresh the mirror tree (commit may have changed revision) and clear state.
-                    s_pp.active = false;
-                    s_pp.checkpoint.clear();
-                    // Keep the readout for one frame? No — clear; selection highlight remains.
-                    s_pp.haveReadout = false;
+                // Release: commit exactly one undo entry at the final distance (async).
+                if (s_pp.active && !s_pp.finishing &&
+                    ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    ppQueueSample(st, s_pp.curDist, /*commit=*/true);
                 }
             }
 

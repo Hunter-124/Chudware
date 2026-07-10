@@ -194,6 +194,13 @@ public:
     PushPullResult pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
                             double distance, bool commit);
 
+    // T-PERF2: GL-thread ingest of a finished doc_push_pull / doc_revert (or any ops-shaped)
+    // JSON response. Used by async latest-wins drag pipelines that issue the RPC via AsyncRpc
+    // and only touch the mirror inside drain(). Same post-conditions as the sync helpers when
+    // the response is successful; returns a filled PushPullResult / OpsResponse for the caller.
+    PushPullResult ingestPushPullResponse(const nlohmann::json& res);
+    OpsResponse    ingestOpsResponse(const nlohmann::json& res);
+
     // C37-F: Checkpoint / revert helpers for the PropertyManager cancel path.
     // checkpoint() issues doc_checkpoint and returns the opaque checkpoint id string (empty on
     // failure). revert() issues doc_revert, parses the full ops-style response (tree / revision /

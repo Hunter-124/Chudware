@@ -1785,11 +1785,20 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     for (const auto& g : groups) if (g.collapse == COL_HIDDEN) { anyHidden = true; break; }
 
     // --- Body child window (no horizontal scroll — reflow handles it) ---
+    // TRANSPARENT child bg: the default ChildBg is the OPAQUE panelBg role, which painted a flat
+    // solid rectangle over the ribbon's liquid-glass band (glassBackground). That opaque panel only
+    // covered the BODY (the tab strip draws outside this child, straight on the glass), so its top
+    // edge — a full-width straight line right under the buttons' rounded bottom corners — read as a
+    // hard border/step against the buttons' rounded tiles (worst at the bottom-left/right corners,
+    // where the panel edge cut across the curve). Dropping the fill lets the same glass show through
+    // the whole band, so the body matches the tabs and the buttons sit on one continuous surface.
     ImGui::SetCursorScreenPos(ImVec2(wPos.x + 4.0f * s, wPos.y + tabH + 2.0f * s));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##RibbonBody",
                       ImVec2(vp->Size.x - 8.0f * s, bodyH2 + 2.0f * s),
                       false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleColor();
 
     float curX = 0.0f;
 

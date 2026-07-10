@@ -2,8 +2,9 @@
 id: T-SIM11
 title: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz
 workstream: SIM
-owner:
+owner: unassigned
 status: todo
+deferred: yes
 branch: task/T-SIM11-em-solver-family
 depends_on: []
 lane: simulation
@@ -57,3 +58,11 @@ captures everything intentionally deferred so nothing is lost.
   test un-skips wherever a solver is installed).
 - Differential rule: numerical adapters validate against `engine_oracle/sim/em/analytic.py`
   (WR-90 TE10 6.5571 GHz; uniform-section S21=exp(-γL)) — never weaken tolerances.
+
+## Linkage (FIN finalize, 2026-07-10)
+
+T-FIN24 wires the EM GUI forms against the **live** EM backend (toast-only gap closed)
+regardless of this card's deeper solver family work. This task remains the home for
+GetDP/Meep/Elmer/MoM adapters, doc-geometry intake, and field viz — still deferred /
+optional parallel work. GUI study kinds that depend on em_status now land via the
+T-FIN24 Simulate tab; extend that tree rather than resurrecting host-path stubs.

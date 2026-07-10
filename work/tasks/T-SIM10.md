@@ -3,7 +3,7 @@ id: T-SIM10
 title: Simulate tab — full multi-physics setup tree with per-part-type disclosure
 workstream: SIM
 owner: unassigned
-status: todo
+status: backlog
 deferred: yes
 branch: task/T-SIM10-simulate-tab-multiphysics
 depends_on: []
@@ -59,6 +59,9 @@ Do not start while that fleet holds `sim_manager.*` — check `git log -5 -- hos
 
 ## Supersession note (2026-07-10)
 
-Superseded by T-FIN24 (Simulate tab multi-physics tree retargeted to ui/imgui —
-host/ paths in this file are stale post-T-G24/T-G11). Kept for the original
-disclosure-matrix spec; deferred so the ready queue stays honest.
+**SUPERSEDED by T-FIN24** (merged 2026-07-10, host/ Simulate tab multiphysics tree +
+worker seam). Status moved to `backlog` + `deferred: yes` so the ready queue stays
+honest. Original disclosure-matrix intent (mech-only vs electronics-open, handoff
+actions, honest engine-pending states) shipped under T-FIN24 against the live `host/`
+GUI (not the deleted ui/imgui path this brief once targeted). Do not re-claim this
+card — open a follow-up only for gaps found against T-FIN24 DoD.

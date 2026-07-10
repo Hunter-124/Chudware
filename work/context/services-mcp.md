@@ -47,7 +47,15 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   ecad_place_symbol, ecad_wire, ecad_label, ecad_add_power/zone, ecad_autoroute,
   ecad_fill_zones, ecad_run_erc/drc/dfm, ecad_simulate, ecad_to_3d, ecad_export,
   ecad_status, ecad_find_part, ecad_design, ecad_sweep, ecad_tf, ecad_update_from_sch,
-  ecad_check_impedance/diff_impedance.
+  ecad_check_impedance/diff_impedance, ecad_run_hostcheck/sicheck/pdn, ecad_fpga_check.
+- services/mcp/ecad_thermal.py — ecad_thermal_handoff/verify (+ thermal_handoff_impl shared
+  with worker), airflow/CHT, vibe screen registration
+- services/mcp/heatsink.py — heatsink_select / heatsink_select_impl (T-FIN17; worker probe)
+- services/mcp/power_budget.py — system power/energy budget (T-FIN23)
+- services/mcp/firmware_tools.py — fw_* suite incl. scenarios (T-FIN3) + fw_verify_board (T-FIN6)
+- services/mcp/simhandoff.py — aicad.simhandoff/1 builders/validators (T-FIN15)
+- Golden demo: scripts/demo_sensor_node.py (T-FIN25); gate stage_fin_content; cad_guide
+  ('simulation'/'firmware') + server instructions reference it
 - services/mcp/cam_tools.py:49 `register_cam_tools(mcp)` — CAM/toolpaths: cam_new_job,
   cam_add_setup/tool/operation, cam_update/remove_operation, cam_generate, cam_simulate,
   cam_post, cam_job_tree, cam_open, cam_save, cam_undo/redo, cam_extract, cam_set_stock,

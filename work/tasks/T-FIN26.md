@@ -2,8 +2,8 @@
 id: T-FIN26
 title: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh
 workstream: FIN
-owner: unassigned
-status: todo
+owner: grok
+status: done
 branch: task/T-FIN26-docs-mcp-freshness-sweep
 depends_on: [T-FIN25]
 lane: platform-infra
@@ -32,3 +32,6 @@ T-V1). Also sweep T-SIM10/T-SIM11 statuses to reflect what T-FIN24 absorbed.
 - cad_guide topics accurate against the shipped tool surface (spot-checked by fresh-agent dry run)
 - Context packs regenerated; graphify current
 - Board statuses reconciled (T-SIM10 superseded note, T-SIM11 linkage)
+
+## Progress log
+- 2026-07-10 20:40 UTC [grok] cad_guide simulation/firmware + server instructions; T-SIM10 backlog/superseded, T-SIM11 deferred+linkage; context packs core-sim/ecad/services-mcp; docs/FIN_CAPABILITY_MAP_2026-07-10.md; graphify update (39502 nodes); mcp freshness 5/5 pass.

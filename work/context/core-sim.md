@@ -42,3 +42,12 @@ run_cfd_flow / run_cfd_accurate / ecad_simulate. CFD-accurate (OpenFOAM) is stil
 - work/tasks: grep `fea|cfd|spice` hits T-A4, T-C1/C2, T-E1/E4, T-F2/F7/F9/F13-F15 (many are GUI-adjacent; read before claiming)
 - docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md (GSL narration of sim state), contracts/mesh_format.md
 - host/src/ui/sim_manager.cpp glass-styling notes in docs/REFACTOR_LOG.md (GUI, not solver)
+
+## FIN content (2026-07-10)
+- Cross-sim seam: `aicad.simhandoff/1` (`services/mcp/simhandoff.py`, contracts via T-FIN15)
+- Transient thermal: `engine_oracle/sim/fea_thermal_transient.py` (T-FIN18)
+- OpenFOAM CHT: `engine_oracle/sim/foam_cht.py` (T-FIN19 / T-SIM5)
+- Worker multiphysics mirror for host Simulate tab: `engine_oracle/sim/multiphysics_rpc.py`
+  (T-FIN24) — sim_caps, ccx buckling/contact, freq-response, ecad_thermal_handoff, heatsink_select
+- Golden demo: `scripts/demo_sensor_node.py` (T-FIN25) + gate stage 4.7
+- T-SIM10 superseded by T-FIN24; T-SIM11 = deferred deeper EM solvers (GUI forms already live)

@@ -110,7 +110,7 @@ graph TD
     T_FIN23["T-FIN23: System power/energy budget - rails tree + firmware duty cycle + battery verdict"]:::done
     T_FIN24["T-FIN24: Simulate tab multi-physics tree (ui/imgui) - all studies + handoff actions (supersedes T-SIM10)"]:::done
     T_FIN25["T-FIN25: E2E golden demo + gate battery - MCU sensor node designed, verified, emulated, cooled"]:::done
-    T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::todo
+    T_FIN26["T-FIN26: Docs/MCP freshness sweep - cad_guide topics, context packs, graphify refresh"]:::done
     T_FIN3["T-FIN3: Sensor stimulus scenario system - simulated sensors/GPIO data driving emulated firmware"]:::done
     T_FIN4["T-FIN4: Firmware toolchain/emulator provisioning doctor - fw_status probe with install guidance"]:::done
     T_FIN5["T-FIN5: Firmware workspace GUI (ui/imgui) - project browser, build console, serial monitor, emulation trace"]:::done
@@ -227,7 +227,7 @@ graph TD
   end
   subgraph WS_SIM["workstream SIM"]
     T_SIM1["T-SIM1: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end"]:::done
-    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::todo
+    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::backlog
     T_SIM11["T-SIM11: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz"]:::todo
     T_SIM2["T-SIM2: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport"]:::done
     T_SIM3["T-SIM3: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish"]:::done

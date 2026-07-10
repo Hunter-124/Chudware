@@ -1548,6 +1548,23 @@ SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
   explicitly labelled; unknown currents stay null (sums become labelled floors), every
   number carries provenance. Also runs inside verify_battery as the 'power_budget'
   check (kwargs power_source / power_converters / board_path / power_profile_path).
+
+GOLDEN DEMO (T-FIN25 — living E2E worked example):
+  scripts/demo_sensor_node.py chains the full FIN surface on an STM32F4 sensor-node
+  board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN) → firmware project +
+  co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
+  ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
+  make_report. Wired into scripts/gate.sh as stage 4.7 (AICAD_SKIP_FIN25=1 to opt out).
+  Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
+  inventing a new end-to-end recipe when demonstrating the content is finished.
+
+SIMULATE TAB (T-FIN24, host GUI): one multiphysics Simulate workspace hosts every live
+  study kind with progressive disclosure by open doc type, plus handoff actions
+  (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
+  seam: engine_oracle/sim/multiphysics_rpc.py (sim_caps / sim_run_buckling /
+  sim_run_contact / sim_freq_response / ecad_thermal_handoff / heatsink_select /
+  piping_verify_cfd). EM forms wire the live EM backend; deeper EM solvers stay on
+  T-SIM11. Supersedes the deferred T-SIM10 host-path brief.
 """
 
 _MOTION_GUIDE = """\
@@ -2346,7 +2363,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  scenarios refuse honestly (invalid_scenario / scenario_error) — e.g.\n"
             "  adc_waveform on nrf52 explains that no ADC stub window is registered.\n\n"
             "BIAS: always fw_sim_run before fw_flash — catches assertion failures without\n"
-            "  hardware.  Link the ECAD board doc so pinmap.h is auto-generated."
+            "  hardware.  Link the ECAD board doc so pinmap.h is auto-generated.\n\n"
+            "GOLDEN DEMO (T-FIN25): scripts/demo_sensor_node.py builds an STM32F4 sensor-\n"
+            "  node board, runs fw_new_project + fw_verify_board, and fw_sim_run with\n"
+            "  fixture:i2c_temp_tmp103 when Renode is provisioned (honest SKIP markers\n"
+            "  otherwise). See docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md + cad_guide('simulation')."
         )
     if topic in ("structural", "structure", "struct", "struct_analyze", "struct_check",
                  "struct_estimate", "beam", "frame", "truss", "steel_design"):

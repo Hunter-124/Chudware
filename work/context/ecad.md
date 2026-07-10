@@ -37,4 +37,16 @@ Contracts: contracts/ecad/ (ecad_ops.md, ecad_rpc.md, fab_outputs.md, library.md
 ## Related tasks/docs
 - contracts/ecad/*.md (frozen RPC/schema contracts — read before changing wire shapes)
 - docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md (GSL layer touches `_ecad_describe`)
-- grep `work/tasks/*.md` for "ecad" to find any open workstream tasks (none matched a dedicated ecad task at time of writing — check `python3 work/tools/work.py board`/`ready` for current state)
+- FIN workstream (2026-07-10): boardphys + host-board/SI/FPGA/PDN packs, thermal handoff,
+  heatsink loop, power budget — see docs/SIM_FW_FINALIZE_PLAN_2026-07-10.md
+
+## FIN verification + physics handoffs (2026-07-10)
+- Metadata keystone: `aicad.boardphys/1` sidecar from `ecad_to_3d` (T-FIN8) — power/thermal/
+  package/rail blocks on every component body
+- Pre-fab packs: `ecad_run_hostcheck` (T-FIN9), `ecad_run_sicheck` (T-FIN10),
+  `ecad_fpga_check` + constraints export (T-FIN11), `ecad_run_pdn` IR-drop (T-FIN13),
+  stackup advisor (T-FIN12), optional ngspice backend (T-FIN14)
+- Physics: `ecad_thermal_handoff` / `ecad_verify_thermal` (T-FIN16), `heatsink_select`
+  (T-FIN17, `services/mcp/heatsink.py` + `heatsink_select_impl` for worker seam),
+  `ecad_airflow_handoff` (T-FIN19), `ecad_vibe_check` (T-FIN21), `power_budget` (T-FIN23)
+- E2E: `scripts/demo_sensor_node.py` (T-FIN25); narrative docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md

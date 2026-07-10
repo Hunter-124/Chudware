@@ -165,12 +165,17 @@ _FULL_INSTRUCTIONS = (
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, reveng, deliverables, requirements, dag, verify, interaction, sourcing, cost, "
         "spec, piping, hydraulic, firmware, structural, regen, code_compliance, serving, "
-        "design_review, doc_diff, plm, tolerance_stackup, sketch3d."
+        "design_review, doc_diff, plm, tolerance_stackup, sketch3d.\n"
         "REBUILD FAILURE? A failed add_features batch may carry a `regen_diagnosis` fix-preview "
         "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
         "regen_diagnose(document_json) runs the same diagnosis on any failed doc directly.\n"
-        "ECAD (schematic/PCB) tools are also available (ecad_*)."
+        "ECAD (schematic/PCB) tools are also available (ecad_*). Pre-fab host-board verification: "
+        "ecad_run_hostcheck / ecad_run_sicheck / ecad_fpga_check / ecad_run_pdn; cross-sim handoffs "
+        "via cad_guide('simulation') (ecad_thermal_handoff, heatsink_select, power_budget).\n"
+        "CONTENT GOLDEN DEMO (T-FIN25): scripts/demo_sensor_node.py is the living E2E worked "
+        "example (sensor-node board → verify ladder → firmware → thermal → heatsink → budget → "
+        "make_report); see docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md and cad_guide('simulation').\n"
 )
 
 mcp = FastMCP(

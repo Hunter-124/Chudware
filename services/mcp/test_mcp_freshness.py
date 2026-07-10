@@ -192,6 +192,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "ecad_status", "ecad_find_part", "ecad_design", "ecad_sweep",
         "ecad_tf", "ecad_update_from_sch", "ecad_check_impedance",
         "ecad_check_diff_impedance",
+        "ecad_set_net_class", "ecad_run_sicheck",
         "ecad_new_schematic", "ecad_new_pcb",
     },
     "cam": {

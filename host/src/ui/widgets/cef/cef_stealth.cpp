@@ -86,9 +86,72 @@ CefRefPtr<CefDictionaryValue> brand(const char* name, const std::string& version
     return d;
 }
 
+// reCAPTCHA login fix. Some vendor logins (e.g. anaheimautomation's Magento MSP
+// invisible reCAPTCHA) bind reCAPTCHA to the form submit, but that execute-then-
+// submit handoff does not attach a token in our OSR browser, so the form POSTs an
+// empty token and the server answers "reCAPTCHA verification failed" — even though
+// grecaptcha.execute() itself works here (proven: it returns a full token). This
+// shim closes the gap WITHOUT any bot-evasion: on a real submit of a reCAPTCHA-
+// protected form whose token field is still empty, it generates a fresh token from
+// the page's own sitekey via grecaptcha and attaches it before the POST, then lets
+// the form submit normally (preserving form_key / session). It is a pure no-op on
+// every other form and every page without an empty reCAPTCHA field. Main frame only
+// (never the reCAPTCHA challenge iframe). Idempotent under the double-inject.
+const char* kRecaptchaLoginHelper = R"JS(
+(() => {
+  if (window.__aicadRcHook) return; window.__aicadRcHook = true;
+  const RESP = 'textarea[name="g-recaptcha-response"],input[name="g-recaptcha-response"]';
+  const findSitekey = (form) => {
+    const el = (form && form.querySelector('[data-sitekey]')) || document.querySelector('[data-sitekey]');
+    if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
+    // Magento MSP and other explicit-render setups keep the key in page config; a
+    // Google sitekey is a 40-char 6L… token. Match the first one in the document.
+    try { const m = document.documentElement.innerHTML.match(/6L[0-9A-Za-z_-]{38}/); if (m) return m[0]; } catch (e) {}
+    return null;
+  };
+  const ensureToken = (form) => {
+    // Already carries a token → nothing to do.
+    const existing = form.querySelector(RESP);
+    if (existing && existing.value && existing.value.length > 20) return false;
+    if (typeof grecaptcha === 'undefined' || !grecaptcha.render || !grecaptcha.execute) return false;
+    const sitekey = findSitekey(form);
+    if (!sitekey) return false;
+    let slot = document.getElementById('__aicad_rc_slot');
+    if (!slot) { slot = document.createElement('div'); slot.id = '__aicad_rc_slot';
+      slot.style.position = 'fixed'; slot.style.left = '-9999px'; slot.style.bottom = '0'; document.body.appendChild(slot); }
+    let wid;
+    try { wid = grecaptcha.render(slot, { sitekey, size: 'invisible', callback: (tok) => {
+      try {
+        let fields = form.querySelectorAll(RESP);
+        if (!fields.length) { const h = document.createElement('input'); h.type = 'hidden';
+          h.name = 'g-recaptcha-response'; form.appendChild(h); fields = [h]; }
+        for (const f of fields) f.value = tok;
+        // Magento rotates its CSRF form_key via a cookie; after our async token
+        // wait the form's hidden form_key can be stale → a silent "Invalid Form Key"
+        // redirect. Refresh it from the live cookie so the POST is accepted.
+        try { const m = document.cookie.match(/(?:^|;\s*)form_key=([^;]+)/);
+          if (m) { const fk = form.querySelector('[name="form_key"]');
+            if (fk) fk.value = decodeURIComponent(m[1]); } } catch (e) {}
+        form.__aicadRcSubmitting = true;   // let this pass straight through the hook
+        if (form.requestSubmit) form.requestSubmit(); else form.submit();
+      } catch (e) {}
+    } }); } catch (e) { return false; }   // widget already rendered / not ready → don't block
+    try { grecaptcha.execute(wid); } catch (e) { return false; }
+    return true;   // we took over: prevent the original (broken) submit
+  };
+  document.addEventListener('submit', (ev) => {
+    const form = ev.target;
+    if (!form || form.tagName !== 'FORM' || form.__aicadRcSubmitting) return;
+    try { if (ensureToken(form)) { ev.preventDefault(); ev.stopImmediatePropagation(); } } catch (e) {}
+  }, true);   // capture phase: run before the vendor's own (broken) submit handler
+})();
+)JS";
+
 }  // namespace
 
 const char* stealth_init_script() { return kInitScript; }
+
+const char* recaptcha_login_helper_script() { return kRecaptchaLoginHelper; }
 
 CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
     if (!browser) return nullptr;

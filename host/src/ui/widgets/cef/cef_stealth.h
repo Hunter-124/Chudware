@@ -41,4 +41,12 @@ CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser);
 // no-Runtime.enable path. Mirrors services/browser/stealth.INIT_SCRIPT.
 const char* stealth_init_script();
 
+// reCAPTCHA login fix (NOT anti-detection): a document-start shim that, on a real
+// submit of a reCAPTCHA-protected form whose g-recaptcha-response is still empty,
+// generates a fresh token from the page's own sitekey via grecaptcha and attaches it
+// before the POST — closing the vendor-side execute-then-submit gap that leaves the
+// token empty in our OSR browser. Pure no-op on any other form/page. Inject in the
+// MAIN FRAME ONLY (never the reCAPTCHA challenge iframe).
+const char* recaptcha_login_helper_script();
+
 }  // namespace ui::cef

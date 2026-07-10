@@ -69,7 +69,13 @@ public:
     // it fires in-process under --single-process too. Mirrors stealth.INIT_SCRIPT.
     void OnContextCreated(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                           CefRefPtr<CefV8Context>) override {
-        if (frame) frame->ExecuteJavaScript(stealth_init_script(), frame->GetURL(), 0);
+        if (!frame) return;
+        frame->ExecuteJavaScript(stealth_init_script(), frame->GetURL(), 0);
+        // reCAPTCHA login fix (NOT anti-detection) — MAIN FRAME ONLY, so it never runs
+        // in the reCAPTCHA challenge iframe. Attaches a fresh token to a reCAPTCHA-
+        // protected login form whose token field is empty at submit; no-op otherwise.
+        if (frame->IsMain())
+            frame->ExecuteJavaScript(recaptcha_login_helper_script(), frame->GetURL(), 0);
     }
 
     void OnBeforeCommandLineProcessing(const CefString& /*process_type*/,

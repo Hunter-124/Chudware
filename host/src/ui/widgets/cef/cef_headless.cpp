@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -64,35 +65,43 @@ private:
 // Windowless client that loads a page for HTML extraction. We still implement
 // CefRenderHandler (OSR requires one) but never touch the pixels — GetViewRect
 // just gives Blink a viewport so responsive/JS-gated content renders.
+// Windowless client for HTML extraction. Created once at about:blank and REUSED
+// across fetches via navigate() — creating/closing a fresh browser per fetch
+// SIGTRAPs on the 2nd create in single-process mode (Chromium can't spawn a 2nd
+// renderer; MEMORY cef-gpu-thread-sigtrap-nvidia). Seeding at about:blank also
+// guarantees the render-process stealth injection is live before the first real
+// document loads. We implement CefRenderHandler (OSR needs one) but ignore paints.
 class FetchClient : public CefClient,
                     public CefRenderHandler,
                     public CefLifeSpanHandler,
                     public CefLoadHandler {
 public:
-    explicit FetchClient(std::string url) : url_(std::move(url)) {}
-
     CefRefPtr<CefRenderHandler>   GetRenderHandler() override   { return this; }
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler>     GetLoadHandler() override     { return this; }
 
     CefRefPtr<CefBrowser> browser() const { return browser_; }
+    bool created() const { return created_; }
     bool loaded() const { return load_end_; }
     int  status() const { return status_; }
+
+    // Point the reused browser at a new URL and arm a fresh load wait.
+    void navigate(const std::string& url) {
+        load_end_ = false;
+        status_ = 0;
+        if (browser_) if (CefRefPtr<CefFrame> f = browser_->GetMainFrame()) f->LoadURL(url);
+    }
 
     // CefRenderHandler — give Blink a viewport; ignore the paint.
     void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override { rect.Set(0, 0, 1280, 800); }
     void OnPaint(CefRefPtr<CefBrowser>, PaintElementType, const RectList&,
                  const void*, int, int) override {}
 
-    // CefLifeSpanHandler. The browser is created at about:blank so the
-    // document-start stealth script is registered BEFORE the real navigation —
-    // otherwise CreateBrowser(url) races the addScriptToEvaluateOnNewDocument
-    // registration and the target's first document runs unhardened (its WebGL/etc.
-    // would leak the real values).
+    // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
-        stealth_reg_ = apply_stealth(browser);  // UA/hints + JS hardening, no CDP tell
-        if (CefRefPtr<CefFrame> f = browser->GetMainFrame()) f->LoadURL(url_);
+        stealth_reg_ = apply_stealth(browser);  // UA/hints, no CDP tell (JS via OnContextCreated)
+        created_ = true;
     }
 
     // CefLoadHandler — only the real navigation counts, not the about:blank seed.
@@ -104,7 +113,7 @@ public:
     }
 
 private:
-    std::string url_;
+    bool created_ = false;
     bool load_end_ = false;
     int  status_ = 0;
     CefRefPtr<CefBrowser> browser_;
@@ -138,27 +147,44 @@ private:
 
 }  // namespace
 
+// Persistent OSR browsers, one per profile dir, REUSED across fetches (see
+// FetchClient). Never create/close per request — the 2nd create SIGTRAPs in
+// single-process mode. Single-threaded access (the daemon serves one request at a
+// time), so no locking. Closed by headless_close_all() before CefShutdown.
+std::map<std::string, CefRefPtr<FetchClient>>& browser_pool() {
+    static std::map<std::string, CefRefPtr<FetchClient>> pool;
+    return pool;
+}
+
 FetchResult headless_fetch(const std::string& url, int settle_ms,
                            const std::string& profile_dir) {
     FetchResult out;
     if (!initialized()) return out;
 
-    CefRefPtr<FetchClient> client = new FetchClient(url);
-    CefWindowInfo window_info;
-    window_info.SetAsWindowless(0);
-    CefBrowserSettings settings;
-    settings.windowless_frame_rate = 30;
+    CefRefPtr<FetchClient>& client = browser_pool()[profile_dir];
+    if (!client) {
+        client = new FetchClient();
+        CefWindowInfo window_info;
+        window_info.SetAsWindowless(0);
+        CefBrowserSettings settings;
+        settings.windowless_frame_rate = 30;
+        // Seed at about:blank so the render-process stealth injection is live
+        // before the first real navigation.
+        if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings,
+                                           nullptr, make_context(profile_dir))) {
+            browser_pool().erase(profile_dir);
+            return out;
+        }
+        for (int i = 0; i < 500 && !client->created(); ++i) pump(20);
+        if (!client->created()) { browser_pool().erase(profile_dir); return out; }
+    }
 
-    // Seed at about:blank; the client navigates to `url` from OnAfterCreated once
-    // the stealth document-start script is registered (see FetchClient).
-    if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings, nullptr,
-                                       make_context(profile_dir)))
-        return out;
-
-    // Wait for the browser to exist and the main frame to finish loading.
-    for (int i = 0; i < 500 && !(client->browser() && client->loaded()); ++i) pump(20);
-    // Let JS / challenge scripts settle so GetSource sees the post-JS DOM.
-    if (settle_ms > 0) pump(settle_ms);
+    client->navigate(url);
+    for (int i = 0; i < 500 && !client->loaded(); ++i) pump(20);
+    // If the navigation never completed, DO NOT return the reused browser's stale
+    // previous-page DOM as success — fail so the caller degrades/retries.
+    if (!client->loaded()) return out;
+    if (settle_ms > 0) pump(settle_ms);  // let JS / challenge scripts settle
 
     if (client->browser()) {
         CefRefPtr<CefFrame> frame = client->browser()->GetMainFrame();
@@ -173,10 +199,15 @@ FetchResult headless_fetch(const std::string& url, int settle_ms,
                 out.final_url = frame->GetURL().ToString();
             }
         }
-        client->browser()->GetHost()->CloseBrowser(true);
-        pump(200);
     }
     return out;
+}
+
+void headless_close_all() {
+    for (auto& [profile, client] : browser_pool())
+        if (client && client->browser()) client->browser()->GetHost()->CloseBrowser(true);
+    for (int i = 0; i < 50; ++i) pump(10);  // let OnBeforeClose settle
+    browser_pool().clear();
 }
 
 bool headless_download(const std::string& url, const std::string& dest_path,

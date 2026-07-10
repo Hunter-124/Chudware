@@ -112,6 +112,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
             }
         }
     }
+    headless_close_all();  // close pooled browsers before CefShutdown
     shutdown();
     return 0;
 }

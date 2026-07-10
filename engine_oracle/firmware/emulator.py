@@ -51,6 +51,10 @@ _REPL_UART_RE = re.compile(r"^(?P<name>\w+)\s*:\s*UART\.", re.MULTILINE)
 # gpio assertion pin like PA5 / PB12 (STM32 convention) — used to derive Renode hooks
 _STM32_PIN_RE = re.compile(r"^P(?P<port>[A-K])(?P<num>\d{1,2})$")
 
+# Coarse time markers the scenario timeline echoes after every monitor sleep (T-FIN3):
+# ``AICAD_T_MARK <ms>`` — subsequent UART lines inherit the last seen mark as t_ms.
+_T_MARK_RE = re.compile(r"AICAD_T_MARK\s+(?P<t>[0-9]+(?:\.[0-9]+)?)")
+
 
 @dataclass
 class AssertionResult:
@@ -121,6 +125,28 @@ def parse_gpio_events(text: str) -> list[dict]:
     return events
 
 
+def parse_uart_events(text: str) -> list[dict]:
+    """Extract UART text lines as events, time-stamped from ``AICAD_T_MARK`` markers (T-FIN3).
+
+    Returns ``{"type": "uart", "seq": int, "t_ms": float | None, "text": str}`` per
+    non-marker, non-trace line. ``t_ms`` is the last scenario time mark seen before the
+    line (coarse — sleep-interleave resolution), or None when the run had no timeline
+    (no scenario ⇒ no marks). Pure — no I/O.
+    """
+    events: list[dict] = []
+    t_ms: Optional[float] = None
+    for i, line in enumerate(text.splitlines()):
+        mark = _T_MARK_RE.search(line)
+        if mark:
+            t_ms = float(mark.group("t"))
+            continue
+        s = line.strip()
+        if not s or "AICAD_GPIO_EVT" in s or "AICAD_GPIO_ODR_" in s:
+            continue
+        events.append({"type": "uart", "seq": i, "t_ms": t_ms, "text": s})
+    return events
+
+
 def parse_renode_gpio_odr(text: str) -> dict[str, int]:
     """Parse the ODR snapshot blocks the generated .resc echoes after the run.
 
@@ -167,13 +193,22 @@ def derive_gpio_states(events: list[dict], odr_states: Optional[dict[str, int]] 
 
 def _pins_from_assertions(assertions: list[str]) -> list[tuple[str, int]]:
     """Extract STM32-style ``(port_letter, pin_number)`` pairs referenced by
-    ``gpio:P<X><n>...`` assertions — these get Renode state-change hooks + ODR reads."""
+    ``gpio:P<X><n>...`` / ``toggles:P<X><n>...`` / ``period:P<X><n>...`` assertions —
+    these get Renode state-change hooks + ODR reads."""
     pins: list[tuple[str, int]] = []
     for a in assertions:
         a = a.strip()
-        if not a.startswith("gpio:"):
+        if a.startswith("gpio:"):
+            spec = a[len("gpio:"):]
+        elif a.startswith("toggles:"):
+            spec = a[len("toggles:"):]
+            m_op = re.search(r">=|<=|==|>|<", spec)
+            spec = spec[:m_op.start()] if m_op else spec
+        elif a.startswith("period:"):
+            spec = a[len("period:"):]
+        else:
             continue
-        pin_name = a[len("gpio:"):].partition("=")[0].strip()
+        pin_name = spec.partition("=")[0].strip()
         m = _STM32_PIN_RE.match(pin_name)
         if m:
             pair = (m.group("port"), int(m.group("num")))
@@ -194,12 +229,9 @@ def write_trace_artifact(elf_path: str, source: str, uart_log: str,
     try:
         if not Path(elf_path).exists():
             return None
-        events: list[dict] = list(gpio_events)
-        for i, line in enumerate(uart_log.splitlines()):
-            s = line.strip()
-            if not s or "AICAD_GPIO_EVT" in s or "AICAD_GPIO_ODR_" in s:
-                continue
-            events.append({"type": "uart", "seq": i, "t_ms": None, "text": s})
+        # T-FIN3: UART events now carry a coarse t_ms when the run had a scenario
+        # timeline (AICAD_T_MARK markers); None otherwise — same shape as before.
+        events: list[dict] = list(gpio_events) + parse_uart_events(uart_log)
         events.sort(key=lambda e: e["seq"])
         payload = {
             "schema": "aicad.firmware.trace/1",
@@ -222,11 +254,28 @@ def write_trace_artifact(elf_path: str, source: str, uart_log: str,
 # ---------------------------------------------------------------------------
 
 _GPIO_TIME_RE = re.compile(r"^(?P<pin>[^=@]+)=(?P<level>\S+?)@(?P<op>[<>]?)(?P<t>[0-9]+(?:\.[0-9]+)?)ms$")
+# T-FIN3 vocabulary extensions:
+_TOGGLES_RE = re.compile(r"^(?P<pin>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>>=|<=|==|>|<)\s*(?P<n>\d+)$")
+_PERIOD_RE = re.compile(
+    r"^(?P<pin>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<p>[0-9]+(?:\.[0-9]+)?)ms"
+    r"\s*(?:±|\+-)\s*(?P<tol>[0-9]+(?:\.[0-9]+)?)ms$")
+_UART_WITHIN_RE = re.compile(r"^(?P<text>.+)@(?P<t>[0-9]+(?:\.[0-9]+)?)ms$")
+
+_TOGGLE_OPS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b,
+               "==": lambda a, b: a == b, ">": lambda a, b: a > b,
+               "<": lambda a, b: a < b}
+
+
+def _count_toggles(gpio_events: list[dict], pin: str) -> int:
+    """Number of level transitions for ``pin`` across its event stream (seq order)."""
+    levels = [e["level"] for e in gpio_events if e.get("pin") == pin]
+    return sum(1 for a, b in zip(levels, levels[1:]) if a != b)
 
 
 def evaluate_assertions(uart_log: str, gpio_states: dict[str, int],
                         assertions: list[str],
-                        gpio_events: Optional[list[dict]] = None) -> list[AssertionResult]:
+                        gpio_events: Optional[list[dict]] = None,
+                        uart_events: Optional[list[dict]] = None) -> list[AssertionResult]:
     """Evaluate ``assertions`` against captured ``uart_log`` and ``gpio_states``.
 
     Each assertion is a string in one of these forms:
@@ -236,6 +285,15 @@ def evaluate_assertions(uart_log: str, gpio_states: dict[str, int],
       passes when a *time-stamped* event in ``gpio_events`` shows the pin at that level
       after / before / at-or-after ``T`` milliseconds. Fails with an explanatory detail
       when no time-stamped events exist for the pin.
+    - ``"toggles:<PIN><op><N>"`` (T-FIN3) — the pin's level changed <op> N times over the
+      run (op: >=, <=, ==, >, <). Evaluated on the event stream — timestamps not needed.
+    - ``"period:<PIN>=<P>ms±<TOL>ms"`` (T-FIN3, also ``+-``) — mean interval between the
+      pin's *time-stamped* rising edges is within P±TOL ms. Needs >= 2 stamped rising
+      edges, else fails with an explanatory detail.
+    - ``"uart_within:<text>@<T>ms"`` (T-FIN3) — a *time-stamped* UART event containing
+      ``<text>`` occurs at or before T ms. UART timestamps are coarse scenario-timeline
+      marks (``AICAD_T_MARK``); without a scenario there are none and this fails with
+      an explanatory detail.
     - plain string (no prefix) — treated as ``"uart:<text>"`` for convenience.
 
     Returns a list of :class:`AssertionResult` in the same order as ``assertions``.
@@ -243,8 +301,73 @@ def evaluate_assertions(uart_log: str, gpio_states: dict[str, int],
     """
     results: list[AssertionResult] = []
     gpio_events = gpio_events or []
+    uart_events = uart_events or []
     for assertion in assertions:
         a = assertion.strip()
+        if a.startswith("toggles:"):
+            m = _TOGGLES_RE.match(a[len("toggles:"):].strip())
+            if not m:
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail="toggles assertion must be toggles:PIN<op>N (op: >= <= == > <)"))
+                continue
+            pin, op, n = m.group("pin"), m.group("op"), int(m.group("n"))
+            count = _count_toggles(gpio_events, pin)
+            ok = _TOGGLE_OPS[op](count, n)
+            results.append(AssertionResult(
+                name=a, passed=ok, detail=f"{pin} toggled {count} time(s), want {op}{n}"))
+            continue
+        if a.startswith("period:"):
+            m = _PERIOD_RE.match(a[len("period:"):].strip())
+            if not m:
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail="period assertion must be period:PIN=<P>ms±<TOL>ms (or +-)"))
+                continue
+            pin, p_ref, tol = m.group("pin"), float(m.group("p")), float(m.group("tol"))
+            rises = [e["t_ms"] for e in gpio_events
+                     if e.get("pin") == pin and e.get("level") == 1
+                     and e.get("t_ms") is not None]
+            if len(rises) < 2:
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail=f"need >=2 time-stamped rising edges on '{pin}', got {len(rises)}"))
+                continue
+            deltas = [b - c for c, b in zip(rises, rises[1:])]
+            mean = sum(deltas) / len(deltas)
+            ok = abs(mean - p_ref) <= tol
+            results.append(AssertionResult(
+                name=a, passed=ok,
+                detail=f"{pin} mean period {mean:.3g}ms over {len(deltas)} interval(s), "
+                       f"want {p_ref:g}±{tol:g}ms"))
+            continue
+        if a.startswith("uart_within:"):
+            m = _UART_WITHIN_RE.match(a[len("uart_within:"):].strip())
+            if not m:
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail="uart_within assertion must be uart_within:<text>@<T>ms"))
+                continue
+            text, t_ref = m.group("text"), float(m.group("t"))
+            stamped = [e for e in uart_events if e.get("t_ms") is not None]
+            if not stamped:
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail="no time-stamped uart events (uart timestamps come from the "
+                           "scenario timeline's AICAD_T_MARK markers)"))
+                continue
+            hits = [e for e in stamped if text in e["text"] and e["t_ms"] <= t_ref]
+            if hits:
+                results.append(AssertionResult(
+                    name=a, passed=True,
+                    detail=f"found at t<={hits[0]['t_ms']:g}ms"))
+            else:
+                later = [e for e in stamped if text in e["text"]]
+                results.append(AssertionResult(
+                    name=a, passed=False,
+                    detail=(f"first match at t={later[0]['t_ms']:g}ms > {t_ref:g}ms"
+                            if later else f"'{text}' not found in time-stamped uart events")))
+            continue
         if a.startswith("gpio:"):
             # gpio:LED=1  or  gpio:PA5=0  or  gpio:PA5=1@>10ms
             spec = a[len("gpio:"):]
@@ -336,7 +459,9 @@ def _emulator_not_found(binary: str, t0: float) -> SimResult:
 
 def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
                 gpio_pins: Optional[list[tuple[str, int]]] = None,
-                gpio_regmap: Optional[dict] = None) -> str:
+                gpio_regmap: Optional[dict] = None,
+                scenario_setup_lines: Optional[list[str]] = None,
+                scenario_timeline: Optional[list[tuple[float, str]]] = None) -> str:
     """Generate a minimal Renode ``.resc`` script that loads the ELF, starts emulation, and lets
     it run for ``run_seconds`` of wall-clock time before the script (and Renode with it) exits.
 
@@ -396,8 +521,11 @@ def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
     lines = [
         "mach create",
         f"machine LoadPlatformDescription @{platform_file}",
-        f"sysbus LoadELF @{elf_path}",
     ]
+    # Scenario peripheral attachment/programming (T-FIN3) — before LoadELF/start so
+    # stimulus peripherals exist when the firmware begins probing buses.
+    lines.extend(scenario_setup_lines or [])
+    lines.append(f"sysbus LoadELF @{elf_path}")
     if uart_name:
         lines.append(f"showAnalyzer sysbus.{uart_name}")
     # Per-pin state-change hooks print a machine-readable event line the parser picks up.
@@ -408,7 +536,13 @@ def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0,
             f"sysbus.gpioPort{port} AddStateChangedHook {num} "
             f"\"print('AICAD_GPIO_EVT P{port}{num}=%d' % (1 if state else 0))\"")
     lines.append("start")
-    lines.append(f"sleep {run_seconds:.1f}")
+    if scenario_timeline:
+        # T-FIN3: replace the single run-window sleep with the stimulus timeline
+        # (sleep interleaving + AICAD_T_MARK markers for coarse UART timestamps).
+        from engine.firmware.scenario import timeline_resc_lines
+        lines.extend(timeline_resc_lines(scenario_timeline, run_seconds))
+    else:
+        lines.append(f"sleep {run_seconds:.1f}")
     # Final-state snapshot: read each referenced port's ODR between echo markers so the
     # parser can pair the hex value with its port (STM32F4 register map).
     for port in sorted({p for (p, _) in gpio_pins}):
@@ -434,7 +568,9 @@ class RenodeEmulator:
 
     def run(self, elf_path: str, platform_file: str, assertions: list[str],
             timeout_s: float = _DEFAULT_TIMEOUT_S,
-            gpio_regmap: Optional[dict] = None) -> SimResult:
+            gpio_regmap: Optional[dict] = None,
+            scenario: Optional[dict] = None,
+            mcu_caps: Optional[dict] = None) -> SimResult:
         """Launch Renode, capture output, evaluate assertions.
 
         Args:
@@ -444,6 +580,10 @@ class RenodeEmulator:
             timeout_s: Wall-clock timeout for the emulation run.
             gpio_regmap: Per-family GPIO ODR register map (T-FIN2,
                 ``platform_db.gpio_regmap_for``); defaults to the STM32F4 map.
+            scenario: Validated ``aicad.fwscenario/1`` dict (T-FIN3) — stimulus tracks
+                compiled into the generated .resc. A plan error is an honest refusal
+                (``passed=False``, ``scenario_error:`` in ``uart_log``), never a raise.
+            mcu_caps: T-FIN2 capability entry (needed when ``scenario`` is given).
 
         Returns:
             :class:`SimResult` — ``passed=False`` when Renode is absent (graceful).
@@ -458,9 +598,43 @@ class RenodeEmulator:
         # before `subprocess.run`'s timeout_s would otherwise kill it mid-run.
         run_seconds = max(1.0, timeout_s - 5.0)
         gpio_pins = _pins_from_assertions(assertions)
+
+        # Compile the scenario (T-FIN3) — pure plan first, then aux files on disk.
+        scenario_setup: Optional[list[str]] = None
+        scenario_timeline: Optional[list[tuple[float, str]]] = None
+        scenario_dir: Optional[tempfile.TemporaryDirectory] = None
+        if scenario:
+            from engine.firmware.scenario import build_scenario_plan, materialize_aux_files
+            from engine.firmware.platform_db import get_capabilities
+            caps = mcu_caps or get_capabilities("cortex-m")
+            try:
+                platform_text = Path(platform_file).read_text(encoding="utf-8")
+            except OSError:
+                platform_text = ""
+            plan = build_scenario_plan(scenario, caps, platform_text)
+            if plan.errors:
+                return SimResult(
+                    passed=False,
+                    uart_log="scenario_error: " + "; ".join(plan.errors),
+                    assertion_results=[AssertionResult(
+                        name=a, passed=False,
+                        detail="not evaluated: scenario invalid (see uart_log)")
+                        for a in assertions],
+                    ms=(time.perf_counter() - t0) * 1000.0)
+            scenario_dir = tempfile.TemporaryDirectory(prefix="aicad_scenario_")
+            materialize_aux_files(plan, Path(scenario_dir.name))
+            scenario_setup = plan.setup_lines
+            scenario_timeline = plan.timeline
+            # Ensure the run window covers the whole timeline (plus settle margin),
+            # and keep the subprocess timeout above it.
+            run_seconds = max(run_seconds, plan.duration_ms / 1000.0 + 1.0)
+            timeout_s = max(timeout_s, run_seconds + 5.0)
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".resc", delete=False) as f:
             f.write(_build_resc(elf_path, platform_file, run_seconds=run_seconds,
-                                gpio_pins=gpio_pins, gpio_regmap=gpio_regmap))
+                                gpio_pins=gpio_pins, gpio_regmap=gpio_regmap,
+                                scenario_setup_lines=scenario_setup,
+                                scenario_timeline=scenario_timeline))
             resc_path = f.name
 
         cmd = [self.BINARY, "--disable-xwt", "--console", resc_path]
@@ -485,14 +659,21 @@ class RenodeEmulator:
                 Path(resc_path).unlink(missing_ok=True)
             except Exception:
                 pass
+            if scenario_dir is not None:
+                try:
+                    scenario_dir.cleanup()
+                except Exception:
+                    pass
 
         uart_log = _cap(raw)
         # GPIO extraction (T-FIN1): hook events + end-of-run ODR snapshot from the raw log.
         gpio_events = parse_gpio_events(raw)
         gpio_states = derive_gpio_states(gpio_events, parse_renode_gpio_odr(raw))
+        uart_events = parse_uart_events(raw)
         trace_path = write_trace_artifact(elf_path, "renode", raw, gpio_events, gpio_states)
         assertion_results = evaluate_assertions(uart_log, gpio_states, assertions,
-                                                gpio_events=gpio_events)
+                                                gpio_events=gpio_events,
+                                                uart_events=uart_events)
         passed = all(a.passed for a in assertion_results) if assertion_results else True
         ms = (time.perf_counter() - t0) * 1000.0
         return SimResult(passed=passed, uart_log=uart_log, gpio_states=gpio_states,
@@ -563,7 +744,8 @@ class QEMUEmulator:
         gpio_states = derive_gpio_states(gpio_events)
         trace_path = write_trace_artifact(elf_path, "qemu", raw, gpio_events, gpio_states)
         assertion_results = evaluate_assertions(uart_log, gpio_states, assertions,
-                                                gpio_events=gpio_events)
+                                                gpio_events=gpio_events,
+                                                uart_events=parse_uart_events(raw))
         passed = all(a.passed for a in assertion_results) if assertion_results else True
         ms = (time.perf_counter() - t0) * 1000.0
         return SimResult(passed=passed, uart_log=uart_log, gpio_states=gpio_states,
@@ -576,8 +758,10 @@ class QEMUEmulator:
 # ---------------------------------------------------------------------------
 
 def _assertion_capability(assertion: str) -> str:
-    """Which platform capability an assertion needs: ``"gpio"`` for gpio:*, else ``"uart"``."""
-    return "gpio" if assertion.strip().startswith("gpio:") else "uart"
+    """Which platform capability an assertion needs: ``"gpio"`` for gpio:/toggles:/period:
+    (all read the pin-event stream), else ``"uart"`` (uart:/uart_within:/plain)."""
+    a = assertion.strip()
+    return "gpio" if a.startswith(("gpio:", "toggles:", "period:")) else "uart"
 
 
 def _unsupported_result(caps: dict, assertions: list[str], unsupported: list[str],
@@ -601,8 +785,14 @@ def _unsupported_result(caps: dict, assertions: list[str], unsupported: list[str
 
 
 def run_simulation(elf_path: str, mcu_family: str, assertions: list[str],
-                   timeout_s: float = _DEFAULT_TIMEOUT_S) -> SimResult:
+                   timeout_s: float = _DEFAULT_TIMEOUT_S,
+                   scenario: Optional[dict] = None) -> SimResult:
     """Top-level entry: pick Renode (with matching platform) or QEMU fallback.
+
+    ``scenario`` (T-FIN3) is a validated ``aicad.fwscenario/1`` dict — stimulus tracks
+    the Renode path compiles into the generated .resc. Scenarios are **Renode-only**:
+    QEMU has no external peripheral-stimulus surface, so a scenario on the QEMU path
+    (or with no emulator at all) is an honest refusal, never a silent drop.
 
     T-FIN2 honesty gates (checked BEFORE launching anything):
     - a family with ``emulation == "none"`` (ESP32) refuses outright — build+flash only;
@@ -630,6 +820,13 @@ def run_simulation(elf_path: str, mcu_family: str, assertions: list[str],
         unsupported = [a for a in assertions
                        if (_assertion_capability(a) == "gpio" and not caps["gpio_observe"])
                        or (_assertion_capability(a) == "uart" and not caps["uart"])]
+        if unsupported and scenario:
+            # A scenario pins the run to Renode (QEMU can't stimulate peripherals) —
+            # so an unobservable assertion cannot be rescued by the QEMU fallback.
+            return _unsupported_result(
+                caps, assertions, unsupported,
+                "platform cannot observe what the assertions need, and the scenario "
+                "requires the Renode path (QEMU has no peripheral stimulus)", t0)
         if unsupported:
             # The Renode platform can't observe what the assertions need. The QEMU
             # semihosting path can (firmware-side aicad_trace.h shim reports both UART
@@ -644,8 +841,19 @@ def run_simulation(elf_path: str, mcu_family: str, assertions: list[str],
                 f"platform lacks {' and '.join(missing)} required by the assertions "
                 f"and no QEMU semihosting fallback is installed", t0)
         return RenodeEmulator().run(str(elf_path), str(platform), assertions, timeout_s,
-                                    gpio_regmap=caps.get("gpio_regmap"))
+                                    gpio_regmap=caps.get("gpio_regmap"),
+                                    scenario=scenario, mcu_caps=caps)
     elif shutil.which(QEMUEmulator.BINARY):
+        if scenario:
+            return SimResult(
+                passed=False,
+                uart_log=("scenario_unsupported: stimulus scenarios need the Renode "
+                          "path (QEMU exposes no peripheral stimulus surface). "
+                          "Install Renode (https://renode.io) to run this scenario."),
+                assertion_results=[AssertionResult(
+                    name=a, passed=False,
+                    detail="not evaluated: scenario requires Renode") for a in assertions],
+                ms=(time.perf_counter() - t0) * 1000.0)
         return QEMUEmulator().run(str(elf_path), timeout_s, assertions)
     else:
         # Neither emulator available — honest graceful degradation

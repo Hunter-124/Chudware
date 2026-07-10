@@ -145,6 +145,17 @@ def fw_sim_run(params: dict) -> dict:
     esp32 build+flash only). When an assertion needs a peripheral the platform lacks,
     the run refuses honestly (``passed=False`` with a ``platform_capability`` reason)
     unless the QEMU semihosting fallback can cover it.
+
+    T-FIN3: ``scenario`` binds declarative sensor/GPIO stimulus to the emulated
+    peripherals (schema ``aicad.fwscenario/1``, contract §9). Accepts a dict, a JSON
+    string, or a fixture reference (``"fixture:i2c_temp_tmp103"`` — see
+    ``engine.firmware.fixtures.list_fixtures()``). Track kinds: gpio_edges / button /
+    quadrature / i2c_sensor (TMP103) / i2c_registers / spi_stub / uart_rx /
+    adc_waveform (Python-peripheral ADC stub; STM32 families only — no upstream ADC
+    model exists). Scenarios run on the Renode path only; an invalid scenario or an
+    unsupported track is an honest refusal (``scenario_error`` / ``scenario_unsupported``
+    in ``uart_log``), never a silent drop. New T-FIN3 assertion forms:
+    ``toggles:<PIN>>=<N>``, ``period:<PIN>=<P>ms±<TOL>ms``, ``uart_within:<text>@<T>ms``.
     """
     project_id = params.get("project_id")
     if not project_id:
@@ -173,11 +184,20 @@ def fw_sim_run(params: dict) -> dict:
 
     assertions: list[str] = list(params.get("assertions") or [])
 
+    # Scenario (T-FIN3): dict, JSON string, or fixture reference → validated dict.
+    from engine.firmware.scenario import load_scenario
+    scenario, scenario_errors = load_scenario(params.get("scenario"))
+    if scenario_errors:
+        return _err("invalid_scenario",
+                    "scenario failed aicad.fwscenario/1 validation",
+                    "; ".join(scenario_errors))
+
     result = run_simulation(
         elf_path=str(elf_path),
         mcu_family=project.mcu_family or "cortex-m4",
         assertions=assertions,
         timeout_s=float(params.get("timeout_s", 30)),
+        scenario=scenario,
     )
     return result.to_dict()
 

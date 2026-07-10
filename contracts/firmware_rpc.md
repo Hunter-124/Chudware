@@ -174,3 +174,52 @@ plus two GUI conveniences:
 Error posture is unchanged from §1: expected failures come back inside the result
 (`{code, message, detail}` envelope or `success=False` / `passed=False`), never a raised
 worker error.
+
+## 9. Sensor stimulus scenarios — `aicad.fwscenario/1` (T-FIN3, appended)
+
+The previously-reserved `scenario` param of `fw_sim_run` (§5) is now defined: a declarative
+set of time-series stimulus tracks bound to emulated peripherals, compiled into the generated
+Renode `.resc` (`engine/firmware/scenario.py`). Accepted as a dict, a JSON string, or a
+fixture reference `"fixture:<name>"` (library: `engine/firmware/fixtures/`, ≥4 sensor
+archetypes: `i2c_temp_tmp103`, `spi_imu_stub`, `quadrature_encoder`, `adc_thermistor`,
+`user_button`). Scenarios are **Renode-path only** — QEMU exposes no peripheral-stimulus
+surface; a scenario on the QEMU/no-emulator path refuses honestly (`scenario_unsupported` /
+`scenario_error` in `uart_log`, per-assertion `not evaluated` details), never a silent drop.
+A structurally invalid scenario is the error envelope `{code:"invalid_scenario", ...}`.
+
+| field | type | notes |
+|---|---|---|
+| `schema` | str | `"aicad.fwscenario/1"` |
+| `name` | str? | display name |
+| `tracks` | [track] | non-empty; each track has a `kind` from the table below |
+
+Track kinds (per-kind fields beyond `kind`):
+
+| kind | fields | Renode realisation |
+|---|---|---|
+| `gpio_edges` | `pin` (`"P<A-K><0-15>"`), `events: [{t_ms, level:0\|1}]` | `Miscellaneous.Button` gated onto the pin; `Press`/`Release` on the timeline |
+| `button` | `pin`, `presses: [{t_ms, hold_ms?=50}]` | as above — press/release pair per entry |
+| `quadrature` | `pin_a`, `pin_b`, `steps>=1`, `step_ms>0`, `start_ms?=0`, `direction?="cw"\|"ccw"` | two Buttons stepping the x4 Gray sequence 00→10→11→01 |
+| `i2c_sensor` | `model:"tmp103"`, `bus?="i2c1"`, `address`, `temperature_c` | upstream `Sensors.TMP103` attached at the address; `Temperature` set at setup |
+| `i2c_registers` | `bus?="i2c1"`, `address`, `response:[byte]` | `Mocks.DummyI2CSlave` + `EnqueueResponseByte` per byte |
+| `spi_stub` | `bus`, `name?` | `Mocks.DummySPISlave` (fixed-pattern connectivity stub; plan carries a warning) |
+| `uart_rx` | `uart?` (default: first UART in the .repl), `events: [{t_ms, text}]` | `sysbus.<uart> WriteChar <byte>` per byte on the timeline |
+| `adc_waveform` | `channel?`, `sample_ms?=1`, `waveform: {type:"sine"\|"ramp", min, max, period_ms}` or `{type:"samples", values:[num]}` | `Python.PythonPeripheral` mapped over the family's real ADC register block (SR/DR), feeding 12-bit samples — **no ADC model ships upstream**; only families with a registered stub window (stm32f4, stm32f1) support this; others refuse with an explanation |
+
+Timing model: timed actions are realised by monitor `sleep` interleaving (wall-clock, the
+same idiom as the base run window); after every sleep the script echoes
+`AICAD_T_MARK <ms>`, which the parser uses to coarsely time-stamp subsequent UART lines
+(`t_ms` on §7 uart events — previously always null, now filled when a scenario ran).
+Renode-side stimulus syntax is [~] not live-verified (Renode absent on the dev box);
+canned .resc-generation + schema tests carry coverage, per the §7 precedent.
+
+### 9.1 Assertion vocabulary extensions (extends §4/§7.3, append-only)
+
+| form | meaning |
+|---|---|
+| `toggles:<PIN><op><N>` (op: `>=` `<=` `==` `>` `<`) | the pin's level changed <op> N times over the run (event stream; timestamps not required) |
+| `period:<PIN>=<P>ms±<TOL>ms` (also `+-`) | mean interval between the pin's time-stamped rising edges is within P±TOL ms; needs ≥2 stamped rising edges, else fails with detail |
+| `uart_within:<text>@<T>ms` | a time-stamped UART event containing `<text>` occurs at or before T ms; without scenario time marks it fails with an explanatory detail |
+
+`toggles:`/`period:` require the `gpio_observe` capability (like `gpio:`);
+`uart_within:` requires `uart`.

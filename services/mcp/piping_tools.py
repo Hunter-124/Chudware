@@ -8,7 +8,9 @@ directly (``engine.piping.solve`` / ``engine.piping.schema``), and holds its own
 state so ``piping_report`` can reuse the document / result of the last ``piping_solve``.
 
 Tools:
-  piping_solve           aicad.piping/1 doc + boundary conditions -> node pressures/heads + link flows
+  piping_solve           aicad.piping/1 doc + boundary conditions -> node pressures/heads + link
+                         flows; also consumes externally-supplied networks (source_handoff=
+                         an aicad.simhandoff/1 envelope, e.g. from hydraulic_piping_handoff)
   piping_report          per-segment pressure-drop table with an explicit K-factor breakdown
   piping_internal_volume extract the internal fluid-domain solid from a pipe run (OCCT boolean)
   piping_cfd_handoff     1-D solve -> extract bore -> invoke run_cfd_flow (LBM) in one step
@@ -75,6 +77,40 @@ def _as_obj(x: Union[str, list, dict, None]) -> Any:
         s = x.strip()
         return json.loads(s) if s else None
     return x
+
+
+def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Optional[dict], list]":
+    """Extract (doc, boundary, fluid, errors) from an ``aicad.simhandoff/1`` handoff.
+
+    The hydraulic→piping coupling (and any future doc-to-doc producer) carries the
+    generated ``aicad.piping/1`` document INLINE in a geometry ref of ``kind:"doc"``
+    and the boundary conditions + fluid in the envelope's ``meta`` — this helper is
+    the consumer side of that shape. Module-level so tests can drive it engine-less.
+    """
+    errs: list = []
+    if not isinstance(env, dict):
+        return None, None, None, ["source_handoff must be an envelope object"]
+    if env.get("schema") != sh.SCHEMA and isinstance(env.get("simhandoff"), dict):
+        env = env["simhandoff"]  # accept a whole producer result too
+    verrs = sh.validate_envelope(env)
+    if verrs:
+        return None, None, None, [f"source_handoff invalid: {e}" for e in verrs]
+    if env.get("kind") != "handoff":
+        return None, None, None, ["source_handoff must be a handoff envelope"]
+    doc = None
+    for g in env.get("geometry", []):
+        if g.get("kind") == "doc" and isinstance(g.get("inline"), dict):
+            doc = g["inline"]
+            break
+    if doc is None:
+        errs.append("source_handoff carries no inline piping doc "
+                    "(geometry ref kind 'doc' with an inline payload)")
+    meta = env.get("meta") or {}
+    boundary = meta.get("boundary")
+    fluid = meta.get("fluid")
+    if boundary is None:
+        errs.append("source_handoff.meta.boundary missing")
+    return doc, boundary, fluid, errs
 
 
 def _node_menu(nodes: list) -> list:
@@ -152,10 +188,12 @@ def register_piping_tools(mcp) -> None:
     """
 
     @mcp.tool()
-    def piping_solve(doc: Union[str, dict], boundary: Union[str, list],
+    def piping_solve(doc: Union[str, dict, None] = None,
+                     boundary: Union[str, list, None] = None,
                      fluid: Union[str, dict, None] = None,
                      pumps: Union[str, list, None] = None,
-                     network_type: str = "liquid") -> str:
+                     network_type: str = "liquid",
+                     source_handoff: Union[str, dict, None] = None) -> str:
         """Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.
 
         ``doc`` is the piping document (a dict, a JSON string, or a path to a ``.json`` file) as
@@ -177,6 +215,14 @@ def register_piping_tools(mcp) -> None:
         pressures are kPa gauge, demands are ``mass_demand`` kg/h or ``std_demand`` Nm³/h, and
         links report ``mass_flow_kgh`` / ``std_flow_nm3h`` / ``dp_kpa``).
 
+        EXTERNALLY-SUPPLIED NETWORKS: ``source_handoff`` accepts an
+        ``aicad.simhandoff/1`` handoff envelope (or a producer result carrying one
+        under ``simhandoff``) — e.g. from ``hydraulic_piping_handoff``. The piping
+        doc is taken from the envelope's inline ``kind:"doc"`` geometry ref and the
+        boundary/fluid from its ``meta``; explicit ``doc``/``boundary``/``fluid``
+        arguments override the envelope's. The result then carries ``handoff_id``
+        so downstream verify steps can close the provenance chain.
+
         Node ids are derived by snapping coincident run endpoints; the result lists every node
         with its coordinates so you can address boundary conditions. Returns node
         pressures/heads, per-link flow / velocity / Reynolds / friction / pressure-drop, whether
@@ -188,9 +234,27 @@ def register_piping_tools(mcp) -> None:
             bc = _as_obj(boundary)
             fl = _as_obj(fluid)
             pp = _as_obj(pumps)
+            env = _as_obj(source_handoff)
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}",
                                hint="pass doc as JSON/dict/path and boundary as a JSON list"))
+
+        handoff_id = None
+        if env is not None:
+            hdoc, hbc, hfl, herrs = network_from_handoff(env)
+            if herrs and (d is None or bc is None):
+                return _dumps(_err("could not consume source_handoff",
+                                   hint="pass a hydraulic_piping_handoff result or its "
+                                        "simhandoff envelope", errors=herrs))
+            d = d if d is not None else hdoc
+            bc = bc if bc is not None else hbc
+            fl = fl if fl is not None else hfl
+            inner = env.get("simhandoff") if env.get("schema") != sh.SCHEMA else env
+            handoff_id = (inner or {}).get("id")
+        if d is None:
+            return _dumps(_err("doc is required (directly or via source_handoff)",
+                               hint="pass doc=<aicad.piping/1> or "
+                                    "source_handoff=<handoff envelope>"))
 
         errs = piping_schema.validate(d) if isinstance(d, dict) else ["doc is not an object"]
         if errs:
@@ -212,6 +276,8 @@ def register_piping_tools(mcp) -> None:
 
         _PIPING.update({"doc": d, "result": res, "boundary": bc, "fluid": fl, "pumps": pp})
         res["node_menu"] = _node_menu(res["nodes"])
+        if handoff_id:
+            res["handoff_id"] = handoff_id  # provenance: study spawned by a handoff
         return _dumps(res)
 
     @mcp.tool()

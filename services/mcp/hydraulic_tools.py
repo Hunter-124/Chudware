@@ -13,20 +13,35 @@ Tools:
   hydraulic_size_cylinder   size a hydraulic cylinder (force, flow, cycle time)
   hydraulic_size_pump       size a hydraulic pump (displacement, power, torque)
   hydraulic_bom             extract a sourcing BOM from the active circuit
+  hydraulic_piping_handoff  hose/tube runs -> piping 1D solver (real per-line pressure drops)
+  hydraulic_verify_piping   cross-check per-hose estimates vs piping solve + pump margin
+  hydraulic_fea_handoff     cylinder mount loads at max pressure -> static FEA load cases
+  hydraulic_verify_fea      cross-check envelope mount forces vs independent recompute
 
 Registration is deferred behind :func:`register_hydraulic_tools` so ``server.py`` wires us in
 with a tiny fenced block — mirrors :func:`register_piping_tools`.
+
+CONFORMANCE: ``hydraulic_piping_handoff`` / ``hydraulic_verify_piping`` and
+``hydraulic_fea_handoff`` / ``hydraulic_verify_fea`` conform to ``aicad.simhandoff/1``
+(contracts/sim_handoff.md — couplings ``hydraulic_to_piping`` and ``hydraulic_to_fea``).
+Successful results carry a validated envelope under the reserved ``simhandoff`` key
+(built exclusively through ``services.mcp.simhandoff``); pre-existing fields unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Optional, Union
 
 from engine.hydraulic import schema as hyd_schema
 from engine.hydraulic import solve as hyd_solve
 from engine.hydraulic import bom as hyd_bom
+from engine.piping import schema as piping_schema
+from engine.piping import solve as piping_solve_mod
+
+from services.mcp import simhandoff as sh
 
 # Session bookkeeping: the last active circuit document
 _HYD: dict = {"doc": None}
@@ -71,6 +86,363 @@ def _as_obj(x: Union[str, list, dict, None]) -> Any:
 
 def _active_doc() -> Optional[dict]:
     return _HYD.get("doc")
+
+
+# ── hydraulic → piping / FEA handoff helpers (module-level: engine-less testable) ──
+
+# ISO VG32 mineral hydraulic oil at ~40 °C — the default working fluid for line-loss
+# estimates and the piping solve (ν = 32 cSt, ρ = 870 kg/m³ → μ = ρ·ν ≈ 0.0278 Pa·s).
+HYDRAULIC_OIL = {"name": "hydraulic_oil_iso_vg32", "rho": 870.0, "mu": 0.0278}
+
+# Default absolute roughness for hose/tube bore (m) — matches the piping solver's
+# commercial-steel default so estimate vs solve compare like-for-like.
+_HOSE_EPS_M = 4.6e-5
+
+# Lateral spacing (mm) between generated runs so endpoint snapping never merges
+# two independent hose lines into one network node.
+_LINE_SPACING_MM = 10_000.0
+
+
+def estimate_line_dp(*, flow_lpm: float, id_mm: float, length_mm: float,
+                     rho: float = HYDRAULIC_OIL["rho"],
+                     mu: float = HYDRAULIC_OIL["mu"],
+                     eps_m: float = _HOSE_EPS_M) -> dict:
+    """Cheap per-hose Darcy–Weisbach pressure-drop estimate (pure math, no deps).
+
+    This is the hydraulic-side prediction that ``hydraulic_verify_piping`` later
+    cross-checks against the piping 1-D solve: laminar f = 64/Re below Re 2300,
+    Swamee–Jain explicit Colebrook approximation above. Returns
+    ``{ok, velocity_ms, reynolds, friction, regime, dp_kpa}``.
+    """
+    if flow_lpm <= 0 or id_mm <= 0 or length_mm <= 0:
+        return {"ok": False, "reason": "flow_lpm, id_mm, length_mm must all be > 0"}
+    d_m = id_mm / 1000.0
+    area = math.pi / 4.0 * d_m ** 2
+    q_m3s = flow_lpm / 60_000.0
+    v = q_m3s / area
+    re = rho * v * d_m / mu
+    if re < 2300.0:
+        f = 64.0 / max(re, 1e-9)
+        regime = "laminar"
+    else:
+        f = 0.25 / math.log10(eps_m / (3.7 * d_m) + 5.74 / re ** 0.9) ** 2
+        regime = "turbulent (Swamee-Jain)"
+    dp_pa = f * (length_mm / 1000.0) / d_m * 0.5 * rho * v ** 2
+    return {
+        "ok": True,
+        "velocity_ms": round(v, 4),
+        "reynolds": round(re, 1),
+        "friction": round(f, 5),
+        "regime": regime,
+        "dp_kpa": round(dp_pa / 1000.0, 4),
+    }
+
+
+def _line_spec(hose: dict, override: dict, default_id_mm: float,
+               default_length_mm: float, default_flow_lpm: float) -> dict:
+    """Resolve one hose's line geometry/flow: explicit override > hose fields > defaults."""
+    def pick(key, default):
+        v = override.get(key)
+        if v is None:
+            v = hose.get(key)
+        return float(v) if v is not None else float(default)
+    return {
+        "id_mm": pick("id_mm", default_id_mm),
+        "length_mm": pick("length_mm", default_length_mm),
+        "flow_lpm": pick("flow_lpm", default_flow_lpm),
+    }
+
+
+def hoses_to_piping(hyd_doc: dict, *, flow_lpm: float, supply_pressure_bar: float,
+                    lines: Optional[dict] = None,
+                    default_id_mm: float = 12.7,
+                    default_length_mm: float = 1000.0,
+                    fluid: Optional[dict] = None) -> dict:
+    """Translate a hydraulic circuit's hose nets into an ``aicad.piping/1`` network.
+
+    Each hose becomes one straight pipe run with an EXPLICIT ``bore_mm`` (hose inner
+    diameter — SAE dash sizes don't exist in the NPS schedule catalog, so the run
+    carries the exact bore and the solver skips the catalog lookup). Runs are spaced
+    apart so each line solves independently: boundary = supply pressure fixed at the
+    run start + the line's flow drawn at the run end.
+
+    Per-hose geometry/flow comes from (in priority order) the ``lines`` override map
+    ``{hose_id: {id_mm, length_mm, flow_lpm}}``, fields stored on the hose object
+    itself, then the defaults. Returns ``{ok, piping_doc, boundary, lines, fluid,
+    estimates, warnings}`` — ``estimates`` is the per-line Darcy prediction that the
+    later verify step cross-checks against the solve.
+    """
+    hoses = hyd_doc.get("hoses") or []
+    if not hoses:
+        return {"ok": False, "reason": "hydraulic circuit has no hoses",
+                "hint": "call hydraulic_add_hose first"}
+    lines = lines or {}
+    fl = dict(fluid) if fluid else dict(HYDRAULIC_OIL)
+
+    pdoc = piping_schema.new_piping(f"{hyd_doc.get('name', 'Hydraulic')} - hose runs")
+    boundary: list = []
+    line_rows: list = []
+    estimates: dict = {}
+    warnings: list = []
+    supply_kpa = supply_pressure_bar * 100.0
+
+    for i, hose in enumerate(hoses):
+        spec = _line_spec(hose, lines.get(hose.get("id"), {}) or {},
+                          default_id_mm, default_length_mm, flow_lpm)
+        rid = piping_schema.next_id(pdoc, "r")
+        y = i * _LINE_SPACING_MM
+        run = piping_schema.new_pipe_run(
+            rid, [[0.0, y, 0.0], [spec["length_mm"], y, 0.0]],
+            nps=round(spec["id_mm"] / 25.4, 4), schedule="40",
+            name=hose.get("net_name") or rid, bore_mm=spec["id_mm"])
+        pdoc["runs"].append(run)
+        q_m3h = spec["flow_lpm"] * 60.0 / 1000.0
+        boundary.append({"run": rid, "end": "start", "pressure": supply_kpa})
+        boundary.append({"run": rid, "end": "end", "demand": q_m3h})
+        est = estimate_line_dp(flow_lpm=spec["flow_lpm"], id_mm=spec["id_mm"],
+                               length_mm=spec["length_mm"],
+                               rho=fl.get("rho", HYDRAULIC_OIL["rho"]),
+                               mu=fl.get("mu", HYDRAULIC_OIL["mu"]))
+        if not est.get("ok"):
+            warnings.append(f"{hose.get('id')}: estimate failed: {est.get('reason')}")
+        estimates[rid] = est
+        line_rows.append({"hose_id": hose.get("id"), "net_name": hose.get("net_name"),
+                          "run_id": rid, **spec, "flow_m3h": round(q_m3h, 6)})
+
+    errs = piping_schema.validate(pdoc)
+    if errs:  # producer bug — surface loudly but contract-shaped
+        return {"ok": False, "reason": "generated piping doc failed schema validation",
+                "errors": errs}
+    return {"ok": True, "piping_doc": pdoc, "boundary": boundary, "lines": line_rows,
+            "fluid": fl, "estimates": estimates, "warnings": warnings}
+
+
+def _piping_handoff_envelope(hyd_doc: dict, net: dict,
+                             supply_pressure_bar: float) -> dict:
+    """aicad.simhandoff/1 handoff envelope for the hydraulic→piping coupling.
+
+    Doc-to-doc coupling: the generated ``aicad.piping/1`` document rides INLINE in a
+    ``geometry_ref`` (contract §1 table, ``hydraulic_to_piping`` row) together with
+    the boundary conditions + fluid in ``meta`` so ``piping_solve(source_handoff=...)``
+    can consume the envelope with no other arguments.
+    """
+    conditions = [sh.condition(
+        "supply_pressure", "pressure", supply_pressure_bar * 100.0, "kPa",
+        "hydraulic circuit operating pressure (supply_pressure_bar x 100)",
+        applied_to="all run starts")]
+    expectations = []
+    for row in net["lines"]:
+        rid = row["run_id"]
+        conditions.append(sh.condition(
+            f"{rid}_flow", "flow", row["flow_m3h"], "m3/h",
+            f"hydraulic hose {row['hose_id']} ({row['net_name']}) flow_lpm",
+            applied_to=rid))
+        est = net["estimates"].get(rid) or {}
+        if est.get("ok"):
+            expectations.append(sh.expectation(
+                f"pressure_drop:{rid}", est["dp_kpa"], "kPa",
+                f"per-hose Darcy estimate (estimate_line_dp, {est['regime']}) "
+                f"for hose {row['hose_id']}"))
+    return sh.build_handoff(
+        "hydraulic_to_piping",
+        sh.study_ref("hydraulic", "hydraulic_piping_handoff",
+                     doc_id=hyd_doc.get("id"),
+                     result_digest={"hoses": len(net["lines"]),
+                                    "supply_pressure_bar": supply_pressure_bar}),
+        sh.study_ref("piping", "piping_solve"),
+        geometry=[sh.geometry_ref("doc", "doc", inline=net["piping_doc"],
+                                  derived_by="hoses_to_piping", units="mm")],
+        conditions=conditions,
+        expectations=expectations or None,
+        warnings=net.get("warnings") or None,
+        meta={"boundary": net["boundary"], "fluid": net["fluid"],
+              "lines": net["lines"]})
+
+
+def _margin_update(supply_pressure_bar: float, load_pressure_bar: Optional[float],
+                   est_loss_bar: Optional[float],
+                   solved_loss_bar: Optional[float]) -> dict:
+    """Pump sizing margin fed back from line losses (real losses change the margin)."""
+    out: dict[str, Any] = {"supply_pressure_bar": supply_pressure_bar,
+                           "load_pressure_bar": load_pressure_bar,
+                           "line_loss_estimate_bar": est_loss_bar,
+                           "line_loss_solved_bar": solved_loss_bar}
+    if load_pressure_bar is not None:
+        if est_loss_bar is not None:
+            out["pump_margin_estimate_bar"] = round(
+                supply_pressure_bar - load_pressure_bar - est_loss_bar, 4)
+        if solved_loss_bar is not None:
+            out["pump_margin_solved_bar"] = round(
+                supply_pressure_bar - load_pressure_bar - solved_loss_bar, 4)
+            out["pump_margin_solved_pct"] = round(
+                out["pump_margin_solved_bar"] / supply_pressure_bar * 100.0, 2)
+    return out
+
+
+def _verify_piping_envelope(handoff: dict, solve_res: dict,
+                            tolerance_pct: float) -> "tuple[dict, list]":
+    """Build the hydraulic→piping verify envelope: per-line estimate vs solved dP.
+
+    Returns ``(envelope, checks)``. Expectation quantities are
+    ``pressure_drop:<run_id>``; solved values come from the matching solve link's
+    ``dp_kpa``. Deviation is relative to the SOLVED value (the trusted number).
+    """
+    links = {lk.get("id"): lk for lk in solve_res.get("links", [])}
+    checks = []
+    for exp in handoff.get("expectations") or []:
+        q = exp["quantity"]
+        rid = q.split(":", 1)[1] if ":" in q else q
+        lk = links.get(rid)
+        if lk is None:
+            continue
+        solved = abs(float(lk.get("dp_kpa", 0.0)))
+        est = float(exp["value"])
+        base = max(abs(solved), 1e-9)
+        dev = abs(solved - est) / base * 100.0
+        checks.append(sh.check(q, "kPa", est, round(solved, 4),
+                               round(dev, 2), tolerance_pct, dev <= tolerance_pct))
+    n_pass = sum(1 for c in checks if c["pass"])
+    verdict = (f"PASS: {n_pass}/{len(checks)} hose-line dP estimates within "
+               f"{tolerance_pct}% of the piping 1D solve"
+               if checks and n_pass == len(checks) else
+               f"FAIL: {len(checks) - n_pass}/{len(checks)} hose-line dP estimates "
+               f"deviate more than {tolerance_pct}% from the piping 1D solve")
+    env = sh.build_verify(
+        "hydraulic_to_piping",
+        sh.study_ref("hydraulic", "hydraulic_piping_handoff"),
+        sh.study_ref("piping", "piping_solve", handoff_id=handoff.get("id")),
+        checks, verdict, handoff_id=handoff.get("id"))
+    return env, checks
+
+
+def _unit3(axis) -> list:
+    v = [float(c) for c in (axis or [0.0, 0.0, 1.0])]
+    if len(v) != 3:
+        raise ValueError("axis must be a 3-vector")
+    n = math.sqrt(sum(c * c for c in v))
+    if n <= 0:
+        raise ValueError("axis must be non-zero")
+    return [c / n for c in v]
+
+
+def _cylinder_mount_forces(*, bore_mm: float, rod_mm: float, max_pressure_bar: float,
+                           efficiency: float = 1.0) -> dict:
+    """Mount reaction magnitudes (N) at max pressure — full bore extend, annulus retract."""
+    a_bore = math.pi / 4.0 * (bore_mm * 1e-3) ** 2
+    a_ann = math.pi / 4.0 * ((bore_mm * 1e-3) ** 2 - (rod_mm * 1e-3) ** 2)
+    p_pa = max_pressure_bar * 1e5
+    return {"extend_n": a_bore * p_pa * efficiency,
+            "retract_n": a_ann * p_pa * efficiency}
+
+
+def _fea_handoff_envelope(*, bore_mm: float, rod_mm: float, max_pressure_bar: float,
+                          axis: list, efficiency: float,
+                          load_face: str, fixture_face: str,
+                          doc_id: Optional[str] = None,
+                          target_doc_id: Optional[str] = None) -> dict:
+    """aicad.simhandoff/1 handoff envelope for the hydraulic→FEA coupling.
+
+    Mirrors the ``motion_to_fea`` pattern (contract §1 table): one force condition per
+    load case (``case`` labels group extend/retract), plus the shared fixture. Extend
+    thrust reacts INTO the mount (−axis); retract pulls the mount toward the load
+    (+axis). Geometry may be empty (doc-to-doc) — the mounting geometry lives in the
+    target FEA document when ``target_doc_id`` is given.
+    """
+    f = _cylinder_mount_forces(bore_mm=bore_mm, rod_mm=rod_mm,
+                               max_pressure_bar=max_pressure_bar,
+                               efficiency=efficiency)
+    ax = _unit3(axis)
+    ext_vec = [round(-c * f["extend_n"], 3) for c in ax]
+    ret_vec = [round(c * f["retract_n"], 3) for c in ax]
+    prov = (f"hydraulic cylinder bore {bore_mm} mm rod {rod_mm} mm at max pressure "
+            f"{max_pressure_bar} bar (area x pressure x efficiency {efficiency})")
+    conditions = [
+        sh.condition("mount_force_extend", "force", ext_vec, "N",
+                     prov + " - extend, full-bore area, reaction into mount (-axis)",
+                     applied_to=load_face, case="extend_max_pressure"),
+        sh.condition("mount_force_retract", "force", ret_vec, "N",
+                     prov + " - retract, annulus area, reaction toward load (+axis)",
+                     applied_to=load_face, case="retract_max_pressure"),
+        sh.condition("mount_fixture", "fixture", {"type": "fixed"}, "1",
+                     "mounting structure support (held fixed in every load case)",
+                     applied_to=fixture_face),
+    ]
+    expectations = [
+        sh.expectation("mount_force:extend_max_pressure", round(f["extend_n"], 3), "N",
+                       "pi/4*bore^2 x max pressure x efficiency"),
+        sh.expectation("mount_force:retract_max_pressure", round(f["retract_n"], 3), "N",
+                       "pi/4*(bore^2-rod^2) x max pressure x efficiency"),
+    ]
+    return sh.build_handoff(
+        "hydraulic_to_fea",
+        sh.study_ref("hydraulic", "hydraulic_fea_handoff", doc_id=doc_id,
+                     result_digest={"bore_mm": bore_mm, "rod_mm": rod_mm,
+                                    "max_pressure_bar": max_pressure_bar,
+                                    "efficiency": efficiency,
+                                    "extend_force_n": round(f["extend_n"], 3),
+                                    "retract_force_n": round(f["retract_n"], 3)}),
+        sh.study_ref("fea", "run_fea_static", doc_id=target_doc_id),
+        geometry=([sh.geometry_ref("mount", "doc_id", doc_id=target_doc_id,
+                                   derived_by="caller-supplied mounting geometry")]
+                  if target_doc_id else []),
+        conditions=conditions,
+        expectations=expectations,
+        meta={"axis": ax, "bore_mm": bore_mm, "rod_mm": rod_mm,
+              "max_pressure_bar": max_pressure_bar, "efficiency": efficiency})
+
+
+def _verify_fea_envelope(handoff: dict, tolerance_pct: float,
+                         fea_result: Optional[dict] = None) -> dict:
+    """Verify envelope for hydraulic→FEA: independently recompute A×P mount forces
+    from the envelope's meta and compare against |force| of each case condition —
+    the cross-check that the load case landed with the correct force magnitude.
+    Direction (colinearity with the cylinder axis) is checked into warnings.
+    ``fea_result`` (a run_fea_static summary), when given, rides as an advisory.
+    """
+    meta = handoff.get("meta") or {}
+    f = _cylinder_mount_forces(bore_mm=float(meta["bore_mm"]),
+                               rod_mm=float(meta.get("rod_mm", 0.0)),
+                               max_pressure_bar=float(meta["max_pressure_bar"]),
+                               efficiency=float(meta.get("efficiency", 1.0)))
+    want = {"extend_max_pressure": f["extend_n"],
+            "retract_max_pressure": f["retract_n"]}
+    axis = meta.get("axis")
+    checks = []
+    warnings: list = []
+    for cond in handoff.get("conditions", []):
+        case = cond.get("case")
+        if cond.get("kind") != "force" or case not in want:
+            continue
+        vec = cond["value"]
+        mag = math.sqrt(sum(float(c) ** 2 for c in vec))
+        expect = want[case]
+        dev = abs(mag - expect) / max(expect, 1e-9) * 100.0
+        checks.append(sh.check(f"mount_force:{case}", "N", round(expect, 3),
+                               round(mag, 3), round(dev, 3), tolerance_pct,
+                               dev <= tolerance_pct))
+        if axis and mag > 0:
+            cosang = abs(sum(float(a) * float(c) for a, c in zip(axis, vec))) / mag
+            if cosang < 0.999:
+                warnings.append(f"{case}: force vector not colinear with cylinder "
+                                f"axis (|cos| = {cosang:.4f})")
+    ok = bool(checks) and all(c["pass"] for c in checks)
+    verdict = (f"PASS: all {len(checks)} mount-load case force magnitudes match "
+               f"the independent area x pressure recompute within {tolerance_pct}%"
+               if ok else "FAIL: mount-load force magnitude(s) deviate from the "
+                          "independent area x pressure recompute")
+    advisories = None
+    if isinstance(fea_result, dict):
+        summ = fea_result.get("summary") or fea_result
+        detail = {k: summ.get(k) for k in
+                  ("max_von_mises_mpa", "max_disp_mm", "min_fos") if k in summ}
+        if detail:
+            advisories = [{"name": "fea_static_summary", "detail": detail}]
+    return sh.build_verify(
+        "hydraulic_to_fea",
+        sh.study_ref("hydraulic", "hydraulic_fea_handoff"),
+        sh.study_ref("fea", "run_fea_static", handoff_id=handoff.get("id")),
+        checks, verdict, handoff_id=handoff.get("id"),
+        advisories=advisories, warnings=warnings or None)
 
 
 def register_hydraulic_tools(mcp) -> None:
@@ -342,3 +714,303 @@ def register_hydraulic_tools(mcp) -> None:
                 "pass bom_lines to bom_rollup at B-chain merge time (T-E5 seam)",
             ],
         })
+
+    @mcp.tool()
+    def hydraulic_piping_handoff(supply_pressure_bar: float,
+                                 flow_lpm: float,
+                                 load_pressure_bar: Optional[float] = None,
+                                 lines: Union[str, dict, None] = None,
+                                 fluid: Union[str, dict, None] = None,
+                                 default_id_mm: float = 12.7,
+                                 default_length_mm: float = 1000.0,
+                                 tolerance_pct: float = 30.0,
+                                 doc: Union[str, dict, None] = None) -> str:
+        """Hand the circuit's hose/tube runs to the piping 1-D solver for REAL per-line
+        pressure drops at the operating point — replacing per-hose estimates — and feed
+        the losses back into the pump sizing margin.
+
+        Each hose in the active ``aicad.hydraulic/1`` circuit becomes a straight pipe
+        run with its exact bore (``bore_mm``, since SAE hose sizes aren't NPS catalog
+        pipes). ``supply_pressure_bar`` is the circuit operating pressure (fixed at
+        every run start); ``flow_lpm`` the default line flow. Per-hose overrides go in
+        ``lines`` = ``{hose_id: {"id_mm":.., "length_mm":.., "flow_lpm":..}}`` (the
+        same keys are also read from fields stored on the hose object itself).
+        ``fluid`` overrides the default ISO VG32 oil ``{"rho":870,"mu":0.0278}``.
+
+        When the ``fluids`` library is installed the piping solve runs LIVE here and
+        the result includes per-line dP + the updated pump margin
+        (``margin.pump_margin_solved_bar`` = supply − load − real line losses, needs
+        ``load_pressure_bar``) plus the estimate-vs-solve verify verdict. When it is
+        absent the tool returns ``stage: "solve_pending"`` with everything needed to
+        run the solve elsewhere: ``piping_solve(source_handoff=<simhandoff>)``.
+
+        Conforms to ``aicad.simhandoff/1`` (coupling ``hydraulic_to_piping``): the
+        generated piping doc rides INLINE in the envelope's geometry ref, per-line
+        flows are conditions, and the per-hose Darcy estimates are expectations that
+        ``hydraulic_verify_piping`` cross-checks at ``tolerance_pct``.
+        """
+        try:
+            d = _load_doc(doc) if doc is not None else _active_doc()
+            ln = _as_obj(lines)
+            fl = _as_obj(fluid)
+        except (ValueError, TypeError, OSError) as exc:
+            return _dumps(_err(f"could not parse inputs: {exc}"))
+        if d is None:
+            return _dumps(_err("no active hydraulic circuit",
+                               hint="call hydraulic_new first, or pass doc=<circuit>"))
+        errs = hyd_schema.validate_hydraulic(d)
+        if errs:
+            return _dumps(_err("hydraulic document failed schema validation",
+                               errors=errs))
+        if supply_pressure_bar <= 0 or flow_lpm <= 0:
+            return _dumps(_err("supply_pressure_bar and flow_lpm must be > 0"))
+
+        net = hoses_to_piping(d, flow_lpm=flow_lpm,
+                              supply_pressure_bar=supply_pressure_bar,
+                              lines=ln, default_id_mm=default_id_mm,
+                              default_length_mm=default_length_mm, fluid=fl)
+        if not net.get("ok"):
+            return _dumps(net)
+
+        env = _piping_handoff_envelope(d, net, supply_pressure_bar)
+        est_loss_bar = None
+        ests = [e for e in net["estimates"].values() if e.get("ok")]
+        if ests:
+            est_loss_bar = round(sum(e["dp_kpa"] for e in ests) / 100.0, 4)
+
+        base = {
+            "ok": True,
+            "piping_doc": net["piping_doc"],
+            "boundary": net["boundary"],
+            "fluid": net["fluid"],
+            "lines": net["lines"],
+            "estimates": net["estimates"],
+            "warnings": net["warnings"],
+        }
+
+        if not piping_solve_mod.have_fluids():
+            base.update({
+                "stage": "solve_pending",
+                "solve": None,
+                "margin": _margin_update(supply_pressure_bar, load_pressure_bar,
+                                         est_loss_bar, None),
+                "hint": ("fluids library not installed — per-hose Darcy estimates "
+                         "returned; run the live solve with pip install fluids, then "
+                         "piping_solve(source_handoff=<this result's simhandoff>)"),
+                "next_actions": [
+                    "pip install fluids (MIT) to enable the live piping solve",
+                    "piping_solve(source_handoff=<simhandoff envelope>) elsewhere",
+                    "hydraulic_verify_piping(handoff, solve_result) once solved",
+                ],
+            })
+            return _dumps(sh.attach(base, env))
+
+        solve_res = piping_solve_mod.solve(net["piping_doc"],
+                                           boundary=net["boundary"],
+                                           fluid=net["fluid"])
+        if not solve_res.get("ok"):
+            base.update({"stage": "solve_failed", "solve": solve_res})
+            return _dumps(sh.attach(base, env))
+
+        _HYD["piping_handoff"] = {"handoff": env, "solve": solve_res}
+        verify_env, checks = _verify_piping_envelope(env, solve_res, tolerance_pct)
+        solved_loss_bar = round(sum(abs(lk.get("dp_kpa", 0.0))
+                                    for lk in solve_res.get("links", [])) / 100.0, 4)
+        base.update({
+            "stage": "solved",
+            "solve": solve_res,
+            "per_line_dp_kpa": {lk["id"]: lk.get("dp_kpa")
+                                for lk in solve_res.get("links", [])},
+            "margin": _margin_update(supply_pressure_bar, load_pressure_bar,
+                                     est_loss_bar, solved_loss_bar),
+            "verify": {"pass": verify_env["pass"], "verdict": verify_env["verdict"],
+                       "checks": checks},
+            "next_actions": [
+                "hydraulic_verify_piping() to get the full verify envelope",
+                "hydraulic_size_pump(flow_lpm, supply_pressure_bar) if the margin "
+                "went negative — hose losses are now real, not estimated",
+            ],
+        })
+        return _dumps(sh.attach(base, env))
+
+    @mcp.tool()
+    def hydraulic_verify_piping(handoff: Union[str, dict, None] = None,
+                                solve_result: Union[str, dict, None] = None,
+                                supply_pressure_bar: Optional[float] = None,
+                                load_pressure_bar: Optional[float] = None,
+                                tolerance_pct: float = 30.0) -> str:
+        """Verify step for the hydraulic→piping coupling: per-hose Darcy estimate vs
+        piping 1-D solve, per line, plus the pump-margin feedback.
+
+        ``handoff`` is the ``simhandoff`` envelope from ``hydraulic_piping_handoff``
+        (or the whole result — the envelope is pulled from its ``simhandoff`` key);
+        ``solve_result`` is the ``piping_solve`` output for the generated network.
+        With no arguments, uses the session's last live handoff+solve pair.
+
+        Each check compares one line's estimated dP (envelope expectation
+        ``pressure_drop:<run_id>``) against the solved link ``dp_kpa`` at
+        ``tolerance_pct`` (deviation relative to the solved value). Pass
+        ``supply_pressure_bar``/``load_pressure_bar`` to also get the updated pump
+        margin from the REAL losses. Returns ``{ok, pass, verdict, checks, margin}``
+        with a validated ``aicad.simhandoff/1`` verify envelope under ``simhandoff``.
+        """
+        try:
+            h = _as_obj(handoff)
+            srs = _as_obj(solve_result)
+        except (ValueError, TypeError) as exc:
+            return _dumps(_err(f"could not parse inputs: {exc}"))
+        sess = _HYD.get("piping_handoff") or {}
+        if h is None:
+            h = sess.get("handoff")
+        elif isinstance(h, dict) and h.get("schema") != sh.SCHEMA:
+            h = h.get("simhandoff")
+        if srs is None:
+            srs = sess.get("solve")
+        if not isinstance(h, dict) or h.get("kind") != "handoff":
+            return _dumps(_err("no hydraulic→piping handoff envelope",
+                               hint="call hydraulic_piping_handoff first, or pass "
+                                    "handoff=<result or its simhandoff envelope>"))
+        if not isinstance(srs, dict) or not srs.get("links"):
+            return _dumps(_err("no piping solve result with links to verify against",
+                               hint="pass solve_result=<piping_solve output>"))
+
+        env, checks = _verify_piping_envelope(h, srs, float(tolerance_pct))
+        if not checks:
+            return _dumps(_err("no comparable lines (expectations vs solve links)",
+                               hint="the handoff had no dP expectations or the solve "
+                                    "links don't match its run ids"))
+        solved_loss_bar = round(sum(abs(lk.get("dp_kpa", 0.0))
+                                    for lk in srs.get("links", [])) / 100.0, 4)
+        est_loss_bar = None
+        exps = h.get("expectations") or []
+        if exps:
+            est_loss_bar = round(sum(float(e["value"]) for e in exps) / 100.0, 4)
+        result = {
+            "ok": True,
+            "pass": env["pass"],
+            "verdict": env["verdict"],
+            "checks": checks,
+            "tolerance_pct": float(tolerance_pct),
+            "margin": (_margin_update(supply_pressure_bar, load_pressure_bar,
+                                      est_loss_bar, solved_loss_bar)
+                       if supply_pressure_bar is not None else None),
+            "warnings": [],
+        }
+        return _dumps(sh.attach(result, env))
+
+    @mcp.tool()
+    def hydraulic_fea_handoff(bore_mm: float,
+                              max_pressure_bar: float,
+                              rod_mm: float = 0.0,
+                              axis: Union[str, list, None] = None,
+                              load_face: str = "the cylinder mount face",
+                              fixture_face: str = "the base",
+                              efficiency: float = 1.0,
+                              target_doc_id: Optional[str] = None,
+                              doc: Union[str, dict, None] = None) -> str:
+        """Turn cylinder/actuator mount loads at max pressure into static-FEA load
+        cases on the mounting geometry (companion of the motion→FEA pattern).
+
+        Computes the mount reaction at ``max_pressure_bar``: extend thrust =
+        π/4·bore² · P (full bore, reacts INTO the mount along −axis) and retract pull
+        = π/4·(bore²−rod²) · P (annulus, +axis). ``axis`` is the cylinder axis in the
+        mount document's world frame (default [0,0,1]); ``load_face`` /
+        ``fixture_face`` are plain-word face queries on the mounting part;
+        ``target_doc_id`` names the open FEA target document when known.
+
+        Returns ready-to-call ``run_fea_static`` argument sets under ``fea_args``
+        (one per load case: ``extend_max_pressure``, ``retract_max_pressure``) plus a
+        validated ``aicad.simhandoff/1`` handoff envelope (coupling
+        ``hydraulic_to_fea``) whose conditions carry the force vectors with ``case``
+        labels and whose expectations record the A×P magnitudes for
+        ``hydraulic_verify_fea`` to cross-check. This tool does NOT run the solve —
+        pass ``fea_args`` straight to ``run_fea_static(doc_id=target_doc_id, ...)``.
+        """
+        try:
+            ax = _unit3(_as_obj(axis))
+            d = _load_doc(doc) if doc is not None else _active_doc()
+        except (ValueError, TypeError, OSError) as exc:
+            return _dumps(_err(f"could not parse inputs: {exc}",
+                               hint="axis must be a non-zero [x,y,z] vector"))
+        if bore_mm <= 0 or max_pressure_bar <= 0:
+            return _dumps(_err("bore_mm and max_pressure_bar must be > 0"))
+        if rod_mm < 0 or rod_mm >= bore_mm:
+            return _dumps(_err("rod_mm must be in [0, bore_mm)"))
+        if not (0.0 < efficiency <= 1.0):
+            return _dumps(_err("efficiency must be in (0, 1]"))
+
+        env = _fea_handoff_envelope(
+            bore_mm=float(bore_mm), rod_mm=float(rod_mm),
+            max_pressure_bar=float(max_pressure_bar), axis=ax,
+            efficiency=float(efficiency), load_face=load_face,
+            fixture_face=fixture_face,
+            doc_id=(d or {}).get("id") if isinstance(d, dict) else None,
+            target_doc_id=target_doc_id)
+        _HYD["fea_handoff"] = env
+
+        fea_args = {}
+        for cond in env["conditions"]:
+            if cond.get("kind") != "force":
+                continue
+            fea_args[cond["case"]] = {
+                "fixtures": [fixture_face],
+                "loads": [{"face": load_face, "force": cond["value"]}],
+                **({"doc_id": target_doc_id} if target_doc_id else {}),
+            }
+        forces = env["source"]["result_digest"]
+        result = {
+            "ok": True,
+            "extend_force_n": forces["extend_force_n"],
+            "retract_force_n": forces["retract_force_n"],
+            "axis": ax,
+            "cases": sorted(fea_args),
+            "fea_args": fea_args,
+            "warnings": [],
+            "hint": ("run each case: run_fea_static(**fea_args['extend_max_pressure']) "
+                     "etc., then hydraulic_verify_fea(fea_result=<summary>)"),
+            "next_actions": [
+                "run_fea_static(**fea_args[case]) for each load case",
+                "hydraulic_verify_fea() to cross-check force magnitude/direction",
+            ],
+        }
+        return _dumps(sh.attach(result, env))
+
+    @mcp.tool()
+    def hydraulic_verify_fea(handoff: Union[str, dict, None] = None,
+                             fea_result: Union[str, dict, None] = None,
+                             tolerance_pct: float = 0.5) -> str:
+        """Verify step for the hydraulic→FEA coupling: recompute the mount forces
+        independently (area × max pressure from the envelope's recorded cylinder
+        parameters) and check each load-case force condition matches in magnitude at
+        ``tolerance_pct`` — plus a colinearity warning if a vector drifted off the
+        cylinder axis. ``handoff`` defaults to the session's last
+        ``hydraulic_fea_handoff`` envelope (or pass that tool's result).
+        ``fea_result`` (a ``run_fea_static`` output) is attached as an advisory
+        (max stress / displacement / FoS) — it does not gate the verdict.
+
+        Returns ``{ok, pass, verdict, checks}`` with a validated
+        ``aicad.simhandoff/1`` verify envelope under ``simhandoff``.
+        """
+        try:
+            h = _as_obj(handoff)
+            fr = _as_obj(fea_result)
+        except (ValueError, TypeError) as exc:
+            return _dumps(_err(f"could not parse inputs: {exc}"))
+        if h is None:
+            h = _HYD.get("fea_handoff")
+        elif isinstance(h, dict) and h.get("schema") != sh.SCHEMA:
+            h = h.get("simhandoff")
+        if not isinstance(h, dict) or h.get("kind") != "handoff" \
+                or not (h.get("meta") or {}).get("bore_mm"):
+            return _dumps(_err("no hydraulic→FEA handoff envelope",
+                               hint="call hydraulic_fea_handoff first, or pass "
+                                    "handoff=<result or its simhandoff envelope>"))
+        env = _verify_fea_envelope(h, float(tolerance_pct), fea_result=fr)
+        result = {
+            "ok": True,
+            "pass": env["pass"],
+            "verdict": env["verdict"],
+            "checks": env["checks"],
+            "warnings": env.get("warnings") or [],
+        }
+        return _dumps(sh.attach(result, env))

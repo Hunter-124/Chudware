@@ -66,6 +66,7 @@ def new_pipe_run(id: str, path: list, nps: float, schedule: str = "40",
         "material": None,
         "bend_radius": None,
         "end_type": "BW",
+        "bore_mm": None,
     }
     run.update({k: v for k, v in kw.items() if k in run})
     return run
@@ -181,6 +182,10 @@ def validate_run(run: dict, loc: str = "run") -> list[str]:
     br = run.get("bend_radius")
     if br is not None and (isinstance(br, bool) or not isinstance(br, (int, float)) or br <= 0):
         errs.append(f"{loc}.bend_radius: must be a positive number (mm) or null, got {br!r}")
+    bore = run.get("bore_mm")
+    if bore is not None and (isinstance(bore, bool)
+                             or not isinstance(bore, (int, float)) or bore <= 0):
+        errs.append(f"{loc}.bore_mm: must be a positive number (mm) or null, got {bore!r}")
     return errs
 
 

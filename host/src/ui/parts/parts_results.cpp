@@ -146,10 +146,23 @@ void drawResultsList(AppState& st) {
         itemTooltipAt(item, hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal |
                                                             ImGuiHoveredFlags_AllowWhenOverlappedByItem));
 
-        // ---- Name cell: domain icon + status badges + name ----
+        // ---- Name cell: thumbnail (or domain icon fallback) + status badges + name ----
         ImGui::SetCursorScreenPos(rowPos);
-        partIconDraw(dl, ImVec2(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f),
-                     iconSz, item.domain);
+        requestThumb(st, item);
+        auto th = S().thumbs.find(item.id);
+        if (th != S().thumbs.end() && th->second.tex) {
+            // Fit the product image into the icon box, centered, preserving aspect.
+            const float iw = (float)th->second.w, ih = (float)th->second.h;
+            const float fit = std::min(iconSz / iw, iconSz / ih);
+            const float dw = iw * fit, dh = ih * fit;
+            const ImVec2 c(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f);
+            dl->AddImage((ImTextureID)(intptr_t)th->second.tex,
+                         ImVec2(c.x - dw * 0.5f, c.y - dh * 0.5f),
+                         ImVec2(c.x + dw * 0.5f, c.y + dh * 0.5f));
+        } else {
+            partIconDraw(dl, ImVec2(rowPos.x + iconSz * 0.5f, rowPos.y + rowH * 0.5f),
+                         iconSz, item.domain);
+        }
         ImGui::SetCursorScreenPos(ImVec2(rowPos.x + iconSz + 6.0f * sc,
                                          rowPos.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f));
         if (item.downloaded) {

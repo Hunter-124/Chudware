@@ -1297,6 +1297,24 @@ def _default_conductivity(mat: dict, material_arg: Any) -> float:
     return 50.0  # mild-steel default
 
 
+# Typical specific heat (J/(kg·K)) by material family — used by the TRANSIENT thermal
+# path (T-FIN18) when neither the caller nor the material dict supplies cp. Same
+# engineering-nominal spirit as the conductivity table above.
+_DEFAULT_SPECIFIC_HEAT_JKGK: dict = {
+    "steel": 490.0, "stainless": 500.0, "aluminum": 900.0, "titanium": 520.0,
+    "brass": 380.0, "abs": 1400.0, "pla": 1800.0,
+}
+
+
+def _default_specific_heat(mat: dict, material_arg: Any) -> float:
+    """Best-effort specific heat (J/kg·K) for the transient thermal solve."""
+    name = str(mat.get("name", material_arg) or "").lower()
+    for key, val in _DEFAULT_SPECIFIC_HEAT_JKGK.items():
+        if key in name:
+            return val
+    return 490.0  # mild-steel default
+
+
 def _first_temperature(faces: list, label: str) -> float:
     """Pull the temperature (°C) from the first face spec in a thermal face list."""
     for f in faces or []:
@@ -1359,6 +1377,19 @@ run_fea_thermal(hot_faces, cold_faces, material) — steady-state THERMAL (heat 
   CalculiX (ccx). hot_faces/cold_faces each carry a {face + temperature °C}. Solves a prismatic
   box proxy sized to the part bbox (through-conduction estimate). ccx is a GPL-2.0 subprocess
   (PATH-discovered); if absent it returns {skipped:true} — never a fabricated result.
+
+run_fea_thermal(..., transient={...}, loads=[...]) — TRANSIENT thermal on the REAL part mesh
+  (C++ core, backward Euler; no ccx, no box proxy). transient={"t_end_s":60, "dt_s":0.5,
+  "t_init_c":20, "frame_times_s":[10,30,60]}. hot/cold faces are Dirichlet held for the run
+  (may be empty — flux-only heat-up is fine). loads carry time-varying heat sources:
+    {"face":"top", "flux_w_m2":5000, "schedule":{"duty":0.25, "period_s":1.0}}   duty cycle —
+       the direct shape for an aicad.powerprofile/1 per-rail duty profile
+    {"face":"top", "flux_w_m2":5000, "schedule":{"points":[[0,1],[2,0.2]], "period_s":4}}
+       piecewise sample-and-hold; each load keeps its OWN independent schedule
+    {"face":"left", "h_w_m2k":25, "t_amb_c":20}                                 convection film
+  Result: summary.max_temp_c = the PEAK over the whole run (max-temp envelope) at
+  summary.max_temp_time_s, plus per-frame max temps at the requested frame times. Use this to
+  check duty-cycled electronics/heater loads that never reach the 100%-on steady state.
 
 run_fea_buckling(fixtures, load, material, n_modes) — linear (eigenvalue) BUCKLING via CalculiX.
   Returns the critical load factors λ (applied load × λ = Pcr); λ<1 buckles below the load.
@@ -4132,24 +4163,153 @@ def register_cad_tools(mcp: FastMCP) -> None:
     def run_fea_thermal(hot_faces: list, cold_faces: list,
                         material: Union[str, dict] = "steel",
                         conductivity_w_mk: Optional[float] = None,
+                        transient: Optional[dict] = None,
+                        loads: Optional[list] = None,
+                        specific_heat_j_kgk: Optional[float] = None,
+                        mesh_fineness: float = 0.5,
                         doc_id: Optional[str] = None) -> str:
-        """Steady-state thermal (heat-conduction) FEA via CalculiX (ccx subprocess).
+        """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
+        C++ core solver on the real part mesh.
 
-        Solves ∇·(k∇T)=0 with the given faces held at fixed temperatures (Dirichlet).
-        Because arbitrary CAD meshing needs the FEA mesher, this ccx path solves on a
-        PRISMATIC BOX PROXY sized to the part's bounding box with a 1-D conduction setup
-        (hot end vs cold end) — an engineering estimate of the through-conduction
-        temperature field / mid-plane temperature, honest for bar/plate-like parts.
+        STEADY (default, transient=None): solves ∇·(k∇T)=0 with the given faces held at
+        fixed temperatures (Dirichlet) via a ccx subprocess. Because arbitrary CAD meshing
+        needs the FEA mesher, this ccx path solves on a PRISMATIC BOX PROXY sized to the
+        part's bounding box with a 1-D conduction setup (hot end vs cold end) — an
+        engineering estimate honest for bar/plate-like parts. CalculiX is GPL-2.0 →
+        subprocess-only, PATH-discovered; absent ccx ⇒ {ok:false, skipped:true}.
 
-        hot_faces / cold_faces : each a {temperature: <°C>} plus a face query, e.g.
-                                 [{"face": "+x", "temperature": 100}].
+        TRANSIENT (T-FIN18, pass a `transient` dict): solves C dT/dt + K T = f(t) with
+        implicit backward Euler on the REAL tet mesh of the part (C++ core, same solver
+        family as run_fea_static — no box proxy, no ccx needed).
+          transient : {"t_end_s": <s>, "dt_s": <s, optional — defaults t_end/200>,
+                       "t_init_c": <°C, default 20>, "frame_times_s": [<s>, ...],
+                       "capacitance": "lumped"|"consistent" (default lumped)}
+          hot_faces/cold_faces : Dirichlet faces held at their temperature for the whole
+                       run, e.g. [{"face": "+x", "temperature": 100}]. May be EMPTY for
+                       transient (a flux-only adiabatic heat-up is well-posed).
+          loads     : optional time-varying heat loads, each
+                       {"face": <query>, "flux_w_m2": <q>, "schedule": {...}}  or
+                       {"face": <query>, "h_w_m2k": <h>, "t_amb_c": <°C>}   (convection)
+                      schedule (per load, optional — omitted = always on):
+                       {"duty": 0.25, "period_s": 1.0}          duty-cycle shorthand —
+                          the direct mapping for an aicad.powerprofile/1 per-rail duty
+                          profile (rail duty d, period p)
+                       {"points": [[t_s, scale], ...], "period_s": <opt>}  piecewise
+                          sample-and-hold (a residency timeline maps verbatim)
+          specific_heat_j_kgk : cp override; else material dict, else a typical value.
+        Returns frame times + per-frame max temperature, the PEAK temperature over the
+        whole run (max-temp envelope) and when it occurred. Full nodal frames stay in
+        the study result inside the doc.
+
         conductivity_w_mk : thermal conductivity override (W/m·K); else from material
                             (falls back to a typical value for the named material).
-
-        CalculiX is GPL-2.0 → subprocess-only, PATH-discovered. If ccx is not installed
-        this returns {ok:false, skipped:true, reason:...} — it never fabricates a result.
         """
         try:
+            if transient is not None:
+                d = _doc(doc_id)
+                mat = _resolve_material(material)
+                k_cond = (float(conductivity_w_mk) if conductivity_w_mk is not None
+                          else float(mat.get("conductivity_w_mk")
+                                     or _default_conductivity(mat, material)))
+                if not isinstance(transient, dict) or not transient.get("t_end_s"):
+                    return _dumps({"ok": False, "error":
+                                   "transient needs a dict with t_end_s (seconds), e.g. "
+                                   "{\"t_end_s\": 60, \"dt_s\": 0.5}"})
+                cp = (float(specific_heat_j_kgk) if specific_heat_j_kgk is not None
+                      else float(mat.get("cp_j_kgk") or _default_specific_heat(mat, material)))
+                step = _tmp(".step")
+                cb.call("doc_export_step", {"doc_id": d, "path": step})
+
+                def _faceset(q):
+                    merged: dict = {"points": []}
+                    faces = _resolve_face_points(d, q)
+                    for f in faces:
+                        merged["points"].extend(f.get("points", []))
+                    if faces:
+                        first = faces[0]
+                        for key in ("tol_mm", "face_normal", "perp_tol_mm"):
+                            if key in first:
+                                merged[key] = first[key]
+                    return merged if merged["points"] else None
+
+                fixtures = []
+                for f in (list(hot_faces or []) + list(cold_faces or [])):
+                    if not isinstance(f, dict) or "temperature" not in f or "face" not in f:
+                        raise ValueError("each hot/cold face needs {'face': <query>, "
+                                         f"'temperature': <°C>}}: {f!r}")
+                    fs = _faceset(f["face"])
+                    if fs is None:
+                        return _dumps({"ok": False, "error":
+                                       f"face query {f['face']!r} resolved to no faces — "
+                                       "use query_geometry() to confirm"})
+                    fs["temp_c"] = float(f["temperature"])
+                    fixtures.append(fs)
+
+                load_specs = []
+                for ld in (loads or []):
+                    if not isinstance(ld, dict) or "face" not in ld:
+                        raise ValueError(f"each thermal load needs a 'face' query: {ld!r}")
+                    fs = _faceset(ld["face"])
+                    if fs is None:
+                        return _dumps({"ok": False, "error":
+                                       f"load face query {ld['face']!r} resolved to no faces"})
+                    if "flux_w_m2" in ld:
+                        spec = {"faces": fs, "type": "flux",
+                                "magnitude": float(ld["flux_w_m2"])}
+                        if isinstance(ld.get("schedule"), dict):
+                            spec["schedule"] = ld["schedule"]
+                    elif "h_w_m2k" in ld:
+                        spec = {"faces": fs, "type": "convection",
+                                "h": float(ld["h_w_m2k"]),
+                                "t_amb_c": float(ld.get("t_amb_c", 20.0))}
+                    else:
+                        raise ValueError("thermal load needs 'flux_w_m2' (+ optional "
+                                         f"'schedule') or 'h_w_m2k'/'t_amb_c': {ld!r}")
+                    load_specs.append(spec)
+
+                study = {"step_path": step,
+                         "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
+                         "fixtures": fixtures, "loads": load_specs,
+                         "fineness": mesh_fineness,
+                         "transient": {
+                             "t_end_s": float(transient["t_end_s"]),
+                             "dt_s": float(transient.get("dt_s") or 0.0),
+                             "t_init_c": float(transient.get("t_init_c", 20.0)),
+                             "frame_times_s": [float(t) for t in
+                                               transient.get("frame_times_s", [])],
+                             "capacitance": transient.get("capacitance", "lumped"),
+                         }}
+                res = cb.call("sim_run_thermal", {"study": study})
+                if not res.get("ok"):
+                    return _dumps({"ok": False, "doc_id": d,
+                                   "error": res.get("error", "transient thermal solve failed")})
+                frames = res.get("frames") or []
+                frame_summ = [{"t_s": fr.get("t_s"),
+                               "max_temp_c": round(max(fr.get("temperature") or [0.0]), 3)}
+                              for fr in frames]
+                out = {"ok": True, "doc_id": d, "transient": True,
+                       "solver": "C++ core transient conduction (backward Euler, "
+                                 f"{study['transient']['capacitance']} capacitance)",
+                       "material": mat.get("name", material),
+                       "conductivity_w_mk": k_cond, "specific_heat_j_kgk": cp,
+                       "summary": res.get("summary", {}),
+                       "n_steps": res.get("n_steps"), "n_nodes": res.get("n_nodes"),
+                       "n_elems": res.get("n_elems"),
+                       "frames": frame_summ,
+                       "solver_notes": res.get("solver_notes", []),
+                       "note": "summary.max_temp_c is the PEAK over the whole run "
+                               "(max-temp envelope), at summary.max_temp_time_s; "
+                               "per-frame nodal fields persisted in the doc study."}
+                _persist_study(d, {"type": "fea_thermal_transient",
+                                   "name": f"Transient thermal ({mat.get('name', material)})",
+                                   "engine": "cpp",
+                                   "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
+                                   "transient": study["transient"],
+                                   "results": {"summary": res.get("summary", {}),
+                                               "frames": frames,
+                                               "envelope_max": res.get("envelope_max")}})
+                return _dumps(out)
+
             from . import fea_advanced as fa
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("thermal steady-state"))

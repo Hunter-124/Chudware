@@ -126,13 +126,18 @@ void applyModelAppearance(AppState& st, const float* color, float metallic, floa
     if (color) { op["color"] = {color[0], color[1], color[2]};
                  op["metallic"] = metallic; op["roughness"] = roughness; }
     else op["color"] = nullptr;
-    auto resp = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-    if (resp.ok && !resp.aicm_path.empty()) {
-        std::string lerr; st.loadDocMesh(resp.aicm_path, lerr);
-        if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
-    } else if (!resp.ok) {
-        st.addLog("[err] set_appearance: " + resp.error_message);
-    }
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
+        [&st](const core::OpsResponse& resp, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (resp.ok && !resp.aicm_path.empty()) {
+                std::string lerr; st.loadDocMesh(resp.aicm_path, lerr);
+                if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+            } else if (!resp.ok) {
+                st.addLog("[err] set_appearance: " + resp.error_message);
+            }
+        });
 }
 
 // Feed a worker ECAD ops-response into the editor mirror; track doc id + revision.
@@ -564,15 +569,21 @@ static void applyFlatPattern(AppState& st) {
     nlohmann::json ops = nlohmann::json::array({
         {{"op", "add_feature"}, {"feature", {{"type", "sm_flat_pattern"}, {"name", "Flat-Pattern"},
                                              {"params", nlohmann::json::object()}}}}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
-    if (r.ok && !r.aicm_path.empty()) {
-        std::string le;
-        st.loadDocMesh(r.aicm_path, le);
-        st.toast(ui::ToastLevel::Info, "Flat pattern created");
-    } else if (!r.ok) {
-        st.toast(ui::ToastLevel::Warn,
-                 r.error_message.empty() ? std::string("Flatten failed") : r.error_message);
-    }
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+        [&st](const core::OpsResponse& r, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (r.ok && !r.aicm_path.empty()) {
+                std::string le;
+                st.loadDocMesh(r.aicm_path, le);
+                st.toast(ui::ToastLevel::Info, "Flat pattern created");
+            } else if (!r.ok) {
+                st.toast(ui::ToastLevel::Warn,
+                         r.error_message.empty() ? std::string("Flatten failed")
+                                                 : r.error_message);
+            }
+        });
 }
 
 // W14: export the ACTIVE sheet-metal part's flat pattern to DXF (outline on layer OUTLINE, bend

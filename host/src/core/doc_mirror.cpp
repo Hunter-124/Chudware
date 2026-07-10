@@ -7,6 +7,7 @@
 #include <string>
 
 #include "doc_mirror.h"
+#include "async_rpc.h"
 #include "../worker_client.h"
 #include "cpp_core.h"  // strangler diagnostic: parity probe against libaicad.dll
 
@@ -280,6 +281,68 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool
         notify();
     }
     return r;
+}
+
+void DocMirror::applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::json& ops,
+                              ApplyAsyncDone done, bool coalesce, int timeoutMs) {
+    OpsResponse early;
+    if (docId_.empty()) {
+        early.error_code = "no_doc";
+        early.error_message = "no document open";
+        if (done) done(early, false);
+        return;
+    }
+    const uint64_t gen = ++mutationGen_;
+    const std::string docId = docId_;
+    const int baseRev = revision_;
+    nlohmann::json params = {
+        {"doc_id", docId},
+        {"base_revision", baseRev},
+        {"ops", ops},
+        {"coalesce", coalesce}
+    };
+    // Capture `this` carefully: DocMirror is owned by AppState for the process lifetime of the
+    // host, so it outlives AsyncRpc callbacks. Gen + docId guard supersession / tab switches.
+    rpc.call("doc_apply_ops", std::move(params),
+        [this, &w, gen, docId, done = std::move(done)](const RpcResult& rr) {
+            OpsResponse r;
+            const bool stillCurrent = (gen == mutationGen_ && docId_ == docId);
+            if (!rr.ok) {
+                r.error_code = "transport";
+                r.error_message = rr.err;
+                if (done) done(r, false);
+                return;
+            }
+            if (rr.result.contains("code")) {
+                r.error_code = jstr(rr.result, "code");
+                r.error_message = jstr(rr.result, "message");
+                if (stillCurrent && r.error_code == "stale_revision") {
+                    std::printf("[doc] stale_revision (async) — resyncing tree\n");
+                    std::fflush(stdout);
+                    resyncTree(w);
+                    if (staleResyncCb_) staleResyncCb_();
+                    notify();
+                }
+                if (done) done(r, false);
+                return;
+            }
+            r = parseOpsResponse(rr.result);
+            if (!stillCurrent) {
+                // Superseded by a newer applyOpsAsync or the user switched docs — do NOT
+                // mutate the mirror / load mesh for this result.
+                if (done) done(r, false);
+                return;
+            }
+            if (r.ok) {
+                revision_ = r.revision;
+                if (!r.tree.is_null()) tree_ = r.tree;
+                if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+                storeOwnerMap(r.owner_map);
+                cppParityProbe("apply_ops_async", docId_, revision_, tree_, featureStatus_);
+                notify();
+            }
+            if (done) done(r, r.ok);
+        }, timeoutMs);
 }
 
 OpsResponse DocMirror::undo(WorkerClient& w) {

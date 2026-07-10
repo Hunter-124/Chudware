@@ -22,6 +22,8 @@ class WorkerClient;
 
 namespace core {
 
+class AsyncRpc;  // async_rpc.h — non-blocking worker round-trips (T-PERF1 applyOpsAsync)
+
 // W1-B (item 6): the topology a single feature owns, parsed from a response's "owner_map".
 // Shape on the wire: {"<fid>": {"bodies":[id...], "faces":[[body,face]...], "edges":[[body,edge]...]}}.
 struct Owned {
@@ -156,6 +158,24 @@ public:
     // can only be expressed as several batches (e.g. a rectangle's chained line ops), so a single
     // Ctrl+Z reverts the whole action.
     OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false);
+
+    // T-PERF1: non-blocking applyOps. Queues doc_apply_ops on `rpc` (GL-thread AsyncRpc). The
+    // Done callback runs inside a later rpc.drain() on the GL thread so it may touch AppState /
+    // loadDocMesh freely. Mirror state (revision/tree/owner_map) is updated ONLY when this
+    // submission is still the latest for this mirror (`mutationGen`) AND the active doc_id still
+    // matches — otherwise `applied` is false and the caller must not load the mesh / learn
+    // id_map (stale/superseded). Latest-wins: a newer applyOpsAsync bumps mutationGen and
+    // drops older completions. stale_revision still auto-resyncs (sync doc_tree, short) and
+    // fires the stale-resync callback. `w` is used only for that resync path.
+    // Prefer this for PM live preview, feature-tree mutations, equations, undo/redo UX —
+    // keep the sync applyOps for scenarios / headless shots that must block.
+    using ApplyAsyncDone = std::function<void(const OpsResponse& r, bool applied)>;
+    void applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::json& ops,
+                       ApplyAsyncDone done, bool coalesce = false, int timeoutMs = 120000);
+
+    // Monotonic counter bumped on every applyOpsAsync submission (and reset()). Callers that
+    // need their own generation guard can snapshot this before submit.
+    uint64_t mutationGen() const { return mutationGen_; }
 
     // Undo / redo the most recent batch. Return the ops-response (same shape as applyOps).
     OpsResponse undo(WorkerClient& w);
@@ -303,6 +323,7 @@ public:
         faceOwner_.clear();
         edgeOwner_.clear();
         bodyOwners_.clear();
+        ++mutationGen_;  // invalidate any in-flight applyOpsAsync completions
     }
 
     // Owned topology for each feature (raw, as last parsed). Exposed for completeness / debugging.
@@ -328,6 +349,7 @@ private:
     double         lastOpenedVolume_ = 1.0;                        // doc_open "volume" (flat-2D probe)
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
+    uint64_t       mutationGen_ = 0;  // T-PERF1: latest-wins guard for applyOpsAsync
 
     // W1-B: parsed owner map + reverse indices (key = (body<<32)|topo for faces/edges).
     std::unordered_map<std::string, Owned> ownerMap_;          // fid -> owned topology

@@ -426,6 +426,7 @@ private:
     bool dirty_ = false;           // a field changed since last preview
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;
+    bool previewInFlight_ = false; // T-PERF1: async applyOps in flight (serialize first add_feature)
 
     // C37-F: checkpoint id taken at open (before any preview). Empty = checkpoint failed at open
     // (fallback: undo loop). revert(checkpointId_) is the single cancel call.

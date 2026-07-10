@@ -363,7 +363,7 @@ graph TD
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
   end
   subgraph WS_perf["workstream perf"]
-    T_PERF1["T-PERF1: GUI async applyOps conversions (never block GL thread on edits)"]:::todo
+    T_PERF1["T-PERF1: GUI async applyOps conversions (never block GL thread on edits)"]:::done
     T_PERF10["T-PERF10: Perf odds & ends — auto-coincide scoping, fillet bisect, unify skip, AICM shared-mem, CEF lazy init, idle render throttle, profiler fix, scrape pool"]:::todo
     T_PERF2["T-PERF2: Async latest-wins drag pipelines (sketch/3D/push-pull/asm/explode)"]:::todo
     T_PERF3["T-PERF3: Mesh load off the GL thread (loader worker + meshGen)"]:::todo

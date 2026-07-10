@@ -177,10 +177,20 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
     if (!st.docMirror.hasDoc()) return false;
     nlohmann::json op = {{"op", "asm_insert_component"}, {"source", {{"path", path}}}};
     if (!transform.is_null()) op["transform"] = transform;
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-    if (!r.ok) { st.addLog("[err] insert: " + r.error_message); return false; }
-    aicmOut = r.aicm_path;
-    if (!aicmOut.empty()) { std::string le; st.loadDocMesh(aicmOut, le); }
+    // T-PERF1: async so large component inserts don't freeze the GL thread. aicmOut is filled
+    // only on the sync path for callers that need it immediately; the mesh reloads in the
+    // drain callback either way.
+    aicmOut.clear();
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
+        [&st](const core::OpsResponse& r, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (!r.ok) { st.addLog("[err] insert: " + r.error_message); return; }
+            if (!r.aicm_path.empty()) {
+                std::string le; st.loadDocMesh(r.aicm_path, le);
+            }
+        });
     return true;
 }
 

@@ -47,24 +47,30 @@ bool validName(const char* s) {
 }
 
 // Apply a single eq_* op, reloading the viewport mesh from the result aicm on success (so dependent
-// dimensions rebuild) and surfacing the engine error as a toast on failure. Returns op success.
+// dimensions rebuild) and surfacing the engine error as a toast on failure. Returns true when the
+// op was *queued* (T-PERF1 async); toast/log still fire on the drained result.
 bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
     if (!st.docMirror.hasDoc()) {
         st.toast(ui::ToastLevel::Warn, "No document open.");
         return false;
     }
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-    if (!r.ok) {
-        // eq_in_use (delete blocked by a referencing feature) and any other engine error surface as
-        // a toast — never crash. The engine puts the human message in error_message.
-        std::string msg = r.error_message.empty() ? std::string("operation failed") : r.error_message;
-        st.toast(ui::ToastLevel::Error, std::string(what) + ": " + msg);
-        st.addLog("[err] " + std::string(what) + ": " + msg +
-                  (r.error_code.empty() ? "" : " [" + r.error_code + "]"));
-        return false;
-    }
-    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-    st.markActiveTabDirty();
+    const std::string whatStr = what ? what : "equation";
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
+        [&st, whatStr](const core::OpsResponse& r, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (!r.ok) {
+                std::string msg = r.error_message.empty() ? std::string("operation failed")
+                                                          : r.error_message;
+                st.toast(ui::ToastLevel::Error, whatStr + ": " + msg);
+                st.addLog("[err] " + whatStr + ": " + msg +
+                          (r.error_code.empty() ? "" : " [" + r.error_code + "]"));
+                return;
+            }
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            st.markActiveTabDirty();
+        });
     return true;
 }
 

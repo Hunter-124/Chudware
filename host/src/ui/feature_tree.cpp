@@ -591,27 +591,34 @@ static std::vector<PendingTreeOps> s_pendingTreeOps;
 
 static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char* what) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
-    auto resp = st.docMirror.applyOps(st.worker, ops);
-    if (resp.ok && !resp.aicm_path.empty()) {
-        std::string lerr;
-        st.loadDocMesh(resp.aicm_path, lerr);
-        if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
-    } else if (!resp.ok) {
-        if (resp.error_code == "dependency_exists") {
-            st.addLog(std::string("[warn] ") + what +
-                      ": blocked — a feature depends on this order");
-            st.toast(ui::ToastLevel::Warn,
-                     std::string(what) + " blocked: a feature depends on this order");
-        } else {
-            st.addLog(std::string("[err] ") + what + ": " + resp.error_message);
-            // W1-B (item 2): surface the failure instead of only logging it. (Transport errors are
-            // already toasted via the worker error sink; this covers method-level op rejections.)
-            if (resp.error_code != "transport")
-                st.toast(ui::ToastLevel::Error,
-                         std::string(what) + " failed: " +
-                         (resp.error_message.empty() ? resp.error_code : resp.error_message));
-        }
-    }
+    // T-PERF1: async apply so suppress/reorder/delete never freezes the GL thread. Batch
+    // multiple pending ops from one flush into a single doc_apply_ops (see flushPendingTreeOps).
+    const std::string whatStr = what ? what : "tree op";
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+        [&st, whatStr](const core::OpsResponse& resp, bool applied) {
+            --st.rebuildsInFlight;
+            if (!applied) return;
+            if (resp.ok && !resp.aicm_path.empty()) {
+                std::string lerr;
+                st.loadDocMesh(resp.aicm_path, lerr);
+                if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+            } else if (!resp.ok) {
+                if (resp.error_code == "dependency_exists") {
+                    st.addLog(std::string("[warn] ") + whatStr +
+                              ": blocked — a feature depends on this order");
+                    st.toast(ui::ToastLevel::Warn,
+                             whatStr + " blocked: a feature depends on this order");
+                } else {
+                    st.addLog(std::string("[err] ") + whatStr + ": " + resp.error_message);
+                    if (resp.error_code != "transport")
+                        st.toast(ui::ToastLevel::Error,
+                                 whatStr + " failed: " +
+                                 (resp.error_message.empty() ? resp.error_code
+                                                             : resp.error_message));
+                }
+            }
+        });
 }
 
 static void applyTreeOps(AppState& st, const nlohmann::json& ops, const char* what) {
@@ -623,7 +630,23 @@ static void flushPendingTreeOps(AppState& st) {
     if (s_pendingTreeOps.empty()) return;
     auto pending = std::move(s_pendingTreeOps);
     s_pendingTreeOps.clear();
-    for (const auto& p : pending) applyTreeOpsNow(st, p.ops, p.what.c_str());
+    // Batch every pending tree mutation from this frame into ONE applyOps (T-PERF1 DoD:
+    // feature tree suppress/reorder/copy batched). Labels join for the toast/log.
+    if (pending.size() == 1) {
+        applyTreeOpsNow(st, pending[0].ops, pending[0].what.c_str());
+        return;
+    }
+    nlohmann::json batch = nlohmann::json::array();
+    std::string labels;
+    for (const auto& p : pending) {
+        if (p.ops.is_array())
+            for (const auto& op : p.ops) batch.push_back(op);
+        else
+            batch.push_back(p.ops);
+        if (!labels.empty()) labels += ", ";
+        labels += p.what;
+    }
+    applyTreeOpsNow(st, batch, labels.c_str());
 }
 
 // Inline-rename state: which feature id is being renamed + its edit buffer.

@@ -490,6 +490,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = false;
+    previewInFlight_ = false;
     lastEditTime_ = ImGui::GetTime();
     previewError_.clear();
     focusedOnOpen_ = false;
@@ -715,6 +716,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = true;   // the feature already exists; edits go straight to edit_feature
+    previewInFlight_ = false;
     lastEditTime_ = ImGui::GetTime();
     previewError_.clear();
     focusedOnOpen_ = false;
@@ -1013,6 +1015,8 @@ void PropertyManager::close() {
     previewBatches_ = 0;
     dirty_ = false;
     firstPreviewDone_ = false;
+    // Leave previewInFlight_ alone if a drain callback is still pending — the callback
+    // clears it and decrements rebuildsInFlight; active_ is false so it no-ops the rest.
     checkpointId_.clear();    // C37-F
     focusedOnOpen_ = false;   // C37-F
     wantFocusFirstField_ = false; // C37-F
@@ -2103,66 +2107,82 @@ bool PropertyManager::applyPreview(AppState& st) {
                       feature.value("refs", nlohmann::json::object())
                           .value("edges", nlohmann::json::array()).size()));
 
-    auto resp = st.docMirror.applyOps(st.worker, ops, previewUndoGroupStarted_);
-    if (!resp.ok) {
-        // C38 (P4f): the inline previewError_ block in the PM body is the surface for a failed
-        // debounced preview — do NOT toast here. Previews fire per-keystroke, so toasting each
-        // failure spams the user with transient parse/validation errors mid-edit. Toasts stay on the
-        // commit/cancel paths (terminal, user-initiated). Still logged for observability.
-        previewError_ = resp.error_message;
-        st.addLog("[pm] preview failed: " + resp.error_message);
-        dirty_ = false;
+    // T-PERF1: async applyOps so typing stays live during a multi-second rebuild. Serialize
+    // in-flight previews so the first add_feature can learn targetId_ before a second batch
+    // races a second add. Latest-wins on the mirror is handled by mutationGen inside
+    // applyOpsAsync; we just refuse to queue a second while one is open.
+    if (previewInFlight_) {
+        // Keep dirty_ true so tick re-fires after the in-flight result drains.
         return false;
     }
-    previewError_.clear();  // C37-F: clear stale error on success
-    if (!previewUndoGroupStarted_) {
-        previewUndoGroupStarted_ = true;
-        ++previewBatches_;
-    }
-    // The add-feature flow learns the new feature id from id_map ($0 -> fX).
-    if (targetId_.empty() && resp.id_map.is_object()) {
-        auto it = resp.id_map.find("$0");
-        if (it != resp.id_map.end() && it->is_string()) targetId_ = it->get<std::string>();
-    }
-    firstPreviewDone_ = true;
-
-    if (!resp.aicm_path.empty()) {
-        std::string lerr;
-        st.loadDocMesh(resp.aicm_path, lerr);   // live rounded body -> id-pass + overlays + render
-        if (!lerr.empty()) st.addLog("[pm] mesh: " + lerr);
-    }
-
-    // Read the session compile's verdict for this feature (the host's applyOps already ran the real
-    // compile — there is no separate stateless compile; the old doc_compile_cpp call was an unknown
-    // method in-app and failed silently). For a blend the warning — "rounded N of M edge(s); K
-    // couldn't be located" — is the "selection saved but an edge didn't apply" signal; we log it so a
-    // dropped edge is visible, surface it in the PM body, and tint any dangling well red.
-    previewWarning_.clear();
-    if (!targetId_.empty() && resp.feature_status.is_array()) {
-        for (const auto& s : resp.feature_status) {
-            if (!s.is_object() || s.value("id", std::string()) != targetId_) continue;
-            auto wt = s.find("warning");
-            if (wt != s.end() && wt->is_string()) previewWarning_ = wt->get<std::string>();
-            const bool sok = s.value("ok", true);
-            if (!sok) previewError_ = s.value("error", std::string());
-            if (blend)
-                st.addLog("[pm] feature status " + targetId_ +
-                          ": ok=" + std::string(sok ? "1" : "0") +
-                          " warn=\"" + (wt != s.end() && wt->is_string() ? wt->get<std::string>() : "") + "\"" +
-                          (sok ? "" : " err=\"" + s.value("error", std::string()) + "\""));
-            auto dr = s.find("dangling_refs");
-            std::vector<std::string> dangling;
-            if (dr != s.end() && dr->is_array())
-                for (const auto& d : *dr) if (d.is_string()) dangling.push_back(d.get<std::string>());
-            for (auto& f : fields_) {
-                if (f.def->kind != PMFieldKind::SelectorWell) continue;
-                f.wellDangling = false;
-                for (const auto& dref : dangling)
-                    if (dref.rfind(f.def->key, 0) == 0) f.wellDangling = true;
-            }
-        }
-    }
     dirty_ = false;
+    previewInFlight_ = true;
+    ++st.rebuildsInFlight;
+    const bool coalesce = previewUndoGroupStarted_;
+    const bool blendCap = blend;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+        [this, &st, blendCap](const core::OpsResponse& resp, bool applied) {
+            previewInFlight_ = false;
+            --st.rebuildsInFlight;
+            // Form may have closed while the RPC was in flight.
+            if (!active_) return;
+            if (!applied || !resp.ok) {
+                // C38 (P4f): inline previewError_ only — never toast per-keystroke failures.
+                if (!applied && resp.ok) {
+                    // Superseded by a newer mutation (or doc switch) — silently drop.
+                    return;
+                }
+                previewError_ = resp.error_message.empty() ? resp.error_code : resp.error_message;
+                st.addLog("[pm] preview failed: " + previewError_);
+                return;
+            }
+            previewError_.clear();
+            if (!previewUndoGroupStarted_) {
+                previewUndoGroupStarted_ = true;
+                ++previewBatches_;
+            }
+            if (targetId_.empty() && resp.id_map.is_object()) {
+                auto it = resp.id_map.find("$0");
+                if (it != resp.id_map.end() && it->is_string())
+                    targetId_ = it->get<std::string>();
+            }
+            firstPreviewDone_ = true;
+
+            if (!resp.aicm_path.empty()) {
+                std::string lerr;
+                st.loadDocMesh(resp.aicm_path, lerr);
+                if (!lerr.empty()) st.addLog("[pm] mesh: " + lerr);
+            }
+
+            previewWarning_.clear();
+            if (!targetId_.empty() && resp.feature_status.is_array()) {
+                for (const auto& s : resp.feature_status) {
+                    if (!s.is_object() || s.value("id", std::string()) != targetId_) continue;
+                    auto wt = s.find("warning");
+                    if (wt != s.end() && wt->is_string())
+                        previewWarning_ = wt->get<std::string>();
+                    const bool sok = s.value("ok", true);
+                    if (!sok) previewError_ = s.value("error", std::string());
+                    if (blendCap)
+                        st.addLog("[pm] feature status " + targetId_ +
+                                  ": ok=" + std::string(sok ? "1" : "0") +
+                                  " warn=\"" + (wt != s.end() && wt->is_string()
+                                                    ? wt->get<std::string>() : "") + "\"" +
+                                  (sok ? "" : " err=\"" + s.value("error", std::string()) + "\""));
+                    auto dr = s.find("dangling_refs");
+                    std::vector<std::string> dangling;
+                    if (dr != s.end() && dr->is_array())
+                        for (const auto& d : *dr)
+                            if (d.is_string()) dangling.push_back(d.get<std::string>());
+                    for (auto& f : fields_) {
+                        if (f.def->kind != PMFieldKind::SelectorWell) continue;
+                        f.wellDangling = false;
+                        for (const auto& dref : dangling)
+                            if (dref.rfind(f.def->key, 0) == 0) f.wellDangling = true;
+                    }
+                }
+            }
+        }, coalesce);
     return true;
 }
 
@@ -2174,7 +2194,7 @@ void PropertyManager::tick(AppState& st) {
         pmEditHold(holdDocId_);
         lastHoldTime_ = ImGui::GetTime();
     }
-    if (!active_ || !dirty_) return;
+    if (!active_ || !dirty_ || previewInFlight_) return;
     double now = ImGui::GetTime();
     if (now - lastEditTime_ < kDebounceSec) return;
     applyPreview(st);

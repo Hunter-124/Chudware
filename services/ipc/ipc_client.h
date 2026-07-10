@@ -43,8 +43,12 @@ public:
     // Blocking JSON-RPC round trip; same contract as CppCore::call. Returns true
     // iff the daemon answered with "result"; err carries transport or RPC errors
     // ("error" payloads are also copied into result for callers that inspect them).
+    // timeoutMs < 0 blocks forever; >= 0 bounds the wait for the response. A
+    // timeout is a transport failure (false, err only, no {code} in result) and
+    // invalidates the connection (the response is still in flight on the wire) —
+    // the next call() reconnects, mirroring daemon_bridge.py's reconnect-on-EOF.
     bool call(const std::string& method, const nlohmann::json& params,
-              nlohmann::json& result, std::string& err);
+              nlohmann::json& result, std::string& err, int timeoutMs = -1);
 
     // Move any queued push events out (non-blocking; also polls the socket).
     std::vector<nlohmann::json> drainEvents();
@@ -53,14 +57,20 @@ private:
     bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);
     bool hello(const std::string& kind, std::string& err);
-    // Read lines until a response with `id` arrives; queue event lines seen on the way.
-    bool readResponse(int id, nlohmann::json& out, std::string& err);
+    // Re-establish a connection invalidated by a timeout/EOF (mtx_ held by the
+    // caller). Connect-only — never spawns — plus an inline hello re-handshake.
+    bool reconnectLocked(std::string& err);
+    // Read lines until a response with `id` arrives; queue event lines seen on
+    // the way. timeoutMs bounds the whole wait; on timeout the connection is
+    // closed (mid-response, unusable) and false/err returned.
+    bool readResponse(int id, nlohmann::json& out, std::string& err, int timeoutMs);
 
     IpcConn conn_;
     std::mutex mtx_;                     // serialize call()s + event queue access
     std::vector<nlohmann::json> events_;
     nlohmann::json serverInfo_;
     std::string sockPath_;
+    std::string clientKind_;             // saved for the reconnect re-handshake
     int nextId_ = 1;
 };
 

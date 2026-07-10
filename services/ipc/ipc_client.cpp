@@ -148,6 +148,7 @@ bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
 
 bool EngineClient::connectInner(const Options& opts, std::string& err) {
     const std::string key = instanceKey(opts.hostdBin);
+    clientKind_ = opts.clientKind;
     sockPath_ = socketPath(key);
     if (sockPath_.empty()) {
         err = "no runtime dir for hostd socket";
@@ -185,10 +186,31 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     }
 }
 
-bool EngineClient::readResponse(int id, json& out, std::string& err) {
+bool EngineClient::readResponse(int id, json& out, std::string& err, int timeoutMs) {
+    // One deadline for the WHOLE response wait: event lines arriving on the way
+    // must not restart the clock.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeoutMs >= 0 ? timeoutMs : 0);
     std::string line;
     for (;;) {
-        if (!conn_.readLine(line, -1)) {
+        int wait = -1;
+        if (timeoutMs >= 0) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  deadline - std::chrono::steady_clock::now())
+                                  .count();
+            wait = left > 0 ? (int)left : 0;
+        }
+        if (!conn_.readLine(line, wait)) {
+            if (!conn_.eof() && timeoutMs >= 0) {
+                // Timed out with the peer still alive: the response is still in
+                // flight, so this connection is mid-stream and unusable — close
+                // it; the next call() reconnects cleanly instead of reading a
+                // stale reply. err-only (no {code} in result), same transport-
+                // error shape as a connection failure, so callers toast it.
+                err = "engine call timed out after " + std::to_string(timeoutMs) + "ms";
+                conn_.close();
+                return false;
+            }
             err = conn_.eof() ? "daemon connection closed" : "daemon read failed";
             return false;
         }
@@ -207,13 +229,47 @@ bool EngineClient::readResponse(int id, json& out, std::string& err) {
     }
 }
 
-bool EngineClient::call(const std::string& method, const json& params, json& result,
-                        std::string& err) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (!conn_.valid() || conn_.eof()) {
+// Reconnect after a timeout/EOF invalidated the connection (mtx_ held).
+// Connect-only, never spawns: a timed-out daemon is usually alive-but-busy, and
+// hello is a daemon-level method that answers even mid-solve. C++ equivalent of
+// daemon_bridge.py DaemonClient.call's reconnect-on-EOF.
+bool EngineClient::reconnectLocked(std::string& err) {
+    if (sockPath_.empty()) {  // connectOrSpawn never ran (or never succeeded)
         err = "not connected to hostd";
         return false;
     }
+    conn_.close();
+    std::string cerr;
+    if (!tryConnect(cerr)) {
+        err = "not connected to hostd (reconnect failed: " + cerr + ")";
+        return false;
+    }
+    // Inline hello — hello() goes through call(), which would re-lock mtx_.
+    // Bounded: a reconnect must never reintroduce an unbounded wait.
+    const int id = nextId_++;
+    json req = {{"id", id},
+                {"method", "hello"},
+                {"params",
+                 {{"client", clientKind_}, {"pid", selfPid()}, {"proto", 1}}}};
+    if (!conn_.writeLine(req.dump())) {
+        err = "daemon write failed (reconnect hello)";
+        return false;
+    }
+    json resp;
+    if (!readResponse(id, resp, err, /*timeoutMs=*/5000)) return false;
+    if (!resp.contains("result")) {
+        err = "hello failed on reconnect";
+        conn_.close();
+        return false;
+    }
+    serverInfo_ = resp["result"];
+    return true;
+}
+
+bool EngineClient::call(const std::string& method, const json& params, json& result,
+                        std::string& err, int timeoutMs) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if ((!conn_.valid() || conn_.eof()) && !reconnectLocked(err)) return false;
     const int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};
     if (!conn_.writeLine(req.dump())) {
@@ -221,7 +277,7 @@ bool EngineClient::call(const std::string& method, const json& params, json& res
         return false;
     }
     json resp;
-    if (!readResponse(id, resp, err)) return false;
+    if (!readResponse(id, resp, err, timeoutMs)) return false;
     if (resp.contains("result")) {
         result = resp["result"];
         return true;

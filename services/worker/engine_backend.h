@@ -42,8 +42,11 @@ aicad_ipc::EngineClient* client();
 //   * {"code":"loading"} absorbed by polling daemon_status until ready.
 //   * {"code":"read_only"} auto-upgrades the attach (attach_doc mode=rw) and
 //     retries once — the "user edits a mirror tab" path, zero new UI.
+// timeoutMs < 0 blocks forever; >= 0 bounds each daemon round trip (a timeout
+// surfaces as a transport failure: false + err, no {code} in result). Ignored
+// on the in-process backend — a call into the loaded DLL can't be timed out.
 bool call(const std::string& method, const nlohmann::json& params,
-          nlohmann::json& result, std::string& err);
+          nlohmann::json& result, std::string& err, int timeoutMs = -1);
 
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon

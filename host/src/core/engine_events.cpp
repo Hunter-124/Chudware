@@ -1,5 +1,6 @@
 #include "engine_events.h"
 
+#include <chrono>
 #include <map>
 #include <set>
 #include <string>
@@ -36,6 +37,9 @@ int tabIndexForDoc(AppState& st, const std::string& docId) {
 // attach, per the plan). Retried while the engine reports "loading" — this runs
 // on the GUI thread, so it must never block on the load.
 bool bootstrapped = false;
+// A failed/deferred bootstrap (engine still "loading") used to retry EVERY frame — two sync
+// RPCs per frame on the GL thread. Back off: retry at most every 500ms until it succeeds.
+std::chrono::steady_clock::time_point lastBootstrapTry{};
 
 // doc_ids with a doc.opened seen but not yet revealed as a tab (deferred while
 // the user is mid-edit, exactly like the poller's `pending`), and the latest
@@ -252,7 +256,13 @@ void engineEventsTick(AppState& st) {
     auto* c = engine::client();
     if (!c) return;
 
-    if (!bootstrapped) bootstrapped = tryBootstrap(st, *c);
+    if (!bootstrapped) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastBootstrapTry >= std::chrono::milliseconds(500)) {
+            lastBootstrapTry = now;
+            bootstrapped = tryBootstrap(st, *c);
+        }
+    }
 
     for (const json& evt : c->drainEvents()) handleEvent(st, evt);
 

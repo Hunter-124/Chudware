@@ -345,22 +345,56 @@ static void drawLiveVendorStrip(AppState& st) {
     if (!S().liveSearching || S().liveVendors.empty()) return;
     const float s = ui::uiScale;
     const auto& pal = ui::palette;
-    ImGui::SameLine();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float logo = 18.0f * s, barH = 3.0f * s, gap = 8.0f * s;
-    const float cellH = logo + 3.0f * s + barH;
+    const float cellH = logo + 3.0f * s + barH;   // logo + gap + progress bar
+    const float rowH  = cellH + 5.0f * s;          // vertical stride between wrapped rows
     const float tsec = (float)ImGui::GetTime();
+    const int   kMaxRows = 3;                       // cap; overflow past this shows a "+N"
+
+    // Capture the pane's line-start x (wrapped rows flush here) BEFORE SameLine moves the cursor
+    // up to the header line's right edge (where row 0 begins).
+    const float leftEdge = ImGui::GetCursorScreenPos().x;
+    ImGui::SameLine();
     const ImVec2 base = ImGui::GetCursorScreenPos();
-    float x = base.x;
-    const float y = base.y - 3.0f * s;   // nudge up to sit with the header text
+    const float rightB = base.x + ImGui::GetContentRegionAvail().x;   // pane right content edge
+    const float rowY0  = base.y - 3.0f * s;         // row 0 sits with the header text
     float trackC4[4];
     ui::Palette::withAlpha(pal.border, trackC4, 0.45f);
     const ImU32 trackCol = ui::Palette::toU32(trackC4);
-    for (auto& lv : S().liveVendors) {
+
+    float x = base.x;
+    int   row = 0, lastRow = 0;
+    const int N = (int)S().liveVendors.size();
+    for (int i = 0; i < N; ++i) {
+        auto& lv = S().liveVendors[i];
+        // Wrap when this logo would cross the right edge — but never wrap a row's first cell.
+        const float rowLeft = (row == 0) ? base.x : leftEdge;
+        if (x + logo > rightB && x > rowLeft + 0.5f) {
+            if (row + 1 >= kMaxRows) {
+                // Out of vertical room within the cap → terminate cleanly with a "+N" count.
+                char more[16];
+                std::snprintf(more, sizeof(more), "+%d", N - i);
+                const float ty = rowY0 + row * rowH + (logo - ImGui::GetTextLineHeight()) * 0.5f;
+                dl->AddText(ImVec2(x, ty), ui::Palette::toU32(pal.textDim), more);
+                ImGui::SetCursorScreenPos(ImVec2(x, rowY0 + row * rowH));
+                ImGui::InvisibleButton("##lv_more",
+                                       ImVec2(ImGui::CalcTextSize(more).x + 4.0f * s, cellH));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%d more vendor%s searching…", N - i,
+                                      (N - i) == 1 ? "" : "s");
+                break;
+            }
+            row++;
+            x = leftEdge;
+        }
+        lastRow = row;
+        const float y = rowY0 + row * rowH;
         const std::string id = "vendorlogo:" + lv.site;
         const ImVec2 l0(x, y), l1(x + logo, y + logo);
         auto it = S().thumbs.find(id);
         if (it != S().thumbs.end() && it->second.tex) {
+            it->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen logos resident
             dl->AddImage((ImTextureID)(intptr_t)it->second.tex, l0, l1);
         } else {
             // Lettered fallback until the favicon loads (or if it never does).
@@ -403,9 +437,11 @@ static void drawLiveVendorStrip(AppState& st) {
         }
         x += logo + gap;
     }
-    // Leave the ImGui cursor past the strip so following content doesn't overlap.
-    ImGui::SetCursorScreenPos(ImVec2(x, base.y));
-    ImGui::Dummy(ImVec2(1.0f, cellH));
+    // Reserve vertical space so the results list flows below the (possibly multi-row) strip.
+    const float bottom = rowY0 + lastRow * rowH + cellH;
+    ImGui::SetCursorScreenPos(ImVec2(leftEdge, base.y));
+    const float reserve = (bottom - base.y) > cellH ? (bottom - base.y) : cellH;
+    ImGui::Dummy(ImVec2(1.0f, reserve));
 }
 
 void startLiveSearch(AppState& st) {

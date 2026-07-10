@@ -49,7 +49,9 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
     const int gen = ++gen_;
-    st.rpc.call(method, params, [this, gen, method](const core::RpcResult& r) {
+    ++st.rebuildsInFlight;
+    st.rpc.call(method, params, [this, &st, gen, method](const core::RpcResult& r) {
+        --st.rebuildsInFlight;
         if (gen != gen_) return;  // a newer eval replaced this one
         pending_ = false;
         if (!r.ok) {
@@ -83,8 +85,10 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
     // Field results are shown in-viewport; while computing, a small wait window gives the
     // user feedback (the old sync call "gave feedback" by freezing the app instead).
     openWindow_ = "field_wait";
+    ++st.rebuildsInFlight;
     st.rpc.call(method, params,
         [this, &st, gen, method, legendTitle, units, fieldDocId](const core::RpcResult& r) {
+            --st.rebuildsInFlight;
             if (gen != gen_) return;
             if (st.docMirror.docId() != fieldDocId) { pending_ = false; return; }  // active doc changed
             pending_ = false;

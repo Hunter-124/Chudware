@@ -152,15 +152,18 @@ aicad_ipc::EngineClient* client() {
     return daemonMode() ? g_client : nullptr;
 }
 
-bool call(const std::string& method, const json& params, json& result, std::string& err) {
+bool call(const std::string& method, const json& params, json& result, std::string& err,
+          int timeoutMs) {
+    // timeoutMs only bounds the daemon round trip; the in-process DLL call is
+    // synchronous and can't be interrupted (matches the pre-daemon behavior).
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
-    bool ok = g_client->call(method, params, result, err);
+    bool ok = g_client->call(method, params, result, err, timeoutMs);
     if (!ok && result.is_object()) {
         const std::string code = result.value("code", std::string());
         if (code == "loading") {
             std::string werr;
             if (waitEngineReady(*g_client, werr))
-                ok = g_client->call(method, params, result, err);
+                ok = g_client->call(method, params, result, err, timeoutMs);
             else if (err.empty())
                 err = werr;
         } else if (code == "read_only" && params.is_object() && params.contains("doc_id")) {
@@ -171,7 +174,7 @@ bool call(const std::string& method, const json& params, json& result, std::stri
             std::string ae;
             if (g_client->call("attach_doc",
                                json{{"doc_id", params["doc_id"]}, {"mode", "rw"}}, ar, ae))
-                ok = g_client->call(method, params, result, err);
+                ok = g_client->call(method, params, result, err, timeoutMs);
         }
     }
     return ok;

@@ -331,10 +331,23 @@ void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
     stbi_image_free(px);
+    t.lastUse = ImGui::GetTime();
     S().thumbs[id] = t;
+    // LRU cap: a long browse session used to accumulate GL textures unboundedly (never
+    // deleted). This runs inside rpc.drain() on the GL thread — the same thread that draws
+    // the thumbs — so deleting the evicted texture right here is safe.
+    constexpr size_t kThumbCap = 256;
+    while (S().thumbs.size() > kThumbCap) {
+        auto oldest = S().thumbs.begin();
+        for (auto it = S().thumbs.begin(); it != S().thumbs.end(); ++it)
+            if (it->second.lastUse < oldest->second.lastUse) oldest = it;
+        if (oldest->second.tex) glDeleteTextures(1, &oldest->second.tex);
+        S().thumbs.erase(oldest);
+    }
 }
 
 void requestThumb(AppState& st, const PartsItem& item) {
+    if (S().thumbFailed.size() > 1024) S().thumbFailed.clear();  // cap: retry beats unbounded growth
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
@@ -363,6 +376,7 @@ void requestVendorLogo(AppState& st, const std::string& site, const std::string&
     // Live vendor logo for the search-progress strip. Stored in the SAME texture cache as
     // part thumbs, keyed "vendorlogo:<site>", fetched through the existing parts_thumbnail RPC.
     const std::string id = "vendorlogo:" + site;
+    if (S().thumbFailed.size() > 1024) S().thumbFailed.clear();  // cap: retry beats unbounded growth
     if (site.empty() || domain.empty() ||
         S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id))
         return;

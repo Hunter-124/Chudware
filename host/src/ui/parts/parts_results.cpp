@@ -151,6 +151,7 @@ void drawResultsList(AppState& st) {
         requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
+            th->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen thumbs resident
             // Fit the product image into the icon box, centered, preserving aspect.
             const float iw = (float)th->second.w, ih = (float)th->second.h;
             const float fit = std::min(iconSz / iw, iconSz / ih);
@@ -274,6 +275,7 @@ void drawResultsGrid(AppState& st) {
         requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
+            th->second.lastUse = ImGui::GetTime();  // LRU: keep on-screen thumbs resident
             const float iw = (float)th->second.w, ih = (float)th->second.h;
             const float fit = std::min((cardW - 2.0f * pad) / iw, (imgH - pad) / ih);
             const float dw = iw * fit, dh = ih * fit;

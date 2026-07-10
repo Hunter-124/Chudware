@@ -85,6 +85,7 @@ struct QueueJob {
 struct Thumb {
     unsigned int tex = 0;
     int w = 0, h = 0;
+    double lastUse = 0.0;   // ImGui::GetTime() at the last draw lookup — LRU eviction key
 };
 
 // parts_search "notices" — per-site skip reasons (login_required etc.) so stubbed vendors
@@ -199,9 +200,9 @@ struct PartsState {
     bool   queueActive   = false;  // any pending/running job → keep polling
 
     // ---- thumbnails ----
-    std::map<std::string, Thumb> thumbs;      // part_id → GL texture (loaded)
+    std::map<std::string, Thumb> thumbs;      // part_id → GL texture; LRU-capped in storeThumb
     std::set<std::string>        thumbBusy;   // requests in flight
-    std::set<std::string>        thumbFailed; // don't retry this session
+    std::set<std::string>        thumbFailed; // don't retry (cleared when it grows past ~1024)
 
     // Set every frame by drawPartsLibraryWorkspace so widget TUs can reach the app fonts
     // (sectionHeader h2). Never dereferenced outside a frame.

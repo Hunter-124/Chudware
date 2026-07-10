@@ -3,7 +3,7 @@ id: T-FIN23
 title: System power/energy budget - rails tree + firmware duty cycle + battery verdict
 workstream: FIN
 owner: fable-fin
-status: doing
+status: done
 branch: task/T-FIN23-system-power-budget
 depends_on: [T-FIN7, T-FIN13]
 lane: simulation

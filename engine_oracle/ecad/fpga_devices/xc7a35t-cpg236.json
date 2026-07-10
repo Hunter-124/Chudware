@@ -1,0 +1,987 @@
+{
+ "banks": {
+  "14": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.35,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "16": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.35,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "34": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.35,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "35": {
+   "vccio_pins": [],
+   "vccio_v_allowed": [
+    1.2,
+    1.35,
+    1.5,
+    1.8,
+    2.5,
+    3.3
+   ]
+  }
+ },
+ "capabilities": {
+  "clock_pins_known": true,
+  "diff_pairs_known": true
+ },
+ "config": {
+  "notes": "PARTIAL SEED: the user-IO balls broken out on the Digilent Cmod A7 (site + full IO_LxxY_Tz[_MRCC/SRCC]_bank function names). Dedicated bank-0 config/JTAG balls (TCK/TMS/TDI/TDO/CCLK/DONE/PROGRAM_B) and VCCO balls are not populated \u2014 config check SKIPS. Extend from the AMD/Xilinx xc7a35tcpg236 package file (data-only addition).",
+  "required": {}
+ },
+ "constraint_dialect": "xdc",
+ "coverage": "partial",
+ "device": "XC7A35T-CPG236",
+ "family": "artix7",
+ "package": "CPG236",
+ "pins": {
+  "A14": {
+   "bank": "16",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6P_T0_16",
+   "pair": "L6_16",
+   "pol": "p",
+   "role": null
+  },
+  "A15": {
+   "bank": "16",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6N_T0_VREF_16",
+   "pair": "L6_16",
+   "pol": "n",
+   "role": null
+  },
+  "A16": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12P_T1_MRCC_16",
+   "pair": "L12_16",
+   "pol": "p",
+   "role": null
+  },
+  "A17": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12N_T1_MRCC_16",
+   "pair": "L12_16",
+   "pol": "n",
+   "role": null
+  },
+  "A18": {
+   "bank": "16",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L19N_T3_VREF_16",
+   "pair": "L19_16",
+   "pol": "n",
+   "role": null
+  },
+  "B15": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11N_T1_SRCC_16",
+   "pair": "L11_16",
+   "pol": "n",
+   "role": null
+  },
+  "B16": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13N_T2_MRCC_16",
+   "pair": "L13_16",
+   "pol": "n",
+   "role": null
+  },
+  "B17": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14N_T2_SRCC_16",
+   "pair": "L14_16",
+   "pol": "n",
+   "role": null
+  },
+  "B18": {
+   "bank": "16",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L19P_T3_16",
+   "pair": "L19_16",
+   "pol": "p",
+   "role": null
+  },
+  "C15": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11P_T1_SRCC_16",
+   "pair": "L11_16",
+   "pol": "p",
+   "role": null
+  },
+  "C16": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13P_T2_MRCC_16",
+   "pair": "L13_16",
+   "pol": "p",
+   "role": null
+  },
+  "C17": {
+   "bank": "16",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14P_T2_SRCC_16",
+   "pair": "L14_16",
+   "pol": "p",
+   "role": null
+  },
+  "D17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_0_14",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "D18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1P_T0_D00_MOSI_14",
+   "pair": "L1_14",
+   "pol": "p",
+   "role": null
+  },
+  "D19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1N_T0_D01_DIN_14",
+   "pair": "L1_14",
+   "pol": "n",
+   "role": null
+  },
+  "F18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2N_T0_D03_14",
+   "pair": "L2_14",
+   "pol": "n",
+   "role": null
+  },
+  "G17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5N_T0_D07_14",
+   "pair": "L5_14",
+   "pol": "n",
+   "role": null
+  },
+  "G18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2P_T0_D02_14",
+   "pair": "L2_14",
+   "pol": "p",
+   "role": null
+  },
+  "G19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L4N_T0_D05_14",
+   "pair": "L4_14",
+   "pol": "n",
+   "role": null
+  },
+  "G2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1N_T0_AD4N_35",
+   "pair": "L1_35",
+   "pol": "n",
+   "role": null
+  },
+  "G3": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1P_T0_AD4P_35",
+   "pair": "L1_35",
+   "pol": "p",
+   "role": null
+  },
+  "H1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L3P_T0_DQS_AD5P_35",
+   "pair": "L3_35",
+   "pol": "p",
+   "role": null
+  },
+  "H17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5P_T0_D06_14",
+   "pair": "L5_14",
+   "pol": "p",
+   "role": null
+  },
+  "H19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L4P_T0_D04_14",
+   "pair": "L4_14",
+   "pol": "p",
+   "role": null
+  },
+  "H2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2P_T0_AD12P_35",
+   "pair": "L2_35",
+   "pol": "p",
+   "role": null
+  },
+  "J1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L3N_T0_DQS_AD5N_35",
+   "pair": "L3_35",
+   "pol": "n",
+   "role": null
+  },
+  "J17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L7P_T1_D09_14",
+   "pair": "L7_14",
+   "pol": "p",
+   "role": null
+  },
+  "J18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L7N_T1_D10_14",
+   "pair": "L7_14",
+   "pol": "n",
+   "role": null
+  },
+  "J19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6N_T0_D08_VREF_14",
+   "pair": "L6_14",
+   "pol": "n",
+   "role": null
+  },
+  "J2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2N_T0_AD12N_35",
+   "pair": "L2_35",
+   "pol": "n",
+   "role": null
+  },
+  "J3": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L7P_T1_AD6P_35",
+   "pair": "L7_35",
+   "pol": "p",
+   "role": null
+  },
+  "K17": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12N_T1_MRCC_14",
+   "pair": "L12_14",
+   "pol": "n",
+   "role": null
+  },
+  "K18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L8N_T1_D12_14",
+   "pair": "L8_14",
+   "pol": "n",
+   "role": null
+  },
+  "K19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6P_T0_FCS_B_14",
+   "pair": "L6_14",
+   "pol": "p",
+   "role": null
+  },
+  "K2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5P_T0_AD13P_35",
+   "pair": "L5_35",
+   "pol": "p",
+   "role": null
+  },
+  "K3": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L7N_T1_AD6N_35",
+   "pair": "L7_35",
+   "pol": "n",
+   "role": null
+  },
+  "L1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6N_T0_VREF_35",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "L17": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12P_T1_MRCC_14",
+   "pair": "L12_14",
+   "pol": "p",
+   "role": null
+  },
+  "L18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L8P_T1_D11_14",
+   "pair": "L8_14",
+   "pol": "p",
+   "role": null
+  },
+  "L2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5N_T0_AD13N_35",
+   "pair": "L5_35",
+   "pol": "n",
+   "role": null
+  },
+  "L3": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L8P_T1_AD14P_35",
+   "pair": "L8_35",
+   "pol": "p",
+   "role": null
+  },
+  "M1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9N_T1_DQS_AD7N_35",
+   "pair": "L9_35",
+   "pol": "n",
+   "role": null
+  },
+  "M18": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11P_T1_SRCC_14",
+   "pair": "L11_14",
+   "pol": "p",
+   "role": null
+  },
+  "M19": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11N_T1_SRCC_14",
+   "pair": "L11_14",
+   "pol": "n",
+   "role": null
+  },
+  "M2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9P_T1_DQS_AD7P_35",
+   "pair": "L9_35",
+   "pol": "p",
+   "role": null
+  },
+  "M3": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L8N_T1_AD14N_35",
+   "pair": "L8_35",
+   "pol": "n",
+   "role": null
+  },
+  "N1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L10N_T1_AD15N_35",
+   "pair": "L10_35",
+   "pol": "n",
+   "role": null
+  },
+  "N17": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13P_T2_MRCC_14",
+   "pair": "L13_14",
+   "pol": "p",
+   "role": null
+  },
+  "N18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9P_T1_DQS_14",
+   "pair": "L9_14",
+   "pol": "p",
+   "role": null
+  },
+  "N19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9N_T1_DQS_D13_14",
+   "pair": "L9_14",
+   "pol": "n",
+   "role": null
+  },
+  "N2": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L10P_T1_AD15P_35",
+   "pair": "L10_35",
+   "pol": "p",
+   "role": null
+  },
+  "N3": {
+   "bank": "35",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12P_T1_MRCC_35",
+   "pair": "L12_35",
+   "pol": "p",
+   "role": null
+  },
+  "P1": {
+   "bank": "35",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L19N_T3_VREF_35",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "P17": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13N_T2_MRCC_14",
+   "pair": "L13_14",
+   "pol": "n",
+   "role": null
+  },
+  "P18": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14P_T2_SRCC_14",
+   "pair": "L14_14",
+   "pol": "p",
+   "role": null
+  },
+  "P19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L10P_T1_D14_14",
+   "pair": "L10_14",
+   "pol": "p",
+   "role": null
+  },
+  "P3": {
+   "bank": "35",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12N_T1_MRCC_35",
+   "pair": "L12_35",
+   "pol": "n",
+   "role": null
+  },
+  "R18": {
+   "bank": "14",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14N_T2_SRCC_14",
+   "pair": "L14_14",
+   "pol": "n",
+   "role": null
+  },
+  "R19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L10N_T1_D15_14",
+   "pair": "L10_14",
+   "pol": "n",
+   "role": null
+  },
+  "R2": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1P_T0_34",
+   "pair": "L1_34",
+   "pol": "p",
+   "role": null
+  },
+  "R3": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2P_T0_34",
+   "pair": "L2_34",
+   "pol": "p",
+   "role": null
+  },
+  "T1": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L3P_T0_DQS_34",
+   "pair": "L3_34",
+   "pol": "p",
+   "role": null
+  },
+  "T17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L17P_T2_A14_D30_14",
+   "pair": "L17_14",
+   "pol": "p",
+   "role": null
+  },
+  "T18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L17N_T2_A13_D29_14",
+   "pair": "L17_14",
+   "pol": "n",
+   "role": null
+  },
+  "T2": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L1N_T0_34",
+   "pair": "L1_34",
+   "pol": "n",
+   "role": null
+  },
+  "T3": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L2N_T0_34",
+   "pair": "L2_34",
+   "pol": "n",
+   "role": null
+  },
+  "U1": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L3N_T0_DQS_34",
+   "pair": "L3_34",
+   "pol": "n",
+   "role": null
+  },
+  "U14": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_25_14",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "U15": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L23P_T3_A03_D19_14",
+   "pair": "L23_14",
+   "pol": "p",
+   "role": null
+  },
+  "U16": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L23N_T3_A02_D18_14",
+   "pair": "L23_14",
+   "pol": "n",
+   "role": null
+  },
+  "U17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L18P_T2_A12_D28_14",
+   "pair": "L18_14",
+   "pol": "p",
+   "role": null
+  },
+  "U18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L18N_T2_A11_D27_14",
+   "pair": "L18_14",
+   "pol": "n",
+   "role": null
+  },
+  "U19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L15P_T2_DQS_RDWR_B_14",
+   "pair": "L15_14",
+   "pol": "p",
+   "role": null
+  },
+  "U2": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9N_T1_DQS_34",
+   "pair": "L9_34",
+   "pol": "n",
+   "role": null
+  },
+  "U3": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L9P_T1_DQS_34",
+   "pair": "L9_34",
+   "pol": "p",
+   "role": null
+  },
+  "U4": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11P_T1_SRCC_34",
+   "pair": "L11_34",
+   "pol": "p",
+   "role": null
+  },
+  "U5": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L16P_T2_34",
+   "pair": "L16_34",
+   "pol": "p",
+   "role": null
+  },
+  "U7": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L19P_T3_34",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "U8": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14P_T2_SRCC_34",
+   "pair": "L14_34",
+   "pol": "p",
+   "role": null
+  },
+  "V13": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L24P_T3_A01_D17_14",
+   "pair": "L24_14",
+   "pol": "p",
+   "role": null
+  },
+  "V14": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L24N_T3_A00_D16_14",
+   "pair": "L24_14",
+   "pol": "n",
+   "role": null
+  },
+  "V15": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L21P_T3_DQS_14",
+   "pair": "L21_14",
+   "pol": "p",
+   "role": null
+  },
+  "V16": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L19P_T3_A10_D26_14",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "V19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L15N_T2_DQS_DOUT_CSO_B_14",
+   "pair": "L15_14",
+   "pol": "n",
+   "role": null
+  },
+  "V2": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5P_T0_34",
+   "pair": "L5_34",
+   "pol": "p",
+   "role": null
+  },
+  "V3": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6P_T0_34",
+   "pair": "L6_34",
+   "pol": "p",
+   "role": null
+  },
+  "V4": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L11N_T1_SRCC_34",
+   "pair": "L11_34",
+   "pol": "n",
+   "role": null
+  },
+  "V5": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L16N_T2_34",
+   "pair": "L16_34",
+   "pol": "n",
+   "role": null
+  },
+  "V8": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L14N_T2_SRCC_34",
+   "pair": "L14_34",
+   "pol": "n",
+   "role": null
+  },
+  "W13": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L22P_T3_A05_D21_14",
+   "pair": "L22_14",
+   "pol": "p",
+   "role": null
+  },
+  "W14": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L22N_T3_A04_D20_14",
+   "pair": "L22_14",
+   "pol": "n",
+   "role": null
+  },
+  "W15": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L21N_T3_DQS_A06_D22_14",
+   "pair": "L21_14",
+   "pol": "n",
+   "role": null
+  },
+  "W16": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L20P_T3_A08_D24_14",
+   "pair": "L20_14",
+   "pol": "p",
+   "role": null
+  },
+  "W17": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L20N_T3_A07_D23_14",
+   "pair": "L20_14",
+   "pol": "n",
+   "role": null
+  },
+  "W18": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L16P_T2_CSI_B_14",
+   "pair": "L16_14",
+   "pol": "p",
+   "role": null
+  },
+  "W19": {
+   "bank": "14",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L16N_T2_A15_D31_14",
+   "pair": "L16_14",
+   "pol": "n",
+   "role": null
+  },
+  "W2": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L5N_T0_34",
+   "pair": "L5_34",
+   "pol": "n",
+   "role": null
+  },
+  "W3": {
+   "bank": "34",
+   "clock": false,
+   "kind": "io",
+   "name": "IO_L6N_T0_VREF_34",
+   "pair": "L6_34",
+   "pol": "n",
+   "role": null
+  },
+  "W4": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12N_T1_MRCC_34",
+   "pair": "L12_34",
+   "pol": "n",
+   "role": null
+  },
+  "W5": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L12P_T1_MRCC_34",
+   "pair": "L12_34",
+   "pol": "p",
+   "role": null
+  },
+  "W6": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13N_T2_MRCC_34",
+   "pair": "L13_34",
+   "pol": "n",
+   "role": null
+  },
+  "W7": {
+   "bank": "34",
+   "clock": true,
+   "kind": "io",
+   "name": "IO_L13P_T2_MRCC_34",
+   "pair": "L13_34",
+   "pol": "p",
+   "role": null
+  }
+ },
+ "schema": "aicad.fpga_device/1",
+ "sources": [
+  "Digilent digilent-xdc Cmod-A7-Master.xdc (MIT) \u2014 ball sites + IO function names",
+  "AMD/Xilinx 7 Series SelectIO UG471 \u2014 HR bank VCCO ranges; MRCC/SRCC = clock-capable"
+ ],
+ "vendor": "xilinx"
+}

@@ -1,0 +1,6 @@
+pin,net,port,site,bank,clock_capable,diff_pair,polarity,iostandard
+35,CLK12M,CLK12M,IOT_46B_G0,0,yes,,,
+3,D_N,D_N,IOB_9B,2,no,IOB_8_9,n,
+4,D_P,D_P,IOB_8A,2,no,IOB_8_9,p,
+46,LED0,LED0,IOB_0A,2,no,,,
+2,UART_TX,UART_TX,IOB_6A,2,no,,,

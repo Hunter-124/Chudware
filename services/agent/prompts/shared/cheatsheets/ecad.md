@@ -180,3 +180,32 @@ PDN / IR-DROP (T-FIN13; DC resistive solve of power-net copper):
   else pdn.boardphys.json) — the trace-heating input for the thermal handoff.
   BIAS: run after routing + zone fill (unrouted copper = "not connected" violations);
   fix drops by widening copper / adding a pour / stitching vias, then re-run.
+
+FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
+  Data-driven FPGA part model in engine/ecad/fpga_devices/*.json — banks -> pins, VCCIO
+  domains, clock-capable pins, TRUE differential-pair pins, config/JTAG pins. Adding a
+  new family/package is a DATA addition (one JSON), not code. Shipped seeds:
+    iCE40UP5K-SG48       FULL (icestorm + iCEBreaker sources); placeable starter symbol
+                         'FPGA:iCE40UP5K-SG48' + QFN-48-1EP footprint, pins generated
+                         FROM the JSON so symbol and checker can never drift.
+    LFE5U-25F-CABGA256   partial (prjtrellis banks + true pairs; no clock/config data yet)
+    XC7A35T-CPG236       partial (Cmod A7 XDC sites; MRCC/SRCC clock flags + pairs)
+  Bind any other symbol to a device with fields={"fpga_device": "<device>"}.
+
+  ecad_fpga_check([ref], [io])     Bank-aware checks on the schematic netlist:
+      1. bank VCCIO — all IO of a bank compatible with ONE VCCIO (bank voltage inferred
+         from the net on its VCCIO pins; per-net need from IOSTANDARD or a voltage-tagged
+         net name like SENSOR_3V3); illegal VCCIO voltages flagged too.
+      2. diff pairs — nets X_P/X_N (or X+/X-) must land on both halves of ONE true pair,
+         correct polarity (P on 'p' pin).
+      3. clocks — *CLK* nets must enter on clock-capable pins (GBIN/MRCC/SRCC).
+      4. config/JTAG — required pins (e.g. iCE40 CRESET_B) actually wired.
+      io={"NET": {"iostandard": "LVCMOS18"}} declares IO standards. HONESTY: partial
+      seeds SKIP checks they lack data for (warning), never guess.
+  ecad_export('constraints')       Pin-constraint files from the design netlist (the
+      board is the source of truth for the HDL flow): native dialect per vendor — XDC
+      (Xilinx) or LPF (Lattice) — plus a neutral CSV pinout (pin,net,port,site,bank,
+      clock_capable,diff_pair,polarity,iostandard). One <ref>_pins.* set per FPGA,
+      byte-deterministic (golden-tested in engine/ecad/test_fpga.py).
+  Typical flow: place FPGA symbol -> wire IO/power/config -> ecad_run_erc() ->
+  ecad_fpga_check() -> fix -> ecad_export('constraints') -> feed XDC/LPF to Vivado/nextpnr.

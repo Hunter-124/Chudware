@@ -1898,6 +1898,58 @@ def register_ecad_tools(mcp) -> None:
                              "ecad_status()"],
         })
 
+    # ---------------------------------------------------------------- FPGA (T-FIN11)
+
+    @mcp.tool()
+    def ecad_fpga_check(ref: str = "", io: Optional[dict] = None, doc_id: str = "") -> str:
+        """Bank-aware FPGA design checks on the active schematic (T-FIN11).
+
+        Finds every placed FPGA (a symbol whose value/libid matches an
+        ``aicad.fpga_device/1`` seed — 'FPGA:iCE40UP5K-SG48' ships full; ECP5 CABGA256
+        and XC7A35T-CPG236 ship as partial seeds — or any symbol tagged with fields
+        ``{"fpga_device": "<device>"}``) and validates:
+
+        1. bank VCCIO: every IO pin of a bank compatible with ONE VCCIO (inferred from the
+           net on the bank's VCCIO pins + each net's IOSTANDARD or voltage-tagged name);
+        2. differential nets (``X_P``/``X_N``, ``X+``/``X-``) on TRUE pair pins, right polarity;
+        3. clock-named nets (``*CLK*``) on clock-capable pins (GBIN/MRCC/SRCC);
+        4. required config/JTAG pins wired per datasheet (e.g. iCE40 CRESET_B).
+
+        ``ref`` limits the check to one component. ``io`` optionally maps net name ->
+        {"iostandard": "LVCMOS18"} to declare IO standards. Partial device seeds SKIP the
+        checks they lack data for (reported as warnings — never guessed). Returns
+        violations [{check, ref, message, ...}] and a per-device coverage summary.
+        Constraint files for the HDL flow: ecad_export('constraints').
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="FPGA checks run on a schematic.",
+                        next_actions=["ecad_new_schematic('myfpga')"])
+        try:
+            from engine.ecad import fpga
+        except Exception as e:  # noqa: BLE001
+            return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
+        nl = netlist_mod.build_netlist(session.doc)
+        res = fpga.fpga_check(nl, ref=ref or "", io=io or None)
+        if not res["devices"]:
+            return _err("no FPGA found on the schematic",
+                        hint="Place 'FPGA:iCE40UP5K-SG48' or tag a symbol with "
+                             "fields={'fpga_device': '<device>'}; known devices: "
+                             + ", ".join(d["device"] for d in fpga.load_devices().values()),
+                        next_actions=["ecad_place_symbol('FPGA:iCE40UP5K-SG48', 100, 100)"])
+        n = len(res["violations"])
+        return _dumps({
+            "ok": res["ok"], "doc_id": session.doc_id, "devices": res["devices"],
+            "violations": res["violations"], "warnings": res["warnings"],
+            "hint": ("FPGA checks clean across "
+                     f"{len(res['devices'])} device(s)." if res["ok"] else
+                     f"{n} FPGA violation(s) — fix bank/pair/clock/config wiring "
+                     "before generating constraints."),
+            "next_actions": ["ecad_export('constraints')  # XDC/LPF/CSV pinout",
+                             "ecad_run_erc()"],
+        })
+
     # ---------------------------------------------------------------- export
 
     @mcp.tool()
@@ -1905,17 +1957,61 @@ def register_ecad_tools(mcp) -> None:
         """Export a fabrication output from the active board.
 
         ``kind`` is one of: 'gerber' (copper/mask/silk layer set), 'drill' (Excellon PTH/NPTH),
-        'bom' (CSV bill of materials), 'placement' (pick-and-place CSV). ``path`` is the output
-        directory (gerber/drill) or file (bom/placement); defaults under the AI-CAD cache. Returns
-        the written path(s).
+        'bom' (CSV bill of materials), 'placement' (pick-and-place CSV), or 'constraints'
+        (FPGA pin-constraint files from the design netlist: native XDC for Xilinx / LPF for
+        Lattice + a neutral CSV pinout per FPGA — the board is the source of truth for the
+        HDL flow; see ecad_fpga_check). ``path`` is the output directory (gerber/drill/
+        constraints) or file (bom/placement); defaults under the AI-CAD cache. Returns the
+        written path(s).
         """
+        kind = (kind or "").lower()
+        if kind == "constraints":
+            # constraints come from the SCHEMATIC netlist (pin->net truth), not the board
+            try:
+                session = _get_sch(doc_id or None)
+            except OpError as e:
+                return _err(e.message,
+                            hint="Constraint export reads the schematic netlist (the placed "
+                                 "FPGA symbol's pin->net map).",
+                            next_actions=["ecad_new_schematic('myfpga')",
+                                          "ecad_place_symbol('FPGA:iCE40UP5K-SG48', 100, 100)"])
+            try:
+                from engine.ecad import fpga
+            except Exception as e:  # noqa: BLE001
+                return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
+            nl = netlist_mod.build_netlist(session.doc)
+            exports = fpga.export_constraints(nl)
+            if not exports:
+                return _err("no FPGA found on the schematic",
+                            hint="Place an FPGA symbol (e.g. 'FPGA:iCE40UP5K-SG48') or tag a "
+                                 "symbol with fields={'fpga_device': '<device>'}; "
+                                 "known devices: " + ", ".join(
+                                     d["device"] for d in fpga.load_devices().values()),
+                            next_actions=["ecad_fpga_check()"])
+            out_dir = path or str(_default_out_dir(session.doc.get("name", "board")))
+            os.makedirs(out_dir, exist_ok=True)
+            files = []
+            for ref, texts in sorted(exports.items()):
+                for ext, text in sorted(texts.items()):
+                    fp = os.path.join(out_dir, f"{ref}_pins.{ext}")
+                    with open(fp, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                    files.append(fp)
+            _ECAD["out_dir"] = out_dir
+            return _dumps({
+                "ok": True, "kind": "constraints", "doc_id": session.doc_id,
+                "dir": out_dir, "files": files, "warnings": [],
+                "hint": ("Wrote pin constraints for "
+                         f"{', '.join(sorted(exports))}: native dialect (XDC/LPF) + neutral "
+                         "CSV pinout. Feed the XDC/LPF straight to Vivado/nextpnr."),
+                "next_actions": ["ecad_fpga_check()  # bank/diff/clock/config validation"],
+            })
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="Export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-        kind = (kind or "").lower()
         try:
             from engine.ecad import fab
         except Exception as e:  # noqa: BLE001
@@ -1952,7 +2048,8 @@ def register_ecad_tools(mcp) -> None:
                           "rows": max(0, text.count("\n") - 1)}
             else:
                 return _err(f"unknown export kind {kind!r}",
-                            hint="Use 'gerber', 'drill', 'bom', or 'placement'.",
+                            hint="Use 'gerber', 'drill', 'bom', 'placement', or "
+                                 "'constraints' (FPGA XDC/LPF/CSV).",
                             next_actions=["ecad_export('gerber')"])
         except Exception as e:  # noqa: BLE001
             return _err(f"export {kind} failed: {type(e).__name__}: {e}",

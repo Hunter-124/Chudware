@@ -1,0 +1,504 @@
+{
+ "banks": {
+  "0": {
+   "vccio_pins": [
+    "33"
+   ],
+   "vccio_v_allowed": [
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "1": {
+   "vccio_pins": [
+    "22"
+   ],
+   "vccio_v_allowed": [
+    1.8,
+    2.5,
+    3.3
+   ]
+  },
+  "2": {
+   "vccio_pins": [
+    "1"
+   ],
+   "vccio_v_allowed": [
+    1.8,
+    2.5,
+    3.3
+   ]
+  }
+ },
+ "capabilities": {
+  "clock_pins_known": true,
+  "diff_pairs_known": true
+ },
+ "config": {
+  "notes": "CDONE (pin 7) optional status LED. SPI master/slave configuration uses the dual-purpose bank-1 pins 14-17 (SPI_SO/SPI_SCK/SPI_CSN/SPI_SI); when configuring from flash, wire them to the flash per AN FPGA-TN-02001. RGB0-2 (39-41) are open-drain current-sink LED pads, not general IO.",
+  "required": {
+   "8": {
+    "note": "external pull-up to VCCIO_1 recommended; must not float",
+    "role": "CRESET_B",
+    "rule": "wired"
+   }
+  }
+ },
+ "constraint_dialect": "lpf",
+ "coverage": "full",
+ "device": "iCE40UP5K-SG48",
+ "family": "ice40up",
+ "package": "SG48",
+ "pins": {
+  "1": {
+   "bank": "2",
+   "clock": false,
+   "kind": "power",
+   "name": "VCCIO_2",
+   "pair": null,
+   "pol": null,
+   "role": "VCCIO"
+  },
+  "10": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_18A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "11": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_20A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "12": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_22A",
+   "pair": "IOB_22_23",
+   "pol": "p",
+   "role": null
+  },
+  "13": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_24A",
+   "pair": "IOB_24_25",
+   "pol": "p",
+   "role": null
+  },
+  "14": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_32a_SPI_SO",
+   "pair": "IOB_32_33",
+   "pol": "p",
+   "role": null
+  },
+  "15": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_34a_SPI_SCK",
+   "pair": "IOB_34_35",
+   "pol": "p",
+   "role": null
+  },
+  "16": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_35b_SPI_CSN",
+   "pair": "IOB_34_35",
+   "pol": "n",
+   "role": null
+  },
+  "17": {
+   "bank": "1",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_33b_SPI_SI",
+   "pair": "IOB_32_33",
+   "pol": "n",
+   "role": null
+  },
+  "18": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_31B",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "19": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_29B",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "2": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_6A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "20": {
+   "bank": "2",
+   "clock": true,
+   "kind": "io",
+   "name": "IOB_25B_G3",
+   "pair": "IOB_24_25",
+   "pol": "n",
+   "role": null
+  },
+  "21": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_23B",
+   "pair": "IOB_22_23",
+   "pol": "n",
+   "role": null
+  },
+  "22": {
+   "bank": "1",
+   "clock": false,
+   "kind": "power",
+   "name": "SPI_VCCIO1",
+   "pair": null,
+   "pol": null,
+   "role": "VCCIO"
+  },
+  "23": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_37A",
+   "pair": "IOT_36_37",
+   "pol": "p",
+   "role": null
+  },
+  "24": {
+   "bank": null,
+   "clock": false,
+   "kind": "power",
+   "name": "VPP_2V5",
+   "pair": null,
+   "pol": null,
+   "role": "VPP"
+  },
+  "25": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_36B",
+   "pair": "IOT_36_37",
+   "pol": "n",
+   "role": null
+  },
+  "26": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_39A",
+   "pair": "IOT_38_39",
+   "pol": "p",
+   "role": null
+  },
+  "27": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_38B",
+   "pair": "IOT_38_39",
+   "pol": "n",
+   "role": null
+  },
+  "28": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_41A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "29": {
+   "bank": null,
+   "clock": false,
+   "kind": "power",
+   "name": "VCCPLL",
+   "pair": null,
+   "pol": null,
+   "role": "VCCPLL"
+  },
+  "3": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_9B",
+   "pair": "IOB_8_9",
+   "pol": "n",
+   "role": null
+  },
+  "30": {
+   "bank": null,
+   "clock": false,
+   "kind": "power",
+   "name": "VCC",
+   "pair": null,
+   "pol": null,
+   "role": "VCC"
+  },
+  "31": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_42B",
+   "pair": "IOT_42_43",
+   "pol": "n",
+   "role": null
+  },
+  "32": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_43A",
+   "pair": "IOT_42_43",
+   "pol": "p",
+   "role": null
+  },
+  "33": {
+   "bank": "0",
+   "clock": false,
+   "kind": "power",
+   "name": "VCCIO_0",
+   "pair": null,
+   "pol": null,
+   "role": "VCCIO"
+  },
+  "34": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_44B",
+   "pair": "IOT_44_45",
+   "pol": "n",
+   "role": null
+  },
+  "35": {
+   "bank": "0",
+   "clock": true,
+   "kind": "io",
+   "name": "IOT_46B_G0",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "36": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_48B",
+   "pair": "IOT_48_49",
+   "pol": "n",
+   "role": null
+  },
+  "37": {
+   "bank": "0",
+   "clock": true,
+   "kind": "io",
+   "name": "IOT_45A_G1",
+   "pair": "IOT_44_45",
+   "pol": "p",
+   "role": null
+  },
+  "38": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_50B",
+   "pair": "IOT_50_51",
+   "pol": "n",
+   "role": null
+  },
+  "39": {
+   "bank": null,
+   "clock": false,
+   "kind": "special",
+   "name": "RGB0",
+   "pair": null,
+   "pol": null,
+   "role": "RGB0"
+  },
+  "4": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_8A",
+   "pair": "IOB_8_9",
+   "pol": "p",
+   "role": null
+  },
+  "40": {
+   "bank": null,
+   "clock": false,
+   "kind": "special",
+   "name": "RGB1",
+   "pair": null,
+   "pol": null,
+   "role": "RGB1"
+  },
+  "41": {
+   "bank": null,
+   "clock": false,
+   "kind": "special",
+   "name": "RGB2",
+   "pair": null,
+   "pol": null,
+   "role": "RGB2"
+  },
+  "42": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_51A",
+   "pair": "IOT_50_51",
+   "pol": "p",
+   "role": null
+  },
+  "43": {
+   "bank": "0",
+   "clock": false,
+   "kind": "io",
+   "name": "IOT_49A",
+   "pair": "IOT_48_49",
+   "pol": "p",
+   "role": null
+  },
+  "44": {
+   "bank": "2",
+   "clock": true,
+   "kind": "io",
+   "name": "IOB_3B_G6",
+   "pair": "IOB_2_3",
+   "pol": "n",
+   "role": null
+  },
+  "45": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_5B",
+   "pair": "IOB_4_5",
+   "pol": "n",
+   "role": null
+  },
+  "46": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_0A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "47": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_2A",
+   "pair": "IOB_2_3",
+   "pol": "p",
+   "role": null
+  },
+  "48": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_4A",
+   "pair": "IOB_4_5",
+   "pol": "p",
+   "role": null
+  },
+  "49": {
+   "bank": null,
+   "clock": false,
+   "kind": "power",
+   "name": "GND",
+   "pair": null,
+   "pol": null,
+   "role": "GND"
+  },
+  "5": {
+   "bank": null,
+   "clock": false,
+   "kind": "power",
+   "name": "VCC",
+   "pair": null,
+   "pol": null,
+   "role": "VCC"
+  },
+  "6": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_13B",
+   "pair": null,
+   "pol": null,
+   "role": null
+  },
+  "7": {
+   "bank": null,
+   "clock": false,
+   "kind": "config",
+   "name": "CDONE",
+   "pair": null,
+   "pol": null,
+   "role": "CDONE"
+  },
+  "8": {
+   "bank": null,
+   "clock": false,
+   "kind": "config",
+   "name": "CRESET_B",
+   "pair": null,
+   "pol": null,
+   "role": "CRESET_B"
+  },
+  "9": {
+   "bank": "2",
+   "clock": false,
+   "kind": "io",
+   "name": "IOB_16A",
+   "pair": null,
+   "pol": null,
+   "role": null
+  }
+ },
+ "schema": "aicad.fpga_device/1",
+ "sources": [
+  "icestorm (ISC) icefuzz/pinloc/pinloc-u4k-sg48.sh \u2014 SG48 user-IO pin list",
+  "iCEBreaker-bitsy KiCad symbol (icebreaker-fpga/icebreaker, CERN-OHL) \u2014 full SG48 pin/name table",
+  "Lattice iCE40 UltraPlus Family Data Sheet FPGA-DS-02008 \u2014 banks/VCCIO/sysCONFIG semantics",
+  "diff pairs derived from A/B PIO tile numbering (A = positive); verify LVDS bank support per datasheet"
+ ],
+ "vendor": "lattice"
+}

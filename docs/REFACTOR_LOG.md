@@ -1054,3 +1054,14 @@ Files: `core/sketch/sketch.cpp`, `core/doc/session.{h,cpp}`, `core/doc/document.
 `core/geom/booleans.{h,cpp}`, `core/hostd/{main,server}.{cpp,h}`,
 `services/ipc/ipc_{transport,discovery}.{h,cpp}` (+ win variants),
 `docs/REFACTOR_LOG.md`, `work/backlog/T-PERF{5,9,10}.md`.
+
+**2026-07-10 — T-PERF10 deferred micro-items (AICM shm + CEF lazy + profiler).**
+`core/util/aicm_handoff.{h,cpp}`: POSIX shm / Win named mapping publish+map with
+`aicm-shm://` URIs; session tess + assembly AICM publish via handoff (file fallback);
+host/`ui/viewport` `loadAicmFile` maps URIs; `doc_close` + keep-last-3 revs free objects.
+CEF: cold GUI no longer calls `CefInitialize` (opt-in `AI_CAD_CEF_EARLY=1`); first
+`CefWebView::open` initializes. Profiler: absolute-time cadence (~1 kHz under load),
+ucontext leaf PC (no longer 100% self-time in `sample_handler`), ELF `.symtab`
+symbolization fallback; summary ticks/dropped diagnostics. Verified: shm lifecycle
+0→10→0, profile_modeling ~2.9k samples/3s with OCCT hotspots, m1 shot smoke PASS.
+**Deferred:** out-of-line content-addressed `embedded_brep` store (schema/PLM).

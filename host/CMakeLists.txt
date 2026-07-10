@@ -73,6 +73,7 @@ add_executable(Billet
   src/renderer.cpp
   # --- C15: AICM loader + ID-buffer picking + overlays + selection ---
   src/render/aicm_loader.cpp
+  ../core/util/aicm_handoff.cpp   # T-PERF10: aicm-shm:// map for loadAicmFile
   src/render/id_pass.cpp
   src/render/overlays.cpp
   src/render/splat_renderer.cpp     # RE-28: 3DGS splat renderer
@@ -208,6 +209,7 @@ endif()
 
 target_include_directories(Billet PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
   ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
   ${stb_SOURCE_DIR}
@@ -215,6 +217,9 @@ target_include_directories(Billet PRIVATE
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(Billet PRIVATE glfw nlohmann_json::nlohmann_json)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(Billet PRIVATE rt)  # shm_open (older glibc)
+endif()
 
 # CEF off-screen browser backend (opt-in). cmake/cef.cmake finds the CEF binary
 # distribution, adds the cef_web_view sources + libcef_dll_wrapper, defines
@@ -242,9 +247,14 @@ set_target_properties(Billet PROPERTIES
 # --- C15: optional pure-CPU loader test (no GL/GLFW). Built with the default target set. ---
 add_executable(test_aicm
   src/render/aicm_loader.cpp
+  ../core/util/aicm_handoff.cpp
   src/render/test_aicm_cpp/test_aicm.cpp)
 target_include_directories(test_aicm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(test_aicm PRIVATE rt)
+endif()
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # --- end C15 ---

@@ -1,5 +1,7 @@
 #include "aicm_loader.h"
 
+#include "util/aicm_handoff.h"
+
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -199,28 +201,12 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
 }
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
-    // u8path so non-ASCII paths work on Windows (fopen/active code page would fail).
-    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
-    if (!f) {
-        err = "cannot open " + path;
-        return false;
-    }
-    f.seekg(0, std::ios::end);
-    std::streamoff n = f.tellg();
-    if (n < 0) {
-        err = "cannot size " + path;
-        return false;
-    }
-    f.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf((size_t)n);
-    if (n > 0) {
-        f.read(reinterpret_cast<char*>(buf.data()), n);
-        if (!f) {
-            err = "short read on " + path;
-            return false;
-        }
-    }
-    return parseAicm(buf.data(), buf.size(), out, err);
+    // T-PERF10: aicm-shm:// URIs (and same-process cache) via aicm_handoff.
+    aicad::aicm_handoff::Mapping m;
+    if (!aicad::aicm_handoff::map(path, m, err)) return false;
+    const bool ok = parseAicm(m.data, m.size, out, err);
+    aicad::aicm_handoff::unmap(m);
+    return ok;
 }
 
 }  // namespace render

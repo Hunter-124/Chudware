@@ -420,12 +420,16 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 #ifdef AI_CAD_ENABLE_CEF
-    // Every remaining path launches the GUI, whose Parts-Library vendor browser is
-    // the in-process CEF backend. Bootstrap Chromium unconditionally here — the CEF
-    // browser is the default, not an opt-in (no AI_CAD_WEBVIEW toggle). The headless
-    // CLI modes (--render/--contact/--build/--design/--ensure-runtime) all returned
-    // above, so they never pay for a Chromium boot.
-    ui::cef::initialize();
+    // T-PERF10: CEF lazy init. Cold GUI launch no longer pays for CefInitialize
+    // (~hundreds of ms + threads) unless a web surface is opened. Headless CEF
+    // modes above still call initialize() themselves. Opt into the old eager path
+    // with AI_CAD_CEF_EARLY=1 (also useful if a platform needs CefInitialize
+    // before GLFW — see docs/SESSION_VERIFY). stash_args already ran above so a
+    // later initialize() still has a clean argv.
+    if (const char* early = std::getenv("AI_CAD_CEF_EARLY");
+        early && early[0] && early[0] != '0') {
+        ui::cef::initialize();
+    }
 #endif
     if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
         // Headless UI capture. An explicit output path is optional; when omitted (the common

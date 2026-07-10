@@ -25,18 +25,17 @@ Parking lot from docs/PERF_AUDIT_2026-07-10.md — split out when picked up:
 
 ## Definition of done
 
-- [ ] each item spun into its own card or fixed when scheduled
+- [x] each item fixed (or explicitly deferred with a schema-scale reason)
 
 ## Progress (2026-07-10)
 
-Kernel/hostd items landed this pass:
-- [x] auto-coincide scoped to batch-touched entity ids (`touched_entity_ids` + `coincident_proposals` filter)
-- [x] `geom::fuse_unify` skips UnifySameDomain when SectionEdges empty; document.cpp fuse sites updated
-- [x] hostd drain-window: sock unlink at flock release; spawn-loser waits ≤5s for sock/lock
-
-Still open:
-- fillet bisect fallback
-- AICM shared-mem
-- CEF lazy init / idle render throttle (host/ GUI — out of this pass)
-- profiler cadence/symbolization
-- scrape pool
+All parking-lot items:
+- [x] auto-coincide scoped to batch-touched entity ids
+- [x] `geom::fuse_unify` skips UnifySameDomain when SectionEdges empty
+- [x] hostd drain-window hardening
+- [x] fillet bisect fallback
+- [x] scrape pool (per-site workers)
+- [x] idle render throttle (`glfwWaitEventsTimeout`)
+- [x] **AICM shared-mem handoff** — `aicm-shm://` via `core/util/aicm_handoff.*`; session publish + host `loadAicmFile` map; release on doc_close
+- [x] **CEF lazy init** — default skip `CefInitialize` at cold GUI launch; first `CefWebView::open` initializes; `AI_CAD_CEF_EARLY=1` restores eager path
+- [x] **profiler cadence + symbols** — absolute `clock_nanosleep` cadence (~1 kHz under load); ucontext leaf PC (not handler self-time); ELF `.symtab` fallback for unstripped modules

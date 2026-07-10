@@ -800,6 +800,14 @@ CefWebView::~CefWebView() {
 }
 
 void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
+    // T-PERF10: first web surface pays for CefInitialize; cold launch skips it.
+    if (!cef::initialize()) {
+        std::lock_guard<std::mutex> lk(impl_->s->mtx);
+        impl_->s->starting = false;
+        impl_->s->active = false;
+        impl_->s->lastError = "CEF failed to initialize";
+        return;
+    }
     impl_->pendingUrlReq.clear();
     impl_->invalidatedOnce_ = false;
     Impl* impl = impl_.get();

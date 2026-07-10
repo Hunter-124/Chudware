@@ -16,6 +16,7 @@
 
 #include "api/libaicad.h"
 
+#include "util/aicm_handoff.h"
 #include "version_info.h"  // CMake-configured AICAD_HOSTD_BUILD_ID (shared with aicad-hostd)
 
 #include <algorithm>
@@ -252,9 +253,8 @@ std::string to_hex(const std::vector<uint8_t>& b) {
 }
 
 // Choose where to write the AICM bytes. Honour an explicit params["aicm_out"]
-// (the host/tests can pin a path), else a unique file in the OS temp dir. The
-// counter + pid keep concurrent compiles from colliding without needing a clock
-// (Date/now is intentionally avoided elsewhere in the codebase).
+// (the host/tests can pin a path), else shared-mem handoff (T-PERF10), else a
+// unique file in the OS temp dir.
 std::filesystem::path aicm_target(const json& params) {
     if (params.contains("aicm_out") && params["aicm_out"].is_string()) {
         return std::filesystem::path(params["aicm_out"].get<std::string>());
@@ -263,6 +263,31 @@ std::filesystem::path aicm_target(const json& params) {
     unsigned long long n = seq.fetch_add(1);
     std::filesystem::path dir = std::filesystem::temp_directory_path();
     return dir / ("aicad_cpp_" + std::to_string(n) + ".aicm");
+}
+
+// Prefer aicm-shm handoff for diagnostic compiles too (same consumer path as session).
+std::string publish_or_write_aicm(const json& params, const std::vector<uint8_t>& aicm) {
+    if (params.contains("aicm_out") && params["aicm_out"].is_string()) {
+        std::filesystem::path target = params["aicm_out"].get<std::string>();
+        std::ofstream f(target, std::ios::binary | std::ios::trunc);
+        if (!f) return {};
+        f.write(reinterpret_cast<const char*>(aicm.data()),
+                static_cast<std::streamsize>(aicm.size()));
+        f.close();
+        return std::filesystem::absolute(target).string();
+    }
+    static std::atomic<unsigned long long> seq{0};
+    unsigned long long n = seq.fetch_add(1);
+    const std::string key = "compile_" + std::to_string(n);
+    std::string uri = aicad::aicm_handoff::publish(key, aicm);
+    if (!uri.empty()) return uri;
+    std::filesystem::path target = aicm_target(params);
+    std::ofstream f(target, std::ios::binary | std::ios::trunc);
+    if (!f) return {};
+    f.write(reinterpret_cast<const char*>(aicm.data()),
+            static_cast<std::streamsize>(aicm.size()));
+    f.close();
+    return std::filesystem::absolute(target).string();
 }
 
 // doc_compile_cpp: compile a document tree to AICM + statuses (diagnostic).
@@ -295,15 +320,10 @@ int handle_compile(const json& params, char** out_json) {
 
     std::string aicm_path;
     if (!res.aicm.empty()) {
-        std::filesystem::path target = aicm_target(params);
-        std::ofstream f(target, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            return emit_error("doc_compile_cpp: cannot open AICM output: " + target.string(), out_json);
+        aicm_path = publish_or_write_aicm(params, res.aicm);
+        if (aicm_path.empty()) {
+            return emit_error("doc_compile_cpp: cannot publish/write AICM output", out_json);
         }
-        f.write(reinterpret_cast<const char*>(res.aicm.data()),
-                static_cast<std::streamsize>(res.aicm.size()));
-        f.close();
-        aicm_path = std::filesystem::absolute(target).string();
     }
 
     // Per-surviving-body stats (surfacing parity gate: area/face/edge counts for open

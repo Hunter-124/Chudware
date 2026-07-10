@@ -94,17 +94,17 @@ Machine: Linux host build. Prefer headed (`AI_CAD_SHOT_HEADED=1` or launch binar
 
 ---
 
-## T-PERF10 — odds & ends
+## T-PERF10 — odds & ends (incl. deferred micro-items shipped this pass)
 
 | # | Item | What to do | Expect | Pass? |
 |---|------|------------|--------|-------|
 | I1 | Auto-coincide scope | Edit one entity in a large sketch | Coincident proposals don't full-scan forever | |
 | I2 | Fillet bisect | All-edge fillet that partially fails | Faster than O(E²) full rebuilds; sensible partial result | |
 | I3 | Unify skip | Fuse-heavy model | No obvious regression; compile not slower | |
-| I4 | AICM shared-mem | Rebuild loop with hostd | No extra temp-file storm if path enabled | |
-| I5 | CEF lazy | Cold launch | Browser/CEF not forced before first web surface (if implemented) | |
+| I4 | **AICM shared-mem** | Edit a part; watch `/dev/shm/aicad_*` (or rebuild loop) | `tess.aicm_path` is `aicm-shm://…`; mesh still appears; no `/tmp/aicad_cpp_docs` storm; close doc frees shm | |
+| I5 | **CEF lazy** | Cold launch *without* opening Parts browser | No `[cef] calling CefInitialize` on stderr at startup; first open of vendor browser initializes CEF (or `AI_CAD_CEF_EARLY=1` restores old eager path) | |
 | I6 | Idle throttle | Leave app idle focused | CPU lower than full vsync spin | |
-| I7 | Profiler | `tools/profile_modeling.py` short run | Sample rate / symbols less broken than pre-fix | |
+| I7 | **Profiler** | `python3 tools/profile_modeling.py --workload fillet --seconds 3 --hz 1000` | ~thousands of samples (not ~76/10s); hot frames are OCCT/geom (not only `sample_handler`); names under `aicad!…` where unstripped | |
 | I8 | Scrape pool | Parts live search; type quickly | Old scrapes cancel; current query wins | |
 
 ---
@@ -113,16 +113,17 @@ Machine: Linux host build. Prefer headed (`AI_CAD_SHOT_HEADED=1` or launch binar
 
 | # | Command / check | Result |
 |---|-----------------|--------|
-| J1 | `./build.sh` (host) | **PASS** (2026-07-10 session) |
-| J2 | `./build.sh core` + ctest sketch/nsolve/document/aicm/ops | **PASS** 13/13 |
-| J3 | `python3 scripts/check.py` | **PARTIAL** — `feature_surface_audit` FAIL is pre-existing (sketch3d ribbon handlers), not from PERF |
-| J4 | `scripts/gate.sh` (or noted SKIPs) | not re-run full; core+host green |
-| J5 | All T-PERF1..10 implemented on master | **YES** (see notes for deferred micro-items) |
+| J1 | `./build.sh` (host) | **PASS** (incl. aicm_handoff + CEF lazy) |
+| J2 | `./build.sh core` + ctest aicm/prof/document/ops/sketch* | **PASS** |
+| J3 | `python3 scripts/check.py` | **PARTIAL** — pre-existing `feature_surface_audit` sketch3d ribbon FAIL (not from PERF) |
+| J4 | AICM shm lifecycle (agent) | **PASS** — path `aicm-shm://…`, mid=10 after 5 docs, after close=0 |
+| J5 | Profiler sample (agent) | **PASS** — ~2.9k samples / 3s @ 1 kHz; hotspots BRepGProp / tessellate / OCCT |
+| J6 | Headless `AI_CAD_SHOT=m1` smoke | **PASS** — scenario complete, PNG written |
+| J7 | All T-PERF1..10 + deferred micro-items | **YES** (only remaining optional: out-of-line embedded_brep store — schema/PLM) |
 
-### Deferred micro-items (not blocking DoD of phase cards)
+### Still intentionally deferred (not phase blockers)
 
-- T-PERF6(b): out-of-line embedded_brep content-addressed store (schema/PLM)
-- T-PERF10: AICM shared-mem handoff; CEF lazy init (CefInitialize-before-GLFW spike); in-process profiler symbolization/cadence (use `perf --call-graph dwarf` until then)
+- T-PERF6(b): out-of-line content-addressed `embedded_brep` store (save/load/PLM schema) — large schema change, not requested this pass.
 
 ---
 

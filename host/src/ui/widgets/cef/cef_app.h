@@ -24,12 +24,15 @@ int execute_subprocess(int argc, char** argv);
 
 // Browser process only. Initialises CEF with windowless rendering + the cookie
 // crypto settings that let the Playwright scraper reuse CEF's sessions. Reuses
-// the argc/argv captured by execute_subprocess (call that first). Returns false
+// the argc/argv captured by stash_args (call that first). Returns false
 // (and available()==false) if CEF failed to start, so callers fall back to the
-// screencast backend. Safe to call once.
+// screencast backend. Safe to call once; also the T-PERF10 lazy-init entry —
+// first CefWebView::open() calls this if main() did not (default). Force early
+// init with AI_CAD_CEF_EARLY=1.
 bool initialize();
 
 // True after a successful initialize(). CefWebView::available() forwards this.
+// Note: after lazy-init, available() is false until the first web surface opens.
 bool initialized();
 
 // Call once per GLFW frame. While any browser is alive (see note_browser_*),

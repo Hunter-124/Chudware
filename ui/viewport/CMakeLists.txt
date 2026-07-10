@@ -12,6 +12,7 @@ add_library(aicad_ui_viewport STATIC
   camera_anim.cpp
   viewport_impl.cpp
   render/aicm_loader.cpp
+  ../../core/util/aicm_handoff.cpp
   render/id_pass.cpp
   render/overlays.cpp
 )
@@ -19,7 +20,11 @@ add_library(aicad_ui_viewport STATIC
 target_include_directories(aicad_ui_viewport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../abstract
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../core
 )
+if(UNIX AND NOT APPLE)
+  target_link_libraries(aicad_ui_viewport PUBLIC rt)
+endif()
 
 if(TARGET glad)
   target_link_libraries(aicad_ui_viewport PUBLIC glad)

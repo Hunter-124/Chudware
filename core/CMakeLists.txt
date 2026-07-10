@@ -168,12 +168,18 @@ add_library(aicad_geom STATIC
 target_include_directories(aicad_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
 
-# --- libaicad util (dimension-expression arithmetic evaluator) ---------------
+# --- libaicad util (dimension-expression arithmetic evaluator + AICM handoff) -
 # C++ port of engine/doc/equations.py (the `evaluate` entry point) so the sketch
 # solver's resolve_dim() matches the Python oracle for expr:"A*B"-style dims.
+# aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
 add_library(aicad_util STATIC
-  util/expr.cpp)
+  util/expr.cpp
+  util/aicm_handoff.cpp)
 target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(UNIX AND NOT APPLE)
+  # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
+  target_link_libraries(aicad_util PUBLIC rt)
+endif()
 
 # --- libaicad sim (simulation solvers) ---------------------------------------
 # C++ port of engine/sim. FEA static linear elasticity first (tet4 + Eigen::SparseLU,
@@ -483,7 +489,7 @@ add_executable(test_aicm
 target_include_directories(test_aicm PRIVATE
   ${doctest_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
-target_link_libraries(test_aicm PRIVATE aicad_aicm)
+target_link_libraries(test_aicm PRIVATE aicad_aicm aicad_util)
 target_sources(test_aicm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
 set_target_properties(test_aicm PROPERTIES
@@ -794,7 +800,7 @@ if(AICAD_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
-  target_link_libraries(test_geom_aicm PRIVATE aicad_geom_occt)
+  target_link_libraries(test_geom_aicm PRIVATE aicad_geom_occt aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_geom_aicm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -816,7 +822,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_profile_extrude PRIVATE
-    aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_profile_extrude PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -837,7 +843,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_ops PRIVATE
-    aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_ops PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -884,7 +890,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   target_sources(test_import_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
@@ -994,7 +1000,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_document PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_document PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1200,7 +1206,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_pattern PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_pattern PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1226,7 +1232,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_mirror PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_mirror PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1273,7 +1279,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_hole PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_hole PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
@@ -1318,7 +1324,7 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_picks PRIVATE
-    aicad_doc aicad_geom_occt aicad_geom)
+    aicad_doc aicad_geom_occt aicad_geom aicad_util)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_picks PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)

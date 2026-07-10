@@ -221,6 +221,12 @@ register_ecad_tools(_reg.view(mcp, "ecad"))
 from mcp_server.ecad_thermal import register_ecad_thermal_tools
 register_ecad_thermal_tools(_reg.view(mcp, "ecad"))
 
+# ECAD -> vibration reliability screen (T-FIN21, aicad.simhandoff/1 coupling
+# ecad_to_structural_fea): mounted-board modal solve + excitation-band flagging +
+# Steinberg deflection-limit solder-joint risk screen (cited heuristic).
+from mcp_server.ecad_reliability import register_ecad_reliability_tools
+register_ecad_reliability_tools(_reg.view(mcp, "ecad"))
+
 # CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(_reg.view(mcp, "cam"))

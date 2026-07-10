@@ -8,21 +8,23 @@ imports Playwright directly:
   local storage, ...) is saved to disk under the app data dir
   (:mod:`services.browser.profiles`) and is LOCAL ONLY — never synced, never
   uploaded, never read by this module into logs or metadata.
-- :func:`browser_fetch` — opens the SAME persistent profile HEADLESS and
-  navigates to a URL under the user's saved session, rate-limited per site
-  (:mod:`services.browser.ratelimit`). Returns rendered HTML — not suitable
-  for binary artifacts (a browser hands those to its download manager rather
-  than rendering them).
+- :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session
+  in our OWN CEF Chromium (:mod:`.cef_client` → the ``AI-CAD --cef-daemon``
+  host), rate-limited per site (:mod:`services.browser.ratelimit`). Returns
+  rendered HTML. Driving CEF through its native C++ API leaves no CDP
+  ``Runtime.enable`` handshake, so the automation-protocol fingerprint that bot
+  gates key on is absent (the reason we dropped Playwright — see the plan).
 - :func:`browser_download` (T-X2) — fetches a URL's raw bytes under the same
-  saved session via Playwright's ``APIRequestContext`` (no page navigation),
-  the right primitive for CAD/PDF downloads. Same rate-limiting and
-  degradation posture as ``browser_fetch``.
+  saved session via the daemon's direct ``CefURLRequest`` (no page navigation),
+  the right primitive for CAD/PDF downloads. Same rate-limiting and degradation
+  posture as ``browser_fetch``.
 
-Playwright (Apache-2.0) is an optional runtime dependency (see
-``requirements.txt``). Both functions lazy-import it so importing this module
-— or any MCP server that transitively imports it — never fails when
-Playwright isn't installed; they degrade to the ``engine.research`` §6 failure
-shape instead (``contracts/research_tools.md``).
+``browser_login`` still opens a headed Playwright window as a CLI/fallback path;
+the primary login surface is the interactive CEF panel in the GUI, and this
+headed fallback is retired once the panel is migrated onto the daemon (plan
+Phase 2b). The CEF daemon is lazily spawned and idle-exits, and all three
+functions degrade to the ``engine.research`` §6 failure shape
+(``contracts/research_tools.md``) instead of raising.
 
 Captcha/2FA (T-X6): this module DETECTS these states (see :mod:`.challenge`) but
 never attempts to solve or bypass them. The rule is the same regardless — hand
@@ -50,8 +52,6 @@ _LOGIN_POLL_INTERVAL_S = 2.0
 #: How long browser_login waits (seconds) for the user's login window to close
 #: on its own before this module closes it for them.
 DEFAULT_LOGIN_TIMEOUT_S = 300.0
-#: Navigation timeout (seconds) for a single browser_fetch page load.
-DEFAULT_NAV_TIMEOUT_S = 30.0
 #: After navigation, how long (seconds) to let the network settle so XHR-driven
 #: single-page-app catalogs (McMaster, Misumi, DigiKey, Amazon, Home Depot, …)
 #: finish rendering their product cards before we snapshot the DOM. Bounded and
@@ -197,74 +197,50 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
             "challenge_detected": challenge_detected}
 
 
-def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEOUT_S,
+def browser_fetch(url: str, site: str, *,
                   render_settle: float = DEFAULT_RENDER_SETTLE_S,
                   min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
-                  _sync_playwright: Callable[[], Any] | None = None) -> dict:
-    """Fetch ``url`` HEADLESS under ``site``'s saved session profile.
+                  _cef: Any | None = None) -> dict:
+    """Fetch ``url`` HEADLESS under ``site``'s saved session, via our own CEF
+    Chromium daemon (:mod:`.cef_client`) — no Playwright, no CDP automation tell.
 
-    Returns the §6 failure shape (never raises) when Playwright isn't installed
-    or navigation fails.  A missing profile is auto-created (anonymous browsing
-    of public catalogs is allowed — live-probe 2026-07-07; login-gated content
-    still degrades to login_required via the adapters).
+    Returns the §6 failure shape (never raises) when the CEF daemon is
+    unavailable or navigation fails. A missing profile is auto-created (anonymous
+    browsing of public catalogs is allowed — login-gated content still degrades to
+    login_required via the adapters).
     """
     profiles.ensure_profile(site)
-    try:
-        sync_playwright = _sync_playwright or _import_sync_playwright()
-    except RuntimeError as exc:
-        return fail("playwright_not_installed", str(exc))
-
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _off_loop(_browser_fetch_locked, url, site, nav_timeout=nav_timeout,
-                         render_settle=render_settle, min_interval=min_interval,
-                         sync_playwright=sync_playwright)
+        return _browser_fetch_locked(url, site, render_settle=render_settle,
+                                     min_interval=min_interval, cef=_cef)
     finally:
         lock.release()
 
 
-def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_settle: float,
-                          min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
+def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
+                          min_interval: float, cef: Any | None = None) -> dict:
     ceiling = ratelimit.reserve_request(site)
     if ceiling is not None:
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
                              f"already made the maximum allowed fetches (a runaway-loop guard). "
                              f"Nothing was fetched.")
     ratelimit.wait(site, min_interval=min_interval, url=url)
-    profile_path = profiles.profile_dir(site)
     status: int | None = None
+    content = ""
     try:
         try:
-            with sync_playwright() as pw:
-                ver = stealth.chromium_version_sync(pw)
-                ua  = stealth.user_agent(ver)
-                context = pw.chromium.launch_persistent_context(
-                    str(profile_path), headless=True,
-                    args=stealth.launch_args(headless=True), **stealth.context_options(ua))
-                stealth.harden_context_sync(context)
-                _apply_staged_cookies(context, site)
-                try:
-                    page = context.new_page()
-                    stealth.harden_page_sync(context, page, ua, ver)
-                    response = page.goto(url, timeout=nav_timeout * 1000)
-                    status = response.status if response else None
-                    # SPA catalogs render product cards via XHR AFTER 'load'
-                    # fires, so page.content() right after goto() returns the
-                    # empty shell (the "no hits parsed" bug across McMaster/
-                    # Misumi/DigiKey/Amazon/…). Let the network settle first;
-                    # swallow the timeout so a chatty page is still snapshotted
-                    # at the deadline rather than failing the fetch.
-                    try:
-                        page.wait_for_load_state("networkidle",
-                                                 timeout=render_settle * 1000)
-                    except Exception:  # noqa: BLE001  (Playwright TimeoutError / mock page)
-                        pass
-                    content = page.content()
-                finally:
-                    context.close()
-        except Exception as exc:  # noqa: BLE001
+            from . import cef_client  # lazy: keep import cheap for non-browser callers
+            r = (cef or cef_client.client()).fetch(
+                url, settle_ms=int(render_settle * 1000))
+            if not r.get("ok"):
+                return fail("browser_fetch_failed",
+                            f"{site}: CEF fetch of {url} did not complete")
+            status = r.get("status") or None
+            content = r.get("html", "")
+        except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
             return fail("browser_fetch_failed", str(exc))
     finally:
         # Drives inter-request spacing AND 429/403 exponential backoff off the
@@ -297,67 +273,51 @@ def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_set
             "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
 
 
-def browser_download(url: str, site: str, dest: Path, *, nav_timeout: float = DEFAULT_NAV_TIMEOUT_S,
+def browser_download(url: str, site: str, dest: Path, *,
                      min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
-                     _sync_playwright: Callable[[], Any] | None = None) -> dict:
+                     _cef: Any | None = None) -> dict:
     """Download raw bytes from ``url`` under ``site``'s saved session, writing them to ``dest``.
 
-    Uses the persistent context's ``request`` (Playwright's ``APIRequestContext``,
-    which shares the context's cookies) rather than page navigation — the
-    right tool for a CAD/PDF file, which a real page load would hand to the
-    browser's download manager instead of returning as page content.
-    A missing profile is auto-created (public datasheets/models need no login;
-    gated files fail naturally and surface login_required upstream).
+    Uses the CEF daemon's direct ``CefURLRequest`` (which shares the profile's
+    cookies) rather than a page navigation — the right tool for a CAD/PDF file,
+    which a real page load would hand to the browser's download manager instead of
+    returning as page content. A missing profile is auto-created (public
+    datasheets/models need no login; gated files fail naturally and surface
+    login_required upstream).
     """
     profiles.ensure_profile(site)
-    try:
-        sync_playwright = _sync_playwright or _import_sync_playwright()
-    except RuntimeError as exc:
-        return fail("playwright_not_installed", str(exc))
-
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _off_loop(_browser_download_locked, url, site, dest, nav_timeout=nav_timeout,
-                         min_interval=min_interval, sync_playwright=sync_playwright)
+        return _browser_download_locked(url, site, dest, min_interval=min_interval, cef=_cef)
     finally:
         lock.release()
 
 
-def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: float,
-                             min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
+def _browser_download_locked(url: str, site: str, dest: Path, *,
+                             min_interval: float, cef: Any | None = None) -> dict:
     ceiling = ratelimit.reserve_request(site)
     if ceiling is not None:
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
                              f"already made the maximum allowed fetches (a runaway-loop guard). "
                              f"Nothing was downloaded.")
     ratelimit.wait(site, min_interval=min_interval, url=url)
-    profile_path = profiles.profile_dir(site)
     status: int | None = None
+    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         try:
-            with sync_playwright() as pw:
-                ver = stealth.chromium_version_sync(pw)
-                ua  = stealth.user_agent(ver)
-                context = pw.chromium.launch_persistent_context(
-                    str(profile_path), headless=True,
-                    args=stealth.launch_args(headless=True), **stealth.context_options(ua))
-                stealth.harden_context_sync(context)
-                _apply_staged_cookies(context, site)
-                try:
-                    response = context.request.get(url, timeout=nav_timeout * 1000)
-                    status = response.status
-                    body = response.body()
-                finally:
-                    context.close()
-        except Exception as exc:  # noqa: BLE001
+            from . import cef_client  # lazy import
+            r = (cef or cef_client.client()).download(url, str(dest))
+            if not r.get("ok"):
+                return fail("browser_download_failed",
+                            f"{site}: CEF download of {url} failed or returned no body")
+        except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
             return fail("browser_download_failed", str(exc))
     finally:
         ratelimit.note_result(site, status)
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(body)
+    nbytes = dest.stat().st_size if dest.exists() else 0
     profiles.save_meta(site, last_used_ts=time.time())
-    return {"ok": True, "url": url, "status": status, "dest": str(dest), "bytes": len(body),
+    return {"ok": True, "url": url, "status": status, "dest": str(dest), "bytes": nbytes,
             "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}

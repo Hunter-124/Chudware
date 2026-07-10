@@ -26,6 +26,31 @@ def register_firmware_tools(mcp) -> None:
     """Register every firmware compile-loop tool on the given FastMCP instance."""
 
     @mcp.tool()
+    def fw_status() -> str:
+        """Firmware provisioning doctor (T-FIN4) — call FIRST before any fw_* work.
+
+        Detects each firmware CLI (cmake, ninja, arm-none-eabi-gcc, renode,
+        qemu-system-arm, probe-rs, esptool, idf.py, arduino-cli) and returns
+        ``{ok, tools, families, banners, missing}``:
+
+        - ``tools[name]`` = ``{found, path, version, install_hint, unlocks}``
+        - ``families`` = per-MCU-family rollup (``cortex-m`` / ``esp32`` / ``avr``)
+          with ``can_build`` / ``can_emulate`` / ``can_flash`` booleans plus the
+          ``missing`` tool list that would unlock each family.
+        - ``banners`` = human-readable fix-it lines; ``missing`` = absent core tools.
+
+        Never fails (mirrors reveng_status / em_status): an unprovisioned machine
+        still returns ``ok=true`` with everything ``found=false`` and install hints.
+        Offline-safe — reads PATH + `--version` only, never the network.
+        """
+        try:
+            from engine.firmware.provision import fw_status as _fw_status
+            return _dumps(_fw_status())
+        except Exception as exc:  # noqa: BLE001 — the doctor itself never errors out
+            return _dumps({"ok": True, "tools": {}, "families": {}, "banners": [
+                f"fw_status probe degraded: {exc}"], "missing": []})
+
+    @mcp.tool()
     def fw_new_project(name: str = "", mcu_family: str = "", toolchain: str = "cmake",
                        board_doc_ref: str = "") -> str:
         """Create an embedded-firmware project (CMake + arm-none-eabi baseline) and return its id.

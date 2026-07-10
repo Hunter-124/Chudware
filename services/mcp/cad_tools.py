@@ -2083,9 +2083,15 @@ def cad_guide_text(topic: str = "overview") -> str:
                  "flash", "debug", "fw_sim_run"):
         return (
             "FIRMWARE — embedded compile loop: build, sim, flash, debug\n\n"
-            "Tools: fw_new_project / fw_build / fw_sources / fw_sim_run /\n"
+            "Tools: fw_status / fw_new_project / fw_build / fw_sources / fw_sim_run /\n"
             "       fw_flash / fw_debug_start / fw_debug_halt / fw_debug_read_mem\n\n"
             "WORKFLOW:\n"
+            "  fw_status()                          FIRST CALL — provisioning doctor. Reports\n"
+            "                                       each toolchain/emulator/flasher (found,\n"
+            "                                       version, path, install hint) plus per-MCU-\n"
+            "                                       family can_build/can_emulate/can_flash.\n"
+            "                                       Never fails; use it to explain any\n"
+            "                                       toolchain_not_found before retrying.\n"
             "  fw_new_project(name, mcu_family)     Scaffold a CMake firmware project.\n"
             "                                       Auto-selects toolchain; generates pinmap.h\n"
             "                                       from linked ECAD board netlist.\n"

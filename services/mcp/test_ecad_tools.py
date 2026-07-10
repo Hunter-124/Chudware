@@ -1573,6 +1573,187 @@ def test_fin16_live_solve() -> None:
     print("  [fin16_live_solve] PASS")
 
 
+# --------------------------------------------------------------------------- T-FIN17 heatsink selection
+
+
+def _fin17_tools() -> dict:
+    """ECAD + thermal-handoff + heatsink tools on ONE stub (shared session state)."""
+    from mcp_server.ecad_thermal import register_ecad_thermal_tools
+    from mcp_server.heatsink import register_heatsink_tools
+    stub = _StubMCP()
+    register_ecad_tools(stub)
+    register_ecad_thermal_tools(stub)
+    register_heatsink_tools(stub)
+    return stub.tools
+
+
+def test_fin17_parametric_generator() -> None:
+    """T-FIN17 (DoD): the parametric plain-finned-sink generator produces VALID
+    geometry across its parameter range — every emitted spec passes structural
+    validation, has physical mass/theta, and yields a well-formed engine op list;
+    unbuildable specs are rejected."""
+    from mcp_server.heatsink import (parametric_candidates, validate_sink_spec,
+                                     sink_theta_sa, sink_mass_g, sink_ops)
+    n_specs = 0
+    for fp in (2.0, 6.0, 12.0, 25.0, 60.0):          # footprint span sweep (mm)
+        cands = parametric_candidates(fp, fp)
+        assert cands, f"no candidates for footprint {fp} mm"
+        prev_theta = None
+        for spec in cands:
+            n_specs += 1
+            assert validate_sink_spec(spec) == [], (spec, validate_sink_spec(spec))
+            assert sink_mass_g(spec) > 0
+            th = sink_theta_sa(spec, 10.0)
+            assert 0.1 < th < 500.0, (spec, th)
+            if prev_theta is not None:               # bigger sink -> lower theta
+                assert th < prev_theta, (spec, th, prev_theta)
+            prev_theta = th
+            ops = sink_ops(spec)
+            assert len(ops) == 1 + spec["n_fins"]
+            assert all(o["op"] == "add_feature" and o["feature"]["type"] == "box"
+                       for o in ops)
+            # Fins sit on the base and fit inside its width.
+            base = ops[0]["feature"]["params"]
+            last_fin = ops[-1]["feature"]["params"]
+            assert last_fin["at"][2] == spec["base_t_mm"]
+            assert (last_fin["at"][1] + spec["fin_t_mm"]
+                    <= base["at"][1] + spec["base_w_mm"] + 1e-9)
+    # Invalid specs are rejected, never silently emitted.
+    assert validate_sink_spec({"base_l_mm": 10, "base_w_mm": 10, "base_t_mm": 2,
+                               "n_fins": 12, "fin_t_mm": 1.0, "fin_h_mm": 8}) != []
+    assert validate_sink_spec({"base_l_mm": -5, "base_w_mm": 10, "base_t_mm": 2,
+                               "n_fins": 4, "fin_t_mm": 1.0, "fin_h_mm": 8}) != []
+    print(f"  FIN17: parametric generator — {n_specs} specs across the range, "
+          "all valid, invalid rejected")
+    print("  [fin17_parametric_generator] PASS")
+
+
+def test_fin17_library_candidates() -> None:
+    """T-FIN17: the parts library serves heatsink candidates WITH thermal metadata
+    (domain 'thermal'), and undersized sinks are filtered for a big component."""
+    from mcp_server.heatsink import library_candidates
+    cands, notice = library_candidates("still_air", 10.0, 6.0, 6.0)
+    assert notice is None, notice
+    assert len(cands) >= 5, f"expected curated heatsinks, got {len(cands)}"
+    for c in cands:
+        assert c["source"] == "library"
+        assert isinstance(c["theta_sa_c_per_w"], (int, float))
+        assert c["mass_g"] and c["base_l_mm"]
+    assert any(c.get("cost_usd") for c in cands), "cost carried when known"
+    big = library_candidates("still_air", 10.0, 45.0, 45.0)[0]
+    assert all(c["base_l_mm"] >= 45.0 * 0.9 for c in big), \
+        "sinks smaller than the component must be filtered"
+    # Forced air uses the forced nominal (lower theta).
+    forced = {c["id"]: c for c in library_candidates("forced_air", 50.0, 6.0, 6.0)[0]}
+    still = {c["id"]: c for c in cands}
+    common = set(forced) & set(still)
+    assert common and all(forced[i]["theta_sa_c_per_w"] < still[i]["theta_sa_c_per_w"]
+                          for i in common)
+    print(f"  FIN17: library — {len(cands)} candidates with theta/mass/cost")
+    print("  [fin17_library_candidates] PASS")
+
+
+def _fin17_board(tools: dict, name: str) -> str:
+    """FIN16 demo board with the regulator turned up to a ~3 W part."""
+    doc_id = _fin16_demo_board(tools, name=name)
+    from engine.ecad import session as ecad_session
+    doc = ecad_session.get_session(doc_id).doc
+    for fp in doc["footprints"]:
+        if fp["ref"] == "U1":
+            fp["eng_overrides"]["power_w"] = {"typ": 3.0, "max": 3.5}
+    return doc_id
+
+
+def test_fin17_heatsink_select() -> None:
+    """T-FIN17 (DoD demo): ~3 W regulator at an 85 C limit — heatsink_select ranks
+    library + parametric candidates, the winner meets target in the re-solve (live
+    FEA when libaicad is available, honest network_estimate otherwise), the ranked
+    table carries {candidate, achieved_tj_c, delta_vs_target, mass_g, cost}, and the
+    result embeds a valid aicad.simhandoff/1 verify envelope. Also: the impossible-
+    target fixture is reported honestly (best achievable named, target_met=false)."""
+    try:
+        import build123d  # noqa: F401
+    except ImportError:
+        print("  FIN17: build123d not installed — skipping heatsink_select test")
+        return
+    from services.mcp import simhandoff as sh
+
+    tools = _fin17_tools()
+    # No context yet -> honest error.
+    from mcp_server import ecad_thermal as _et
+    _et._THERMAL["last_ctx"] = None
+    r0 = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=85.0)
+    assert not r0["ok"] and "ecad_thermal_handoff" in r0["error"]
+
+    doc_id = _fin17_board(tools, "fin17_demo")
+    live = True
+    try:
+        from mcp_server import core_bridge as cb
+        cb.call("ping", {})
+    except Exception:  # noqa: BLE001
+        live = False
+    h = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, mesh_fineness=0.25,
+              dry_run=not live)
+    assert h["ok"], h.get("error")
+    if live and not h.get("solved"):
+        live = False   # Netgen-less build: envelope-only result, network mode below
+
+    r = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=85.0)
+    _assert_context(r, "heatsink_select")
+    assert r["ok"], r.get("error")
+    assert r["mode"] == ("fea_resolve" if live else "network_estimate")
+    assert r["mesh_cached"] is live
+    # Ranked-table shape (DoD): candidate/achieved/delta/mass/cost per row, sorted.
+    table = r["table"]
+    assert len(table) >= 4
+    for row in table:
+        assert {"candidate", "source", "achieved_tj_c", "delta_vs_target_c",
+                "mass_g", "cost_usd", "theta_sa_c_per_w", "meets_target"} <= set(row)
+    achieved = [row["achieved_c"] for row in table if row["achieved_c"] is not None]
+    assert achieved == sorted(achieved), "table must be ranked best-first"
+    srcs = {row["source"] for row in table}
+    assert "library" in srcs and "parametric" in srcs, srcs
+    # Winner meets the 85 C target in the re-solve.
+    assert r["target_met"] is True, (r["winner"], r["warnings"])
+    w = r["winner"]
+    assert w["meets_target"] and w["achieved_c"] <= 85.0
+    assert w["delta_vs_target_c"] <= 0.0
+    if live:
+        assert w["solve"] == "fea" and w.get("board_max_temp_c") is not None
+        # Winner's solved study is KEPT.
+        from mcp_server.heatsink import _HEATSINK
+        kept = _HEATSINK["winner_study"]
+        assert kept and kept["candidate"] == w["candidate"]
+        assert kept["study"]["t_case_c"] is not None
+        # The sink must actually help vs the bare baseline solve.
+        bare_u1 = {c["ref"]: c for c in h["components"]}["U1"]
+        assert w["achieved_c"] < bare_u1["tj_c"], (w, bare_u1)
+    # simhandoff verify envelope (DoD).
+    env = r["simhandoff"]
+    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
+    assert env["kind"] == "verify"
+    assert env["coupling"] == "ecad_heatsink_to_thermal_fea"
+    assert env["checks"][0]["pass"] is True
+
+    # Impossible target: 26 C at 25 C ambient -> honest FAIL, best achievable named.
+    imp = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=26.0)
+    assert imp["ok"] and imp["target_met"] is False
+    assert imp["best_achievable"]["candidate"]
+    assert imp["best_achievable"]["achieved_c"] > 26.0
+    assert any("IMPOSSIBLE TARGET" in wmsg for wmsg in imp["warnings"])
+    assert imp["simhandoff"]["checks"][0]["pass"] is False
+    assert "FAIL" in imp["simhandoff"]["verdict"]
+    # Below-ambient target rejected outright.
+    sub = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=20.0)
+    assert not sub["ok"] and "ambient" in sub["error"]
+
+    print(f"  FIN17: {'LIVE FEA re-solve' if live else 'network estimate'} — "
+          f"winner {w['candidate']!r} achieves {w['achieved_c']} C "
+          f"(target 85), mass {w['mass_g']} g; impossible target honest "
+          f"(best {imp['best_achievable']['achieved_c']} C)")
+    print("  [fin17_heatsink_select] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     _restore_provider = _disable_live_provider()
@@ -1636,6 +1817,10 @@ def _run_all() -> None:
     test_fin16_trace_heating_toggle()
     test_fin16_verify_thermal()
     test_fin16_live_solve()
+    # T-FIN17 heatsink selection loop
+    test_fin17_parametric_generator()
+    test_fin17_library_candidates()
+    test_fin17_heatsink_select()
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

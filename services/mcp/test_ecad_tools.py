@@ -72,6 +72,8 @@ def test_register() -> dict:
         "ecad_check_impedance", "ecad_tf", "ecad_make_board",
         # Wave-L new tools
         "ecad_run_dfm", "ecad_check_diff_impedance",
+        # T-FIN9
+        "ecad_run_hostcheck",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -1047,6 +1049,45 @@ def test_e9_noise_top_level_nonzero(tools: dict) -> None:
     print("  [e9_noise_top_level_nonzero] PASS")
 
 
+# ---------------------------------------------------------------- T-FIN9 host-board rule pack
+
+
+def test_fin9_hostcheck_tool(tools: dict) -> None:
+    """T-FIN9: ecad_run_hostcheck runs on the active board, reports the metadata-driven
+    sequencing finding with a fix hint, and is clean on an empty board."""
+    from engine.ecad import session as ecad_session
+
+    # clean empty board -> no findings, teaching payload intact
+    b = _call(tools, "ecad_new_pcb", name="FIN9_clean")
+    clean = _call(tools, "ecad_run_hostcheck", doc_id=b["doc_id"])
+    assert clean["ok"] and clean["errors"] == 0 and clean["violations"] == [], clean
+    _assert_context(clean, "ecad_run_hostcheck")
+
+    # seeded board: a host whose T-FIN8 metadata demands 'VCORE before VIO' but no
+    # component sources VIO -> host_sequencing_unverifiable (no hardcoded part knowledge:
+    # the requirement travels entirely in eng_overrides).
+    b2 = _call(tools, "ecad_new_pcb", name="FIN9_seeded")
+    sess = ecad_session.get_session(b2["doc_id"])
+    sess.doc["footprints"].append({
+        "id": "fp1", "fpid": "Test:FP", "libid": "", "ref": "U1", "value": "MCU",
+        "pos": [0.0, 0.0], "angle": 0.0, "side": "top", "graphics": [],
+        "model_3d": None, "attr": "smd", "linked_symbol": None,
+        "pads": [{"id": "fp1_p1", "number": "1", "pos": [0, 0], "angle": 0.0,
+                  "shape": "rect", "size": [0.5, 0.5], "type": "smd",
+                  "layers": ["F.Cu"], "drill": None, "net": "3V3"}],
+        "eng_overrides": {"supply": {
+            "rails": [{"name": "3V3", "voltage_v_nom": 3.3}],
+            "sequencing": ["VCORE before VIO"]}},
+    })
+    seeded = _call(tools, "ecad_run_hostcheck", doc_id=b2["doc_id"])
+    assert seeded["ok"], seeded
+    rules = {g["rule"] for g in seeded["by_rule"]}
+    assert "host_sequencing_unverifiable" in rules, f"expected sequencing finding: {seeded}"
+    assert seeded["fix_hints"], "findings must carry actionable fix hints"
+    print(f"  FIN9: clean board 0 findings; seeded board rules {sorted(rules)}")
+    print("  [fin9_hostcheck_tool] PASS")
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -1207,6 +1248,8 @@ def main() -> None:
     test_fin8_metadata_roundtrip(tools)
     test_fin8_missing_metadata_degrades(tools)
     test_fin8_to_3d_boardphys_sidecar(tools)
+    # T-FIN9 host-board rule pack
+    test_fin9_hostcheck_tool(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

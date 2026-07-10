@@ -24,6 +24,8 @@ Tools (each returns ``{ok, ...result, warnings:[], hint:"...", next_actions:[...
   ecad_run_erc                        readable ERC violation lines + "N errors, M warnings"
   ecad_simulate                       netlist -> SPICE -> simulate; op/dc/tran/ac + four/mc/temp/noise
   ecad_run_drc                        PCB DRC summary with the worst offenders
+  ecad_run_hostcheck                  MCU host-board rule pack (decoupling/sequencing/xtal/
+                                      reset/boot-strap) driven by T-FIN8 eng metadata
   ecad_export / ecad_to_3d            wrap fab writers / 3D export (lazy import, clean if unavailable)
   ecad_check_impedance                Z0 + delay for a routed trace vs. target; plain-English reading
   ecad_stackup_solve                  invert IPC-2141A: targets + fab profile -> stackup + net-class widths
@@ -1241,6 +1243,67 @@ def register_ecad_tools(mcp) -> None:
                 ["Address the worst DRC offenders above (widen tracks / increase spacing / "
                  "move parts), then re-run ecad_run_drc()."] if violations else
                 ["ecad_export('gerber')  # board passes DRC — generate fab outputs"]
+            ),
+        })
+
+    # ---------------------------------------------------------------- host-board rule pack
+
+    @mcp.tool()
+    def ecad_run_hostcheck(doc_id: str = "") -> str:
+        """Run the MCU/FPGA host-board rule pack (T-FIN9) on the active board — the
+        device-level checks that brick a host board even when DRC/ERC are clean.
+
+        Rule families (stable ids, all findings carry an actionable fix hint):
+          host_decoupling_missing/_far/_via  per-power-pin decoupling coverage (value band,
+                                             distance budget, same-side/via-quality heuristic)
+          host_bulk_cap                      bulk capacitance (>= 4.7 uF) per supply rail
+          host_sequencing[/_unparsed/_unverifiable]  power-sequencing requirements from the
+                                             component's T-FIN8 eng metadata
+                                             (contracts/ecad/boardphys.md — 'VCORE before VIO')
+                                             validated against the board's actual enable/PGOOD
+                                             chains; NO hardcoded part knowledge
+          host_xtal_loadcap/_loadcap_match/_loop/_keepout  crystal load caps present + matched,
+                                             loop-area and other-net-track keepout heuristics
+          host_reset_pull/_cap               reset line pull resistor + filter cap
+          host_bootstrap_float/_shared       boot-strap pins strapped to a valid level and not
+                                             shared with an actively-driven signal
+
+        Advisory, like DRC. Hosts are found via T-FIN8 metadata (eng.supply.rails) or
+        power_in pins; seed metadata via the library or per-instance sim_params.eng
+        overrides. Thresholds can be tuned per board via board rules 'hostcheck'
+        (decoupling_dist_mm, decoupling_min_f/max_f, bulk_min_f, xtal_loop_dist_mm,
+        xtal_keepout_mm). Also runs inside ecad_make_board(hostcheck=True).
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Open a board first.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        doc = session.doc
+        try:
+            from engine.ecad import hostboard_rules as hb_mod
+            violations = hb_mod.run_hostcheck(doc)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"hostcheck engine error: {e}", hint="Inspect with ecad_status().")
+        summary = _erc_summary(violations)
+        lines = _erc_lines(violations)
+        hints = [v["hint"] for v in violations if v.get("severity") == "error"][:5] or \
+                [v["hint"] for v in violations][:5]
+        verdict = (f"{summary['errors']} error(s), {summary['warnings']} warning(s)."
+                   + (" worst: " + " | ".join(lines[:5]) if lines else
+                      " Host-board rules clean."))
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "errors": summary["errors"], "warning_count": summary["warnings"],
+            "verdict": verdict,
+            "violations": lines, "by_rule": summary["groups"],
+            "fix_hints": hints,
+            "warnings": [],
+            "hint": verdict + (" " + hints[0] if hints else ""),
+            "next_actions": (
+                ["Apply the fix_hints above (add/move decoupling, strap pins, wire the "
+                 "enable chain), then re-run ecad_run_hostcheck()."] if violations else
+                ["ecad_run_drc()  # host rules clean — check the geometric rules too"]
             ),
         })
 
@@ -2573,7 +2636,8 @@ def register_ecad_tools(mcp) -> None:
     # ---------------------------------------------------------------- one-shot board flow
 
     @mcp.tool()
-    def ecad_make_board(pcb_name: str = "Board1", doc_id: str = "") -> str:
+    def ecad_make_board(pcb_name: str = "Board1", doc_id: str = "",
+                        hostcheck: bool = False) -> str:
         """ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones ->
         DRC and report every step's outcome, remaining issues, and what to do next.
 
@@ -2583,6 +2647,9 @@ def register_ecad_tools(mcp) -> None:
           3. ecad_autoroute        -- route the ratsnest with the 2-layer router
           4. ecad_fill_zones       -- pour copper on GND (adds a zone automatically if none)
           5. ecad_run_drc          -- report remaining violations
+          6. (opt-in) hostcheck=True also runs the MCU host-board rule pack
+             (ecad_run_hostcheck: decoupling / bulk / sequencing / crystal / reset /
+             boot-strap) and folds its verdict into the step report
 
         Sets _ECAD['current_pcb'] to the produced board so ecad_status / ecad_run_drc /
         ecad_export work immediately after.
@@ -2764,6 +2831,21 @@ def register_ecad_tools(mcp) -> None:
             except Exception as e:  # noqa: BLE001
                 _step("drc", {"ok": False}, f"DRC unavailable: {e}")
 
+            # ---- 6. host-board rule pack (opt-in) ----
+            hb_errors = 0; hb_warnings = 0; hb_lines: list[str] = []
+            if hostcheck:
+                try:
+                    from engine.ecad import hostboard_rules as hb_mod
+                    hb_v = hb_mod.run_hostcheck(pcb_sess.doc)
+                    hb_sum = _erc_summary(hb_v)
+                    hb_errors = hb_sum["errors"]
+                    hb_warnings = hb_sum["warnings"]
+                    hb_lines = _erc_lines(hb_v)[:6]
+                    _step("hostcheck", {"ok": hb_errors == 0},
+                          f"{hb_errors} error(s), {hb_warnings} warning(s)")
+                except Exception as e:  # noqa: BLE001
+                    _step("hostcheck", {"ok": False}, f"hostcheck unavailable: {e}")
+
             all_ok = all(s["ok"] for s in steps)
             summary_lines = [f"  {s['step']}: {'OK' if s['ok'] else 'FAIL'} -- {s['note']}"
                              for s in steps]
@@ -2780,6 +2862,10 @@ def register_ecad_tools(mcp) -> None:
                     "Try ecad_autoroute(pitch=0.15) or move parts to give the router more room.")
             if drc_errors:
                 next_actions.append(f"ecad_run_drc()  # {drc_errors} DRC error(s) to fix")
+            if hostcheck and hb_errors:
+                next_actions.append(
+                    f"ecad_run_hostcheck()  # {hb_errors} host-board rule error(s) — "
+                    "see fix_hints")
             next_actions.append("ecad_to_3d()  # export STEP and design an enclosure in the CAD app")
             if not next_actions:
                 next_actions.append("ecad_export('gerber')  # board passes DRC -- ready for fab")
@@ -2797,6 +2883,8 @@ def register_ecad_tools(mcp) -> None:
                 "nets_failed": _nets_failed_count,
                 "drc_errors": drc_errors, "drc_warnings": drc_warnings,
                 "drc_violations": drc_lines,
+                **({"hostcheck_errors": hb_errors, "hostcheck_warnings": hb_warnings,
+                    "hostcheck_violations": hb_lines} if hostcheck else {}),
                 "warnings": drc_lines[:3],
                 "hint": hint,
                 "next_actions": next_actions,

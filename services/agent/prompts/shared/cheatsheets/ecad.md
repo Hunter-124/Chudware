@@ -86,3 +86,33 @@ NOTES:
     impedance from the fab's coupon service for critical interfaces.
   * No board open? ecad_stackup_solve(apply=False) still returns the full solve
     (design-ahead mode) so you can plan the stackup before layout starts.
+
+HOST-BOARD RULE PACK (T-FIN9) — MCU/FPGA device-level checks above DRC/ERC:
+  ecad_run_hostcheck()               run on the active board; advisory, DRC-style output
+                                     with stable rule ids + per-finding fix_hints
+  ecad_make_board(hostcheck=True)    opt-in: fold the pack into the one-shot board flow
+  Rule families (suppression-stable ids):
+    host_decoupling_missing/_far/_via   per power_in pin: a 10 nF–1 uF cap on the pin's
+                                        net to GND, within 3 mm, on the same board side
+    host_bulk_cap                       each supply rail needs a bulk cap >= 4.7 uF
+    host_sequencing[/_unparsed/_unverifiable]
+                                        eng.supply.sequencing ('VCORE before VIO', from
+                                        the T-FIN8 metadata layer / boardphys.md — never
+                                        hardcoded part knowledge) verified against the
+                                        board's real enable/PGOOD chains: the later
+                                        rail's regulator EN must be gated by the earlier
+                                        rail or its PGOOD output
+    host_xtal_loadcap/_loadcap_match/_loop/_keepout
+                                        crystal load caps present + matched, within 5 mm
+                                        (loop area), no other-net track within 1 mm
+    host_reset_pull / host_reset_cap    reset pin needs a pull to a rail + filter cap
+    host_bootstrap_float/_shared        BOOT/MODE/CFG pins strapped to a valid level
+                                        (direct or one resistor) and not shared with an
+                                        actively-driven signal
+  NOTES:
+    * Hosts are found by metadata (eng.supply.rails) or power_in pins; seed sequencing
+      requirements per instance via sim_params.eng = {'supply': {'sequencing':
+      ['VCORE before VIO']}} on the schematic symbol (carried to the board by sync).
+      sequencing [] = known none required; null = unknown (honest silence).
+    * Thresholds tune per board: board rules 'hostcheck' dict (decoupling_dist_mm,
+      decoupling_min_f/max_f, bulk_min_f, xtal_loop_dist_mm, xtal_keepout_mm).

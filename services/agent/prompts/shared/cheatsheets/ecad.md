@@ -278,3 +278,34 @@ VIBRATION RELIABILITY SCREEN (T-FIN21; aicad.simhandoff/1 coupling ecad_to_struc
   Typical flow: ecad_make_board -> ecad_vibe_check() -> if FLAG/FAIL: add a mount
       / thicken laminate / move heavy parts toward mounts -> re-run -> re-screen
       with the real spec PSD.
+
+HEATSINK SELECTION LOOP (T-FIN17) — heatsink_select on the last thermal study:
+  heatsink_select(component_ref, tj_target_c | t_case_target_c,
+                  [tim_t_mm=0.1], [tim_k_w_mk=3.0], [max_candidates=8])
+      Run ecad_thermal_handoff() FIRST — its geometry/loads/mesh are the cached
+      context this tool re-solves. Candidates come from the parts library
+      (part_search domain "thermal": curated plain-finned aluminum heatsinks with
+      datasheet-class theta_sa + mass + cost) PLUS a parametric plain-finned sink
+      generator sized to the component footprint (fin-efficiency theta_sa; geometry
+      buildable via services.mcp.heatsink.sink_ops engine ops).
+  MOUNT MODEL: bonded contact through a TIM bondline (R_tim = t/(k*A_contact),
+      default 0.1 mm of 3.0 W/m-K grease-class TIM). The core solver is
+      single-material, so a mounted sink is an EFFECTIVE CONVECTION
+      h_eff = 1/((R_tim + R_sa)*A_top) over the component top: board geometry is
+      unchanged -> the baseline BOARD MESH IS REUSED per candidate, and board
+      spreading + neighbor heating stay fully in the FEA re-solve. Not modeled
+      (conservative): sink-base overhang spreading beyond the footprint.
+  RESULT: ranked table rows {candidate, source library|parametric, achieved_tj_c,
+      achieved_t_case_c, delta_vs_target_c, theta_sa_c_per_w, mass_g, cost_usd,
+      meets_target}; winner = LIGHTEST candidate meeting the target (cost tiebreak),
+      its solved study kept, and an aicad.simhandoff/1 VERIFY envelope (coupling
+      ecad_heatsink_to_thermal_fea) under result.simhandoff.
+  HONESTY: an impossible target returns ok:true with target_met:false and the best
+      achievable candidate NAMED (never a fake win); a target at/below ambient is
+      rejected outright; without a sim-enabled libaicad the tool runs a FLAGGED
+      mode="network_estimate" (Tj = Ta + P*(theta_jc + R_tim + R_sa) — board
+      coupling ignored). Library theta_sa values are curated datasheet-class
+      nominals: verify the chosen part's datasheet before release.
+  Typical flow: ecad_thermal_handoff() -> ecad_verify_thermal() shows U1 over its
+      limit -> heatsink_select('U1', tj_target_c=85) -> source the winning library
+      part (part_source) or model the parametric winner via sink_ops.

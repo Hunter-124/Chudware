@@ -56,7 +56,9 @@ _GRID_MAX_STEP = 1.0
 _FACE_TOL_MM = 0.8
 _PERP_TOL_MM = 0.3
 
-_THERMAL: dict = {"last_handoff": None}   # session state for ecad_verify_thermal
+_THERMAL: dict = {"last_handoff": None,   # session state for ecad_verify_thermal
+                  "last_ctx": None}       # solve context cache for heatsink_select
+                                          # (T-FIN17): geometry/loads/mesh reuse.
 
 
 def _dumps(payload: dict) -> str:
@@ -593,6 +595,18 @@ def register_ecad_thermal_tools(mcp) -> None:
             "warnings": warnings,
         }
 
+        # T-FIN17 heatsink_select context: everything needed to re-solve the SAME
+        # board with a candidate heatsink mounted (mesh added after a live solve so
+        # candidates reuse it — geometry is unchanged by the effective-h mount model).
+        ctx = {"doc_id": session.doc_id, "step_path": built["step_path"],
+               "board": board_geo, "components": components, "env": env,
+               "material": material, "transient": tr, "flux_loads": loads,
+               "fixtures": fixtures, "mesh": None,
+               "mesh_fineness": float(mesh_fineness),
+               "quasi_steady": quasi_steady,
+               "handoff_envelope_id": envelope.get("id")}
+        _THERMAL["last_ctx"] = ctx
+
         if dry_run:
             _THERMAL["last_handoff"] = None
             return _dumps(sh.attach({
@@ -647,6 +661,7 @@ def register_ecad_thermal_tools(mcp) -> None:
                              "to inspect the generated BCs.",
                         step_path=built["step_path"])
 
+        ctx["mesh"] = mesh   # candidates reuse the board mesh (heatsink_select)
         rows = map_component_temps(components, mesh["points"],
                                    res.get("temperature") or [],
                                    res.get("envelope_max"))

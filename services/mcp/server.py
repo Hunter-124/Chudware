@@ -231,6 +231,11 @@ register_ecad_airflow_tools(_reg.view(mcp, "ecad"))
 # Steinberg deflection-limit solder-joint risk screen (cited heuristic).
 from mcp_server.ecad_reliability import register_ecad_reliability_tools
 register_ecad_reliability_tools(_reg.view(mcp, "ecad"))
+# Heatsink selection loop (T-FIN17): parts-library + parametric candidates re-solved
+# to a Tj/case target on the cached ecad_thermal_handoff study (verify envelope
+# coupling ecad_heatsink_to_thermal_fea).
+from mcp_server.heatsink import register_heatsink_tools
+register_heatsink_tools(_reg.view(mcp, "ecad"))
 
 # CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
 from mcp_server.cam_tools import register_cam_tools

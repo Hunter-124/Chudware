@@ -1127,6 +1127,12 @@ struct AppState {
     int simUnits = 0;
     bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
+    // T-FIN24: AI_CAD_SHOT=simdisc_mech|simdisc_ecad — Simulate-tab disclosure-matrix shots.
+    // mech: part only -> the "+ New Study" picker must show NO electronics options.
+    // ecad: PCB tab + part -> electronics simulation + firmware emulation rows appear.
+    bool wantSimDisc = false;
+    int  simDiscKind = 0;          // 0 = mech-only, 1 = with a PCB open
+    bool simDiscShotDone = false;
     bool wantCam = false;       // AI_CAD_SHOT=cam: build a part, run the copilot CAM fast-path,
     bool camShotDone = false;   //   adopt the job into the Manufacture panel — runs exactly once
     bool wantFlow = false;      // AI_CAD_SHOT=flow scripted external-flow (wind-tunnel) study scenario

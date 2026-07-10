@@ -1497,6 +1497,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.wantSketch3d = shot && shotMode && std::strcmp(shotMode, "sketch3d") == 0;  // 3D sketcher flow
     if (st.wantSketch3d) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
+    // T-FIN24 disclosure-matrix shots (Simulate workspace study picker).
+    st.wantSimDisc = shot && shotMode && (std::strcmp(shotMode, "simdisc_mech") == 0 ||
+                                          std::strcmp(shotMode, "simdisc_ecad") == 0);
+    if (st.wantSimDisc) {
+        st.simDiscKind = std::strcmp(shotMode, "simdisc_ecad") == 0 ? 1 : 0;
+        st.showSimulationTools = true;
+        st.showRibbon = true;
+        st.ribbonTab = AppState::RT_Simulation;
+        st.leftPaneTab = AppState::LP_Simulation;
+    }
     st.wantCam = shot && shotMode && std::strcmp(shotMode, "cam") == 0;       // CAM copilot fast-path
     if (st.wantCam) { st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture; }
     st.wantFlow = shot && shotMode && std::strcmp(shotMode, "flow") == 0;     // external-flow study
@@ -3590,6 +3600,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // cam shot: wait for the worker + the build/load scenario, then give the CAM tab a few
         // frames to come forward (camLoadJob re-requests focus for ~10 frames) before capturing.
         if (st.wantCam) shotFrame = st.camShotDone ? 60 : 99999;
+        // simdisc: keep the loop alive until the scenario forced the study picker open, then
+        // give the popup a few frames to draw before capturing.
+        if (st.wantSimDisc) shotFrame = st.simDiscShotDone ? 30 : 99999;
         // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in tick()) until every
         // recipe is captured, then exit promptly — the --shot backbuffer capture is a throwaway.
         if (st.wantIconPipe) shotFrame = st.iconPipeShotDone ? 3 : 99999;

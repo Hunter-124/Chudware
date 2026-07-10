@@ -139,6 +139,10 @@ static const char* studyTypeKey(StudyType t) {
         case StudyType::Fatigue: return "fatigue";
         case StudyType::Thermal: return "thermal";
         case StudyType::Motion:  return "motion";
+        case StudyType::ThermalFea:   return "thermal_fea";
+        case StudyType::Buckling:     return "buckling";
+        case StudyType::Contact:      return "contact";
+        case StudyType::FreqResponse: return "freq_response";
         default:                 return "static";
     }
 }
@@ -148,6 +152,10 @@ static StudyType studyTypeFromKey(const std::string& k) {
     if (k == "fatigue") return StudyType::Fatigue;
     if (k == "thermal") return StudyType::Thermal;
     if (k == "motion")  return StudyType::Motion;
+    if (k == "thermal_fea")   return StudyType::ThermalFea;
+    if (k == "buckling")      return StudyType::Buckling;
+    if (k == "contact")       return StudyType::Contact;
+    if (k == "freq_response") return StudyType::FreqResponse;
     return StudyType::Static;
 }
 static const char* studyTypeLabel(StudyType t) {
@@ -157,6 +165,10 @@ static const char* studyTypeLabel(StudyType t) {
         case StudyType::Fatigue: return "Fatigue";
         case StudyType::Thermal: return "Thermal";
         case StudyType::Motion:  return "Motion";
+        case StudyType::ThermalFea:   return "Thermal (FEA)";
+        case StudyType::Buckling:     return "Buckling";
+        case StudyType::Contact:      return "Contact";
+        case StudyType::FreqResponse: return "Vibration";
         default:                 return "Static";
     }
 }
@@ -172,6 +184,10 @@ static const char* studyTypeIcon(StudyType t) {
         case StudyType::Motion:  return "rotate_component";  // no dedicated study_motion sprite; the
                                                              // rotation-gizmo glyph reads as motion and
                                                              // is a real atlas icon (picker + study tree)
+        case StudyType::ThermalFea:   return "study_thermal";
+        case StudyType::Buckling:     return "study_static";
+        case StudyType::Contact:      return "study_static";
+        case StudyType::FreqResponse: return "study_modal";
         default:                 return "study_static";
     }
 }
@@ -565,6 +581,11 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
         nlohmann::json l = {{"faces", faces}};
         if (ld.pressure) { l["type"] = "pressure"; l["magnitude"] = ld.pressureMpa; }
         else { l["type"] = "force"; l["vec"] = {ld.vec[0], ld.vec[1], ld.vec[2]}; }
+        // ThermalFea persists its heat-load definition alongside (harmless for others).
+        l["thermal_kind"] = ld.thermalKind;
+        l["flux_w_m2"] = ld.fluxWm2;
+        l["h_w_m2k"] = ld.hWm2k;
+        l["t_amb_c"] = ld.tAmbC;
         loads.push_back(l);
     }
     return nlohmann::json{
@@ -604,6 +625,14 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
         {"motion", {{"mate_id", s.motionMateId}, {"start", s.motionStart}, {"stop", s.motionStop},
                     {"steps", s.motionSteps}, {"loop", s.motionLoop}, {"fps", s.motionFps},
                     {"check_interference", s.motionCheckInterference}}},
+        // T-FIN24 study kinds (buckling/contact proxies, frequency response, thermal FEA).
+        {"adv", {{"buckling_load_n", s.bucklingLoadN},
+                 {"contact_pressure_mpa", s.contactPressureMpa},
+                 {"fr_dir", s.frDir}, {"fr_zeta", s.frZeta}, {"fr_base_g", s.frBaseG},
+                 {"therm_k", s.thermK}, {"therm_cp", s.thermCp},
+                 {"therm_fix_temp_c", s.thermFixTempC},
+                 {"therm_transient", s.thermTransient}, {"therm_t_end_s", s.thermTEndS},
+                 {"therm_dt_s", s.thermDtS}, {"therm_t_init_c", s.thermTInitC}}},
         {"result_summary", s.summary},
     };
 }
@@ -680,6 +709,21 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.fatigueTempC = fa.value("temp_c", 20.0);
         s.fatigueReliability = fa.value("reliability", 50.0);
     }
+    if (j.contains("adv") && j["adv"].is_object()) {
+        const auto& av = j["adv"];
+        s.bucklingLoadN = av.value("buckling_load_n", 1000.0f);
+        s.contactPressureMpa = av.value("contact_pressure_mpa", 1.0f);
+        s.frDir = av.value("fr_dir", 2);
+        s.frZeta = av.value("fr_zeta", 0.02f);
+        s.frBaseG = av.value("fr_base_g", 1.0f);
+        s.thermK = av.value("therm_k", 200.0f);
+        s.thermCp = av.value("therm_cp", 900.0f);
+        s.thermFixTempC = av.value("therm_fix_temp_c", 20.0f);
+        s.thermTransient = av.value("therm_transient", false);
+        s.thermTEndS = av.value("therm_t_end_s", 60.0f);
+        s.thermDtS = av.value("therm_dt_s", 0.0f);
+        s.thermTInitC = av.value("therm_t_init_c", 20.0f);
+    }
     if (j.contains("motion") && j["motion"].is_object()) {
         const auto& mo = j["motion"];
         s.motionMateId = mo.value("mate_id", std::string());
@@ -700,6 +744,10 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
             if (l.pressure) l.pressureMpa = ld.value("magnitude", 0.1);
             else if (ld.contains("vec") && ld["vec"].is_array() && ld["vec"].size() == 3)
                 for (int k = 0; k < 3; ++k) l.vec[k] = ld["vec"][k].get<float>();
+            l.thermalKind = ld.value("thermal_kind", 0);
+            l.fluxWm2 = ld.value("flux_w_m2", 1000.0f);
+            l.hWm2k = ld.value("h_w_m2k", 10.0f);
+            l.tAmbC = ld.value("t_amb_c", 25.0f);
             if (ld.contains("faces") && ld["faces"].is_array())
                 for (const auto& sel : ld["faces"]) l.faces.picks.push_back(selFromJson(sel));
             s.loads.push_back(std::move(l));
@@ -844,6 +892,10 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sim_new_thermal") return newAndOpen(StudyType::Thermal);
     if (cmdId == "sim_new_fatigue") return newAndOpen(StudyType::Fatigue);
     if (cmdId == "sim_new_motion")  return newAndOpen(StudyType::Motion);
+    if (cmdId == "sim_new_thermal_fea") return newAndOpen(StudyType::ThermalFea);
+    if (cmdId == "sim_new_buckling")    return newAndOpen(StudyType::Buckling);
+    if (cmdId == "sim_new_contact")     return newAndOpen(StudyType::Contact);
+    if (cmdId == "sim_new_freqresp")    return newAndOpen(StudyType::FreqResponse);
     refresh(st);
 
     // Per-type setup tools (the per-type ribbon tabs): target a study of the tab's type — keep
@@ -2071,6 +2123,10 @@ void SimManager::run(AppState& st, Study& s) {
     if (s.type == StudyType::Motion)         runMotion(st, s);
     else if (isFlowFamily(s.type))           runFlow(st, s);
     else if (s.type == StudyType::Fatigue)   runFatigue(st, s);
+    else if (s.type == StudyType::ThermalFea)   runThermalFea(st, s);
+    else if (s.type == StudyType::Buckling)     runBuckling(st, s);
+    else if (s.type == StudyType::Contact)      runContact(st, s);
+    else if (s.type == StudyType::FreqResponse) runFreqResponse(st, s);
     else                                     runStaticOrModal(st, s);
 }
 
@@ -2384,6 +2440,14 @@ void SimManager::tick(AppState& st) {
     if (emStatus_ == 0 && !emProbeInflight_ &&
         st.activeWorkspace == AppState::Workspace::Simulate)
         probeEmStatus(st);
+    // T-FIN24: probe the multiphysics capability doctor (ccx / handoff seams) + fw_status
+    // the same way — once, async, only while the Simulate workspace is up.
+    if (capsStatus_ == 0 && !capsInflight_ &&
+        st.activeWorkspace == AppState::Workspace::Simulate)
+        probeCaps(st);
+    if (fwStatus_ == 0 && !fwProbeInflight_ &&
+        st.activeWorkspace == AppState::Workspace::Simulate)
+        probeFwStatus(st);
     if (!st.simClient) return;
     auto* sim = st.simClient;
     auto& job = sim->job();
@@ -2480,6 +2544,44 @@ void SimManager::tick(AppState& st) {
             resultShown_ = true; shownStudyId_ = s.id;
             rebuildFlowLines(st, s);
             st.addLog("[sim] flow done: " + s.summary);
+        } else if (s.type == StudyType::ThermalFea) {
+            // Conduction solve (steady or T-FIN18 transient): numeric summary only — the core
+            // returns the nodal temperature field but packages no display overlay (honest gap;
+            // the summary + flux audit are shown in Results).
+            s.nNodes = res.value("n_nodes", 0);
+            s.nElems = res.value("n_elems", 0);
+            s.nDof = res.value("n_dof", 0);
+            s.resultSummary = (res.contains("summary") && res["summary"].is_object())
+                                  ? res["summary"] : nlohmann::json::object();
+            nlohmann::json adv = nlohmann::json::object();
+            adv["summary"] = s.resultSummary;
+            if (res.contains("flux_summary")) adv["flux_summary"] = res["flux_summary"];
+            if (res.contains("n_steps")) adv["n_steps"] = res["n_steps"];
+            if (res.contains("transient")) adv["transient"] = res["transient"];
+            if (res.contains("simhandoff")) adv["simhandoff"] = res["simhandoff"];
+            s.advResult = adv;
+            const auto& sm = s.resultSummary;
+            char buf[256];
+            if (res.value("transient", false))
+                std::snprintf(buf, sizeof(buf),
+                              "peak %.1f degC @ %.1fs | final max %.1f degC | min %.1f degC",
+                              sm.value("max_temp_c", 0.0), sm.value("max_temp_time_s", 0.0),
+                              sm.value("final_max_temp_c", sm.value("max_temp_c", 0.0)),
+                              sm.value("min_temp_c", 0.0));
+            else
+                std::snprintf(buf, sizeof(buf), "max %.1f degC | min %.1f degC",
+                              sm.value("max_temp_c", 0.0), sm.value("min_temp_c", 0.0));
+            s.summary = buf;
+            st.addLog("[sim] thermal FEA done: " + s.summary);
+        } else if (s.type == StudyType::FreqResponse) {
+            // Stage 1 (modal eigen solve) landed — hand the mode shapes to the worker's
+            // vibration post-processor (modal superposition; async, panel stays live).
+            s.nNodes = res.value("n_nodes", 0);
+            s.nDof = res.value("n_dof", 0);
+            s.freqs.clear();
+            if (res.contains("freqs_hz") && res["freqs_hz"].is_array())
+                for (auto& v : res["freqs_hz"]) s.freqs.push_back((float)v.get<double>());
+            postFreqResponse(st, s, res);
         } else {
             // Mesh / system size for the Results metric table + solver transparency.
             s.nNodes = res.value("n_nodes", 0);
@@ -2550,6 +2652,31 @@ void SimManager::tick(AppState& st) {
 static bool studyReady(const Study& s, std::string& blocker) {
     if (s.type == StudyType::Motion) return true;  // Motion only needs a doc + optional mate-id
     if (isFlowFamily(s.type)) return true;
+    // T-FIN24 kinds: the ccx proxies need only a material (E, nu — dims come from the part
+    // bbox); thermal FEA needs at least one boundary condition; frequency response mirrors
+    // modal (fixtures optional — free-free is allowed).
+    if (s.type == StudyType::Buckling || s.type == StudyType::Contact) {
+        if (s.materialKey.empty()) {
+            blocker = "Material required — the proxy solve reads E and nu from it.";
+            return false;
+        }
+        return true;
+    }
+    if (s.type == StudyType::ThermalFea) {
+        if (s.fixtures.empty() && s.loads.empty()) {
+            blocker = "Add at least one thermal BC: a fixed-temperature face (Fixtures) or a "
+                      "flux/convection load.";
+            return false;
+        }
+        return true;
+    }
+    if (s.type == StudyType::FreqResponse) {
+        if (s.materialKey.empty()) {
+            blocker = "Material required — mass and stiffness come from it.";
+            return false;
+        }
+        return true;
+    }
     if (s.materialKey.empty()) {
         blocker = "Material required — pick a material before running.";
         return false;
@@ -2614,6 +2741,11 @@ void SimManager::drawTreeBody(AppState& st) {
     // ---- EM (electromagnetics) panel takes over the pane when open. EM is standalone (no doc Study),
     // so it must be handled BEFORE the study-panel block below (which requires a valid sel_).
     if (emPanelOpen_) { drawEmPanel(st); return; }
+    // T-FIN24 stateless panels (electronics SPICE / firmware emulation / cross-sim handoff):
+    // same PM-style takeover as the EM panel.
+    if (elPanelOpen_) { drawElectronicsPanel(st); return; }
+    if (fwPanelOpen_) { drawEmulationPanel(st); return; }
+    if (handoffPanelOpen_) { drawHandoffPanel(st); return; }
 
     // ---- sim-gui rework: tool-invoked setup panel (PropertyManager flow) --------------------
     // When a ribbon tool was invoked (or a tree node double-clicked) the matching setup editor
@@ -2633,9 +2765,11 @@ void SimManager::drawTreeBody(AppState& st) {
 
     // ---- Single "+ New Study" entry point: opens a picker popup for the study types.
     // The per-type ribbon tabs' "New Study" buttons route to the same newStudy path.
-    if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)))
+    if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)) || shotForcePicker)
         ImGui::OpenPopup("##newStudyPicker");
-    simTip("Add a simulation study to this part. Static, Fatigue, Frequency, Flow, or Thermal.");
+    simTip("Add a simulation study. The offered kinds follow what you have open: mechanical "
+           "studies for parts/assemblies, motion for mated assemblies, electronics simulation "
+           "and firmware emulation when a schematic / PCB / firmware project is open.");
 
     const float S2 = ui::uiScale;
     ImGui::SetNextWindowBgAlpha(0.0f);   // suppress the flat PopupBg — the glass panel replaces it
@@ -2646,26 +2780,85 @@ void SimManager::drawTreeBody(AppState& st) {
         pushCardText();          // re-pair the adaptive ink for the frosted popup surface
         ui::fmRowStripeReset();  // refresh the FM palette + restart the row stripe phase
 
-        // A study row can create either an in-part FEA/CFD study (newStudy) or route into the EM
-        // panel (handleEmCommand — which honours the em_status solver gate).
-        enum class Kind { Fea, Em };
-        struct SEntry { Kind kind; StudyType type; const char* name; const char* icon; const char* desc; };
-        const SEntry kEntries[] = {
-            { Kind::Fea, StudyType::Static,  "Static",          studyTypeIcon(StudyType::Static),
-              "Linear stress, displacement and factor of safety." },
-            { Kind::Fea, StudyType::Fatigue, "Fatigue",         studyTypeIcon(StudyType::Fatigue),
-              "Cyclic-load life (Goodman / Gerber / Soderberg)." },
-            { Kind::Fea, StudyType::Modal,   "Frequency",       studyTypeIcon(StudyType::Modal),
-              "Natural frequencies and mode shapes." },
-            { Kind::Fea, StudyType::Flow,    "Flow",            studyTypeIcon(StudyType::Flow),
-              "External aerodynamics: drag, lift, streamlines." },
-            { Kind::Fea, StudyType::Thermal, "Thermal",         studyTypeIcon(StudyType::Thermal),
-              "Heat transfer via OpenFOAM convection / CHT." },
-            { Kind::Fea, StudyType::Motion,  "Motion",          studyTypeIcon(StudyType::Motion),
-              "Drive a dimensional mate, play back the trajectory." },
-            { Kind::Em,  StudyType::Static,  "Electromagnetic", "cat_electronics",
-              "Full-wave RF: eigenmode, S-parameters, time domain." },
-        };
+        // A study row creates an in-part study (newStudy) or routes into a stateless panel
+        // (EM / electronics SPICE / firmware emulation). The offered set is PROGRESSIVELY
+        // DISCLOSED by the open doc types (T-SIM10 spec / T-FIN24): mechanical kinds need a
+        // Part/Assembly, motion needs an assembly, electronics + emulation appear only with a
+        // Schematic / PCB / firmware project open. Kinds whose engine leg is missing render
+        // dimmed with the doctor's guidance (fw_status pattern) — never dead buttons.
+        enum class Kind { Fea, Em, El, Fw };
+        struct SEntry { Kind kind; StudyType type; const char* name; const char* icon;
+                        std::string desc; bool disabled; std::string reason; };
+        bool hasSch = false, hasPcb = false, hasAsm = false;
+        for (const auto& t : st.docTabs) {
+            if (t.kind == AppState::DocTab::TabKind::Schematic) hasSch = true;
+            if (t.kind == AppState::DocTab::TabKind::PCB) hasPcb = true;
+            if (t.kind == AppState::DocTab::TabKind::Assembly) hasAsm = true;
+        }
+        const bool mechDoc = st.docMirror.hasDoc();
+        const bool ccxMissing = capsStatus_ == 1 && caps_.contains("ccx") &&
+                                !caps_["ccx"].value("found", false);
+        const std::string ccxHint = ccxMissing
+            ? caps_["ccx"].value("hint", std::string("CalculiX (ccx) not found."))
+            : std::string();
+        std::vector<SEntry> kEntries;
+        if (mechDoc) {
+            kEntries.push_back({Kind::Fea, StudyType::Static, "Static",
+                studyTypeIcon(StudyType::Static),
+                "Linear stress, displacement and factor of safety.", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::Fatigue, "Fatigue",
+                studyTypeIcon(StudyType::Fatigue),
+                "Cyclic-load life (Goodman / Gerber / Soderberg).", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::Modal, "Frequency",
+                studyTypeIcon(StudyType::Modal),
+                "Natural frequencies and mode shapes.", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::FreqResponse, "Vibration",
+                studyTypeIcon(StudyType::FreqResponse),
+                "Harmonic base-excitation response (modal superposition).", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::Buckling, "Buckling",
+                studyTypeIcon(StudyType::Buckling),
+                "Critical load factors (CalculiX box proxy).", ccxMissing, ccxHint});
+            kEntries.push_back({Kind::Fea, StudyType::Contact, "Contact",
+                studyTypeIcon(StudyType::Contact),
+                "Nonlinear contact conservation check (CalculiX).", ccxMissing, ccxHint});
+            kEntries.push_back({Kind::Fea, StudyType::Flow, "Flow",
+                studyTypeIcon(StudyType::Flow),
+                "External aerodynamics: drag, lift, streamlines. Fast (LBM) or accurate "
+                "(OpenFOAM).", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::Thermal, "Thermal (CFD)",
+                studyTypeIcon(StudyType::Thermal),
+                "Heat transfer via OpenFOAM convection / CHT.", false, ""});
+            kEntries.push_back({Kind::Fea, StudyType::ThermalFea, "Thermal (FEA)",
+                studyTypeIcon(StudyType::ThermalFea),
+                "Conduction on the part: fixed temps, flux, convection; steady or transient.",
+                false, ""});
+        }
+        if (hasAsm)
+            kEntries.push_back({Kind::Fea, StudyType::Motion, "Motion",
+                studyTypeIcon(StudyType::Motion),
+                "Drive a dimensional mate, play back the trajectory.", false, ""});
+        if (mechDoc)
+            kEntries.push_back({Kind::Em, StudyType::Static, "Electromagnetic",
+                "cat_electronics",
+                "Full-wave RF: eigenmode, S-parameters, time domain.",
+                emStatus_ < 0, "EM solver not installed on this machine."});
+        // Electronics-sim + emulation: disclosed ONLY with electronics docs / firmware
+        // projects open (T-SIM10 rule 2).
+        const bool fwProjects = fwsim_.projectsLoaded && !fwsim_.projectIds.empty();
+        if (hasSch || hasPcb) {
+            kEntries.push_back({Kind::El, StudyType::Static, "Electronics",
+                "cat_electronics",
+                "Circuit simulation (SPICE): operating point, AC sweep, transient.",
+                !hasSch, "SPICE runs on a Schematic — open the board's schematic tab."});
+        }
+        if (hasSch || hasPcb || fwProjects) {
+            kEntries.push_back({Kind::Fw, StudyType::Static, "Firmware emulation",
+                "cat_electronics",
+                "Run the firmware in an emulator (Renode / QEMU) with scenario assertions.",
+                fwStatus_ == 1 && !fwCanEmulate_,
+                fwHint_.empty() ? std::string("Emulation backend unavailable — install "
+                                              "Renode or qemu-system-arm.") : fwHint_});
+        }
 
         // Title.
         ImGui::PushFont(st.fonts.medium);
@@ -2681,6 +2874,12 @@ void SimManager::drawTreeBody(AppState& st) {
         ImGui::PushFont(st.fonts.medium);
         float maxNameW = 0.0f;
         for (const auto& e : kEntries) maxNameW = std::max(maxNameW, ImGui::CalcTextSize(e.name).x);
+        if (kEntries.empty()) {
+            pushDimText();
+            ImGui::TextWrapped("Open a part, assembly, schematic, PCB or firmware project to "
+                               "see the study kinds it unlocks.");
+            popDimText();
+        }
         ImGui::PopFont();
         const float descOffset = iconSz + 8.0f * S2 + maxNameW + 14.0f * S2;
         Kind chosenKind = Kind::Fea;
@@ -2703,14 +2902,20 @@ void SimManager::drawTreeBody(AppState& st) {
             ImGui::SameLine(0, 0);
             ImGui::SetCursorPosX(startX + descOffset);
             pushDimText();
-            ImGui::TextUnformatted(e.desc);
+            ImGui::TextUnformatted(e.desc.c_str());
             popDimText();
             // Full-row hit target as the LAST item so fmRowPillEnd's hover paint (and the click)
             // cover the entire row, not just the description text under the cursor.
             ImGui::SetCursorScreenPos(r.mn);
             const bool hit = ImGui::InvisibleButton("##row", ImVec2(r.mx.x - r.mn.x, r.mx.y - r.mn.y));
             ui::fmRowPillEnd(r, false);
-            if (hit) { chosenKind = e.kind; chosenType = e.type; picked = true; }
+            if (e.disabled) {
+                // Honest gating: the row stays visible but dimmed; hovering explains the
+                // missing engine leg (doctor guidance), and the click is swallowed.
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.reason.c_str());
+            } else if (hit) {
+                chosenKind = e.kind; chosenType = e.type; picked = true;
+            }
             ImGui::PopID();
         }
 
@@ -2718,8 +2923,10 @@ void SimManager::drawTreeBody(AppState& st) {
         glass.finish();
         // Act AFTER the loop so a routed EM command (which mutates panel state) doesn't run mid-draw.
         if (picked) {
-            if (chosenKind == Kind::Em) handleEmCommand(st, "sim_em_eigen");
-            else                        newStudy(st, chosenType);
+            if (chosenKind == Kind::Em)      handleEmCommand(st, "sim_em_eigen");
+            else if (chosenKind == Kind::El) openElectronicsPanel(st);
+            else if (chosenKind == Kind::Fw) openEmulationPanel(st);
+            else                             newStudy(st, chosenType);
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -2727,8 +2934,29 @@ void SimManager::drawTreeBody(AppState& st) {
     ImGui::PopStyleVar(2);
     ImGui::Spacing();
 
+    // ---- cross-sim handoffs (aicad.simhandoff/1 seam, T-FIN24) -------------------------
+    // One-click flows between domains, disclosed by the open doc types. Drawn ABOVE the
+    // study tree so a board-only session still reaches them.
+    {
+        int pcbTab = -1;
+        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+            if (st.docTabs[i].kind == AppState::DocTab::TabKind::PCB &&
+                !st.docTabs[i].ecadDocId.empty()) { pcbTab = i; break; }
+        if (pcbTab >= 0) {
+            ui::fmSectionDivider("Cross-sim handoffs");
+            if (ImGui::Button("Send board to thermal FEA", ImVec2(-FLT_MIN, 0)))
+                openHandoffPanel(st, pcbTab);
+            simTip("ECAD -> thermal handoff (aicad.simhandoff/1): fuses the routed board into "
+                   "one FEA solid, applies per-component heat sources from the boardphys power "
+                   "metadata and environment convection, and solves the core conduction study.");
+        }
+    }
+
     if (!st.docMirror.hasDoc()) {
-        ImGui::TextWrapped("Open a part to set up a simulation study.");
+        pushDimText();
+        ImGui::TextWrapped("Open a part or assembly to set up mechanical studies. Electronics "
+                           "docs unlock circuit simulation and emulation in the picker above.");
+        popDimText();
         return;
     }
     if (studies_.empty()) {
@@ -2882,21 +3110,45 @@ void SimManager::drawStudyRow(AppState& st, int i) {
         if (s.type == StudyType::Thermal)
             child("study_thermal", "Heat source / wall BC", SimNode::Study, true,
                   "Configure the thermal boundary condition in the study form.");
+        // T-FIN24 kinds: type-level setup entry points. The ccx proxies have no per-face
+        // setup (they solve a box proxy sized to the part), so fixtures/loads/mesh nodes
+        // are hidden for them below.
+        if (s.type == StudyType::Buckling)
+            child("study_static", "Proxy load / modes", SimNode::Study, true,
+                  "Compressive load and mode count for the eigenvalue buckling solve.");
+        if (s.type == StudyType::Contact)
+            child("study_static", "Contact pressure", SimNode::Study, true,
+                  "Pressure on the two-block contact proxy.");
+        if (s.type == StudyType::FreqResponse)
+            child("study_modal", "Excitation / damping", SimNode::Study, true,
+                  "Base-excitation axis, amplitude and modal damping.");
+        if (s.type == StudyType::ThermalFea)
+            child("study_thermal", "Conductivity / transient", SimNode::Study, true,
+                  "Solid conductivity and the optional transient time settings.");
 
-        if (!isFlowFamily(s.type)) {
+        const bool proxyKind = (s.type == StudyType::Buckling || s.type == StudyType::Contact);
+        if (!isFlowFamily(s.type) && !proxyKind) {
             bool hasFix = !s.fixtures.empty();
-            child("fixture", "Fixtures (" + s.fixtures.label() + ")", SimNode::Fixtures, hasFix,
-                  hasFix ? "" : (s.type == StudyType::Modal
-                      ? "No fixtures — frequency study will run free-free."
+            child("fixture",
+                  (s.type == StudyType::ThermalFea ? "Fixed temp (" : "Fixtures (") +
+                      s.fixtures.label() + ")",
+                  SimNode::Fixtures, hasFix,
+                  hasFix ? "" : (s.type == StudyType::Modal || s.type == StudyType::FreqResponse
+                      ? "No fixtures — the modal basis will be free-free."
+                      : s.type == StudyType::ThermalFea
+                      ? "Optional: faces held at a fixed temperature."
                       : "A static study needs at least one fixed face."));
             // Loads (each its own row). Frequency (modal) eigenvalue solves ignore loads entirely —
             // they never reach runStaticOrModal's load array — so the load nodes are hidden for
             // modal studies. Fixtures + Mesh stay (fixtures constrain rigid-body modes).
-            if (s.type != StudyType::Modal) {
+            if (s.type != StudyType::Modal && s.type != StudyType::FreqResponse) {
                 for (int li = 0; li < (int)s.loads.size(); ++li) {
                     const SimLoad& ld = s.loads[li];
-                    std::string lbl = (ld.pressure ? "Pressure " : "Force ") + std::to_string(li + 1) +
-                                      " (" + ld.faces.label() + ")";
+                    std::string lbl = s.type == StudyType::ThermalFea
+                        ? std::string(ld.thermalKind == 1 ? "Convection " : "Heat flux ") +
+                              std::to_string(li + 1) + " (" + ld.faces.label() + ")"
+                        : (ld.pressure ? "Pressure " : "Force ") + std::to_string(li + 1) +
+                              " (" + ld.faces.label() + ")";
                     child(ld.pressure ? "load_pressure" : "load_force", lbl, SimNode::Load,
                           !ld.faces.empty(),
                           ld.faces.empty() ? "This load has no faces selected." : "", li);
@@ -3963,6 +4215,12 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
 }
 
 void SimManager::drawResultControls(AppState& st, Study& s) {
+    // T-FIN24 kinds render numeric/plot results (no viewport overlay).
+    if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
+        s.type == StudyType::FreqResponse || s.type == StudyType::ThermalFea) {
+        drawAdvancedResults(st, s);
+        return;
+    }
     // Motion results: timeline + trace plot — no colormap, no metric table.
     if (s.type == StudyType::Motion) {
         float rH = ImGui::GetContentRegionAvail().y - 50.0f * ui::uiScale;
@@ -4440,9 +4698,46 @@ void SimManager::drawForm(AppState& st, Study& s) {
             break;
         case SimNode::Fixtures:
             drawFixturesForm(st, s);
+            if (s.type == StudyType::ThermalFea) {
+                ImGui::Spacing();
+                ImGui::SeparatorText("Fixed temperature");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##thermfixt", &s.thermFixTempC, 0, 0, "T = %.1f degC")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Dirichlet temperature held on the fixture faces (thermal FEA: fixtures "
+                       "are fixed-TEMPERATURE faces, not structural clamps).");
+            }
             break;
         case SimNode::Load:
             drawLoadsForm(st, s);
+            if (s.type == StudyType::ThermalFea && loadIdx_ >= 0 &&
+                loadIdx_ < (int)s.loads.size()) {
+                SimLoad& ld = s.loads[loadIdx_];
+                ImGui::Spacing();
+                ImGui::SeparatorText("Thermal load");
+                static const char* kTk[2] = {"Heat flux (W/m2)", "Convection (h, T_amb)"};
+                int tk = (ld.thermalKind == 1) ? 1 : 0;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##thermloadkind", kTk[tk])) {
+                    for (int i = 0; i < 2; ++i)
+                        if (ImGui::Selectable(kTk[i], tk == i)) { ld.thermalKind = i; persist(st, s); }
+                    ImGui::EndCombo();
+                }
+                simTip("For a thermal FEA study this load's faces carry heat flux in, or shed "
+                       "heat by convection (the force/pressure fields above are ignored).");
+                if (ld.thermalKind == 0) {
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermflux", &ld.fluxWm2, 0, 0, "q = %.0f W/m2")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                } else {
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermh", &ld.hWm2k, 0, 0, "h = %.1f W/(m2 K)")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermtamb", &ld.tAmbC, 0, 0, "T_amb = %.1f degC")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                }
+            }
             break;
         case SimNode::Mesh:
             drawMeshForm(st, s);
@@ -4472,6 +4767,97 @@ void SimManager::drawForm(AppState& st, Study& s) {
                 if (ImGui::SliderInt("##modesp", &s.nModes, 1, 12)) {}
                 if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
                 simTip("How many natural frequencies / mode shapes to solve for.");
+            } else if (s.type == StudyType::ThermalFea) {
+                drawStudyTypeBanner(s.type,
+                    "Heat conduction on the part itself (core FEA solver): fixed-temperature "
+                    "faces (Fixtures) + flux / convection loads. Toggle Transient for a "
+                    "time-domain solve (backward Euler).");
+                ImGui::SeparatorText("Solid properties");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##thermk", &s.thermK, 0, 0, "k = %.1f W/(m K)")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Thermal conductivity of the solid. ~200 aluminium, ~50 steel, ~400 copper, "
+                       "~0.3 FR4/plastics.");
+                ImGui::SeparatorText("Transient");
+                if (ImGui::Checkbox("Transient (time-domain)", &s.thermTransient)) persist(st, s);
+                simTip("Off = steady state. On = integrate C dT/dt + K T = f(t) to the horizon "
+                       "below (T-FIN18).");
+                if (s.thermTransient) {
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermtend", &s.thermTEndS, 0, 0, "t_end = %.1f s")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermdt", &s.thermDtS, 0, 0, "dt = %.2f s (0 = auto)")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermtinit", &s.thermTInitC, 0, 0, "T_init = %.1f degC")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##thermcp", &s.thermCp, 0, 0, "cp = %.0f J/(kg K)")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                    simTip("Specific heat (transient only). ~900 aluminium, ~490 steel.");
+                }
+            } else if (s.type == StudyType::Buckling) {
+                drawStudyTypeBanner(s.type,
+                    "Linear (eigenvalue) buckling via CalculiX: critical load factors for "
+                    "slender members. Solves a BOX PROXY sized to the part bounding box "
+                    "(fixed-free column) — an Euler-grade estimate, honest for strut-like parts.");
+                if (capsStatus_ == 1 && caps_.contains("ccx") && !caps_["ccx"].value("found", false)) {
+                    pushDimText();
+                    ImGui::TextWrapped("%s", caps_["ccx"].value("hint",
+                        std::string("CalculiX (ccx) not found.")).c_str());
+                    popDimText();
+                }
+                ImGui::SeparatorText("Compressive load");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##buckload", &s.bucklingLoadN, 0, 0, "P = %.0f N")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Axial compressive load the factors scale: critical load = P x lambda. "
+                       "lambda < 1 means the part buckles below this load.");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderInt("##buckmodes", &s.nModes, 1, 8, "%d modes")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+            } else if (s.type == StudyType::Contact) {
+                drawStudyTypeBanner(s.type,
+                    "Nonlinear contact via CalculiX (*STATIC, NLGEOM + *CONTACT PAIR): a two-"
+                    "block proxy sized to the part bounding box, verifying the interface "
+                    "transmits the applied load into the support (reaction = applied).");
+                if (capsStatus_ == 1 && caps_.contains("ccx") && !caps_["ccx"].value("found", false)) {
+                    pushDimText();
+                    ImGui::TextWrapped("%s", caps_["ccx"].value("hint",
+                        std::string("CalculiX (ccx) not found.")).c_str());
+                    popDimText();
+                }
+                ImGui::SeparatorText("Contact pressure");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##ctpress", &s.contactPressureMpa, 0, 0, "p = %.2f MPa")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Downward pressure on the upper block's top face.");
+            } else if (s.type == StudyType::FreqResponse) {
+                drawStudyTypeBanner(s.type,
+                    "Harmonic base-excitation response by modal superposition: each mode becomes "
+                    "an SDOF oscillator; responses combine by SRSS. Random (PSD) response is "
+                    "available via the copilot's run_fea_frequency_response tool.");
+                ImGui::SeparatorText("Excitation");
+                static const char* kAxes[3] = {"X axis", "Y axis", "Z axis"};
+                int ax = (s.frDir < 0 || s.frDir > 2) ? 2 : s.frDir;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##fraxis", kAxes[ax])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(kAxes[i], ax == i)) { s.frDir = i; persist(st, s); }
+                    ImGui::EndCombo();
+                }
+                simTip("Base-excitation direction (the shaker axis).");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##frbaseg", &s.frBaseG, 0, 0, "base input = %.2f g")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##frzeta", &s.frZeta, 0, 0, "damping zeta = %.3f")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Modal damping ratio (assumption, echoed on the result). 0.02 = Q of 25.");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderInt("##frmodes", &s.nModes, 1, 12, "%d modes")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
             } else {  // Static
                 drawStudyTypeBanner(s.type,
                     "Linear static stress under applied loads. Use the ribbon's Material / "
@@ -4488,7 +4874,7 @@ void SimManager::drawForm(AppState& st, Study& s) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        bool busy = st.simClient && st.simClient->busy();
+        bool busy = (st.simClient && st.simClient->busy()) || advRunning_;
         std::string blocker;
         bool ready = studyReady(s, blocker);
         const bool canRun = ready && !busy;
@@ -5003,6 +5389,973 @@ void SimManager::drawMotionResults(AppState& st, Study& s) {
                     IM_COL32(255, 200, 80, 200), 1.5f * S);
             }
         }
+    }
+
+    // ---- cross-sim handoff: motion -> static FEA (aicad.simhandoff/1) ----------------
+    // Wired behind the sim_caps endpoint-availability check (T-FIN24 honest gating): the
+    // worst-frame joint-reaction chaining lives in the MCP motion_fea_handoff tool; until
+    // its worker mirror lands the button stays dimmed with the doctor's guidance.
+    {
+        ImGui::Spacing();
+        ImGui::SeparatorText("Handoff");
+        const bool up = capsStatus_ == 1 && caps_.contains("handoffs") &&
+                        caps_["handoffs"].contains("motion_fea") &&
+                        caps_["handoffs"]["motion_fea"].value("available", false);
+        if (!up) ImGui::BeginDisabled();
+        ImGui::Button("Send reactions to static FEA", ImVec2(-FLT_MIN, 0));
+        if (!up) ImGui::EndDisabled();
+        if (!up && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", capsStatus_ == 1 && caps_.contains("handoffs") &&
+                                            caps_["handoffs"].contains("motion_fea")
+                ? caps_["handoffs"]["motion_fea"]
+                      .value("hint", std::string("motion->FEA worker seam pending")).c_str()
+                : "motion->FEA handoff: run motion_fea_handoff via the copilot "
+                  "(worker mirror pending)");
+        drawProvenance(s.advResult);
+    }
+}
+
+
+// ============================================================ T-FIN24: multiphysics Simulate tab
+//
+// One Simulate workspace for every study kind. The pieces below add: the sim_caps / fw_status
+// capability probes (honest gating), the four new study-kind runs (thermal FEA on the core
+// conduction solver; CalculiX buckling/contact box proxies + modal-superposition frequency
+// response via the worker's multiphysics seam), the stateless electronics-SPICE and firmware-
+// emulation panels, and the cross-sim handoff panel (aicad.simhandoff/1: ECAD board -> thermal
+// FEA + the T-FIN17 heatsink-pick forward seam). All async work goes through st.rpc (callbacks
+// drain on the GL thread) or the SimClient job — never a sync worker.call in a draw path.
+
+void SimManager::probeCaps(AppState& st) {
+    if (capsStatus_ != 0 || capsInflight_) return;
+    capsInflight_ = true;
+    st.rpc.call("sim_caps", nlohmann::json::object(),
+                [this](const core::RpcResult& r) {
+                    capsInflight_ = false;
+                    if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+                        caps_ = r.result;
+                        capsStatus_ = 1;
+                    } else {
+                        capsStatus_ = -1;
+                    }
+                },
+                8000);
+}
+
+void SimManager::probeFwStatus(AppState& st) {
+    if (fwStatus_ != 0 || fwProbeInflight_) return;
+    fwProbeInflight_ = true;
+    st.rpc.call("fw_status", nlohmann::json::object(),
+                [this](const core::RpcResult& r) {
+                    fwProbeInflight_ = false;
+                    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                        fwStatus_ = -1;
+                        fwHint_ = r.err.empty() ? "fw_status unavailable" : r.err;
+                        return;
+                    }
+                    fwStatus_ = 1;
+                    if (r.result.contains("families") && r.result["families"].is_object()) {
+                        const auto fam = r.result["families"].value("cortex-m",
+                                                                    nlohmann::json::object());
+                        fwCanEmulate_ = fam.value("can_emulate", false);
+                    }
+                    if (!fwCanEmulate_)
+                        fwHint_ = "Emulation unavailable: install Renode (preferred) or "
+                                  "qemu-system-arm.";
+                },
+                8000);
+    // Project list for the emulation panel + picker disclosure (firmware-project-only case).
+    if (!fwsim_.projectsLoaded && !fwsim_.projectsPending) {
+        fwsim_.projectsPending = true;
+        st.rpc.call("fw_projects", nlohmann::json::object(),
+                    [this](const core::RpcResult& r) {
+                        fwsim_.projectsPending = false;
+                        fwsim_.projectsLoaded = true;
+                        fwsim_.projectIds.clear(); fwsim_.projectNames.clear();
+                        if (r.ok && r.result.is_object() && r.result.contains("projects") &&
+                            r.result["projects"].is_array()) {
+                            for (const auto& pr : r.result["projects"]) {
+                                fwsim_.projectIds.push_back(pr.value("id", std::string()));
+                                std::string nm = pr.value("name", pr.value("id", std::string()));
+                                const std::string mcu = pr.value("mcu", std::string());
+                                if (!mcu.empty()) nm += " (" + mcu + ")";
+                                fwsim_.projectNames.push_back(std::move(nm));
+                            }
+                        }
+                    },
+                    8000);
+    }
+}
+
+bool SimManager::modelBbox(AppState& st, float lo[3], float hi[3]) const {
+    lo[0] = lo[1] = lo[2] = 1e30f;
+    hi[0] = hi[1] = hi[2] = -1e30f;
+    bool any = false;
+    for (const auto& kv : st.faceNormalCache) {
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = std::min(lo[k], kv.second[3 + k]);
+            hi[k] = std::max(hi[k], kv.second[3 + k]);
+        }
+        any = true;
+    }
+    return any;
+}
+
+void SimManager::drawProvenance(const nlohmann::json& result) {
+    if (!result.is_object() || !result.contains("simhandoff") ||
+        !result["simhandoff"].is_object())
+        return;
+    const auto& env = result["simhandoff"];
+    const std::string coupling = env.value("coupling", std::string("?"));
+    std::string src = "?";
+    if (env.contains("source") && env["source"].is_object())
+        src = env["source"].value("domain", std::string("?")) + "/" +
+              env["source"].value("tool", std::string("?"));
+    pushDimText();
+    ImGui::TextWrapped("Provenance: %s \xe2\x80\x94 from %s (aicad.simhandoff/1, id %s)",
+                       coupling.c_str(), src.c_str(),
+                       env.value("id", std::string("?")).c_str());
+    popDimText();
+}
+
+// ---------------------------------------------------------------- thermal FEA run (conduction)
+
+void SimManager::runThermalFea(AppState& st, Study& s) {
+    if (!st.simClient) return;
+    auto* sim = st.simClient;
+    if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
+
+    std::string stepPath = appdataAppDir() + "/cache/sim_thermal.step";
+    {
+        nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
+        std::string e;
+        if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
+            st.addLog("[sim] export STEP failed: " + (r.contains("code") ? r.value("message", e) : e));
+            st.toast(ui::ToastLevel::Error, "Simulation: export failed");
+            return;
+        }
+        lastStepPath_ = r.value("path", stepPath);
+    }
+
+    // Fixed-temperature (Dirichlet) faces.
+    nlohmann::json fixtures = nlohmann::json::array();
+    for (const auto& pck : s.fixtures.picks) {
+        std::string e;
+        auto fp = facePointsFor(st, pck.selector, e);
+        if (!fp.is_null() && fp.contains("points")) {
+            fp["temp_c"] = s.thermFixTempC;
+            fixtures.push_back(fp);
+        }
+    }
+    // Flux / convection loads.
+    nlohmann::json loads = nlohmann::json::array();
+    for (const auto& ld : s.loads) {
+        nlohmann::json faces;
+        for (const auto& pck : ld.faces.picks) {
+            std::string e;
+            auto fp = facePointsFor(st, pck.selector, e);
+            if (!fp.is_null() && fp.contains("points")) {
+                if (faces.is_null()) faces = fp;
+                else for (auto& pt : fp["points"]) faces["points"].push_back(pt);
+            }
+        }
+        if (faces.is_null()) continue;
+        nlohmann::json l = {{"faces", faces}};
+        if (ld.thermalKind == 1) {
+            l["type"] = "convection"; l["h"] = ld.hWm2k; l["t_amb_c"] = ld.tAmbC;
+        } else {
+            l["type"] = "flux"; l["magnitude"] = ld.fluxWm2;
+        }
+        loads.push_back(l);
+    }
+    if (fixtures.empty() && loads.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Add a thermal boundary condition before running");
+        return;
+    }
+
+    // Material: conductivity from the study; density from the picked material (transient mass).
+    double density = 2.7;
+    int mi = materialIndexByKey(s.materialKey);
+    if (mi >= 0 && materials()[mi].density_g_cm3 > 0) density = materials()[mi].density_g_cm3;
+    nlohmann::json study = {
+        {"step_path", lastStepPath_},
+        {"material", {{"k_w_mk", s.thermK}, {"cp_j_kgk", s.thermCp},
+                      {"density_g_cm3", density}}},
+        {"fixtures", fixtures},
+        {"loads", loads},
+    };
+    if (s.thermTransient && s.thermTEndS > 0) {
+        nlohmann::json tr = {{"t_end_s", s.thermTEndS}, {"t_init_c", s.thermTInitC}};
+        if (s.thermDtS > 0) tr["dt_s"] = s.thermDtS;
+        study["transient"] = tr;
+    }
+    addMeshParams(study, s, /*order=*/1, /*allowHex=*/false);
+
+    std::string note;
+    if (sim->launch("sim_run_thermal", {{"study", study}}, note, st.docMirror.docId())) {
+        clearTransientResult(s);
+        clearMeshPreview();
+        resultShown_ = false; shownStudyId_.clear();
+        running_ = true; runningStudy_ = sel_; runningStudyId_ = s.id;
+    }
+    st.addLog(note);
+}
+
+// ---------------------------------------------------------------- ccx proxy runs (worker seam)
+
+void SimManager::runBuckling(AppState& st, Study& s) {
+    float lo[3], hi[3];
+    if (!modelBbox(st, lo, hi)) {
+        st.toast(ui::ToastLevel::Warn, "No model geometry to size the buckling proxy from");
+        return;
+    }
+    int mi = materialIndexByKey(s.materialKey);
+    if (mi < 0) { st.toast(ui::ToastLevel::Warn, "Pick a material first"); return; }
+    const auto& m = materials()[mi];
+    // Column axis = the longest bbox extent; the two others are the section.
+    float d[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+    int ax = (d[1] > d[0]) ? 1 : 0; if (d[2] > d[ax]) ax = 2;
+    const float L = std::max(1.0f, d[ax]);
+    const float b = std::max(1.0f, d[(ax + 1) % 3]);
+    const float h = std::max(1.0f, d[(ax + 2) % 3]);
+    nlohmann::json params = {{"L_mm", L}, {"b_mm", b}, {"h_mm", h},
+                             {"E_mpa", m.E_mpa}, {"nu", m.nu},
+                             {"load_n", s.bucklingLoadN}, {"n_modes", s.nModes}};
+    advRunning_ = true;
+    s.summary = "Solving (CalculiX)\xe2\x80\xa6";
+    const std::string sid = s.id;
+    st.rpc.call("sim_run_buckling", params, [this, &st, sid](const core::RpcResult& r) {
+        advRunning_ = false;
+        for (auto& stu : studies_) {
+            if (stu.id != sid) continue;
+            if (!r.ok || !r.result.is_object()) {
+                stu.summary = "Buckling run failed: " + (r.err.empty() ? "worker error" : r.err);
+                st.addLog("[sim] " + stu.summary);
+                return;
+            }
+            stu.advResult = r.result;
+            if (!r.result.value("ok", false)) {
+                stu.summary = "Buckling: " + r.result.value("error",
+                    r.result.value("reason", std::string("solve failed")));
+                st.addLog("[sim] " + stu.summary);
+                return;
+            }
+            stu.hasResult = true;
+            double l0 = 0.0;
+            if (r.result.contains("load_factors") && r.result["load_factors"].is_array() &&
+                !r.result["load_factors"].empty())
+                l0 = r.result["load_factors"][0].get<double>();
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "lowest load factor %.3g (critical %.4g N)",
+                          l0, l0 * r.result.value("applied_load_n", 0.0));
+            stu.summary = buf;
+            node_ = SimNode::Results;
+            st.addLog("[sim] buckling done: " + stu.summary);
+            return;
+        }
+    }, 120000);
+}
+
+void SimManager::runContact(AppState& st, Study& s) {
+    float lo[3], hi[3];
+    if (!modelBbox(st, lo, hi)) {
+        st.toast(ui::ToastLevel::Warn, "No model geometry to size the contact proxy from");
+        return;
+    }
+    int mi = materialIndexByKey(s.materialKey);
+    if (mi < 0) { st.toast(ui::ToastLevel::Warn, "Pick a material first"); return; }
+    const auto& m = materials()[mi];
+    nlohmann::json params = {{"L_mm", std::max(1.0f, hi[0] - lo[0])},
+                             {"b_mm", std::max(1.0f, hi[1] - lo[1])},
+                             {"h_mm", std::max(1.0f, hi[2] - lo[2])},
+                             {"E_mpa", m.E_mpa}, {"nu", m.nu},
+                             {"pressure_mpa", s.contactPressureMpa}};
+    advRunning_ = true;
+    s.summary = "Solving (CalculiX)\xe2\x80\xa6";
+    const std::string sid = s.id;
+    st.rpc.call("sim_run_contact", params, [this, &st, sid](const core::RpcResult& r) {
+        advRunning_ = false;
+        for (auto& stu : studies_) {
+            if (stu.id != sid) continue;
+            if (!r.ok || !r.result.is_object()) {
+                stu.summary = "Contact run failed: " + (r.err.empty() ? "worker error" : r.err);
+                st.addLog("[sim] " + stu.summary);
+                return;
+            }
+            stu.advResult = r.result;
+            if (!r.result.value("ok", false)) {
+                stu.summary = "Contact: " + r.result.value("error",
+                    r.result.value("reason", std::string("solve failed")));
+                st.addLog("[sim] " + stu.summary);
+                return;
+            }
+            stu.hasResult = true;
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "applied %.4g N | base reaction %.4g N",
+                          r.result.value("applied_load_n", 0.0),
+                          r.result.value("base_reaction_n", 0.0));
+            stu.summary = buf;
+            node_ = SimNode::Results;
+            st.addLog("[sim] contact done: " + stu.summary);
+            return;
+        }
+    }, 120000);
+}
+
+// ---------------------------------------------------------------- frequency response
+
+void SimManager::runFreqResponse(AppState& st, Study& s) {
+    // Stage 1: the ordinary modal eigen solve on the SimClient (runStaticOrModal's non-
+    // static branch launches sim_run_modal). Stage 2 (the modal-superposition post) fires
+    // from tick's completion handler -> postFreqResponse.
+    runStaticOrModal(st, s);
+}
+
+void SimManager::postFreqResponse(AppState& st, Study& s, const nlohmann::json& modalRes) {
+    if (!modalRes.contains("mode_shapes") || !modalRes.contains("freqs_hz")) {
+        s.summary = "Vibration: modal solve returned no mode shapes";
+        st.addLog("[sim] " + s.summary);
+        return;
+    }
+    // Part mass from the solid volume at the material density (eval_mass, same source the
+    // MCP tool uses). Sync call but sub-second (pure B-rep volume integral).
+    double massKg = 0.0;
+    int mi = materialIndexByKey(s.materialKey);
+    const double dens = (mi >= 0) ? materials()[mi].density_g_cm3 : 0.0;
+    if (dens > 0 && st.docMirror.hasDoc()) {
+        nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"density_g_cm3", dens}};
+        std::string e;
+        if (st.worker.call("eval_mass", p, r, e, 15000) && !r.contains("code"))
+            massKg = r.value("mass_g", 0.0) / 1000.0;
+    }
+    if (massKg <= 0.0) {
+        s.summary = "Vibration: part mass unknown (set a material with density)";
+        st.addLog("[sim] " + s.summary);
+        return;
+    }
+    double dir[3] = {0, 0, 0};
+    dir[(s.frDir < 0 || s.frDir > 2) ? 2 : s.frDir] = 1.0;
+    nlohmann::json params = {
+        {"freqs_hz", modalRes["freqs_hz"]},
+        {"mode_shapes", modalRes["mode_shapes"]},
+        {"n_nodes", modalRes.value("n_nodes", 0)},
+        {"total_mass_kg", massKg},
+        {"excitation_dir", {dir[0], dir[1], dir[2]}},
+        {"zeta", s.frZeta},
+        {"base_accel_g", s.frBaseG},
+    };
+    advRunning_ = true;
+    s.summary = "Post-processing (modal superposition)\xe2\x80\xa6";
+    const std::string sid = s.id;
+    st.rpc.call("sim_freq_response", params, [this, &st, sid](const core::RpcResult& r) {
+        advRunning_ = false;
+        for (auto& stu : studies_) {
+            if (stu.id != sid) continue;
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                stu.summary = "Vibration post failed: " +
+                              (r.ok ? r.result.value("error", std::string("worker error"))
+                                    : r.err);
+                st.addLog("[sim] " + stu.summary);
+                return;
+            }
+            stu.advResult = r.result;
+            stu.frSweep.clear(); stu.frAccel.clear();
+            if (r.result.contains("harmonic") && r.result["harmonic"].is_object()) {
+                const auto& hm = r.result["harmonic"];
+                if (hm.contains("sweep_hz") && hm["sweep_hz"].is_array())
+                    for (const auto& v : hm["sweep_hz"])
+                        stu.frSweep.push_back((float)v.get<double>());
+                if (hm.contains("accel_g") && hm["accel_g"].is_array())
+                    for (const auto& v : hm["accel_g"])
+                        stu.frAccel.push_back((float)v.get<double>());
+                char buf[160];
+                std::snprintf(buf, sizeof(buf), "peak %.2f g @ %.1f Hz (zeta %.3g)",
+                              hm.value("peak_accel_g", 0.0), hm.value("peak_freq_hz", 0.0),
+                              r.result.value("damping_assumption", std::string()).empty()
+                                  ? 0.02 : 0.0);
+                std::snprintf(buf, sizeof(buf), "peak %.2f g @ %.1f Hz",
+                              hm.value("peak_accel_g", 0.0), hm.value("peak_freq_hz", 0.0));
+                stu.summary = buf;
+            }
+            stu.hasResult = true;
+            node_ = SimNode::Results;
+            st.addLog("[sim] frequency response done: " + stu.summary);
+            return;
+        }
+    }, 60000);
+}
+
+// ---------------------------------------------------------------- advanced results block
+
+void SimManager::drawAdvancedResults(AppState& st, Study& s) {
+    (void)st;
+    if (!s.hasResult) {
+        if (advRunning_ || running_) ImGui::TextDisabled("Solving\xe2\x80\xa6");
+        else ImGui::TextDisabled("Run the study to generate results.");
+        return;
+    }
+    ImGui::TextWrapped("%s", s.summary.c_str());
+    ImGui::Spacing();
+    const auto& res = s.advResult;
+    if (s.type == StudyType::Buckling && res.is_object()) {
+        ImGui::SeparatorText("Buckling load factors");
+        if (res.contains("load_factors") && res["load_factors"].is_array() &&
+            ImGui::BeginTable("##bucktab", 3, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Mode"); ImGui::TableSetupColumn("Factor");
+            ImGui::TableSetupColumn("Critical load (N)");
+            ImGui::TableHeadersRow();
+            const auto& fac = res["load_factors"];
+            const double P = res.value("applied_load_n", 0.0);
+            for (int i = 0; i < (int)fac.size(); ++i) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%d", i + 1);
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.4g", fac[i].get<double>());
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.4g", fac[i].get<double>() * P);
+            }
+            ImGui::EndTable();
+        }
+        pushDimText();
+        ImGui::TextWrapped("%s", res.value("note", std::string()).c_str());
+        popDimText();
+    } else if (s.type == StudyType::Contact && res.is_object()) {
+        ImGui::SeparatorText("Contact conservation check");
+        ImGui::Text("Applied load: %.4g N", res.value("applied_load_n", 0.0));
+        ImGui::Text("Base reaction: %.4g N", res.value("base_reaction_n", 0.0));
+        pushDimText();
+        ImGui::TextWrapped("%s", res.value("note", std::string()).c_str());
+        popDimText();
+    } else if (s.type == StudyType::FreqResponse && res.is_object()) {
+        ImGui::SeparatorText("Harmonic response");
+        if (!s.frSweep.empty() && s.frSweep.size() == s.frAccel.size())
+            drawEmLinePlot("##frplot", s.frSweep, &s.frAccel, "accel (g)", nullptr, nullptr,
+                           "f (Hz)", "response (g)");
+        if (!s.freqs.empty()) {
+            std::string f = "Modes (Hz):";
+            for (float v : s.freqs) { char b[24]; std::snprintf(b, sizeof(b), " %.1f", v); f += b; }
+            pushDimText(); ImGui::TextWrapped("%s", f.c_str()); popDimText();
+        }
+        pushDimText();
+        ImGui::TextWrapped("%s", res.value("damping_assumption", std::string()).c_str());
+        ImGui::TextWrapped("Random (PSD) response needs a qualification-spec PSD — run "
+                           "run_fea_frequency_response via the copilot with psd_breakpoints.");
+        popDimText();
+    } else if (s.type == StudyType::ThermalFea && res.is_object()) {
+        ImGui::SeparatorText(s.thermTransient ? "Transient conduction" : "Steady conduction");
+        const auto sm = res.value("summary", nlohmann::json::object());
+        ImGui::Text("Max temp: %.1f degC", sm.value("max_temp_c", 0.0));
+        if (sm.contains("final_max_temp_c"))
+            ImGui::Text("Final max: %.1f degC", sm.value("final_max_temp_c", 0.0));
+        ImGui::Text("Min temp: %.1f degC", sm.value("min_temp_c", 0.0));
+        if (res.contains("n_steps"))
+            ImGui::Text("Time steps: %d", res.value("n_steps", 0));
+        ImGui::Text("Nodes %d | elements %d", s.nNodes, s.nElems);
+        pushDimText();
+        ImGui::TextWrapped("The temperature field colormap overlay is not packaged by the "
+                           "conduction solver yet — numeric summary + flux audit only.");
+        popDimText();
+    }
+    for (const auto& n : s.solverNotes) { pushDimText(); ImGui::TextWrapped("%s", n.c_str()); popDimText(); }
+    drawProvenance(res);
+}
+
+// ---------------------------------------------------------------- electronics (SPICE) panel
+
+void SimManager::openElectronicsPanel(AppState& st) {
+    elPanelOpen_ = true;
+    // Default to the first open Schematic tab.
+    el_.docTab = -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].kind == AppState::DocTab::TabKind::Schematic &&
+            !st.docTabs[i].ecadDocId.empty()) { el_.docTab = i; break; }
+    st.leftPaneTab = AppState::LP_Simulation;
+}
+
+void SimManager::selectElTrace(int idx) {
+    el_.probeIdx = idx;
+    el_.xs.clear(); el_.ys.clear();
+    if (idx < 0 || idx >= (int)el_.probes.size()) return;
+    const std::string& pr = el_.probes[idx];
+    const auto results = el_.raw.value("results", nlohmann::json::object());
+    if (results.contains("tran") && results["tran"].is_object()) {
+        const auto& tr = results["tran"];
+        if (tr.contains("x_t") && tr["x_t"].is_array() && tr.contains("traces") &&
+            tr["traces"].contains(pr)) {
+            for (const auto& v : tr["x_t"]) el_.xs.push_back((float)(v.get<double>() * 1e3));
+            for (const auto& v : tr["traces"][pr]) el_.ys.push_back((float)v.get<double>());
+        }
+    } else if (results.contains("ac") && results["ac"].is_object()) {
+        const auto& ac = results["ac"];
+        if (ac.contains("x_f") && ac["x_f"].is_array() && ac.contains("mag") &&
+            ac["mag"].contains(pr)) {
+            for (const auto& v : ac["x_f"]) el_.xs.push_back((float)v.get<double>());
+            for (const auto& v : ac["mag"][pr]) {
+                double m = v.is_number() ? v.get<double>() : 0.0;
+                el_.ys.push_back((float)(20.0 * std::log10(std::max(m, 1e-12))));
+            }
+        }
+    }
+}
+
+void SimManager::runElectronics(AppState& st) {
+    if (el_.docTab < 0 || el_.docTab >= (int)st.docTabs.size()) return;
+    const std::string docId = st.docTabs[el_.docTab].ecadDocId;
+    if (docId.empty()) return;
+    nlohmann::json analyses = nlohmann::json::array();
+    if (el_.analysis == 0) analyses.push_back({{"type", "op"}});
+    else if (el_.analysis == 2)
+        analyses.push_back({{"type", "ac"}, {"fstart", el_.acStartHz}, {"fstop", el_.acStopHz},
+                            {"n", el_.acPoints}});
+    else
+        analyses.push_back({{"type", "tran"}, {"tstep", el_.tranStepUs * 1e-6},
+                            {"tstop", el_.tranStopMs * 1e-3}});
+    elRunning_ = true;
+    el_.result = -1; el_.error.clear(); el_.headline.clear();
+    st.rpc.call("ecad_simulate",
+                {{"doc_id", docId}, {"study", {{"analyses", analyses}}}},
+                [this](const core::RpcResult& r) {
+                    elRunning_ = false;
+                    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                        el_.result = 0;
+                        el_.error = r.ok ? r.result.value("message",
+                                                          std::string("simulation failed"))
+                                         : r.err;
+                        return;
+                    }
+                    if (!r.result.value("ok", true)) {
+                        el_.result = 0;
+                        el_.error = r.result.value("error", std::string("simulation failed"));
+                        return;
+                    }
+                    el_.raw = r.result;
+                    el_.result = 1;
+                    el_.headline = r.result.value("converged", false)
+                                       ? "Converged" : "Completed (convergence warnings)";
+                    // Collect the probe names from the analysis payload.
+                    el_.probes.clear();
+                    const auto results = r.result.value("results", nlohmann::json::object());
+                    const char* keys[2] = {"tran", "ac"};
+                    for (const char* k : keys) {
+                        if (!results.contains(k) || !results[k].is_object()) continue;
+                        const auto& blk = results[k];
+                        const char* tk = (std::string(k) == "tran") ? "traces" : "mag";
+                        if (blk.contains(tk) && blk[tk].is_object())
+                            for (auto it = blk[tk].begin(); it != blk[tk].end(); ++it)
+                                el_.probes.push_back(it.key());
+                    }
+                    selectElTrace(el_.probes.empty() ? -1 : 0);
+                },
+                60000);
+}
+
+void SimManager::drawElectronicsPanel(AppState& st) {
+    const float S = ui::uiScale;
+    IconUV iv = getIcon("cat_electronics", 20);
+    if (iv.valid) { ImGui::Image(iv.texId, ImVec2(16.0f * S, 16.0f * S), iv.uv0, iv.uv1);
+                    ImGui::SameLine(0, 6.0f * S); }
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Electronics \xe2\x80\x94 circuit simulation");
+    ImGui::PopFont();
+    const float btnW = 40.0f * S;
+    const float rightX = ImGui::GetWindowContentRegionMax().x - btnW;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX); else ImGui::SameLine();
+    if (ImGui::Button("OK", ImVec2(btnW, 0))) { elPanelOpen_ = false; return; }
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Schematic selector (SPICE runs on the schematic netlist).
+    std::vector<int> schTabs;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].kind == AppState::DocTab::TabKind::Schematic &&
+            !st.docTabs[i].ecadDocId.empty())
+            schTabs.push_back(i);
+    if (schTabs.empty()) {
+        pushDimText();
+        ImGui::TextWrapped("No schematic open. SPICE simulation runs on a Schematic document's "
+                           "netlist \xe2\x80\x94 open the board's schematic tab (a PCB alone has "
+                           "no simulatable devices).");
+        popDimText();
+        return;
+    }
+    if (el_.docTab < 0 ||
+        std::find(schTabs.begin(), schTabs.end(), el_.docTab) == schTabs.end())
+        el_.docTab = schTabs[0];
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##elsch", st.docTabs[el_.docTab].displayTitle().c_str())) {
+        for (int i : schTabs)
+            if (ImGui::Selectable(st.docTabs[i].displayTitle().c_str(), el_.docTab == i))
+                el_.docTab = i;
+        ImGui::EndCombo();
+    }
+    simTip("Which open schematic to simulate.");
+
+    static const char* kAn[3] = {"Operating point (DC)", "AC sweep", "Transient"};
+    int ai = (el_.analysis == 0) ? 0 : (el_.analysis == 2) ? 1 : 2;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##elan", kAn[ai])) {
+        if (ImGui::Selectable(kAn[0], ai == 0)) el_.analysis = 0;
+        if (ImGui::Selectable(kAn[1], ai == 1)) el_.analysis = 2;
+        if (ImGui::Selectable(kAn[2], ai == 2)) el_.analysis = 3;
+        ImGui::EndCombo();
+    }
+    if (el_.analysis == 3) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##eltstop", &el_.tranStopMs, 0, 0, "t_stop = %.2f ms");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##eltstep", &el_.tranStepUs, 0, 0, "t_step = %.1f us");
+    } else if (el_.analysis == 2) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##elfstart", &el_.acStartHz, 0, 0, "f_start = %.0f Hz");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##elfstop", &el_.acStopHz, 0, 0, "f_stop = %.0f Hz");
+    }
+
+    ImGui::Spacing();
+    if (elRunning_) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Running\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) {
+        runElectronics(st);
+    }
+    simTip("Build the SPICE netlist from the schematic and solve (async). Probes default to "
+           "every node voltage + source current.");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (el_.result == 0) {
+        ImGui::TextWrapped("Failed: %s", el_.error.c_str());
+    } else if (el_.result == 1) {
+        ImGui::TextUnformatted(el_.headline.c_str());
+        const auto results = el_.raw.value("results", nlohmann::json::object());
+        if (el_.analysis == 0 && results.contains("op") && results["op"].is_object()) {
+            ImGui::SeparatorText("Operating point");
+            for (auto it = results["op"].begin(); it != results["op"].end(); ++it)
+                if (it.value().is_number())
+                    ImGui::Text("%s = %.6g", it.key().c_str(), it.value().get<double>());
+        } else if (!el_.probes.empty()) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##elprobe",
+                                  el_.probeIdx >= 0 && el_.probeIdx < (int)el_.probes.size()
+                                      ? el_.probes[el_.probeIdx].c_str() : "(probe)")) {
+                for (int i = 0; i < (int)el_.probes.size(); ++i)
+                    if (ImGui::Selectable(el_.probes[i].c_str(), el_.probeIdx == i))
+                        selectElTrace(i);
+                ImGui::EndCombo();
+            }
+            if (!el_.xs.empty() && el_.xs.size() == el_.ys.size())
+                drawEmLinePlot("##elplot", el_.xs, &el_.ys,
+                               el_.analysis == 2 ? "mag (dB)" : "V / I", nullptr, nullptr,
+                               el_.analysis == 2 ? "f (Hz)" : "t (ms)",
+                               el_.analysis == 2 ? "dB" : "value");
+        }
+    } else {
+        ImGui::TextDisabled("Run to simulate the schematic.");
+    }
+}
+
+// ---------------------------------------------------------------- firmware emulation panel
+
+void SimManager::openEmulationPanel(AppState& st) {
+    fwPanelOpen_ = true;
+    probeFwStatus(st);
+    st.leftPaneTab = AppState::LP_Simulation;
+}
+
+void SimManager::runEmulation(AppState& st) {
+    if (fwsim_.projIdx < 0 || fwsim_.projIdx >= (int)fwsim_.projectIds.size()) return;
+    nlohmann::json p{{"project_id", fwsim_.projectIds[fwsim_.projIdx]}};
+    nlohmann::json asserts = nlohmann::json::array();
+    std::string buf(fwsim_.asserts);
+    size_t start = 0;
+    while (start <= buf.size()) {
+        size_t end = buf.find(';', start);
+        std::string tok = buf.substr(start,
+                                     end == std::string::npos ? std::string::npos : end - start);
+        const size_t a = tok.find_first_not_of(" \t");
+        const size_t b = tok.find_last_not_of(" \t");
+        if (a != std::string::npos) asserts.push_back(tok.substr(a, b - a + 1));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (!asserts.empty()) p["assertions"] = asserts;
+    fwRunning_ = true;
+    fwsim_.result = -1; fwsim_.error.clear(); fwsim_.headline.clear(); fwsim_.uart.clear();
+    st.rpc.call("fw_sim_run", p, [this](const core::RpcResult& r) {
+        fwRunning_ = false;
+        if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+            fwsim_.result = 0;
+            fwsim_.error = r.ok ? r.result.value("message", std::string("emulation failed"))
+                                : r.err;
+            return;
+        }
+        fwsim_.result = r.result.value("passed", false) ? 1 : 0;
+        char buf2[96];
+        std::snprintf(buf2, sizeof(buf2), "%s  (%.0f ms emulated)",
+                      r.result.value("passed", false) ? "PASSED" : "NOT PASSED",
+                      r.result.value("ms", 0.0));
+        fwsim_.headline = buf2;
+        if (r.result.contains("assertion_results") && r.result["assertion_results"].is_array())
+            for (const auto& a : r.result["assertion_results"]) {
+                if (!a.is_object()) continue;
+                std::string line = a.value("passed", false) ? "PASS  " : "FAIL  ";
+                line += a.value("assertion", std::string());
+                fwsim_.uart.push_back(std::move(line));
+            }
+        const std::string uart = r.result.value("uart_log", std::string());
+        if (!uart.empty()) {
+            std::istringstream is(uart);
+            std::string ln;
+            while (std::getline(is, ln)) fwsim_.uart.push_back(ln);
+        }
+    }, 120000);
+}
+
+void SimManager::drawEmulationPanel(AppState& st) {
+    const float S = ui::uiScale;
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Firmware \xe2\x80\x94 emulation");
+    ImGui::PopFont();
+    const float btnW = 40.0f * S;
+    const float rightX = ImGui::GetWindowContentRegionMax().x - btnW;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX); else ImGui::SameLine();
+    if (ImGui::Button("OK", ImVec2(btnW, 0))) { fwPanelOpen_ = false; return; }
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (fwStatus_ == 0) { ImGui::TextDisabled("Checking fw_status\xe2\x80\xa6"); return; }
+    if (fwStatus_ < 0 || !fwCanEmulate_) {
+        // Honest doctor state: the run leg is missing — show the guidance, no dead buttons.
+        pushDimText();
+        ImGui::TextWrapped("%s", fwHint_.empty()
+            ? "Emulation backend unavailable \xe2\x80\x94 install Renode (preferred) or "
+              "qemu-system-arm, then Recheck."
+            : fwHint_.c_str());
+        popDimText();
+        if (ImGui::SmallButton("Recheck")) { fwStatus_ = 0; probeFwStatus(st); }
+        return;
+    }
+    if (!fwsim_.projectsLoaded) { ImGui::TextDisabled("Loading projects\xe2\x80\xa6"); return; }
+    if (fwsim_.projectIds.empty()) {
+        pushDimText();
+        ImGui::TextWrapped("No firmware projects yet \xe2\x80\x94 create one in the Firmware "
+                           "workspace (its New Project rail), then come back.");
+        popDimText();
+        return;
+    }
+    if (fwsim_.projIdx >= (int)fwsim_.projectIds.size()) fwsim_.projIdx = 0;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##fwproj", fwsim_.projectNames[fwsim_.projIdx].c_str())) {
+        for (int i = 0; i < (int)fwsim_.projectIds.size(); ++i)
+            if (ImGui::Selectable(fwsim_.projectNames[i].c_str(), fwsim_.projIdx == i))
+                fwsim_.projIdx = i;
+        ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##fwasserts",
+                             "assertions, ';'-separated  e.g. uart:hello; gpio:PA5=1",
+                             fwsim_.asserts, sizeof(fwsim_.asserts));
+    simTip("Scenario assertions checked against the emulated run (UART text, GPIO levels).");
+    ImGui::Spacing();
+    if (fwRunning_) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Running\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("Run emulation", ImVec2(-FLT_MIN, 0))) {
+        runEmulation(st);
+    }
+    simTip("Build (if needed) and run the firmware in Renode/QEMU with the scenario "
+           "assertions (async).");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (fwsim_.result == 1) ImGui::TextUnformatted(fwsim_.headline.c_str());
+    else if (fwsim_.result == 0 && !fwsim_.headline.empty())
+        ImGui::TextUnformatted(fwsim_.headline.c_str());
+    if (!fwsim_.error.empty()) ImGui::TextWrapped("Failed: %s", fwsim_.error.c_str());
+    if (!fwsim_.uart.empty()) {
+        ImGui::SeparatorText("Output");
+        ImGui::BeginChild("##fwuart", ImVec2(0, 160.0f * S), ImGuiChildFlags_Border);
+        for (const auto& l : fwsim_.uart) ImGui::TextUnformatted(l.c_str());
+        ImGui::EndChild();
+    }
+    if (fwsim_.result < 0 && fwsim_.error.empty() && !fwRunning_)
+        ImGui::TextDisabled("Run to emulate the selected project.");
+}
+
+// ---------------------------------------------------------------- cross-sim handoff panel
+
+void SimManager::openHandoffPanel(AppState& st, int pcbTab) {
+    handoffPanelOpen_ = true;
+    ho_.docTab = pcbTab;
+    probeCaps(st);
+    st.leftPaneTab = AppState::LP_Simulation;
+}
+
+void SimManager::runEcadThermalHandoff(AppState& st) {
+    if (ho_.docTab < 0 || ho_.docTab >= (int)st.docTabs.size()) return;
+    const std::string ecadId = st.docTabs[ho_.docTab].ecadDocId;
+    if (ecadId.empty()) return;
+    // Fetch the full board document (ecad_tree carries the doc verbatim) — sync but light
+    // (the board JSON is already resident in the worker's session).
+    nlohmann::json tree, boardDoc;
+    std::string e;
+    if (!st.worker.call("ecad_tree", {{"doc_id", ecadId}}, tree, e, 15000) ||
+        tree.contains("code")) {
+        ho_.error = "ecad_tree failed: " + (tree.contains("code")
+                        ? tree.value("message", e) : e);
+        return;
+    }
+    boardDoc = tree.value("tree", nlohmann::json::object());
+    static const char* kEnvs[3] = {"still_air", "forced_air", "cold_plate"};
+    nlohmann::json params = {
+        {"board", boardDoc},
+        {"doc_id", ecadId},
+        {"environment", kEnvs[(ho_.envIdx < 0 || ho_.envIdx > 2) ? 0 : ho_.envIdx]},
+        {"include_trace_heating", ho_.traceHeating},
+    };
+    ho_.running = true;
+    ho_.error.clear();
+    st.rpc.call("ecad_thermal_handoff", params, [this, &st](const core::RpcResult& r) {
+        ho_.running = false;
+        if (!r.ok || !r.result.is_object()) {
+            ho_.error = r.err.empty() ? "worker error" : r.err;
+            return;
+        }
+        ho_.result = r.result;
+        if (!r.result.value("ok", false))
+            ho_.error = r.result.value("error", std::string("handoff failed"));
+        st.addLog("[sim] ecad_thermal_handoff: " +
+                  r.result.value("hint", r.result.value("error", std::string("done"))));
+    }, 300000);
+}
+
+void SimManager::runHeatsinkSelect(AppState& st) {
+    ho_.heatsinkRunning = true;
+    st.rpc.call("heatsink_select", nlohmann::json::object(),
+                [this](const core::RpcResult& r) {
+                    ho_.heatsinkRunning = false;
+                    ho_.heatsink = r.ok ? r.result : nlohmann::json{{"ok", false},
+                                                                    {"error", r.err}};
+                },
+                300000);
+}
+
+void SimManager::drawHandoffPanel(AppState& st) {
+    const float S = ui::uiScale;
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Board \xe2\x86\x92 thermal FEA handoff");
+    ImGui::PopFont();
+    const float btnW = 40.0f * S;
+    const float rightX = ImGui::GetWindowContentRegionMax().x - btnW;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX); else ImGui::SameLine();
+    if (ImGui::Button("OK", ImVec2(btnW, 0))) { handoffPanelOpen_ = false; return; }
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ho_.docTab >= 0 && ho_.docTab < (int)st.docTabs.size())
+        ImGui::Text("Board: %s", st.docTabs[ho_.docTab].displayTitle().c_str());
+    static const char* kEnvLabels[3] = {"Still air (h=10)", "Forced air (h=50)",
+                                        "Cold plate (bottom held)"};
+    int ei = (ho_.envIdx < 0 || ho_.envIdx > 2) ? 0 : ho_.envIdx;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##hoenv", kEnvLabels[ei])) {
+        for (int i = 0; i < 3; ++i)
+            if (ImGui::Selectable(kEnvLabels[i], ei == i)) ho_.envIdx = i;
+        ImGui::EndCombo();
+    }
+    simTip("Convection environment preset applied to the board/component surfaces.");
+    ImGui::Checkbox("Include copper I2R trace heating", &ho_.traceHeating);
+    simTip("Adds the PDN I2R map as distributed flux cells (needs a prior ecad_run_pdn).");
+
+    ImGui::Spacing();
+    const bool seamUp = capsStatus_ == 1 && caps_.contains("handoffs") &&
+                        caps_["handoffs"]["ecad_thermal"].value("available", false);
+    if (capsStatus_ == 0) {
+        ImGui::TextDisabled("Checking the handoff seam\xe2\x80\xa6");
+    } else if (!seamUp) {
+        pushDimText();
+        ImGui::TextWrapped("ECAD \xe2\x86\x92 thermal handoff unavailable: %s",
+                           capsStatus_ == 1
+                               ? caps_["handoffs"]["ecad_thermal"]
+                                     .value("hint", std::string("worker seam missing")).c_str()
+                               : "worker unreachable (sim_caps probe failed)");
+        popDimText();
+    } else if (ho_.running) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Solving\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("Send board to thermal FEA", ImVec2(-FLT_MIN, 0))) {
+        runEcadThermalHandoff(st);
+    }
+
+    // T-FIN17 forward seam: the button exists behind an endpoint-availability check and
+    // lights up the moment the heatsink selection loop lands in the worker.
+    const bool hsUp = capsStatus_ == 1 && caps_.contains("handoffs") &&
+                      caps_["handoffs"]["heatsink_select"].value("available", false);
+    if (!hsUp) ImGui::BeginDisabled();
+    if (ImGui::Button(ho_.heatsinkRunning ? "Picking\xe2\x80\xa6" : "Pick heatsink",
+                      ImVec2(-FLT_MIN, 0)) && hsUp && !ho_.heatsinkRunning)
+        runHeatsinkSelect(st);
+    if (!hsUp) ImGui::EndDisabled();
+    if (!hsUp && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", capsStatus_ == 1
+            ? caps_["handoffs"]["heatsink_select"]
+                  .value("hint", std::string("heatsink selection (T-FIN17) not installed yet"))
+                  .c_str()
+            : "heatsink selection (T-FIN17) not installed yet");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (!ho_.error.empty()) ImGui::TextWrapped("Failed: %s", ho_.error.c_str());
+    if (ho_.result.is_object() && ho_.result.value("ok", false)) {
+        if (ho_.result.value("solved", false)) {
+            ImGui::SeparatorText("Component temperatures");
+            ImGui::Text("Board max: %.1f degC",
+                        ho_.result.value("board_max_temp_c", 0.0));
+            if (ho_.result.contains("components") && ho_.result["components"].is_array() &&
+                ImGui::BeginTable("##hocomp", 3, ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Ref"); ImGui::TableSetupColumn("Tcase (C)");
+                ImGui::TableSetupColumn("Tj (C)");
+                ImGui::TableHeadersRow();
+                for (const auto& c : ho_.result["components"]) {
+                    if (!c.is_object()) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(c.value("ref", std::string("?")).c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    if (c.contains("t_case_c") && c["t_case_c"].is_number())
+                        ImGui::Text("%.1f", c["t_case_c"].get<double>());
+                    else ImGui::TextDisabled("-");
+                    ImGui::TableSetColumnIndex(2);
+                    if (c.contains("tj_c") && c["tj_c"].is_number())
+                        ImGui::Text("%.1f", c["tj_c"].get<double>());
+                    else ImGui::TextDisabled("-");
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextWrapped("%s", ho_.result.value("hint",
+                ho_.result.value("error_solve", std::string("not solved"))).c_str());
+        }
+        if (ho_.result.contains("warnings") && ho_.result["warnings"].is_array()) {
+            for (const auto& w : ho_.result["warnings"])
+                if (w.is_string()) {
+                    pushDimText();
+                    ImGui::TextWrapped("%s", w.get<std::string>().c_str());
+                    popDimText();
+                }
+        }
+        drawProvenance(ho_.result);
+    }
+    if (ho_.heatsink.is_object() && !ho_.heatsink.empty()) {
+        ImGui::SeparatorText("Heatsink pick");
+        if (ho_.heatsink.value("ok", false))
+            ImGui::TextWrapped("%s", ho_.heatsink.value("hint",
+                ho_.heatsink.dump(2)).c_str());
+        else
+            ImGui::TextWrapped("%s", ho_.heatsink.value("error",
+                std::string("heatsink selection failed")).c_str());
+        drawProvenance(ho_.heatsink);
     }
 }
 

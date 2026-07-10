@@ -764,6 +764,62 @@ void ScenarioRunner::tick(AppState& st) {
         (void)sim;
     }
 
+    // ---------- T-FIN24 disclosure-matrix scenario (AI_CAD_SHOT=simdisc_mech|simdisc_ecad) ----------
+    // Proves the Simulate tab's progressive disclosure: mech-only -> no electronics study
+    // kinds in the "+ New Study" picker; with a PCB tab open -> electronics simulation +
+    // firmware emulation rows appear. The picker is held open for the capture via the
+    // SimManager's scripted-shot hook.
+    if (st.wantSimDisc && st.workerStarted && !st.simDiscShotDone) {
+        if (st.simManager) st.simManager->tick(st);
+        if (sdSettle > 0) { --sdSettle; }
+        else switch (sdStep) {
+            case 0: {  // (ecad variant) open a PCB tab first so the disclosure scan sees it
+                if (st.simDiscKind == 1) {
+                    nlohmann::json res; std::string err;
+                    if (st.worker.call("ecad_new", {{"kind", "pcb"}}, res, err, 20000) &&
+                        !res.contains("code")) {
+                        st.addEcadTab("pcb", res.value("doc_id", std::string()),
+                                      res.value("revision", 0), "PCB1");
+                        std::printf("simdisc: PCB tab opened (%s)\n",
+                                    res.value("doc_id", std::string()).c_str());
+                    } else {
+                        std::printf("simdisc: ecad_new failed: %s\n", err.c_str());
+                    }
+                    std::fflush(stdout);
+                }
+                sdSettle = 3; ++sdStep; break;
+            }
+            case 1: {  // new part + box so the mechanical kinds are unlocked
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},{"params",{
+                        {"length",{{"value",60.0},{"expr",nullptr}}},
+                        {"width", {{"value",40.0},{"expr",nullptr}}},
+                        {"height",{{"value",10.0},{"expr",nullptr}}}},
+                    },{"centered",true}}}});
+                auto r = st.docMirror.applyOps(st.worker, ops);
+                if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                std::printf("simdisc: part+box ok=%d\n", (int)r.ok);
+                std::fflush(stdout);
+                sdSettle = 6; ++sdStep; break;
+            }
+            case 2: {  // Simulate workspace + hold the study picker open for the capture
+                st.activeWorkspace = AppState::Workspace::Simulate;
+                st.leftPaneTab = AppState::LP_Simulation;
+                if (st.simManager) st.simManager->shotForcePicker = true;
+                sdSettle = 12; ++sdStep; break;
+            }
+            default:
+                st.simDiscShotDone = true;
+                std::printf("simdisc: scenario complete (kind=%s)\n",
+                            st.simDiscKind == 1 ? "ecad" : "mech");
+                std::fflush(stdout);
+                break;
+        }
+    }
+
     // ---------- CAM copilot fast-path scenario (AI_CAD_SHOT=cam) ----------
     // new part -> box 80x60x15 + 4 corner through-holes -> run the copilot CAM fast-path
     // (agent_run options.cam) -> adopt the built job into the Manufacture panel (exactly as the

@@ -27,7 +27,12 @@ namespace core { class SimClient; }
 
 namespace ui {
 
-enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion };
+// T-FIN24: one Simulate workspace hosts EVERY study kind. Flow/Thermal are the OpenFOAM/LBM
+// CFD family; ThermalFea is the core conduction solver (sim_run_thermal, steady + T-FIN18
+// transient); Buckling/Contact are CalculiX box proxies via the worker's multiphysics seam;
+// FreqResponse is modal superposition (core modal + worker vibration post-processing).
+enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion,
+                       ThermalFea, Buckling, Contact, FreqResponse };
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };
@@ -54,6 +59,11 @@ struct SimLoad {
     bool pressure = false;          // false = force vector, true = pressure
     float vec[3] = {0, 0, -100};    // N (force)
     float pressureMpa = 0.1f;       // MPa (pressure)
+    // ThermalFea loads only (structural studies ignore these): heat flux or convection.
+    int   thermalKind = 0;          // 0 = heat flux (W/m^2), 1 = convection (h, t_amb)
+    float fluxWm2 = 1000.0f;        // W/m^2 (thermalKind 0)
+    float hWm2k = 10.0f;            // film coefficient W/(m^2 K) (thermalKind 1)
+    float tAmbC = 25.0f;            // ambient temperature C (thermalKind 1)
 };
 
 // A study definition + its last (transient, not-persisted) result.
@@ -87,6 +97,30 @@ struct Study {
 
     // Static: which failure theory drives the headline FoS + the FoS plot field.
     FailureCriterion criterion = FailureCriterion::VonMises;
+
+    // ---- T-FIN24 study kinds -----------------------------------------------------------
+    // Buckling (CalculiX box-proxy Euler column): compressive load magnitude λ scales.
+    float bucklingLoadN = 1000.0f;
+    // Contact (CalculiX two-block proxy): pressure on the upper block.
+    float contactPressureMpa = 1.0f;
+    // Frequency response (modal superposition over the core modal solve).
+    int   frDir = 2;                // base-excitation axis: 0..2 = X, Y, Z
+    float frZeta = 0.02f;           // modal damping ratio (assumption, echoed back)
+    float frBaseG = 1.0f;           // harmonic base input amplitude (g)
+    // Thermal FEA (core conduction solver): fixture faces = fixed temperature; loads =
+    // flux/convection; transient per T-FIN18 (backward Euler).
+    float thermK = 200.0f;          // conductivity W/(m K) (default ~aluminium)
+    float thermCp = 900.0f;         // specific heat J/(kg K) — transient only
+    float thermFixTempC = 20.0f;    // Dirichlet temperature on the fixture faces (C)
+    bool  thermTransient = false;
+    float thermTEndS = 60.0f;       // transient horizon (s)
+    float thermDtS = 0.0f;          // step (s); 0 = solver default
+    float thermTInitC = 20.0f;      // initial temperature (C)
+    // Transient result payloads for the T-FIN24 kinds (never persisted). advResult holds
+    // the raw worker/solver JSON (incl. any aicad.simhandoff/1 provenance under
+    // "simhandoff"); frSweep/frAccel are the harmonic response plot arrays.
+    nlohmann::json advResult;
+    std::vector<float> frSweep, frAccel;
 
     // Fatigue (StudyType::Fatigue). The engine evaluates ALL mean-stress theories; fatigueMethod only
     // chooses which one colors the model + headlines. Loading is defined by load factors (the cyclic
@@ -265,6 +299,10 @@ public:
     // ---- scripted-shot helpers (AI_CAD_SHOT=fea), preserved from the old SimPanel ----
     void configureActive(AppState& st, float density, const std::string& materialKey);
 
+    // Scripted-shot helper (AI_CAD_SHOT=simdisclosure*): hold the "+ New Study" picker open
+    // so the headless disclosure-matrix shots capture the offered study kinds.
+    bool shotForcePicker = false;
+
     // ---- scripted-shot helpers (AI_CAD_SHOT=motion) ----
     // True when the selected study is a Motion type with a successful result.
     bool motionHasResult() const;
@@ -440,6 +478,98 @@ private:
                         const std::vector<float>* y1, const char* l1,
                         const std::vector<float>* y2, const char* l2,
                         const char* xlabel, const char* ylabel);
+
+    // ---- T-FIN24: multiphysics capability doctor + panels ----------------------------------
+    // sim_caps probe (worker multiphysics seam): CalculiX presence (buckling/contact), the
+    // vibration post leg, and which cross-sim handoff endpoints are servable. Probed once
+    // asynchronously when the Simulate workspace activates; drives honest gating (fw_status
+    // pattern: absent legs show doctor guidance, never dead buttons).
+    int  capsStatus_ = 0;             // 0 = not probed, 1 = loaded, -1 = probe failed
+    bool capsInflight_ = false;
+    nlohmann::json caps_;             // cached sim_caps payload
+    void probeCaps(AppState& st);
+    // fw_status probe for the Emulation study kind (canEmulate + guidance banner).
+    int  fwStatus_ = 0;               // 0 = not probed, 1 = loaded, -1 = failed
+    bool fwProbeInflight_ = false;
+    bool fwCanEmulate_ = false;
+    std::string fwHint_;
+    void probeFwStatus(AppState& st);
+
+    // Electronics (SPICE) panel — stateless like EM (the ecad_simulate backend runs against
+    // the open Schematic doc, not a part study). Analyses: op / dc / ac / tran.
+    struct ElState {
+        int  docTab = -1;             // docTabs index of the schematic to simulate
+        int  analysis = 3;            // 0 op, 1 dc, 2 ac, 3 tran
+        float tranStopMs = 5.0f, tranStepUs = 50.0f;
+        float acStartHz = 10.0f, acStopHz = 1e6f; int acPoints = 61;
+        // Result (transient). ok<0 unrun, 0 error, 1 ok.
+        int  result = -1;
+        std::string error, headline;
+        std::vector<std::string> probes;   // trace names available in the last result
+        int  probeIdx = 0;
+        std::vector<float> xs, ys;         // active trace (tran: t/V, ac: f/dB)
+        nlohmann::json raw;                // full ecad_simulate payload
+    };
+    ElState el_;
+    bool elPanelOpen_ = false;
+    bool elRunning_ = false;
+    void openElectronicsPanel(AppState& st);
+    void drawElectronicsPanel(AppState& st);
+    void runElectronics(AppState& st);
+    void selectElTrace(int idx);          // rebuild xs/ys from raw for probes[idx]
+
+    // Firmware emulation panel — runs fw_sim_run against an on-disk firmware project
+    // (fw_projects), honestly gated on fw_status.can_emulate.
+    struct FwSimState {
+        bool projectsLoaded = false, projectsPending = false;
+        std::vector<std::string> projectIds, projectNames;
+        int  projIdx = 0;
+        char asserts[256] = "";
+        float durationMs = 200.0f;
+        int  result = -1;             // <0 unrun, 0 error, 1 ok
+        std::string error, headline;
+        std::vector<std::string> uart; // UART console tail from the run
+    };
+    FwSimState fwsim_;
+    bool fwPanelOpen_ = false;
+    bool fwRunning_ = false;
+    void openEmulationPanel(AppState& st);
+    void drawEmulationPanel(AppState& st);
+    void runEmulation(AppState& st);
+
+    // Cross-sim handoff panel (aicad.simhandoff/1 seam): ECAD board -> thermal FEA
+    // (ecad_thermal_handoff worker mirror) + the T-FIN17 heatsink pick forward seam.
+    struct HandoffState {
+        int  docTab = -1;             // docTabs index of the PCB tab
+        int  envIdx = 0;              // 0 still_air, 1 forced_air, 2 cold_plate
+        bool traceHeating = false;
+        bool running = false;
+        std::string error;
+        nlohmann::json result;        // last ecad_thermal_handoff payload
+        nlohmann::json heatsink;      // last heatsink_select payload (T-FIN17)
+        bool heatsinkRunning = false;
+    };
+    HandoffState ho_;
+    bool handoffPanelOpen_ = false;
+    void openHandoffPanel(AppState& st, int pcbTab);
+    void drawHandoffPanel(AppState& st);
+    void runEcadThermalHandoff(AppState& st);
+    void runHeatsinkSelect(AppState& st);
+
+    // T-FIN24 runs.
+    void runThermalFea(AppState& st, Study& s);       // SimClient sim_run_thermal
+    void runBuckling(AppState& st, Study& s);         // worker sim_run_buckling (async rpc)
+    void runContact(AppState& st, Study& s);          // worker sim_run_contact (async rpc)
+    void runFreqResponse(AppState& st, Study& s);     // modal solve, post in tick completion
+    void postFreqResponse(AppState& st, Study& s, const nlohmann::json& modalRes);
+    bool advRunning_ = false;                          // an async worker study run in flight
+    // Model bbox from the face-centroid cache (proxy dims for buckling/contact).
+    bool modelBbox(AppState& st, float lo[3], float hi[3]) const;
+    // Draw the results block for the T-FIN24 kinds (tables + line plots, no overlay).
+    void drawAdvancedResults(AppState& st, Study& s);
+    // One "Provenance: <coupling> — <domain>/<tool>" line when a result carries a
+    // simhandoff envelope (study provenance display, T-FIN24).
+    static void drawProvenance(const nlohmann::json& result);
 
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
     int armedWell_ = -1;

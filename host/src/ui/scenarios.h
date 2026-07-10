@@ -95,6 +95,9 @@ private:
     // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
     int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
 
+    // ---------- T-FIN24 disclosure-matrix scenario (AI_CAD_SHOT=simdisc_mech|simdisc_ecad) ----------
+    int sdStep = 0, sdSettle = 0;
+
     // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
     int flowStep = 0, flowSettle = 0, flowWaitFrames = 0;
 

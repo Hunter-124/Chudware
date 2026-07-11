@@ -138,6 +138,27 @@ def test_classifier_still_flags_cf_challenge_platform_with_interstitial():
     assert challenge.classify_challenge(html, "https://www.thomsonlinear.com/") == "captcha"
 
 
+def test_classifier_ignores_shopify_storefront_forms_captcha_tokens():
+    # Shopify's storefront-forms captcha library templates the token FIELD names
+    # `g-recaptcha-response` / `h-captcha-response` into ordinary pages (incl. its
+    # search results — live-probe fibreglast 2026-07-10). Those contain the bare
+    # marker substrings but are passive form protection, not an active widget.
+    html = (
+        '<html><body><h1>Search: 320 results found</h1>'
+        '<a href="/products/saertex-830" class="full-unstyled-link">Saertex 830</a>'
+        "<script>const f=['g-recaptcha-response','h-captcha-response'];</script>"
+        '<script src="//cdn.shopify.com/…/storefront-forms-hcaptcha.v1.5.2.iife.js"></script>'
+        '</body></html>'
+    )
+    assert challenge.classify_challenge(
+        html, "https://www.fibreglast.com/search?q=fiberglass+cloth") is None
+
+
+def test_classifier_still_flags_active_hcaptcha_widget():
+    # A real hCaptcha widget (bare class, not the -response token) still aborts.
+    assert challenge.classify_challenge('<div class="h-captcha" data-sitekey="x"></div>') == "captcha"
+
+
 def test_classifier_ignores_magento_refresh_captcha_module():
     # Magento ships `Magento_PaypalCaptcha/js/model/skipRefreshCaptcha.js`, whose name
     # contains the substring "refres·hCaptcha" — it must NOT false-match hCaptcha.

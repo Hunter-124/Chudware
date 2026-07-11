@@ -160,6 +160,17 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
         if (passive_widgets and not has_interstitial
                 and all(m == "challenge-platform" for m in hit_markers)):
             return None
+        # Shopify's storefront-forms captcha library templates the token FIELD names
+        # `g-recaptcha-response` / `h-captcha-response` into ordinary form pages (incl.
+        # its search-results page — live-probe fibreglast 2026-07-10) and loads
+        # `storefront-forms-hcaptcha…js`. Those `-response` names contain the bare
+        # marker substrings but are passive form protection, not an active widget. If
+        # the ONLY captcha hits are g-/h-captcha and every occurrence is a `-response`
+        # token (count matches), with no interstitial, it is not a challenge.
+        if (all(m in ("g-recaptcha", "h-captcha") for m in hit_markers)
+                and not has_interstitial and "hcaptcha.com" not in hay
+                and all(hay.count(m) == hay.count(m + "-response") for m in hit_markers)):
+            return None
         # Login forms often embed Turnstile/reCAPTCHA widgets — not a full-page CF wall.
         if (_is_auth_url(u) and _login_form_on_page(hay) and not has_interstitial
                 and not substantive and passive_widgets):

@@ -3723,6 +3723,28 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         glfwSwapBuffers(win);
     }
 
+    // Clean-exit discard signal (daemon mode): closing the app normally is a
+    // DELIBERATE exit, so tell the shared daemon to drop the parts we're leaving
+    // unsaved — otherwise, once abandoned, it would retire them for recovery and
+    // flood the "Recover unsaved parts?" prompt on the next launch. This is what
+    // makes recovery CRASH-ONLY: a crash never reaches this teardown, so its docs
+    // stay abandoned and the daemon retires them (offered next launch). A part an
+    // agent is still building degrades to a plain detach (doc_discard keeps it for
+    // the remaining writer). The user was already warned about unsaved changes by
+    // the quit modal. Screenshot/headless runs skip it.
+    if (!shot && engine::daemonMode()) {
+        if (auto* c = engine::client()) {
+            for (const auto& t : st.docTabs) {
+                if (t.docId.empty() || (t.kind != AppState::DocTab::TabKind::Part &&
+                                        t.kind != AppState::DocTab::TabKind::Assembly))
+                    continue;
+                nlohmann::json res;
+                std::string err;
+                c->call("doc_discard", {{"doc_id", t.docId}}, res, err);
+            }
+        }
+    }
+
     ui::persistChatHistory(st);  // save the active conversation transcript before teardown
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live

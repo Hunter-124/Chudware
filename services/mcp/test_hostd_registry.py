@@ -355,7 +355,9 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     time.sleep(0.3)
 
     monkeypatch.setattr(daemon_bridge, "_client", None)  # fresh connection
-    recovered = cad_tools.recover_autosaved()
+    # include_orphaned=True == the explicit recover_parts path; startup would NOT
+    # auto-open the tier (that is what recover_parts is for).
+    recovered = cad_tools.recover_autosaved(include_orphaned=True)
     scratch_daemon.append(daemon_bridge.client().call("daemon_status")["pid"])
     assert any(r["original_doc_id"] == doc for r in recovered), recovered
     new_id = next(r["doc_id"] for r in recovered if r["original_doc_id"] == doc)
@@ -451,10 +453,11 @@ def test_doc_close_kills_autosave_artifact(scratch_daemon):
     assert not any(e.get("name") == "closed-for-good" for e in entries), entries
 
 
-def test_doc_gc_discards_abandoned_docs(scratch_daemon, monkeypatch):
-    """A doc whose every client disconnected is DISCARDED after the GC grace — an
-    abandoned scratch doc is not a crash, so it is not preserved for recovery
-    (the grace window is the chance to reopen + save it in the GUI first)."""
+def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
+    """A doc whose every client vanished WITHOUT discarding it (an app/agent crash)
+    is RETIRED to the recovery tier after the GC grace, then closed to free memory
+    — the work stays recoverable. (A clean app quit sends doc_discard first, so
+    only crash-abandoned docs reach this path.)"""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
@@ -464,7 +467,7 @@ def test_doc_gc_discards_abandoned_docs(scratch_daemon, monkeypatch):
     b.call("subscribe", {"doc_ids": "*"})
     doc = a.call("doc_new", {"name": "abandoned"})["doc_id"]
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
-    a.close()  # only client attached to the doc goes away
+    a.close()  # only client attached to the doc goes away (no doc_discard = crash-like)
 
     deadline = time.monotonic() + 20
     gone = False
@@ -479,9 +482,27 @@ def test_doc_gc_discards_abandoned_docs(scratch_daemon, monkeypatch):
     evts = _events(b, "doc.closed")
     assert any(e.get("data", {}).get("doc_id") == doc and
                e.get("data", {}).get("reason") == "gc" for e in evts), evts
-    # ...and it is DISCARDED, not retired: nothing waits in the recovery tier.
+    # ...and the work is RETIRED, not lost: it waits in the recovery tier.
     entries = b.call("recovery_list", {}).get("entries") or []
-    assert not any(e.get("name") == "abandoned" for e in entries), entries
+    assert any(e.get("name") == "abandoned" for e in entries), entries
+
+
+def test_doc_discard_then_gc_leaves_no_recovery(scratch_daemon, monkeypatch):
+    """The clean-exit path: a client that doc_discards its doc before leaving must
+    NOT leave a recovery entry — that is what keeps a normal app quit from flooding
+    the recovery prompt (contrast the crash path above)."""
+    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    b.call("subscribe", {"doc_ids": "*"})
+    doc = a.call("doc_new", {"name": "quit-clean"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    a.call("doc_discard", {"doc_id": doc})  # the app quitting cleanly
+    a.close()
+    time.sleep(3)  # well past the GC grace
+    assert b.call("recovery_list", {}).get("entries") == []
 
 
 def test_doc_discard_closes_abandoned_doc_no_recovery(scratch_daemon):

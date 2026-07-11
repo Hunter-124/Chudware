@@ -10,25 +10,32 @@
 // The instance-key level is a deliberate addition over the plan's path: scratch
 // test daemons must never recover (or sweep) the real daemon's sessions.
 //
-// RECOVERY IS CRASH-ONLY (doc-lifecycle overhaul):
+// RECOVERY IS CRASH-ONLY (doc-lifecycle overhaul). The rule: a CLEAN exit
+// discards, a CRASH is recoverable — and the app signals which by whether it
+// explicitly discarded before going away.
 //
-//  A prior session dir that still exists means that daemon died HARD — a clean
-//  shutdown removes its own session dir (stop()), and so does an explicit
-//  doc_close / doc-GC on each doc it touched. So on start, any surviving prior
-//  session is a crash: its autosaves are NOT auto-opened (that silently
-//  resurrected zombie parts) — each is registered into the ORPHAN tier
-//  (<baseDir>/orphaned/, {stem}.step+ + {stem}.json meta) so a client restores it
-//  DELIBERATELY via recovery_list -> recovery_open (the GUI "Recover unsaved
-//  parts?" prompt, or the recover_parts MCP tool). recovery_open mints a fresh id
-//  and records {old_id: new_id} (noteRecoveredRemap) so hello can rebind a
-//  reconnecting client. Nothing else feeds the tier: clean shutdown and doc-GC
-//  both DISCARD, and an explicitly closed part is purged outright. This is what
-//  keeps closed / cleanly-quit parts from flooding back on the next launch while
-//  still catching genuine crashes.
+//  * Explicit discard — an app closing a tab, or quitting cleanly (it discards
+//    every unsaved doc it leaves behind), calls doc_discard. That closes the doc
+//    AND purges its autosave artifacts (onDocClosed) — a deliberately-dropped
+//    part never resurfaces.
 //
-// Explicit doc_close deletes the doc's autosave artifacts (session file + name
-// sidecar, and its crash-tier source when the doc came from recovery) — closed
-// means closed.
+//  * doc-GC RETIRE — a doc whose every client vanished WITHOUT discarding it
+//    (an app/agent crash) is doc_save'd into the ORPHAN tier (<baseDir>/orphaned/,
+//    {stem}.step+ + {stem}.json meta) and then closed to free memory. A clean doc
+//    already safe in a real user file is just closed. This is the long-lived
+//    disk recovery store (AICAD_ORPHAN_KEEP entries).
+//
+//  * CRASH tier — a prior session dir that still exists means that daemon itself
+//    died hard (clean shutdown removes its session dir). Its autosaves are NOT
+//    auto-opened (that silently resurrected zombie parts) — each is registered
+//    into the same orphan tier.
+//
+//  Everything in the orphan tier waits for a DELIBERATE recovery_list ->
+//  recovery_open (the GUI "Recover unsaved parts?" prompt, or the recover_parts
+//  MCP tool); nothing auto-loads. recovery_open mints a fresh id and records
+//  {old_id: new_id} (noteRecoveredRemap) so hello can rebind a reconnecting
+//  client. This keeps closed / cleanly-quit parts from flooding back while still
+//  catching genuine crashes.
 #pragma once
 
 #include <atomic>
@@ -79,6 +86,19 @@ public:
     // Explicit doc_close: delete the doc's session autosave, and when the doc
     // was crash-recovered also its source file + id_remap entry.
     void onDocClosed(const std::string& docId);
+
+    // doc-GC of an ABANDONED doc (an app/agent vanished without discarding it —
+    // i.e. a crash): doc_save `docId` into the orphan tier + drop its session
+    // autosave, so the work is recoverable long-term while the live doc is closed
+    // to free memory. `name` is stored for the recovery prompt. False on save fail.
+    bool retireDoc(const std::string& docId, const std::string& name);
+
+    // True when `path` is one of OUR artifacts (session autosave / orphan file):
+    // a doc whose path points in here is NOT "safe in a user file", so GC still
+    // retires it rather than trusting the on-disk copy.
+    bool isAutosavePath(const std::string& path) const {
+        return !baseDir_.empty() && path.rfind(baseDir_, 0) == 0;
+    }
 
 private:
     void loop();

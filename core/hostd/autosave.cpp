@@ -241,6 +241,35 @@ void Autosave::noteRecoveredRemap(const std::string& oldId, const std::string& n
     idRemap_[oldId] = newId;
 }
 
+bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
+    if (docId.empty()) return false;
+    std::error_code ec;
+    fs::create_directories(orphanDir_, ec);
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    char stem[128];
+    std::snprintf(stem, sizeof stem, "%015lld-%s", nowMs, docId.c_str());
+    const std::string base = orphanDir_ + "/" + stem;
+    json result;
+    std::string err;
+    if (!core::cpp_core().call("doc_save", json{{"doc_id", docId}, {"path", base + ".step+"}},
+                               result, err)) {
+        log().line("doc-gc: retire doc_save(%s) failed: %s", docId.c_str(), err.c_str());
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(orphanMtx_);
+        std::ofstream meta(base + ".json", std::ios::trunc);
+        meta << json{{"doc_id", docId}, {"name", name}, {"retired_ms", nowMs}}.dump();
+    }
+    fs::remove(sessionDir_ + "/" + docId + ".step+", ec);  // session copy is now redundant
+    fs::remove(sessionDir_ + "/" + docId + ".json", ec);    // name sidecar
+    { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
+    sweepOrphans();
+    return true;
+}
+
 json Autosave::orphanMeta(const std::string& id) {
     if (id.empty() || id.find('/') != std::string::npos ||
         id.find("..") != std::string::npos)
@@ -323,7 +352,9 @@ int Autosave::discardOrphans(const std::string& id) {
 }
 
 void Autosave::sweepOrphans() {
-    int keep = 20;
+    // Generous by default: the orphan tier is the long-lived disk recovery store
+    // for crashed work (cheap on disk, never auto-loaded), so keep a deep history.
+    int keep = 200;
     if (const char* v = std::getenv("AICAD_ORPHAN_KEEP"); v && *v)
         keep = std::max(0, std::atoi(v));
     std::lock_guard<std::mutex> lk(orphanMtx_);

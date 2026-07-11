@@ -190,20 +190,42 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
     // it now would yank a live doc out from under that client. Re-check under the
     // lock and bail if it's no longer abandoned.
     if (!registry_.isReapable(docId)) return false;
-    // DISCARD, never retire: an abandoned doc (doc-GC grace expired) or an
-    // explicitly-closed one is not a crash, so it is not preserved for recovery.
-    // doc_close + onDocClosed purge the doc's autosave artifacts so it can never
-    // resurrect. Recovery is reserved for crashes (see Autosave::recoverPriorSession).
+    // Explicit discard (reason "discarded", from doc_discard) = the app dropped
+    // this part deliberately -> PURGE. doc-GC (reason "gc") = every client vanished
+    // WITHOUT discarding -> a crash: RETIRE to the orphan tier so the work stays
+    // recoverable, then close to free memory. A clean doc already safe in a real
+    // user file is just closed.
+    const bool discard = std::string_view(reason) == "discarded";
     json result;
     std::string err;
-    if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err)) {
-        // Already gone from the engine (raced a real doc_close): still drop
-        // registry state + artifacts so nothing lingers.
-        log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
+    if (!discard && autosave_) {
+        json docs;
+        std::string name = docId;
+        bool needRetire = true;
+        if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
+            docs.is_object() && docs.contains("docs")) {
+            for (const auto& d : docs["docs"]) {
+                if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
+                name = d.value("name", docId);
+                const std::string path = d.contains("path") && d["path"].is_string()
+                                             ? d["path"].get<std::string>()
+                                             : std::string();
+                needRetire = path.empty() || d.value("dirty", false) ||
+                             autosave_->isAutosavePath(path);
+                break;
+            }
+        }
+        if (needRetire && !autosave_->retireDoc(docId, name)) {
+            log().line("doc-gc: keeping %s open (retire failed)", docId.c_str());
+            return false;  // never close a doc we could not preserve
+        }
     }
-    if (autosave_) autosave_->onDocClosed(docId);
+    if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err))
+        log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
+    if (discard && autosave_) autosave_->onDocClosed(docId);  // deliberately dropped -> purge
     registry_.onDaemonClosedDoc(docId, reason);
-    log().line("doc-gc: discarded doc %s (reason %s)", docId.c_str(), reason);
+    log().line("doc-gc: %s doc %s (reason %s)", discard ? "discarded" : "retired",
+               docId.c_str(), reason);
     return true;
 }
 

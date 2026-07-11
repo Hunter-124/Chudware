@@ -936,19 +936,23 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> 
 
     scope="recent" (default): only the SINGLE most-recent prior session's docs — the
     crash we're recovering from — never the whole history. scope="all": every autosave.
-    include_orphaned: no longer changes daemon-mode behavior (see below); kept for the
-    non-daemon path and API stability. Prunes stale autosaves first.
+    include_orphaned: open the daemon's on-disk recovery tier (crash-retired docs) —
+    only the explicit recover_parts tool passes this. Startup must NOT (the tier keeps a
+    deep history of crash recoveries; auto-opening all of it would flood the engine).
+    Prunes stale autosaves first.
 
-    Daemon mode: crash recovery now lives in the orphan tier — a crashed daemon's
-    autosaves are REGISTERED there (not auto-opened), and clean-shutdown / doc-GC docs
-    are DISCARDED, so the tier holds only genuine crash survivors. We open those. The
-    hello id_remap path stays as a fallback for an older daemon that still auto-opens."""
+    Daemon mode: recovery lives in the orphan tier — a crashed daemon's autosaves and
+    any crash-abandoned doc (GC-retired) are REGISTERED there, never auto-opened. A
+    clean app quit sends doc_discard, so the tier holds only genuine crash survivors.
+    recover_parts opens them DELIBERATELY; startup recovers nothing here (the hello
+    id_remap fallback is empty on a current daemon)."""
     if cb._daemon_mode():
         out = _recover_via_daemon()  # [] on a current daemon (no auto-open)
-        seen = {r.get("original_doc_id") for r in out}
-        for r in _recover_orphans_via_daemon():
-            if r.get("original_doc_id") not in seen:
-                out.append(r)
+        if include_orphaned:
+            seen = {r.get("original_doc_id") for r in out}
+            for r in _recover_orphans_via_daemon():
+                if r.get("original_doc_id") not in seen:
+                    out.append(r)
         return out
     _prune_autosaves()
     out: list = []

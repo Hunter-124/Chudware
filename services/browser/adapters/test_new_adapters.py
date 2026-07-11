@@ -67,11 +67,14 @@ MISUMI_DETAIL_HTML = """
 </body></html>
 """
 
+# Real live shape (verified 2026-07-11): LCSC's search results are a Nuxt/Vue SSR
+# table — rows are JS-clickable <tr>s, NOT <a href="/product-detail/…"> anchors.
+# The per-row extraction anchor is `aria-label="<title> detail page" title="C<code>"`.
 LCSC_SEARCH_HTML = """
-<html><body>
-<a class="product-item" href="/product-detail/STM32F103C8T6_C8734.html">STM32F103C8T6
-<span class="lcsc-number">C8734</span><span class="price">$2.10</span><span class="stock">12,000 in stock</span></a>
-</body></html>
+<html><body><table><tr><td>
+<span data-v-8adf140e="" aria-label="ST STM32F103C8T6 detail page" title="C8734"
+ class="font-Bold-600 major--text"><span>C8734</span></span>
+</td></tr></table></body></html>
 """
 
 LCSC_LOGIN_WALL_HTML = '<html><body>Sign In <div id="login-email"></div></body></html>'
@@ -273,11 +276,13 @@ def test_lcsc_search_parses_result_cards(adapter_mods, monkeypatch):
 
     assert len(hits) == 1
     assert "STM32F103C8T6" in hits[0]["title"]
-    assert hits[0]["url"] == "https://www.lcsc.com/product-detail/STM32F103C8T6_C8734.html"
+    # URL is derived from the LCSC code (no anchor href in the SSR table).
+    assert hits[0]["url"] == "https://www.lcsc.com/product-detail/C8734.html"
     assert hits[0]["site"] == "lcsc"
     assert hits[0]["lcsc"] == "C8734"
-    assert hits[0]["price"] == "$2.10"
-    assert hits[0]["stock"] == "12,000"
+    # Price/stock are not associated from the fragile results table; acquire() reads them.
+    assert hits[0]["price"] is None
+    assert hits[0]["stock"] is None
 
 
 def test_lcsc_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):

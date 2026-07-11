@@ -70,6 +70,33 @@ _TWO_FACTOR_MARKERS: tuple[str, ...] = (
     "confirm your identity to continue",
 )
 
+# STRONG 2FA markers are distinctive of an ACTIVE challenge interstitial — a page
+# whose whole purpose is to collect a code. These always classify, regardless of
+# page size. The WEAK markers below are bare form-field labels ("verification
+# code", "authentication code") that ride along in a site's login/register i18n
+# string blob templated into EVERY page — e.g. LCSC's Nuxt app ships
+# "Verification Code"/"Verification code required" as JS labels on its 800KB
+# search results page (live-probe 2026-07-11). A weak marker alone on a large
+# real content page is NOT a challenge; on a small page it still is (the code
+# prompt IS the page). classify_challenge only sees html+url (no HTTP status), so
+# len(html) is the content-corroboration signal.
+_TWO_FACTOR_STRONG: frozenset[str] = frozenset({
+    "two-factor", "two factor authentication",
+    "2-step verification", "two-step verification",
+    "multi-factor authentication",
+    "one-time password", "one time passcode",
+    "enter the code we sent", "enter the 6-digit", "6-digit code",
+    "authenticator app", "security code we sent",
+    "confirm your identity to continue",
+})
+# Bare form-field labels that appear on ordinary content pages via i18n blobs.
+_TWO_FACTOR_WEAK: frozenset[str] = frozenset({
+    "verification code", "authentication code",
+})
+# Above this size, a page carrying ONLY a weak 2FA label is real content, not a
+# challenge (a genuine 2FA interstitial is a small, form-only page).
+_TWO_FACTOR_CONTENT_BYTES = 50_000
+
 # iframe src fragments that indicate an embedded captcha widget.  "recaptcha"
 # is deliberately absent: the v3 badge injects an invisible anchor iframe on
 # ordinary pages — the anchor is handled separately with a size=invisible check.
@@ -187,7 +214,18 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
     # size=invisible anchor on an ordinary page is not.
     if "recaptcha/api2/anchor" in hay and "size=invisible" not in hay:
         return "captcha"
-    if any(m in hay for m in _TWO_FACTOR_MARKERS):
+    tf_hits = [m for m in _TWO_FACTOR_MARKERS if m in hay]
+    if tf_hits:
+        strong = [m for m in tf_hits if m in _TWO_FACTOR_STRONG]
+        if strong:
+            return "2fa"
+        # Only WEAK markers matched. On a large, real content page these are
+        # ride-along i18n form labels (LCSC's Nuxt search page etc.), not a
+        # challenge. On a small page the code prompt IS the page — still 2fa.
+        if all(m in _TWO_FACTOR_WEAK for m in tf_hits):
+            if len(hay) >= _TWO_FACTOR_CONTENT_BYTES:
+                return None
+            return "2fa"
         return "2fa"
     return None
 

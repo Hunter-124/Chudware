@@ -176,6 +176,42 @@ def test_classifier_still_flags_active_recaptcha_bframe():
     assert challenge.classify_challenge(html) == "captcha"
 
 
+def test_classifier_ignores_passive_2fa_label_on_lcsc_storefront():
+    # LCSC's Nuxt search-results page (live-probe 2026-07-11, HTTP 200, 800KB of
+    # real product HTML) ships its login/register i18n string blob into EVERY
+    # page — including the bare form label "Verification Code"/"Verification code
+    # required". That WEAK marker rides along on a large real content page and
+    # must NOT be read as a 2FA wall (it degraded the whole LCSC adapter to
+    # challenge_page). A genuine 2FA interstitial is a small, form-only page.
+    blob = ('top_login_coupons:B}}}}}("","Required",null,"Email","Contact Us",'
+            '"Verification Code","Type","Customer Service","Home",'
+            '"Verification code required")')
+    html = "<html><body>" + blob + ("<div>product row</div>" * 4000) + "</body></html>"
+    assert len(html) >= 50_000
+    assert challenge.classify_challenge(
+        html, "https://www.lcsc.com/search?q=resistor") is None
+
+
+def test_classifier_still_flags_genuine_2fa_interstitial():
+    # A real 2FA challenge page (strong prompt) still classifies regardless of the
+    # weak-marker size escape above — strong markers win unconditionally.
+    html = ("<html><body><h1>Verify it's you</h1>"
+            "<p>Enter the 6-digit code we sent to your phone.</p>"
+            '<input name="code"></body></html>')
+    assert challenge.classify_challenge(
+        html, "https://vendor.example.com/2fa") == "2fa"
+
+
+def test_classifier_still_flags_weak_2fa_label_on_small_page():
+    # The size escape is narrow: a SMALL page whose only 2FA marker is the bare
+    # "verification code" label is still a challenge (the code prompt IS the page).
+    # Without this the weak-marker exclusion would be secretly too broad.
+    html = ('<html><body><form><label>Verification code</label>'
+            '<input name="otp"></form></body></html>')
+    assert challenge.classify_challenge(
+        html, "https://vendor.example.com/verify") == "2fa"
+
+
 # --- fakes (page carries a .url, unlike test_browser_session's minimal one) ------
 
 class _FakePage:

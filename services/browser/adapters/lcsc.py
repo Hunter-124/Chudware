@@ -29,11 +29,15 @@ LICENSE_NOTE = (
     "engineering reference. See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('Sign In', 'id="login-email"', 'class="login-dialog"')
-# Best-effort: LCSC search result cards link to /product-detail/<slug>.html.
+_LOGIN_WALL_MARKERS = ('id="login-email"', 'class="login-dialog"')
+# LCSC's search results are a Nuxt/Vue SSR table (verified live 2026-07-11): rows
+# are JS-clickable <tr>s, NOT <a href="/product-detail/…"> anchors. Each product
+# cell carries `aria-label="<manufacturer part title> detail page" title="C<code>"`
+# — the one solid, per-row extraction anchor. The canonical detail URL is derived
+# from the LCSC code as /product-detail/C<code>.html.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-item[^"]*"[^>]+href="(?P<href>/product-detail/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'aria-label="(?P<title>[^"]+?)\s+detail page"\s+title="(?P<lcsc>C\d+)"',
+    re.IGNORECASE)
 _LCSC_RE = re.compile(r'<span[^>]*class="[^"]*lcsc-number[^"]*"[^>]*>(?P<lcsc>C\d+)</span>',
                       re.IGNORECASE)
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
@@ -60,18 +64,22 @@ class LcscAdapter:
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
         hits = []
+        seen: set[str] = set()
         for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            lcsc_match = _LCSC_RE.search(card)
-            price_match = _PRICE_RE.search(card)
-            stock_match = _STOCK_RE.search(card)
+            lcsc = m.group("lcsc")
+            if lcsc in seen:
+                continue
+            seen.add(lcsc)
             hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "title": _strip_tags(m.group("title")),
+                "url": f"{BASE_URL}/product-detail/{lcsc}.html",
                 "site": SITE,
-                "lcsc": lcsc_match.group("lcsc") if lcsc_match else None,
-                "price": ("$" + price_match.group("price")) if price_match else None,
-                "stock": stock_match.group("stock") if stock_match else None,
+                "lcsc": lcsc,
+                # Price/stock live in sibling table cells whose row-to-cell
+                # association is fragile in the SSR markup; left to acquire() on
+                # the detail page rather than guessed from the results table.
+                "price": None,
+                "stock": None,
             })
         return hits
 

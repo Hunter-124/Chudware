@@ -8948,15 +8948,15 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     DocLock lk;
     StepPlusDoc loaded = stepplus_open(path);  // throws OpError on a bad file
 
-    // Only PART documents are handled by the C++ core. A non-part container (e.g. an
-    // assembly) is rejected BEFORE a session is created — code "unsupported" — so the
-    // host's minting-call fallback can route the open to the Python worker instead (no
-    // C++ doc exists yet, so the fallback is clean / not a mid-doc switch).
+    // PART and ASSEMBLY containers both open in the C++ core (parts compile via
+    // compile_session, assemblies via rebuild_assembly below — see the is_assembly branch).
+    // Any OTHER schema (ecad/drawing/cam) has no doc_open session path, so it is rejected
+    // BEFORE a session is created — code "unsupported".
     const std::string schema =
         loaded.doc.is_object() ? loaded.doc.value("schema", std::string()) : std::string();
-    if (!schema.empty() && schema != "aicad.part/1")
+    if (!schema.empty() && schema != "aicad.part/1" && schema != "aicad.asm/1")
         throw OpError("unsupported",
-                      "doc_open: the C++ core handles only part documents (got schema '" +
+                      "doc_open: the C++ core handles only part/assembly documents (got schema '" +
                           schema + "')",
                       {{"schema", schema}, {"reason", "unsupported document kind"}});
 
@@ -8982,6 +8982,15 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     }
     Session& stored = lk.acquire(sid);
 
+    CompileResult r;
+    if (stored.is_assembly()) {
+        // Assemblies compile via rebuild_assembly / asm_result — NOT compile_document —
+        // exactly as doc_new(kind=assembly) does. base_dir is derived from stored.path
+        // inside rebuild_assembly, so the components' saved source paths resolve. The
+        // part-only geometry cache below does not apply, so we skip straight to the response.
+        rebuild_assembly(stored);
+        resp = ops_response_assembly(stored, json::object());
+    } else {
     // Fast cold-open via the persisted geometry cache: if the container carries a valid
     // cache.json/cache.aicm (engine key + doc hash both match the loaded tree), return the
     // cached ops-response + mesh WITHOUT re-running compile_document. stored.compiled is left
@@ -9017,11 +9026,11 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
         }
     }
 
-    CompileResult r;
     if (!cache_hit) {
         r = compile_session(stored);
         resp = warm_and_respond(stored, std::move(r), json::object(), /*with_tess=*/true);
     }
+    }  // end part-vs-assembly branch
     resp["doc_id"] = stored.doc_id;
     if (stored.doc.is_object())
         resp["name"] = stored.doc.value("name", std::string());

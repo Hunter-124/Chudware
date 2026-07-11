@@ -195,10 +195,16 @@ static const std::vector<PMFormDef>& forms() {
             Signed    (DimIf ("end_offset","End Offset",      "Direction 1", 0.0,
                        "end", "offset_from_reference", true)),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            Range     (AngleIf("draft",    "Draft angle",     "Direction 1", 0.0,
-                       "end", "blind|mid_plane", true), 0.0, 89.0),
+            // Issue #32: "Draft outward" is the enable toggle. The angle field (and its in-viewport
+            // handle/callout, which follow fieldVisible) stay hidden until it's checked, so a plain
+            // extrude isn't cluttered by a draft control the user didn't ask for. The checkbox is
+            // only offered for blind/mid-plane ends where draft is meaningful. (omitWhenDisabled on
+            // the angle => it's hidden, not greyed.) Inward draft remains available via the
+            // standalone Draft feature.
             CheckIf   ("draft_outward", "Draft outward","Direction 1", false,
                        "end", "blind|mid_plane"),
+            Range     (AngleIf("draft",    "Draft angle",     "Direction 1", 0.0,
+                       "draft_outward", "true", true), 0.0, 89.0),
             ComboL    ("end2",     "End Condition",   "Direction 2",
                        "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
                        "None|Blind|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),

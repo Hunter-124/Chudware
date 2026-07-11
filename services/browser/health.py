@@ -79,6 +79,7 @@ CANARY_QUERIES: dict[str, str] = {
     "hdsc": "HC32",  # EN search is a series/news index — generic terms return 0
     "dfrobot": "gravity sensor",  # SPA/XHR-only — degrades honestly headless
     "futureelectronics": "atmega328p",
+    "mouser": "heatsink",  # catalog /c/?q= is Akamai-walled headless — degrades honestly
     "parker": "hydraulic valve",
     "boschrexroth": "linear guide",
     "hydraforce": "solenoid valve",

@@ -207,7 +207,7 @@ from . import (boschrexroth, hydraforce, parker,  # hydraulics CAD  # noqa: E402
                speedymetals, coremarkmetals, professionalplastics,  # metals/plastics
                rockwest, acpcomposites, fibreglast,  # composites
                surpluscenter, baileyhydraulics,  # hydraulics commerce
-               wch, hdsc, dfrobot, seeedstudio, futureelectronics,  # CN/electronics
+               wch, hdsc, dfrobot, seeedstudio, futureelectronics, mouser,  # electronics distributors
                datasheet4u,  # datasheet DB (RE feed)
                ultralibrarian, componentsearchengine,  # ECAD CAD libraries
                freecadlibrary,  # open git STEP repo (no login)

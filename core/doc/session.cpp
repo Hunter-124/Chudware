@@ -215,6 +215,13 @@ struct Session {
 };
 
 constexpr std::size_t kUndoLimit = 100;
+// Each undo/redo/checkpoint entry is a full doc JSON dump, so bounding by COUNT
+// alone is not enough: on an import-heavy multi-megabyte doc a 100-deep stack
+// would pin hundreds of MB of process RSS indefinitely. Bound history in BYTES
+// too, and cap the PM-cancel checkpoint map (which minted one full-doc snapshot
+// per PropertyManager open and was NEVER freed on commit — an unbounded leak).
+constexpr std::size_t kUndoByteBudget = 256u * 1024u * 1024u;  // per stack
+constexpr std::size_t kCheckpointLimit = 32;                   // PM-cancel snapshots
 
 // =============================================================================
 // T-PERF5 — per-doc engine locking
@@ -3156,10 +3163,22 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     return resp;
 }
 
+// Bound an undo/redo history stack (oldest at front) by BOTH count and cumulative
+// bytes. Always keeps the newest entry even if it alone exceeds the byte budget —
+// dropping the just-captured state would corrupt undo/redo.
+void trim_history(std::vector<std::string>& stack) {
+    while (stack.size() > kUndoLimit) stack.erase(stack.begin());
+    std::size_t total = 0;
+    for (const std::string& e : stack) total += e.size();
+    while (stack.size() > 1 && total > kUndoByteBudget) {
+        total -= stack.front().size();
+        stack.erase(stack.begin());
+    }
+}
+
 void push_undo(Session& s) {
     s.undo_stack.push_back(s.doc.dump());
-    if (s.undo_stack.size() > kUndoLimit)
-        s.undo_stack.erase(s.undo_stack.begin());
+    trim_history(s.undo_stack);
     s.redo_stack.clear();
 }
 
@@ -4091,6 +4110,7 @@ json doc_undo(const std::string& doc_id) {
     if (s.undo_stack.empty())
         throw OpError("invalid_op", "nothing to undo", {{"reason", "empty undo stack"}});
     s.redo_stack.push_back(s.doc.dump());
+    trim_history(s.redo_stack);
     s.doc = json::parse(s.undo_stack.back());
     s.undo_stack.pop_back();
     s.revision += 1;  // undo bumps the revision forward (Python contract)
@@ -4113,7 +4133,7 @@ json doc_redo(const std::string& doc_id) {
     if (s.redo_stack.empty())
         throw OpError("invalid_op", "nothing to redo", {{"reason", "empty redo stack"}});
     s.undo_stack.push_back(s.doc.dump());
-    if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
+    trim_history(s.undo_stack);
     s.doc = json::parse(s.redo_stack.back());
     s.redo_stack.pop_back();
     s.revision += 1;
@@ -4476,6 +4496,11 @@ json doc_checkpoint(const std::string& doc_id) {
     Session& s = require_session(doc_id);
     const std::string cid = new_checkpoint_id();
     s.checkpoints[cid] = s.doc.dump();
+    // Cap retained PM-cancel snapshots. Checkpoint ids are zero-padded monotonic
+    // hex, so the map's own key order IS mint order — erasing begin() drops the
+    // oldest. Bounds the leak from the commit path, which never frees its snapshot.
+    while (s.checkpoints.size() > kCheckpointLimit)
+        s.checkpoints.erase(s.checkpoints.begin());
     return json{{"checkpoint", cid}};
 }
 
@@ -4489,9 +4514,14 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     // One undo entry of the pre-revert state (a single undo restores it); clear redo
     // like any edit. Then swap in the snapshot, rebuild, and bump the revision.
     s.undo_stack.push_back(s.doc.dump());
-    if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
+    trim_history(s.undo_stack);
     s.redo_stack.clear();
-    s.doc = json::parse(it->second);
+    // Consume the checkpoint: every caller mints a fresh one per PM open and reverts
+    // it at most once (sketch3d_mode, doc_mirror), so freeing it here reclaims the
+    // snapshot immediately instead of waiting for the kCheckpointLimit cap to evict it.
+    const std::string snapshot = std::move(it->second);
+    s.checkpoints.erase(it);
+    s.doc = json::parse(snapshot);
     s.revision += 1;
     s.dirty = true;
     CompileResult r = compile_session(s);
@@ -8389,7 +8419,7 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     // Commit pushes ONE undo entry of the pre-edit doc; a transient preview pushes none.
     if (commit) {
         s.undo_stack.push_back(pre_snapshot);
-        if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
+        trim_history(s.undo_stack);
         s.redo_stack.clear();
     }
     s.doc = std::move(working);

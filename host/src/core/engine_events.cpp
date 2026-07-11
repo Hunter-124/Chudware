@@ -265,10 +265,30 @@ bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
         return true;  // subscribed; doc listing best-effort
     }
     if (dl.is_object() && dl.contains("docs") && dl["docs"].is_array()) {
+        std::set<std::string> liveIds;
         for (const auto& doc : dl["docs"]) {
             const std::string id =
                 doc.is_object() ? doc.value("doc_id", std::string()) : std::string();
-            if (!id.empty()) openMirrorTab(st, id);
+            if (!id.empty()) {
+                liveIds.insert(id);
+                openMirrorTab(st, id);
+            }
+        }
+        // Reconnect reconciliation: after a drain-replace we re-mirror the NEW
+        // daemon's docs above, but mirror tabs for docs that were open in the OLD
+        // daemon and are gone now would linger forever (no doc.closed arrives — a
+        // different daemon). doc_list is authoritative, so drop any daemon-mirror
+        // tab whose doc_id it no longer lists. Guards mirror the doc.closed
+        // handler: only our own aiHandoff mirrors, never a user tab, never one
+        // with unsaved edits, and never disrupt an active mid-edit. If we drop one
+        // wrongly (transient list), a later doc.opened / re-bootstrap re-mirrors it.
+        for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+            const auto& t = st.docTabs[i];
+            if (!t.aiHandoff || t.docId.empty() || liveIds.count(t.docId)) continue;
+            if (t.dirty || (i == st.activeTab && userMidEdit(st))) continue;
+            st.addLog("[daemon] dropping stale mirror tab " + t.docId +
+                      " (absent from daemon after reconnect)");
+            st.closeDocTab(i);
         }
     }
     checkOrphanRecovery(st, c);

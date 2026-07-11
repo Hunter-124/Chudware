@@ -283,7 +283,17 @@ def slice_pngs(slices: list, slice_transforms: list, speed_mps: float) -> list:
     try:
         import matplotlib
         matplotlib.use("Agg")
-        from matplotlib import cm
+        # matplotlib >=3.9 removed matplotlib.cm.get_cmap; prefer the colormaps registry.
+        try:
+            from matplotlib import colormaps as _mpl_colormaps
+
+            def _get_cmap(name):
+                return _mpl_colormaps[name]
+        except Exception:  # noqa: BLE001 -- older matplotlib (<3.5)
+            from matplotlib import cm as _cm
+
+            def _get_cmap(name):
+                return _cm.get_cmap(name)
     except Exception:  # noqa: BLE001
         return []
 
@@ -295,7 +305,7 @@ def slice_pngs(slices: list, slice_transforms: list, speed_mps: float) -> list:
 
     vmax = max(1e-6, 1.5 * float(speed_mps))
     out = []
-    cmap = cm.get_cmap("turbo")
+    cmap = _get_cmap("turbo")
     for i, (sl, xf) in enumerate(zip(slices, slice_transforms)):
         arr = np.asarray(sl, dtype=np.float32)
         if arr.ndim != 2 or arr.size == 0:

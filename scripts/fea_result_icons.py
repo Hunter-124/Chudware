@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -139,6 +140,41 @@ def _fit(pts_uv, px: int, margin: float = 0.06):
 
 
 # ---------------------------------------------------------------------------
+# Overlay resolution: file path OR aicm-shm:// URI -> AICM bytes.
+# ---------------------------------------------------------------------------
+def _read_overlay(handle: str) -> bytes:
+    """Resolve a sim_run_* ``overlay_aicm`` handle to raw AICM bytes.
+
+    The engine emits two forms (matches scripts/sim_icons.py._read_overlay):
+      * a plain filesystem path (older engine / file fallback), and
+      * ``aicm-shm:///aicad_overlay_N`` -> POSIX shm object ``/aicad_overlay_N``,
+        i.e. ``/dev/shm/aicad_overlay_N``, whose layout is an 8-byte little-endian
+        size header followed by exactly that many AICM payload bytes
+        (core/util/aicm_handoff.cpp publish_shm: memcpy(p,&sz,8); memcpy(p+8,data,n)).
+    """
+    if not handle:
+        raise RuntimeError("empty overlay handle")
+    prefix = "aicm-shm://"
+    if handle.startswith(prefix):
+        name = handle[len(prefix):]          # "/aicad_overlay_0"
+        name = "/" + name.lstrip("/")        # normalize to a single leading slash
+        shm_path = Path("/dev/shm") / name.lstrip("/")
+        if not shm_path.exists():
+            raise RuntimeError(f"shm overlay object missing: {shm_path}")
+        raw = shm_path.read_bytes()
+        if len(raw) < 8:
+            raise RuntimeError(f"shm overlay too small: {len(raw)} bytes")
+        (sz,) = struct.unpack_from("<Q", raw, 0)
+        if sz <= 0 or 8 + sz > len(raw):
+            raise RuntimeError(f"shm overlay bad size header: sz={sz} raw={len(raw)}")
+        return raw[8:8 + sz]
+    p = Path(handle)
+    if not p.exists():
+        raise RuntimeError(f"overlay file missing: {handle}")
+    return p.read_bytes()
+
+
+# ---------------------------------------------------------------------------
 # Engine drive
 # ---------------------------------------------------------------------------
 
@@ -184,10 +220,12 @@ def solve_cantilever(cb):
         res = cb.call("sim_run_static", {"study": study})
         if not res.get("ok"):
             raise RuntimeError(f"sim_run_static failed: {res.get('error')}")
-        aicm_path = res.get("overlay_aicm")
-        if not aicm_path or not os.path.exists(aicm_path):
-            raise RuntimeError(f"no overlay_aicm produced: {aicm_path!r}")
-        parsed = read_aicm(Path(aicm_path).read_bytes())
+        overlay = res.get("overlay_aicm")
+        if not overlay:
+            raise RuntimeError(f"no overlay_aicm produced: {overlay!r}")
+        # overlay_aicm is either a plain file path OR an "aicm-shm:///..." POSIX
+        # shared-memory URI (current engine); _read_overlay resolves both.
+        parsed = read_aicm(_read_overlay(overlay))
         stats = {"n_nodes": res.get("n_nodes"), "n_elems": res.get("n_elems"),
                  "n_dof": res.get("n_dof"), "mesh": res.get("mesh_type_used")}
         try:

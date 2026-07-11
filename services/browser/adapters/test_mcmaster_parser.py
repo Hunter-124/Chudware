@@ -146,3 +146,110 @@ def test_mcmaster_search_login_wall_surfaces_ask_user(mcmaster_mods, monkeypatch
     assert len(hits) == 1
     assert hits[0]["ok"] is False
     assert hits[0]["reason"] == "login_required"
+
+
+# --- acquire(): client-generated STEP FilePath via browser_interact --------------
+# The STEP model URL is minted client-side (no static .step href on the HTML); the
+# adapter drives page JS to fetch McMaster's product-data endpoint and reads the
+# "3-D STEP" FilePath out of a sentinel div. These tests stub browser_interact to
+# return that sentinel DOM (the shape the real page JS publishes) and assert the
+# adapter extracts the FilePath, downloads it, and returns a provenance envelope.
+def _sentinel_dom(status: str, fp: str) -> str:
+    return (f'<html><body><div id="__aicad_capture" data-status="{status}" '
+            f'data-fp="{fp}">done</div></body></html>')
+
+
+def test_mcmaster_acquire_downloads_client_generated_step(mcmaster_mods, monkeypatch):
+    mcmaster, session = mcmaster_mods
+    fp = "/mvC/Library/CAD2/20260528/920DEA54/91290A115_Socket Head Screw.STEP"
+    seen = {}
+
+    def fake_interact(url, site, script, **kw):
+        seen["interact_url"] = url
+        seen["script"] = script
+        return {"ok": True, "content": _sentinel_dom("ok", fp), "final_url": url}
+
+    def fake_download(url, site, dest, **kw):
+        seen["download_url"] = url
+        return {"ok": True, "dest": str(dest), "session_profile_used": "mcmaster"}
+
+    monkeypatch.setattr(session, "browser_interact", fake_interact)
+    monkeypatch.setattr(session, "browser_download", fake_download)
+
+    out = mcmaster.ADAPTER.acquire({
+        "url": "https://www.mcmaster.com/products/socket-head-screws/steel-socket-head-screws~~/",
+        "title": "Steel Socket Head Screws", "kind": "family",
+        "part_number": "91290A115"})
+
+    assert out["ok"] is True
+    assert out["sku"] == "91290A115"
+    # interact ran against the concrete SKU page, and the script fetches the
+    # product-data endpoint for that part number.
+    assert seen["interact_url"] == "https://www.mcmaster.com/91290A115/"
+    assert "partNumber=91290A115" in seen["script"]
+    # The downloaded URL is BASE + the (percent-encoded) FilePath from the sentinel.
+    assert seen["download_url"].startswith("https://www.mcmaster.com/mvC/Library/CAD2/")
+    assert seen["download_url"].endswith(".STEP")
+    assert out["artifact_path"].endswith(".STEP")
+
+
+def test_mcmaster_acquire_derives_part_number_from_url(mcmaster_mods, monkeypatch):
+    # A /<PN>/ product URL carries the SKU — no part_number field needed.
+    mcmaster, session = mcmaster_mods
+    fp = "/mvC/Library/CAD2/x/90044A203_Screw.STEP"
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": _sentinel_dom("ok", fp), "final_url": url})
+    monkeypatch.setattr(session, "browser_download",
+                        lambda url, site, dest, **kw: {
+                            "ok": True, "dest": str(dest), "session_profile_used": "mcmaster"})
+
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/90044A203/"})
+    assert out["ok"] is True
+    assert out["sku"] == "90044A203"
+
+
+def test_mcmaster_acquire_login_status_degrades(mcmaster_mods, monkeypatch):
+    # The product-data endpoint reports PromptLoginInd → sentinel data-status="login".
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": _sentinel_dom("login", ""), "final_url": url})
+
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
+    assert out["ok"] is False
+    assert out["reason"] == "login_required"
+
+
+def test_mcmaster_acquire_no_step_model_is_honest(mcmaster_mods, monkeypatch):
+    # A part with no 3-D model → data-status="nofile", no FilePath → no_download_link.
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": _sentinel_dom("nofile", ""), "final_url": url})
+
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
+    assert out["ok"] is False
+    assert out["reason"] == "no_download_link"
+
+
+def test_mcmaster_acquire_picks_first_sku_from_family_table(mcmaster_mods, monkeypatch):
+    # No part_number and a family URL (not a /<PN>/ page): fetch the table and pick
+    # the first concrete part number off it.
+    mcmaster, session = mcmaster_mods
+    table = '<table><span class="part-number">91251A051</span> more 91251A052</table>'
+    fp = "/mvC/Library/CAD2/x/91251A051_Screw.STEP"
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": table})
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda url, site, script, **kw: {
+                            "ok": True, "content": _sentinel_dom("ok", fp), "final_url": url})
+    monkeypatch.setattr(session, "browser_download",
+                        lambda url, site, dest, **kw: {
+                            "ok": True, "dest": str(dest), "session_profile_used": "mcmaster"})
+
+    out = mcmaster.ADAPTER.acquire({
+        "url": "https://www.mcmaster.com/products/socket-head-screws/steel-socket-head-screws~~/",
+        "kind": "family"})
+    assert out["ok"] is True
+    assert out["sku"] == "91251A051"

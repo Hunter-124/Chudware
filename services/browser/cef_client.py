@@ -171,6 +171,23 @@ class CefDaemon:
         """Fetch ``url``'s bytes into ``dest`` under the profile's cookies."""
         return self._call("download", {"url": url, "dest": dest, "profile": profile})
 
+    def interact(self, url: str, script: str, *, sentinel: str = "__aicad_capture",
+                 settle_ms: int = 4000, timeout_ms: int = 12000, profile: str = "",
+                 timeout_s: float = 90.0) -> dict:
+        """Load ``url`` under the warm session, run ``script`` in the page, and wait
+        for a sentinel DOM element (id ``sentinel``) to publish a result. Returns
+        {ok, status, final_url, html} — the caller extracts the sentinel's contents.
+
+        The reusable primitive behind SPA configurators that mint a download URL
+        client-side (McMaster CAD FilePath, Misumi series→SKU): ``script`` drives the
+        page's own controls or fetches a same-origin config endpoint with the page's
+        cookies+headers, then writes the result into ``<... id="sentinel">…</...>``."""
+        return self._call("interact",
+                          {"url": url, "script": script, "sentinel": sentinel,
+                           "settle_ms": settle_ms, "timeout_ms": timeout_ms,
+                           "profile": profile},
+                          timeout_s=timeout_s)
+
     def import_session(self, cookies: list[dict], *, profile: str = "",
                        timeout_s: float = 60.0) -> dict:
         """Inject a cookie jar (exported from the interactive CEF panel) into the

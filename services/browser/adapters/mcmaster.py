@@ -31,18 +31,26 @@ into ``/products/<CATEGORY>/<family-slug>~~/`` — a URL ``acquire`` can fetch t
 real SKU table. Results are typed ``kind="family"`` (a per-SKU configurable
 table, not a single final SKU), mirroring MISUMI's honest ``kind="series"``.
 
-``acquire`` reaching an actual STEP is still expected to be gated: the family
-table's CAD download link is generated client-side after the user selects a
-concrete size/length row (no static ``.step`` href is present in the settled
-family HTML), so ``acquire`` surfaces ``no_download_link`` / login when it can't
-find one — the ``_DOWNLOAD_RE`` remains a best-effort shape for a page that does
-expose a direct link. The ``product-card`` regex is kept as a first pass for the
-rare page that renders SKU cards directly.
+``acquire`` reaches an actual STEP by RESOLVING the client-generated download URL
+(2026-07-11): McMaster mints the CAD ``FilePath`` in the SPA — there is no static
+``.step`` href in the settled HTML. So ``acquire`` drives the page's own JS (via
+``session.browser_interact``) to fetch McMaster's product-data endpoint
+(``/WebParts/Navigate/ProductContent.aspx?partNumber=<PN>`` — same-origin, so the
+browser attaches the login cookies + the ``X-Requested-With`` header the endpoint
+requires; a bare ``CefURLRequest`` 403s without it) and reads the ``"3-D STEP"``
+model's ``FilePath`` out of a sentinel div. That ``FilePath`` IS a cookie-authed
+direct download, so ``browser_download`` fetches it to disk. The concrete SKU is
+the caller's ``part_number``/``sku``, the ``/<PN>/`` URL's segment, or — for a
+``kind="family"`` table — the first configurable part number on the page. Same
+in-page-JS + capture pattern generalises to Misumi/cadenas series→SKU configurators.
+The ``product-card`` regex is kept as a first pass for the rare page that renders
+SKU cards directly.
 """
 from __future__ import annotations
 
 import html
 import re
+import urllib.parse
 
 from .. import session as _session
 from . import (download_dir, is_login_wall, login_required, provenance_envelope,
@@ -95,13 +103,69 @@ _CATEGORY_TILE_RE = re.compile(
 _CATEGORY_NAME_RE = re.compile(
     r'<span[^>]*class="[^"]*category-name[^"]*"[^>]*>(?P<name>[^<]+)</span>', re.IGNORECASE)
 _SKU_RE = re.compile(r'<span[^>]*class="[^"]*part-number[^"]*"[^>]*>(?P<sku>[^<]+)</span>', re.IGNORECASE)
-_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>', re.IGNORECASE)
-_DOWNLOAD_RE = re.compile(
-    r'href="(?P<href>[^"]+\.(?:step|stp|iges|igs)(?:\?[^"]*)?)"', re.IGNORECASE)
+# A concrete McMaster SKU part number, e.g. 90044A203 / 91290A115 (digits, a letter,
+# digits). Used to pick the first configurable row off a family table when the caller
+# didn't name a specific part number.
+_PART_NUMBER_RE = re.compile(r'\b(\d{3,6}[A-Z]\d{2,5})\b')
+# ProductContent.aspx (the SPA's product-data endpoint) returns JSON carrying
+# cadControlData.AvailableCAD.ThreeDDownloads[] = [{DisplayName, FilePath}, …]. The
+# STEP model's FilePath (server-generated, session-scoped) is the real download URL —
+# there is no static .step href on the family/part HTML (it's minted client-side).
+# We prefer the exact "3-D STEP" (with threads), then any .STEP FilePath.
+_PRODUCT_CONTENT_PATH = "/WebParts/Navigate/ProductContent.aspx?partNumber="
+_CAD_STEP_LABEL = "3-D STEP"
+# The sentinel element browser_interact's JS publishes with the captured FilePath.
+_SENTINEL_RE = re.compile(
+    r'id="__aicad_capture"[^>]*\bdata-status="(?P<status>[^"]*)"[^>]*\bdata-fp="(?P<fp>[^"]*)"',
+    re.IGNORECASE)
 
 
 def _strip_tags(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+
+def _part_number_from_url(url: str) -> str:
+    """A McMaster product URL is keyed by the SKU: ``/90044A203/`` → ``90044A203``.
+    Returns "" for family/category/search URLs (which carry no single SKU)."""
+    for seg in reversed(urllib.parse.urlparse(url).path.strip("/").split("/")):
+        m = _PART_NUMBER_RE.fullmatch(seg)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _cad_capture_js(part_number: str) -> str:
+    """Page JS that fetches McMaster's product-data endpoint (same-origin, so the
+    browser attaches the login cookies + the XHR header the endpoint requires) and
+    publishes the "3-D STEP" model's server-generated FilePath into a sentinel div.
+
+    The FilePath is minted per-session and has no static href on the HTML, so this
+    in-page fetch is the only way to reach it — a direct CefURLRequest for the
+    endpoint 403s (it lacks the same-origin XHR header). ``data-status`` reports the
+    outcome (ok | login | nofile | err) so the adapter can degrade honestly."""
+    pn = urllib.parse.quote(part_number)
+    return (
+        "(function(){"
+        "function pub(st,fp){var d=document.createElement('div');"
+        "d.id='__aicad_capture';d.setAttribute('data-status',st);"
+        "d.setAttribute('data-fp',fp||'');d.textContent='done';"
+        "document.documentElement.appendChild(d);}"
+        "try{"
+        "fetch('" + _PRODUCT_CONTENT_PATH + pn + "',"
+        "{credentials:'include',headers:{'X-Requested-With':'XMLHttpRequest'}})"
+        ".then(function(r){return r.text();}).then(function(t){"
+        "if(/PromptLoginInd\"\\s*:\\s*true/.test(t)){pub('login','');return;}"
+        # Scope to the single ThreeDDownloads object whose DisplayName is "3-D STEP",
+        # then pull its FilePath (avoids grabbing the DWG/IGES sibling's path).
+        "var m=t.match(/\\{[^{}]*\"DisplayName\":\"3-D STEP\"[^{}]*\\}/);"
+        "var fp=m&&(m[0].match(/\"FilePath\":\"([^\"]+)\"/)||[])[1];"
+        # Fallbacks: any .STEP FilePath, else the first CAD FilePath present.
+        "if(!fp){var s=t.match(/\"FilePath\":\"([^\"]+\\.STEP)\"/i);fp=s&&s[1];}"
+        "if(fp){pub('ok',fp);}else{pub('nofile','');}"
+        "}).catch(function(e){pub('err','');});"
+        "}catch(e){pub('err','');}"
+        "})();"
+    )
 
 
 class McMasterAdapter:
@@ -174,42 +238,64 @@ class McMasterAdapter:
         if not url:
             return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
 
-        page = _session.browser_fetch(url, SITE)
-        if not page.get("ok"):
-            return page
-        content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
-        if is_login_wall(content, _TERMS_MARKERS):
-            return terms_confirmation_required(
-                SITE, url, "McMaster-Carr requires accepting the CAD download terms for this part")
+        # 1) Determine the concrete SKU part number to download. Caller may name one
+        #    (part_number/sku), it may be encoded in a /<PN>/ product URL, or — for a
+        #    kind="family" table — we pick the first configurable row off the page.
+        part_number = (result.get("part_number") or result.get("sku")
+                       or _part_number_from_url(url))
+        if not part_number:
+            page = _session.browser_fetch(url, SITE)
+            if not page.get("ok"):
+                return page
+            content = page.get("content", "")
+            if is_login_wall(content, _LOGIN_WALL_MARKERS):
+                return login_required(SITE, url)
+            m = _PART_NUMBER_RE.search(content)
+            if not m:
+                return {"ok": False, "reason": "no_sku",
+                        "hint": "no concrete McMaster part number found on this page — "
+                                "pass part_number (e.g. 91290A115) for a specific SKU"}
+            part_number = m.group(1)
 
-        match = _DOWNLOAD_RE.search(content)
-        if not match:
+        # 2) The STEP model URL is minted client-side — no static href exists. Drive
+        #    the page's own JS to fetch the SPA's product-data endpoint (same-origin,
+        #    the browser attaches the login cookies + XHR header) and read out the
+        #    "3-D STEP" FilePath. browser_interact returns the settled DOM with our
+        #    sentinel <div id="__aicad_capture" data-fp="…" data-status="…">.
+        part_url = f"{BASE_URL}/{part_number}/"
+        interact = _session.browser_interact(part_url, SITE, _cad_capture_js(part_number))
+        if not interact.get("ok"):
+            return interact
+        html_dom = interact.get("content", "")
+        if is_login_wall(html_dom, _LOGIN_WALL_MARKERS):
+            return login_required(SITE, part_url)
+
+        cap = _SENTINEL_RE.search(html_dom)
+        status = (cap.group("status") if cap else "") or ""
+        file_path = html.unescape(cap.group("fp")) if cap and cap.group("fp") else ""
+        if status == "login":
+            return login_required(SITE, part_url)
+        if not file_path:
             return {"ok": False, "reason": "no_download_link",
-                    "hint": "could not find a CAD download link on the product page"}
-        download_url = match.group("href")
-        if download_url.startswith("/"):
-            download_url = BASE_URL + download_url
+                    "hint": f"McMaster returned no STEP CAD file for {part_number} "
+                            f"(status={status or 'unknown'}); the part may have no 3-D "
+                            f"model or the session expired — run vendor_login('mcmaster')"}
 
-        sku_match = _SKU_RE.search(content)
-        sku = sku_match.group("sku").strip() if sku_match else result.get("sku")
-        price_match = _PRICE_RE.search(content)
-
-        filename = download_url.rsplit("/", 1)[-1].split("?", 1)[0] or "download.step"
+        download_url = BASE_URL + urllib.parse.quote(file_path)
+        filename = (file_path.rsplit("/", 1)[-1] or f"{part_number}.step")
         dest = download_dir(SITE) / filename
         outcome = _session.browser_download(download_url, SITE, dest)
         if not outcome.get("ok"):
             return outcome
 
         return provenance_envelope(
-            source_url=url,
+            source_url=part_url,
             session_profile_used=outcome.get("session_profile_used", SITE),
             license_note=LICENSE_NOTE,
             artifact_path=outcome["dest"],
-            title=result.get("title", ""),
-            sku=sku,
-            price=("$" + price_match.group("price")) if price_match else None,
+            title=result.get("title", "") or filename,
+            sku=part_number,
+            price=None,
         )
 
 

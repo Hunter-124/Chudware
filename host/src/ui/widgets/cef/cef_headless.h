@@ -54,6 +54,23 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
                                  int settle_ms, int post_wait_ms,
                                  const std::string& profile_dir = "");
 
+// Navigate to `url` under the profile's session, run caller `script` in the main
+// frame (CefFrame::ExecuteJavaScript — render-frame JS, NOT CDP Runtime.evaluate,
+// so the no-automation-tell guarantee holds), and wait for the script to publish a
+// result into a sentinel DOM element with id `sentinel_id`. The script is expected
+// to do its work (drive an SPA control, or fetch a same-origin JSON/config endpoint
+// with the page's own cookies+headers) and, when finished, append/populate an
+// element `<... id="sentinel_id">RESULT</...>`; this call polls the serialized DOM
+// until that element appears (or `timeout_ms` elapses) and returns the final HTML —
+// the caller extracts the sentinel's contents. `settle_ms` is dwell after load
+// before the script runs (default 4000). Unlike login_probe this is a normal
+// capability (no AI_CAD_CEF_PROBE gate, no synthetic mouse) — it is the reusable
+// primitive behind client-generated download URLs on SPA configurators (McMaster
+// CAD FilePath, Misumi/cadenas series→SKU). `profile_dir` as in headless_fetch.
+FetchResult headless_interact(const std::string& url, const std::string& script,
+                              const std::string& sentinel_id, int settle_ms,
+                              int timeout_ms, const std::string& profile_dir = "");
+
 // One cookie to inject into a profile's jar (plain fields — no CEF/JSON types, so
 // the daemon TU can parse the wire jar and this TU can build the CefCookie).
 struct ImportCookie {

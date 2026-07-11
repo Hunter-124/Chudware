@@ -106,6 +106,24 @@ json handle(const std::string& line, bool& stop) {
         const int n = headless_import_cookies(profile, cookies);
         return json{{"id", id}, {"result", {{"ok", n > 0}, {"count", n}}}};
     }
+    // Run caller JS in the page under the warm session and wait for a sentinel DOM
+    // element to publish a result — the reusable primitive for SPA configurators
+    // that generate a download URL client-side (McMaster CAD FilePath, Misumi
+    // series→SKU). params: {url, script, sentinel?, settle_ms?, timeout_ms?, profile?}
+    if (method == "interact") {
+        const std::string url = p.value("url", "");
+        const std::string js = p.value("script", "");
+        if (url.empty() || js.empty()) return err("missing url/script");
+        const std::string sentinel = p.value("sentinel", "__aicad_capture");
+        const int settle = p.value("settle_ms", 4000);
+        const int timeout = p.value("timeout_ms", 12000);
+        const std::string profile = p.value("profile", warm_profile_dir());
+        FetchResult r = headless_interact(url, js, sentinel, settle, timeout, profile);
+        json result = {{"ok", r.ok}, {"status", r.status}, {"final_url", r.final_url},
+                       {"html_len", r.html.size()}};
+        if (r.ok) result["html"] = r.html;
+        return json{{"id", id}, {"result", result}};
+    }
     // DIAGNOSTIC (opt-in AI_CAD_CEF_PROBE): drive a real form login headlessly to
     // observe a bot-wall verdict. Executes caller JS in the page, so it is gated off
     // by default and never part of the normal fetch/download surface.

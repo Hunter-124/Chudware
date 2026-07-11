@@ -737,6 +737,61 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
             "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
 
 
+def browser_interact(url: str, site: str, script: str, *,
+                     sentinel: str = "__aicad_capture",
+                     settle: float = DEFAULT_RENDER_SETTLE_S,
+                     timeout: float = 12.0,
+                     min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
+                     _cef: Any | None = None) -> dict:
+    """Load ``url`` HEADLESS under ``site``'s session, run ``script`` in the page,
+    and return the settled HTML once ``script`` publishes a result into a sentinel
+    DOM element (id ``sentinel``). Same posture as :func:`browser_fetch` (rate limit,
+    profile lock, §6 degradation) — the primitive for SPA configurators whose
+    download URL is generated client-side (an adapter runs page JS to fetch a
+    same-origin config endpoint / drive a control, then reads the sentinel out of the
+    returned ``content``)."""
+    profiles.ensure_profile(site)
+    lock = profiles.profile_lock(site)
+    if not lock.acquire(blocking=False):
+        return _busy(site)
+    try:
+        ceiling = ratelimit.reserve_request(site)
+        if ceiling is not None:
+            return fail(ceiling, f"{site}: per-session request ceiling reached — this run "
+                                 f"has already made the maximum allowed fetches (a "
+                                 f"runaway-loop guard). Nothing was fetched.")
+        ratelimit.wait(site, min_interval=min_interval, url=url)
+        status: int | None = None
+        content = ""
+        try:
+            try:
+                from . import cef_client  # lazy import
+                r = (_cef or cef_client.client()).interact(
+                    url, script, sentinel=sentinel,
+                    settle_ms=int(settle * 1000), timeout_ms=int(timeout * 1000))
+                if not r.get("ok"):
+                    return fail("browser_interact_failed",
+                                f"{site}: CEF interact on {url} did not complete")
+                status = r.get("status") or None
+                content = r.get("html", "")
+            except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
+                return fail("browser_interact_failed", str(exc))
+        finally:
+            ratelimit.note_result(site, status)
+
+        challenge_kind = challenge.classify_challenge(content, url)
+        if challenge_kind:
+            return fail("challenge_page",
+                        f"{site} returned a {challenge_kind} page for {url} — no usable "
+                        f"content")
+        profiles.save_meta(site, last_used_ts=time.time())
+        return {"ok": True, "url": url, "status": status, "content": content,
+                "final_url": r.get("final_url", url), "fetched_ts": now_ts(),
+                "session_profile_used": profiles.slug(site)}
+    finally:
+        lock.release()
+
+
 def browser_download(url: str, site: str, dest: Path, *,
                      min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
                      _cef: Any | None = None) -> dict:

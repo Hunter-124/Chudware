@@ -114,6 +114,11 @@ class _FakeCef:
         self.downloaded.append((url, dest))
         return {"ok": True, "dest": dest}
 
+    def interact(self, url, script, *, sentinel="__aicad_capture",
+                 settle_ms=4000, timeout_ms=12000, profile=""):
+        self.fetched.append(url)
+        return {"ok": True, "status": self._status, "final_url": self._url, "html": self._html}
+
 
 # --- profiles -----------------------------------------------------------------
 
@@ -312,6 +317,30 @@ def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):
     assert cef.fetched[-1] == "https://grabcad.com/part/1"
     # Rate-limit hit was recorded even though this call itself didn't need to wait.
     assert ratelimit.seconds_until_ready("grabcad", min_interval=1000.0) > 0.0
+
+
+def test_browser_interact_returns_settled_dom(browser_mods):
+    profiles, _ratelimit, session = browser_mods
+    profiles.ensure_profile("mcmaster")
+    cef = _FakeCef(html='<div id="__aicad_capture" data-status="ok" data-fp="/x.STEP"></div>')
+    result = session.browser_interact("https://www.mcmaster.com/91290A115/", "mcmaster",
+                                      "js();", _cef=cef, min_interval=0.0)
+    assert result["ok"] is True
+    assert "__aicad_capture" in result["content"]
+    assert cef.fetched == ["https://www.mcmaster.com/91290A115/"]
+
+
+def test_browser_interact_never_raises_on_daemon_error(browser_mods):
+    _profiles, _ratelimit, session = browser_mods
+
+    class _Boom:
+        def interact(self, *a, **k):
+            raise RuntimeError("daemon down")
+
+    result = session.browser_interact("https://www.mcmaster.com/91290A115/", "mcmaster",
+                                      "js();", _cef=_Boom(), min_interval=0.0)
+    assert result["ok"] is False
+    assert result["reason"] == "browser_interact_failed"
 
 
 def test_browser_fetch_never_raises_on_navigation_error(browser_mods):

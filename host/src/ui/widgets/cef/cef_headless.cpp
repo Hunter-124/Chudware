@@ -287,6 +287,81 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
     return out;
 }
 
+namespace {
+// Synchronously (pump-until-done) serialize the main frame's post-JS DOM.
+std::string get_source_sync(const CefRefPtr<FetchClient>& client) {
+    if (!client || !client->browser()) return {};
+    CefRefPtr<CefFrame> frame = client->browser()->GetMainFrame();
+    if (!frame) return {};
+    CefRefPtr<SourceVisitor> visitor = new SourceVisitor();
+    frame->GetSource(visitor);
+    for (int i = 0; i < 200 && !visitor->done(); ++i) pump(10);
+    return visitor->done() ? visitor->html() : std::string{};
+}
+}  // namespace
+
+FetchResult headless_interact(const std::string& url, const std::string& script,
+                              const std::string& sentinel_id, int settle_ms,
+                              int timeout_ms, const std::string& profile_dir) {
+    FetchResult out;
+    if (!initialized()) return out;
+
+    CefRefPtr<FetchClient>& client = browser_pool()[profile_dir];
+    if (!client) {
+        client = new FetchClient();
+        CefWindowInfo window_info;
+        window_info.SetAsWindowless(0);
+        CefBrowserSettings settings;
+        settings.windowless_frame_rate = 30;
+        if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings,
+                                           nullptr, make_context(profile_dir))) {
+            browser_pool().erase(profile_dir);
+            return out;
+        }
+        for (int i = 0; i < 500 && !client->created(); ++i) pump(20);
+        if (!client->created()) { browser_pool().erase(profile_dir); return out; }
+    }
+
+    client->navigate(url);
+    for (int i = 0; i < 500 && !client->loaded(); ++i) pump(20);
+    if (!client->loaded()) return out;
+
+    // Mark the windowless browser visible/focused so visibility-gated SPA code runs
+    // (document.visibilityState='visible'), then let the page settle before the
+    // caller script fires. No synthetic mouse — this is not a bot-score probe.
+    if (CefRefPtr<CefBrowser> b = client->browser()) {
+        b->GetHost()->WasHidden(false);
+        b->GetHost()->SetFocus(true);
+    }
+    if (settle_ms > 0) pump(settle_ms);
+
+    client->runJs(script);
+
+    // Poll the serialized DOM until the caller's sentinel element appears (its
+    // presence is the "script finished" signal — the script must create/populate it
+    // only when its result is ready), or the timeout elapses. Async work in the
+    // script (fetch to a config endpoint) completes within this window.
+    const std::string needle = "id=\"" + sentinel_id + "\"";
+    std::string html;
+    const int budget = timeout_ms > 0 ? timeout_ms : 12000;
+    const int slices = budget / 300;
+    for (int i = 0; i < slices; ++i) {
+        pump(300);
+        html = get_source_sync(client);
+        if (!sentinel_id.empty() && html.find(needle) != std::string::npos) break;
+    }
+    if (html.empty()) html = get_source_sync(client);
+
+    if (client->browser()) {
+        out.ok = true;
+        out.html = html;
+        out.status = client->status();
+        if (CefRefPtr<CefFrame> f = client->browser()->GetMainFrame())
+            out.final_url = f->GetURL().ToString();
+    }
+    return out;
+}
+
 void headless_close_all() {
     for (auto& [profile, client] : browser_pool())
         if (client && client->browser()) client->browser()->GetHost()->CloseBrowser(true);

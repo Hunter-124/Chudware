@@ -80,6 +80,9 @@ private:
     void touch();
     bool idleExpired(int lingerSecs);
     void staleBinaryTick();
+    // Doc-GC: retire `docId` to the autosave orphan tier and close it in the
+    // engine (grace expired with no attached client — see DocRegistry::tick).
+    void gcCloseDoc(const std::string& docId);
     void sendEventTo(int clientId, const std::string& line);
     void sendEventToAll(const std::string& line);
 

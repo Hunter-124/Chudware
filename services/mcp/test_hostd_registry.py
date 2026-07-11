@@ -347,6 +347,149 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     assert cad_tools._resolve_alias(doc) == new_id
 
 
+# --------------------------------------------- doc lifecycle (GC + orphan tier)
+
+
+def _wait_daemon_gone(pid: int, timeout: float = 20.0) -> bool:
+    """True once `pid` no longer runs. A detached hostd whose parent is this
+    pytest process lingers as a zombie after exit — treat state Z as gone."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().split(")")[-1].split()[0] == "Z":
+                    return True
+        except OSError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_clean_shutdown_retires_docs_no_autorecover(scratch_daemon):
+    """A cleanly shut down daemon must NOT auto-resurrect its open docs on the
+    next start — they land in the orphan tier behind an explicit recovery_open."""
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "retire-me"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+
+    assert a.call("daemon_drain", {}).get("ok") is True
+    a.close()  # last client gone -> drained daemon exits, retiring open docs
+    assert _wait_daemon_gone(pid), "drained daemon did not exit"
+
+    b = DaemonClient()
+    b.connect()  # fresh daemon
+    pid2 = _pid(b)
+    assert pid2 != pid
+    scratch_daemon.append(pid2)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if b.call("daemon_status").get("recovery") == "done":
+            break
+        time.sleep(0.2)
+
+    # No crash -> no auto-recovery; the doc is NOT open...
+    info = b.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
+    assert not (info.get("id_remap") or {}), info.get("id_remap")
+    names = [d["name"] for d in b.call("doc_list", {})["docs"]]
+    assert "retire-me" not in names, names
+    # ...but it IS waiting in the orphan tier, and recovery_open restores it.
+    entries = b.call("recovery_list", {}).get("entries") or []
+    assert any(e.get("name") == "retire-me" for e in entries), entries
+    opened = b.call("recovery_open", {"all": True}).get("opened") or []
+    assert opened, "recovery_open restored nothing"
+    names = [d["name"] for d in b.call("doc_list", {})["docs"]]
+    assert "retire-me" in names, names
+    # Consumed: a second recovery_open must not duplicate it.
+    assert b.call("recovery_list", {}).get("entries") == []
+
+
+def test_doc_close_kills_autosave_artifact(scratch_daemon):
+    """Explicitly closed docs stay closed: even a hard crash right after
+    doc_close must not resurrect the doc (its autosave artifact is deleted)."""
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "closed-for-good"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    time.sleep(2.5)  # AI_CAD_AUTOSAVE_INTERVAL_S=1 -> the autosave file exists
+    assert a.call("doc_close", {"doc_id": doc}).get("_is_error") is None
+
+    os.kill(pid, signal.SIGKILL)  # crash AFTER the close
+    time.sleep(0.3)
+
+    b = DaemonClient()
+    b.connect()
+    scratch_daemon.append(_pid(b))
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if b.call("daemon_status").get("recovery") == "done":
+            break
+        time.sleep(0.2)
+    info = b.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
+    assert doc not in (info.get("id_remap") or {}), "closed doc resurrected"
+    names = [d["name"] for d in b.call("doc_list", {})["docs"]]
+    assert "closed-for-good" not in names, names
+    entries = b.call("recovery_list", {}).get("entries") or []
+    assert not any(e.get("name") == "closed-for-good" for e in entries), entries
+
+
+def test_doc_gc_closes_abandoned_docs(scratch_daemon, monkeypatch):
+    """A doc whose every client disconnected is retired + closed after the GC
+    grace — zombie docs never pile up behind dead agent sessions."""
+    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    b.connect()  # keeps the daemon alive past a's disconnect
+    b.call("subscribe", {"doc_ids": "*"})
+    doc = a.call("doc_new", {"name": "abandoned"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    a.close()  # only client attached to the doc goes away
+
+    deadline = time.monotonic() + 20
+    gone = False
+    while time.monotonic() < deadline:
+        ids = [d["doc_id"] for d in b.call("doc_list", {})["docs"]]
+        if doc not in ids:
+            gone = True
+            break
+        time.sleep(0.5)
+    assert gone, "GC never closed the abandoned doc"
+    # Subscribers heard about it...
+    evts = _events(b, "doc.closed")
+    assert any(e.get("data", {}).get("doc_id") == doc and
+               e.get("data", {}).get("reason") == "gc" for e in evts), evts
+    # ...and the work is recoverable, not lost.
+    entries = b.call("recovery_list", {}).get("entries") or []
+    assert any(e.get("name") == "abandoned" for e in entries), entries
+
+
+def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
+    """A doc still attached by ANY client (e.g. a GUI mirror tab) is never GC'd
+    when another client disconnects."""
+    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "still-watched"})["doc_id"]
+    assert b.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
+    a.close()
+
+    time.sleep(3.0)  # well past the 1 s grace
+    ids = [d["doc_id"] for d in b.call("doc_list", {})["docs"]]
+    assert doc in ids, "GC closed a doc that still had a viewer attached"
+
+
 def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
     monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
     from mcp_server import cad_tools

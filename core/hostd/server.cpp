@@ -155,7 +155,10 @@ void Server::run(int lingerSecs) {
             c->thread = std::thread([this, c] { clientLoop(c); });
             log().line("client #%d connected (%d total)", c->id, status_.clients.load());
         }
-        registry_.tick();  // expire stale edit-holds + emit doc.lease_change
+        // Expire stale edit-holds + emit doc.lease_change; docs whose GC grace
+        // expired with no attached client are retired + closed here so dead
+        // sessions can never pile zombie docs into the shared engine.
+        for (const std::string& id : registry_.tick()) gcCloseDoc(id);
         staleBinaryTick();  // mtime watch on hostd binary + libaicad (self-drain)
         if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
         if (idleExpired(lingerSecs)) {
@@ -168,6 +171,50 @@ void Server::run(int lingerSecs) {
     // saved state postdates the last agent edit. Daemon SIGKILL is covered by
     // each child's PDEATHSIG.
     children_.shutdown();
+}
+
+void Server::gcCloseDoc(const std::string& docId) {
+    if (status_.engineState.load() != 1) return;
+    // Save-before-close: the doc goes to the autosave orphan tier so the work
+    // stays recoverable (recovery_list / recovery_open) without ever
+    // auto-reopening. Clean docs that live in a user file skip the copy.
+    json docs;
+    std::string err;
+    std::string name = docId;
+    bool needRetire = true;
+    if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
+        docs.is_object() && docs.contains("docs")) {
+        bool found = false;
+        for (const auto& d : docs["docs"]) {
+            if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
+            found = true;
+            name = d.value("name", docId);
+            const std::string path = d.contains("path") && d["path"].is_string()
+                                         ? d["path"].get<std::string>()
+                                         : std::string();
+            // Only a CLEAN doc backed by a real user file skips the orphan
+            // copy; a path inside the autosave tree is our own artifact.
+            needRetire = path.empty() || d.value("dirty", false) ||
+                         (autosave_ && autosave_->isAutosavePath(path));
+            break;
+        }
+        if (!found) {  // already gone from the engine — just drop registry state
+            registry_.onDaemonClosedDoc(docId, "gc");
+            return;
+        }
+    }
+    if (needRetire && autosave_ && !autosave_->retireDoc(docId, name)) {
+        log().line("doc-gc: keeping %s open (retire failed)", docId.c_str());
+        return;  // never close a doc we could not preserve
+    }
+    json result;
+    if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err)) {
+        log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
+        return;
+    }
+    registry_.onDaemonClosedDoc(docId, "gc");
+    log().line("doc-gc: closed orphaned doc %s (%s)%s", docId.c_str(), name.c_str(),
+               needRetire ? " — recoverable via recovery_list" : "");
 }
 
 void Server::clientLoop(std::shared_ptr<ClientConn> c) {
@@ -215,7 +262,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"state", stateNames[status_.engineState.load()]},
                     // Autosave-recovery rebind map (empty until recovery ran;
                     // daemon_status.recovery tells clients when to re-hello).
-                    {"id_remap", autosave_ ? autosave_->idRemap() : json::object()}};
+                    {"id_remap", autosave_ ? autosave_->idRemap() : json::object()},
+                    // Retired docs awaiting an explicit recovery_open/discard —
+                    // the GUI prompts the user when this is non-zero.
+                    {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
     if (method == "daemon_status") {
@@ -228,6 +278,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                 {"recovery", !autosave_                  ? "off"
                              : autosave_->recoveryDone() ? "done"
                                                          : "pending"},
+                {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0},
                 {"pid", selfPid()}};
         children_.statusInto(st);  // children count + mission ids
         return st;
@@ -245,6 +296,63 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         status_.draining = true;
         log().line("drain requested by client #%d", c.id);
         return json{{"ok", true}};
+    }
+
+    // Orphan-tier recovery (docs retired by clean shutdown / doc-GC — never
+    // auto-opened; the user or agent decides).
+    if (method == "recovery_list") {
+        if (!autosave_) return json{{"entries", json::array()}};
+        return autosave_->recoveryList();
+    }
+    if (method == "recovery_discard") {
+        if (!autosave_) return json{{"discarded", 0}};
+        const bool all = params.value("all", false);
+        const std::string id = params.value("id", std::string());
+        if (!all && id.empty()) {
+            isError = true;
+            return json{{"code", "invalid_params"},
+                        {"message", "pass {\"id\": ...} or {\"all\": true}"}};
+        }
+        return json{{"discarded", autosave_->discardOrphans(all ? "" : id)}};
+    }
+    if (method == "recovery_open") {
+        if (status_.engineState.load() != 1) {
+            isError = true;
+            return json{{"code", "loading"}, {"message", "engine is still loading; retry"}};
+        }
+        if (!autosave_) return json{{"opened", json::array()}};
+        std::vector<std::string> ids;
+        if (params.value("all", false)) {
+            const json list = autosave_->recoveryList();
+            for (const auto& e : list["entries"]) ids.push_back(e.value("id", std::string()));
+        } else if (params.contains("id") && params["id"].is_string()) {
+            ids.push_back(params["id"].get<std::string>());
+        }
+        if (ids.empty()) {
+            isError = true;
+            return json{{"code", "invalid_params"},
+                        {"message", "pass {\"id\": ...} or {\"all\": true}"}};
+        }
+        json opened = json::array();
+        for (const std::string& id : ids) {
+            const std::string path = autosave_->orphanPath(id);
+            if (path.empty()) continue;
+            json result;
+            std::string err;
+            json p2 = json{{"path", path}};
+            if (!core::cpp_core().call("doc_open", p2, result, err)) {
+                log().line("recovery_open: doc_open(%s) failed: %s", path.c_str(),
+                           err.c_str());
+                continue;
+            }
+            // Route through the registry so the caller attaches rw and every
+            // mirror gets doc.opened — same envelope as a client doc_open.
+            registry_.postCall(c.id, c.kind, "doc_open", p2, result);
+            autosave_->discardOrphans(id);  // consumed — it lives in the engine now
+            opened.push_back(json{{"id", id},
+                                  {"doc_id", result.value("doc_id", std::string())}});
+        }
+        return json{{"opened", opened}};
     }
 
     // Agent child supervision (agent_spawn/agent_stop/agent_list) — daemon
@@ -304,6 +412,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
     registry_.postCall(c.id, c.kind, method, p, result);
+    // Closed means closed: an explicit doc_close deletes the doc's autosave
+    // artifacts so it can never resurrect on the next daemon start.
+    if (method == "doc_close" && autosave_)
+        autosave_->onDocClosed(p.value("doc_id", std::string()));
     if (!attachWarning.empty() && result.is_object() && !result.contains("warning"))
         result["warning"] = attachWarning;
     return result;

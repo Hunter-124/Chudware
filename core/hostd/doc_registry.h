@@ -75,12 +75,19 @@ public:
                   const nlohmann::json& params, nlohmann::json& result);
 
     // Client disconnected: drop its attachments/holds/subscriptions and notify
-    // remaining subscribers (doc.lease_change).
+    // remaining subscribers (doc.lease_change). Docs left with NO attached
+    // client start the doc-GC grace countdown (AICAD_DOC_GC_GRACE_S, default
+    // 90 s; AICAD_DOC_GC=0 disables) — swept by tick().
     void onDisconnect(int clientId, const std::string& kind);
 
     // Periodic housekeeping from the accept loop (~every 500 ms): expire stale
-    // edit-holds and emit doc.lease_change for them.
-    void tick();
+    // edit-holds (doc.lease_change) and return doc ids whose GC grace expired
+    // with still no attached client. The Server retires + closes those.
+    std::vector<std::string> tick();
+
+    // A doc the daemon itself closed (GC): drop registry state + fan out
+    // doc.closed with the given reason so mirrors drop their tabs.
+    void onDaemonClosedDoc(const std::string& docId, const std::string& reason);
 
 private:
     struct Attach {
@@ -100,6 +107,9 @@ private:
         int lastWriterClient = -1;
         std::string lastWriterKind;
         std::string lastWriterMethod;
+        // Doc-GC: when > 0, no client is attached and the doc closes once this
+        // deadline passes without a new attach (zombie-doc prevention).
+        long long orphanDeadlineMs = 0;
     };
     struct PendingEvent {
         int target;
@@ -109,6 +119,9 @@ private:
     static bool isReadOnlyMethod(const std::string& method);
     static long sniffRevision(const nlohmann::json& result);
     int holdSecs() const;
+    // Start/refresh the GC countdown when `d` has no attachments; clear it when
+    // it does. No-op when doc-GC is disabled.
+    static void updateOrphanDeadlineLocked(DocState& d);
     int rwCountLocked(const DocState& d) const;
     // Queue an event for every subscriber of `docId` except `exceptClient`.
     void fanoutLocked(const std::string& docId, const nlohmann::json& evt, int exceptClient,

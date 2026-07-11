@@ -76,6 +76,30 @@ int DocRegistry::holdSecs() const {
     return 120;
 }
 
+// Doc-GC knobs. Grace default 90 s: long enough for the GUI to adopt a doc a
+// disconnecting agent just minted (and for quick app relaunches), short enough
+// that zombie docs never pile up behind dead sessions.
+static long long gcGraceMs() {
+    static const long long ms = [] {
+        if (const char* v = std::getenv("AICAD_DOC_GC"); v && *v && std::atoi(v) == 0)
+            return -1LL;  // disabled
+        if (const char* v = std::getenv("AICAD_DOC_GC_GRACE_S"); v && *v)
+            return (long long)std::max(1, std::atoi(v)) * 1000;
+        return 90'000LL;
+    }();
+    return ms;
+}
+
+void DocRegistry::updateOrphanDeadlineLocked(DocState& d) {
+    if (!d.attach.empty()) {
+        d.orphanDeadlineMs = 0;
+        return;
+    }
+    const long long grace = gcGraceMs();
+    if (grace < 0) return;                                   // GC disabled
+    if (d.orphanDeadlineMs == 0) d.orphanDeadlineMs = monoMs() + grace;
+}
+
 int DocRegistry::rwCountLocked(const DocState& d) const {
     int n = 0;
     for (const auto& [id, a] : d.attach)
@@ -115,11 +139,36 @@ void DocRegistry::expireHoldLocked(const std::string& docId, DocState& d,
     d.hold = Hold{};
 }
 
-void DocRegistry::tick() {
+std::vector<std::string> DocRegistry::tick() {
+    std::vector<PendingEvent> pending;
+    std::vector<std::string> expired;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const long long now = monoMs();
+        for (auto& [id, d] : docs_) {
+            expireHoldLocked(id, d, pending);
+            // GC sweep: re-check emptiness at expiry — an attach since the
+            // countdown started clears the deadline in updateOrphanDeadlineLocked.
+            if (d.orphanDeadlineMs > 0 && now >= d.orphanDeadlineMs && d.attach.empty())
+                expired.push_back(id);
+        }
+    }
+    flush(pending);
+    return expired;
+}
+
+void DocRegistry::onDaemonClosedDoc(const std::string& docId, const std::string& reason) {
     std::vector<PendingEvent> pending;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        for (auto& [id, d] : docs_) expireHoldLocked(id, d, pending);
+        auto it = docs_.find(docId);
+        if (it == docs_.end()) return;
+        json evt = {{"event", "doc.closed"},
+                    {"data", {{"doc_id", docId},
+                              {"reason", reason},
+                              {"source_kind", "daemon"}}}};
+        fanoutLocked(docId, evt, /*exceptClient=*/-1, pending);
+        docs_.erase(it);
     }
     flush(pending);
 }
@@ -155,6 +204,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                 Attach& a = d.attach[clientId];
                 a.mode = mode;
                 if (a.lastSeenRev < 0) a.lastSeenRev = d.revision;
+                updateOrphanDeadlineLocked(d);
                 result = json{{"ok", true}, {"mode", mode}, {"revision", d.revision}};
                 if (!otherWriter.empty()) {
                     // Multi-editor is discouraged, not prohibited (plan): SUCCEED
@@ -170,6 +220,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                 const bool wasRw = ait != d.attach.end() && ait->second.mode == "rw";
                 if (ait != d.attach.end()) d.attach.erase(ait);
                 if (d.hold.active && d.hold.clientId == clientId) d.hold = Hold{};
+                updateOrphanDeadlineLocked(d);
                 if (wasRw && rwCountLocked(d) == 0) {
                     // Last writer left: viewers should treat their mirror as final.
                     json evt = {{"event", "doc.closed"},
@@ -280,6 +331,7 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
                     Attach& a = d.attach[clientId];
                     a.mode = "rw";
                     if (a.lastSeenRev < 0) a.lastSeenRev = d.revision;
+                    updateOrphanDeadlineLocked(d);
                     ait = d.attach.find(clientId);
                 }
                 // Overlap CAS — only when the doc actually has >1 writer, so the
@@ -354,6 +406,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
             // The client whose call minted the doc gets rw implicitly.
             Attach& a = d.attach[clientId];
             a.mode = "rw";
+            updateOrphanDeadlineLocked(d);
             a.lastSeenRev = rev;
             d.revision = rev;
             d.lastWriterClient = clientId;
@@ -374,6 +427,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
         // another client advanced the doc since this client's last touch, say so
         // in the result envelope (cad_tools turns it into a tool-output note).
         Attach& a = d.attach[clientId];  // observer entry (mode "") for pure readers
+        updateOrphanDeadlineLocked(d);   // any live touch resets the GC countdown
         if (result.is_object() && a.lastSeenRev >= 0 && d.revision > a.lastSeenRev &&
             d.lastWriterClient != clientId && d.lastWriterClient != -1) {
             result["_foreign_edits"] = json::array({json{
@@ -425,6 +479,7 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
             const bool wasRw = ait != d.attach.end() && ait->second.mode == "rw";
             if (heldHere) d.hold = Hold{};
             if (ait != d.attach.end()) d.attach.erase(ait);
+            updateOrphanDeadlineLocked(d);
             if (heldHere || wasRw) {
                 json evt = {{"event", "doc.lease_change"},
                             {"data", {{"doc_id", docId},

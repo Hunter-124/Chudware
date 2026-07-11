@@ -900,15 +900,50 @@ def _recover_via_daemon() -> list:
     return out
 
 
-def recover_autosaved(scope: str = "recent") -> list:
+def _recover_orphans_via_daemon() -> list:
+    """Open the daemon's orphan-tier docs (retired by clean shutdown / doc-GC —
+    never auto-opened; see core/hostd/autosave.h). Only called from the explicit
+    recover_parts tool, never at startup. Best-effort; never raises."""
+    out: list = []
+    try:
+        from . import daemon_bridge
+        c = daemon_bridge.client()
+        entries = (c.call("recovery_list") or {}).get("entries") or []
+        if not entries:
+            return out
+        opened = (c.call("recovery_open", {"all": True}) or {}).get("opened") or []
+        names = {e.get("id"): e for e in entries if isinstance(e, dict)}
+        for o in opened:
+            if not isinstance(o, dict):
+                continue
+            meta = names.get(o.get("id"), {})
+            new_id = o.get("doc_id") or ""
+            old_id = meta.get("doc_id") or ""
+            if old_id and new_id and old_id != new_id:
+                _DOC_ALIASES[old_id] = new_id
+            out.append({"path": meta.get("path"), "doc_id": new_id,
+                        "name": meta.get("name", ""), "original_doc_id": old_id})
+            if new_id:
+                _CUR["doc_id"] = new_id
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> list:
     """Reopen autosaved .step+ docs into the engine. A reopened doc gets a FRESH doc_id;
     returns [{path, doc_id, name, original_doc_id}] for the ones that loaded.
 
     scope="recent" (default): only the SINGLE most-recent prior session's docs — the
     crash we're recovering from — never the whole history. scope="all": every autosave.
-    Prunes stale autosaves first. Called at server startup and by recover_parts."""
+    include_orphaned (daemon mode): also open the daemon's retired docs (clean-shutdown /
+    doc-GC orphans) — only the explicit recover_parts tool passes this; startup never
+    resurrects retired docs. Prunes stale autosaves first."""
     if cb._daemon_mode():
-        return _recover_via_daemon()
+        out = _recover_via_daemon()
+        if include_orphaned:
+            out.extend(_recover_orphans_via_daemon())
+        return out
     _prune_autosaves()
     out: list = []
     try:
@@ -4742,12 +4777,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         By default this recovers ONLY the most-recent prior session's parts (the one that was
         dropped) — not the entire autosave history, so you don't drag in unrelated old docs.
-        Pass all=True to reach every autosaved part. Each entry returns its fresh `doc_id` plus
-        the saved `name` and `original_doc_id` so you can re-map old handles. Stale autosaves
-        (older than AI_CAD_AUTOSAVE_MAX_AGE_DAYS, default 7) are pruned automatically.
+        Pass all=True to reach every autosaved part. In daemon mode this also reopens parts the
+        daemon retired (unclosed docs from ended sessions — they were saved and closed instead of
+        lingering forever; nothing reopens them except this call or the GUI's recovery prompt).
+        Each entry returns its fresh `doc_id` plus the saved `name` and `original_doc_id` so you
+        can re-map old handles. Stale autosaves (older than AI_CAD_AUTOSAVE_MAX_AGE_DAYS,
+        default 7) are pruned automatically.
         """
         try:
-            recovered = recover_autosaved(scope="all" if all else "recent")
+            recovered = recover_autosaved(scope="all" if all else "recent",
+                                          include_orphaned=True)
             return _dumps({"ok": True, "recovered": recovered, "count": len(recovered),
                            "scope": "all" if all else "recent"})
         except Exception as e:  # noqa: BLE001

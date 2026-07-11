@@ -5,7 +5,9 @@
 
 #include "ipc_transport.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 
@@ -33,10 +35,10 @@ IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
     if (this != &o) {
         close();
         fd_ = o.fd_;
-        eof_ = o.eof_;
+        eof_.store(o.eof_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         readBuf_ = std::move(o.readBuf_);
         o.fd_ = -1;
-        o.eof_ = false;
+        o.eof_.store(false, std::memory_order_relaxed);
         o.readBuf_.clear();
     }
     return *this;
@@ -73,7 +75,7 @@ bool IpcConn::readLine(std::string& line, int timeoutMs) {
         int pr = ::poll(&pfd, 1, wait);
         if (pr < 0) {
             if (errno == EINTR) continue;
-            eof_ = true;
+            eof_.store(true, std::memory_order_release);
             return false;
         }
         if (pr == 0) return false;  // timeout (incl. the 0 ms non-blocking probe)
@@ -83,7 +85,7 @@ bool IpcConn::readLine(std::string& line, int timeoutMs) {
         if (got > 0) {
             readBuf_.append(buf, (size_t)got);
         } else if (got == 0 || (errno != EINTR && errno != EAGAIN)) {
-            eof_ = true;  // peer closed (a buffered partial line without \n is dropped)
+            eof_.store(true, std::memory_order_release);  // peer closed (partial line dropped)
             if (got == 0 && readBuf_.find('\n') == std::string::npos) return false;
         }
     }
@@ -101,7 +103,14 @@ bool IpcConn::writeLine(const std::string& line) {
         } else if (errno == EINTR) {
             continue;
         } else {
-            eof_ = true;
+            // A slow/wedged peer whose recv buffer is full makes write() block;
+            // accepted daemon sockets carry SO_SNDTIMEO so that surfaces here as
+            // EAGAIN/EWOULDBLOCK instead of an unbounded hang. Either way the
+            // stream is now desynced (a partial line may have gone out), so the
+            // connection is dead: flag EOF (the owning client loop tears it down)
+            // and fail. This is the backstop that stops one stuck GUI from
+            // stalling event fanout to every other client — see Server fanout.
+            eof_.store(true, std::memory_order_release);
             return false;
         }
     }
@@ -176,7 +185,23 @@ IpcConn IpcListener::accept(int timeoutMs) {
     int pr = ::poll(&pfd, 1, timeoutMs);
     if (pr <= 0) return IpcConn();
     int c = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
-    return c >= 0 ? IpcConn(c) : IpcConn();
+    if (c < 0) return IpcConn();
+    // Bound every write to this client. Without it, a client whose recv buffer
+    // fills (a busy/wedged GUI under a heavy multi-agent event stream) makes the
+    // daemon's write() block forever — and event fanout runs on the acting
+    // client's dispatch thread and on the accept loop (tick flush), so ONE stuck
+    // consumer could stall the whole daemon. On timeout the write fails
+    // (EAGAIN) and the connection is dropped. Configurable; 0 disables.
+    static const int sndTimeoutS = [] {
+        if (const char* s = std::getenv("AICAD_HOSTD_WRITE_TIMEOUT_S"); s && *s)
+            return std::max(0, std::atoi(s));
+        return 10;  // headroom for a merely-busy GUI; a dropped client reconnects
+    }();
+    if (sndTimeoutS > 0) {
+        struct timeval tv{sndTimeoutS, 0};
+        ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+    return IpcConn(c);
 }
 
 std::string IpcListener::releasePath() {

@@ -50,8 +50,12 @@ void Server::sendEventToAll(const std::string& line) {
         for (auto& [id, c] : clients_) live.push_back(c);
     }
     for (auto& c : live) {
-        std::lock_guard<std::mutex> wlk(c->writeMtx);
-        c->conn.writeLine(line);
+        // try_lock, never block: a client mid-write (its own response, or another
+        // fanout) must not stall event delivery to everyone else. A busy client
+        // simply misses this push — it re-syncs on its next reconnect (which now
+        // re-subscribes + re-lists). Same rationale as sendEventTo.
+        std::unique_lock<std::mutex> wlk(c->writeMtx, std::try_to_lock);
+        if (wlk.owns_lock()) c->conn.writeLine(line);
     }
 }
 
@@ -63,8 +67,13 @@ void Server::sendEventTo(int clientId, const std::string& line) {
         if (it == clients_.end()) return;
         c = it->second;
     }
-    std::lock_guard<std::mutex> wlk(c->writeMtx);  // interleaves with response writes
-    c->conn.writeLine(line);
+    // try_lock (not lock_guard): if the client is mid-write we skip this push
+    // rather than block the caller — event fanout runs on OTHER clients' dispatch
+    // threads and on the accept loop, so blocking here on one wedged consumer
+    // would stall unrelated work. The bounded SO_SNDTIMEO write is the second
+    // backstop once we DO hold the lock.
+    std::unique_lock<std::mutex> wlk(c->writeMtx, std::try_to_lock);
+    if (wlk.owns_lock()) c->conn.writeLine(line);
 }
 
 std::string Server::detachSocketForFlockRelease() {

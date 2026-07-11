@@ -14,6 +14,7 @@
 // (core/hostd) and every C++ client (GUI DaemonConn, tests) compile these sources.
 #pragma once
 
+#include <atomic>
 #include <string>
 
 namespace aicad_ipc {
@@ -52,7 +53,7 @@ public:
     // lives in the protocol layer, where response writes and event pushes meet).
     bool writeLine(const std::string& line);
 
-    bool eof() const { return eof_; }
+    bool eof() const { return eof_.load(std::memory_order_acquire); }
     void close();
 #ifndef _WIN32
     int fd() const { return fd_; }
@@ -65,7 +66,10 @@ private:
 #else
     int fd_ = -1;
 #endif
-    bool eof_ = false;
+    // Written by writeLine on a foreign thread (event fanout) when a bounded
+    // write fails, read by readLine on the owning client-loop thread — atomic so
+    // that cross-thread signal is a clean handoff rather than a data race.
+    std::atomic<bool> eof_{false};
     std::string readBuf_;
 };
 

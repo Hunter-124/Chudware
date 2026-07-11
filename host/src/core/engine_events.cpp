@@ -274,6 +274,12 @@ bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
                 openMirrorTab(st, id);
             }
         }
+        // Breadcrumb for the "parts didn't show up" report: live docs mirror as
+        // tabs immediately; anything not here but flagged by checkOrphanRecovery
+        // below was already retired to the orphan tier (agent session ended >GC
+        // grace ago) and needs the recovery prompt.
+        st.addLog("[daemon] bootstrap: " + std::to_string(liveIds.size()) +
+                  " live doc(s) mirrored");
         // Reconnect reconciliation: after a drain-replace we re-mirror the NEW
         // daemon's docs above, but mirror tabs for docs that were open in the OLD
         // daemon and are gone now would linger forever (no doc.closed arrives — a
@@ -339,6 +345,15 @@ void engineEventsTick(AppState& st) {
             applyChangedActive(st, activeId, d);
         }
     }
+}
+
+void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds) {
+    if (!engine::daemonMode() || !engine::client()) return;
+    // openMirrorTab is the same path bootstrap's doc_list uses for live docs:
+    // it dedups against already-open tabs, attaches ro, and focuses the first
+    // reveal. Recovered docs are minted with a fresh doc_id, so none are open yet.
+    for (const auto& id : docIds)
+        if (!id.empty()) openMirrorTab(st, id);
 }
 
 }  // namespace core

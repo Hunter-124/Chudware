@@ -404,6 +404,11 @@ def test_clean_shutdown_retires_docs_no_autorecover(scratch_daemon):
     assert any(e.get("name") == "retire-me" for e in entries), entries
     opened = b.call("recovery_open", {"all": True}).get("opened") or []
     assert opened, "recovery_open restored nothing"
+    # Each opened entry MUST carry the newly-minted doc_id: the GUI mirrors tabs
+    # for the recovered docs from this return value (the daemon's doc.opened
+    # fanout excludes the caller), so a missing doc_id means recovered parts only
+    # surface on the next app launch. See host mirrorRecoveredDocs.
+    assert all(isinstance(o.get("doc_id"), str) and o["doc_id"] for o in opened), opened
     names = [d["name"] for d in b.call("doc_list", {})["docs"]]
     assert "retire-me" in names, names
     # Consumed: a second recovery_open must not duplicate it.

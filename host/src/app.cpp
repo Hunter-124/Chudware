@@ -3427,10 +3427,21 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                         nlohmann::json r;
                         std::string e;
                         if (c->call("recovery_open", nlohmann::json{{"all", true}}, r, e)) {
-                            const int n = (r.is_object() && r.contains("opened") &&
-                                           r["opened"].is_array())
-                                              ? (int)r["opened"].size()
-                                              : s_recoveryCount;
+                            // The daemon minted a fresh doc for each recovered
+                            // orphan and returned their doc_ids in `opened`. Its
+                            // doc.opened fanout EXCLUDES us (the caller), so mirror
+                            // the tabs here from the return value — otherwise the
+                            // recovered parts only surface on the next app launch.
+                            std::vector<std::string> ids;
+                            if (r.is_object() && r.contains("opened") &&
+                                r["opened"].is_array()) {
+                                for (const auto& o : r["opened"])
+                                    if (o.is_object() && o.contains("doc_id") &&
+                                        o["doc_id"].is_string())
+                                        ids.push_back(o["doc_id"].get<std::string>());
+                            }
+                            core::mirrorRecoveredDocs(st, ids);
+                            const int n = ids.empty() ? s_recoveryCount : (int)ids.size();
                             st.toast(ui::ToastLevel::Info,
                                      "Recovered " + std::to_string(n) + " part" +
                                          (n == 1 ? "" : "s"));

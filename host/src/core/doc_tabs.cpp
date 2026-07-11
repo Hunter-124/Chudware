@@ -11,6 +11,7 @@
 // Safety: switching/closing first cleanly exits any in-progress sketch and cancels any open
 // PropertyManager form so no half-edited state leaks across documents (the "zombie state" the tree
 // and forms must never carry between docs).
+#include <set>
 #include <string>
 
 #include "app_state.h"
@@ -69,6 +70,11 @@ static std::string jtab(const nlohmann::json& o, const char* k) {
     auto it = o.find(k);
     return (it != o.end() && it->is_string()) ? it->get<std::string>() : std::string();
 }
+
+// doc_ids with a "Loading <title>…" toast in flight (async switch-in rebuild pending). Re-entering
+// switchToTab for the same doc while its rebuild drains must not post the toast again — dedup here,
+// erased in the rebuild-completion callback.
+static std::set<std::string> loadingToastInFlight;
 
 // The display title for a document: its tree "name", else a kind-appropriate default.
 static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
@@ -276,7 +282,8 @@ void AppState::switchToTab(int idx) {
         // Async rebuild path: finish the tab UI shell now, apply tree/mesh when rebuild drains.
         const std::string rebuildDocId = dst.docId;
         const int rebuildTabIdx = idx;
-        toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
+        if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
+            toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
         ++rebuildsInFlight;
         // Optimistic: select the tab so the strip highlights; keep prior mesh until ready.
         activeTab = idx;
@@ -291,6 +298,7 @@ void AppState::switchToTab(int idx) {
         rpc.call("doc_rebuild", nlohmann::json{{"doc_id", rebuildDocId}},
                  [this, rebuildDocId, rebuildTabIdx](const core::RpcResult& r) {
                      --rebuildsInFlight;
+                     loadingToastInFlight.erase(rebuildDocId);   // a fresh switch-in may toast again
                      if (rebuildTabIdx < 0 || rebuildTabIdx >= (int)docTabs.size() ||
                          docTabs[rebuildTabIdx].docId != rebuildDocId) {
                          addLog("[tabs] async rebuild for " + rebuildDocId +

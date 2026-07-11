@@ -52,7 +52,10 @@ std::map<std::string, json> pendingChanged;
 // parts open in the background with the aiPulse glow.
 void openMirrorTab(AppState& st, const std::string& docId) {
     if (docId.rfind("doc-cpp", 0) != 0) return;  // parts/assemblies only (no dwg/ecad mirror yet)
-    if (tabIndexForDoc(st, docId) >= 0) return;  // already visible (ours or a prior mirror)
+    if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
+        pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
+        return;
+    }
     if (userMidEdit(st)) {                       // defer the reveal, never disrupt
         pendingOpen.insert(docId);
         return;
@@ -228,6 +231,22 @@ void handleEvent(AppState& st, const json& evt) {
     if (!name.empty()) st.addLog("[daemon] event: " + name);
 }
 
+// Retired docs from a previous session awaiting explicit recovery (the daemon's
+// orphan-recovery protocol): count them and raise the AppState prompt flag — the
+// modal itself renders in app.cpp alongside the other app-scope confirmations.
+// Best-effort: an old daemon without recovery_list just fails the call quietly.
+void checkOrphanRecovery(AppState& st, aicad_ipc::EngineClient& c) {
+    json rl;
+    std::string e;
+    if (!c.call("recovery_list", json::object(), rl, e)) return;
+    if (!rl.is_object() || !rl.contains("entries") || !rl["entries"].is_array()) return;
+    const int n = (int)rl["entries"].size();
+    if (n <= 0) return;
+    st.addLog("[daemon] " + std::to_string(n) +
+              " retired doc(s) from a previous session awaiting recovery");
+    st.recoveryPromptCount = n;
+}
+
 bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
     json r;
     std::string e;
@@ -246,6 +265,7 @@ bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
             if (!id.empty()) openMirrorTab(st, id);
         }
     }
+    checkOrphanRecovery(st, c);
     return true;
 }
 

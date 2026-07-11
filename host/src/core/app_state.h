@@ -1343,6 +1343,11 @@ struct AppState {
     // Quit-without-saving so the next close request falls straight through to the real exit.
     bool wantQuitConfirm = false;     // raise the "unsaved changes on exit" modal next frame
     bool quitConfirmed   = false;     // user approved the quit (after saving or discarding)
+    // Orphan recovery (daemon mode): set at bootstrap when the daemon reports retired docs from a
+    // previous session awaiting explicit recovery (recovery_list). >0 raises the "Recover unsaved
+    // parts?" modal next frame; the modal consumes it. "Later" just dismisses — the daemon keeps
+    // the entries, so the prompt returns on the next app start.
+    int recoveryPromptCount = 0;      // raise the orphan-recovery modal next frame (0 = none)
     // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
     void pushRecentFile(const std::string& path);
 

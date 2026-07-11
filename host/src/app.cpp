@@ -43,6 +43,7 @@
 #include "core/app_state.h"
 #include "core/engine_events.h"  // Phase 4: per-frame hostd event drain (daemon mode)
 #include "engine_backend.h"      // Phase 4: engine::daemonMode() (services/worker)
+#include "ipc_client.h"          // services/ipc EngineClient (orphan recovery RPCs)
 
 #ifdef AI_CAD_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"  // CEF process lifecycle (init/pump/shutdown)
@@ -3392,6 +3393,73 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ImGui::EndPopup();
             }
             if (!open) s_quitModalOpen = false;   // dismissed via the title-bar X = Cancel
+        }
+
+        // ---------- orphan recovery prompt (daemon mode) ----------
+        // Raised from the daemon bootstrap (st.recoveryPromptCount) when the daemon reports retired
+        // docs from a previous session awaiting explicit recovery. Recover opens them all (tabs then
+        // appear via the normal doc.opened mirror path); Discard drops them daemon-side; Later just
+        // dismisses — the daemon keeps the entries, so the prompt returns on the next app start.
+        {
+            static bool s_recoveryModalOpen = false;
+            static int  s_recoveryCount = 0;
+            if (st.recoveryPromptCount > 0) {
+                s_recoveryCount = st.recoveryPromptCount;
+                st.recoveryPromptCount = 0;
+                s_recoveryModalOpen = true;
+            }
+            if (s_recoveryModalOpen) ImGui::OpenPopup("Recover unsaved parts?##recovery");
+            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
+                                           vp->Pos.y + vp->Size.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            bool ropen = true;
+            if (ImGui::BeginPopupModal("Recover unsaved parts?##recovery", &ropen,
+                                       ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoSavedSettings)) {
+                ImGui::Text("%d unsaved part%s from a previous session.", s_recoveryCount,
+                            s_recoveryCount == 1 ? "" : "s");
+                ImGui::Spacing();
+                ImGui::TextUnformatted("Recover them now, or discard them for good?");
+                ImGui::Spacing();
+                const float bw = 110.0f * scale;
+                if (ImGui::Button("Recover", ImVec2(bw, 0))) {
+                    if (auto* c = engine::client()) {
+                        nlohmann::json r;
+                        std::string e;
+                        if (c->call("recovery_open", nlohmann::json{{"all", true}}, r, e)) {
+                            const int n = (r.is_object() && r.contains("opened") &&
+                                           r["opened"].is_array())
+                                              ? (int)r["opened"].size()
+                                              : s_recoveryCount;
+                            st.toast(ui::ToastLevel::Info,
+                                     "Recovered " + std::to_string(n) + " part" +
+                                         (n == 1 ? "" : "s"));
+                        } else {
+                            st.toast(ui::ToastLevel::Error, "Recovery failed: " + e);
+                        }
+                    }
+                    s_recoveryModalOpen = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Discard", ImVec2(bw, 0))) {
+                    if (auto* c = engine::client()) {
+                        nlohmann::json r;
+                        std::string e;
+                        if (!c->call("recovery_discard", nlohmann::json{{"all", true}}, r, e))
+                            st.toast(ui::ToastLevel::Error, "Discard failed: " + e);
+                    }
+                    s_recoveryModalOpen = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Later", ImVec2(90.0f * scale, 0))) {
+                    s_recoveryModalOpen = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+            if (!ropen) s_recoveryModalOpen = false;   // title-bar X = Later
         }
 
         // ---------- mesh-export tessellation options ----------

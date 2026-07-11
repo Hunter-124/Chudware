@@ -447,10 +447,10 @@ def test_mcmaster_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["sku"] == "91290A115"
 
 
-def test_mcmaster_search_falls_back_to_category_tiles(adapter_mods, monkeypatch):
-    # Live shape (2026-07-07): a flat "/{query}/" fetch lands on McMaster's
-    # catalog-navigation grid (no product cards). The adapter should return the
-    # real category tiles as kind="category" rather than a silent empty list.
+def test_mcmaster_search_last_resort_category_tiles(adapter_mods, monkeypatch):
+    # Last-resort shape: a bare mega-menu navigation grid with NO product-family
+    # breadcrumb. The adapter should return the real category tiles as
+    # kind="category" rather than a silent empty list.
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
     catalog_html = (
         '<a id="catg0_Fastening" class="category-tile" href="/products/fastening-and-joining/">'

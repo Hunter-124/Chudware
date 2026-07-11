@@ -7,14 +7,37 @@ some catalog pages (same shape as TraceParts — see traceparts.py). This
 adapter never accepts those terms on the user's behalf; it detects the
 click-through and surfaces :func:`terms_confirmation_required` instead.
 
-NOTE (live-probe 2026-07-07): McMaster is a hierarchical catalog SPA. A flat
-``/{query}/`` fetch does NOT reach a product-results page — its client-side
-router lands on a CATEGORY-NAVIGATION grid (``<a class="category-tile">``), so
-``search`` returns those catalog sections (``kind="category"``) rather than
-SKUs. Reaching purchasable SKUs (and their STEP downloads) needs to follow the
-category tree or drive McMaster's search API — a per-site follow-up, tracked
-separately. The product-card / SKU / price regexes remain a best-effort shape
-for when a real product page IS reached and are not yet live-verified.
+NOTE (live-verified 2026-07-11): McMaster is a hierarchical catalog SPA. A flat
+``/{query}/`` fetch DOES render a real search-results page server-side — it just
+isn't a SKU list. The page carries two things this adapter needs:
+
+1. A breadcrumb with the canonical product-family link
+   ``<a href="/products/product-family~~<CATEGORY>~~<hash>/?s=...">`` — the
+   ``<CATEGORY>`` token (e.g. ``socket-head-screws``) is the catalog category slug.
+2. A grid of result tiles ``<a class="_selectable_<hash>" href="<family-slug>~~/?s=...">``
+   with the family title in the tile's ``<img alt="...">``. Each ``<family-slug>~~/``
+   is a PRODUCT-FAMILY table page (the real per-SKU table + CAD downloads).
+
+The old adapter parsed the wrong ``<a>`` set — the top-nav mega-menu department
+links (``/products/fastening-and-joining/`` …), which are the "26 category
+landing pages" the bug reported. Those departments are NOT product pages.
+
+The linchpin (live-verified cold, no warm-cache): a family table only RENDERS
+headless at the full path ``/products/<CATEGORY>/<family-slug>~~/`` (735 KB, 266
+part numbers). The bare ``/<family-slug>~~/`` or the ``product-family~~<hash>``
+breadcrumb URL both render only a category-nav SHELL (~360 KB, 0 SKUs). So
+``search`` derives ``<CATEGORY>`` from the breadcrumb and rebuilds each result
+into ``/products/<CATEGORY>/<family-slug>~~/`` — a URL ``acquire`` can fetch to a
+real SKU table. Results are typed ``kind="family"`` (a per-SKU configurable
+table, not a single final SKU), mirroring MISUMI's honest ``kind="series"``.
+
+``acquire`` reaching an actual STEP is still expected to be gated: the family
+table's CAD download link is generated client-side after the user selects a
+concrete size/length row (no static ``.step`` href is present in the settled
+family HTML), so ``acquire`` surfaces ``no_download_link`` / login when it can't
+find one — the ``_DOWNLOAD_RE`` remains a best-effort shape for a page that does
+expose a direct link. The ``product-card`` regex is kept as a first pass for the
+rare page that renders SKU cards directly.
 """
 from __future__ import annotations
 
@@ -42,12 +65,30 @@ _TERMS_MARKERS = ('Accept the terms', 'class="cad-terms"', 'License agreement re
 _RESULT_RE = re.compile(
     r'<a[^>]+class="[^"]*product-card[^"]*"[^>]+href="(?P<href>/[0-9A-Za-z]+/?)"[^>]*>'
     r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
-# McMaster is a hierarchical catalog SPA: a flat "/{query}/" fetch lands on a
-# CATEGORY-NAVIGATION page (grid of <a class="category-tile" href="/products/...">
-# with a <span class="category-name">), NOT a product-results page (live-probe
-# 2026-07-07). Parse those tiles so the query returns real navigable catalog
-# categories instead of a silent empty list; reaching actual SKUs requires
-# following the tree (a per-site follow-up — see the module note).
+# Live shape (2026-07-11): the flat "/{query}/" search page embeds breadcrumb
+# links of the form "/products/<crumb-kind>~~<SLUG>~~<hash>/". The <SLUG> is the
+# catalog category token needed to build a renderable family URL
+# "/products/<SLUG>/<family-slug>~~/". McMaster's router accepts EITHER the
+# product-family slug OR the product-line slug as that segment (both live-verified
+# to render the SKU table), so we prefer product-family (most specific) and fall
+# back to product-line. product-line is present on BOTH the family-disambiguation
+# search pages (e.g. "m8 socket head cap screw") AND the direct-category search
+# pages (e.g. "ball bearing", "hex nut") that carry no product-family crumb —
+# without this fallback those queries drop to the department mega-menu (the bug).
+_PRODUCT_FAMILY_CRUMB_RE = re.compile(
+    r'href="/products/product-family~~(?P<category>[a-z0-9-]+)~~[^"/]+/', re.IGNORECASE)
+_PRODUCT_LINE_CRUMB_RE = re.compile(
+    r'href="/products/product-line~~(?P<category>[a-z0-9-]+)~~[^"/]+/', re.IGNORECASE)
+# Result tiles on the search page: <a class="_selectable_<hash>" href="<slug>~~/?s=...">
+# whose title is in the tile's <img alt="...">. The class hash (_selectable_srkjh_1)
+# rotates on deploys, so match only the stable "_selectable_" prefix. Only "~~/"
+# hrefs are product-family (SKU-table) pages; "~/" hrefs are subcategories.
+_RESULT_TILE_RE = re.compile(
+    r'<a[^>]+class="_selectable_[^"]*"[^>]+href="(?P<slug>[a-z0-9-]+)~~/(?P<qs>\?[^"]*)?"'
+    r'[^>]*>.*?<img[^>]+alt="(?P<title>[^"]*)"', re.IGNORECASE | re.DOTALL)
+# Legacy mega-menu department tiles (kept only as a last-resort fallback so a
+# query that somehow lands on a bare navigation grid still returns *something*
+# navigable rather than a silent empty list; these are departments, not products).
 _CATEGORY_TILE_RE = re.compile(
     r'<a[^>]+class="[^"]*category-tile[^"]*"[^>]+href="(?P<href>/[^"]+)"[^>]*>'
     r'(?P<inner>.*?)</a>', re.IGNORECASE | re.DOTALL)
@@ -75,6 +116,7 @@ class McMasterAdapter:
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
         hits = []
+        # First pass: a page that renders SKU cards directly (rare on the SPA).
         for m in _RESULT_RE.finditer(content):
             sku_match = _SKU_RE.search(m.group("title"))
             hits.append({
@@ -85,9 +127,37 @@ class McMasterAdapter:
             })
         if hits:
             return hits
-        # No product cards → we're on a catalog-navigation page. Return the real
-        # category tiles as typed "category" results (honest: these are catalog
-        # sections to drill into, not SKUs) instead of a misleading empty list.
+
+        # Real search-results page (live 2026-07-11): the breadcrumb carries the
+        # catalog category slug; result tiles carry the family slugs. Rebuild each
+        # family into "/products/<CATEGORY>/<family-slug>~~/" — the only URL that
+        # renders the per-SKU table headless (bare slug / breadcrumb URL render a
+        # nav shell). Emit as kind="family" (a configurable per-SKU table).
+        crumb = (_PRODUCT_FAMILY_CRUMB_RE.search(content)
+                 or _PRODUCT_LINE_CRUMB_RE.search(content))
+        if crumb:
+            category = crumb.group("category")
+            seen: set[str] = set()
+            for m in _RESULT_TILE_RE.finditer(content):
+                slug = m.group("slug")
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                hits.append({
+                    "title": html.unescape(m.group("title").strip()),
+                    "url": f"{BASE_URL}/products/{category}/{slug}~~/",
+                    "site": SITE,
+                    # A family is a configurable per-SKU table, not one final SKU;
+                    # the concrete part number/price only exist after selecting a
+                    # size/length row on site — so no sku/part_number is invented.
+                    "kind": "family",
+                })
+            if hits:
+                return hits
+
+        # Last resort: a bare mega-menu navigation grid (departments, not
+        # products). Return the tiles as typed "category" results — honest that
+        # these are catalog sections to drill into, not SKUs — rather than [].
         for m in _CATEGORY_TILE_RE.finditer(content):
             name = _CATEGORY_NAME_RE.search(m.group("inner"))
             hits.append({

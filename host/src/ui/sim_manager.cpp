@@ -1959,7 +1959,27 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
     // Fatigue with fully-reversed loading swings +/- the load — draw a second, opposite arrow so the
     // alternating nature reads on the model (a double-headed indicator).
     const bool reversed = (s.type == StudyType::Fatigue && s.fatigueLoadType == 0);
-    for (const auto& ld : s.loads)
+    // Issue #22: scale each load's arrow length by its magnitude relative to the largest load of
+    // the SAME kind (force vs pressure normalized separately — different units, not comparable). A
+    // lone load is unchanged (ratio 1.0); the smallest of several floors at 0.4*L so it stays
+    // legible. Head length tracks len (pushArrow3 default), so heads scale too.
+    float maxForce = 0.0f, maxPress = 0.0f;
+    for (const auto& ld : s.loads) {
+        if (ld.pressure)
+            maxPress = std::max(maxPress, std::fabs(ld.pressureMpa));
+        else
+            maxForce = std::max(maxForce, std::sqrt(ld.vec[0] * ld.vec[0] +
+                                                    ld.vec[1] * ld.vec[1] + ld.vec[2] * ld.vec[2]));
+    }
+    for (const auto& ld : s.loads) {
+        float scale = 1.0f;
+        if (ld.pressure) {
+            if (maxPress > 1e-9f) scale = 0.4f + 0.6f * std::fabs(ld.pressureMpa) / maxPress;
+        } else {
+            float m = std::sqrt(ld.vec[0] * ld.vec[0] + ld.vec[1] * ld.vec[1] + ld.vec[2] * ld.vec[2]);
+            if (maxForce > 1e-9f) scale = 0.4f + 0.6f * m / maxForce;
+        }
+        const float Ld = L * scale;
         for (const auto& p : ld.faces.picks) {
             if (!p.pickBody || !p.pickTopo) continue;
             float c[3], n[3];
@@ -1967,25 +1987,26 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
             if (ld.pressure) {
                 // Pressure pushes INTO the face along -normal; arrow tip lands on the surface.
                 float dir[3] = {-n[0], -n[1], -n[2]};
-                float tail[3] = {c[0] - dir[0] * L, c[1] - dir[1] * L, c[2] - dir[2] * L};
-                pushArrow3(loadSegs, tail, dir, L, loadTris);
+                float tail[3] = {c[0] - dir[0] * Ld, c[1] - dir[1] * Ld, c[2] - dir[2] * Ld};
+                pushArrow3(loadSegs, tail, dir, Ld, loadTris);
                 if (reversed) {  // opposite (suction) half-cycle
                     float rd[3] = {n[0], n[1], n[2]};
-                    float rt[3] = {c[0] - rd[0] * L, c[1] - rd[1] * L, c[2] - rd[2] * L};
-                    pushArrow3(loadSegs, rt, rd, L, loadTris);
+                    float rt[3] = {c[0] - rd[0] * Ld, c[1] - rd[1] * Ld, c[2] - rd[2] * Ld};
+                    pushArrow3(loadSegs, rt, rd, Ld, loadTris);
                 }
             } else {
                 float dir[3] = {ld.vec[0], ld.vec[1], ld.vec[2]};
                 float mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
                 if (mag < 1e-6f) continue;
                 // force arrow emanates from the face along the vector
-                pushArrow3(loadSegs, c, dir, L, loadTris);
+                pushArrow3(loadSegs, c, dir, Ld, loadTris);
                 if (reversed) {
                     float rd[3] = {-dir[0], -dir[1], -dir[2]};
-                    pushArrow3(loadSegs, c, rd, L, loadTris);
+                    pushArrow3(loadSegs, c, rd, Ld, loadTris);
                 }
             }
         }
+    }
 }
 
 // ---------------------------------------------------------------- flow setup preview + result lines

@@ -219,9 +219,15 @@ std::string stepplus_save(const json& doc, const std::string& path,
     add("meta.json", meta_json, /*stored=*/false);
     add("document.json", document, /*stored=*/false);
     // Preserve unknown entries (forward-compat) — never clobber the entries we own.
+    // cache.aicm (the persisted-geometry mesh blob) is written STORED, not deflated: it is
+    // large binary that barely compresses, and STORED lets doc_open extract it raw with
+    // MZ_ZIP_FLAG_COMPRESSED_DATA — zero inflate AND zero CRC32 — which together dominated
+    // open self-time (measured mz_crc32 47% + tinfl_decompress 34% of doc_open). Any zip
+    // reader still reads a STORED entry transparently, so this stays fully back/forward
+    // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
     for (const auto& [name, data] : extra) {
         if (is_known_entry(name)) continue;
-        add(name, data, /*stored=*/false);
+        add(name, data, /*stored=*/ name == "cache.aicm");
     }
 
     if (!mz_zip_writer_finalize_archive(&zip)) {
@@ -306,8 +312,17 @@ StepPlusDoc stepplus_open(const std::string& path) {
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
         if (is_known_entry(name)) continue;
-        std::string data;
-        if (read_entry(name, data)) result.extra[name] = std::move(data);
+        // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
+        // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH the DEFLATE inflate and
+        // the byte-wise mz_crc32 verify (for a STORED entry the "compressed" bytes ARE the data).
+        // This is the doc_open / agent->GUI handoff fast path — it was the dominant open cost.
+        // DEFLATE entries take the normal extract (they must be inflated).
+        std::size_t n = 0;
+        mz_uint flags = (st.m_method == 0) ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
+        void* p = mz_zip_reader_extract_to_heap(&zip, i, &n, flags);
+        if (!p) continue;
+        result.extra[name].assign(static_cast<char*>(p), n);
+        mz_free(p);
     }
 
     mz_zip_reader_end(&zip);

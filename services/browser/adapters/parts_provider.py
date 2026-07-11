@@ -103,7 +103,18 @@ class BrowserCatalogAdapter:
             result = {"title": "", "url": part_id[len(prefix):], "site": self._site}
         outcome = self._adapter.acquire(result)
         if not outcome.get("ok"):
-            return outcome  # login_required / terms_confirmation_required / etc — actionable
+            # Acquire produced no file (login_required / terms_confirmation_required /
+            # distributor_only / no_download_link). Stamp identity + a link-out so the
+            # downstream seam (place() / part_get / part_place) can surface an actionable
+            # next step — run vendor_login(site) then retry — and the record stays usable
+            # as a reference. Additive: never overwrites the adapter's reason/ask_user.
+            enriched = dict(outcome)
+            enriched.setdefault("part_id", part_id)
+            enriched.setdefault("site", self._site)
+            enriched.setdefault("url", result.get("url", ""))
+            enriched.setdefault("source_url", result.get("url", ""))
+            enriched.setdefault("title", result.get("title", ""))
+            return enriched
         # Fold the acquire envelope's vendor-specific extras (sku / price / availability / asin /
         # lcsc / stock / ... — everything beyond the standard T-X2 envelope keys) into params so
         # they land on the part record. T-X7 item 3: vendor(site)/SKU/URL/fetched-at metadata for

@@ -62,14 +62,14 @@ def _ok(domain: str, doc_id: str | None, entity_id: str | None, detail: dict) ->
     }
 
 
-def _err(domain: str, reason: str, hint: str = "") -> dict:
+def _err(domain: str, reason: str, hint: str = "", detail: dict | None = None) -> dict:
     return {
         "ok": False,
         "domain": domain,
         "doc_id": None,
         "entity_id": None,
         "editable": False,
-        "detail": {},
+        "detail": dict(detail) if detail else {},
         "reason": str(reason),
         "hint": str(hint),
     }
@@ -447,6 +447,37 @@ def place(part_id: str, *,
     if record is None:
         return _err("unknown", f"part_id not found: {part_id!r}",
                     "Use part_search to discover valid part_ids.")
+
+    # 1b. A live catalog provider may return an acquire-FAILURE envelope in place of a
+    # PartRecord — login_required / terms_confirmation_required / distributor_only /
+    # no_download_link from a walled vendor (McMaster, GrabCAD, …). That is NOT "not
+    # found": it is an actionable degradation. Surface it directly — with the sign-in
+    # question and a link-out to the part page — instead of the misleading generic
+    # "no geometry_ref — cannot place". The human resolves it (one-time vendor_login or
+    # terms click-through) and re-invokes part_place; we deliberately do NOT auto-retry.
+    if record.get("ok") is False:
+        reason = record.get("reason", "unavailable")
+        site = record.get("site", "")
+        link = record.get("source_url") or record.get("url") or ""
+        detail = {k: record[k] for k in ("ask_user", "distributors_url", "source_url",
+                                         "url", "site", "title")
+                  if record.get(k) is not None}
+        if reason == "login_required" and site:
+            hint = (f"Sign in first: run vendor_login('{site}') to open a browser window, "
+                    f"complete the login once, then retry part_place"
+                    + (f". Part page: {link}" if link else "") + ".")
+        elif reason == "terms_confirmation_required":
+            hint = (f"Accept the download terms shown at {link}, then retry part_place."
+                    if link else record.get("hint", "Terms acceptance required."))
+        elif reason == "distributor_only":
+            du = record.get("distributors_url")
+            hint = (f"{site} sells only through distributors — no downloadable model. "
+                    + (f"Find a distributor: {du}. " if du else "")
+                    + (f"Reference: {link}." if link else "")).strip()
+        else:
+            hint = record.get("hint") or f"Could not acquire a model ({reason})."
+        return _err(record.get("domain", "catalog"),
+                    f"Cannot place {part_id!r}: {reason}.", hint, detail=detail)
 
     # 2. Extract and validate geometry_ref.
     gref = record.get("geometry_ref")

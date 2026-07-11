@@ -151,16 +151,28 @@ def test_get_without_prior_search_still_recovers_url(provider_mods):
     assert src.acquire_calls == [{"title": "", "url": "https://fakesite.example/widget", "site": "fakesite"}]
 
 
-def test_get_propagates_acquire_failure(provider_mods):
+def test_get_propagates_and_enriches_acquire_failure(provider_mods):
+    """An acquire failure (login_required/terms/…) is propagated, and additively
+    enriched with part_id/site/link-out so the downstream place() seam can surface an
+    actionable next step. The adapter's own reason/ask_user must survive unchanged."""
     profiles, parts_provider = provider_mods
     profiles.profile_dir("fakesite").mkdir(parents=True)
     src = _FakeSourceAdapter()
     src.acquire_return = {"ok": False, "reason": "login_required", "ask_user": {"kind": "approval"}}
     provider = parts_provider.BrowserCatalogAdapter(src)
 
-    rec = provider.get("catalog:fakesite::https://fakesite.example/widget")
+    part_id = "catalog:fakesite::https://fakesite.example/widget"
+    rec = provider.get(part_id)
 
-    assert rec == {"ok": False, "reason": "login_required", "ask_user": {"kind": "approval"}}
+    # original fields untouched
+    assert rec["ok"] is False
+    assert rec["reason"] == "login_required"
+    assert rec["ask_user"] == {"kind": "approval"}
+    # additive identity + link-out
+    assert rec["part_id"] == part_id
+    assert rec["site"] == "fakesite"
+    assert rec["url"] == "https://fakesite.example/widget"
+    assert rec["source_url"] == "https://fakesite.example/widget"
 
 
 def test_get_folds_vendor_extras_into_params(provider_mods):

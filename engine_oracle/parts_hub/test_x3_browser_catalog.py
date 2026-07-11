@@ -74,6 +74,95 @@ def test_place_dispatches_import_file_kind():
     assert "import_file" in _PLACERS
 
 
+# ── login-degradation seam (walled catalog vendor → actionable next step) ────
+
+class _FakeWalledAdapter:
+    """A SourceAdapter whose acquire hits a login/terms/distributor wall."""
+    def __init__(self, key, outcome):
+        self.key = key
+        self._outcome = outcome
+    def search(self, query):
+        return [{"ok": True, "title": "M8 SHCS", "url": f"https://{self.key}.com/p/84881A248"}]
+    def acquire(self, result):
+        return dict(self._outcome)
+
+
+def test_parts_provider_get_enriches_acquire_failure_with_identity():
+    """When acquire fails, BrowserCatalogAdapter.get must stamp part_id/site/link-out
+    onto the envelope so the downstream seam can act on it."""
+    from services.browser.adapters import login_required
+    from services.browser.adapters.parts_provider import BrowserCatalogAdapter
+    prov = BrowserCatalogAdapter(_FakeWalledAdapter(
+        "mcmaster", login_required("mcmaster", "https://mcmaster.com/p/84881A248")))
+    # search first so the url is cached under the part_id
+    recs = prov.search("m8 shcs")
+    pid = recs[0]["part_id"]
+    out = prov.get(pid)
+    assert out["ok"] is False
+    assert out["reason"] == "login_required"
+    assert out["part_id"] == pid
+    assert out["site"] == "mcmaster"
+    assert out["source_url"].startswith("https://mcmaster.com/")
+    assert out["ask_user"]["kind"] == "approval"  # adapter's question preserved
+
+
+def _place_with_record(monkeypatch, record):
+    import engine_oracle.parts_hub as ph
+    monkeypatch.setattr(ph, "get", lambda pid: record)
+    from engine_oracle.parts_hub.place import place
+    return place("catalog:mcmaster::https://mcmaster.com/p/84881A248")
+
+
+def test_place_surfaces_login_required_actionably(monkeypatch):
+    from services.browser.adapters import login_required
+    rec = dict(login_required("mcmaster", "https://mcmaster.com/p/84881A248"),
+               site="mcmaster", source_url="https://mcmaster.com/p/84881A248")
+    r = _place_with_record(monkeypatch, rec)
+    assert r["ok"] is False
+    assert r["reason"] == "Cannot place 'catalog:mcmaster::https://mcmaster.com/p/84881A248': login_required."
+    assert "vendor_login('mcmaster')" in r["hint"]
+    assert "retry part_place" in r["hint"]
+    # the sign-in question + link-out survive for the caller to route to the user
+    assert r["detail"]["ask_user"]["id"] == "browser_login.mcmaster"
+    assert r["detail"]["source_url"] == "https://mcmaster.com/p/84881A248"
+
+
+def test_place_surfaces_distributor_only(monkeypatch):
+    from services.browser.adapters import distributor_only
+    rec = dict(distributor_only("hydraforce", "https://hydraforce.com/valve",
+                                distributors_url="https://hydraforce.com/distributors"),
+               site="hydraforce")
+    r = _place_with_record(monkeypatch, rec)
+    assert r["ok"] is False
+    assert "distributor_only" in r["reason"]
+    assert "distributors" in r["hint"]
+    assert r["detail"]["distributors_url"] == "https://hydraforce.com/distributors"
+
+
+def test_place_surfaces_terms_confirmation(monkeypatch):
+    from services.browser.adapters import terms_confirmation_required
+    rec = dict(terms_confirmation_required("traceparts", "https://traceparts.com/p/1",
+                                           "per-download license"),
+               site="traceparts", source_url="https://traceparts.com/p/1")
+    r = _place_with_record(monkeypatch, rec)
+    assert r["ok"] is False
+    assert "terms_confirmation_required" in r["reason"]
+    assert "traceparts.com/p/1" in r["hint"]
+    assert r["detail"]["ask_user"]["id"] == "browser_terms.traceparts"
+
+
+def test_place_still_reports_plain_missing_geometry(monkeypatch):
+    """A genuine PartRecord with no geometry_ref (not a failure envelope) keeps the
+    original 'no geometry_ref' error — the seam must not swallow that case."""
+    rec = {"part_id": "catalog:x::y", "domain": "catalog", "geometry_ref": None}
+    import engine_oracle.parts_hub as ph
+    monkeypatch.setattr(ph, "get", lambda pid: rec)
+    from engine_oracle.parts_hub.place import place
+    r = place("catalog:x::y")
+    assert r["ok"] is False
+    assert "no geometry_ref" in r["reason"]
+
+
 # ── hub wiring (bootstrap registers browser catalog providers) ──────────────
 
 def _make_hub():

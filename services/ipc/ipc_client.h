@@ -11,6 +11,8 @@
 // so pushes arrive even when the client is idle.
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -53,6 +55,15 @@ public:
     // Move any queued push events out (non-blocking; also polls the socket).
     std::vector<nlohmann::json> drainEvents();
 
+    // Monotonic counter bumped on every successful reconnect (EOF/timeout drop
+    // followed by a fresh connect + hello). Each reconnect lands on a NEW daemon
+    // clientId, so per-connection daemon state (event subscriptions especially)
+    // is gone — a client that subscribed once must re-subscribe when this
+    // advances. Tracking the daemon pid is NOT enough: a reconnect can land on
+    // the same daemon (transient EOF, drain-replace race) with the pid unchanged
+    // but the subscription already dropped. Safe to read from any thread.
+    uint64_t reconnectGeneration() const { return reconnectGen_.load(); }
+
 private:
     bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);
@@ -72,6 +83,7 @@ private:
     std::string sockPath_;
     std::string clientKind_;             // saved for the reconnect re-handshake
     int nextId_ = 1;
+    std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)
 };
 
 }  // namespace aicad_ipc

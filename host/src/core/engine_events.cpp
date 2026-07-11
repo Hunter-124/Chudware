@@ -40,6 +40,12 @@ bool bootstrapped = false;
 // A failed/deferred bootstrap (engine still "loading") used to retry EVERY frame — two sync
 // RPCs per frame on the GL thread. Back off: retry at most every 500ms until it succeeds.
 std::chrono::steady_clock::time_point lastBootstrapTry{};
+// Last reconnect generation we bootstrapped against. When EngineClient silently
+// reconnects (daemon drain-replace, transient EOF), it lands on a fresh daemon
+// clientId with NO event subscriptions — the one-time `bootstrapped` latch would
+// otherwise leave the GUI permanently deaf to doc events (frozen live previews).
+// A generation bump re-arms bootstrap so we re-subscribe + re-mirror open docs.
+uint64_t bootstrapGen = 0;
 
 // doc_ids with a doc.opened seen but not yet revealed as a tab (deferred while
 // the user is mid-edit, exactly like the poller's `pending`), and the latest
@@ -275,6 +281,15 @@ void engineEventsTick(AppState& st) {
     if (!engine::daemonMode()) return;
     auto* c = engine::client();
     if (!c) return;
+
+    // A silent reconnect (new daemon clientId, subscriptions lost) re-arms the
+    // one-time bootstrap so we re-subscribe and re-mirror the current doc set.
+    const uint64_t gen = c->reconnectGeneration();
+    if (gen != bootstrapGen) {
+        bootstrapGen = gen;
+        bootstrapped = false;
+        lastBootstrapTry = {};  // retry immediately, don't wait out the backoff
+    }
 
     if (!bootstrapped) {
         const auto now = std::chrono::steady_clock::now();

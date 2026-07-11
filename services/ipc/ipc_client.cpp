@@ -263,6 +263,9 @@ bool EngineClient::reconnectLocked(std::string& err) {
         return false;
     }
     serverInfo_ = resp["result"];
+    // Signal subscribers (GUI event bootstrap) that per-connection daemon state
+    // — event subscriptions above all — was just reset by this new connection.
+    reconnectGen_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

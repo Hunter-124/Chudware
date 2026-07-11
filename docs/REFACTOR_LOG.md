@@ -1133,3 +1133,22 @@ Wizard auto-routes `anaheimautomation` to native system Chrome (reCAPTCHA);
 staged Playwright + CEF warm). Native login fails cleanly without
 DISPLAY/WAYLAND so pure-headless agents get a structured "login once headed"
 hint. Cleaned stale profile SingletonLocks.
+
+### 2026-07-10 — viewport origin + new-sketch plane + sim load arrows
+Touched `host/src/renderer.cpp`, `host/src/ui/viewport_panel.cpp`,
+`host/src/ui/sketch_mode.cpp`, `host/src/ui/sim_manager.cpp`. (1) Origin triad
+shortened (`drawRefDatums` origin block `os` 0.22→0.13 scene-radius) + a
+`GL_POINTS` dot at absolute (0,0,0); the `+X/+Y/+Z` screen-space label constant
+in `viewport_panel.cpp` (~L3915) MUST stay synced to `os` or labels drift off
+the tips (issue #19). (2) `enterNewOnSelection` now clears the consumed plane
+pre-selection (`selectedFeatureId` + `selection`) so a fresh New Sketch
+re-presents the plane picker instead of inheriting the previous sketch's plane;
+that stale short-circuit was also why planes weren't clickable to sketch on (it
+never armed `sketchPlanePickActive`) — issue #20. (3) FEA load arrows now scale
+by magnitude relative to the largest load of the same kind (force/pressure
+normalized separately), lone-load-unchanged — issue #22. Deferred/tracked:
+issues #21 (general id_pass datum/plane click-select with no command active),
+#23–#28 (fixture-type glyphs, thermal BC glyphs, CFD inlet-speed/outlet/wall
+viz, streamline direction arrows, deformation compare slider, results
+iso-contours/field-switch). Origin dot selection is routed only through
+`drawPointPicker` (PM point wells) today; general click-select is #21.

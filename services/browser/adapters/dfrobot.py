@@ -9,7 +9,18 @@ JSON-LD for search, spec-table + ``find_datasheet_url`` grabbing the datasheet
 PDF on the detail page. Open catalog — no login. Challenge pages degrade to
 ``login_required`` — never solved.
 
-v1 best-effort, not live-verified (T-X6 gates live tests).
+Live-investigated 2026-07-10 (STILL_BROKEN): DFRobot runs a Nuxt SPA over an
+OpenCart backend. The guessed ``/search-adv/result?q=`` is a hard HTTP 404 on the
+real network (WebFetch-confirmed), as is every SSR variant tried
+(``/search?q=``, ``/search?keyword=``, ``index.php?route=product/search&...``).
+robots.txt disallows ``/index.php?route=product/`` and sitemap.xml lists ONLY
+``/product-<id>.html`` pages — there is NO server-rendered search route. Site
+search is XHR-JSON only (an internal API not discoverable from the static DOM or
+the ``window.__NUXT__`` payload), so this adapter cannot fetch results headless
+today; ``search`` degrades to ``http_error`` until the XHR search endpoint is
+captured from a live browser session. The homepage DOES server-render product
+cards (``/product-<id>.html``), so a category-browse fallback is a possible
+future path but is not a keyword search.
 """
 from __future__ import annotations
 

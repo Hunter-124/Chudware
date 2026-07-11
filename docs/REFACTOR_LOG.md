@@ -1152,3 +1152,23 @@ issues #21 (general id_pass datum/plane click-select with no command active),
 viz, streamline direction arrows, deformation compare slider, results
 iso-contours/field-switch). Origin dot selection is routed only through
 `drawPointPicker` (PM point wells) today; general click-select is #21.
+
+### 2026-07-10b — plane selectability, origin gizmo, FEA glyphs
+Second viewport batch. Files: `host/src/renderer.cpp`, `host/src/core/app_state.{h,cpp}`,
+`host/src/ui/viewport_panel.cpp`, `host/src/ui/sketch_mode.cpp`,
+`host/src/ui/feature_tree.cpp`, `host/src/ui/sim_manager.cpp`. (1) Datum-plane
+picking was dead because all three plane hit-tests gated on the raw `showPlane[]`
+toggle (default false) while the renderer force-shows via a local `effPlane`. Now
+the viewport publishes `st.planeVisEff[3]` (the effective/drawn visibility) each
+frame and the hit-tests gate on that — fixes new-sketch pick, PM plane wells, and
+`drawPlanePicker` is generalized to a plain-SELECT mode (no PM well → click sets
+`selectedFeatureId`, mirroring the plane chip). Issues #20/#21. (2) Origin gizmo:
+real 3D cone heads + octahedron "sphere" dot with a selected-state glow shell
+(batched one-tri-per-upload because `planeVbo_` holds only 6 verts), thicker axes,
+much shorter (0.06·r), labels 0.75×. Auto-show while no solid body / auto-hide once
+one exists via `st.originUserToggled` (mirrors `planesUserToggled`), FM eye sets
+the flag. Issues #19/#29/#30. (3) FEA fixtures now draw a 6-DOF restraint symbol
+(3-axis ground pins + 3 moment arcs) repeated on a 3×3 grid over the face bbox;
+loads distribute solid-cone arrows on the same grid. Issue #23/#31. Deferred:
+draft-angle gating (#32 — semantic question posted), sim-tab engine-rendered icons
+(#33 — in flight).

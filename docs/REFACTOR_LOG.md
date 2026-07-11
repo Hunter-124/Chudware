@@ -1172,3 +1172,24 @@ the flag. Issues #19/#29/#30. (3) FEA fixtures now draw a 6-DOF restraint symbol
 loads distribute solid-cone arrows on the same grid. Issue #23/#31. Deferred:
 draft-angle gating (#32 — semantic question posted), sim-tab engine-rendered icons
 (#33 — in flight).
+
+## 2026-07-11 — Viewport gizmo + simulation-BC visualization pass (issues #19–#35)
+
+Batch reworking the viewport/origin gizmo and simulation setup/result previews so the app
+visibly "knows how to model." Files: host/src/renderer.cpp (origin: shorter arrows, 3D cone
+heads, thicker axes, octahedral selectable center dot with glow), host/src/ui/viewport_panel.cpp
++ core/app_state.{h,cpp} (publish st.planeVisEff each frame; origin auto-hide once hasDocMesh via
+originUserToggled), host/src/ui/sketch_mode.cpp (clear stale plane pre-selection on New Sketch;
+hit-tests + drawPlanePicker gate on planeVisEff not showPlane; plain plane/datum select),
+host/src/ui/feature_tree.cpp (origin eye toggle sets originUserToggled), host/src/ui/pm_forms.cpp
+(draft angle gated behind 'draft outward' checkbox), host/src/ui/sim_manager.cpp (6-DOF fixture
+glyphs pushFixture3 + ground hatch + moment arcs; magnitude-scaled load arrows; CFD speed-scaled
+inlet arrows + outlet plane; streamline direction barbs; ThermalFea BC glyphs — pushIsoTemp /
+pushConvection / heat-flux arrows), scripts/sim_icons.py + fea_result_icons.py (engine-rendered
+sim-tab icons; shm overlay URI resolver), engine_oracle/sim/overlay.py (matplotlib>=3.9 get_cmap
+fix). Deferred: #23 (constraint-type discrimination — needs SimWell restraintType data model +
+solver), #27 full undeformed translucent ghost (scale slider + edge-cage reference already exist),
+#32 draft slider reveal ANIMATION (gating done; needs PM form-layout animation infra), #34 modal
+overlay zeroed-DISP mode shape (core/python solver bug). Gotcha: sim_manager.cpp result draw path
+only calls drawSegments per band, so streamline arrowheads are wireframe barbs (band-colored), not
+solid cones. Live-process caution: never cp over dist .so (SIGBUS) — relink-only builds are safe.

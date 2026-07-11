@@ -789,7 +789,8 @@ struct CefWebView::Impl {
 
 // ---- public ------------------------------------------------------------------
 
-bool CefWebView::available() { return cef::initialized(); }
+bool CefWebView::processReady() { return cef::initialized(); }
+bool CefWebView::available() const { return cef::initialized(); }
 
 CefWebView::CefWebView() : impl_(std::make_unique<Impl>()) {}
 

@@ -130,6 +130,9 @@ json handle(const std::string& line, bool& stop) {
 }  // namespace
 
 int run_cef_daemon(const std::string& sock_path, int idle_secs) {
+    // GUI and daemon must not share Chromium ProcessSingleton (same root_cache_path).
+    // Mark this process before initialize() so cache_root() → cef_cache_daemon.
+    cef_platform::set_daemon_process(true);
     if (!initialize()) { std::fprintf(stderr, "[cef-daemon] CEF init failed\n"); return 1; }
 
     aicad_ipc::IpcListener listener;

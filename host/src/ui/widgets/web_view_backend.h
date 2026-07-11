@@ -88,6 +88,10 @@ public:
     // has no worker embed, so it returns false and the panel drives it with
     // open(site) instead. Keeps the wizard flow backend-agnostic.
     virtual bool usesWorkerEmbed() const { return true; }
+
+    // False when the backend cannot host a browser (e.g. CEF cold-init failed).
+    // Wizard falls back to headed/native desktop login instead of crashing.
+    virtual bool available() const { return true; }
 };
 
 // Backend selection, single source of truth. Returns the in-process CefWebView —

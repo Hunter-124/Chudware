@@ -378,6 +378,32 @@ void startLoginWizard(AppState& st, const std::string& site) {
             st.toast(ui::ToastLevel::Info, "All vendor sites are already signed in.");
             return;
         }
+        w.currentSite = jstr(r.result, "current_site");
+        // In-process CEF: if cold init failed (e.g. ProcessSingleton held by a
+        // stale daemon, or GPU init), do NOT open the panel — a second
+        // CefInitialize used to SIGTRAP. Fall back to headed/native desktop login.
+        if (!w.web->usesWorkerEmbed() && !w.web->available()) {
+            S().browserWizardRequested = false;
+            w.active = false;
+            std::string fallback = !w.currentSite.empty() ? w.currentSite : site;
+            if (fallback.empty() && r.result.contains("sites") && r.result["sites"].is_array()
+                && !r.result["sites"].empty() && r.result["sites"][0].is_string())
+                fallback = r.result["sites"][0].get<std::string>();
+            if (!fallback.empty()) {
+                for (auto& v : S().vendors)
+                    if (v.id == fallback && !v.loginInProgress) {
+                        st.toast(ui::ToastLevel::Warn,
+                                 "In-app browser unavailable — opening desktop Chrome for "
+                                     + fallback);
+                        startVendorLogin(st, v);
+                        return;
+                    }
+            }
+            st.toast(ui::ToastLevel::Error,
+                     "In-app browser unavailable (CEF init failed). Restart Billet, or use "
+                     "Desktop browser on a vendor row.");
+            return;
+        }
         w.active = true;
         w.done.clear();
         w.skipped.clear();
@@ -385,7 +411,6 @@ void startLoginWizard(AppState& st, const std::string& site) {
         if (r.result.contains("sites") && r.result["sites"].is_array())
             for (const auto& s : r.result["sites"])
                 if (s.is_string()) w.remaining.push_back(s.get<std::string>());
-        w.currentSite = jstr(r.result, "current_site");
         w.embedId.clear();
         const std::string embed = jstr(r.result, "embed_id");
         if (!embed.empty()) {

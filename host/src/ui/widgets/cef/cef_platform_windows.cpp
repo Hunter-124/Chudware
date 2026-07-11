@@ -28,13 +28,22 @@ std::string helper_path() {
     return executable_dir() + "\\ai_cad_cef_helper.exe";
 }
 
+namespace {
+bool g_daemon_process = false;
+}  // namespace
+
+void set_daemon_process(bool daemon) { g_daemon_process = daemon; }
+
 std::string cache_root() {
+    if (const char* ov = std::getenv("AI_CAD_CEF_CACHE_ROOT"); ov && ov[0])
+        return std::string(ov);
+    const char* leaf = g_daemon_process ? "cef_cache_daemon" : "cef_cache_gui";
     char buf[MAX_PATH];
     if (SUCCEEDED(::SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf)))
-        return std::string(buf) + "\\ai-cad\\cef_cache";
+        return std::string(buf) + "\\ai-cad\\" + leaf;
     if (const char* la = std::getenv("LOCALAPPDATA"); la && la[0])
-        return std::string(la) + "\\ai-cad\\cef_cache";
-    return executable_dir() + "\\cef_cache";   // last-resort fallback
+        return std::string(la) + "\\ai-cad\\" + leaf;
+    return executable_dir() + "\\" + leaf;   // last-resort fallback
 }
 
 void configure_settings(CefSettings& settings) {

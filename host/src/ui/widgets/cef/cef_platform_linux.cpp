@@ -28,17 +28,25 @@ std::string helper_path() {
     return executable_dir() + "/ai_cad_cef_helper";
 }
 
+namespace {
+bool g_daemon_process = false;
+}  // namespace
+
+void set_daemon_process(bool daemon) { g_daemon_process = daemon; }
+
 std::string cache_root() {
     // AI_CAD_CEF_CACHE_ROOT lets a --cef-shot diagnostic run alongside the live
     // app: the process singleton is keyed on root_cache_path, so a distinct dir
     // dodges "CefInitialize FAILED / Opening in existing browser session".
     if (const char* ov = std::getenv("AI_CAD_CEF_CACHE_ROOT"); ov && ov[0])
         return std::string(ov);
+    // GUI vs daemon: separate ProcessSingleton roots (see cef_platform.h).
+    const char* leaf = g_daemon_process ? "cef_cache_daemon" : "cef_cache_gui";
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
-        return std::string(xdg) + "/ai-cad/cef_cache";
+        return std::string(xdg) + "/ai-cad/" + leaf;
     if (const char* home = std::getenv("HOME"); home && home[0])
-        return std::string(home) + "/.local/share/ai-cad/cef_cache";
-    return executable_dir() + "/cef_cache";   // last-resort fallback
+        return std::string(home) + "/.local/share/ai-cad/" + leaf;
+    return executable_dir() + "/" + leaf;   // last-resort fallback
 }
 
 void configure_settings(CefSettings& settings) {

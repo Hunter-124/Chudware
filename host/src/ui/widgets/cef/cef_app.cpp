@@ -21,6 +21,11 @@ namespace ui::cef {
 namespace {
 
 bool g_initialized = false;
+// Once CefInitialize has been attempted (success or fail), never call it again
+// in this process. A second CefInitialize after FAILED is a hard crash under
+// CEF 149 (SetSamplingProfiler SIGTRAP — vendor wizard coredumps 2026-07-10)
+// when the first attempt lost the ProcessSingleton race to the headless daemon.
+bool g_init_attempted = false;
 int    g_argc = 0;       // cached by execute_subprocess for a later argless initialize()
 char** g_argv = nullptr;
 
@@ -249,6 +254,8 @@ int execute_subprocess(int argc, char** argv) {
 
 bool initialize() {
     if (g_initialized) return true;
+    if (g_init_attempted) return false;   // prior fail — do not re-enter CefInitialize
+    g_init_attempted = true;
 
     CefSettings settings;
     settings.windowless_rendering_enabled = 1;
@@ -286,7 +293,9 @@ bool initialize() {
     std::fprintf(stderr, "[cef] calling CefInitialize (subproc=%s)\n",
                  cef_platform::helper_path().c_str());
     g_initialized = CefInitialize(args, settings, g_app.get(), nullptr);
-    std::fprintf(stderr, "[cef] CefInitialize %s\n", g_initialized ? "OK" : "FAILED");
+    std::fprintf(stderr, "[cef] CefInitialize %s (cache=%s)\n",
+                 g_initialized ? "OK" : "FAILED",
+                 cef_platform::cache_root().c_str());
     return g_initialized;
 }
 

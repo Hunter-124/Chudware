@@ -1114,3 +1114,12 @@ with zero Playwright/CDP during sign-in; poll `/json` tab URLs (HTTP only)
 for `/customer/account/`; export cookies via one-shot CDP or profile relaunch
 after success/close; stage + CEF warm import. User must click Allow Cookies
 and complete the form themselves.
+
+**2026-07-10 — CEF GUI crash on vendor login (ProcessSingleton).** Vendor
+wizard opened in-process CEF after cold `CefInitialize FAILED` because the
+headless `--cef-daemon` held `SingletonLock` on the shared
+`…/ai-cad/cef_cache`. A second `CefInitialize` from `CefWebView::open`
+SIGTRAP'd in `SetSamplingProfiler`. Fix: separate cache roots
+(`cef_cache_gui` vs `cef_cache_daemon`), never re-enter `CefInitialize`
+after a failed attempt, wizard falls back to desktop `vendor_login` when
+`available()` is false.

@@ -20,7 +20,7 @@ public:
     // True when the CEF runtime initialised for this process (see cef_app).
     // makeWebView() checks this before choosing the CEF backend so any CEF
     // startup failure degrades to the screencast backend instead of a black box.
-    static bool available();
+    static bool processReady();
 
     CefWebView();
     ~CefWebView() override;
@@ -41,6 +41,8 @@ public:
     // CEF renders in-process — it has no worker-side embed to attach to, so the
     // panel opens the current wizard site's URL via open() instead of attach().
     bool usesWorkerEmbed() const override;
+    // IWebViewBackend: false when cold CefInitialize failed (wizard falls back).
+    bool available() const override;
 
     // Browser-chrome navigation (URL bar / refresh / back-forward), driven on the
     // GL/UI thread == TID_UI.

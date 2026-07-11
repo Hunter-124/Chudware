@@ -31,9 +31,22 @@ std::string helper_path();
 // CefRequestContextSettings.cache_path to be a child of this dir. Deliberately
 // SEPARATE from the Playwright profile dirs (services/browser/profiles) for now:
 // two Chromium engines must not share one user-data-dir until the cookie-interop
-// pass lands (docs/cef_webview.md). Linux: $XDG_DATA_HOME|~/.local/share/ai-cad/
-// cef_cache; Windows: %LOCALAPPDATA%\ai-cad\cef_cache.
+// pass lands (docs/cef_webview.md).
+//
+// GUI and --cef-daemon MUST use different roots: Chromium's ProcessSingleton is
+// keyed on root_cache_path. Sharing one dir made the GUI's CefInitialize fail
+// ("Opening in existing browser session") while the daemon held SingletonLock,
+// and a second CefInitialize from the vendor wizard then SIGTRAP'd in
+// SetSamplingProfiler (coredump 2026-07-10). Linux defaults:
+//   GUI:    …/ai-cad/cef_cache_gui
+//   daemon: …/ai-cad/cef_cache_daemon
+// Windows: %LOCALAPPDATA%\ai-cad\cef_cache_{gui,daemon}. Override both with
+// AI_CAD_CEF_CACHE_ROOT (tests / --cef-shot isolation).
 std::string cache_root();
+
+// Call before initialize() in the --cef-daemon process so cache_root() picks the
+// daemon subtree. GUI leaves this at the default (false).
+void set_daemon_process(bool daemon);
 
 // Apply OS-specific CefSettings knobs (e.g. Windows sandbox info, Linux Ozone /
 // no-zygote flags). Cross-platform settings (windowless rendering, cache path,

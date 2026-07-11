@@ -1013,11 +1013,20 @@ struct AppState {
     // W4-K: hidden by default (SolidWorks behavior). Toggle a plane on via the FeatureManager row
     // or it is forced visible during sketch-plane picking. Sketch mode hides them (grid owns view).
     bool showPlane[3] = {false, false, false};
+    // Per-frame EFFECTIVE origin-plane visibility (showPlane OR-ed with the auto-show / pick /
+    // PM-well force-show), written by the viewport each frame right after it computes what the
+    // renderer draws. Plane hit-tests gate on THIS, not showPlane — otherwise a force-shown plane
+    // (new-sketch pick, body-less auto-show, ref-plane well) is drawn but not clickable.
+    bool planeVisEff[3] = {false, false, false};
     // True once the user has explicitly toggled origin-plane visibility (eye / FeatureManager row).
     // Until then, an empty part (no solid body) auto-shows all three planes (SolidWorks "pick a plane
     // to start"); after the user takes control, showPlane is authoritative so a hide actually sticks
     // even with no body yet. Per-doc (parked in DocSession); reset on a fresh doc.
     bool planesUserToggled = false;
+    // Same story for the world-origin gizmo (issue #30): auto-show it while there's no solid body
+    // (reference for the first sketch), auto-hide once a body exists — until the user explicitly
+    // toggles origin visibility via the FeatureManager eye, after which hiddenFeatures is honored.
+    bool originUserToggled = false;
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire

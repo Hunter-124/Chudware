@@ -1957,6 +1957,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // datums even amid geometry, so it stays unconditional.
         if ((st.sketchPlanePickActive && !anyVisibleBody) || pmWantsPlane)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
+        // Publish the effective visibility so plane hit-tests (drawPlanePicker / new-sketch pick /
+        // hitTestOriginPlane) gate on what is actually DRAWN, not the raw showPlane toggle. Without
+        // this, a force-shown plane renders but stays unclickable (issues #20/#21).
+        for (int pv = 0; pv < 3; ++pv) st.planeVisEff[pv] = effPlane[pv];
+        // Origin gizmo auto-hide (issue #30): like the planes, show the origin while there's no
+        // solid body and auto-hide it once one exists — overlaid on hiddenFeatures each frame so it
+        // never clobbers the user's set. Skipped once the user explicitly toggles origin visibility.
+        if (!st.originUserToggled) {
+            std::unordered_set<std::string> effDatums = st.hiddenFeatures;
+            if (st.hasDocMesh) effDatums.insert("point.origin");
+            else               effDatums.erase("point.origin");
+            renderer.setHiddenDatums(effDatums);
+        }
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)
             // Plane-pick: the hovered plane (from last frame's overlay hit-test) gets the
@@ -3912,7 +3925,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 return true;
             };
             const float e  = renderer.effectiveSceneRadius();
-            const float os = e * 0.13f;   // positive axis length (issue #19: matches drawRefDatums)
+            const float os = e * 0.06f;   // positive axis length (issue #19: matches drawRefDatums)
             const float ns = os * 0.80f;  // negative tail length
             static const float kAxis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
             static const ImU32 kAxCol[3] = {IM_COL32(230, 64, 64, 255),    // X red
@@ -3933,8 +3946,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     float dx = sp.x - so.x, dy = sp.y - so.y;
                     float len = std::sqrt(dx * dx + dy * dy);
                     if (len > 1e-3f) {
-                        sp.x += dx / len * 10.0f * ui::uiScale;
-                        sp.y += dy / len * 10.0f * ui::uiScale;
+                        sp.x += dx / len * 5.0f * ui::uiScale;
+                        sp.y += dy / len * 5.0f * ui::uiScale;
                     }
                 }
                 ImFont* f = ImGui::GetFont();
@@ -3954,7 +3967,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                  halo, txt);
                 vdl->AddText(f, fs, p, col, txt);
             };
-            const float fsP = ImGui::GetFontSize();
+            const float fsP = ImGui::GetFontSize() * 0.75f;   // issue #19: smaller origin labels
             const float fsN = fsP * 0.85f;
             for (int ai = 0; ai < 3; ++ai) {
                 const float* d = kAxis[ai];

@@ -1486,11 +1486,10 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                 // tail on the negative direction. The +X/+Y/+Z text labels are screen-space and
                 // live in viewport_panel.cpp (kOriginAxisLen there must match os/e here).
                 if (d.id == "point.origin") {
-                    const float os = e * 0.13f;   // positive axis length (issue #19: shortened; label
-                                                  // constant in viewport_panel.cpp must stay in sync)
+                    const float os = e * 0.06f;   // positive axis length (issue #19: much shorter,
+                                                  // arrowheads removed; the label constant in
+                                                  // viewport_panel.cpp must stay in sync with this)
                     const float ns = os * 0.80f;  // negative tail length (shorter, subdued)
-                    const float ah = os * 0.18f;  // arrowhead back-set along -dir
-                    const float aw = os * 0.07f;  // arrowhead half-width
                     static const Vec3 kDirs[3] = {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1)};
                     static const float kAxCol[3][3] = {{0.90f, 0.25f, 0.25f},   // X red
                                                        {0.25f, 0.80f, 0.30f},   // Y green
@@ -1498,28 +1497,37 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                     const Vec3 o = d.origin;
                     for (int ai = 0; ai < 3; ++ai) {
                         const Vec3& dir = kDirs[ai];
-                        const Vec3& u = kDirs[(ai + 1) % 3];
-                        const Vec3& v = kDirs[(ai + 2) % 3];
+                        const Vec3& u = kDirs[(ai + 1) % 3];   // cone base ring lives in the other
+                        const Vec3& v = kDirs[(ai + 2) % 3];   // two cardinal axes
                         const float r = kAxCol[ai][0], g = kAxCol[ai][1], b = kAxCol[ai][2];
-                        // Positive: solid shaft + 4-line arrowhead (same construction as the
-                        // datum-plane normal arrow above).
+                        // Positive axis: a thicker colored shaft capped by a REAL 3D cone head
+                        // (issue #29). The shaft stops at the cone base so it doesn't poke through.
+                        const float coneLen = os * 0.34f, coneRad = coneLen * 0.42f;
                         Vec3 tip = o + dir * os;
-                        Vec3 base = tip - dir * ah;
+                        Vec3 cbase = tip - dir * coneLen;
                         setCol(selected ? r + 0.10f : r, selected ? g + 0.10f : g,
                                selected ? b + 0.05f : b, 1.0f);
-                        glLineWidth(selected ? 3.5f : 2.5f);
-                        float shaft[6] = {o.x, o.y, o.z, tip.x, tip.y, tip.z};
+                        glLineWidth(selected ? 4.5f : 3.5f);   // ~1px thicker than before
+                        float shaft[6] = {o.x, o.y, o.z, cbase.x, cbase.y, cbase.z};
                         upload(shaft, 6);
                         glDrawArrays(GL_LINES, 0, 2);
-                        Vec3 head[4] = {base + u * aw, base - u * aw, base + v * aw, base - v * aw};
-                        for (int i = 0; i < 4; ++i) {
-                            float seg[6] = {tip.x, tip.y, tip.z, head[i].x, head[i].y, head[i].z};
-                            upload(seg, 6);
-                            glDrawArrays(GL_LINES, 0, 2);
+                        // Filled cone: side fan + base cap around the axis. planeVbo_ holds only 6
+                        // verts, so emit one triangle (9 floats) per upload. Cull is off here, so
+                        // winding doesn't matter.
+                        const int cseg = 12;
+                        Vec3 prevR = cbase + u * coneRad;
+                        for (int ci = 1; ci <= cseg; ++ci) {
+                            float a = (float)ci / cseg * 6.2831853f;
+                            Vec3 cur = cbase + (u * std::cos(a) + v * std::sin(a)) * coneRad;
+                            float side[9] = {tip.x, tip.y, tip.z, prevR.x, prevR.y, prevR.z, cur.x, cur.y, cur.z};
+                            upload(side, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
+                            float cap[9] = {cbase.x, cbase.y, cbase.z, cur.x, cur.y, cur.z, prevR.x, prevR.y, prevR.z};
+                            upload(cap, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
+                            prevR = cur;
                         }
                         // Negative: dimmer dashed tail (CPU dashes — core GL has no stipple).
                         setCol(r, g, b, selected ? 0.55f : 0.40f);
-                        glLineWidth(1.5f);
+                        glLineWidth(2.5f);
                         Vec3 nEnd = o - dir * ns;
                         const int cells = 12;  // 6 visible dashes
                         for (int i = 0; i < cells; i += 2) {
@@ -1530,17 +1538,29 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                             glDrawArrays(GL_LINES, 0, 2);
                         }
                     }
-                    // Issue #19: a small dot at absolute (0,0,0) so the origin reads as a grabbable
-                    // reference point (selection is routed via SketchMode::drawPointPicker for
-                    // "point.origin"). Drawn last, on top of the axes; depth-mask is already off.
-                    // Brightens + grows a touch when the origin datum is selected.
-                    setCol(selected ? 1.00f : 0.92f, selected ? 1.00f : 0.92f,
-                           selected ? 1.00f : 0.92f, 1.0f);
-                    glPointSize(selected ? 10.0f : 7.0f);
-                    float odot[3] = {o.x, o.y, o.z};
-                    upload(odot, 3);
-                    glDrawArrays(GL_POINTS, 0, 1);
-                    glPointSize(1.0f);
+                    // Issue #19/#29: a tiny 3D sphere (octahedron approximation) at absolute (0,0,0)
+                    // as a grabbable reference point (selection routes via drawPointPicker for
+                    // "point.origin"). Drawn last, over the axes; depth-mask off. When the origin is
+                    // selected a translucent halo blooms around it for a glowing-border read.
+                    {
+                        const float rd = os * 0.16f;
+                        static const Vec3 A[6] = {Vec3(1, 0, 0), Vec3(-1, 0, 0), Vec3(0, 1, 0),
+                                                  Vec3(0, -1, 0), Vec3(0, 0, 1), Vec3(0, 0, -1)};
+                        static const int F[8][3] = {{4, 0, 2}, {4, 2, 1}, {4, 1, 3}, {4, 3, 0},
+                                                    {5, 2, 0}, {5, 1, 2}, {5, 3, 1}, {5, 0, 3}};
+                        auto drawOcta = [&](float rad, float cr, float cg, float cb, float ca) {
+                            setCol(cr, cg, cb, ca);
+                            for (int f = 0; f < 8; ++f) {
+                                Vec3 p0 = o + A[F[f][0]] * rad, p1 = o + A[F[f][1]] * rad,
+                                     p2 = o + A[F[f][2]] * rad;
+                                float t[9] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z};
+                                upload(t, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
+                            }
+                        };
+                        if (selected) drawOcta(rd * 2.4f, 0.55f, 0.80f, 1.00f, 0.35f);  // glow halo
+                        drawOcta(rd, selected ? 1.0f : 0.92f, selected ? 1.0f : 0.92f,
+                                 selected ? 1.0f : 0.95f, 1.0f);
+                    }
                     break;
                 }
                 // A 3-axis cross marker centered on the point.

@@ -1154,6 +1154,7 @@ void AppState::clearViewportForNewDoc() {
     zoomToBBoxRequested = false;
     // A fresh part re-enters the auto-show "pick a plane to start" state until the user toggles.
     planesUserToggled = false;
+    originUserToggled = false;
 }
 
 // Multi-document: park the LEAVING tab's live per-doc value state into its DocSession (move out, so

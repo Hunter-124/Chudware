@@ -4550,7 +4550,7 @@ static bool hitTestOriginPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin,
     static const char* kName[3] = {"X/Z", "X/Y", "Y/Z"};
     bool found = false;
     for (int p = 0; p < 3; ++p) {
-        if (!st.showPlane[p]) continue;   // only a visible plane is clickable in the graphics area
+        if (!st.planeVisEff[p]) continue;   // only a visible plane is clickable in the graphics area
         Vec3 c4[4];
         if (!r.planeQuad(p, c4)) continue;
         // Ray vs. the plane of the quad, then a bounds check in the quad's own (u,v) frame. World-
@@ -4588,8 +4588,13 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     pmPlaneHover_ = -1;
     if (active_) return false;                  // editing a sketch: that overlay owns the canvas
     auto* pm = st.propertyManager;
-    if (!st.renderer || !st.workerStarted || !st.docMirror.hasDoc() ||
-        !pm || !pm->active() || !pm->activeWellWantsPlane())
+    if (!st.renderer || !st.workerStarted || !st.docMirror.hasDoc()) return false;
+    // Two modes: (1) a feature PM well wants a plane -> a click ROUTES the datum into that well;
+    // (2) no well -> plain graphics-area SELECT (issue #21): a click sets the plane as the
+    // FeatureManager selection (mirrors the plane chip), so it highlights and a later New Sketch
+    // starts on it. Select mode only runs when at least one origin plane is actually visible.
+    const bool wellMode = pm && pm->active() && pm->activeWellWantsPlane();
+    if (!wellMode && !(st.planeVisEff[0] || st.planeVisEff[1] || st.planeVisEff[2]))
         return false;
 
     const Renderer& r = *st.renderer;
@@ -4609,7 +4614,7 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     bool quadVis[3] = {false, false, false};
     Vec3 quadW[3][4];
     for (int p = 0; p < 3; ++p) {
-        if (!st.showPlane[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
+        if (!st.planeVisEff[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
         Vec3 c4[4];
         if (!r.planeQuad(p, c4)) continue;
         for (int i = 0; i < 4; ++i) quadW[p][i] = c4[i];
@@ -4664,8 +4669,10 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
                      quadS[hovered][3], col(pal.accent, 0.90f), 2.0f * ui::uiScale);
     }
     // Compact hint pill (below the heads-up view toolbar, same slot as the new-sketch banner).
-    glassHudBanner(wdl, "sk_pm_plane_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
-                   "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face");
+    // Only in well mode — plain select shouldn't nag a banner every time a plane is on screen.
+    if (wellMode)
+        glassHudBanner(wdl, "sk_pm_plane_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                       "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face");
     wdl->PopClipRect();
 
     // Click a plane -> route its datum ref into the active well (a created datum plane routes its
@@ -4674,8 +4681,17 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     if ((datumWins || hovered >= 0) && imgHovered) {
         st.requestCursor(ui::CursorKind::Hand);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (datumWins) pm->routeDatumPlane(datumFid, datumName);
-            else           pm->routeDatumPlane(planeSel[hovered]);
+            if (wellMode) {
+                if (datumWins) pm->routeDatumPlane(datumFid, datumName);
+                else           pm->routeDatumPlane(planeSel[hovered]);
+            } else {
+                // Plain select: mirror the plane chip (viewport_panel.cpp) — set it as the
+                // FeatureManager selection + emphasis so it highlights and a later New Sketch
+                // consumes it. Not added to st.selection (datum-for-measure/mate is a follow-up).
+                st.selection.clear();
+                st.selectedFeatureId = datumWins ? datumFid : std::string(planeSel[hovered]);
+                st.planeEmphasis = datumWins ? -1 : hovered;
+            }
         }
     }
     return hovered >= 0 || datumWins;
@@ -5123,7 +5139,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         bool quadVis[3] = {false, false, false};
         Vec3 quadW[3][4];
         for (int p = 0; p < 3; ++p) {
-            if (!st.showPlane[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
+            if (!st.planeVisEff[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
             Vec3 c4[4];
             if (!r.planeQuad(p, c4)) continue;
             for (int i = 0; i < 4; ++i) quadW[p][i] = c4[i];

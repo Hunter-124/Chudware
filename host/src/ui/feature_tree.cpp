@@ -2859,6 +2859,7 @@ void drawFeatureTreeBody(AppState& st,
                                     st.hiddenFeatures.insert("point.origin");
                                     if (originSelected) st.selectedFeatureId.clear();
                                 }
+                                st.originUserToggled = true;   // issue #30: stick — stop auto-hide
                                 st.applyDatumVisibility();
                             }
                         }

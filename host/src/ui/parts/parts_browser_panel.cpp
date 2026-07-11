@@ -570,8 +570,8 @@ void drawBrowserPanel(AppState& st) {
                     if (v.id == w.currentSite && !v.loginInProgress) {
                         startVendorLogin(st, v);
                         st.toast(ui::ToastLevel::Info,
-                                 "Desktop browser opened for " + vendorLabel(w.currentSite) +
-                                     " — complete any captcha there, then close the window.");
+                                 "System Chrome opened for " + vendorLabel(w.currentSite) +
+                                     " (no automation). Allow cookies, sign in, then close the window.");
                         break;
                     }
                 }

@@ -253,6 +253,25 @@ def test_browser_login_never_raises_on_launch_error(browser_mods):
     assert result["reason"] == "browser_login_failed"
 
 
+def test_anaheim_prefers_native_chrome_login(browser_mods):
+    """Anaheim Magento reCAPTCHA rejects Playwright-driven sessions — product
+    path must opt into system Chrome with zero automation during sign-in."""
+    _profiles, _ratelimit, session = browser_mods
+    assert session._site_wants_native_chrome("anaheimautomation") is True
+    assert session._site_wants_native_chrome("grabcad") is False
+    assert session._url_looks_post_login(
+        "anaheimautomation",
+        "https://anaheimautomation.com/customer/account/",
+    ) is True
+    assert session._url_looks_post_login(
+        "anaheimautomation",
+        "https://anaheimautomation.com/customer/account/login/referer/xxx/",
+    ) is False
+    assert session._url_looks_post_login(
+        "anaheimautomation",
+        "https://anaheimautomation.com/customer/account/create/",
+    ) is False
+
 # --- session: browser_fetch ------------------------------------------------------
 
 def test_browser_fetch_without_profile_autocreates_one(browser_mods):

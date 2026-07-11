@@ -1104,3 +1104,13 @@ GPU; (3) storefront header Sign-In is self-referential
 without WebGL hook; prefer system `channel=chrome`; Magento fixup seeds
 `login_redirect` to `/customer/account/`, rewrites self-referer links, hops
 to the dashboard when the session already took.
+
+**2026-07-10 — Anaheim native Chrome login (no automation).** Live probe with
+real credentials proved Playwright-controlled headed Chrome (even
+`channel=chrome`, no WebGL spoof, real NVIDIA GPU) always gets Magento
+`reCAPTCHA verification failed` on loginPost. Product path: adapters with
+`NATIVE_CHROME_LOGIN` (Anaheim) open **system Chrome as a plain subprocess**
+with zero Playwright/CDP during sign-in; poll `/json` tab URLs (HTTP only)
+for `/customer/account/`; export cookies via one-shot CDP or profile relaunch
+after success/close; stage + CEF warm import. User must click Allow Cookies
+and complete the form themselves.

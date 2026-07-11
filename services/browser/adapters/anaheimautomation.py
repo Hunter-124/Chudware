@@ -29,9 +29,13 @@ POST_LOGIN_URL = BASE_URL + "/customer/account/"
 # header "Sign In" link is self-referential
 # (/login/referer/<base64 of the login page itself>/) and is what leaves users
 # on a "login/referral" URL after a failed captcha/form_key — we deliberately
-# open the plain login form and, after success, land on POST_LOGIN_URL via the
-# headed browser_login Magento hop (session.py).
+# open the plain login form; native Chrome login lands on POST_LOGIN_URL after
+# Magento accepts the session.
 LOGIN_URL = BASE_URL + "/customer/account/login/"
+# MSP invisible reCAPTCHA rejects ANY Playwright/CDP-controlled session (live
+# proven 2026-07-10: valid credentials → "reCAPTCHA verification failed").
+# browser_login must open system Chrome with zero automation during sign-in.
+NATIVE_CHROME_LOGIN = True
 SEARCH_URL_TMPL = BASE_URL + "/catalogsearch/result/?q={query}"
 LICENSE_NOTE = (
     "Anaheim Automation CAD models and datasheets are fetched under the "
@@ -98,6 +102,7 @@ class AnaheimAutomationAdapter:
     # expose hooks for embed.classify_login_state / start_url_for_site
     LOGIN_URL = LOGIN_URL
     BASE_URL = BASE_URL
+    NATIVE_CHROME_LOGIN = NATIVE_CHROME_LOGIN
     _LOGIN_WALL_MARKERS = _LOGIN_WALL_MARKERS
 
     def is_logged_in(self, content: str | None, url: str = "") -> bool:

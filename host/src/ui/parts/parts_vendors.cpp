@@ -234,7 +234,8 @@ void drawVendorSignInList(AppState& st) {
                 if (preferDesktop) {
                     startVendorLogin(st, v);
                     st.toast(ui::ToastLevel::Info,
-                             "Desktop browser — complete captcha/sign-in, then close the window.");
+                             "System Chrome opened (no automation). Allow cookies, sign in, "
+                             "wait for My Account, then close the window.");
                 } else {
                     startLoginWizard(st, v.id);
                 }

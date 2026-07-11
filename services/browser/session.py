@@ -115,16 +115,30 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
     Blocks up to ``timeout`` seconds while the window stays open; returns as
     soon as the user closes it (closing the window is how the user signals
     "I'm done logging in"). Only bookkeeping is returned — never credentials.
-    """
-    try:
-        sync_playwright = _sync_playwright or _import_sync_playwright()
-    except RuntimeError as exc:
-        return fail("playwright_not_installed", str(exc))
 
+    Hard reCAPTCHA vendors (Anaheim Magento et al., see
+    :func:`_site_wants_native_chrome`) open **system Google Chrome as a plain
+    subprocess** with zero Playwright/CDP control during the sign-in — any
+    automation protocol attachment makes Google return "reCAPTCHA verification
+    failed" even with valid credentials (proven live 2026-07-10). Cookies are
+    exported after success/close and pushed into the CEF warm profile.
+    """
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
+        # Test injection of ``_sync_playwright`` always takes the Playwright path
+        # so unit fakes keep working. Production hard-sites prefer native Chrome.
+        if _sync_playwright is None and _site_wants_native_chrome(site) \
+                and _chrome_bin() is not None:
+            return _off_loop(_browser_login_native_chrome, site, timeout=timeout)
+        try:
+            sync_playwright = _sync_playwright or _import_sync_playwright()
+        except RuntimeError as exc:
+            # Hard-site fallback only — ordinary sites still need Playwright.
+            if _site_wants_native_chrome(site) and _chrome_bin() is not None:
+                return _off_loop(_browser_login_native_chrome, site, timeout=timeout)
+            return fail("playwright_not_installed", str(exc))
         return _off_loop(_browser_login_locked, site, timeout=timeout,
                          sync_playwright=sync_playwright)
     finally:
@@ -145,12 +159,303 @@ def _push_cookies_to_cef_warm(cookies: list) -> None:
         pass
 
 
-def _chrome_channel_available() -> bool:
-    """True when a system Google Chrome install is on PATH (Playwright channel)."""
+def _chrome_bin() -> str | None:
+    """Absolute path to system Google Chrome, or None."""
     import shutil
-    return bool(shutil.which("google-chrome")
-                or shutil.which("google-chrome-stable")
-                or shutil.which("chrome"))
+    return (shutil.which("google-chrome")
+            or shutil.which("google-chrome-stable")
+            or shutil.which("chrome")
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser"))
+
+
+def _chrome_channel_available() -> bool:
+    """True when a system Google Chrome install is on PATH."""
+    return _chrome_bin() is not None
+
+
+def _site_wants_native_chrome(site: str) -> bool:
+    """True when Playwright-driven login cannot pass the vendor's bot score.
+
+    Adapters set ``NATIVE_CHROME_LOGIN = True`` (or the attr on the instance).
+    Live-proven: Anaheim Magento MSP invisible reCAPTCHA rejects any session
+    where Playwright/CDP controlled the page, even headed real Chrome + valid
+    credentials ("reCAPTCHA verification failed").
+    """
+    slug = profiles.slug(site)
+    try:
+        from . import adapters
+        ad = adapters.get_adapter(slug)
+    except Exception:  # noqa: BLE001
+        ad = None
+    if ad is not None:
+        for name in ("NATIVE_CHROME_LOGIN", "prefer_native_chrome_login"):
+            val = getattr(ad, name, None)
+            if val is not None:
+                return bool(val)
+            mod = getattr(type(ad), "__module__", "")
+            try:
+                import sys
+                m = sys.modules.get(mod)
+                val = getattr(m, name, None) if m is not None else None
+                if val is not None:
+                    return bool(val)
+            except Exception:  # noqa: BLE001
+                pass
+    return slug in _NATIVE_CHROME_SITES
+
+
+#: Hard-coded fallback when an adapter has not grown the flag yet.
+_NATIVE_CHROME_SITES = frozenset({"anaheimautomation"})
+
+
+def _free_port() -> int:
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = int(s.getsockname()[1])
+    s.close()
+    return port
+
+
+def _devtools_tabs(port: int) -> list[dict]:
+    """Read Chrome's ``/json`` endpoint (no page injection — safe during login)."""
+    import json
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=1.5) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return data if isinstance(data, list) else []
+
+
+def _url_looks_post_login(site: str, url: str) -> bool:
+    """Heuristic: tab left the auth surface for a logged-in destination."""
+    u = (url or "").lower()
+    if not u.startswith("http"):
+        return False
+    auth_bits = ("/login", "/signin", "/sign-in", "/sign_in", "/register",
+                 "/create", "/forgot", "/ap/signin", "/customer/account/login")
+    if any(b in u for b in auth_bits):
+        return False
+    slug = profiles.slug(site)
+    if slug == "anaheimautomation" or "anaheimautomation.com" in u:
+        return "/customer/account" in u
+    # Generic: non-auth URL on a real host is a weak positive — final stamp still
+    # goes through classify_login_state when we can read content.
+    return True
+
+
+def _export_cookies_cdp(port: int) -> list:
+    """One-shot cookie dump via connect_over_cdp (call only AFTER login succeeded
+    or the user is closing — never during captcha interaction)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            if not browser.contexts:
+                return []
+            return list(browser.contexts[0].cookies() or [])
+            # Leave the CDP session to fall out of scope — do not browser.close()
+            # (on some Playwright builds that tears down the real Chrome).
+    except Exception:  # noqa: BLE001
+        return []
+
+def _export_cookies_relaunch(profile_path: Path) -> list:
+    """Open the on-disk profile headless (Chrome already exited) and dump cookies."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+    try:
+        with sync_playwright() as pw:
+            kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile_path),
+                "headless": True,
+                "args": ["--password-store=basic", "--no-first-run"],
+            }
+            if _chrome_channel_available():
+                kwargs["channel"] = "chrome"
+            try:
+                ctx = pw.chromium.launch_persistent_context(**kwargs)
+            except Exception:
+                kwargs.pop("channel", None)
+                ctx = pw.chromium.launch_persistent_context(**kwargs)
+            try:
+                return list(ctx.cookies() or [])
+            finally:
+                ctx.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _finalize_login_cookies(site: str, profile_path: Path, *,
+                            exported_cookies: list,
+                            last_url: str,
+                            last_content: str | None,
+                            channel: str) -> dict:
+    """Stage cookies, stamp verification, push CEF warm — shared by both login paths."""
+    profiles.touch_created(site)
+    now = time.time()
+    fields: dict[str, Any] = {"last_login_ts": now, "login_channel": channel}
+    login_verified = False
+    try:
+        from .embed import classify_login_state, import_session_cookies
+        if last_content is not None and \
+                classify_login_state(site, last_content, last_url) == "logged_in":
+            login_verified = True
+        elif last_url and _url_looks_post_login(site, last_url):
+            login_verified = True
+        if login_verified:
+            fields["login_verified_ts"] = now
+        if exported_cookies:
+            try:
+                import_session_cookies(site, exported_cookies, verified=login_verified)
+            except Exception:  # noqa: BLE001
+                pass
+            import threading
+            threading.Thread(target=_push_cookies_to_cef_warm, args=(exported_cookies,),
+                             daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+    meta = profiles.save_meta(site, **fields)
+    return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
+            "last_login_ts": meta["last_login_ts"],
+            "login_verified": bool(meta.get("login_verified_ts")),
+            "challenge_detected": None,
+            "cookies_exported": len(exported_cookies),
+            "channel": channel,
+            "last_url": last_url or ""}
+
+
+def _browser_login_native_chrome(site: str, *, timeout: float) -> dict:
+    """System Chrome subprocess — zero automation during the user's sign-in.
+
+    Polls Chrome's ``/json`` tab list (HTTP, no Runtime.enable) for a post-login
+    URL, then exports cookies. Falls back to profile relaunch dump when the
+    user closes the window first.
+    """
+    import subprocess
+
+    chrome = _chrome_bin()
+    if not chrome:
+        return fail("browser_login_failed", "no system Chrome/Chromium on PATH")
+
+    profile_path = profiles.ensure_profile(site)
+    try:
+        from .embed import start_url_for_site
+        start = start_url_for_site(site) or "about:blank"
+    except Exception:  # noqa: BLE001
+        start = "about:blank"
+
+    port = _free_port()
+    cmd = [
+        chrome,
+        f"--user-data-dir={str(profile_path)}",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--password-store=basic",
+        # Do NOT pass --enable-automation / headless / app mode — reCAPTCHA
+        # scores those. Remote debugging port alone is fine while nothing
+        # attaches CDP domains during the challenge.
+        start,
+    ]
+    print(
+        f"[browser_login] {site}: opened system Chrome (no automation).\n"
+        f"  1) Click Allow Cookies if the banner appears\n"
+        f"  2) Sign in with your email/password (complete any captcha yourself)\n"
+        f"  3) Wait until you see your account page, then close the window",
+        flush=True,
+    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return fail("browser_login_failed", f"failed to launch Chrome: {exc}")
+
+    last_url = ""
+    last_content: str | None = None
+    exported: list = []
+    saw_success = False
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break  # user closed the browser
+            try:
+                for t in _devtools_tabs(port):
+                    if t.get("type") != "page":
+                        continue
+                    u = t.get("url") or ""
+                    if u:
+                        last_url = u
+                    if u and _url_looks_post_login(site, u):
+                        saw_success = True
+                        # One CDP attach AFTER success only — dump cookies + HTML.
+                        try:
+                            from playwright.sync_api import sync_playwright
+                            with sync_playwright() as pw:
+                                b = pw.chromium.connect_over_cdp(
+                                    f"http://127.0.0.1:{port}")
+                                if b.contexts:
+                                    ctx = b.contexts[0]
+                                    exported = list(ctx.cookies() or [])
+                                    page = next(
+                                        (p for p in ctx.pages
+                                         if "login" not in (p.url or "").lower()),
+                                        ctx.pages[0] if ctx.pages else None,
+                                    )
+                                    if page is not None:
+                                        try:
+                                            last_content = page.content()
+                                            last_url = page.url or last_url
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                        except Exception:  # noqa: BLE001
+                            if not exported:
+                                exported = _export_cookies_cdp(port)
+                        break
+            except Exception:  # noqa: BLE001 — devtools not up yet / mid-nav
+                pass
+            if saw_success:
+                break
+            time.sleep(_LOGIN_POLL_INTERVAL_S)
+    finally:
+        if proc.poll() is None:
+            try:
+                if not exported:
+                    exported = _export_cookies_cdp(port)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=8)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Always try profile relaunch dump if CDP export was empty (user closed
+        # the window before we could connect).
+        if not exported:
+            time.sleep(0.4)  # let ProcessSingleton release the profile
+            exported = _export_cookies_relaunch(profile_path)
+
+    return _finalize_login_cookies(
+        site, profile_path,
+        exported_cookies=exported,
+        last_url=last_url,
+        last_content=last_content,
+        channel="native-chrome",
+    )
 
 
 # Magento (Anaheim et al.) often leaves the user on ``/login/referer/<base64>/``

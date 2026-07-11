@@ -936,13 +936,19 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False) -> 
 
     scope="recent" (default): only the SINGLE most-recent prior session's docs — the
     crash we're recovering from — never the whole history. scope="all": every autosave.
-    include_orphaned (daemon mode): also open the daemon's retired docs (clean-shutdown /
-    doc-GC orphans) — only the explicit recover_parts tool passes this; startup never
-    resurrects retired docs. Prunes stale autosaves first."""
+    include_orphaned: no longer changes daemon-mode behavior (see below); kept for the
+    non-daemon path and API stability. Prunes stale autosaves first.
+
+    Daemon mode: crash recovery now lives in the orphan tier — a crashed daemon's
+    autosaves are REGISTERED there (not auto-opened), and clean-shutdown / doc-GC docs
+    are DISCARDED, so the tier holds only genuine crash survivors. We open those. The
+    hello id_remap path stays as a fallback for an older daemon that still auto-opens."""
     if cb._daemon_mode():
-        out = _recover_via_daemon()
-        if include_orphaned:
-            out.extend(_recover_orphans_via_daemon())
+        out = _recover_via_daemon()  # [] on a current daemon (no auto-open)
+        seen = {r.get("original_doc_id") for r in out}
+        for r in _recover_orphans_via_daemon():
+            if r.get("original_doc_id") not in seen:
+                out.append(r)
         return out
     _prune_autosaves()
     out: list = []

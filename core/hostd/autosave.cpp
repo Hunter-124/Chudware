@@ -51,17 +51,13 @@ void Autosave::stop(bool finalSave) {
     stopping_ = true;
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
-    // Final save runs even when the periodic loop is disabled (interval 0):
-    // "disable" means no background ticks, not "lose dirty docs on drain".
-    if (finalSave && engineState_ && engineState_->load() == 1) {
-        saveDirtyDocs();
-        retireOpenDocsOnExit();
-    }
-    // Clean shutdown: remove this session's dir so the next start does not
-    // crash-recover docs that were deliberately retired (or had nothing to
-    // save). A hard kill skips this — that IS the crash-recovery signal. The
-    // crash-tier source we recovered from is equally settled by now (every
-    // doc from it was retired, closed, or re-saved), so it goes too.
+    // Clean shutdown DISCARDS unsaved work — it is not a crash, so nothing is
+    // preserved for recovery (the front-line guard is the GUI's "unsaved changes
+    // on quit" warning; the daemon only reaches a clean stop once every client
+    // has disconnected). Removing this session's dir is the discard: the next
+    // start finds no prior session and offers no recovery. A hard kill skips this
+    // whole path — a surviving session dir IS the crash-recovery signal.
+    (void)finalSave;
     std::error_code ec;
     if (!sessionDir_.empty()) fs::remove_all(sessionDir_, ec);
     if (!recoverDir_.empty()) fs::remove_all(recoverDir_, ec);
@@ -119,38 +115,63 @@ void Autosave::recoverPriorSession() {
     for (const auto& s : sessions)
         if (s != latest) fs::remove_all(baseDir_ + "/" + s, ec);
 
-    recoverDir_ = baseDir_ + "/" + latest;
+    // A surviving prior-session dir means that daemon CRASHED (a clean shutdown
+    // removes its own session dir). Crash recovery is the ONLY path that feeds the
+    // recovery tier now — clean shutdown and doc-GC both discard. We do NOT
+    // auto-open the survivors (that silently resurrected zombie parts); instead we
+    // register each into the orphan tier so a client restores it deliberately via
+    // recovery_list -> recovery_open (GUI "Recover?" prompt / recover_parts tool).
+    const std::string dir = baseDir_ + "/" + latest;
+    fs::create_directories(orphanDir_, ec);
+    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
     int recovered = 0;
-    for (const auto& e : fs::directory_iterator(recoverDir_, ec)) {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
         if (e.path().extension() != ".step+") continue;
         const std::string oldId = e.path().stem().string();
-        json result;
-        std::string err;
-        // detach_path: a crash-recovered doc must not keep pointing INTO the autosave
-        // tier — a user save would land there, and the artifact is transient anyway.
-        if (!core::cpp_core().call(
-                "doc_open",
-                json{{"path", e.path().string()}, {"detach_path", true}}, result, err)) {
-            log().line("autosave recovery: doc_open(%s) failed: %s",
-                       e.path().string().c_str(), err.c_str());
+        std::string name = oldId;
+        {
+            std::ifstream in(dir + "/" + oldId + ".json");
+            if (in) {
+                try {
+                    json m;
+                    in >> m;
+                    name = m.value("name", oldId);
+                } catch (...) {
+                }
+            }
+        }
+        // stem = <ms>-<doc_id>: doc_id keeps it unique even within one ms, and the
+        // orphan meta records the ORIGINAL id so a reconnecting agent's old handle
+        // still resolves once recovery_open mints the new one.
+        char stem[128];
+        std::snprintf(stem, sizeof stem, "%015lld-%s", nowMs, oldId.c_str());
+        std::lock_guard<std::mutex> lk(orphanMtx_);
+        fs::copy_file(e.path(), orphanDir_ + "/" + stem + ".step+",
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log().line("crash recovery: copy %s -> orphan failed: %s", oldId.c_str(),
+                       ec.message().c_str());
+            ec.clear();
             continue;
         }
-        const std::string newId = result.value("doc_id", std::string());
-        if (newId.empty()) continue;
-        {
-            std::lock_guard<std::mutex> lk(remapMtx_);
-            idRemap_[oldId] = newId;
-        }
-        // The doc came back detached (clean of any autosave path) and not dirty, so
-        // the tick won't re-save it until the first edit. Carry the artifact into
-        // THIS session's dir under the new id so a crash in that window still recovers.
-        fs::create_directories(sessionDir_, ec);
-        fs::copy_file(e.path(), sessionDir_ + "/" + newId + ".step+",
-                      fs::copy_options::overwrite_existing, ec);
+        std::ofstream meta(orphanDir_ + "/" + stem + ".json", std::ios::trunc);
+        meta << json{{"doc_id", oldId},
+                     {"name", name},
+                     {"retired_ms", nowMs},
+                     {"from_crash", true}}
+                    .dump();
         ++recovered;
-        log().line("autosave recovery: %s -> %s", oldId.c_str(), newId.c_str());
     }
-    if (recovered) log().line("recovered %d doc(s) from session %s", recovered, latest.c_str());
+    fs::remove_all(dir, ec);  // consumed into the orphan tier
+    recoverDir_.clear();
+    if (recovered) {
+        sweepOrphans();
+        log().line("crash recovery: registered %d doc(s) from session %s into the "
+                   "recovery tier (awaiting recovery_open)",
+                   recovered, latest.c_str());
+    }
 }
 
 void Autosave::saveDirtyDocs() {
@@ -182,6 +203,11 @@ void Autosave::saveDirtyDocs() {
                 std::lock_guard<std::mutex> lk(revMtx_);
                 lastSavedRev_[id] = rev;
             }
+            // Name sidecar: crash recovery registers this .step+ into the orphan
+            // tier WITHOUT opening it, so the human-readable name has to travel
+            // beside the file (the .step+ stem is the doc_id).
+            std::ofstream meta(sessionDir_ + "/" + id + ".json", std::ios::trunc);
+            meta << json{{"name", d.value("name", id)}}.dump();
         } else {
             log().line("autosave: doc_save(%s) failed: %s", id.c_str(), err.c_str());
         }
@@ -194,6 +220,7 @@ void Autosave::onDocClosed(const std::string& docId) {
     if (docId.empty()) return;
     std::error_code ec;
     fs::remove(sessionDir_ + "/" + docId + ".step+", ec);
+    fs::remove(sessionDir_ + "/" + docId + ".json", ec);  // name sidecar
     { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
     // A crash-recovered doc closed on purpose must not come back on the next
     // crash: drop its source file and remap entry too.
@@ -208,51 +235,25 @@ void Autosave::onDocClosed(const std::string& docId) {
     }
 }
 
-bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
-    if (docId.empty()) return false;
-    std::error_code ec;
-    fs::create_directories(orphanDir_, ec);
-    const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-    char stem[128];
-    std::snprintf(stem, sizeof stem, "%015lld-%s", nowMs, docId.c_str());
-    const std::string base = orphanDir_ + "/" + stem;
-    json result;
-    std::string err;
-    if (!core::cpp_core().call("doc_save", json{{"doc_id", docId}, {"path", base + ".step+"}},
-                               result, err)) {
-        log().line("doc-gc: retire doc_save(%s) failed: %s", docId.c_str(), err.c_str());
-        return false;
-    }
-    {
-        std::lock_guard<std::mutex> lk(orphanMtx_);
-        std::ofstream meta(base + ".json", std::ios::trunc);
-        meta << json{{"doc_id", docId}, {"name", name}, {"retired_ms", nowMs}}.dump();
-    }
-    fs::remove(sessionDir_ + "/" + docId + ".step+", ec);
-    { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
-    sweepOrphans();
-    return true;
+void Autosave::noteRecoveredRemap(const std::string& oldId, const std::string& newId) {
+    if (oldId.empty() || newId.empty() || oldId == newId) return;
+    std::lock_guard<std::mutex> lk(remapMtx_);
+    idRemap_[oldId] = newId;
 }
 
-void Autosave::retireOpenDocsOnExit() {
-    json docs;
-    std::string err;
-    if (!core::cpp_core().call("doc_list", json::object(), docs, err)) return;
-    if (!docs.is_object() || !docs.contains("docs")) return;
-    for (const auto& d : docs["docs"]) {
-        if (!d.is_object()) continue;
-        const std::string id = d.value("doc_id", std::string());
-        if (id.empty()) continue;
-        // A clean doc that lives in a USER file needs no orphan copy — the user
-        // reopens the file. Autosave artifacts don't count (doc_save set them as
-        // the doc's path); those docs are retired like unsaved ones.
-        const std::string path = d.contains("path") && d["path"].is_string()
-                                     ? d["path"].get<std::string>()
-                                     : std::string();
-        if (!path.empty() && !isAutosavePath(path) && !d.value("dirty", false)) continue;
-        retireDoc(id, d.value("name", id));
+json Autosave::orphanMeta(const std::string& id) {
+    if (id.empty() || id.find('/') != std::string::npos ||
+        id.find("..") != std::string::npos)
+        return json::object();
+    std::lock_guard<std::mutex> lk(orphanMtx_);
+    std::ifstream in(orphanDir_ + "/" + id + ".json");
+    if (!in) return json::object();
+    try {
+        json m;
+        in >> m;
+        return m.is_object() ? m : json::object();
+    } catch (...) {
+        return json::object();
     }
 }
 

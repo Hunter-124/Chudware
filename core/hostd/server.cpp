@@ -182,7 +182,7 @@ void Server::run(int lingerSecs) {
     children_.shutdown();
 }
 
-bool Server::gcCloseDoc(const std::string& docId, bool retire, const char* reason) {
+bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
     if (status_.engineState.load() != 1) return false;
     // TOCTOU guard: tick() decided this doc was abandoned under the registry
     // lock, then released it before we got here. A client may have re-attached
@@ -190,48 +190,20 @@ bool Server::gcCloseDoc(const std::string& docId, bool retire, const char* reaso
     // it now would yank a live doc out from under that client. Re-check under the
     // lock and bail if it's no longer abandoned.
     if (!registry_.isReapable(docId)) return false;
-    // Save-before-close (GC only): the doc goes to the autosave orphan tier so the
-    // work stays recoverable (recovery_list / recovery_open) without ever
-    // auto-reopening. Clean docs that live in a user file skip the copy. An
-    // explicit discard (retire=false) skips the whole tier — the user closed it.
-    json docs;
-    std::string err;
-    std::string name = docId;
-    bool needRetire = retire;
-    if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
-        docs.is_object() && docs.contains("docs")) {
-        bool found = false;
-        for (const auto& d : docs["docs"]) {
-            if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
-            found = true;
-            name = d.value("name", docId);
-            const std::string path = d.contains("path") && d["path"].is_string()
-                                         ? d["path"].get<std::string>()
-                                         : std::string();
-            // Only a CLEAN doc backed by a real user file skips the orphan
-            // copy; a path inside the autosave tree is our own artifact.
-            if (needRetire)
-                needRetire = path.empty() || d.value("dirty", false) ||
-                             (autosave_ && autosave_->isAutosavePath(path));
-            break;
-        }
-        if (!found) {  // already gone from the engine — just drop registry state
-            registry_.onDaemonClosedDoc(docId, reason);
-            return true;
-        }
-    }
-    if (needRetire && autosave_ && !autosave_->retireDoc(docId, name)) {
-        log().line("doc-gc: keeping %s open (retire failed)", docId.c_str());
-        return false;  // never close a doc we could not preserve
-    }
+    // DISCARD, never retire: an abandoned doc (doc-GC grace expired) or an
+    // explicitly-closed one is not a crash, so it is not preserved for recovery.
+    // doc_close + onDocClosed purge the doc's autosave artifacts so it can never
+    // resurrect. Recovery is reserved for crashes (see Autosave::recoverPriorSession).
     json result;
+    std::string err;
     if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err)) {
+        // Already gone from the engine (raced a real doc_close): still drop
+        // registry state + artifacts so nothing lingers.
         log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
-        return false;
     }
+    if (autosave_) autosave_->onDocClosed(docId);
     registry_.onDaemonClosedDoc(docId, reason);
-    log().line("doc-gc: closed %s doc %s (%s)%s", reason, docId.c_str(), name.c_str(),
-               needRetire ? " — recoverable via recovery_list" : "");
+    log().line("doc-gc: discarded doc %s (reason %s)", docId.c_str(), reason);
     return true;
 }
 
@@ -368,9 +340,16 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             // Route through the registry so the caller attaches rw and every
             // mirror gets doc.opened — same envelope as a client doc_open.
             registry_.postCall(c.id, c.kind, "doc_open", p2, result);
+            const std::string newId = result.value("doc_id", std::string());
+            // The original id (pre-crash) lives in the entry meta: record the
+            // rebind so a reconnecting client's hello resolves its old handle, and
+            // hand it back so callers (recover_parts) can alias without a re-hello.
+            const std::string origId = autosave_->orphanMeta(id).value("doc_id", std::string());
+            autosave_->noteRecoveredRemap(origId, newId);
             autosave_->discardOrphans(id);  // consumed — it lives in the engine now
             opened.push_back(json{{"id", id},
-                                  {"doc_id", result.value("doc_id", std::string())}});
+                                  {"doc_id", newId},
+                                  {"original_doc_id", origId}});
         }
         return json{{"opened", opened}};
     }
@@ -393,7 +372,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         // isReapable == no client still attached: the writer (agent) is gone, so
         // this close is safe and the doc was truly abandoned.
         const bool discarded =
-            registry_.isReapable(docId) && gcCloseDoc(docId, /*retire=*/false, "discarded");
+            registry_.isReapable(docId) && gcCloseDoc(docId, "discarded");
         return json{{"ok", true}, {"discarded", discarded}};
     }
 

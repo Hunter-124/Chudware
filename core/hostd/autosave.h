@@ -10,23 +10,25 @@
 // The instance-key level is a deliberate addition over the plan's path: scratch
 // test daemons must never recover (or sweep) the real daemon's sessions.
 //
-// TWO RECOVERY TIERS (doc-lifecycle overhaul):
+// RECOVERY IS CRASH-ONLY (doc-lifecycle overhaul):
 //
-//  * CRASH tier — a prior session dir that still exists means that daemon died
-//    hard (clean shutdown removes its session dir). On start the MOST RECENT
-//    prior session's autosaves are doc_open'd back in (the engine assigns fresh
-//    ids); the {old_id: new_id} map is served in hello so reconnecting clients
-//    rebind. Sessions older than that most recent one are swept.
+//  A prior session dir that still exists means that daemon died HARD — a clean
+//  shutdown removes its own session dir (stop()), and so does an explicit
+//  doc_close / doc-GC on each doc it touched. So on start, any surviving prior
+//  session is a crash: its autosaves are NOT auto-opened (that silently
+//  resurrected zombie parts) — each is registered into the ORPHAN tier
+//  (<baseDir>/orphaned/, {stem}.step+ + {stem}.json meta) so a client restores it
+//  DELIBERATELY via recovery_list -> recovery_open (the GUI "Recover unsaved
+//  parts?" prompt, or the recover_parts MCP tool). recovery_open mints a fresh id
+//  and records {old_id: new_id} (noteRecoveredRemap) so hello can rebind a
+//  reconnecting client. Nothing else feeds the tier: clean shutdown and doc-GC
+//  both DISCARD, and an explicitly closed part is purged outright. This is what
+//  keeps closed / cleanly-quit parts from flooding back on the next launch while
+//  still catching genuine crashes.
 //
-//  * ORPHAN tier — <baseDir>/orphaned/. Docs retired here are NEVER auto-opened:
-//    clean shutdown retires every open doc with unsaved state, and the doc-GC
-//    (all clients gone + grace expired) retires before closing. Clients list
-//    them with recovery_list and explicitly recovery_open / recovery_discard.
-//    This is what stops closed viewports from resurrecting zombie parts on the
-//    next startup while keeping the work recoverable.
-//
-// Explicit doc_close deletes the doc's autosave artifacts (session file, and
-// its crash-tier source when the doc came from recovery) — closed means closed.
+// Explicit doc_close deletes the doc's autosave artifacts (session file + name
+// sidecar, and its crash-tier source when the doc came from recovery) — closed
+// means closed.
 #pragma once
 
 #include <atomic>
@@ -47,9 +49,11 @@ public:
     // wait for ready.
     void start(const std::string& baseDir, const std::atomic<int>* engineState);
 
-    // Stop the loop (join). finalSave: save every dirty doc, retire every open
-    // doc with unsaved state to the orphan tier, then remove this session's dir
-    // so the next start does NOT crash-recover a cleanly shut down session.
+    // Stop the loop (join) and DISCARD: remove this session's dir so the next
+    // start does NOT crash-recover a cleanly shut down session. Clean shutdown is
+    // not a crash — unsaved work is dropped (the GUI's quit warning is the guard),
+    // recovery is reserved for crashes. finalSave is retained for ABI/callers but
+    // no longer preserves anything.
     void stop(bool finalSave);
 
     // {old_doc_id: new_doc_id} from crash recovery; empty until recoveryDone().
@@ -63,31 +67,23 @@ public:
     // Look up the orphan file for entry `id`; "" when unknown. Does not delete —
     // the caller removes via discardOrphan() only after a successful doc_open.
     std::string orphanPath(const std::string& id);
+    // The stored meta for orphan entry `id` ({doc_id,name,retired_ms,from_crash});
+    // empty object when unknown. Lets recovery_open recover the ORIGINAL doc_id.
+    nlohmann::json orphanMeta(const std::string& id);
     // Delete orphan `id` (or all when id==""). Returns how many were removed.
     int discardOrphans(const std::string& id);
+    // Record a crash-recovery rebind so hello can hand a reconnecting client the
+    // {old_id: new_id} map (recovery_open mints a fresh id for each restored doc).
+    void noteRecoveredRemap(const std::string& oldId, const std::string& newId);
 
     // Explicit doc_close: delete the doc's session autosave, and when the doc
     // was crash-recovered also its source file + id_remap entry.
     void onDocClosed(const std::string& docId);
 
-    // True when `path` is one of OUR artifacts (session autosave / recovery /
-    // orphan file). doc_save sets the doc's path + clears dirty, so a doc whose
-    // path points in here is NOT "safe in a user file" — it must still be
-    // retired before closing.
-    bool isAutosavePath(const std::string& path) const {
-        return !baseDir_.empty() && path.rfind(baseDir_, 0) == 0;
-    }
-
-    // Doc-GC / clean-shutdown path: doc_save `docId` into the orphan tier and
-    // drop its session autosave. `name` is stored beside it for the recovery
-    // prompt. False when the engine save failed (session file is kept).
-    bool retireDoc(const std::string& docId, const std::string& name);
-
 private:
     void loop();
     void recoverPriorSession();
     void saveDirtyDocs();
-    void retireOpenDocsOnExit();
     void sweepOrphans();  // keep the newest AICAD_ORPHAN_KEEP (default 20)
 
     std::string baseDir_;
@@ -107,7 +103,7 @@ private:
     nlohmann::json idRemap_ = nlohmann::json::object();
     // doc_id -> revision at last save. Written by the autosave thread
     // (saveDirtyDocs) and erased from server-dispatch / accept-loop threads
-    // (onDocClosed, retireDoc) — guarded by revMtx_ against concurrent map ops.
+    // (onDocClosed) — guarded by revMtx_ against concurrent map ops.
     std::mutex revMtx_;
     std::map<std::string, long> lastSavedRev_;
     std::mutex orphanMtx_;  // serializes orphan dir mutations

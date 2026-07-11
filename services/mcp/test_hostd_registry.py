@@ -289,7 +289,11 @@ def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
 # ------------------------------------------------------- autosave + recovery
 
 
-def test_autosave_recovery_id_remap(scratch_daemon):
+def test_crash_recovery_prompts_via_orphan_tier(scratch_daemon):
+    """A hard CRASH is the only path that feeds the recovery tier. The survivor is
+    NOT auto-opened (that silently resurrected zombie parts) — it waits in
+    recovery_list until an explicit recovery_open, which mints a fresh id, carries
+    both doc_id + original_doc_id, and rebinds the old handle in hello."""
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
@@ -311,22 +315,34 @@ def test_autosave_recovery_id_remap(scratch_daemon):
         if b.call("daemon_status").get("recovery") == "done":
             break
         time.sleep(0.2)
+
+    # NOT auto-opened: no id_remap at hello yet, doc absent from doc_list...
     info = b.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
-    remap = info.get("id_remap") or {}
-    assert doc in remap, f"old id must be remapped, got {remap}"
-    new_id = remap[doc]
+    assert not (info.get("id_remap") or {}), info.get("id_remap")
+    assert "recover-me" not in [d["name"] for d in b.call("doc_list", {})["docs"]]
+    # ...but present in the recovery tier with its real name preserved.
+    entries = b.call("recovery_list", {}).get("entries") or []
+    entry = next((e for e in entries if e.get("name") == "recover-me"), None)
+    assert entry is not None, entries
+    assert entry.get("doc_id") == doc, entry  # meta keeps the ORIGINAL id
+
+    opened = b.call("recovery_open", {"all": True}).get("opened") or []
+    o = next((x for x in opened if x.get("original_doc_id") == doc), None)
+    assert o is not None, opened
+    new_id = o["doc_id"]
+    assert isinstance(new_id, str) and new_id, o  # GUI mirrors tabs from this
     docs = {d["doc_id"]: d for d in b.call("doc_list", {})["docs"]}
-    assert new_id in docs
     assert docs[new_id]["name"] == "recover-me"
-    assert docs[new_id]["revision"] >= 0
-    # Content survived: the box feature is in the recovered tree.
     tree = b.call("doc_tree", {"doc_id": new_id})
     assert "b1" in str(tree.get("tree")), "recovered doc lost its geometry"
+    # Consumed: a second recovery_open must not duplicate it.
+    assert b.call("recovery_list", {}).get("entries") == []
 
 
 def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
-    """cad_tools.recover_autosaved in daemon mode consumes the hello id_remap
-    into _DOC_ALIASES instead of re-opening files."""
+    """After a crash, cad_tools.recover_autosaved (daemon mode) restores the
+    survivor from the orphan tier (recovery_open) and aliases the agent's old
+    handle to the freshly-minted id."""
     monkeypatch.setenv("AI_CAD_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_client", None)
     from mcp_server import cad_tools, core_bridge
@@ -369,18 +385,19 @@ def _wait_daemon_gone(pid: int, timeout: float = 20.0) -> bool:
     return False
 
 
-def test_clean_shutdown_retires_docs_no_autorecover(scratch_daemon):
-    """A cleanly shut down daemon must NOT auto-resurrect its open docs on the
-    next start — they land in the orphan tier behind an explicit recovery_open."""
+def test_clean_shutdown_discards_docs(scratch_daemon):
+    """A CLEAN shutdown discards unsaved work — recovery is crash-only. The doc
+    must not auto-open AND must not land in the recovery tier on the next start
+    (the GUI's quit warning is the front-line guard against data loss)."""
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
     scratch_daemon.append(pid)
-    doc = a.call("doc_new", {"name": "retire-me"})["doc_id"]
+    doc = a.call("doc_new", {"name": "discard-on-quit"})["doc_id"]
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
 
     assert a.call("daemon_drain", {}).get("ok") is True
-    a.close()  # last client gone -> drained daemon exits, retiring open docs
+    a.close()  # last client gone -> drained daemon exits cleanly, discarding
     assert _wait_daemon_gone(pid), "drained daemon did not exit"
 
     b = DaemonClient()
@@ -394,25 +411,13 @@ def test_clean_shutdown_retires_docs_no_autorecover(scratch_daemon):
             break
         time.sleep(0.2)
 
-    # No crash -> no auto-recovery; the doc is NOT open...
+    # Clean shutdown is not a crash: nothing auto-opens AND nothing is recoverable.
     info = b.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
     assert not (info.get("id_remap") or {}), info.get("id_remap")
     names = [d["name"] for d in b.call("doc_list", {})["docs"]]
-    assert "retire-me" not in names, names
-    # ...but it IS waiting in the orphan tier, and recovery_open restores it.
+    assert "discard-on-quit" not in names, names
     entries = b.call("recovery_list", {}).get("entries") or []
-    assert any(e.get("name") == "retire-me" for e in entries), entries
-    opened = b.call("recovery_open", {"all": True}).get("opened") or []
-    assert opened, "recovery_open restored nothing"
-    # Each opened entry MUST carry the newly-minted doc_id: the GUI mirrors tabs
-    # for the recovered docs from this return value (the daemon's doc.opened
-    # fanout excludes the caller), so a missing doc_id means recovered parts only
-    # surface on the next app launch. See host mirrorRecoveredDocs.
-    assert all(isinstance(o.get("doc_id"), str) and o["doc_id"] for o in opened), opened
-    names = [d["name"] for d in b.call("doc_list", {})["docs"]]
-    assert "retire-me" in names, names
-    # Consumed: a second recovery_open must not duplicate it.
-    assert b.call("recovery_list", {}).get("entries") == []
+    assert not any(e.get("name") == "discard-on-quit" for e in entries), entries
 
 
 def test_doc_close_kills_autosave_artifact(scratch_daemon):
@@ -446,9 +451,10 @@ def test_doc_close_kills_autosave_artifact(scratch_daemon):
     assert not any(e.get("name") == "closed-for-good" for e in entries), entries
 
 
-def test_doc_gc_closes_abandoned_docs(scratch_daemon, monkeypatch):
-    """A doc whose every client disconnected is retired + closed after the GC
-    grace — zombie docs never pile up behind dead agent sessions."""
+def test_doc_gc_discards_abandoned_docs(scratch_daemon, monkeypatch):
+    """A doc whose every client disconnected is DISCARDED after the GC grace — an
+    abandoned scratch doc is not a crash, so it is not preserved for recovery
+    (the grace window is the chance to reopen + save it in the GUI first)."""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
@@ -473,9 +479,9 @@ def test_doc_gc_closes_abandoned_docs(scratch_daemon, monkeypatch):
     evts = _events(b, "doc.closed")
     assert any(e.get("data", {}).get("doc_id") == doc and
                e.get("data", {}).get("reason") == "gc" for e in evts), evts
-    # ...and the work is recoverable, not lost.
+    # ...and it is DISCARDED, not retired: nothing waits in the recovery tier.
     entries = b.call("recovery_list", {}).get("entries") or []
-    assert any(e.get("name") == "abandoned" for e in entries), entries
+    assert not any(e.get("name") == "abandoned" for e in entries), entries
 
 
 def test_doc_discard_closes_abandoned_doc_no_recovery(scratch_daemon):

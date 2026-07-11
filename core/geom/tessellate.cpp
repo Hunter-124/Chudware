@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepBndLib.hxx>
+#include <Bnd_Box.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -105,6 +108,37 @@ bool is_hidden_edge(const TopoDS_Edge& edge,
 
 }  // namespace
 
+// Size-relative default linear deflection (T-PERF7b, perf audit §4 P2). A fixed
+// absolute 0.05 mm meshed multi-metre imports at millions of triangles; scale the
+// chord tolerance with the part instead:
+//   lin = clamp(bbox_diag * kAutoRel, kAutoFloor, kAutoCeil)
+//     kAutoRel   = 6e-4  — a ~50 mm part (diag ~86.6 mm) yields ~0.052 mm, i.e.
+//                          essentially the historical 0.05 mm default, so small
+//                          and medium parts keep their prior visual quality
+//     kAutoFloor = 0.02 mm — bounds the density gain on tiny parts
+//     kAutoCeil  = 1.0 mm  — caps facet chord error on huge parts (a 2 m part
+//                            meshes at 1.0 mm, ~20x fewer curved-face tris)
+// Falls back to the historical 0.05 mm when the bbox is void/degenerate.
+double auto_linear_deflection(const TopoDS_Shape& shape) {
+    constexpr double kAutoRel = 6e-4;
+    constexpr double kAutoFloor = 0.02;    // mm
+    constexpr double kAutoCeil = 1.0;      // mm
+    constexpr double kLegacyDefault = 0.05;  // mm
+    try {
+        Bnd_Box bb;
+        BRepBndLib::Add(shape, bb);
+        if (!bb.IsVoid()) {
+            double x0, y0, z0, x1, y1, z1;
+            bb.Get(x0, y0, z0, x1, y1, z1);
+            const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+            const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (std::isfinite(diag) && diag > 0.0)
+                return std::min(kAutoCeil, std::max(kAutoFloor, diag * kAutoRel));
+        }
+    } catch (...) { /* fall through to the legacy default */ }
+    return kLegacyDefault;
+}
+
 aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
                                const std::string& name, const float color[3],
                                double lin_deflection, double ang_deflection,
@@ -121,17 +155,20 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
     // Smooth-render clamp (display path): never let a curved face facet worse than
     // kDisplayMaxAngularDeflection. A coarse caller angular value (the 0.35 rad default) would
     // otherwise render a faceted cylinder; a FINER request passes through unchanged. Linear
-    // deflection is left as the caller set it (0.05 mm by default is already smooth) — the
-    // angular term is the one that was binding on curved faces.
+    // deflection: an explicit positive caller value is used as-is; the <=0 default selects
+    // the size-relative auto value (auto_linear_deflection) so huge parts don't mesh at a
+    // fixed 0.05 mm — the angular term is the one that was binding on curved faces.
     const double eff_ang = (ang_deflection > 0.0)
                                ? std::min(ang_deflection, kDisplayMaxAngularDeflection)
                                : kDisplayMaxAngularDeflection;
+    const double eff_lin =
+        (lin_deflection > 0.0) ? lin_deflection : auto_linear_deflection(shape);
 
     // Mesh the shape (parallel, absolute deflection) — same call as tessellate.py.
     // BRepMesh is face-incremental: a face whose TShape already carries a matching
     // triangulation is skipped, so on a downstream edit only the changed faces re-mesh.
     const auto _mesh_t0 = std::chrono::steady_clock::now();
-    BRepMesh_IncrementalMesh mesher(shape, lin_deflection, Standard_False,
+    BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
                                     eff_ang, Standard_True);
     mesher.Perform();
     const auto _mesh_t1 = std::chrono::steady_clock::now();
@@ -254,7 +291,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
         if (pts.empty()) {
             try {
                 BRepAdaptor_Curve crv(edge);
-                GCPnts_TangentialDeflection disc(crv, lin_deflection, eff_ang);
+                GCPnts_TangentialDeflection disc(crv, eff_lin, eff_ang);
                 for (int ni = 1; ni <= disc.NbPoints(); ++ni) {
                     gp_Pnt p = disc.Value(ni);
                     pts.push_back(static_cast<float>(p.X()));

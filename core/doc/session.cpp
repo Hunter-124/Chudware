@@ -3939,6 +3939,49 @@ bool force_release_doc_lock() {
     return released;
 }
 
+// Auto-unique document names, like real CAD. If `requested` exactly matches an
+// already-open document's name, strip any trailing integer to get the base
+// ("Part1" -> "Part") and return the first free "<base><N>", continuing past
+// the highest existing suffix so repeated doc_new("Part1") yields Part1,
+// Part2, Part3, ...  Non-colliding names pass through untouched.
+static std::string unique_doc_name(const std::string& requested) {
+    // Snapshot open-doc names: pin sessions under the registry lock, then lock
+    // each one at a time to read its name (T-PERF5 pattern, same as doc_list).
+    // Caller's DocLock holds no session mutexes yet, so this cannot deadlock.
+    std::vector<std::shared_ptr<Session>> pins;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        pins.reserve(g_sessions.size());
+        for (const auto& kv : g_sessions) pins.push_back(kv.second);
+    }
+    std::set<std::string> names;
+    for (const auto& sp : pins) {
+        std::lock_guard<std::mutex> doc(sp->mtx);
+        if (sp->doc.is_object()) names.insert(sp->doc.value("name", std::string()));
+    }
+    if (names.find(requested) == names.end()) return requested;
+    // Split off a trailing integer to get the series base.
+    std::size_t cut = requested.size();
+    while (cut > 0 && std::isdigit(static_cast<unsigned char>(requested[cut - 1]))) --cut;
+    std::string base = requested.substr(0, cut);
+    if (base.empty()) base = requested;  // all-digit name: suffix the whole thing
+    // Start after the highest existing "<base><N>" so the series stays monotonic.
+    long start = 2;
+    for (const std::string& n : names) {
+        if (n.size() <= base.size() || n.compare(0, base.size(), base) != 0) continue;
+        const std::string tail = n.substr(base.size());
+        if (tail.empty() || tail.size() > 9 ||
+            tail.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        const long v = std::stol(tail);
+        if (v + 1 > start) start = v + 1;
+    }
+    for (long i = start;; ++i) {
+        std::string cand = base + std::to_string(i);
+        if (names.find(cand) == names.end()) return cand;
+    }
+}
+
 // ----------------------------------------------------------------- public API
 json doc_new(const std::string& kind, const std::string& name) {
     const std::string k = kind.empty() ? std::string("part") : kind;
@@ -3946,10 +3989,13 @@ json doc_new(const std::string& kind, const std::string& name) {
         throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
                       {{"kind", kind}, {"reason", "bad kind"}});
     DocLock lk;
+    const std::string requested =
+        name.empty() ? (k == "assembly" ? std::string("Assembly1") : std::string("Part1")) : name;
+    const std::string resolved = unique_doc_name(requested);
     if (k == "assembly") {
         auto sp = std::make_shared<Session>();
         sp->doc_id = new_doc_id();
-        sp->doc = blank_assembly(sp->doc_id, name);
+        sp->doc = blank_assembly(sp->doc_id, resolved);
         sp->revision = 0;
         const std::string id = sp->doc_id;
         {
@@ -3960,12 +4006,14 @@ json doc_new(const std::string& kind, const std::string& name) {
         rebuild_assembly(stored);
         json resp = ops_response_assembly(stored, json::object());
         resp["doc_id"] = stored.doc_id;
+        resp["name"] = resolved;
         return resp;
     }
-    Session& stored = new_part_session_locked(name);
+    Session& stored = new_part_session_locked(resolved);
     CompileResult r = compile_session(stored);
     json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
+    resp["name"] = resolved;
     return resp;
 }
 
@@ -5540,7 +5588,8 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
             float bmetal = 0.0f, brough = 0.5f;
             apply_doc_appearance(s.doc, id, bcolor, bmetal, brough);
             bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), bcolor,
-                                                     0.05, 0.35, bmetal, brough));
+                                                     /*lin_deflection=*/0.0 /*auto: size-relative*/,
+                                                     0.35, bmetal, brough));
             ++id;
         } catch (...) {
         }

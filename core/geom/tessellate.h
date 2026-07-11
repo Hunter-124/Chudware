@@ -13,12 +13,22 @@ class TopoDS_Shape;
 
 namespace geom {
 
+// Size-relative default linear deflection (T-PERF7b, perf audit §4 P2):
+// clamp(bbox_diag * 6e-4, 0.02 mm, 1.0 mm). A ~50 mm part (diag ~86.6 mm) lands
+// on ~0.05 mm — the old fixed default — so small/medium parts keep their prior
+// mesh density, while multi-metre parts no longer mesh at millions of triangles.
+// Falls back to 0.05 mm when the shape has no measurable bbox.
+double auto_linear_deflection(const TopoDS_Shape& shape);
+
 // Tessellate one OCCT shape into an AICM body.
-//   lin_deflection / ang_deflection : BRepMesh tolerances (mm, radians) — defaults
-//   match tessellate.py (0.05 / 0.35). metallic/roughness fill the C32-A trailer.
+//   lin_deflection / ang_deflection : BRepMesh tolerances (mm, radians).
+//   lin_deflection <= 0 (the default) selects the size-relative auto value
+//   (auto_linear_deflection above); an explicit positive value wins unchanged.
+//   ang_deflection default matches tessellate.py (0.35 rad). metallic/roughness
+//   fill the C32-A trailer.
 aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
                                const std::string& name, const float color[3],
-                               double lin_deflection = 0.05,
+                               double lin_deflection = 0.0,
                                double ang_deflection = 0.35,
                                float metallic = 0.0f, float roughness = 0.5f);
 

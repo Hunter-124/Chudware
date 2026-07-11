@@ -7206,35 +7206,17 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
 
             // Fresh tessellate + stats.
-            // T-PERF7(b) size-relative linear deflection:
-            //   lin = clamp(diag * k, floor, ceil)
-            //     k     = 1e-3   (0.1% of bbox diagonal)
-            //     floor = 0.05 mm  — same absolute default as before, so tiny parts
-            //                       keep prior visual quality / mesh density
-            //     ceil  = 2.0 mm  — caps facet size on multi-metre parts so a 2 m
-            //                       part (~diag 2000) meshes at O(100k) tris instead
-            //                       of millions at a fixed 0.05 mm
+            // T-PERF7(b) size-relative linear deflection — the shared helper
+            // ::geom::auto_linear_deflection computes clamp(bbox_diag * 6e-4,
+            // 0.02 mm, 1.0 mm), so a ~50 mm part keeps the historical 0.05 mm
+            // quality while multi-metre parts stop meshing at millions of tris.
+            // Passing 0.0 (the auto sentinel) lets tessellate_body pick it; every
+            // default-parameter caller gets the same policy.
             // Angular deflection stays 0.35 rad (tessellate_body clamps for display).
             g_cc_bodies_tessellated.fetch_add(1, std::memory_order_relaxed);
-            double lin_defl = 0.05;
-            try {
-                Bnd_Box bb;
-                BRepBndLib::Add(shape, bb);
-                if (!bb.IsVoid()) {
-                    double x0, y0, z0, x1, y1, z1;
-                    bb.Get(x0, y0, z0, x1, y1, z1);
-                    const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
-                    const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    if (std::isfinite(diag) && diag > 0.0) {
-                        constexpr double kRel = 1e-3;
-                        constexpr double kFloor = 0.05;  // mm
-                        constexpr double kCeil = 2.0;    // mm
-                        lin_defl = std::min(kCeil, std::max(kFloor, diag * kRel));
-                    }
-                }
-            } catch (...) { /* keep 0.05 floor */ }
             aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, sid, bcolor,
-                                                       lin_defl, 0.35, bmetal, brough);
+                                                       /*lin_deflection=*/0.0, 0.35,
+                                                       bmetal, brough);
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts

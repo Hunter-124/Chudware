@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 
 from mcp.server.fastmcp import FastMCP
 
@@ -553,8 +554,38 @@ def _reexec_with_fast_malloc() -> None:
         pass  # exec failed -> fall through and run on the default allocator
 
 
+def _start_orphan_watchdog() -> None:
+    """Exit when the client that spawned us is gone.
+
+    stdio MCP servers are children of their client (Claude Desktop/Code, Cursor,
+    the GUI copilot). When that parent dies without closing our pipes cleanly —
+    crash, SIGKILL, session teardown bugs — this process used to linger forever,
+    holding a live connection into aicad-hostd: the daemon never idle-exited,
+    its docs never GC'd, and orphaned bridges piled up one per dead session
+    (observed: 5 on one box). The parent can't be relied on to clean us up, so
+    we watch it ourselves: if our ppid changes (parent died; we were reparented
+    to init/a subreaper), exit. The engine state lives in hostd, not here, so
+    an abrupt exit loses nothing. Opt out with AICAD_ORPHAN_WATCHDOG=0."""
+    if os.name == "nt" or os.environ.get("AICAD_ORPHAN_WATCHDOG") == "0":
+        return  # Windows has no reparenting signal; Job Objects handle teardown
+    parent = os.getppid()
+    if parent <= 1:
+        return  # already init-parented (launched by a supervisor) — no signal to watch
+
+    def _watch() -> None:
+        while True:
+            time.sleep(15.0)
+            if os.getppid() != parent:
+                print("[mcp_server] parent client died — exiting orphan bridge",
+                      file=sys.stderr)
+                os._exit(0)
+
+    threading.Thread(target=_watch, name="aicad-orphan-watchdog", daemon=True).start()
+
+
 def main() -> None:
     _reexec_with_fast_malloc()  # fast-allocator preload (best-effort, before any core alloc)
+    _start_orphan_watchdog()  # a dead client must never leave a zombie bridge pinning hostd
     real_stream = _install_clean_stdout()
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.

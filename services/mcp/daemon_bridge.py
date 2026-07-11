@@ -253,6 +253,16 @@ def _reap_spawned() -> None:
     _SPAWNED[:] = [p for p in _SPAWNED if p.poll() is None]
 
 
+def _watch_spawned(p: "subprocess.Popen") -> "subprocess.Popen":
+    """Track a spawned hostd AND reap it the moment it exits. The polling
+    _reap_spawned() only runs on the next connect, so a flock-race loser or a
+    drained daemon used to sit <defunct> in this process for its whole life;
+    a dedicated wait() thread collects it immediately."""
+    _SPAWNED.append(p)
+    threading.Thread(target=p.wait, name="aicad-hostd-reaper", daemon=True).start()
+    return p
+
+
 def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
     """Launch the daemon so it outlives this client.
 
@@ -272,8 +282,7 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
             p = subprocess.Popen([str(hostd)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB,
                                  close_fds=True, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            _SPAWNED.append(p)
-            return p
+            return _watch_spawned(p)
         except OSError:
             print(
                 "[daemon_bridge] WARNING: job breakaway denied — aicad-hostd will die "
@@ -284,16 +293,14 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
             p = subprocess.Popen([str(hostd)], creationflags=flags, close_fds=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
-            _SPAWNED.append(p)
-            return p
+            return _watch_spawned(p)
     p = subprocess.Popen(
         [str(hostd)],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    _SPAWNED.append(p)
-    return p
+    return _watch_spawned(p)
 
 
 class DaemonClient:

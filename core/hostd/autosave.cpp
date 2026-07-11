@@ -352,9 +352,12 @@ int Autosave::discardOrphans(const std::string& id) {
 }
 
 void Autosave::sweepOrphans() {
-    // Generous by default: the orphan tier is the long-lived disk recovery store
-    // for crashed work (cheap on disk, never auto-loaded), so keep a deep history.
-    int keep = 200;
+    // Longer than the old 20, but deliberately NOT unbounded: the GUI "Recover"
+    // button loads every listed entry synchronously (attach + tree + mesh per
+    // doc), so a very deep tier would reproduce the original "loading a pile of
+    // garbage freezes the app" symptom. 50 keeps a generous disk history while
+    // capping a worst-case Recover-all. Raise AICAD_ORPHAN_KEEP if you accept that.
+    int keep = 50;
     if (const char* v = std::getenv("AICAD_ORPHAN_KEEP"); v && *v)
         keep = std::max(0, std::atoi(v));
     std::lock_guard<std::mutex> lk(orphanMtx_);

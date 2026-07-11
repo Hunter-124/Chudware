@@ -1981,6 +1981,64 @@ void pushFixture3(std::vector<float>& s, std::vector<float>* tris, const float c
         pushMomentArc(s, c, u, w, 0.55f * r);
     }
 }
+// ---- Thermal-FEA boundary-condition glyphs (issue #24) --------------------------------------------
+// A thermal study's "fixture" faces are a *fixed-temperature* (Dirichlet) BC, not a mechanical
+// restraint, and its "loads" are heat flux or convection — so they get their own symbols instead of
+// the 6-DOF pin cluster / force arrows. All three build the local face frame the same way (e2 = out
+// normal, e0/e1 span the face plane).
+static void faceFrame(const float n[3], float e0[3], float e1[3], float e2[3]) {
+    e2[0] = n[0]; e2[1] = n[1]; e2[2] = n[2];
+    vecNorm3(e2);
+    perp3(e2, e0);
+    cross3(e2, e0, e1);
+}
+// Fixed-temperature marker: an octagon ring flat on the face + a bold "=" (two parallel bars) at its
+// centre — reads as "held constant" (isothermal), the thermal analogue of the ground hatch.
+void pushIsoTemp(std::vector<float>& s, const float c[3], const float n[3], float r) {
+    float e0[3], e1[3], e2[3];
+    faceFrame(n, e0, e1, e2);
+    const int kN = 8;
+    float prev[3];
+    for (int i = 0; i <= kN; ++i) {
+        const float a = 6.2831853f * (float)i / (float)kN;
+        const float ca = std::cos(a) * r, sa = std::sin(a) * r;
+        float q[3] = {c[0] + e0[0] * ca + e1[0] * sa,
+                      c[1] + e0[1] * ca + e1[1] * sa,
+                      c[2] + e0[2] * ca + e1[2] * sa};
+        if (i > 0) pushSeg3(s, prev, q);
+        prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
+    }
+    for (int b = -1; b <= 1; b += 2) {  // the "=" bars
+        float off = 0.30f * r * (float)b;
+        float p0[3], p1[3];
+        for (int k = 0; k < 3; ++k) {
+            p0[k] = c[k] + e1[k] * off - e0[k] * 0.42f * r;
+            p1[k] = c[k] + e1[k] * off + e0[k] * 0.42f * r;
+        }
+        pushSeg3(s, p0, p1);
+    }
+}
+// Convection marker: three stacked "≈" waves standing off the surface along the outward normal, so a
+// convective/film BC reads as heat wafting away from the face (distinct from a straight flux arrow).
+void pushConvection(std::vector<float>& s, const float c[3], const float n[3], float r) {
+    float e0[3], e1[3], e2[3];
+    faceFrame(n, e0, e1, e2);
+    const int kSeg = 12;
+    for (int row = 0; row < 3; ++row) {
+        const float h = (0.25f + 0.55f * (float)row) * r;   // stand-off along the normal
+        float prev[3];
+        for (int i = 0; i <= kSeg; ++i) {
+            const float t = (float)i / (float)kSeg;               // 0..1 across the face
+            const float u = (t - 0.5f) * 1.7f * r;                // span along e0
+            const float wob = std::sin(t * 6.2831853f) * 0.16f * r;  // wave along e1
+            float q[3];
+            for (int k = 0; k < 3; ++k)
+                q[k] = c[k] + e0[k] * u + e1[k] * wob + e2[k] * h;
+            if (i > 0) pushSeg3(s, prev, q);
+            prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
+        }
+    }
+}
 }  // namespace
 
 void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& loadSegs,
@@ -2053,6 +2111,9 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
             }
         }
     };
+    // ThermalFea reinterprets the wells: fixture faces are a fixed-temperature (Dirichlet) BC and
+    // loads are heat flux / convection — so both get thermal glyphs instead of mechanical ones.
+    const bool thermalFea = (s.type == StudyType::ThermalFea);
     for (const auto& p : s.fixtures.picks) {
         if (!p.pickBody || !p.pickTopo) continue;
         float c[3], n[3];
@@ -2064,7 +2125,10 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
         // grid stay distinct instead of merging into a blob.
         float gr = L * 0.30f;
         if (spacing > 1e-4f) gr = std::min(gr, 0.40f * spacing);
-        for (const auto& pt : pts) pushFixture3(fixtureSegs, fixtureTris, pt.data(), n, gr);
+        for (const auto& pt : pts) {
+            if (thermalFea) pushIsoTemp(fixtureSegs, pt.data(), n, gr);
+            else pushFixture3(fixtureSegs, fixtureTris, pt.data(), n, gr);
+        }
     }
     // Fatigue with fully-reversed loading swings +/- the load — draw a second, opposite arrow so the
     // alternating nature reads on the model (a double-headed indicator).
@@ -2082,6 +2146,31 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
                                                     ld.vec[1] * ld.vec[1] + ld.vec[2] * ld.vec[2]));
     }
     for (const auto& ld : s.loads) {
+        // ThermalFea loads: heat flux (arrows normal to the face, into the part) or convection (the
+        // stacked-wave film glyph). No magnitude normalization — thermal units aren't the force scale.
+        if (thermalFea) {
+            for (const auto& p : ld.faces.picks) {
+                if (!p.pickBody || !p.pickTopo) continue;
+                float c[3], n[3];
+                if (!faceCN(p.pickBody, p.pickTopo, c, n)) continue;
+                std::vector<std::array<float, 3>> pts;
+                float spacing = 0.0f;
+                faceGrid(p.pickBody, p.pickTopo, c, n, 3, pts, spacing);
+                float gr = L * 0.30f;
+                if (spacing > 1e-4f) gr = std::min(gr, 0.40f * spacing);
+                for (const auto& ap : pts) {
+                    if (ld.thermalKind == 1) {
+                        pushConvection(loadSegs, ap.data(), n, gr);
+                    } else {  // heat flux into the surface
+                        float dir[3] = {-n[0], -n[1], -n[2]};
+                        float tail[3] = {ap[0] - dir[0] * L * 0.7f, ap[1] - dir[1] * L * 0.7f,
+                                         ap[2] - dir[2] * L * 0.7f};
+                        pushArrow3(loadSegs, tail, dir, L * 0.7f, loadTris);
+                    }
+                }
+            }
+            continue;
+        }
         float scale = 1.0f;
         if (ld.pressure) {
             if (maxPress > 1e-9f) scale = 0.4f + 0.6f * std::fabs(ld.pressureMpa) / maxPress;

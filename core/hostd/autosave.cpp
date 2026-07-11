@@ -167,15 +167,21 @@ void Autosave::saveDirtyDocs() {
         const long rev = d.contains("revision") && d["revision"].is_number()
                              ? d["revision"].get<long>()
                              : -1;
-        auto it = lastSavedRev_.find(id);
-        if (it != lastSavedRev_.end() && rev >= 0 && it->second == rev)
-            continue;  // unchanged since last autosave — skip the full serialize
+        {
+            std::lock_guard<std::mutex> lk(revMtx_);
+            auto it = lastSavedRev_.find(id);
+            if (it != lastSavedRev_.end() && rev >= 0 && it->second == rev)
+                continue;  // unchanged since last autosave — skip the full serialize
+        }
         fs::create_directories(sessionDir_, ec);
         json result;
         const std::string path = sessionDir_ + "/" + id + ".step+";
         if (core::cpp_core().call("doc_save", json{{"doc_id", id}, {"path", path}}, result,
                                   err)) {
-            if (rev >= 0) lastSavedRev_[id] = rev;
+            if (rev >= 0) {
+                std::lock_guard<std::mutex> lk(revMtx_);
+                lastSavedRev_[id] = rev;
+            }
         } else {
             log().line("autosave: doc_save(%s) failed: %s", id.c_str(), err.c_str());
         }
@@ -188,7 +194,7 @@ void Autosave::onDocClosed(const std::string& docId) {
     if (docId.empty()) return;
     std::error_code ec;
     fs::remove(sessionDir_ + "/" + docId + ".step+", ec);
-    lastSavedRev_.erase(docId);
+    { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
     // A crash-recovered doc closed on purpose must not come back on the next
     // crash: drop its source file and remap entry too.
     std::lock_guard<std::mutex> lk(remapMtx_);
@@ -225,7 +231,7 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
         meta << json{{"doc_id", docId}, {"name", name}, {"retired_ms", nowMs}}.dump();
     }
     fs::remove(sessionDir_ + "/" + docId + ".step+", ec);
-    lastSavedRev_.erase(docId);
+    { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
     sweepOrphans();
     return true;
 }

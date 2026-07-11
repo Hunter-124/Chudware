@@ -3609,6 +3609,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
             _unpublish(d)  # drop its mirror tab in the app
             if _CUR["doc_id"] == d:
                 _CUR["doc_id"] = None
+            # Prune recovery aliases that resolve to this now-closed doc. The bridge
+            # outlives daemon restarts (which reset the doc-id counter), so a stale
+            # old_id -> d alias could later misroute an agent's call to a REUSED d.
+            for k in [k for k in _DOC_ALIASES if k == d or _resolve_alias(k) == d]:
+                _DOC_ALIASES.pop(k, None)
             return _dumps({"ok": True, "closed": r.get("closed", True), "doc_id": d})
         except Exception as e:  # noqa: BLE001
             return _err(e)

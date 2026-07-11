@@ -105,8 +105,12 @@ private:
 
     std::mutex remapMtx_;
     nlohmann::json idRemap_ = nlohmann::json::object();
-    std::map<std::string, long> lastSavedRev_;  // doc_id -> revision at last save
-    std::mutex orphanMtx_;                      // serializes orphan dir mutations
+    // doc_id -> revision at last save. Written by the autosave thread
+    // (saveDirtyDocs) and erased from server-dispatch / accept-loop threads
+    // (onDocClosed, retireDoc) — guarded by revMtx_ against concurrent map ops.
+    std::mutex revMtx_;
+    std::map<std::string, long> lastSavedRev_;
+    std::mutex orphanMtx_;  // serializes orphan dir mutations
 };
 
 }  // namespace hostd

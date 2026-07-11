@@ -47,23 +47,42 @@ name=password widget) — those markers were dropped for the public catalogs
 - **acehardware** — HTTP 403 real Cloudflare Turnstile interstitial ("Just a moment", cf_chl_) on `/search?query=`.
 - **coremarkmetals** — HTTP 200 but a real reCAPTCHA `api2/bframe` challenge popup on `/search?q=`, zero products.
 
-## REMAINING — HARD TAIL (real endpoint found, but per-product results are NOT in the
-## fetched HTML — client-side JS/Nuxt/Next/AJAX). Need browser-rendered extraction
-## (execute the page's search XHR) or the site's JSON API, not a regex on the static
-## shell. Real endpoints discovered (query param in parens):
-- **meanwell** → `/productSearch.aspx?pkeywords=` (200; page shows series *categories*, product models render client-side)
-- **hdsc** → `/en/search?search=` (200; results JS-rendered)
-- **applerubber** → `/search.cfm?keyword=` (200; returns product *category* links only, no per-product SKUs — a kind="category" case if wanted)
-- **speedymetals** → `search.aspx?SearchTerm=` (200; aspx SPA, results via XHR)
-- **acpcomposites** → `/?s=<q>&post_type=product` (200 "Search Results for:" but WooCommerce grid is AJAX)
-- **dfrobot** (Nuxt SPA), **wch**, **batteryspace**, **marcorubber** (JS)
-- **maxon** → Next.js `__NEXT_DATA__` blob (login-wizard; parse the JSON, mirror digikey_web.py)
-- **freecadlibrary** → GitHub repo tree search (special-case)
+## HARD TAIL — FINISHED (2026-07-10, 3 parallel subagents; each fix live-verified,
+## fixture test added, committed + pushed separately). The daemon returns the live
+## post-JS DOM, so the "results render client-side" blockers were mostly the wrong
+## endpoint + speculative CSS regexes, not a true JS wall.
+| adapter | real endpoint | parse mode | live hits |
+|---|---|---|---|
+| maxon | `/en-us/search?q=` | Next.js `__NEXT_DATA__` `productSearchData.products[].record` | 10 (PN+USD price) |
+| applerubber | `/search.cfm?keyword=` | ColdFusion `<ol id=SearchResults>` rows → `kind="page"` | 10 |
+| freecadlibrary | GitHub git-tree API `/git/trees/master?recursive=1` | walk blobs, filter by basename + CAD ext, raw download URLs | 40 (capped) |
+| batteryspace | `/search.aspx?find=` | AmeriCommerce rendered product cards | 30 (title+url+price+SKU) |
+| wch | `search.wch-ic.com/?q=&t=all` | Vue app, `/downloads/` doc anchors → `kind="document"` | 12 |
+| hdsc | `/en/search?type=post&search=` | rendered post rows → `kind="post"` (news index; product-family terms only) | 12 (HC32) |
+| acpcomposites | `/?s=<q>&post_type=product` | WooCommerce/FacetWP server-rendered grid `<h3><a href=/shop/..>` | 16 |
+| speedymetals | `/search.aspx?SearchTerm=` | ASP.NET server table `<td><a href=p-<id>.aspx>` + Material/Shape → category | 462 |
+| meanwell | `/productSearch.aspx?pkeywords=` | series anchors `search.aspx?prod=<MODEL>` → `kind="series"` (model/series-indexed; free text → 0) | 15 (LRS) |
+| marcorubber | `/search-results?search=` | Angular SPA route (found in bundle) `<a class=search-header>` | 18 |
 
-These are best finished with parallel subagents each executing the page's search XHR
-(or hitting the discovered JSON API) and reading the rendered DOM. Cross-check every
-fix against `[[vendor-adapter-parser-reveng]]`; never fake-fix a genuinely walled site.
-NB: after the challenge false-positive fixes, Magento/Woo/Shopify/BigCommerce sites can
-fall through to a FALSE login-wall (header "Sign In"/"Log In"/name=password widget) —
-drop those markers for public catalogs (done for the 8 fixed above).
+**9 fixed + 1 documented-unreachable.** dfrobot is a **Nuxt SPA whose search is
+XHR-JSON only** — no SSR route (`/search-adv/result?q=` is a hard 404, sitemap lists
+only `/product-<id>.html`), not in static DOM or `window.__NUXT__`. Left degrading
+cleanly to `http_error`; docstring records the finding.
+
+Every "false login-wall" (header Sign In / name=password newsletter field on a public
+catalog) was dropped again here (batteryspace, acpcomposites, speedymetals, meanwell,
+marcorubber, applerubber); challenge markers retained. Cross-check
+`[[vendor-adapter-parser-reveng]]`.
+
+## Infra fix landed alongside (reload-safety + canary backfill)
+The 10 new reload-fixture parser tests exposed a pre-existing test-isolation bug:
+`importlib.reload(services.browser.adapters)` reset `_REGISTRY` to empty (the
+bottom-of-file site imports are no-ops on reload), so `all_adapters()`/
+`login_wizard_sites()` silently emptied for later tests — the baseline was green only
+by collection-order luck. Fixed by re-registering every already-imported adapter
+submodule at package load (no-op first time, repopulates on reload). That, in turn,
+un-masked `test_health_canaries_cover_every_registered_site`: 35 Wave 3/4/5 adapters
+had no `CANARY_QUERIES` entry (hidden by the truncated registry). Backfilled all 35
+(live-verified queries for headless-parsing sites, category terms for walled/SPA ones).
+**Full suite: 301 passed / 79 skipped.**
 </content>

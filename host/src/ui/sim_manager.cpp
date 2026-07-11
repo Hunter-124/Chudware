@@ -2217,6 +2217,22 @@ void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
     pushSeg3(inletSegs, a3, a4); pushSeg3(inletSegs, a4, a1);
     pushSeg3(inletSegs, a1, a3); pushSeg3(inletSegs, a2, a4);
 
+    // Outlet plane (issue #24/#25): the downstream box face got no marker, so it was unclear where
+    // flow exits. Stamp the same rectangle + diagonal cross at the trailing face centre. It shares the
+    // inletSegs batch (drawn in the flow-inlet colour) but sits 6r downstream of the inlet, so the two
+    // read as clearly separate planes rather than one glyph.
+    float outC[3] = {boxC[0] + f[0]*halfLen, boxC[1] + f[1]*halfLen, boxC[2] + f[2]*halfLen};
+    float o1[3], o2[3], o3[3], o4[3];
+    for (int k = 0; k < 3; ++k) {
+        o1[k] = outC[k] + rgt[k]*halfCross + upv[k]*halfCross;
+        o2[k] = outC[k] - rgt[k]*halfCross + upv[k]*halfCross;
+        o3[k] = outC[k] - rgt[k]*halfCross - upv[k]*halfCross;
+        o4[k] = outC[k] + rgt[k]*halfCross - upv[k]*halfCross;
+    }
+    pushSeg3(inletSegs, o1, o2); pushSeg3(inletSegs, o2, o3);
+    pushSeg3(inletSegs, o3, o4); pushSeg3(inletSegs, o4, o1);
+    pushSeg3(inletSegs, o1, o3); pushSeg3(inletSegs, o2, o4);
+
     // Flow arrows: a 3x3 grid announcing the incoming stream, kept fully UPSTREAM of the inlet
     // face (tips just short of it) and much shorter than the old 1.2r spears that pierced the
     // model. Heads are capped so the glyphs never shout over the part being analysed.
@@ -2245,7 +2261,6 @@ bool SimManager::flowResultLinesActive(AppState& st) const {
 void SimManager::rebuildFlowLines(AppState& st, Study& s) {
     for (int b = 0; b < kFlowBands; ++b) { flowStreamSegs_[b].clear(); flowSliceSegs_[b].clear(); }
     flowLinesBuiltFor_.clear();
-    (void)st;
     if (s.overlayPath.empty()) return;
     std::error_code ec;
     if (!std::filesystem::exists(s.overlayPath, ec)) return;
@@ -2257,6 +2272,26 @@ void SimManager::rebuildFlowLines(AppState& st, Study& s) {
         int bi = (int)((spd / (float)vmax) * kFlowBands);
         return bi < 0 ? 0 : (bi >= kFlowBands ? kFlowBands - 1 : bi);
     };
+    // Issue #26: streamlines carry NO flow-direction cue. We stamp small wireframe arrow "barbs"
+    // along each streamline (every kArrowEvery segments) pointing the local flow direction, pushed
+    // into the SAME per-band buffer so they inherit the band colour and the show-streamlines toggle,
+    // and are drawn by the existing per-band drawSegments caller (viewport_panel). They are wireframe
+    // (two barb segs) rather than solid cones because the results draw path only draws segments per
+    // band — filled cones would need a per-band drawTriangles call the read-only caller doesn't make.
+    // Barb size is a small fraction of the model diagonal (NOT the local segment length, which can be
+    // near-zero) so heads stay legible and uniform.
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; bool anyF = false;
+    for (const auto& kv : st.faceNormalCache) {
+        for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], kv.second[3+k]); hi[k] = std::max(hi[k], kv.second[3+k]); }
+        anyF = true;
+    }
+    float mdiag = 100.0f;
+    if (anyF) {
+        mdiag = std::sqrt((hi[0]-lo[0])*(hi[0]-lo[0]) + (hi[1]-lo[1])*(hi[1]-lo[1]) + (hi[2]-lo[2])*(hi[2]-lo[2]));
+        if (mdiag < 1e-3f) mdiag = 100.0f;
+    }
+    const float barbLen = 0.018f * mdiag;   // barb leg length
+    const int kArrowEvery = 6;              // one arrowhead every N segments along a streamline
     for (const auto& ls : doc.lines) {
         const bool isSlice = (ls.name == "slices");
         const bool isStream = (ls.name == "streamlines");
@@ -2274,6 +2309,23 @@ void SimManager::rebuildFlowLines(AppState& st, Study& s) {
                 const float* pa = &ls.pts[a * 3];
                 const float* pc = &ls.pts[c * 3];
                 dst[bi].insert(dst[bi].end(), {pa[0], pa[1], pa[2], pc[0], pc[1], pc[2]});
+                // Sample a direction barb sparsely along streamlines only.
+                if (isStream && (i % kArrowEvery) == (uint32_t)(kArrowEvery / 2)) {
+                    float d[3] = {pc[0]-pa[0], pc[1]-pa[1], pc[2]-pa[2]};
+                    float dl = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                    if (dl > 1e-6f) {
+                        d[0]/=dl; d[1]/=dl; d[2]/=dl;
+                        float perp[3]; perp3(d, perp);   // any unit vector normal to d
+                        // Barbs sweep back from the tip (pc) at ~30 deg on either side.
+                        for (int sgn = -1; sgn <= 1; sgn += 2) {
+                            float b[3] = {
+                                pc[0] - d[0]*barbLen + perp[0]*barbLen*0.5f*sgn,
+                                pc[1] - d[1]*barbLen + perp[1]*barbLen*0.5f*sgn,
+                                pc[2] - d[2]*barbLen + perp[2]*barbLen*0.5f*sgn};
+                            dst[bi].insert(dst[bi].end(), {pc[0], pc[1], pc[2], b[0], b[1], b[2]});
+                        }
+                    }
+                }
             }
             p += cnt;
         }

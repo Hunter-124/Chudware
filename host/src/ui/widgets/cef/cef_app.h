@@ -31,9 +31,14 @@ int execute_subprocess(int argc, char** argv);
 // init with AI_CAD_CEF_EARLY=1.
 bool initialize();
 
-// True after a successful initialize(). CefWebView::available() forwards this.
-// Note: after lazy-init, available() is false until the first web surface opens.
+// True after a successful initialize(). CefWebView::processReady() forwards this.
+// Note: after lazy-init, processReady() is false until the first web surface opens.
 bool initialized();
+
+// True when initialize() was attempted and returned false. Never call
+// CefInitialize again in this process (CEF 149 SIGTRAP). Wizard uses this to
+// fall back to desktop/native login instead of crashing on re-init.
+bool init_failed();
 
 // Call once per GLFW frame. While any browser is alive (see note_browser_*),
 // pumps CefDoMessageLoopWork() EVERY frame — the external-pump deadline model

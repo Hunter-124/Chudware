@@ -96,9 +96,19 @@ std::string vendorLabel(const std::string& site) {
     return site;
 }
 
+// Magento MSP invisible reCAPTCHA (and similar) reject in-panel OSR CEF under
+// software GL / automation. Mirror services/browser NATIVE_CHROME_LOGIN sites:
+// open real system Chrome, export cookies → Playwright profile + CEF warm so
+// headless browser_fetch / CEF daemon can reuse the session.
+bool sitePrefersDesktopLogin(const std::string& site) {
+    return site == "anaheimautomation";
+}
+
 // Point the web view at the wizard's current step. The screencast backend adopts
 // the worker-side embed session (embed_id); CEF has no worker embed, so it opens
 // the current site's sign-in URL in-process instead (usesWorkerEmbed()==false).
+// Hard-captcha sites skip CEF and open native desktop Chrome (session still
+// lands in the warm jar for headless reuse when the user closes the window).
 void openWizardSite(AppState& st, const std::string& embedId) {
     auto& w = W();
     w.loggedInSince = 0.0;
@@ -106,12 +116,29 @@ void openWizardSite(AppState& st, const std::string& embedId) {
     w.loadTimedOut  = false;
     WIZ_TRACE("openWizardSite site='%s' embed='%s' workerEmbed=%d",
               w.currentSite.c_str(), embedId.c_str(), (int)w.web->usesWorkerEmbed());
-    if (w.web->usesWorkerEmbed())
+    if (w.web->usesWorkerEmbed()) {
         w.web->attach(st, embedId);
-    else if (!w.currentSite.empty())
-        w.web->open(st, w.currentSite, /*isUrl=*/false);
-    else
+        return;
+    }
+    if (w.currentSite.empty()) {
         WIZ_TRACE("openWizardSite: NO currentSite — nothing opened");
+        return;
+    }
+    if (sitePrefersDesktopLogin(w.currentSite)) {
+        for (auto& v : S().vendors) {
+            if (v.id == w.currentSite && !v.loginInProgress) {
+                WIZ_TRACE("openWizardSite: native desktop for '%s' (reCAPTCHA)",
+                          w.currentSite.c_str());
+                st.toast(ui::ToastLevel::Info,
+                         "Opening system Chrome for " + vendorLabel(w.currentSite) +
+                             " (bot-check site). Sign in, then close the window — "
+                             "session carries to headless fetch.");
+                startVendorLogin(st, v);
+                return;
+            }
+        }
+    }
+    w.web->open(st, w.currentSite, /*isUrl=*/false);
 }
 
 // Re-open the current site's page in-place (Retry after a stall / load error).
@@ -243,7 +270,12 @@ void wizardNext(AppState& st, bool skip, bool assertLoggedIn = false) {
     // reuse it, then advance. Export failure still advances — the login stamp is
     // also written by the import, so a failed export degrades to "signed in for
     // this GUI session only" rather than blocking the wizard.
-    if (loggedIn && !w.web->usesWorkerEmbed() && !w.currentSite.empty()) {
+    //
+    // Native-desktop sites (Anaheim etc.) already push cookies via
+    // browser_login → import_session_cookies + CEF warm; skip CEF export
+    // (the panel browser never held that jar).
+    if (loggedIn && !w.web->usesWorkerEmbed() && !w.currentSite.empty()
+        && !sitePrefersDesktopLogin(w.currentSite)) {
         w.web->exportSession(st, w.currentSite, [send](bool ok) {
             if (!ok)
                 std::fprintf(stderr, "[parts] vendor session export failed — "

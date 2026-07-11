@@ -790,7 +790,11 @@ struct CefWebView::Impl {
 // ---- public ------------------------------------------------------------------
 
 bool CefWebView::processReady() { return cef::initialized(); }
-bool CefWebView::available() const { return cef::initialized(); }
+// available() == "can still host a browser". Only false after a hard cold-init
+// failure — while not yet initialized (lazy path) open() may still succeed.
+// Wizard must NOT treat "not yet init" as dead, or multi-site Connect falls
+// back to desktop before CEF has a chance.
+bool CefWebView::available() const { return !cef::init_failed(); }
 
 CefWebView::CefWebView() : impl_(std::make_unique<Impl>()) {}
 

@@ -1123,3 +1123,13 @@ SIGTRAP'd in `SetSamplingProfiler`. Fix: separate cache roots
 (`cef_cache_gui` vs `cef_cache_daemon`), never re-enter `CefInitialize`
 after a failed attempt, wizard falls back to desktop `vendor_login` when
 `available()` is false.
+
+### 2026-07-10 — vendor connect crash + headless handoff (follow-up)
+Verified concurrent CEF: daemon (`cef_cache_daemon`) + GUI (`cef_cache_gui`)
+both `CefInitialize OK` and headless `fetch` works while daemon holds lock.
+Hardened `CefWebView::available()` to only false on `init_failed()` (lazy-safe).
+Wizard auto-routes `anaheimautomation` to native system Chrome (reCAPTCHA);
+"I'm signed in" skips CEF cookie export for those sites (native path already
+staged Playwright + CEF warm). Native login fails cleanly without
+DISPLAY/WAYLAND so pure-headless agents get a structured "login once headed"
+hint. Cleaned stale profile SingletonLocks.

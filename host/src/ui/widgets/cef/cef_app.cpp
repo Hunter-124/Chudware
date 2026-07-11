@@ -301,6 +301,8 @@ bool initialize() {
 
 bool initialized() { return g_initialized; }
 
+bool init_failed() { return g_init_attempted && !g_initialized; }
+
 void note_browser_creating() { g_creating.fetch_add(1, std::memory_order_relaxed); }
 
 void note_browser_create_failed() {

@@ -334,13 +334,28 @@ def _browser_login_native_chrome(site: str, *, timeout: float) -> dict:
 
     Polls Chrome's ``/json`` tab list (HTTP, no Runtime.enable) for a post-login
     URL, then exports cookies. Falls back to profile relaunch dump when the
-    user closes the window first.
+    user closes the window first. Cookies are staged for Playwright headless
+    reuse and pushed into the CEF daemon warm profile (headless fetch path).
+
+    Requires a real display — reCAPTCHA sites cannot complete under pure
+    headless automation. Callers without DISPLAY get a structured failure
+    pointing at the headed path.
     """
+    import os
     import subprocess
 
     chrome = _chrome_bin()
     if not chrome:
         return fail("browser_login_failed", "no system Chrome/Chromium on PATH")
+    # Wayland/X11: need a real session. Pure headless (no DISPLAY/WAYLAND) cannot
+    # complete Magento MSP reCAPTCHA — fail clearly instead of hanging Chrome.
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return fail(
+            "browser_login_needs_display",
+            f"{profiles.slug(site)} requires headed system Chrome (reCAPTCHA); "
+            "no DISPLAY/WAYLAND_DISPLAY — run vendor_login from the desktop GUI "
+            "once, then headless browser_fetch reuses the saved session",
+        )
 
     profile_path = profiles.ensure_profile(site)
     try:

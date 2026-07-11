@@ -175,6 +175,12 @@ void Server::run(int lingerSecs) {
 
 void Server::gcCloseDoc(const std::string& docId) {
     if (status_.engineState.load() != 1) return;
+    // TOCTOU guard: tick() decided this doc was abandoned under the registry
+    // lock, then released it before we got here. A client may have re-attached
+    // in that window (GUI re-list -> attach_doc, or an implicit rw touch); closing
+    // it now would yank a live doc out from under that client. Re-check under the
+    // lock and bail if it's no longer abandoned.
+    if (!registry_.isReapable(docId)) return;
     // Save-before-close: the doc goes to the autosave orphan tier so the work
     // stays recoverable (recovery_list / recovery_open) without ever
     // auto-reopening. Clean docs that live in a user file skip the copy.

@@ -157,6 +157,13 @@ std::vector<std::string> DocRegistry::tick() {
     return expired;
 }
 
+bool DocRegistry::isReapable(const std::string& docId) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    if (it == docs_.end()) return false;  // vanished — nothing for GC to reap
+    return it->second.attach.empty();     // a re-attach since tick() cancels GC
+}
+
 void DocRegistry::onDaemonClosedDoc(const std::string& docId, const std::string& reason) {
     std::vector<PendingEvent> pending;
     {

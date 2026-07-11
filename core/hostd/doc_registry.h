@@ -89,6 +89,14 @@ public:
     // doc.closed with the given reason so mirrors drop their tabs.
     void onDaemonClosedDoc(const std::string& docId, const std::string& reason);
 
+    // Re-check, under the registry lock, that a doc tick() flagged as expired is
+    // STILL abandoned (no client attached) right before the Server retires+closes
+    // it. tick() releases mtx_ before the Server acts, so a client can re-attach
+    // (re-list -> attach_doc / implicit rw) in that window — closing it out from
+    // under the client would be silent data loss. Returns false if the doc gained
+    // an attachment or already vanished; the Server then aborts the GC close.
+    bool isReapable(const std::string& docId);
+
 private:
     struct Attach {
         std::string mode;       // "rw" | "ro"

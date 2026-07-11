@@ -53,6 +53,46 @@ CANARY_QUERIES: dict[str, str] = {
     "servocity": "gearmotor",
     "pololu": "gearmotor",
     "8020": "1010 t-slot",
+    # Wave 3/4/5 supplier expansion (2026-07-07/08) — queries are live-verified to
+    # return hits on the sites that parse headless (vendor-adapter audit 2026-07-10);
+    # for the genuinely-walled/SPA sites the query is a sensible category term (the
+    # canary is only executed by the live health check, where walling is expected —
+    # no test runs these live).
+    "rockwest": "carbon fiber tube",
+    "surpluscenter": "hydraulic cylinder",
+    "baileyhydraulics": "hydraulic pump",
+    "globaloring": "o-ring",
+    "seeedstudio": "esp32",
+    "cui": "dc fan",
+    "datasheet4u": "lm358",
+    "fibreglast": "fiberglass cloth",
+    "acpcomposites": "carbon fiber",
+    "speedymetals": "6061 aluminum",
+    "professionalplastics": "acrylic sheet",
+    "coremarkmetals": "steel plate",
+    "maxon": "dc motor",
+    "applerubber": "o-ring",
+    "marcorubber": "o-ring",
+    "meanwell": "LRS",  # MEAN WELL search is series-indexed (free text returns 0)
+    "batteryspace": "18650 battery",
+    "wch": "ch340",
+    "hdsc": "HC32",  # EN search is a series/news index — generic terms return 0
+    "dfrobot": "gravity sensor",  # SPA/XHR-only — degrades honestly headless
+    "futureelectronics": "atmega328p",
+    "parker": "hydraulic valve",
+    "boschrexroth": "linear guide",
+    "hydraforce": "solenoid valve",
+    "hiwin": "linear guide",
+    "thk": "linear guide",
+    "igus": "drylin bearing",
+    "thomson": "linear actuator",
+    "orientalmotor": "stepper motor",
+    "anaheimautomation": "stepper motor",
+    "cadenas": "hex bolt",
+    "ultralibrarian": "atmega328p",
+    "componentsearchengine": "atmega328p",
+    "freecadlibrary": "screw",
+    "gbstandards": "GB/T 70.1",
 }
 
 #: Failure reasons that mean "provision a login", not "the adapter is broken".

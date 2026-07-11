@@ -224,3 +224,22 @@ from . import (maxon, orientalmotor, anaheimautomation,  # motors  # noqa: E402,
 # real spec sheets, and T-slot aluminum extrusion.
 from . import (servocity, pololu,  # robotics structural + motion / gearmotors  # noqa: E402,F401
                eightytwenty)  # 80/20 T-slot extrusion (bot-walled — degrades honestly)
+
+# --- Reload safety -----------------------------------------------------------
+# ``importlib.reload(<this package>)`` re-executes this file, which resets
+# ``_REGISTRY`` to empty — but the site-module imports above become no-ops on
+# reload (each submodule is already in ``sys.modules``, so its module-level
+# ``register(...)`` side-effect does NOT run again). That would leave a reloaded
+# package with an empty registry, silently breaking ``all_adapters()`` /
+# ``login_wizard_sites()`` / ``get_adapter()`` for whatever runs next. Test
+# fixtures reload this package after tweaking ``engine.paths``/``session``, so
+# re-register every already-imported adapter submodule here to keep reload a
+# no-op for the registry. On first import this is harmless (each key is already
+# present); on reload it repopulates the emptied registry.
+import sys as _sys  # noqa: E402
+_pkg_prefix = __name__ + "."
+for _mod in list(_sys.modules.values()):
+    _adapter = getattr(_mod, "ADAPTER", None)
+    if _adapter is not None and getattr(_mod, "__name__", "").startswith(_pkg_prefix):
+        register(_adapter)
+del _sys, _pkg_prefix

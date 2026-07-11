@@ -2220,7 +2220,10 @@ void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
     // Flow arrows: a 3x3 grid announcing the incoming stream, kept fully UPSTREAM of the inlet
     // face (tips just short of it) and much shorter than the old 1.2r spears that pierced the
     // model. Heads are capped so the glyphs never shout over the part being analysed.
-    const float aLen = 0.5f * r;
+    // Issue #25: the arrow length now tracks the inlet speed — a fast stream reads visibly longer
+    // than a slow one — normalized around a nominal ~20 m/s and clamped so it stays readable.
+    const float spd = std::max(0.0f, (float)s.flowSpeed);
+    const float aLen = (0.32f + 0.50f * std::min(spd / 20.0f, 1.4f)) * r;
     const float headLen = std::min(0.28f * aLen, 0.08f * r);
     for (int iu = -1; iu <= 1; ++iu)
         for (int iv = -1; iv <= 1; ++iv) {

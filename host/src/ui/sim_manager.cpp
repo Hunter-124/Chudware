@@ -1893,30 +1893,92 @@ void pushCross3(std::vector<float>& s, const float c[3], float r) {
         pushSeg3(s, a, b);
     }
 }
-// Fixture "fixed geometry" glyph at a face: a solid cone pinned tip-first to the face centroid
-// along the outward normal + a ground bar with hatch ticks laid in the face plane (SW-style
-// anchor). Falls back to the legacy 3-axis cross when no triangle batch is supplied.
+// A short "ground bar + diagonal hatch" anchor laid in the plane spanned by (u,w), centred at p,
+// half-width r, the bar running along u and the hatch ticks leaning toward -w. This is the classic
+// SolidWorks restraint tick that says "this direction is pinned to ground".
+void pushGroundHatch(std::vector<float>& s, const float p[3], const float u[3], const float w[3],
+                     float r) {
+    float b0[3], b1[3];
+    for (int k = 0; k < 3; ++k) { b0[k] = p[k] - u[k] * r; b1[k] = p[k] + u[k] * r; }
+    pushSeg3(s, b0, b1);
+    for (int i = -2; i <= 2; ++i) {
+        float t0[3], t1[3];
+        for (int k = 0; k < 3; ++k) {
+            t0[k] = p[k] + u[k] * (0.42f * r * i);
+            t1[k] = t0[k] - (u[k] * 0.30f + w[k] * 0.42f) * r;
+        }
+        pushSeg3(s, t0, t1);
+    }
+}
+// A small moment/rotation restraint marker: a ~270-degree arc in the plane (u,w) about centre c with
+// radius r, capped by a tiny double tick at the open end so it reads as a "no rotation about this
+// axis" bracket rather than a full circle. Cheap: 10 chord segments + 2 ticks.
+void pushMomentArc(std::vector<float>& s, const float c[3], const float u[3], const float w[3],
+                   float r) {
+    const int kN = 10;
+    const float a0 = 0.35f, a1 = 0.35f + 4.9f;  // ~281 deg sweep, leaves a gap
+    float prev[3];
+    for (int i = 0; i <= kN; ++i) {
+        const float a = a0 + (a1 - a0) * (float)i / (float)kN;
+        const float ca = std::cos(a) * r, sa = std::sin(a) * r;
+        float q[3] = {c[0] + u[0] * ca + w[0] * sa,
+                      c[1] + u[1] * ca + w[1] * sa,
+                      c[2] + u[2] * ca + w[2] * sa};
+        if (i > 0) pushSeg3(s, prev, q);
+        if (i == kN) {  // stop-ticks at the arc end so it reads as a restraint bracket
+            float t1[3], t2[3];
+            for (int k = 0; k < 3; ++k) {
+                t1[k] = q[k] - (u[k] * std::cos(a1) + w[k] * std::sin(a1)) * 0.4f * r;
+                t2[k] = q[k] + (u[k] * -std::sin(a1) + w[k] * std::cos(a1)) * 0.4f * r;
+            }
+            pushSeg3(s, q, t1);
+            pushSeg3(s, q, t2);
+        }
+        prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
+    }
+}
+// Fixture "fixed geometry" glyph at a point on a face — a full 6-DOF restraint symbol so a "Fixed"
+// support visually says it locks all three translations AND all three rotations (moments):
+//   * 3 solid ground-anchored pin-cones along the local orthonormal axes (X/Y/Z translations)
+//   * a ground hatch under each pin (the SolidWorks "pinned to ground" tick)
+//   * a small moment arc about each of the 3 axes (rotational restraint)
+// `n` is the face outward normal; the two in-plane axes are derived from it so the hatches sit flat
+// on the surface. Falls back to the legacy 3-axis cross when no triangle batch is supplied.
 void pushFixture3(std::vector<float>& s, std::vector<float>* tris, const float c[3],
                   const float n[3], float r) {
     if (!tris) { pushCross3(s, c, r); return; }
-    float d[3] = {n[0], n[1], n[2]};
-    vecNorm3(d);
-    pushCone3(*tris, c, d, 1.1f * r, 0.5f * r);  // tip on the face, base lifted along +n
-    // Ground hatching around the anchor: a bar through the centroid + 4 diagonal ticks, all in the
-    // face plane (drawSegments' depth bias keeps them over the surface).
-    float p1[3], p2[3];
-    perp3(d, p1);
-    cross3(d, p1, p2);
-    float b0[3], b1[3];
-    for (int k = 0; k < 3; ++k) { b0[k] = c[k] - p1[k] * 0.9f * r; b1[k] = c[k] + p1[k] * 0.9f * r; }
-    pushSeg3(s, b0, b1);
-    for (int i = -2; i <= 1; ++i) {
-        float t0[3], t1[3];
-        for (int k = 0; k < 3; ++k) {
-            t0[k] = c[k] + p1[k] * (0.45f * r * i + 0.2f * r);
-            t1[k] = t0[k] - (p1[k] + p2[k]) * 0.32f * r;
+    // Local orthonormal frame: e2 = outward normal, e0/e1 span the face plane.
+    float e2[3] = {n[0], n[1], n[2]};
+    vecNorm3(e2);
+    float e0[3], e1[3];
+    perp3(e2, e0);
+    cross3(e2, e0, e1);
+    const float* ax[3] = {e0, e1, e2};
+    const float pinLen = 1.05f * r, pinRad = 0.34f * r;
+    for (int a = 0; a < 3; ++a) {
+        const float* d = ax[a];
+        // Translation pin: solid cone pointing back toward the anchor along +axis (both directions
+        // for the two in-plane axes so the restraint reads symmetric; normal points outward only).
+        int dirs = (a == 2) ? 1 : 2;
+        for (int sgn = 0; sgn < dirs; ++sgn) {
+            float dd[3] = {d[0], d[1], d[2]};
+            if (sgn == 1) { dd[0] = -dd[0]; dd[1] = -dd[1]; dd[2] = -dd[2]; }
+            float tip[3] = {c[0] + dd[0] * 0.15f * r, c[1] + dd[1] * 0.15f * r, c[2] + dd[2] * 0.15f * r};
+            pushCone3(*tris, tip, dd, pinLen, pinRad);  // tip inboard, base out along axis
         }
-        pushSeg3(s, t0, t1);
+        // Ground hatch anchoring this axis, drawn in the plane perpendicular to the axis.
+        const float* u = ax[(a + 1) % 3];
+        const float* w = ax[(a + 2) % 3];
+        float base[3] = {c[0] + d[0] * (pinLen + 0.15f * r),
+                         c[1] + d[1] * (pinLen + 0.15f * r),
+                         c[2] + d[2] * (pinLen + 0.15f * r)};
+        pushGroundHatch(s, base, u, w, 0.6f * r);
+    }
+    // Moment (rotational) restraint: one small arc about each axis, drawn in the plane it rotates in.
+    for (int a = 0; a < 3; ++a) {
+        const float* u = ax[(a + 1) % 3];
+        const float* w = ax[(a + 2) % 3];
+        pushMomentArc(s, c, u, w, 0.55f * r);
     }
 }
 }  // namespace
@@ -1950,11 +2012,59 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
         c[0] = it->second[3]; c[1] = it->second[4]; c[2] = it->second[5];
         return true;
     };
+    // Distribute up to `grid`x`grid` sample points across a face so a fixture/load repeats its symbol
+    // across the surface (SolidWorks-style) instead of a single glyph at the centroid. Points live on
+    // the face plane (through centroid c, normal n) and are spread over the face's world AABB, then
+    // pulled 55% toward the centroid so they stay inside curved/circular/L-shaped faces we can't clip
+    // exactly. Missing bbox key -> just the centroid (mirrors faceCN's guard). `spacing` returns the
+    // world gap between adjacent cells so callers can shrink the glyph to avoid overlap.
+    auto faceGrid = [&](uint32_t body, uint32_t topo, const float c[3], const float n[3], int grid,
+                        std::vector<std::array<float, 3>>& out, float& spacing) {
+        out.clear();
+        spacing = 0.0f;
+        float e0[3], e1[3], nn[3] = {n[0], n[1], n[2]};
+        vecNorm3(nn);
+        perp3(nn, e0);
+        cross3(nn, e0, e1);
+        uint64_t key = ((uint64_t)body << 32) | topo;
+        auto bit = st.faceBBoxCache.find(key);
+        if (bit == st.faceBBoxCache.end() || grid <= 1) {
+            out.push_back({c[0], c[1], c[2]});
+            return;
+        }
+        const auto& bb = bit->second;  // {minX,minY,minZ,maxX,maxY,maxZ}
+        // In-plane half extents = projected bbox size onto each in-plane axis, shrunk toward centroid.
+        float hu = 0.0f, hw = 0.0f;
+        for (int k = 0; k < 3; ++k) {
+            float d = (bb[3 + k] - bb[k]);
+            hu += std::fabs(e0[k]) * d;
+            hw += std::fabs(e1[k]) * d;
+        }
+        hu *= 0.55f * 0.5f;
+        hw *= 0.55f * 0.5f;
+        spacing = std::min(2.0f * hu, 2.0f * hw) / (float)std::max(1, grid - 1);
+        for (int j = 0; j < grid; ++j) {
+            float tv = (grid == 1) ? 0.0f : (2.0f * (float)j / (float)(grid - 1) - 1.0f);
+            for (int i = 0; i < grid; ++i) {
+                float su = (grid == 1) ? 0.0f : (2.0f * (float)i / (float)(grid - 1) - 1.0f);
+                out.push_back({c[0] + e0[0] * su * hu + e1[0] * tv * hw,
+                               c[1] + e0[1] * su * hu + e1[1] * tv * hw,
+                               c[2] + e0[2] * su * hu + e1[2] * tv * hw});
+            }
+        }
+    };
     for (const auto& p : s.fixtures.picks) {
         if (!p.pickBody || !p.pickTopo) continue;
         float c[3], n[3];
-        if (faceCN(p.pickBody, p.pickTopo, c, n))
-            pushFixture3(fixtureSegs, fixtureTris, c, n, L * 0.35f);
+        if (!faceCN(p.pickBody, p.pickTopo, c, n)) continue;
+        std::vector<std::array<float, 3>> pts;
+        float spacing = 0.0f;
+        faceGrid(p.pickBody, p.pickTopo, c, n, 3, pts, spacing);
+        // Glyph radius: scaled to model size but capped to ~40% of the cell gap so neighbours in the
+        // grid stay distinct instead of merging into a blob.
+        float gr = L * 0.30f;
+        if (spacing > 1e-4f) gr = std::min(gr, 0.40f * spacing);
+        for (const auto& pt : pts) pushFixture3(fixtureSegs, fixtureTris, pt.data(), n, gr);
     }
     // Fatigue with fully-reversed loading swings +/- the load — draw a second, opposite arrow so the
     // alternating nature reads on the model (a double-headed indicator).
@@ -1984,25 +2094,34 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
             if (!p.pickBody || !p.pickTopo) continue;
             float c[3], n[3];
             if (!faceCN(p.pickBody, p.pickTopo, c, n)) continue;
-            if (ld.pressure) {
-                // Pressure pushes INTO the face along -normal; arrow tip lands on the surface.
-                float dir[3] = {-n[0], -n[1], -n[2]};
-                float tail[3] = {c[0] - dir[0] * Ld, c[1] - dir[1] * Ld, c[2] - dir[2] * Ld};
-                pushArrow3(loadSegs, tail, dir, Ld, loadTris);
-                if (reversed) {  // opposite (suction) half-cycle
-                    float rd[3] = {n[0], n[1], n[2]};
-                    float rt[3] = {c[0] - rd[0] * Ld, c[1] - rd[1] * Ld, c[2] - rd[2] * Ld};
-                    pushArrow3(loadSegs, rt, rd, Ld, loadTris);
-                }
-            } else {
-                float dir[3] = {ld.vec[0], ld.vec[1], ld.vec[2]};
-                float mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-                if (mag < 1e-6f) continue;
-                // force arrow emanates from the face along the vector
-                pushArrow3(loadSegs, c, dir, Ld, loadTris);
-                if (reversed) {
-                    float rd[3] = {-dir[0], -dir[1], -dir[2]};
-                    pushArrow3(loadSegs, c, rd, Ld, loadTris);
+            // Distribute the load's arrow across the face (SolidWorks-style field of arrows) so the
+            // load reads clearly instead of a single stalk at the centroid. loadTris is always passed
+            // so every arrowhead is a SOLID 3D cone, never the wireframe fallback.
+            std::vector<std::array<float, 3>> pts;
+            float spacing = 0.0f;
+            faceGrid(p.pickBody, p.pickTopo, c, n, 3, pts, spacing);
+            for (const auto& ap : pts) {
+                const float* a = ap.data();
+                if (ld.pressure) {
+                    // Pressure pushes INTO the face along -normal; arrow tip lands on the surface.
+                    float dir[3] = {-n[0], -n[1], -n[2]};
+                    float tail[3] = {a[0] - dir[0] * Ld, a[1] - dir[1] * Ld, a[2] - dir[2] * Ld};
+                    pushArrow3(loadSegs, tail, dir, Ld, loadTris);
+                    if (reversed) {  // opposite (suction) half-cycle
+                        float rd[3] = {n[0], n[1], n[2]};
+                        float rt[3] = {a[0] - rd[0] * Ld, a[1] - rd[1] * Ld, a[2] - rd[2] * Ld};
+                        pushArrow3(loadSegs, rt, rd, Ld, loadTris);
+                    }
+                } else {
+                    float dir[3] = {ld.vec[0], ld.vec[1], ld.vec[2]};
+                    float mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    if (mag < 1e-6f) continue;
+                    // force arrow emanates from the face along the vector
+                    pushArrow3(loadSegs, a, dir, Ld, loadTris);
+                    if (reversed) {
+                        float rd[3] = {-dir[0], -dir[1], -dir[2]};
+                        pushArrow3(loadSegs, a, rd, Ld, loadTris);
+                    }
                 }
             }
         }

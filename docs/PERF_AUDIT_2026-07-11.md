@@ -74,19 +74,20 @@ SIGBUS). Stage + restart when the live sessions finish. Same maintenance rule as
 
 ## 2. Ranked menu — remaining opportunities (measured, not folklore)
 
-### [P1] Negative-volume guard computes full inertia to check a sign (~5–8% of every build)
+### [P2, downgraded] Negative-volume guard integrates full inertia to check a sign
 `core/doc/document.cpp:1557-1561` — `signed_vol()` calls
 `BRepGProp::VolumeProperties(shape, gp)` (full Gauss **volume + centre-of-mass + inertia
-tensor**) but only reads `gp.Mass()`. This runs on **every committed solid on every compile**;
-in the `all`/`boolean` workloads it's the top *compute* self-time
-(`BRepGProp_Gauss::computeVInertiaOfElementaryPart` 4.3% + `BRepGProp_Face::Normal` 3.3%),
-independent of the load artifact.
-- **Fix candidate:** we only need the *sign*, not µm-accurate mass. The `Eps` overload
-  `BRepGProp::VolumeProperties(shape, gp, eps)` terminates the adaptive Gauss integration
-  early; a loose `eps` (e.g. 1e-2..1e-3 relative) is orders of magnitude more than enough to
-  tell inverted from healthy. **Correctness-sensitive** (it's a B-rep integrity guard) — gate
-  behind its own test pass: run the full core ctest + a near-zero-volume-body case before
-  trusting it. Effort S, but do it *with* verification, not blind.
+tensor**) but only reads `gp.Mass()`. In the `all`/`boolean` workloads it's the top *compute*
+self-time (`BRepGProp_Gauss::computeVInertiaOfElementaryPart` 4.3% + `BRepGProp_Face::Normal`
+3.3%). **Downgraded after inspection:** the guard is **already incremental** — it runs only
+inside the feature-execution loop (document.cpp:7013, `for k = solids_before..`), so
+prefix-cached/reused features skip it entirely. The 5–8% is a *cold-build* figure (profiler
+rebuilds every feature); real interactive edits already elide it via the prefix cache.
+- The only remaining lever is the per-execution integration itself. The `Eps` overload
+  (`VolumeProperties(shape, gp, eps)`) is **not a safe win**: it switches to adaptive
+  Gauss-Kronrod, which can be *slower* than the fixed-order default on the simple planar /
+  cylindrical faces these parts are made of, and it touches a B-rep integrity guard. Leave it
+  unless a measured, quiet-box A/B shows a clear win.
 
 ### [P1] TBB parallel-boolean oversubscription under load / for tiny ops
 `all` + `boolean` showed ~36% and ~35% self-time in `syscall` / `__lll_lock_wait` /
@@ -112,13 +113,23 @@ allocates + copies; a STORED entry could instead be read via
 `mz_zip_reader_extract_iter`/offset and the AICM parsed in place (or mmap the file). Bounded
 upside (open is already ~5× faster) — do only if open latency still shows up.
 
-### [DECISION] Size-relative tessellation deflection (T-PERF7b — needs Hunter)
-Still open from the 2026-07-10 audit. `document.cpp` tessellates at a **fixed 0.05 mm absolute**
-deflection; a 2 m part meshes at millions of triangles (and then §1's memmove copies all of
-them). Fix = bbox-diagonal-relative deflection → O(100k) tris on huge parts. Blocked because it
-churns golden-image / mesh-hash baselines. **Recommended:** implement behind a **default-OFF**
-env flag (`AICAD_TESS_RELATIVE=1`) so it ships without baseline churn and Hunter can A/B it,
-then flip the default once the goldens are re-based. Not implemented here — it's Hunter's call.
+### [DONE] Size-relative tessellation deflection (T-PERF7b) — already landed
+Correction to the 2026-07-10 audit's "DECISION NEEDED": this is **already implemented and
+active** (`core/doc/document.cpp:7208-7219`). `::geom::auto_linear_deflection` computes
+`clamp(bbox_diag * 6e-4, 0.02 mm, 1.0 mm)`, so a ~50 mm part keeps the historical 0.05 mm
+quality while multi-metre parts stop meshing at millions of triangles. No flag, no pending
+decision — the biggest asymptotic gap is closed.
+
+### [L, invasive] Import-heavy doc_open — embedded_brep is still inline in document.json
+The §1 fix accelerates `cache.aicm`, but for **import-heavy** docs the dominant open cost is
+`document.json` itself: `embedded_brep` is stored **inline as base64 inside the feature params**
+(`session.cpp:8621/8666`), so a doc that imports a big STEP carries multi-MB base64 in
+`document.json`, which is a KNOWN entry always written DEFLATE and read with inflate + CRC. This
+is what T-PERF6b ("out-of-line content-addressed blob store") was meant to fix — it did **not**
+fully land (blobs are still inline). Moving them to a separate STORED entry would make
+`document.json` small again (fast parse) and let the blob use the §1 raw-read fast path. It's
+deferred because it's a **schema/migration change** touching save/load, the PLM vault, and the
+Python readers — not safe without that test coverage + a quiet box. Do it as its own task.
 
 ## 3. Verified-clean / already-done (don't re-audit)
 Parallel booleans, tcmalloc-for-MCP, persisted geometry cache (§A/§B), incremental prefix
@@ -129,8 +140,13 @@ autosave token, live-search cancel, sampler cadence/symbolization. See T-PERF1..
 2026-07-10 audit.
 
 ## 4. Execution order
-1. ✅ doc_open zip-decode (§1) — **shipped to build-linux, verified, awaiting dist deploy.**
-2. Negative-volume guard `Eps` (§2 P1) — S, with a dedicated correctness test pass.
-3. Re-measure TBB parallel-boolean on a **quiet** box, then gate on size (§2 P1).
-4. tcmalloc into host binary (§2 P2) — compile-only.
-5. Hunter decision on size-relative tess (§2 DECISION).
+1. ✅ doc_open zip-decode (§1) — **shipped to build-linux, verified (ctest green: aicm,
+   geom_aicm, import_roundtrip, document, sketch3d_doc), awaiting dist deploy.**
+2. Re-measure TBB parallel-boolean on a **quiet** box first (the ~35% syscall/lock/yield is
+   partly the load-16 artifact), then cap TBB threads per process when many engines share a box
+   — do NOT naively disable parallelism (it's a measured single-op win on a quiet box).
+3. tcmalloc into host binary (§2 P2) — compile-only; needs a host rebuild, but
+   `host/build-linux` is the **live GUI** (do it when the GUI is down).
+4. Out-of-line embedded_brep blob store (T-PERF6b, §2 [L]) — the import-heavy-doc lever;
+   schema change, its own task.
+5. Volume-guard / zero-copy-open (§2) — marginal; only if a quiet-box profile still flags them.

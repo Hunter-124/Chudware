@@ -87,11 +87,13 @@ def _place_core_family(gref: dict, doc_context: dict | None,
         return _err(domain, "geometry_ref missing 'family' or 'size'",
                     "Fetch the PartRecord via part_get to confirm geometry_ref fields.")
     try:
-        # Import core_bridge from services/mcp where it lives.
-        svc = _REPO / "services" / "mcp"
-        if str(svc) not in sys.path:
-            sys.path.insert(0, str(svc))
-        import core_bridge as cb  # type: ignore  # noqa: PLC0415
+        # Import core_bridge as a PACKAGE member (services.mcp.core_bridge), not bare.
+        # A bare `import core_bridge` leaves core_bridge.__package__ == "" so its own
+        # relative imports (`from . import daemon_bridge`) fail with "attempted relative
+        # import with no known parent package" the moment daemon mode (the default) is
+        # active — and it forks a second core_bridge instance with its own DLL/fallback
+        # state, diverging from cad_tools' canonical `from . import core_bridge`.
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         call_params: dict[str, Any] = {"family": family, "size": size}
         if gref.get("length_mm") is not None:
             call_params["length_mm"] = gref["length_mm"]
@@ -378,10 +380,11 @@ def _place_import_file(gref: dict, doc_context: dict | None,
         return _err(domain, f"file not found: {path}",
                     "The browser-acquired file may have been moved or cleaned up.")
     try:
-        svc = _REPO / "services" / "mcp"
-        if str(svc) not in sys.path:
-            sys.path.insert(0, str(svc))
-        import core_bridge as cb  # type: ignore  # noqa: PLC0415
+        # PACKAGE import (see _place_core_family): a bare `import core_bridge` zeros
+        # core_bridge.__package__, so its `from . import daemon_bridge` fails in daemon
+        # mode (the default) with "attempted relative import with no known parent
+        # package" — which is exactly what broke the browser-catalog import chain.
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
 
         as_solid = bool((params or {}).get("as_solid", False))
         r = cb.call("import_file", {"path": path, "as_solid": as_solid})

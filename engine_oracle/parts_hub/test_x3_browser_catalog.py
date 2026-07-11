@@ -38,7 +38,7 @@ def test_place_import_file_success(tmp_path, monkeypatch):
     fake_step = tmp_path / "widget.step"
     fake_step.write_text("ISO-10303-21;")
 
-    import core_bridge as cb  # type: ignore
+    from services.mcp import core_bridge as cb  # canonical module place.py imports
     monkeypatch.setattr(cb, "call", lambda verb, params: {"doc_id": "doc-abc", "body_count": 1})
 
     from engine_oracle.parts_hub.place import _place_import_file
@@ -51,11 +51,82 @@ def test_place_import_file_success(tmp_path, monkeypatch):
     assert "reverse_engineer" in r["detail"]["hint"]
 
 
+# ── REAL-CORE integration: the full import chain, no mocks ───────────────────
+# Proves the FINAL link of the browser-catalog chain on the native engine:
+#   real STEP on disk -> _place_import_file -> import_file RPC -> new editable doc.
+# SKIPPED (not failed) when the native core (libaicad) is unavailable, so CI on a
+# core-less machine stays green while a machine that HAS the core proves the chain.
+# Regression guard for the daemon-mode "attempted relative import with no known
+# parent package" bug: _place_import_file imported core_bridge bare, zeroing its
+# __package__, so `from . import daemon_bridge` blew up in daemon mode (the default).
+
+def _core_available() -> bool:
+    try:
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
+        return cb.available()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _core_available(),
+                    reason="native core (libaicad) not available in this environment")
+def test_place_import_file_real_core_editable_doc(tmp_path):
+    """End-to-end with the REAL engine: export a STEP from a core-built box, then
+    place it back via _place_import_file and assert a genuine editable doc_id — the
+    same import_file RPC the import_artifact / import_part MCP tools drive."""
+    from services.mcp import core_bridge as cb
+
+    # Produce a real STEP with the core itself (self-contained: no dependence on a
+    # browser-download that only exists on one machine).
+    step = tmp_path / "coupon.step"
+    npr = cb.call("doc_new", {"kind": "part", "name": "x3_coupon"})
+    doc_id = npr.get("doc_id") or npr.get("id")
+    assert doc_id, f"doc_new gave no doc_id: {npr!r}"
+    cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [
+        cb.feat("box", "b1",
+                {"length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10)}),
+    ]})
+    exp = cb.call("export_file",
+                  {"doc_id": doc_id, "path": str(step), "format": "step"})
+    assert step.is_file() and step.stat().st_size > 0, f"export_file produced no file: {exp!r}"
+
+    # The real placement: import the STEP as a NEW editable doc.
+    from engine_oracle.parts_hub.place import _place_import_file
+    r = _place_import_file({"kind": "import_file", "path": str(step)}, None, None)
+
+    assert r["ok"] is True, f"real import failed: {r.get('reason')!r}"
+    assert r["editable"] is True
+    assert r["doc_id"], "no doc_id from a real import_file"
+    assert r["doc_id"].startswith("doc-"), f"unexpected doc_id shape: {r['doc_id']!r}"
+    assert "reverse_engineer" in r["detail"]["hint"]
+
+
+def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch):
+    """The real-core test's skip gate must actually skip (not error) when the core
+    is unavailable. Force available()->False and confirm the placer degrades to a
+    clean {ok: False} error envelope rather than raising."""
+    from services.mcp import core_bridge as cb
+    fake_step = tmp_path / "widget.step"
+    fake_step.write_text("ISO-10303-21;")
+
+    monkeypatch.setattr(cb, "available", lambda: False)
+    assert not _core_available()
+
+    def _unavailable(verb, params):
+        raise cb.CoreError("libaicad.so not found")
+    monkeypatch.setattr(cb, "call", _unavailable)
+
+    from engine_oracle.parts_hub.place import _place_import_file
+    r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
+    assert r["ok"] is False
+    assert "import_file RPC failed" in r["reason"]
+
+
 def test_place_import_file_rpc_failure(tmp_path, monkeypatch):
     fake_step = tmp_path / "widget.step"
     fake_step.write_text("ISO-10303-21;")
 
-    import core_bridge as cb  # type: ignore
+    from services.mcp import core_bridge as cb  # canonical module place.py imports
 
     def _raise(verb, params):
         raise RuntimeError("no core")

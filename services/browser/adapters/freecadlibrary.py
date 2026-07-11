@@ -2,20 +2,27 @@
 
 The FreeCAD-library GitHub repo (github.com/FreeCAD/FreeCAD-library) is an OPEN
 git repo of raw .stp/.step and .fcstd part files — the ONE truly-open, no-login,
-no-captcha CAD source in this registry. Search queries GitHub's public code
-search; `acquire` downloads the raw .stp straight from raw.githubusercontent.com
-into download_dir(SITE), yielding directly importable geometry with provenance
-for import_part / part_place.
+no-captcha CAD source in this registry. `acquire` downloads the raw .stp straight
+from raw.githubusercontent.com into download_dir(SITE), yielding directly
+importable geometry with provenance for import_part / part_place.
 
 Unlike the login-walled ECAD/CAD portals, no session is provisioned and no wall
 is negotiated: files come from the public repo, provenance is recorded, done.
 
-NOTE: the GitHub search markup / regexes below are a v1 best-effort shape, not
-verified against a live GitHub response (T-X6 gates the real per-source
-integration tests behind an env flag).
+Live-verified 2026-07-10: the old GitHub HTML code-search (``/search?q=...``) is
+JS-rendered and unreliable headless. This adapter instead reads the deterministic
+GitHub REST git-tree API
+``/repos/FreeCAD/FreeCAD-library/git/trees/master?recursive=1`` (HTTP 200, ~11k
+entries, ``truncated:false``) once and filters the blob paths client-side by the
+query tokens + a CAD extension (.stp/.step/.fcstd) — no JS, no auth, no rate-limit
+key needed for one call. The CEF headless fetch wraps the JSON body in
+``<html>…<pre>{…}</pre>…``, so the raw JSON is sliced out between the first ``{``
+and the last ``}`` before parsing. Each hit carries the /blob/ page URL plus a
+ready raw.githubusercontent.com download URL.
 """
 from __future__ import annotations
 
+import json
 import re
 
 from .. import session as _session
@@ -23,10 +30,14 @@ from . import download_dir, provenance_envelope, register
 
 SITE = "freecadlibrary"
 REPO = "FreeCAD/FreeCAD-library"
+REF = "master"
 BASE_URL = "https://github.com"
-RAW_BASE = "https://raw.githubusercontent.com/" + REPO + "/master"
+RAW_BASE = "https://raw.githubusercontent.com/" + REPO + "/" + REF
+# The deterministic git-tree API (query-independent; filtered client-side).
 SEARCH_URL_TMPL = (
-    BASE_URL + "/search?q=repo%3A" + REPO.replace("/", "%2F") + "+{query}&type=code")
+    "https://api.github.com/repos/" + REPO + "/git/trees/" + REF + "?recursive=1")
+_CAD_EXTS = (".stp", ".step", ".fcstd")
+_MAX_HITS = 40
 LICENSE_NOTE = (
     "FreeCAD-library is community-contributed CAD content published in the "
     "public github.com/FreeCAD/FreeCAD-library repo under the repository's "
@@ -35,54 +46,83 @@ LICENSE_NOTE = (
     "is recorded. See contracts/license_debt.md."
 )
 
-# Best-effort: GitHub code-search result rows link to /FreeCAD/FreeCAD-library/blob/<ref>/<path>.
-_RESULT_RE = re.compile(
-    r'href="(?P<href>/' + re.escape(REPO) +
-    r'/blob/[^"?#]+\.(?:stp|step|fcstd))"', re.IGNORECASE)
+
+def _raw_url(path: str) -> str:
+    return RAW_BASE + "/" + "/".join(_quote_seg(s) for s in path.split("/"))
 
 
-def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+def _blob_url(path: str) -> str:
+    return BASE_URL + "/" + REPO + "/blob/" + REF + "/" + "/".join(
+        _quote_seg(s) for s in path.split("/"))
 
 
-def _raw_url(blob_href: str) -> str:
-    # /FreeCAD/FreeCAD-library/blob/<ref>/<path...> -> raw.githubusercontent.com/<repo>/<ref>/<path...>
-    path = blob_href.split("/blob/", 1)[-1]
-    return "https://raw.githubusercontent.com/" + REPO + "/" + path
+def _quote_seg(seg: str) -> str:
+    from urllib.parse import quote
+    return quote(seg)
+
+
+def _extract_json(content: str) -> dict:
+    """CEF wraps the API JSON in <html>…<pre>{…}</pre>…; slice the object out."""
+    start = content.find("{")
+    end = content.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        return json.loads(content[start:end + 1])
+    except (ValueError, TypeError):
+        return {}
 
 
 class FreeCadLibraryAdapter:
     key = SITE
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
-        result = _session.browser_fetch(url, SITE)
+        result = _session.browser_fetch(SEARCH_URL_TMPL, SITE)
         if not result.get("ok"):
             return [result]
-        content = result.get("content", "")
-        hits = []
-        seen = set()
-        for m in _RESULT_RE.finditer(content):
-            href = m.group("href")
-            if href in seen:
+        data = _extract_json(result.get("content", ""))
+        tree = data.get("tree", [])
+        if not isinstance(tree, list):
+            return []
+
+        tokens = [t for t in re.split(r"[\s_\-]+", query.lower()) if t]
+        hits: list[dict] = []
+        seen: set[str] = set()
+        for entry in tree:
+            if not isinstance(entry, dict) or entry.get("type") != "blob":
                 continue
-            seen.add(href)
-            filename = href.rsplit("/", 1)[-1]
+            path = entry.get("path", "")
+            low = path.lower()
+            if not low.endswith(_CAD_EXTS):
+                continue
+            name = path.rsplit("/", 1)[-1]
+            hay = name.lower()
+            # All query tokens must appear in the filename (basename) — a filename
+            # match is far more precise than a full-path match.
+            if tokens and not all(t in hay for t in tokens):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
             hits.append({
-                "title": filename,
-                "url": BASE_URL + href,
-                "raw_url": _raw_url(href),
+                "ok": True,
+                "title": name,
+                "url": _blob_url(path),
+                "raw_url": _raw_url(path),
                 "site": SITE,
+                "path": path,
             })
+            if len(hits) >= _MAX_HITS:
+                break
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         raw_url = result.get("raw_url", "")
-        if not raw_url and url:
-            # Reconstruct raw URL from a /blob/ page URL if only 'url' was passed.
-            if "/blob/" in url:
-                raw_url = _raw_url(url[len(BASE_URL):] if url.startswith(BASE_URL) else url)
+        if not raw_url and url and "/blob/" in url:
+            # Reconstruct a raw URL from a /blob/ page URL.
+            path = url.split("/blob/", 1)[-1]
+            raw_url = "https://raw.githubusercontent.com/" + REPO + "/" + path
         if not raw_url:
             return {"ok": False, "reason": "bad_result",
                     "hint": "result has no 'raw_url' (or a /blob/ 'url' to derive it from)"}

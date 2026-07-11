@@ -492,12 +492,16 @@ void AppState::closeDocTab(int idx) {
         if (ecadDocId == closing.ecadDocId) { ecadDocId.clear(); ecadRevision = -1; }
     } else if (closing.aiHandoff && engine::daemonMode()) {
         // Phase 4: a daemon mirror tab VIEWS a doc another client (an agent) is
-        // still building in the SHARED engine — closing the tab must only drop
-        // our view (detach_doc), never doc_close the agent's document.
+        // building in the SHARED engine. Closing the tab is an explicit "I'm done
+        // with this" — doc_discard drops our view AND, if no other client still
+        // holds the doc (the agent has finished/detached), closes it for good so
+        // this deliberately-closed part does not flood back as unsaved-recovery on
+        // the next launch. If the agent is still building it, doc_discard degrades
+        // to a plain detach and the doc lives on for that writer.
         if (auto* c = engine::client()) {
             nlohmann::json res;
             std::string err;
-            c->call("detach_doc", {{"doc_id", closing.docId}}, res, err);
+            c->call("doc_discard", {{"doc_id", closing.docId}}, res, err);
         }
     } else {
         nlohmann::json res;

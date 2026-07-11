@@ -182,21 +182,22 @@ void Server::run(int lingerSecs) {
     children_.shutdown();
 }
 
-void Server::gcCloseDoc(const std::string& docId) {
-    if (status_.engineState.load() != 1) return;
+bool Server::gcCloseDoc(const std::string& docId, bool retire, const char* reason) {
+    if (status_.engineState.load() != 1) return false;
     // TOCTOU guard: tick() decided this doc was abandoned under the registry
     // lock, then released it before we got here. A client may have re-attached
     // in that window (GUI re-list -> attach_doc, or an implicit rw touch); closing
     // it now would yank a live doc out from under that client. Re-check under the
     // lock and bail if it's no longer abandoned.
-    if (!registry_.isReapable(docId)) return;
-    // Save-before-close: the doc goes to the autosave orphan tier so the work
-    // stays recoverable (recovery_list / recovery_open) without ever
-    // auto-reopening. Clean docs that live in a user file skip the copy.
+    if (!registry_.isReapable(docId)) return false;
+    // Save-before-close (GC only): the doc goes to the autosave orphan tier so the
+    // work stays recoverable (recovery_list / recovery_open) without ever
+    // auto-reopening. Clean docs that live in a user file skip the copy. An
+    // explicit discard (retire=false) skips the whole tier — the user closed it.
     json docs;
     std::string err;
     std::string name = docId;
-    bool needRetire = true;
+    bool needRetire = retire;
     if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
         docs.is_object() && docs.contains("docs")) {
         bool found = false;
@@ -209,27 +210,29 @@ void Server::gcCloseDoc(const std::string& docId) {
                                          : std::string();
             // Only a CLEAN doc backed by a real user file skips the orphan
             // copy; a path inside the autosave tree is our own artifact.
-            needRetire = path.empty() || d.value("dirty", false) ||
-                         (autosave_ && autosave_->isAutosavePath(path));
+            if (needRetire)
+                needRetire = path.empty() || d.value("dirty", false) ||
+                             (autosave_ && autosave_->isAutosavePath(path));
             break;
         }
         if (!found) {  // already gone from the engine — just drop registry state
-            registry_.onDaemonClosedDoc(docId, "gc");
-            return;
+            registry_.onDaemonClosedDoc(docId, reason);
+            return true;
         }
     }
     if (needRetire && autosave_ && !autosave_->retireDoc(docId, name)) {
         log().line("doc-gc: keeping %s open (retire failed)", docId.c_str());
-        return;  // never close a doc we could not preserve
+        return false;  // never close a doc we could not preserve
     }
     json result;
     if (!core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err)) {
         log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
-        return;
+        return false;
     }
-    registry_.onDaemonClosedDoc(docId, "gc");
-    log().line("doc-gc: closed orphaned doc %s (%s)%s", docId.c_str(), name.c_str(),
+    registry_.onDaemonClosedDoc(docId, reason);
+    log().line("doc-gc: closed %s doc %s (%s)%s", reason, docId.c_str(), name.c_str(),
                needRetire ? " — recoverable via recovery_list" : "");
+    return true;
 }
 
 void Server::clientLoop(std::shared_ptr<ClientConn> c) {
@@ -370,6 +373,28 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                                   {"doc_id", result.value("doc_id", std::string())}});
         }
         return json{{"opened", opened}};
+    }
+
+    // Explicit user discard: the caller (GUI closing a tab) drops its attach and,
+    // if no other client still holds the doc, we close it WITHOUT retiring it to
+    // the orphan tier — a deliberately-closed part must not resurface on the next
+    // launch. If an agent is still building it (another attach remains), this is a
+    // plain detach: the doc lives on for that writer. Contrast doc-GC, which
+    // retires abandoned docs for recovery.
+    if (method == "doc_discard") {
+        const std::string docId = params.value("doc_id", std::string());
+        if (docId.empty()) {
+            isError = true;
+            return json{{"code", "invalid_params"}, {"message", "doc_id required"}};
+        }
+        json det;
+        bool de = false;
+        registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
+        // isReapable == no client still attached: the writer (agent) is gone, so
+        // this close is safe and the doc was truly abandoned.
+        const bool discarded =
+            registry_.isReapable(docId) && gcCloseDoc(docId, /*retire=*/false, "discarded");
+        return json{{"ok", true}, {"discarded", discarded}};
     }
 
     // Agent child supervision (agent_spawn/agent_stop/agent_list) — daemon

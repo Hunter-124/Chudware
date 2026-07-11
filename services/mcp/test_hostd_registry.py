@@ -478,6 +478,40 @@ def test_doc_gc_closes_abandoned_docs(scratch_daemon, monkeypatch):
     assert any(e.get("name") == "abandoned" for e in entries), entries
 
 
+def test_doc_discard_closes_abandoned_doc_no_recovery(scratch_daemon):
+    """Explicit discard (GUI closing a tab) of a doc no other client holds closes
+    it for good — NOT retired to the orphan tier. A deliberately-closed part must
+    never flood back as unsaved-recovery on the next launch."""
+    a = DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    doc = a.call("doc_new", {"name": "discard-me"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    # `a` minted the doc (implicit rw attach); discarding drops that last attach
+    # and, finding no other holder, closes the doc.
+    r = a.call("doc_discard", {"doc_id": doc})
+    assert r.get("discarded") is True, r
+    names = [d["name"] for d in a.call("doc_list", {})["docs"]]
+    assert "discard-me" not in names, names
+    assert a.call("recovery_list", {}).get("entries") == []
+
+
+def test_doc_discard_keeps_doc_with_other_holder(scratch_daemon):
+    """Discard while another client still holds the doc (an agent still building)
+    only drops the caller's view — the doc lives on for the remaining client."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "still-building"})["doc_id"]  # a: rw writer
+    assert b.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
+    # b (a viewer) closes its tab; a still holds the doc -> not reapable -> survives.
+    r = b.call("doc_discard", {"doc_id": doc})
+    assert r.get("discarded") is False, r
+    names = [d["name"] for d in a.call("doc_list", {})["docs"]]
+    assert "still-building" in names, names
+
+
 def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
     """A doc still attached by ANY client (e.g. a GUI mirror tab) is never GC'd
     when another client disconnects."""

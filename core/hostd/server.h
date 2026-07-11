@@ -80,9 +80,14 @@ private:
     void touch();
     bool idleExpired(int lingerSecs);
     void staleBinaryTick();
-    // Doc-GC: retire `docId` to the autosave orphan tier and close it in the
-    // engine (grace expired with no attached client — see DocRegistry::tick).
-    void gcCloseDoc(const std::string& docId);
+    // Close an abandoned doc in the engine. retire=true (doc-GC) copies it to the
+    // autosave orphan tier first so the work stays recoverable; retire=false
+    // (explicit user discard) skips that — the doc_close purges the doc's autosave
+    // artifact, so a discarded doc never resurfaces. Returns true if it closed
+    // (false = still attached / engine loading / preserve failed). `reason` labels
+    // the doc.closed event. See DocRegistry::tick + isReapable.
+    bool gcCloseDoc(const std::string& docId, bool retire = true,
+                    const char* reason = "gc");
     void sendEventTo(int clientId, const std::string& line);
     void sendEventToAll(const std::string& line);
 

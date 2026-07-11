@@ -339,7 +339,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             if (path.empty()) continue;
             json result;
             std::string err;
-            json p2 = json{{"path", path}};
+            // detach_path: the orphan artifact is deleted right after this open, so
+            // the doc must forget it (and re-unique its name vs already-open docs).
+            json p2 = json{{"path", path}, {"detach_path", true}};
             if (!core::cpp_core().call("doc_open", p2, result, err)) {
                 log().line("recovery_open: doc_open(%s) failed: %s", path.c_str(),
                            err.c_str());

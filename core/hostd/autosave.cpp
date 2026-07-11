@@ -126,8 +126,11 @@ void Autosave::recoverPriorSession() {
         const std::string oldId = e.path().stem().string();
         json result;
         std::string err;
-        if (!core::cpp_core().call("doc_open", json{{"path", e.path().string()}}, result,
-                                   err)) {
+        // detach_path: a crash-recovered doc must not keep pointing INTO the autosave
+        // tier — a user save would land there, and the artifact is transient anyway.
+        if (!core::cpp_core().call(
+                "doc_open",
+                json{{"path", e.path().string()}, {"detach_path", true}}, result, err)) {
             log().line("autosave recovery: doc_open(%s) failed: %s",
                        e.path().string().c_str(), err.c_str());
             continue;
@@ -138,6 +141,12 @@ void Autosave::recoverPriorSession() {
             std::lock_guard<std::mutex> lk(remapMtx_);
             idRemap_[oldId] = newId;
         }
+        // The doc came back detached (clean of any autosave path) and not dirty, so
+        // the tick won't re-save it until the first edit. Carry the artifact into
+        // THIS session's dir under the new id so a crash in that window still recovers.
+        fs::create_directories(sessionDir_, ec);
+        fs::copy_file(e.path(), sessionDir_ + "/" + newId + ".step+",
+                      fs::copy_options::overwrite_existing, ec);
         ++recovered;
         log().line("autosave recovery: %s -> %s", oldId.c_str(), newId.c_str());
     }

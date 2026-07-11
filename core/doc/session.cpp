@@ -8932,7 +8932,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     return json{{"path", out}};
 }
 
-json doc_open(const std::string& path, bool as_solid) {
+json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     // Manual File>Open / File>Import of a NON-native file (.step/.stp/.iges/.brep/.stl/
     // .obj/.ply/.gltf/.glb/.3mf/.3dm/.sldprt/…) is NOT a .step+ container — importing it
     // as a fresh part doc is what the user expects (and is why "open a non-.step+ part"
@@ -8964,10 +8964,17 @@ json doc_open(const std::string& path, bool as_solid) {
     sp->doc_id = new_doc_id();
     sp->doc = std::move(loaded.doc);
     sp->revision = 0;
-    sp->path = path;
+    sp->path = detach_path ? std::string() : path;
     sp->extra_entries = std::move(loaded.extra);
     // Stamp the document's own id to the new session id (mirrors blank_part).
     if (sp->doc.is_object()) sp->doc["id"] = sp->doc_id;
+    // Recovery opens re-unique the display name BEFORE the session is registered
+    // (unique_doc_name locks every open session's mutex, so it cannot run while we
+    // hold this doc's lock). Several retired "Part1" docs recover as Part1/Part2/…
+    if (detach_path && sp->doc.is_object()) {
+        const std::string want = sp->doc.value("name", std::string());
+        if (!want.empty()) sp->doc["name"] = unique_doc_name(want);
+    }
     const std::string sid = sp->doc_id;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);

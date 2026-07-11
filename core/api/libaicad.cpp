@@ -2516,7 +2516,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             if (m == "doc_open")
                 return emit(aicad::doc::doc_open(params.value("path", std::string()),
-                                                 params.value("as_solid", false)),
+                                                 params.value("as_solid", false),
+                                                 params.value("detach_path", false)),
                             out_json, 0);
             if (m == "doc_resolve_pick")
                 return emit(aicad::doc::doc_resolve_pick(

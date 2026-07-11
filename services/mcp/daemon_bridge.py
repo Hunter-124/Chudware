@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -172,6 +173,17 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
         return f"\\\\.\\pipe\\aicad-hostd-{_windows_user_sid()}-{key}"
     if xdg := os.environ.get("XDG_RUNTIME_DIR"):
         return f"{xdg}/aicad/hostd-{key}.sock"
+    # No XDG_RUNTIME_DIR (common for agent-spawned processes): fall back to the
+    # canonical /run/user/<uid> BEFORE /tmp so every client resolves the SAME
+    # directory as desktop-launched ones — otherwise two "singleton" daemons
+    # coexist on different sockets. Mirrors ipc_discovery.cpp runtimeDir().
+    run_user = f"/run/user/{os.getuid()}"
+    try:
+        st = os.lstat(run_user)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return f"{run_user}/aicad/hostd-{key}.sock"
+    except OSError:
+        pass
     return f"/tmp/aicad-{os.getuid()}/hostd-{key}.sock"
 
 

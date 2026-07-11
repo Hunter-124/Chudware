@@ -22,6 +22,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <thread>
 
@@ -175,6 +176,32 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+
+#ifndef _WIN32
+    // 1b. Housekeeping: sweep dead sibling endpoints. SIGKILLed daemons (mostly
+    // scratch pytest instances) leave hostd-*.sock/.lock pairs behind forever —
+    // the flock died with the process, so a non-blocking acquire tells us the
+    // owner is gone and the pair is garbage. Own key is skipped (we hold it).
+    {
+        namespace fs = std::filesystem;
+        const std::string dir = fs::path(sock).parent_path().string();
+        std::error_code ec;
+        int swept = 0;
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            const std::string name = e.path().filename().string();
+            if (name.rfind("hostd-", 0) != 0 || e.path().extension() != ".lock") continue;
+            if (e.path().string() == lock) continue;
+            aicad_ipc::SingleInstance probe;
+            std::string perr;
+            if (!probe.acquire(e.path().string(), perr)) continue;  // owner alive
+            fs::remove(e.path(), ec);
+            fs::path s = e.path();
+            s.replace_extension(".sock");
+            if (fs::remove(s, ec)) ++swept;
+        }
+        if (swept) hostd::log().line("swept %d dead sibling endpoint(s) in %s", swept, dir.c_str());
+    }
+#endif
 
     // 2. Bind before engine load.
     aicad_ipc::IpcListener listener;

@@ -40,11 +40,25 @@ std::string instanceKey(const std::string& hostdBin) {
 }
 
 std::string runtimeDir() {
+    // Resolution must be DETERMINISTIC across every process that can spawn or
+    // discover the daemon: the flock singleton only works if the GUI, the MCP
+    // bridges, and the daemon all agree on one directory. Agent-spawned
+    // processes often lack XDG_RUNTIME_DIR, so an env-only rule split the
+    // world into /run/user/<uid> and /tmp/aicad-<uid> — two live "singletons"
+    // with the same instance key. When the env var is unset, fall back to the
+    // canonical /run/user/<uid> (if it exists and is ours) BEFORE /tmp.
+    // Mirrored in daemon_bridge.py socket_path().
     std::string dir;
     if (const char* x = std::getenv("XDG_RUNTIME_DIR"); x && *x) {
         dir = std::string(x) + "/aicad";
     } else {
-        dir = "/tmp/aicad-" + std::to_string((long)::getuid());
+        const std::string runUser = "/run/user/" + std::to_string((long)::getuid());
+        struct stat ru{};
+        if (::lstat(runUser.c_str(), &ru) == 0 && S_ISDIR(ru.st_mode) &&
+            ru.st_uid == ::getuid())
+            dir = runUser + "/aicad";
+        else
+            dir = "/tmp/aicad-" + std::to_string((long)::getuid());
     }
     if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
     // Refuse a dir we don't own or that others can write (symlink squat defence).

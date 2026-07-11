@@ -3912,7 +3912,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 return true;
             };
             const float e  = renderer.effectiveSceneRadius();
-            const float os = e * 0.22f;   // positive axis length (matches drawRefDatums)
+            const float os = e * 0.13f;   // positive axis length (issue #19: matches drawRefDatums)
             const float ns = os * 0.80f;  // negative tail length
             static const float kAxis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
             static const ImU32 kAxCol[3] = {IM_COL32(230, 64, 64, 255),    // X red

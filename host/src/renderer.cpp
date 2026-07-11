@@ -1486,7 +1486,8 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                 // tail on the negative direction. The +X/+Y/+Z text labels are screen-space and
                 // live in viewport_panel.cpp (kOriginAxisLen there must match os/e here).
                 if (d.id == "point.origin") {
-                    const float os = e * 0.22f;   // positive axis length
+                    const float os = e * 0.13f;   // positive axis length (issue #19: shortened; label
+                                                  // constant in viewport_panel.cpp must stay in sync)
                     const float ns = os * 0.80f;  // negative tail length (shorter, subdued)
                     const float ah = os * 0.18f;  // arrowhead back-set along -dir
                     const float aw = os * 0.07f;  // arrowhead half-width
@@ -1529,6 +1530,17 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                             glDrawArrays(GL_LINES, 0, 2);
                         }
                     }
+                    // Issue #19: a small dot at absolute (0,0,0) so the origin reads as a grabbable
+                    // reference point (selection is routed via SketchMode::drawPointPicker for
+                    // "point.origin"). Drawn last, on top of the axes; depth-mask is already off.
+                    // Brightens + grows a touch when the origin datum is selected.
+                    setCol(selected ? 1.00f : 0.92f, selected ? 1.00f : 0.92f,
+                           selected ? 1.00f : 0.92f, 1.0f);
+                    glPointSize(selected ? 10.0f : 7.0f);
+                    float odot[3] = {o.x, o.y, o.z};
+                    upload(odot, 3);
+                    glDrawArrays(GL_POINTS, 0, 1);
+                    glPointSize(1.0f);
                     break;
                 }
                 // A 3-axis cross marker centered on the point.

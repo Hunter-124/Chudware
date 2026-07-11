@@ -1218,7 +1218,18 @@ bool SketchMode::enterNewOnSelection(AppState& st) {
         }
         if (isPlane) { planeRef = sfid; haveRef = true; }
     }
-    if (haveRef) return !createSketchOnPlane(st, planeRef).empty();
+    if (haveRef) {
+        // Issue #20: the pre-selected plane is now CONSUMED — clear it so it can't silently drive
+        // the NEXT "New Sketch" onto the same plane. Both the FeatureManager plane row
+        // (feature_tree.cpp) and the viewport plane chip (viewport_panel.cpp) set
+        // st.selectedFeatureId / st.selection to pre-select a plane, but nothing cleared it after
+        // use — so a second sketch inherited the first sketch's plane and the plane-picker never
+        // engaged (which also made planes un-clickable in the viewport). Clearing here makes a fresh
+        // New Sketch re-present the picker unless the user deliberately pre-selects a plane again.
+        st.selectedFeatureId.clear();
+        st.selection.clear();
+        return !createSketchOnPlane(st, planeRef).empty();
+    }
     // No usable selection: enter the interactive plane-pick (front/top/right or a planar face).
     planePicking_ = true;
     planeHover_ = -1;

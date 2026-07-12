@@ -20,6 +20,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 C0 = 299_792_458.0  # speed of light, m/s
+MU0 = 4.0e-7 * math.pi          # vacuum permeability, H/m (classical SI definition)
+EPS0 = 1.0 / (MU0 * C0**2)      # vacuum permittivity from c = 1/sqrt(mu0*eps0)
+ETA0 = MU0 * C0                 # free-space wave impedance eta0 = sqrt(mu0/eps0) ~ 376.73 ohm
 
 # ---------------------------------------------------------------- standard guides
 # EIA rectangular waveguide standards: name -> (a_mm, b_mm). a is the broad wall.
@@ -116,6 +119,54 @@ def circ_mode_table(radius_m: float, n_modes: int = 6, eps_r: float = 1.0) -> Li
                           "kc_per_m": kc})
     modes.sort(key=lambda md: (md["fc_hz"], md["type"]))
     return modes[:n_modes]
+
+
+# ---------------------------------------------------------------- line impedances
+
+def te_wave_impedance(f_hz: float, fc_hz: float, eps_r: float = 1.0) -> float:
+    """TE-mode wave impedance of a hollow guide above cutoff (Pozar 4e, eq. 3.22).
+
+    Z_TE = k*eta/beta = eta / sqrt(1 - (fc/f)^2), eta = eta0/sqrt(eps_r).
+    Below (or at) cutoff there is no propagating wave -> ValueError.
+    """
+    if f_hz <= fc_hz:
+        raise ValueError(f"TE wave impedance undefined at/below cutoff "
+                         f"({f_hz:.4g} Hz <= fc {fc_hz:.4g} Hz)")
+    eta = ETA0 / math.sqrt(eps_r)
+    return eta / math.sqrt(1.0 - (fc_hz / f_hz) ** 2)
+
+
+def parallel_plate_z0(w_m: float, d_m: float, eps_r: float = 1.0) -> float:
+    """Characteristic impedance of an ideal parallel-plate line (Pozar 4e, §3.2).
+
+    Z0 = eta*d/w with eta = eta0/sqrt(eps_r) — plate width w, separation d,
+    fringing fields neglected (valid for w >> d).
+    """
+    if w_m <= 0 or d_m <= 0 or eps_r < 1.0:
+        raise ValueError("parallel_plate_z0 needs w > 0, d > 0, eps_r >= 1")
+    return ETA0 / math.sqrt(eps_r) * d_m / w_m
+
+
+def microstrip_z0(w_m: float, h_m: float, eps_r: float) -> Dict[str, float]:
+    """Quasi-static microstrip characteristic impedance — Hammerstad closed form
+    (Pozar 4e, eqs. 3.195-3.196; zero-thickness trace).
+
+    eps_e = (er+1)/2 + (er-1)/2 / sqrt(1 + 12 h/W)
+    W/h <= 1:  Z0 = 60/sqrt(eps_e) * ln(8h/W + W/(4h))
+    W/h >= 1:  Z0 = 120*pi / (sqrt(eps_e) * (W/h + 1.393 + 0.667*ln(W/h + 1.444)))
+
+    Returns {"z0": ohm, "eps_eff": ..., "model": "microstrip-hammerstad"}.
+    """
+    if w_m <= 0 or h_m <= 0 or eps_r < 1.0:
+        raise ValueError("microstrip_z0 needs w > 0, h > 0, eps_r >= 1")
+    u = w_m / h_m
+    eps_e = (eps_r + 1.0) / 2.0 + (eps_r - 1.0) / 2.0 / math.sqrt(1.0 + 12.0 / u)
+    if u <= 1.0:
+        z0 = 60.0 / math.sqrt(eps_e) * math.log(8.0 / u + u / 4.0)
+    else:
+        z0 = 120.0 * math.pi / (math.sqrt(eps_e)
+                                * (u + 1.393 + 0.667 * math.log(u + 1.444)))
+    return {"z0": z0, "eps_eff": eps_e, "model": "microstrip-hammerstad"}
 
 
 # ---------------------------------------------------------------- propagation

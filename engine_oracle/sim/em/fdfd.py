@@ -158,19 +158,34 @@ def solve_eigenmodes(shape: str, a_m: float, b_m: float, n_modes: int = 6,
 
 def _label_modes(modes: List[dict], shape: str, a_m: float, b_m: float,
                  eps_r: float) -> None:
-    """Attach TEmn/TMnm names by matching fc against the analytic table (2% tol)."""
+    """Attach TEmn/TMnm names by matching fc against the analytic table (2% tol).
+
+    Degeneracy: among the references within tolerance, prefer one whose name is
+    not already assigned — a square guide's TE10/TE01 pair are distinct modes at
+    the same cutoff and must get both names (matching purely by nearest fc used
+    to label both "TE01").  If every candidate is taken, reuse the closest:
+    circular TEn1/TMn1 (n>=1) pairs are genuinely doubly degenerate and share
+    one table entry.
+    """
     table = (rect_mode_table(a_m, b_m, 40, eps_r) if shape == "rectangular"
              else circ_mode_table(a_m, 40, eps_r))
+    used: set = set()
     for md in modes:
+        cands = sorted(
+            ((abs(ref["fc_hz"] - md["fc_hz"]) / ref["fc_hz"], ref)
+             for ref in table if ref["type"] == md["type"]),
+            key=lambda pair: pair[0])
+        cands = [(err, ref) for err, ref in cands if err < 0.02]
         best: Optional[dict] = None
         best_err = 0.02
-        for ref in table:
-            if ref["type"] != md["type"]:
-                continue
-            err = abs(ref["fc_hz"] - md["fc_hz"]) / ref["fc_hz"]
-            if err < best_err:
+        for err, ref in cands:
+            if ref["name"] not in used:
                 best, best_err = ref, err
+                break
+        if best is None and cands:            # all in-tolerance names taken:
+            best_err, best = cands[0]         # true degeneracy — reuse closest
         md["name"] = best["name"] if best else f"{md['type']}?"
         if best:
+            used.add(best["name"])
             md["analytic_fc_hz"] = best["fc_hz"]
             md["analytic_err_pct"] = round(100.0 * best_err, 3)

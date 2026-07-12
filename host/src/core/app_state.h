@@ -611,6 +611,16 @@ struct AppState {
         // in the background is visible without stealing focus or the viewport. Cleared the moment the
         // user switches to the tab (switchToTab) or the poller refreshes it while it IS active.
         bool        aiPulse = false;
+        // Ownership: the user ADOPTED this AI mirror tab by editing it (first edit flips it via
+        // markActiveTabDirty). An adopted doc becomes user-owned — it is never auto-closed when
+        // the agent finishes, IS included in the unsaved-work quit warning, and drops the "AI:"
+        // label prefix. The agent keeps co-editing the same live doc (existing multi-writer CAS).
+        // Set once, never cleared (survives save). Meaningless unless aiHandoff.
+        bool        userAdopted = false;
+        // The agent that was building this mirror has FINISHED (daemon sent doc.closed with
+        // reason "last_writer_detached"). If this is the active tab we keep it on screen; it
+        // becomes eligible for auto-close on the next switch-away (unless adopted/dirty).
+        bool        agentDone = false;
 
         // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
         // thing the user actually opened/saved) over the internal tree "name" — an opened .step+
@@ -765,9 +775,17 @@ struct AppState {
     // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_rebuild → tree+mesh),
     // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
     void switchToTab(int idx);
+    // The switch body. switchToTab() wraps this to auto-close a leaving AI mirror tab whose agent
+    // has finished and that the user never adopted (see switchToTab in doc_tabs.cpp).
+    void switchToTabCore(int idx);
     // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
     // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
-    void closeDocTab(int idx);
+    // detachOnly (aiHandoff tabs, daemon mode): drop only THIS client's view (detach_doc) instead of
+    // discarding the doc, so an un-adopted AI doc the agent abandoned survives to the daemon's
+    // GC/retire tier (recoverable) rather than being purged. Used by the agent-finished auto-close;
+    // a manual X-click leaves detachOnly=false (explicit user intent to discard the mirror).
+    void closeDocTab(int idx, bool detachOnly);
+    void closeDocTab(int idx) { closeDocTab(idx, false); }
     // Discard any disposable blank "starter" tab(s) — the launch example doc the user never touched
     // (isStarter && !dirty && no saved path) — EXCEPT the tab at keepIdx. Called when a real file is
     // opened so the blank example doesn't linger beside it. A starter the user edited (dirty) or

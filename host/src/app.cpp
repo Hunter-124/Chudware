@@ -785,6 +785,9 @@ static bool saveAllDirtyForQuit(AppState& st) {
     bool allSaved = true;
     for (int i = 0; i < (int)st.docTabs.size(); ++i) {
         if (!st.docTabs[i].dirty) continue;
+        // Only save user-owned docs — a pure AI mirror the user never adopted isn't theirs to
+        // save (its agent owns it). In practice such a tab is never dirty, but guard anyway.
+        if (st.docTabs[i].aiHandoff && !st.docTabs[i].userAdopted) continue;
         ui::TabSaveResult r = ui::saveDocTab(st, i, /*forceDialog=*/false);
         if (r == ui::TabSaveResult::Cancelled || r == ui::TabSaveResult::Failed) allSaved = false;
     }
@@ -1976,7 +1979,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (!shot && glfwWindowShouldClose(win) && !st.quitConfirmed) {
             bool anyDirty = false;
             for (const auto& t : st.docTabs)
-                if (t.dirty) { anyDirty = true; break; }
+                // Only warn about USER-owned docs: a doc the user created/opened, or an AI mirror
+                // they adopted by editing. Pure AI mirror tabs are excluded — the agent owns their
+                // save discipline, and any unsaved AI work is preserved by the daemon's recovery
+                // tier, so nagging the user about them would be a false positive.
+                if (t.dirty && (!t.aiHandoff || t.userAdopted)) { anyDirty = true; break; }
             if (anyDirty) {
                 glfwSetWindowShouldClose(win, GLFW_FALSE);
                 st.wantQuitConfirm = true;
@@ -3387,12 +3394,18 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             if (ImGui::BeginPopupModal("Quit Billet?##appquit", &open,
                                        ImGuiWindowFlags_AlwaysAutoResize |
                                            ImGuiWindowFlags_NoSavedSettings)) {
+                // Only USER-owned docs (own tabs + adopted AI mirrors) are the user's to save —
+                // pure AI mirror tabs are the agent's responsibility and are covered by the daemon
+                // recovery tier, so they're excluded from this prompt (no false positives).
+                auto userOwnedDirty = [](const AppState::DocTab& t) {
+                    return t.dirty && (!t.aiHandoff || t.userAdopted);
+                };
                 int n = 0;
-                for (const auto& t : st.docTabs) if (t.dirty) ++n;
+                for (const auto& t : st.docTabs) if (userOwnedDirty(t)) ++n;
                 ImGui::Text("%d document%s with unsaved changes:", n, n == 1 ? "" : "s");
                 ImGui::Spacing();
                 for (const auto& t : st.docTabs)
-                    if (t.dirty) ImGui::BulletText("%s", t.displayTitle().c_str());
+                    if (userOwnedDirty(t)) ImGui::BulletText("%s", t.displayTitle().c_str());
                 ImGui::Spacing();
                 ImGui::TextUnformatted("Save before quitting?");
                 ImGui::Spacing();
@@ -3751,24 +3764,28 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         glfwSwapBuffers(win);
     }
 
-    // Clean-exit discard signal (daemon mode): closing the app normally is a
-    // DELIBERATE exit, so tell the shared daemon to drop the parts we're leaving
-    // unsaved — otherwise, once abandoned, it would retire them for recovery and
-    // flood the "Recover unsaved parts?" prompt on the next launch. This is what
-    // makes recovery CRASH-ONLY: a crash never reaches this teardown, so its docs
-    // stay abandoned and the daemon retires them (offered next launch). A part an
-    // agent is still building degrades to a plain detach (doc_discard keeps it for
-    // the remaining writer). The user was already warned about unsaved changes by
-    // the quit modal. Screenshot/headless runs skip it.
+    // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE exit.
+    //  * USER-owned docs (own tabs + adopted AI mirrors): doc_discard — drop the parts we're
+    //    leaving unsaved so, once abandoned, the daemon doesn't retire them and flood the
+    //    "Recover unsaved parts?" prompt next launch. This is what makes recovery CRASH-ONLY
+    //    for user docs (a crash never reaches this teardown, so its docs are retired + offered).
+    //    The user was already warned about these by the quit modal.
+    //  * PURE AI mirror tabs (un-adopted): only detach_doc — never discard. The agent may still
+    //    be building the doc (discard would degrade to detach anyway), but if the agent already
+    //    finished a DIRTY doc, discarding here would purge its autosave and lose the work. A
+    //    plain detach leaves it for the daemon's GC/retire tier so it's recoverable — closing
+    //    the real data-loss hole. Screenshot/headless runs skip it.
     if (!shot && engine::daemonMode()) {
         if (auto* c = engine::client()) {
             for (const auto& t : st.docTabs) {
                 if (t.docId.empty() || (t.kind != AppState::DocTab::TabKind::Part &&
                                         t.kind != AppState::DocTab::TabKind::Assembly))
                     continue;
+                const bool userOwned = !t.aiHandoff || t.userAdopted;
                 nlohmann::json res;
                 std::string err;
-                c->call("doc_discard", {{"doc_id", t.docId}}, res, err);
+                c->call(userOwned ? "doc_discard" : "detach_doc",
+                        {{"doc_id", t.docId}}, res, err);
             }
         }
     }

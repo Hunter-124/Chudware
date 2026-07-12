@@ -88,7 +88,8 @@ static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
 std::string AppState::DocTab::displayTitle() const {
     // Live MCP-handoff mirror: never show its on-disk name ("live", from live.step+). Label it as
     // the AI's part using the tree-derived title so the user reads "AI: bracket", not "live".
-    if (aiHandoff)
+    // Once the user has ADOPTED it (edited it), it's their doc — drop the "AI:" prefix.
+    if (aiHandoff && !userAdopted)
         return "AI: " + (title.empty() ? std::string("part") : title);
     if (!path.empty()) {
         std::size_t slash = path.find_last_of("/\\");
@@ -188,6 +189,31 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
 }
 
 void AppState::switchToTab(int idx) {
+    if (idx < 0 || idx >= (int)docTabs.size()) return;
+    // Before leaving the current tab, note whether it's an AI mirror whose agent has FINISHED and
+    // that the user never adopted or dirtied — such a tab is kept alive only while it's the one the
+    // user is looking at, so switching away is its cue to auto-close (detach-only → recoverable).
+    std::string leavingAutoCloseId;
+    if (activeTab >= 0 && activeTab < (int)docTabs.size() && activeTab != idx) {
+        const DocTab& lv = docTabs[activeTab];
+        if (lv.aiHandoff && lv.agentDone && !lv.userAdopted && !lv.dirty &&
+            lv.docId != docTabs[idx].docId)
+            leavingAutoCloseId = lv.docId;
+    }
+
+    switchToTabCore(idx);
+
+    if (!leavingAutoCloseId.empty()) {
+        for (int i = 0; i < (int)docTabs.size(); ++i)
+            if (docTabs[i].docId == leavingAutoCloseId && i != activeTab) {
+                addLog("[tabs] auto-closing finished AI tab on switch-away: " + leavingAutoCloseId);
+                closeDocTab(i, /*detachOnly=*/true);
+                break;
+            }
+    }
+}
+
+void AppState::switchToTabCore(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
     docTabs[idx].aiPulse = false;   // the user is now looking at it — stop the AI-activity glow
     // Already-active no-op early-out (part/asm: also require the mirror to match; drawing/ECAD: by
@@ -460,7 +486,7 @@ void AppState::switchToTab(int idx) {
            ", rev " + std::to_string(docMirror.revision()) + ")");
 }
 
-void AppState::closeDocTab(int idx) {
+void AppState::closeDocTab(int idx, bool detachOnly) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
     DocTab closing = docTabs[idx];
     // Multi-document: keep the closing tab's session alive past this erase until any async RPC its
@@ -491,17 +517,21 @@ void AppState::closeDocTab(int idx) {
         // can't drive the panel after the tab is gone (a neighbor switch re-points it if needed).
         if (ecadDocId == closing.ecadDocId) { ecadDocId.clear(); ecadRevision = -1; }
     } else if (closing.aiHandoff && engine::daemonMode()) {
-        // Phase 4: a daemon mirror tab VIEWS a doc another client (an agent) is
-        // building in the SHARED engine. Closing the tab is an explicit "I'm done
-        // with this" — doc_discard drops our view AND, if no other client still
-        // holds the doc (the agent has finished/detached), closes it for good so
-        // this deliberately-closed part does not flood back as unsaved-recovery on
-        // the next launch. If the agent is still building it, doc_discard degrades
-        // to a plain detach and the doc lives on for that writer.
+        // A daemon mirror tab VIEWS a doc another client (an agent) is building in the
+        // SHARED engine. Two close paths:
+        //  * detachOnly (agent-finished auto-close): drop ONLY our ro view (detach_doc).
+        //    The doc goes unattached and the daemon's GC/retire tier preserves it if it
+        //    was dirty — so an abandoned unsaved AI part is recoverable next launch, never
+        //    silently purged. This is the data-safe default for auto-close.
+        //  * manual X-click (detachOnly=false): an explicit "I'm done" — doc_discard drops
+        //    our view AND, if no other client still holds the doc, closes it for good so a
+        //    deliberately-closed part doesn't flood back as unsaved-recovery. If the agent
+        //    is still building it, doc_discard degrades to a plain detach.
         if (auto* c = engine::client()) {
             nlohmann::json res;
             std::string err;
-            c->call("doc_discard", {{"doc_id", closing.docId}}, res, err);
+            c->call(detachOnly ? "detach_doc" : "doc_discard",
+                    {{"doc_id", closing.docId}}, res, err);
         }
     } else {
         nlohmann::json res;
@@ -582,8 +612,15 @@ void AppState::markActiveTabDirty() {
     // re-pointed the mirror but the strip hasn't reconciled yet) the active index can lag the
     // mirror; checking the id avoids dirtying the wrong document's tab.
     if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
-        docTabs[activeTab].docId == docMirror.docId())
+        docTabs[activeTab].docId == docMirror.docId()) {
         docTabs[activeTab].dirty = true;
+        // First user edit on an AI mirror tab ADOPTS it: it becomes user-owned, so it is
+        // never auto-closed when the agent finishes and IS covered by the quit warning. The
+        // agent keeps co-editing the same live doc (the mirror's ro attach silently upgraded
+        // to rw for this edit — engine_backend.cpp — so both writers coexist under the CAS).
+        if (docTabs[activeTab].aiHandoff)
+            docTabs[activeTab].userAdopted = true;
+    }
 }
 
 void AppState::clearActiveTabDirty() {

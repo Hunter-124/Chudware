@@ -207,15 +207,29 @@ void handleEvent(AppState& st, const json& evt) {
         pendingOpen.erase(docId);
         pendingChanged.erase(docId);
         if (idx < 0) return;
-        if (!st.docTabs[idx].aiHandoff) {
-            st.addLog("[daemon] doc.closed for user tab " + docId + " (reason " + reason + ")");
-            return;  // never auto-close a tab the user opened themselves
-        }
-        if (reason == "last_writer_detached") {
-            st.docTabs[idx].aiPulse = false;  // keep the final view on screen
+        if (!st.docTabs[idx].aiHandoff || st.docTabs[idx].userAdopted) {
+            // A tab the user opened themselves, or an AI mirror the user ADOPTED by editing:
+            // it's user-owned now. Never auto-close it — the user decides its fate (and the
+            // quit warning covers it). last_writer_detached just means the agent stepped away.
+            st.docTabs[idx].aiPulse = false;
+            st.docTabs[idx].agentDone = true;
+            st.addLog("[daemon] doc.closed for user-owned tab " + docId + " (reason " + reason + ")");
             return;
         }
-        st.closeDocTab(idx);
+        if (reason == "last_writer_detached") {
+            // The agent finished this un-adopted mirror. If the user is actively looking at it
+            // (active tab), keep it on screen — it auto-closes when they switch away
+            // (switchToTab). Otherwise close the live view now; detach-only, so if the doc was
+            // dirty the daemon's GC/retire tier preserves it for recovery (never a silent purge).
+            st.docTabs[idx].aiPulse = false;
+            st.docTabs[idx].agentDone = true;
+            if (idx == st.activeTab) return;  // keep while viewed
+            st.toast(ui::ToastLevel::Info,
+                     "AI finished '" + st.docTabs[idx].displayTitle() + "' — closed (recoverable if unsaved)");
+            st.closeDocTab(idx, /*detachOnly=*/true);
+            return;
+        }
+        st.closeDocTab(idx);  // closed/gc/discarded/daemon — the doc is gone; drop the mirror
         return;
     }
     if (name == "doc.lease_change") {
@@ -272,6 +286,15 @@ bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
             if (!id.empty()) {
                 liveIds.insert(id);
                 openMirrorTab(st, id);
+                // origin_kind (daemon-annotated): a doc minted by a GUI client is user-owned,
+                // so if we mirrored it after (re)connecting, mark it adopted — it must be
+                // quit-warned and never auto-closed. Unknown/mcp/agent origin stays AI-owned.
+                const std::string origin =
+                    doc.is_object() ? doc.value("origin_kind", std::string()) : std::string();
+                if (origin == "gui") {
+                    const int ti = tabIndexForDoc(st, id);
+                    if (ti >= 0 && st.docTabs[ti].aiHandoff) st.docTabs[ti].userAdopted = true;
+                }
             }
         }
         // Breadcrumb for the "parts didn't show up" report: live docs mirror as

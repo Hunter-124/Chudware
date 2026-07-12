@@ -74,6 +74,16 @@ public:
     void postCall(int clientId, const std::string& kind, const std::string& method,
                   const nlohmann::json& params, nlohmann::json& result);
 
+    // Stamp each doc_list entry with "origin_kind" (the kind of the client that
+    // MINTED the doc: gui|mcp|agent|test, or "unknown"). Lets a GUI that connected
+    // AFTER a doc was created recover its user-vs-AI ownership on bootstrap.
+    void annotateDocList(nlohmann::json& result);
+
+    // True if a client OTHER than `clientId` currently holds an rw attach on
+    // `docId`. Server uses this to degrade a doc_close into a plain detach so one
+    // client can't destroy a doc another client is still editing.
+    bool hasOtherRwWriter(const std::string& docId, int clientId);
+
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
     // client start the doc-GC grace countdown (AICAD_DOC_GC_GRACE_S, default
@@ -115,6 +125,9 @@ private:
         int lastWriterClient = -1;
         std::string lastWriterKind;
         std::string lastWriterMethod;
+        // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
+        // once set — the origin of ownership (user vs AI). Empty = unknown.
+        std::string originKind;
         // Doc-GC: when > 0, no client is attached and the doc closes once this
         // deadline passes without a new attach (zombie-doc prevention).
         long long orphanDeadlineMs = 0;

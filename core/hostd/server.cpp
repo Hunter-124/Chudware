@@ -398,6 +398,24 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         return json{{"ok", true}, {"discarded", discarded}};
     }
 
+    // Co-edit protection: a plain doc_close destroys the doc for EVERY client.
+    // When another client still holds an rw attach (e.g. the user adopted an AI
+    // doc and is editing it, or an agent is still building a doc the user closed),
+    // degrade the close to a detach so one client can't yank the doc out from
+    // under another. Pass {"force": true} to close anyway.
+    if (method == "doc_close" && !params.value("force", false)) {
+        const std::string docId = params.value("doc_id", std::string());
+        if (!docId.empty() && registry_.hasOtherRwWriter(docId, c.id)) {
+            json det;
+            bool de = false;
+            registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
+            return json{{"ok", true},
+                        {"detached", true},
+                        {"note", "another client is editing this doc; detached "
+                                 "instead of closing (pass force:true to close anyway)"}};
+        }
+    }
+
     // Agent child supervision (agent_spawn/agent_stop/agent_list) — daemon
     // state only, no engine touch.
     {
@@ -455,6 +473,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
     registry_.postCall(c.id, c.kind, method, p, result);
+    // Stamp origin_kind onto each doc_list entry so a GUI that connected after a
+    // doc was minted can recover user-vs-AI ownership on bootstrap.
+    if (method == "doc_list") registry_.annotateDocList(result);
     // Closed means closed: an explicit doc_close deletes the doc's autosave
     // artifacts so it can never resurrect on the next daemon start.
     if (method == "doc_close" && autosave_)

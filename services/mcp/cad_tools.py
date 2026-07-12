@@ -53,6 +53,26 @@ _DOC_ALIASES: dict = {}
 # (material added / removed / unchanged) in its write-diff confirmation. Best-effort cache.
 _LAST_VOLUME: dict = {}
 
+# Save discipline (user-vs-AI ownership): the engine revision this doc was last DELIVERED at
+# (save_part / export_part to a file). The engine `dirty` flag is NOT a usable "undelivered
+# work" signal here — the MCP autosave timer calls doc_save to a temp path, which clears dirty
+# without the agent having delivered anything. Revision IS reliable: it's monotonic and bumped
+# only by mutating ops (never by a save), so `current_revision > _LAST_DELIVER_REV[doc]` means
+# "edited since the last real save". close_part uses it to nudge the agent to save its work.
+_LAST_DELIVER_REV: dict = {}
+
+
+def _doc_revision(doc_id: str) -> Optional[int]:
+    """Current engine revision for a doc via the cheap doc_list (no geometry compute)."""
+    try:
+        for e in cb.call("doc_list", {}).get("docs", []):
+            if isinstance(e, dict) and e.get("doc_id") == doc_id:
+                r = e.get("revision")
+                return int(r) if r is not None else None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -1748,6 +1768,17 @@ Address geometry in PLAIN WORDS (no coordinates, no face numbers): "the top face
 edges", "the vertical edges", "the largest round face". The engine resolves the words to
 topology. cad_guide("review") explains how to read the annotated render. The full op
 vocabulary, with worked examples, follows.
+
+DOC OWNERSHIP & SAVE DISCIPLINE
+  Docs you mint (new_part/new_assembly/import) are AI-OWNED. The user sees them live in a
+  mirror tab while you work; when you finish (detach/close/disconnect) the app AUTO-CLOSES
+  that live view unless the user is actively viewing or has adopted it by editing. So the
+  responsibility to preserve work is YOURS, not the user's:
+    * save_part(path=...) every DELIVERABLE before you finish — this is the hand-off.
+    * close_part(discard=True) for SCRATCH docs you don't want kept.
+  An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
+  net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
+  edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
 
 ================================================================================
 """
@@ -3611,11 +3642,47 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def close_part(doc_id: Optional[str] = None) -> str:
-        """Close a part document and free it. Clears the current part if it was current."""
+    def close_part(doc_id: Optional[str] = None, discard: bool = False) -> str:
+        """Close a part document and free it. Clears the current part if it was current.
+
+        SAVE DISCIPLINE: docs you (the AI) create are AI-owned. The desktop app never warns
+        the user about YOUR unsaved docs — so YOU are responsible for saving deliverables
+        before closing. If the doc has unsaved changes this returns {"ok": false,
+        "code": "unsaved_changes"} WITHOUT closing; call save_part(path=...) to deliver it,
+        or close_part(discard=True) to intentionally drop scratch work.
+
+        If another client (e.g. the user, who adopted this doc by editing it) is still
+        editing, the daemon degrades the close to a detach and returns {"detached": true} —
+        your live view drops but their doc lives on.
+        """
         try:
             d = _doc(doc_id)
+            if not discard:
+                # "Undelivered work" = mutated since the last save_part/export_part. Revision is
+                # the reliable signal (the engine `dirty` flag is cleared by the MCP autosave's
+                # doc_save to a temp path, so it would false-negative here).
+                name = d
+                for e in cb.call("doc_list", {}).get("docs", []):
+                    if isinstance(e, dict) and e.get("doc_id") == d:
+                        name = e.get("name") or d
+                        break
+                rev = _doc_revision(d)
+                delivered = _LAST_DELIVER_REV.get(d)
+                if rev is not None and rev > 0 and delivered != rev:
+                    return _dumps({
+                        "ok": False, "code": "unsaved_changes", "doc_id": d, "dirty": True,
+                        "message": f"{name} has unsaved changes — call save_part(path=...) "
+                                   f"to deliver it, or close_part(discard=True) to drop it",
+                    })
             r = cb.call("doc_close", {"doc_id": d})
+            if r.get("detached"):
+                # Another client is editing it: our view detached, the doc lives on.
+                _unpublish(d)
+                if _CUR["doc_id"] == d:
+                    _CUR["doc_id"] = None
+                _LAST_DELIVER_REV.pop(d, None)
+                return _dumps({"ok": True, "detached": True, "doc_id": d,
+                               "note": r.get("note")})
             _unpublish(d)  # drop its mirror tab in the app
             if _CUR["doc_id"] == d:
                 _CUR["doc_id"] = None
@@ -3624,6 +3691,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
             # old_id -> d alias could later misroute an agent's call to a REUSED d.
             for k in [k for k in _DOC_ALIASES if k == d or _resolve_alias(k) == d]:
                 _DOC_ALIASES.pop(k, None)
+            _LAST_DELIVER_REV.pop(d, None)
             return _dumps({"ok": True, "closed": r.get("closed", True), "doc_id": d})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -3640,6 +3708,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         path : where to write. If omitted, a temp .step+ is written. A ".step+" extension is added
                if missing. Returns the written path and bytes so you can confirm a real save.
+
+        Save every deliverable BEFORE your session ends: the user is never warned about your
+        unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
+        recoverable from a fallback crash-recovery tier — not a delivery mechanism.
         """
         try:
             d = _doc(doc_id)
@@ -3652,6 +3724,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
             r = cb.call("doc_save", {"doc_id": d, "path": out})
             written = r.get("path", out)
             ok = os.path.exists(written)
+            if ok:
+                # Delivered: record the revision so close_part won't warn until further edits.
+                rev = _doc_revision(d)
+                if rev is not None:
+                    _LAST_DELIVER_REV[d] = rev
             return _dumps({"ok": ok, "format": "step+", "native": True, "doc_id": d,
                            "path": written,
                            "bytes": (os.path.getsize(written) if ok else 0)})
@@ -3682,6 +3759,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     out += ".step+"
                 r = cb.call("doc_save", {"doc_id": d, "path": out})
                 written = r.get("path", out)
+                if os.path.exists(written):
+                    rev = _doc_revision(d)
+                    if rev is not None:
+                        _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
                 return _dumps({"ok": os.path.exists(written), "format": "step+",
                                "native": True, "doc_id": d, "path": written,
                                "exists": os.path.exists(written)})
@@ -3693,6 +3774,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
             # trust the export instead of a bare exists flag.
             r = cb.call("export_file", {"doc_id": d, "path": out, "format": fmt})
             written = r.get("path", out)
+            if os.path.exists(written):
+                rev = _doc_revision(d)
+                if rev is not None:
+                    _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
             res = {"ok": True, "format": fmt, "doc_id": d, "path": written,
                    "exists": os.path.exists(written)}
             for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated"):

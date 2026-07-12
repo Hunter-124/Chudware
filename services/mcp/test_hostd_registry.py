@@ -243,6 +243,62 @@ def test_disconnect_releases_hold(scratch_daemon):
     assert r.get("_is_error") is None, r
 
 
+# ----------------------------------------------------------- ownership/origin
+
+
+def test_origin_kind_in_doc_list(scratch_daemon):
+    """doc_list stamps each entry with the minting client's kind (user vs AI)."""
+    a = DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    doc = a.call("doc_new", {"name": "origin"})["doc_id"]
+    entry = next(e for e in a.call("doc_list", {})["docs"] if e.get("doc_id") == doc)
+    # A DaemonClient registers kind "mcp" (its hello sends {"client": "mcp"}).
+    assert entry.get("origin_kind") == "mcp", entry
+
+
+def test_disconnect_emits_last_writer_detached(scratch_daemon):
+    """An agent (last rw writer) disconnecting tells ro viewers their mirror is
+    final via doc.closed last_writer_detached — the signal the GUI auto-closes on.
+    Without it a crashed agent's mirror tab would live forever."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    b.call("subscribe", {"doc_ids": "*"})
+    doc = a.call("doc_new", {"name": "abandoned"})["doc_id"]
+    # B is a read-only viewer (the GUI mirror), so A's rw is the only writer.
+    b.call("attach_doc", {"doc_id": doc, "mode": "ro"})
+    a.close()
+    time.sleep(0.4)
+    closed = _events(b, "doc.closed")
+    assert any(e["data"].get("doc_id") == doc and
+               e["data"].get("reason") == "last_writer_detached" for e in closed), closed
+
+
+def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
+    """A co-edited doc must not be destroyed by one client's doc_close: it degrades
+    to a detach unless force:true. Protects a user-adopted doc from an agent's
+    close_part (and vice versa)."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "coedit"})["doc_id"]
+    assert b.call("attach_doc", {"doc_id": doc, "mode": "rw"}).get("ok") is True
+
+    # A closes while B still holds rw -> degrade to detach, doc survives for B.
+    r = a.call("doc_close", {"doc_id": doc})
+    assert r.get("detached") is True, r
+    assert b.call("doc_tree", {"doc_id": doc}).get("_is_error") is None, "doc must survive"
+    assert b.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS}).get("_is_error") is None
+
+    # A can still FORCE the close even though B holds rw (explicit override).
+    assert a.call("doc_close", {"doc_id": doc, "force": True}).get("_is_error") is None
+    time.sleep(0.1)
+    assert all(e.get("doc_id") != doc for e in b.call("doc_list", {})["docs"]), "doc gone"
+
+
 # ------------------------------------------------------------ foreign edits
 
 

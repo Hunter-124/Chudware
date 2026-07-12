@@ -419,11 +419,13 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
             d.lastWriterClient = clientId;
             d.lastWriterKind = kind;
             d.lastWriterMethod = method;
+            d.originKind = kind;  // who created it — user (gui) vs AI (mcp/agent)
             json evt = {{"event", "doc.opened"},
                         {"data", {{"doc_id", docId},
                                   {"revision", rev},
                                   {"source_client", clientId},
                                   {"source_kind", kind},
+                                  {"origin_kind", kind},
                                   {"method", method}}}};
             fanoutLocked(docId, evt, clientId, pending);
             flush(pending);
@@ -494,9 +496,47 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
                                       {"state", "disconnected"}}}};
                 fanoutLocked(docId, evt, clientId, pending);
             }
+            // A disconnecting agent is the same signal as an explicit detach:
+            // when its rw attach was the last writer, tell viewers their mirror
+            // is final so they can auto-close (mirrors the detach_doc path).
+            // Without this, a crashed/killed agent leaves its live view stuck open
+            // forever (the GUI's ro attach also blocks GC, so no other event fires).
+            if (wasRw && rwCountLocked(d) == 0) {
+                json evt = {{"event", "doc.closed"},
+                            {"data", {{"doc_id", docId},
+                                      {"reason", "last_writer_detached"},
+                                      {"source_kind", kind}}}};
+                fanoutLocked(docId, evt, clientId, pending);
+            }
         }
     }
     flush(pending);
+}
+
+// ------------------------------------------------------------- ownership reads
+
+void DocRegistry::annotateDocList(json& result) {
+    if (!result.is_object() || !result.contains("docs") || !result["docs"].is_array())
+        return;
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (auto& e : result["docs"]) {
+        if (!e.is_object()) continue;
+        const std::string id = e.value("doc_id", std::string());
+        if (id.empty()) continue;
+        auto it = docs_.find(id);
+        e["origin_kind"] = (it != docs_.end() && !it->second.originKind.empty())
+                               ? it->second.originKind
+                               : std::string("unknown");
+    }
+}
+
+bool DocRegistry::hasOtherRwWriter(const std::string& docId, int clientId) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = docs_.find(docId);
+    if (it == docs_.end()) return false;
+    for (const auto& [cid, a] : it->second.attach)
+        if (cid != clientId && a.mode == "rw") return true;
+    return false;
 }
 
 }  // namespace hostd

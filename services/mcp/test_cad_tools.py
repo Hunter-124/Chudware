@@ -400,6 +400,41 @@ def test_save_part_native_stepplus_roundtrips():
     os.unlink(r["path"])
 
 
+def test_close_part_warns_on_unsaved_changes():
+    """close_part on a dirty doc refuses (unsaved_changes) so the AI saves deliverables —
+    the user is never nagged about the AI's docs, so the discipline lives here."""
+    doc = _new_plate_with_hole()  # has edits -> dirty
+    r, _ = _call("close_part", {"doc_id": doc})
+    assert r.get("ok") is False and r.get("code") == "unsaved_changes", r
+    assert r.get("dirty") is True, r
+    # The doc is untouched — still listable and closable.
+    ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
+    assert doc in ids, "refused close must not have dropped the doc"
+    assert _call("close_part", {"doc_id": doc, "discard": True})[0].get("ok") is True
+
+
+def test_close_part_discard_drops_scratch():
+    """close_part(discard=True) closes a dirty scratch doc without saving."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("close_part", {"doc_id": doc, "discard": True})
+    assert r.get("ok") is True, r
+    ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
+    assert doc not in ids, "discard must actually close the doc"
+
+
+def test_close_part_clean_after_save():
+    """A saved (clean) doc closes without the unsaved-changes guard tripping."""
+    import os
+    import tempfile
+    doc = _new_plate_with_hole()
+    out = os.path.join(tempfile.mkdtemp(), "clean")
+    s, _ = _call("save_part", {"path": out, "doc_id": doc})
+    assert s["ok"], s
+    r, _ = _call("close_part", {"doc_id": doc})
+    assert r.get("ok") is True and r.get("code") != "unsaved_changes", r
+    os.unlink(s["path"])
+
+
 def test_export_step_plus_alias_is_native():
     """export_part('step+') is accepted as an alias and routed to the native saver."""
     import os

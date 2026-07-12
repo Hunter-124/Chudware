@@ -97,3 +97,6 @@ core/build-occt/
 tools/_*.png
 work/.claim.lock
 extern/cef/
+
+# simsuite baseline output (transient)
+benchmarks/simsuite/results/

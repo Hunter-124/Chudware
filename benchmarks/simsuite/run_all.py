@@ -99,8 +99,14 @@ def main() -> int:
 
     # REPORT.md — accuracy table + slowest-first timing table
     lines = [f"# simsuite baseline — {stamp}{' (quick)' if args.quick else ''}", ""]
-    bad = [c for c in all_cases if c["status"] != "ok"]
-    lines += [f"{len(all_cases)} cases, {len(bad)} not-ok, {len(module_errors)} module errors", ""]
+    # A case-level `skip` (optional dep absent — OpenFOAM/ngspice/openEMS, or a case
+    # too big for the host per resguard.fits) is expected and does NOT fail the gate;
+    # only true `fail`s and module_errors do. A resguard budget ABORT is recorded as a
+    # module_error (not a case skip), so it still fails the gate as it should.
+    failed = [c for c in all_cases if c["status"] == "fail"]
+    skipped = [c for c in all_cases if c["status"] == "skip"]
+    lines += [f"{len(all_cases)} cases, {len(failed)} failed, {len(skipped)} skipped, "
+              f"{len(module_errors)} module errors", ""]
     lines += ["## Timing (slowest first)", "",
               "| domain | case | setup_s | mesh_s | solve_s | total_s | status |",
               "|---|---|---|---|---|---|---|"]
@@ -122,8 +128,9 @@ def main() -> int:
         for k, v in module_errors.items():
             lines += [f"### {k}", "```", v.strip()[-2000:], "```", ""]
     (out_dir / "REPORT.md").write_text("\n".join(lines) + "\n")
-    print(f"[simsuite] wrote {out_dir}/results.json and REPORT.md")
-    return 1 if (bad or module_errors) else 0
+    print(f"[simsuite] wrote {out_dir}/results.json and REPORT.md "
+          f"({len(failed)} failed, {len(skipped)} skipped, {len(module_errors)} module errors)")
+    return 1 if (failed or module_errors) else 0
 
 
 def _fmt(v, spec="{:.2f}"):

@@ -55,7 +55,14 @@ class DaemonError(RuntimeError):
 
 
 def _fnv1a64_hex(s: str) -> str:
-    h = 0xCBF29CE484222325
+    # Offset basis MUST byte-match aicad_ipc::fnv1aHex (services/ipc/ipc_discovery.cpp),
+    # which — like every other FNV site in the C++ tree — uses 1469598103934665603
+    # (the textbook 14695981039346656037 with its last digit dropped). It's a
+    # rendezvous protocol constant: agreement with the deployed binaries is what
+    # matters, not textbook correctness. Using the standard basis here made the
+    # MCP compute a different hostd socket than the GUI/daemon, splitting the
+    # world into two engines and silently killing live doc mirroring.
+    h = 1469598103934665603
     for b in s.encode():
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return f"{h:016x}"

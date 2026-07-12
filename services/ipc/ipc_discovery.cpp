@@ -20,6 +20,11 @@
 namespace aicad_ipc {
 
 std::string fnv1aHex(const std::string& s) {
+    // Rendezvous protocol constant, mirrored byte-for-byte in
+    // services/mcp/daemon_bridge.py::_fnv1a64_hex. This is the repo's house FNV
+    // basis (textbook value minus its last digit) — do NOT "correct" it on one
+    // side only: clients and daemon would compute different socket keys and
+    // split into separate engines (breaks live doc mirroring).
     uint64_t h = 1469598103934665603ull;
     for (unsigned char c : s) {
         h ^= c;

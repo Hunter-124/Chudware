@@ -654,3 +654,33 @@ def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
     names = [t.name for t in threading.enumerate()]
     assert "aicad-autosave" not in names, names
     assert cad_tools._PERIODIC_TIMER[0] is None
+
+
+def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
+    """The default (no AICAD_INSTANCE_KEY) rendezvous: Python must hash the hostd
+    path to the SAME instance key the C++ daemon computes for itself, or the MCP
+    and the GUI split into two engines and live doc mirroring silently dies.
+    Every other test here pins AICAD_INSTANCE_KEY, which is exactly how the
+    truncated-vs-textbook FNV basis mismatch stayed invisible. Isolated from any
+    live daemon via a scratch XDG_RUNTIME_DIR (both sides derive the socket dir
+    from it), so the path-derived key lands on a fresh socket."""
+    monkeypatch.delenv("AICAD_INSTANCE_KEY", raising=False)
+    monkeypatch.delenv("AICAD_HOSTD_SOCKET", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("AICAD_HOSTD_LINGER_SECS", "3")
+    c = DaemonClient()
+    try:
+        c.connect()  # spawns hostd; connect only succeeds if the keys agree
+        assert c.server_info.get("state") in ("ready", "loading")
+        sock = c._sock_path
+        assert sock and sock.startswith(str(tmp_path)) and os.path.exists(sock), sock
+        pid = int(c.call("daemon_status", {})["pid"])
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, UnboundLocalError):
+        pass

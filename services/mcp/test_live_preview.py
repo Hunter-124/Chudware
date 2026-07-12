@@ -117,7 +117,11 @@ def test_live_preview_events_no_handoff_files(scratch_daemon):
     assert d["doc_id"] == doc
     assert d["source_kind"] == "mcp"
     assert d.get("aicm_path"), "doc.changed must carry the mesh path (live preview)"
-    assert Path(d["aicm_path"]).is_file()
+    # Since 94b9124f the engine may emit a shared-memory mesh URI
+    # (e.g. "aicm-shm:/aicad_doc-...") instead of a filesystem path, matching the
+    # GUI's loadDocMesh / filesystem::exists guard. Accept either form.
+    aicm = d["aicm_path"]
+    assert aicm.startswith("aicm-shm:") or Path(aicm).is_file(), aicm
 
     # The daemon path writes ZERO handoff files (legacy .step+ flow only).
     assert _handoff_snapshot() == before, "daemon mode must not touch the handoff dir"

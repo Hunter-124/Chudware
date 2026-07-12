@@ -1,6 +1,8 @@
 // hex_mesher.cpp — see hex_mesher.h. Structured hex8 grid for a box/rectangular prism.
 #include "sim/hex_mesher.h"
 
+#include "prof/phases.h"  // per-phase timers (StudyScope "mesh_hex")
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -126,18 +128,26 @@ BoxGeomInfo detect_box_geometry(const std::string& step_path) {
 }
 
 MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
+    // Per-phase record (prof/phases.h): "detect" (STEP classification) + "generate" (grid).
+    aicad::prof::phases::StudyScope _study("mesh_hex");
     MeshOut out;
     out.nodes_per_elem = 8;
 
     // Classify first: detect_box_geometry runs the 6-face + volume/bbox check. If the part is
     // not a mappable axis-aligned box, surface its error (the caller — mesh_step — falls back
     // to tet meshing when options.fallback_to_tet is set).
-    const BoxGeomInfo info = detect_box_geometry(step_path);
+    const BoxGeomInfo info = [&] {
+        aicad::prof::phases::PhaseScope _p("detect");
+        return detect_box_geometry(step_path);
+    }();
     if (!info.is_box) {
         out.error = info.error;
         return out;
     }
     const double Lx = info.Lx, Ly = info.Ly, Lz = info.Lz;
+    // Everything from here (STEP re-read for the bbox origin + grid build) is "generate";
+    // destroyed before _study so it lands inside the mesh_hex study.
+    aicad::prof::phases::PhaseScope _p_generate("generate");
 
     // Recover the world-space bbox MIN corner for grid placement: the mesh must sit at the
     // CAD part's actual position so FEA fixtures/loads resolve by node coordinate, and

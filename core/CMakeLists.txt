@@ -139,7 +139,8 @@ set_property(TARGET aicad_clipper2 PROPERTY
 # symbolize at report time. OCCT-free + tiny, so it links cleanly into libaicad.{dll,so} and the
 # unit test. See core/prof/sampler.{h,cpp} and docs/PROFILER.md.
 add_library(aicad_prof STATIC
-  prof/sampler.cpp)
+  prof/sampler.cpp
+  prof/phases.cpp)
 target_include_directories(aicad_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_prof PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
@@ -198,7 +199,10 @@ add_library(aicad_sim STATIC
   sim/flow_run.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
-target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json aicad_util)
+# aicad_util: host resource_governor (memory admission/degrade). aicad_prof: the per-phase
+# sim timers (prof/phases.h) every solver records into. PUBLIC so aicad_mesh (fea_run/mesher)
+# and the final aicad DLL inherit both links.
+target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json aicad_util aicad_prof)
 
 # --- Optional CHOLMOD (SuiteSparse) supernodal Cholesky for the SPD FEA solve ------
 # Eigen's SimplicialLDLT is scalar + single-threaded; on a bulky 3D solid its fill-in
@@ -404,6 +408,17 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_prof PRIVATE -rdynamic)
 endif()
 add_test(NAME prof COMMAND test_prof)
+
+# --- per-phase sim timer unit test (OCCT-free) --------------------------------
+# Exercises prof/phases.{h,cpp} directly (StudyScope/PhaseScope/add/report) AND proves the
+# fea_static solver records its solve.* phases end to end (aicad_sim is OCCT-free).
+add_executable(test_prof_phases
+  tests/test_prof_phases.cpp)
+target_include_directories(test_prof_phases PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_prof_phases PRIVATE aicad_prof aicad_sim)
+set_target_properties(test_prof_phases PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME prof_phases COMMAND test_prof_phases)
 
 add_executable(test_sketch
   tests/test_sketch.cpp)
@@ -684,6 +699,7 @@ if(AICAD_WITH_OCCT)
   # Eigen3::Eigen; nlohmann_json for the solved-entity dicts profile.cpp consumes.
   target_link_libraries(aicad_geom_occt PUBLIC
     aicad_geom
+    aicad_prof   # per-phase sim timers (sim/overlay.cpp overlay_* studies)
     aicad_util   # aicm_handoff publish for sim/overlay AICM (T-PERF10)
     aicad_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
     nlohmann_json::nlohmann_json

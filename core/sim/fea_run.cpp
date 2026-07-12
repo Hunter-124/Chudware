@@ -1,6 +1,8 @@
 // fea_run.cpp — see fea_run.h. The combined mesh+resolve+solve glue.
 #include "sim/fea_run.h"
 
+#include "prof/phases.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -396,6 +398,10 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
 }
 
 nlohmann::json fea_run_static(const nlohmann::json& study) {
+    // Per-study structured phase record (prof/phases.h): "mesh" / "setup" / "solve" here,
+    // plus the solver-internal "solve.<label>" phases from fea_static_solve's FeaProf marks.
+    // Surfaced via the prof_phases RPC (engine_profile action="phases").
+    aicad::prof::phases::StudyScope _study("fea_static");
     // AI_CAD_FEA_PROFILE=1 -> coarse mesh-vs-solve wall-clock split on stderr (the per-solve
     // phase breakdown is emitted by fea_static_solve under the same env var). Flushed so it
     // survives an abort() on a too-fine mesh.
@@ -408,8 +414,11 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::string err;
-    if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
-        return json{{"ok", false}, {"error", err}};
+    {
+        aicad::prof::phases::PhaseScope _p("mesh");
+        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
+            return json{{"ok", false}, {"error", err}};
+    }
     if (fprof) {
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t_start).count();
@@ -442,6 +451,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::vector<std::string> notes;
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
+    const auto t_setup0 = std::chrono::steady_clock::now();  // BC/load resolution phase
     // ── Force vector (replicate run_static's load loop EXACTLY) ──────────────
     std::vector<double> nodal_forces(static_cast<size_t>(n_dof), 0.0);
     if (study.contains("loads") && study["loads"].is_array()) {
@@ -565,8 +575,12 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
     const auto t_solve0 = std::chrono::steady_clock::now();
+    aicad::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
+                                          t_solve0 - t_setup0).count());
     FeaStaticResult r = fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
                                          nodal_forces, nodes_per_elem);
+    aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
         const auto now = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[fea] %-22s %10.2f ms\n[fea] %-22s %10.2f ms\n",
@@ -578,6 +592,9 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     }
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+    // Post-processing (failure criteria + result packaging) — dtor fires at function exit,
+    // BEFORE _study's (declared earlier), so the phase lands inside this study.
+    aicad::prof::phases::PhaseScope _post("post");
 
     // ── Additive failure-criterion summary (Tresca / Rankine) ────────────────
     // Computed from the per-node principal stresses the solver already produced;
@@ -636,6 +653,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
 }
 
 nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
+    aicad::prof::phases::StudyScope _study("fea_modal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
@@ -651,8 +669,12 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     modal_study["mesh_order"] = want_order;
     if (modal_study.contains("nodes_per_elem"))
         modal_study["nodes_per_elem"] = (want_order == 2) ? 10 : 4;
-    if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
-        return json{{"ok", false}, {"error", err}};
+    {
+        aicad::prof::phases::PhaseScope _p("mesh");
+        if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, mesh_type_used, mesh_note,
+                          err))
+            return json{{"ok", false}, {"error", err}};
+    }
     notes.push_back(nodes_per_elem == 10 ? "modal uses 2nd-order (tet10) elements"
                                          : "modal uses 1st-order (tet4) elements");
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
@@ -689,8 +711,11 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     }
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
-    FeaModalResult r = fea_modal_solve(points, tets, E_mpa, nu, density_g_cm3, fixed_nodes,
-                                       n_modes, nodes_per_elem);
+    FeaModalResult r = [&] {
+        aicad::prof::phases::PhaseScope _p("solve");  // assemble + shift-invert eigensolve
+        return fea_modal_solve(points, tets, E_mpa, nu, density_g_cm3, fixed_nodes,
+                               n_modes, nodes_per_elem);
+    }();
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
 
     return json{{"ok", true},
@@ -765,13 +790,17 @@ bool parse_thermal_schedule(const nlohmann::json& js, aicad::sim::ThermalSchedul
 }  // namespace
 
 nlohmann::json fea_run_thermal(const nlohmann::json& study) {
+    aicad::prof::phases::StudyScope _study("fea_thermal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
     std::string err;
-    if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
-        return json{{"ok", false}, {"error", err}};
+    {
+        aicad::prof::phases::PhaseScope _p("mesh");
+        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
+            return json{{"ok", false}, {"error", err}};
+    }
 
     std::vector<std::string> notes;
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
@@ -895,9 +924,12 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             notes.push_back("transient dt_s not given — defaulted to t_end_s/200");
         }
 
-        aicad::sim::ThermalTransientResult r = aicad::sim::fea_thermal_transient(
-            points, tets, k_cond, fixed_nodes, fixed_temps, transient_fluxes, convections,
-            opts, nodes_per_elem);
+        aicad::sim::ThermalTransientResult r = [&] {
+            aicad::prof::phases::PhaseScope _p("solve.transient");
+            return aicad::sim::fea_thermal_transient(
+                points, tets, k_cond, fixed_nodes, fixed_temps, transient_fluxes, convections,
+                opts, nodes_per_elem);
+        }();
         if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};
 
         json frames = json::array();
@@ -931,9 +963,12 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                     {"solver_notes", notes}};
     }
 
-    aicad::sim::ThermalResult r = aicad::sim::fea_thermal_solve(
-        points, tets, k_cond, fixed_nodes, fixed_temps, flux_nodes, flux_q_mm2, convections,
-        nodes_per_elem);
+    aicad::sim::ThermalResult r = [&] {
+        aicad::prof::phases::PhaseScope _p("solve");
+        return aicad::sim::fea_thermal_solve(
+            points, tets, k_cond, fixed_nodes, fixed_temps, flux_nodes, flux_q_mm2, convections,
+            nodes_per_elem);
+    }();
     if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};
 
     // ── Per-face flux summary (advisory): report the applied flux/convection per BC. ─────

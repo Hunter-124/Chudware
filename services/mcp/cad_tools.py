@@ -2848,6 +2848,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
           "contention"  return g_mtx lock-wait/hold/queue-depth stats since last reset — the
                         primary multi-subagent bottleneck signal (%wall blocked, top callers).
           "reset_contention"  zero the contention counters (call before a measured run).
+          "phases"      per-study simulation phase timings (always-on, no start needed):
+                        every mesher / FEA static / modal / thermal / fatigue / LBM /
+                        flow / overlay run as {domain, total_ms, phases:[{name,ms,pct}]}
+                        — mesh vs assemble vs factorize vs post, per study. The same
+                        breakdown also rides along on "stop"/"report" under "phases".
+          "reset_phases"  clear the phase registry (call before a measured run).
 
         top/min_samples/write_folded/write_speedscope tune the sampling report (see PROFILER.md).
         """
@@ -2872,8 +2878,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps(cb.call("prof_contention", {}))
             if a == "reset_contention":
                 return _dumps(cb.call("prof_contention", {"reset": True}))
+            if a == "phases":
+                return _dumps(cb.call("prof_phases", {}))
+            if a == "reset_phases":
+                return _dumps(cb.call("prof_phases", {"reset": True}))
             return _err(ValueError(
-                f"unknown action {action!r}; use start|stop|report|status|contention|reset_contention"))
+                f"unknown action {action!r}; use start|stop|report|status|contention|"
+                f"reset_contention|phases|reset_phases"))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

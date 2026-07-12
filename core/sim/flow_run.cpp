@@ -4,6 +4,7 @@
 #include "sim/flow_run.h"
 
 #include "util/resource_governor.h"
+#include "prof/phases.h"  // per-phase timers (StudyScope "flow_run")
 
 #include <algorithm>
 #include <cmath>
@@ -95,6 +96,10 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           double* reynolds_out) {
     LbmResult R;
     if (body_pos.empty()) { R.ok = false; R.error = "no geometry"; return R; }
+    // Per-phase record (prof/phases.h): setup+voxelize / solve (the nested lbm_run also
+    // opens its own "lbm" study with the init/loop/output split) / post.
+    aicad::prof::phases::StudyScope _study("flow_run");
+    const auto t_setup0 = std::chrono::steady_clock::now();
 
     // Axis convention: the LBM kernel measures DRAG along its X and LIFT along its Y. AI-CAD is
     // Z-up, so we want lift to come out along CAD +Z. Map CAD (x,y,z) -> LBM (x, z, y): flow on X,
@@ -239,7 +244,12 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
             if (f) f << buf;
         };
     }
+    const auto t_solve0 = std::chrono::steady_clock::now();
+    aicad::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
+                                             t_solve0 - t_setup0).count());
     R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress);
+    aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t_solve0).count());
 
     // Resolution diagnostics. The grid pitch is set from the DOMAIN's longest span, so a thin
     // feature (a 4 mm wing/tail edge) can fall below one voxel and vanish — the real cause of

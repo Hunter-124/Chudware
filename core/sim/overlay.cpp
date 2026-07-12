@@ -1,5 +1,7 @@
 #include "sim/overlay.h"
 
+#include "prof/phases.h"  // per-phase timers (overlay generation studies)
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -370,6 +372,7 @@ std::string static_overlay(const std::string& step_path,
                            double yield_mpa, const nlohmann::json& summary) {
     (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
     try {
+        aicad::prof::phases::StudyScope _study("overlay_static");  // total overlay-build time
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
         if (!overlay_within_cap(bt, "static_overlay")) return std::string();
@@ -489,6 +492,7 @@ std::string fatigue_overlay(const std::string& step_path,
                             const std::vector<double>& von_mises_peak) {
     (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
     try {
+        aicad::prof::phases::StudyScope _study("overlay_fatigue");  // total overlay-build time
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
         if (!overlay_within_cap(bt, "fatigue_overlay")) return std::string();
@@ -518,6 +522,7 @@ std::string modal_overlay(const std::string& step_path,
     (void)freq_hz;  // freq is metadata only (Python takes it but does not encode it).
     (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
     try {
+        aicad::prof::phases::StudyScope _study("overlay_modal");  // total overlay-build time
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
         if (!overlay_within_cap(bt, "modal_overlay")) return std::string();

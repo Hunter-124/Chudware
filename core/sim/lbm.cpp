@@ -13,7 +13,9 @@
 #include "sim/lbm.h"
 
 #include "util/resource_governor.h"
+#include "prof/phases.h"  // per-phase timers (StudyScope "lbm")
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 
@@ -144,6 +146,10 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         R.error = "lbm_run: solid mask size mismatch";
         return R;
     }
+    // Per-phase record (prof/phases.h): init / loop (+ accumulated convergence sampling)
+    // / output. Opened after arg validation so trivially-rejected calls don't pollute it.
+    aicad::prof::phases::StudyScope _study("lbm");
+    const auto t_init0 = std::chrono::steady_clock::now();
 
     // Stride along q for the (Nx,Ny,Nz,19) C-order layout.
     const std::size_t sz_q = static_cast<std::size_t>(NQ);
@@ -323,6 +329,11 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     std::vector<double> drag_hist;
     const int sample_every = std::max(1, n_steps / 50);
 
+    const auto t_loop0 = std::chrono::steady_clock::now();
+    aicad::prof::phases::add("init", std::chrono::duration<double, std::milli>(
+                                         t_loop0 - t_init0).count());
+    double convergence_ms = 0.0;  // accumulated checkpoint-sampling time inside the loop
+
     int step = 0;
     for (step = 1; step <= n_steps; ++step) {
         // --- Collision (BGK + Smagorinsky) ---
@@ -468,11 +479,15 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         }
 
         // Sample the (lattice) drag at checkpoints for the convergence residual. Read-only — it
-        // gathers from f and never writes it, so the solve is unchanged.
+        // gathers from f and never writes it, so the solve is unchanged. Timed into the
+        // accumulated "convergence" phase (~50 checkpoints/run: two clock reads each = noise).
         if (step % sample_every == 0 || step == n_steps) {
+            const auto t_cv0 = std::chrono::steady_clock::now();
             double d = 0.0, l = 0.0;
             momentum_exchange(f, d, l);
             drag_hist.push_back(d);
+            convergence_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_cv0).count();
             if (on_progress) on_progress(step, n_steps);  // live progress (read-only)
             // Emergency stop (governor): the HOST is nearly out of memory — the lattice
             // itself was admitted up-front, so this means some other process is eating
@@ -489,6 +504,13 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         }
     }
     step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value
+    aicad::prof::phases::add("loop", std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - t_loop0).count(),
+                             static_cast<unsigned long long>(n_steps > 0 ? n_steps : 0));
+    aicad::prof::phases::add("convergence", convergence_ms,
+                             static_cast<unsigned long long>(drag_hist.size()));
+    // Post-processing to function exit ("output"): final macros + drag/Cd + residual.
+    aicad::prof::phases::PhaseScope _p_output("output");
 
     // ---- Post-processing: final macros + drag/Cd --------------------------------
     macros(f);

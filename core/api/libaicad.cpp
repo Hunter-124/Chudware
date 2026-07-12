@@ -73,6 +73,7 @@
 #include "doc/validate.h"
 #include "parts/parts.h"
 #include "prof/sampler.h"
+#include "prof/phases.h"
 #include "ecad/autoroute.h"
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
@@ -905,19 +906,35 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         // return the symbolized report (also writes the requested files).
         if (m == "prof_stop") {
             aicad::prof::stop();
-            return emit(aicad::prof::report(params), out_json, 0);
+            json r = aicad::prof::report(params);
+            // Additive: per-study simulation phase timings (prof/phases.h). Attached even
+            // when the sampler captured nothing (r.ok=false) — the phase registry is
+            // independent of the sampler and often the only data a sim-only run has.
+            r["phases"] = aicad::prof::phases::report(false);
+            return emit(std::move(r), out_json, 0);
         }
         // prof_report {...} -> symbolize + return the report WITHOUT stopping.
         if (m == "prof_report") {
-            return emit(aicad::prof::report(params), out_json, 0);
+            json r = aicad::prof::report(params);
+            r["phases"] = aicad::prof::phases::report(false);  // additive (see prof_stop)
+            return emit(std::move(r), out_json, 0);
         }
         if (m == "prof_status") {
             return emit(json{{"ok", true},
                              {"active", aicad::prof::active()},
                              {"samples", aicad::prof::sample_count()},
                              {"interval_us", aicad::prof::interval_us()},
-                             {"mode", aicad::prof::mode()}},
+                             {"mode", aicad::prof::mode()},
+                             // Additive: completed sim studies in the phase registry.
+                             {"phase_studies", aicad::prof::phases::completed_count()}},
                         out_json, 0);
+        }
+        // prof_phases {reset?} -> per-study simulation phase timings (prof/phases.h):
+        // mesher / FEA static / modal / thermal / fatigue / LBM / flow_run / overlay, each as
+        // {domain, total_ms, phases:[{name,ms,count,pct}]}. Always-on (no start needed).
+        // reset=true clears the registry AFTER building the report (call before a run).
+        if (m == "prof_phases") {
+            return emit(aicad::prof::phases::report(params.value("reset", false)), out_json, 0);
         }
         // prof_contention {reset?} -> g_mtx lock wait/hold/queue-depth meters (Phase 1b).
         // The on-CPU sampler above sees only the ONE thread holding the lock; this reveals the
@@ -2203,7 +2220,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         opts.quad_surface = study.value("quad_surface", false);
                         opts.fallback_to_tet = study.value("fallback_to_tet", true);
                         opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
+                        // Cached: the solve just meshed this same STEP+options via
+                        // resolve_mesh -> mesh_step_cached, so the cached call is a hit and
+                        // the overlay no longer pays a full duplicate mesh (measured ~75% of
+                        // sim_run_static wall time on a small part). Content+options keyed,
+                        // so the recovered nodes/tets are exactly the solved mesh.
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step_cached(step_path, opts);
                         if (mo.ok) {
                             vol = mo.points;
                             tets = mo.tets;
@@ -2291,7 +2313,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         opts.quad_surface = study.value("quad_surface", false);
                         opts.fallback_to_tet = study.value("fallback_to_tet", true);
                         opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
+                        // Cached: the solve just meshed this same STEP+options via
+                        // resolve_mesh -> mesh_step_cached, so the cached call is a hit and
+                        // the overlay no longer pays a full duplicate mesh (measured ~75% of
+                        // sim_run_static wall time on a small part). Content+options keyed,
+                        // so the recovered nodes/tets are exactly the solved mesh.
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step_cached(step_path, opts);
                         if (mo.ok) {
                             vol = mo.points;
                             tets = mo.tets;

@@ -7,6 +7,8 @@
 
 #include "sim/fea_static.h"
 
+#include "prof/phases.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -83,23 +85,30 @@ void apply_solver_thread_cap(int n) {
 // (e.g. std::bad_alloc on a too-fine mesh -> SIGABRT), the LAST line printed localizes
 // the death — a sampling profiler's report() never runs after an abort, this does.
 // Costs nothing when the env var is unset (one getenv per solve).
+//
+// The SAME mark() boundaries also feed the always-on structured phase registry
+// (prof/phases.h) as "solve.<label>" so RPC callers (engine_profile action="phases")
+// get the per-phase breakdown without the env var: one clock read + one thread-local
+// vector append per mark, so keeping it always-on is free at these coarse boundaries.
 struct FeaProf {
     bool on = false;
     std::chrono::steady_clock::time_point t0;
     explicit FeaProf() {
         const char* e = std::getenv("AI_CAD_FEA_PROFILE");
         on = e && e[0] && e[0] != '0';
-        if (on) t0 = std::chrono::steady_clock::now();
+        t0 = std::chrono::steady_clock::now();
     }
-    // Milliseconds since the previous mark(), then re-anchor. Prints "[fea] <label> = <ms>".
+    // Milliseconds since the previous mark(), then re-anchor. Records the phase into the
+    // structured registry always; prints "[fea] <label> = <ms>" only when env-enabled.
     void mark(const char* label) {
-        if (!on) return;
         const auto now = std::chrono::steady_clock::now();
         const double ms =
             std::chrono::duration<double, std::milli>(now - t0).count();
+        t0 = now;
+        aicad::prof::phases::add((std::string("solve.") + label).c_str(), ms);
+        if (!on) return;
         std::fprintf(stderr, "[fea] %-22s %10.2f ms\n", label, ms);
         std::fflush(stderr);
-        t0 = now;
     }
     template <typename... A>
     void note(const char* fmt, A... args) {

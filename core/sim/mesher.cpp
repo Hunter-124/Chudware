@@ -28,6 +28,7 @@
 
 #include "sim/mesher.h"
 
+#include "prof/phases.h"     // per-phase timers (StudyScope "mesh_tet")
 #include "sim/hex_mesher.h"  // mesh_box_hex (structured hex path)
 #include "geom/booleans.h"   // geom::unify_same_domain (mesh-time geometry healing)
 #include "util/resource_governor.h"  // host-memory element ceiling (graceful degrade)
@@ -452,6 +453,9 @@ struct NetgenSession {
 
 MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options) {
     std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
+    // Per-phase record (prof/phases.h): load_step / generate / second_order / extract.
+    // Opened AFTER the meshing mutex so lock-wait is not misattributed to meshing time.
+    aicad::prof::phases::StudyScope _study("mesh_tet");
     MeshOut out;
 
     // Second-order (tet10) selection. order==1 produces 4-node tets (NG_TET); order==2
@@ -617,7 +621,10 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         // Load the OCC geometry from the STEP via Netgen's OCCT (the SAME OCCT libaicad
         // links). Raises a netgen exception on unreadable geometry; treat null OR throw as a
         // load failure so the heal-and-retry wrapper can take over.
-        sess.geo = nglib::Ng_OCC_Load_STEP(step_path.c_str());
+        {
+            aicad::prof::phases::PhaseScope _p("load_step");
+            sess.geo = nglib::Ng_OCC_Load_STEP(step_path.c_str());
+        }
         if (!sess.geo) return fail("could not load the OCC geometry from the STEP");
 
         sess.mesh = nglib::Ng_NewMesh();
@@ -675,17 +682,21 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         // equivalent — Netgen uses its Delaunay + advancing-front mesher unconditionally —
         // so the field is accepted for API compatibility but intentionally not mapped.
 
-        nglib::Ng_OCC_SetLocalMeshSize(sess.geo, sess.mesh, &mp);
-        if (nglib::Ng_OCC_GenerateEdgeMesh(sess.geo, sess.mesh, &mp) != nglib::NG_OK)
-            return fail("edge meshing failed (check that the geometry is a valid solid)");
-        if (nglib::Ng_OCC_GenerateSurfaceMesh(sess.geo, sess.mesh, &mp) != nglib::NG_OK)
-            return fail("surface meshing failed");
-        if (nglib::Ng_GenerateVolumeMesh(sess.mesh, &mp) != nglib::NG_OK)
-            return fail("volume meshing failed");
+        {
+            aicad::prof::phases::PhaseScope _p("generate");
+            nglib::Ng_OCC_SetLocalMeshSize(sess.geo, sess.mesh, &mp);
+            if (nglib::Ng_OCC_GenerateEdgeMesh(sess.geo, sess.mesh, &mp) != nglib::NG_OK)
+                return fail("edge meshing failed (check that the geometry is a valid solid)");
+            if (nglib::Ng_OCC_GenerateSurfaceMesh(sess.geo, sess.mesh, &mp) != nglib::NG_OK)
+                return fail("surface meshing failed");
+            if (nglib::Ng_GenerateVolumeMesh(sess.mesh, &mp) != nglib::NG_OK)
+                return fail("volume meshing failed");
+        }
         if (order2) {
             // Elevate to 10-node tets; the OCC refinement PROJECTS the new mid-edge nodes
             // onto the CAD surface (curved elements) so tet10 stress on fillets/holes is
             // accurate.
+            aicad::prof::phases::PhaseScope _p("second_order");
             nglib::Ng_OCC_Generate_SecondOrder(sess.geo, sess.mesh);
         }
     } catch (const std::exception& e) {
@@ -694,6 +705,9 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         return fail("meshing raised an unknown exception");
     }
 
+    // Extraction + quality fill — timed as one "extract" phase (runs to function exit;
+    // destroyed before _study, so it lands inside the mesh_tet study).
+    aicad::prof::phases::PhaseScope _p_extract("extract");
     // Extract nodes (1-based in Netgen) into a flat n*3 row-major array (0-based).
     const int np = nglib::Ng_GetNP(sess.mesh);
     if (np <= 0) return fail("mesh produced no points");

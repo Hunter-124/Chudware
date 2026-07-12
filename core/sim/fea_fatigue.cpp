@@ -12,7 +12,10 @@
 // the worst node, plus the strength echoes, so the host can finish the calculation.
 #include "sim/fea_fatigue.h"
 
+#include "prof/phases.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -112,10 +115,14 @@ ResolvedMesh resolve_mesh_for_overlay(const json& study) {
 }  // namespace
 
 nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
+    // Per-phase record (prof/phases.h): "static" (the reused static solve — which also opens
+    // its own nested fea_static study with the finer split), "damage", "overlay".
+    aicad::prof::phases::StudyScope _study("fea_fatigue");
     try {
         // ── 1. Static stress field (reuse the existing parity-proven path) ────
         json st;
         try {
+            aicad::prof::phases::PhaseScope _p("static");
             st = fea_run_static(study);
         } catch (const std::exception& e) {
             return json{{"ok", false},
@@ -134,6 +141,7 @@ nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
                               ? st["n_dof"].get<int>()
                               : 0;
         if (vm.empty()) return json{{"ok", false}, {"error", "fatigue: empty stress field"}};
+        const auto t_damage0 = std::chrono::steady_clock::now();  // phases: damage evaluation
 
         // ── 2. Fatigue params (study["fatigue"] + material fallbacks) ─────────
         // The host now owns Marin correction + reliability + method selection; the
@@ -279,9 +287,14 @@ nlohmann::json fea_run_fatigue(const nlohmann::json& study) {
             life_log10[i] = std::log10(N);
         }
 
+        aicad::prof::phases::add(
+            "damage", std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_damage0).count());
+
         // ── 5. Fatigue overlay (best-effort, only when a STEP path is given) ──
         std::string overlay_path;
         if (study.contains("step_path") && study["step_path"].is_string()) {
+            aicad::prof::phases::PhaseScope _p("overlay");
             ResolvedMesh rm = resolve_mesh_for_overlay(study);
             if (rm.ok && rm.points.size() / 3 == vm.size()) {
                 overlay_path = fatigue_overlay(study["step_path"].get<std::string>(),

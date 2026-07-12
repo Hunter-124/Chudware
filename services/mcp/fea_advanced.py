@@ -104,11 +104,24 @@ def run_ccx(inp_text: str, job: str = "job", timeout: float = 300.0,
     frd = os.path.join(workdir, f"{job}.frd")
     sta = os.path.join(workdir, f"{job}.sta")
     ok = proc.returncode == 0
+
+    def _nonempty(p: str) -> Optional[str]:
+        # ccx 2.23 exits 0 on an unparseable deck (only *WARNING "card image cannot
+        # be interpreted" on stdout, "Job finished") and still touches a ZERO-BYTE
+        # .dat — reporting that path would make callers treat a no-op run as a
+        # solved study (e.g. buckling would return ok with an empty factor list).
+        # A 0-byte result file is never a result; hide it so callers hit their
+        # honest "ccx run failed" branch.
+        try:
+            return p if os.path.getsize(p) > 0 else None
+        except OSError:
+            return None
+
     return {
         "ok": ok, "returncode": proc.returncode, "workdir": workdir,
-        "dat_path": dat if os.path.exists(dat) else None,
-        "frd_path": frd if os.path.exists(frd) else None,
-        "sta_path": sta if os.path.exists(sta) else None,
+        "dat_path": _nonempty(dat),
+        "frd_path": _nonempty(frd),
+        "sta_path": _nonempty(sta),
         "stdout": proc.stdout, "stderr": proc.stderr,
         "backend": f"calculix ({os.path.basename(ccx)})",
     }
@@ -340,8 +353,15 @@ def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
     """Fixed-free column buckling: base x=0 encastre, axial compressive load -x on the
     x=L end. Clean-room *BUCKLE .inp. Returns {inp, expected_Pcr, tip_nodes} where
     Pcr is the Euler fixed-free critical load; ccx returns the load FACTOR λ so
-    Pcr_ccx = λ * P."""
+    Pcr_ccx = λ * P.
+
+    Elements are C3D8I (incompatible modes): fully-integrated C3D8 hexes
+    shear-lock in the bending-dominated buckling mode and overshoot the Euler
+    critical load by 40-60% at these mesh densities (measured: +61.8% at
+    L/h=50, nx=40); C3D8I removes the parasitic shear and lands within <1% of
+    Pcr = π²EI/(2L)² (Timoshenko & Gere, Theory of Elastic Stability, K=2)."""
     node_lines, elem_lines, nnx, nny, nnz = _hex_box_nodes_elems(L, b, h, nx, ny, nz)
+    elem_lines = [ln.replace("TYPE=C3D8,", "TYPE=C3D8I,") for ln in elem_lines]
     nid = _nid_fn(nnx, nny)
     fixed = [nid(0, j, k) for k in range(nnz) for j in range(nny)]
     tip = [nid(nx, j, k) for k in range(nnz) for j in range(nny)]
@@ -483,12 +503,19 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                     component: int = 1) -> Optional[float]:
     """Parse a ccx *NODE PRINT .dat block for the variable `key` (CalculiX names:
     "NT" temperature, "U" displacement, "RF" reaction force). Return the averaged
-    value of the given 1-based `component` column over `node_set`. None if nothing
-    parsed.
+    value of the given 1-based `component` column over `node_set`, taken from the
+    LAST matching result block in the file. None if nothing parsed.
 
     ccx labels the result block with a natural-language header ("temperatures for
     set NMID", "forces (reaction) ..."), NOT the terse variable name, so we match on
-    the mapped keyword (with the raw key as a fallback)."""
+    the mapped keyword (with the raw key as a fallback).
+
+    LAST block only: a multi-increment step (*STATIC with automatic incrementation,
+    NLGEOM contact) prints one block PER converged increment — averaging across all
+    of them mixes partial-load states into the answer (measured: the two-block
+    contact base reaction came out 53% below the applied load because increments at
+    5%..96% load were averaged in; the final time=1.0 block alone balances the load
+    exactly). Single-block outputs (steady thermal, static) are unaffected."""
     want = set(node_set)
     vals: list = []
     kw = _DAT_HEADER_KEYWORD.get(key.upper(), key.lower())
@@ -502,7 +529,7 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
             # scan forward through the block, skipping blanks, until data STARTS then
             # ends (a blank line after data began, or a non-numeric header line).
             j = i + 1
-            got_block = False
+            block_vals: list = []
             started = False
             while j < len(lines):
                 row = lines[j]
@@ -514,14 +541,14 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                         nid = int(parts[0])
                         col = component  # 1-based column after the node id
                         if nid in want and len(parts) > col:
-                            vals.append(float(parts[col]))
-                            got_block = True
+                            block_vals.append(float(parts[col]))
                     except (ValueError, IndexError):
                         pass
                 elif started:
                     break  # data block ended
                 j += 1
-            if got_block:
+            if block_vals:
+                vals = block_vals  # keep the LAST matching block (final increment)
                 i = j
                 continue
         i += 1

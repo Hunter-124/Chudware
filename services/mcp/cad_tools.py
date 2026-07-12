@@ -4085,10 +4085,40 @@ def register_cad_tools(mcp: FastMCP) -> None:
                      "mesh_order": 2, "fineness": mesh_fineness}
 
             def _solve() -> dict:
-                res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
+                # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold
+                # degenerate, and the C++ shift-invert Lanczos (ncv = 2k+1) often
+                # converges only PART of that cluster for small k — silently
+                # substituting higher elastic modes into the "lowest n_modes" list
+                # (observed: n_modes=8 on a slender beam returned 3 rigid + 5
+                # elastic modes). Over-request so the Krylov subspace can resolve
+                # all 6 rigid modes, VERIFY the count, retry bigger if short, then
+                # truncate the ascending list back to the caller's n_modes.
+                free_free = not fixture_sets
+                solve_n = max(n_modes + 6, 14) if free_free else n_modes
+                res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "modal solve failed")}
+                freqs = list(res.get("freqs_hz", []))
+                note = None
+                if free_free:
+                    def _n_rigid(fs: list) -> int:
+                        return sum(1 for f in fs if f < 0.5)  # rigid ~0 Hz, elastic >> 0.5 Hz
+                    for _ in range(2):
+                        if _n_rigid(freqs) >= 6:
+                            break
+                        solve_n += 6
+                        retry = cb.call("sim_run_modal",
+                                        {"study": study, "n_modes": solve_n})
+                        if not retry.get("ok"):
+                            break
+                        res, freqs = retry, list(retry.get("freqs_hz", []))
+                    if _n_rigid(freqs) < 6:
+                        note = (f"warning: free-free solve resolved only "
+                                f"{_n_rigid(freqs)}/6 rigid-body modes — the mode list "
+                                "may be missing rigid modes (eigensolver degenerate-"
+                                "cluster limitation); elastic frequencies are unaffected")
+                    freqs = freqs[:n_modes]
                 _persist_study(d, {
                     "type": "fea_modal",
                     "name": f"Modal ({mat.get('name', material)})",
@@ -4097,12 +4127,14 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     "fixtures": fixtures,
                     "n_modes": n_modes,
                     "mesh_fineness": mesh_fineness,
-                    "results": {"freqs_hz": res.get("freqs_hz", []),
-                                "n_modes": res.get("n_modes")},
+                    "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
                 })
-                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                        "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes"),
-                        "saved_to_study": True}
+                out = {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                       "freqs_hz": freqs, "n_modes": len(freqs),
+                       "saved_to_study": True}
+                if note:
+                    out["note"] = note
+                return out
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:

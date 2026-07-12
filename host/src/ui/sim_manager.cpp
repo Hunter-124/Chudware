@@ -25,6 +25,7 @@
 #include "../bootstrap.h"
 #include "../renderer.h"
 #include "../render/aicm_loader.h"   // parse the flow overlay's streamline / slice LINS chunks
+#include "util/aicm_handoff.h"       // is_shm_uri — overlay paths are aicm-shm:// handoff URIs, not files
 #include "../ui_theme.h"
 
 namespace ui {
@@ -1594,12 +1595,18 @@ void SimManager::collectLoadFaces(std::vector<uint64_t>& keys) const {
 
 void SimManager::applyResultField(AppState& st, Study& s) {
     if (s.overlayPath.empty() || !st.renderer) return;
-    // The overlay is a temp .aicm; if it was cleaned up (e.g. since a previous session) don't try to
-    // load a missing file — just leave the current view alone instead of faulting.
-    std::error_code ec;
-    if (!std::filesystem::exists(s.overlayPath, ec)) {
-        st.addLog("[sim] overlay file missing (re-run to regenerate): " + s.overlayPath);
-        return;
+    // The overlay is normally an aicm-shm:// handoff URI (published to /dev/shm by the engine and
+    // resolved through aicm_handoff::map inside loadAicmFile) — NOT a filesystem path. Only a
+    // fallback temp .aicm is a real file. std::filesystem::exists() on a shm URI is always false, so
+    // guarding every overlay with it silently dropped the whole result (colormap + deform) on every
+    // solve. Precheck existence ONLY for genuine file paths; shm URIs go straight to the loader,
+    // which reports a clean error if the segment was reclaimed.
+    if (!aicad::aicm_handoff::is_shm_uri(s.overlayPath)) {
+        std::error_code ec;
+        if (!std::filesystem::exists(s.overlayPath, ec)) {
+            st.addLog("[sim] overlay file missing (re-run to regenerate): " + s.overlayPath);
+            return;
+        }
     }
     std::string err;
     // FULL (not renderOnly) load: re-attaches the chosen named scalar to the mesh so the colormap
@@ -2361,8 +2368,12 @@ void SimManager::rebuildFlowLines(AppState& st, Study& s) {
     for (int b = 0; b < kFlowBands; ++b) { flowStreamSegs_[b].clear(); flowSliceSegs_[b].clear(); }
     flowLinesBuiltFor_.clear();
     if (s.overlayPath.empty()) return;
-    std::error_code ec;
-    if (!std::filesystem::exists(s.overlayPath, ec)) return;
+    // Overlay is normally an aicm-shm:// URI (see applyResultField) — filesystem::exists() would
+    // wrongly reject it and drop every streamline. Precheck existence only for real file paths.
+    if (!aicad::aicm_handoff::is_shm_uri(s.overlayPath)) {
+        std::error_code ec;
+        if (!std::filesystem::exists(s.overlayPath, ec)) return;
+    }
     render::DocMesh doc; std::string err;
     if (!render::loadAicmFile(s.overlayPath, doc, err)) return;
     double vmax = (s.vmaxMps > 1e-6) ? s.vmaxMps : ((s.flowSpeed * 1.5 > 1e-6) ? s.flowSpeed * 1.5 : 1.0);

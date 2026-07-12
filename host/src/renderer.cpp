@@ -597,6 +597,12 @@ void Renderer::setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, fl
 // Re-upload a Sub's positions (and edge lines) as base + deformScale_ * disp. No-op if the body
 // carries no displacement field.
 void Renderer::uploadDeformed(Sub& s) {
+    // Diagnostic for a "colored but flat" FEA result: a displacement field is present but its length
+    // doesn't match the render vertices, so the deform is silently dropped. Fires only on that mismatch
+    // (never on the normal empty-disp bodies), so it's a one-liner not a spammer.
+    if (!s.disp.empty() && s.disp.size() != s.basePos.size())
+        std::fprintf(stderr, "[render] deform skipped: disp=%zu != basePos=%zu (body %u)\n",
+                     s.disp.size(), s.basePos.size(), s.body_id);
     if (s.disp.empty() || s.disp.size() != s.basePos.size() || s.vboPos == 0) return;
     std::vector<float> p(s.basePos.size());
     for (size_t i = 0; i < p.size(); ++i) p[i] = s.basePos[i] + deformScale_ * s.disp[i];

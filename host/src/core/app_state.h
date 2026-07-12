@@ -1380,10 +1380,15 @@ struct AppState {
     bool ips() const { return settings.units == Units::IPS; }
     void toggleUnits() { settings.units = ips() ? Units::MMGS : Units::IPS; }
 
-    // True while the Simulation left-pane tab is the active workspace. Modeling tools (ribbon
-    // commands + Instant3D push-pull/drag) lock out in this state so the model can't change shape
-    // out from under a study's fixtures/loads/results — SolidWorks behaves the same in a study.
-    bool inSimulation() const { return leftPaneTab == LP_Simulation; }
+    // True while the Simulate WORKSPACE is active. Modeling tools (ribbon commands + Instant3D
+    // push-pull/drag) lock out in this state so the model can't change shape out from under a study's
+    // fixtures/loads/results — SolidWorks behaves the same in a study.
+    // NB: gate on activeWorkspace, NOT leftPaneTab. leftPaneTab==LP_Simulation persists after the user
+    // clicks away to another workspace tab (title_bar only flips activeWorkspace), so keying off it
+    // left the model locked — and the "leave the Simulation tab" toast firing — on Model/Manufacture/
+    // Drawing/etc. activeWorkspace is what the workspace tabs actually set, so the lock releases the
+    // instant you leave Simulate.
+    bool inSimulation() const { return activeWorkspace == Workspace::Simulate; }
 
     // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on

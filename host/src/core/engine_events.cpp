@@ -193,7 +193,11 @@ void handleEvent(AppState& st, const json& evt) {
             st.docTabs[idx].aiPulse = true;  // background: glow; switch-in refreshes
             return;
         }
-        if (userMidEdit(st) || st.docTabs[idx].dirty) {
+        // Adopted mirrors stay live: the user's edits are already committed to the shared
+        // engine (dirty = unsaved-to-disk, not un-pushed), so resyncing pulls the unified
+        // tree containing BOTH edit streams — nothing local to clobber. Only an open
+        // sketch/PM preview (userMidEdit) or a dirty tab the user owns outright defers.
+        if (userMidEdit(st) || (st.docTabs[idx].dirty && !st.docTabs[idx].userAdopted)) {
             pendingChanged[docId] = d;  // defer, retry when safe (poller semantics)
             st.docTabs[idx].aiPulse = true;
             return;
@@ -363,7 +367,8 @@ void engineEventsTick(AppState& st) {
                 ? st.docTabs[st.activeTab].docId
                 : std::string();
         auto it = pendingChanged.find(activeId);
-        if (it != pendingChanged.end() && !st.docTabs[st.activeTab].dirty) {
+        if (it != pendingChanged.end() &&
+            (!st.docTabs[st.activeTab].dirty || st.docTabs[st.activeTab].userAdopted)) {
             const json d = it->second;
             applyChangedActive(st, activeId, d);
         }

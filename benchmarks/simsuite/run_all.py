@@ -54,6 +54,9 @@ def main() -> int:
     args = ap.parse_args()
 
     os.environ.setdefault("AI_CAD_ENGINE_DAEMON", "0")
+    sys.path.insert(0, str(SUITE_DIR))
+    import resguard
+    budget = resguard.install()  # before any engine/solver library loads
     only = {s.strip() for s in args.only.split(",") if s.strip()} or None
 
     stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
@@ -64,11 +67,20 @@ def main() -> int:
     module_errors: dict[str, str] = {}
     for mod_path in _discover(only):
         name = mod_path.stem.removesuffix("_bench")
+        if resguard.should_abort():
+            module_errors[name] = "skipped: resource budget exhausted by an earlier module"
+            print(f"[simsuite] {name} SKIPPED (resource budget)", file=sys.stderr)
+            continue
         print(f"[simsuite] {name} ...", flush=True)
         try:
             mod = _load(mod_path)
             cases = mod.run(quick=args.quick)
             all_cases += [_validate(dict(c), name) for c in cases]
+        except (KeyboardInterrupt, MemoryError):
+            # resguard watchdog hard-stop or RLIMIT backstop: record and move on;
+            # should_abort() gates the remaining modules
+            module_errors[name] = "aborted by resguard (memory budget exceeded)"
+            print(f"[simsuite] {name} ABORTED by resguard", file=sys.stderr)
         except Exception:
             module_errors[name] = traceback.format_exc()
             print(f"[simsuite] {name} FAILED to run:\n{module_errors[name]}", file=sys.stderr)
@@ -76,7 +88,10 @@ def main() -> int:
     payload = {
         "timestamp": stamp,
         "quick": args.quick,
-        "host": os.uname().nodename,
+        "host": os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "?"),
+        "budget": {"mem_gb": round(budget.mem_bytes / 2**30, 2),
+                   "total_gb": round(budget.total_bytes / 2**30, 2),
+                   "workers": budget.workers},
         "cases": all_cases,
         "module_errors": module_errors,
     }

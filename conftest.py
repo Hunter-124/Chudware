@@ -61,6 +61,23 @@ def _stub(name: str, **attrs) -> types.ModuleType:
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Resource guard (benchmarks/simsuite/resguard.py): caps solver thread pools to
+# the host's core budget and watchdogs the RSS of this test process + children
+# (ccx/foam/ngspice) so a runaway solve aborts the run instead of freezing the
+# box. Budgets scale with the machine (SIMSUITE_* env overrides); disable with
+# SIMSUITE_GUARD=0. Must run before the engine/solver libs load their pools.
+if os.environ.get("SIMSUITE_GUARD", "1") == "1":
+    try:
+        _RESGUARD_DIR = os.path.join(_ROOT, "benchmarks", "simsuite")
+        if _RESGUARD_DIR not in sys.path:
+            sys.path.insert(0, _RESGUARD_DIR)
+        import resguard as _resguard
+        _resguard.install()
+    except Exception:
+        pass  # the guard is protection, never a reason tests can't run
+
+
 # PIL / Pillow — needed at import time by engine.vision.ingest.
 try:
     import PIL.Image  # noqa: F401  (real Pillow wins whenever installed)

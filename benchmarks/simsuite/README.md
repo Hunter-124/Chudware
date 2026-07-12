@@ -31,6 +31,18 @@ returning one dict per benchmark case:
 Rules:
 - `quick=True` must finish the whole module in under ~60 s (coarse meshes) —
   used for smoke runs. Full mode is the timing baseline.
+- **Resource guard**: `run_all.py` installs `resguard` (this dir) before any
+  module loads — it caps solver thread pools to a fraction of the machine's
+  cores, watchdogs the RSS of the whole process tree (ccx/foam children
+  included), and aborts the run before the OS starts swapping. Budgets scale
+  with the host (defaults: 50% of RAM, 75% of cores, 6 GB OS headroom) and are
+  tunable via `SIMSUITE_MEM_FRAC` / `SIMSUITE_MEM_CAP_GB` / `SIMSUITE_HEADROOM_GB`
+  / `SIMSUITE_CPU_FRAC` / `SIMSUITE_RLIMIT` — so the same suite runs on a 16 GB
+  laptop, this 32 GB desktop, or a CI box unchanged (Linux/Windows/macOS).
+- A case whose peak memory could exceed a few GB must gate itself:
+  `import resguard; resguard.install()` then `if not resguard.fits(est_peak_gb):`
+  emit that case with `status="skip", detail="resguard: needs ~N GB"`.
+  Between heavy cases, call `resguard.check()`.
 - Run the engine **in-process** (`AI_CAD_ENGINE_DAEMON=0`, services/dist lib via
   `services.mcp.core_bridge`) — never against a live daemon/GUI.
 - No load-bearing constants from memory: analytic references carry a comment

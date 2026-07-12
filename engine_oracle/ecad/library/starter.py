@@ -352,7 +352,7 @@ def _make_symbols() -> dict:
             _line(0.0, -2.54, 0.0, -3.81),
             _circle(0.0, 0.0, 2.2),
         ],
-        sim={"model": "NPN", "pin_order": ["B", "C", "E"]},
+        sim={"model": "NPN", "pin_order": ["C", "B", "E"]},  # solver order (devices.py BJT: nodes=[C,B,E])
         footprint_filters=["TO-92*", "SOT-23*"],
     )
 
@@ -375,7 +375,7 @@ def _make_symbols() -> dict:
             _line(0.0, -2.54, 0.0, -3.81),
             _circle(0.0, 0.0, 2.2),
         ],
-        sim={"model": "PNP", "pin_order": ["B", "C", "E"]},
+        sim={"model": "PNP", "pin_order": ["C", "B", "E"]},  # solver order (devices.py BJT: nodes=[C,B,E])
         footprint_filters=["TO-92*", "SOT-23*"],
     )
 
@@ -402,7 +402,7 @@ def _make_symbols() -> dict:
             _rect(-1.27, -2.8, 0.0, 2.8),
             _circle(0.0, 0.0, 2.8),
         ],
-        sim={"model": "NMOS", "pin_order": ["G", "D", "S"]},
+        sim={"model": "NMOS", "pin_order": ["D", "G", "S"]},  # solver order (devices.py Mosfet: nodes=[D,G,S])
         footprint_filters=["SOT-23*", "TO-92*"],
     )
 
@@ -425,7 +425,7 @@ def _make_symbols() -> dict:
             _rect(-1.27, -2.8, 0.0, 2.8),
             _circle(0.0, 0.0, 2.8),
         ],
-        sim={"model": "PMOS", "pin_order": ["G", "D", "S"]},
+        sim={"model": "PMOS", "pin_order": ["D", "G", "S"]},  # solver order (devices.py Mosfet: nodes=[D,G,S])
         footprint_filters=["SOT-23*", "TO-92*"],
     )
 

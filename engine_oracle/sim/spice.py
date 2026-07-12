@@ -859,6 +859,14 @@ def netlist_to_spice_circuit(
         kind = _model_to_kind(model_name, ref)
 
         dev_params: dict = {}
+        # Transistor polarity. _model_to_kind collapses NMOS/PMOS -> 'M' and NPN/PNP
+        # -> 'Q', and the schematic path attaches no .model card, so without this the
+        # solver's channel-type default (devices.py: dparams/model "type" falling back
+        # to nmos/npn) silently simulated every schematic PMOS/PNP with INVERTED
+        # polarity. Carry the type on device params — the seam both solvers read.
+        _pol = {"NMOS": "nmos", "PMOS": "pmos", "NPN": "npn", "PNP": "pnp"}.get(model_name)
+        if _pol:
+            dev_params["type"] = _pol
         # Independent sources (V/I) may carry a small-signal AC magnitude so an AC
         # sweep has a stimulus. The structured netlist path parses only the DC
         # `value`, so without this an AC analysis sees 0 at every frequency (Bug

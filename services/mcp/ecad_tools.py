@@ -334,6 +334,59 @@ def _sym_by_ref(doc: dict, ref: str) -> dict | None:
     return None
 
 
+def _apply_sim_source_params(doc: dict, circuit: dict, warns: list,
+                             *, apply_waveforms: bool = False) -> None:
+    """Attach per-symbol ``sim_params`` source waveforms the structured netlist path drops
+    (engine/ecad/netlist.py surfaces only ac_mag/ac_phase/eng — the netlist contract has
+    no waveform field, so this is applied at the MCP seam by mutating device ``params``,
+    the shape both solvers read).
+
+    Only when ``apply_waveforms`` (tran/four analyses; an op/dc/ac run keeps the DC
+    ``value`` as its level, matching SPICE .op semantics). A V/I symbol's ``sim_params``
+    may carry either the canonical sim.md shape
+    ``{"waveform": {"type": "SIN", "vo":..,"va":..,"f":..}}`` or the flat GUI shape
+    ``{"waveform": "SIN", "amplitude": "5", "freq": "1000", "offset": "0"}``.
+    Without this a sine-driven rectifier transient silently ran pure DC.
+    """
+    if not apply_waveforms:
+        return
+    by_ref = {d.get("name"): d for d in circuit.get("devices", [])}
+    for sym in doc.get("symbols", []):
+        dev = by_ref.get(sym.get("ref"))
+        if dev is None:
+            continue
+        sp = sym.get("sim_params") or {}
+        if not (dev.get("kind") in ("V", "I") and sp.get("waveform")):
+            continue
+        wf_in = sp["waveform"]
+        wf: dict | None = None
+        if isinstance(wf_in, dict) and wf_in.get("type"):
+            wf = dict(wf_in)  # canonical sim.md §1 shape — pass through
+        else:
+            kind = str(wf_in).upper()
+
+            def _f(key: str, default: float = 0.0) -> float:
+                try:
+                    return float(sp.get(key, default))
+                except (TypeError, ValueError):
+                    return default
+
+            if kind == "SIN":
+                wf = {"type": "SIN", "vo": _f("offset"), "va": _f("amplitude", 1.0),
+                      "f": _f("freq", 1e3), "td": _f("td"), "theta": _f("theta")}
+            elif kind == "PULSE":
+                wf = {"type": "PULSE", "v1": _f("v1"), "v2": _f("v2", 1.0),
+                      "td": _f("td"), "tr": _f("tr", 1e-9), "tf": _f("tf", 1e-9),
+                      "pw": _f("pw", 1e-3), "per": _f("per", 2e-3)}
+            elif kind == "PWL" and isinstance(sp.get("points"), list):
+                wf = {"type": "PWL", "points": sp["points"]}
+        if wf:
+            dev.setdefault("params", {})["waveform"] = wf
+        else:
+            warns.append(f"{sym.get('ref')}: unrecognized sim_params waveform "
+                         f"{wf_in!r} — simulated as DC")
+
+
 def _resolve_ref_or_id(doc: dict, token: str) -> dict | None:
     """Accept either a ref-des ('R1') or an internal symbol id ('s1')."""
     sym = _sym_by_ref(doc, token)
@@ -1065,6 +1118,10 @@ def register_ecad_tools(mcp) -> None:
             return _err(f"simulator unavailable ({type(e).__name__}: {e})",
                         hint="The sim engine (numpy/scipy) is not importable here.")
         circuit, warns = netlist_to_spice_circuit(nl)
+        # tran/four honor per-symbol source waveforms (SIN/PULSE/PWL); every analysis
+        # gets transistor polarity restored (see _apply_sim_source_params).
+        _apply_sim_source_params(doc, circuit, warns,
+                                 apply_waveforms=analysis in ("tran", "four"))
         if not circuit.get("devices"):
             return _err("nothing to simulate — the netlist has no simulatable devices",
                         hint="Place parts with sim models (R/C/L/V/I/D/Q) and give them VALUES "
@@ -1474,6 +1531,17 @@ def register_ecad_tools(mcp) -> None:
         ok_results = [r for r in results if r.get("ok")]
         failed = [{"net": r.get("net"), "error": r.get("error")}
                   for r in results if not r.get("ok")]
+        if not ok_results:
+            # every requested net failed — return a real error (previously this fell
+            # through to ok=False with NO 'error' key and a "PDN clean on 0 net(s)"
+            # verdict, which read as a pass to a weak model).
+            return _err("PDN solve failed for every requested net: "
+                        + "; ".join(f"{f['net']}: {f['error']}" for f in failed),
+                        failed_nets=failed,
+                        hint="Check the net names and that each has copper + a source "
+                             "(ecad_status lists the board's nets).",
+                        next_actions=["ecad_status()",
+                                      "ecad_run_pdn(net='+5V', source_refs='J1')"])
 
         # ---- persist the I2R map as the boardphys `pdn` sidecar extension
         sidecar_path = None
@@ -1864,6 +1932,8 @@ def register_ecad_tools(mcp) -> None:
             return _err(f"simulator unavailable ({type(e).__name__}: {e})",
                         hint="The sim engine (numpy/scipy) is not importable here.")
         circuit, warns = netlist_to_spice_circuit(nl)
+        _apply_sim_source_params(doc, circuit, warns,
+                                 apply_waveforms=analysis in ("tran", "four"))
         if not circuit.get("devices"):
             return _err("nothing to sweep — the netlist has no simulatable devices",
                         hint="Place R/C/L/V/I/D parts with VALUES and wire them up first.",
@@ -2550,12 +2620,17 @@ def register_ecad_tools(mcp) -> None:
         layer = tr_p.get("layer", "F.Cu")
 
         # Infer intra-pair gap: centre-to-centre of the two tracks minus half-widths of each.
-        # If tracks are on the same horizontal or vertical run we estimate from the two p1s.
+        # Track digitisation direction is arbitrary (a router may emit the return net
+        # reversed, p1<->p2 swapped), so take the MIN distance over the four endpoint
+        # pairings — for parallel co-extensive segments that is the pair separation
+        # regardless of direction. (Using p1-p1 only inflated the gap to ~the track
+        # LENGTH for a reversed pair, wrecking Z_diff.)
         import math as _math
-        p1_p = tr_p.get("p1", [0.0, 0.0])
-        p1_n = tr_n.get("p1", [0.0, 0.0])
-        centre_dist = _math.hypot(float(p1_p[0]) - float(p1_n[0]),
-                                  float(p1_p[1]) - float(p1_n[1]))
+        _ends_p = [tr_p.get("p1", [0.0, 0.0]), tr_p.get("p2") or tr_p.get("p1", [0.0, 0.0])]
+        _ends_n = [tr_n.get("p1", [0.0, 0.0]), tr_n.get("p2") or tr_n.get("p1", [0.0, 0.0])]
+        centre_dist = min(
+            _math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+            for a in _ends_p for b in _ends_n)
         # Clamp gap to something physical (0.05mm minimum; fall back to DEFAULT_DIFF_GAP=0.2)
         gap = max(centre_dist - width_p / 2.0 - width_n / 2.0, 0.05)
         if centre_dist < 0.01:
@@ -3319,9 +3394,22 @@ def _build_analysis(analysis: str, params: dict, circuit: dict) -> dict | None:
         tstop = float(params.get("tstop", 1e-3))
         f0 = float(params.get("f0", 1e3))
         probe = params.get("probe")
-        return {"type": "four", "f0": f0, "tstop": tstop,
-                "tstep": float(params.get("tstep", tstop / 400)),
-                "probe": probe, "nharm": int(params.get("nharm", 9))}
+        an = {"type": "four", "f0": f0, "tstop": tstop,
+              "tstep": float(params.get("tstep", tstop / 400)),
+              "probe": probe, "nharm": int(params.get("nharm", 9))}
+        # Window: the solvers' own default is "as many whole periods as fit", which
+        # INCLUDES the start-up transient (a circuit starting from its op point reads
+        # phantom THD — measured 2.3% on a plain linear RC) and, worse, whether the
+        # first period gets included is a float-rounding lottery in int(tspan/period).
+        # Analyze the LAST whole periods excluding the first (SPICE .four convention
+        # is the last period only), unless the caller pins 'periods' explicitly.
+        if "periods" in params:
+            an["periods"] = int(params["periods"])
+        else:
+            whole = int(round(tstop * f0))
+            if whole >= 2:
+                an["periods"] = whole - 1
+        return an
     if a == "mc":
         inner_name = params.get("inner", "op")
         inner_params = params.get("inner_params", {})

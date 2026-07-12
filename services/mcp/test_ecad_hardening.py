@@ -124,9 +124,9 @@ def test_simulate_overrun_returns_clean_message() -> None:
     orig_budget = et._ECAD_HEAVY_BUDGET_S
     et._ECAD_HEAVY_BUDGET_S = 1.0
 
-    def _slow_sim(circuit, study):  # noqa: ANN001
+    def _slow_sim(circuit, study, **kw):  # noqa: ANN001 — **kw: tool passes backend= (T-FIN14)
         time.sleep(5)
-        return orig(circuit, study)
+        return orig(circuit, study, **kw)
 
     circ.simulate = _slow_sim
     try:

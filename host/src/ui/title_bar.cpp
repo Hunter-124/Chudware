@@ -99,7 +99,7 @@ static ImVec4 titleBar_chromeTint(const float base[4]) {
 // both themes (stroke color = the chip's text color). Consistent stroke width
 // (1.5px * uiScale) and visual weight across all glyphs.
 enum class TbIcon {
-    File, Search, Settings,
+    File, Search, Settings, Web,
     Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI,
     Firmware,   // T-FIN5: firmware workspace tab (progressive disclosure)
 };
@@ -140,6 +140,14 @@ static void drawTbIcon(ImDrawList* dl, TbIcon icon, ImVec2 c, float sz, ImU32 co
             dl->AddLine(ImVec2(c.x + ca * r * 0.58f, c.y + sa * r * 0.58f),
                         ImVec2(c.x + ca * r * 0.95f, c.y + sa * r * 0.95f), col, th);
         }
+        break;
+    }
+    case TbIcon::Web: {
+        // Globe: circle + equator + one meridian (an ellipse squashed to a line).
+        const float gr = r * 0.90f;
+        dl->AddCircle(c, gr, col, 0, th);
+        dl->AddLine(ImVec2(c.x - gr, c.y), ImVec2(c.x + gr, c.y), col, th);
+        dl->AddEllipse(c, ImVec2(gr * 0.42f, gr), col, 0.0f, 0, th);
         break;
     }
     case TbIcon::Model: {
@@ -556,6 +564,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float fileW     = chipMeasureW("File",     padX, boldFont, iconSz, iconGap);
         const float searchW   = chipMeasureW("Search",   padX, boldFont, iconSz, iconGap);
         const float settingsW = chipMeasureW("Settings", padX, boldFont, iconSz, iconGap);
+        const float webW      = chipMeasureW("Web",      padX, boldFont, iconSz, iconGap);
 
         // Start x: just after logo (screen-relative → then convert to screen-absolute for SetCursorScreenPos).
         // logoEndRelX is already window-relative cursor position; convert to screen.
@@ -621,6 +630,31 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             hitLayout.addSpan((int)(cx - winX), (int)(cx - winX + settingsW));
             if (res.clicked) st.openSettings = true;
             cx += settingsW + chipGap;
+        }
+
+        // Liquid-glass divider in the gap between Settings and Web.
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float dividerX = cx - chipGap * 0.5f;
+            const float dy0 = barTopScreenY + barH * 0.24f;
+            const float dy1 = barTopScreenY + barH * 0.76f;
+            ImU32 dHi  = (ui::Palette::toU32(ui::palette.accent) & 0x00FFFFFFu) | 0x22000000u;
+            ImU32 dCol = (ui::Palette::toU32(ui::palette.border) & 0x00FFFFFFu) | 0x66000000u;
+            dl->AddLine(ImVec2(dividerX - 0.5f * s, dy0), ImVec2(dividerX - 0.5f * s, dy1), dHi,  1.0f * s);
+            dl->AddLine(ImVec2(dividerX + 0.5f * s, dy0), ImVec2(dividerX + 0.5f * s, dy1), dCol, 1.0f * s);
+        }
+
+        // -- Web chip -- toggles the full-window in-app CEF browser overlay (st.showWeb).
+        // Lit while browsing so the user can see they're in the web view. Clicking it again,
+        // a workspace tab, or Esc returns to modeling with the page kept alive underneath.
+        {
+            const ImVec2 chipP0(cx, barTopScreenY + chipVPad);
+            auto res = drawChipAt("##tb_web", "Web", chipP0, webW, chipH,
+                                  st.showWeb, chipRound, boldFont,
+                                  TbIcon::Web, iconSz, iconGap);
+            hitLayout.addSpan((int)(cx - winX), (int)(cx - winX + webW));
+            if (res.clicked) st.showWeb = !st.showWeb;
+            cx += webW + chipGap;
         }
 
         // File popup (positioned below the File chip).
@@ -734,7 +768,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // Register window-relative span.
             hitLayout.addSpan((int)(tx - winX), (int)(tx - winX + chipW));
 
-            if (res.clicked) st.activeWorkspace = kTabs[i].ws;
+            if (res.clicked) { st.activeWorkspace = kTabs[i].ws; st.showWeb = false; }
 
             tx += chipW + tabGapX;
             drewPrevTab = true;

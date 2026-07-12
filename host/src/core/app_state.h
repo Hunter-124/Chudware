@@ -1085,6 +1085,7 @@ struct AppState {
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)
     bool showProfilerWindow = false;  // in-app profiler results window (text report + flamegraph)
     bool showCommandSearch  = false;  // top-bar unified search popup (settings + modeling tools)
+    bool showWeb            = false;  // "Web" title-bar chip: full-window in-app CEF browser overlay
     int  openSettingsTab    = -1;     // >=0: jump the Settings modal to this tab index (search result)
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
     bool showSimulationTools = false; // View-gated advanced module; hidden from default ribbon

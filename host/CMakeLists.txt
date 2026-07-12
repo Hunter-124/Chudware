@@ -179,6 +179,7 @@ add_executable(Billet
   src/ui/parts/parts_results.cpp
   src/ui/parts/parts_vendors.cpp
   src/ui/parts/parts_browser_panel.cpp
+  src/ui/web_panel.cpp   # "Web" title-bar chip: full-window in-app CEF browser overlay
   src/ui/plm/plm_workspace.cpp
   src/ui/plm/plm_pages.cpp   # plmDraw*Page implementations (split out of plm_workspace)
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName

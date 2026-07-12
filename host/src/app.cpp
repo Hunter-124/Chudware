@@ -97,6 +97,7 @@
 #include "ui/equations_dialog.h"  // Equations / Global Variables editor
 #include "ui/profiler_window.h"   // in-app sampling-profiler window (text report + flamegraph)
 #include "ui/command_search.h"    // unified settings + modeling-tools search popup
+#include "ui/web_panel.h"          // "Web" title-bar chip: full-window in-app CEF browser
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 // [workspace-tabs seam] full-body workspace renderers for PLM and PartsLibrary.
 #include "ui/plm/plm_workspace.h"
@@ -2728,8 +2729,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 for (ImGuiWindow* w = g->NavWindow; w; w = w->ParentWindow)
                     if (std::strcmp(w->Name, "ECAD") == 0) { ecadFocused = true; break; }
             }
-            if (canDoc && !textFocus && !inSketchNow && !ecadFocused && st.docMirror.hasDoc() &&
-                (io.KeyCtrl || io.KeySuper)) {
+            if (canDoc && !textFocus && !st.showWeb && !inSketchNow && !ecadFocused &&
+                st.docMirror.hasDoc() && (io.KeyCtrl || io.KeySuper)) {
                 if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
                     st.docRedo();
                 } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
@@ -2738,14 +2739,20 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     st.docRedo();
                 }
             }
+            // While the in-app browser overlay owns the screen it is the "text field": its
+            // page/forms swallow typing, but a CEF OSR view does not set io.WantTextInput, so
+            // guard the app's Ctrl-shortcuts on !st.showWeb too — otherwise Ctrl+N/P/O/S get
+            // hijacked out from under the browser (where they mean new-tab/print/open/save).
+            const bool appShortcutsOk = !textFocus && !st.showWeb;
+
             // Ctrl+N creates a new part directly. The old "+" chooser lived in the removed document
             // strip; full document-type creation is still available from File > New.
-            if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+            if (appShortcutsOk && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
                 ImGui::IsKeyPressed(ImGuiKey_N, false))
                 ui::createNewDoc(st, 0);
 
             // Ctrl+P: open the unified command + settings search.
-            if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+            if (appShortcutsOk && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
                 ImGui::IsKeyPressed(ImGuiKey_P, false))
                 st.showCommandSearch = true;
 
@@ -2763,16 +2770,24 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     {ImGuiKey_7, WS::PartsLibrary}, {ImGuiKey_8, WS::AI},
                     {ImGuiKey_9, WS::ReverseEng},
                 };
+                // Ctrl+digit stays live while the Web overlay is up so it doubles as an exit
+                // (switch workspace AND drop the browser), mirroring a workspace-tab click.
                 for (const auto& k : kWsKeys)
-                    if (ImGui::IsKeyPressed(k.key, false)) { st.activeWorkspace = k.ws; break; }
+                    if (ImGui::IsKeyPressed(k.key, false)) {
+                        st.activeWorkspace = k.ws; st.showWeb = false; break;
+                    }
             }
+
+            // Esc closes the Web overlay (back to modeling), unless a text field owns the key.
+            if (st.showWeb && !textFocus && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                st.showWeb = false;
 
             // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
             // Set request flags consumed by the GL-thread file pump below (after the input block) so
             // the native dialog opens with the doc swap off the ImGui input path. Skip while a text
             // field or the ECAD window owns input (the ECAD editor has its own save). Ctrl+S/Shift+S
             // require a live doc; Ctrl+O is always allowed.
-            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
+            if (appShortcutsOk && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
                 if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
                     st.requestOpenDialog = true;
                 else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
@@ -2787,7 +2802,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             // global router stands down; with no sketch active it routes to the FeatureManager
             // selection (Wave 4C/4D). Guards mirror the undo block: skip while a text field or the
             // ECAD window owns input. Ctrl+Z/Y are handled above; we never touch them.
-            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift) {
+            if (appShortcutsOk && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift) {
                 if (ui::fileExplorerActive(st)) {
                     // Explorer-tab FILE copy/paste — no worker needed, so not gated on canDoc.
                     if (ImGui::IsKeyPressed(ImGuiKey_C, false))      ui::fileExplorerCopySelection(st);
@@ -3082,8 +3097,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // column is always drawn so it stays available in non-AI workspaces exactly as today.
         using WS = AppState::Workspace;
         const WS ws = st.activeWorkspace;
-        // Workspaces that own the ENTIRE central region — no left pane, no viewport, no cam/ecad.
-        const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI
+        // The "Web" chip's full-window in-app browser overlay (title_bar.cpp toggles st.showWeb).
+        // It is NOT a workspace — activeWorkspace stays put underneath — so it composes with any
+        // workspace and toggles straight back to modeling. While up it owns the whole central band.
+        const bool webActive = st.showWeb;
+        // Workspaces (or the Web overlay) that own the ENTIRE central region — no left pane, no
+        // viewport, no cam/ecad. Folding webActive in suppresses all of those in one place; the
+        // full-body workspace renderers below are gated on !webActive separately.
+        const bool wsFullBody = webActive || (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI
                                  || ws == WS::ReverseEng || ws == WS::Firmware);
         // Effective left-pane tab override (derived this frame; never written to st).
         // Simulate forces the Simulation tab so the sim tree shows.
@@ -3175,7 +3196,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // edge in every workspace EXCEPT the AI workspace, where the full-body AI hub
         // (drawAiWorkspace, below) hosts its own expanded chat on the same st.chat state —
         // drawing both would double the conversation panel.
-        if (ws != WS::AI) ui::drawAIPanel(st, busy, canRun);
+        if (ws != WS::AI && !webActive) ui::drawAIPanel(st, busy, canRun);
         // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.
@@ -3228,7 +3249,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // These take the whole central region. They use drawViewportPanel's dock slot (the
         // ImGui window ID "Viewport" is NOT opened by them — they draw directly into the
         // overlay band area as floating non-docked glass panels, same pattern as drawLeftPane).
-        if (ws == WS::PLM || ws == WS::PartsLibrary) {
+        if (!webActive && (ws == WS::PLM || ws == WS::PartsLibrary)) {
             // PLM / Parts Library: full-body workspaces. The body functions emit widgets directly
             // (no Begin of their own), so host them in ONE borderless window spanning the whole
             // central band — otherwise ImGui dumps them into its fallback "Debug" window (a small
@@ -3258,7 +3279,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 else               ui::drawPartsLibraryWorkspace(st);
                 ImGui::End();
             }
-        } else if (ws == WS::AI) {
+        } else if (!webActive && ws == WS::AI) {
             // AI workspace: full-body AI hub spanning the whole central band —
             // [sessions + sub-agents rail] | [expanded Copilot chat / project DAG] | [AI settings].
             // Unlike PLM/Parts this fills to band.maxX (drawAIPanel's docked column is suppressed
@@ -3279,7 +3300,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ui::drawAiWorkspace(st);
                 ImGui::End();
             }
-        } else if (ws == WS::ReverseEng) {
+        } else if (!webActive && ws == WS::ReverseEng) {
             // RE-ANCHOR(reveng): full-body Reverse Engineering workspace (RE-03/RE-19/RE-21).
             const ui::OverlayBand& band = ui::overlayBand();
             if (band.valid) {
@@ -3298,7 +3319,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ui::drawRevEngWorkspace(st);
                 ImGui::End();
             }
-        } else if (ws == WS::Firmware) {
+        } else if (!webActive && ws == WS::Firmware) {
             // T-FIN5: full-body Firmware workspace (project rail | build/emulation/trace |
             // fw_status-gated backend rail). Same borderless central-band host as PLM/RevEng.
             const ui::OverlayBand& band = ui::overlayBand();
@@ -3319,6 +3340,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ImGui::End();
             }
         }
+
+        // ---- "Web" chip overlay: full-window in-app browser over the central band ----
+        // Drawn LAST in the central-body section and only when active, so it's the single
+        // central renderer for the frame (viewport / left pane / full-body workspaces above
+        // are all suppressed via wsFullBody|webActive) — one body owner = no focus/z fights.
+        if (webActive) ui::drawWebBrowserPanel(st);
+
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadAiBoardGo) { st.ecadAiBoardGo = false; ecadAiBoard(st, st.ecadAiRequest); }  // Wave U
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q

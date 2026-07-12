@@ -1955,7 +1955,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // --- Group separator + label ---
         {
             ImVec2 cwinPos = ImGui::GetWindowPos();
-            float  sepX    = snap(cwinPos.x + curX + grpW - kGroupPadX * s * 0.5f);
+            // Center the divider in the inter-group GAP, not on the left pill's right edge. The
+            // group pill spans [curX + gpad, curX + grpW - gpad] (gpad = kGroupPadX*s*0.5), so the
+            // gap between this pill and the next runs [curX+grpW-gpad, curX+grpW+gpad] — its midpoint
+            // is curX+grpW. The old sepX (grpW - 0.5*pad) sat exactly on this pill's right edge,
+            // jamming the divider against the left group and leaving a lopsided gap to the right one.
+            float  sepX    = snap(cwinPos.x + curX + grpW);
             // Two-line highlight+hairline divider, retuned to the title-bar pinned spec (faint accent
             // highlight over a restrained border hairline) so the ribbon dividers read the same weight
             // as the title bar's — not the previous heavier 0.92 main line.

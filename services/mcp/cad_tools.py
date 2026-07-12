@@ -707,6 +707,15 @@ def _autosave_all_open() -> None:
     monotonic per-doc revision is the change signal; docs without one are always saved).
     Called on the periodic timer and before a heavy solve so a transport timeout that
     kills the server can never lose an unrelated open part (Bug R-1)."""
+    if cb._daemon_mode():
+        # Daemon mode: aicad-hostd is THE single autosave authority (start_periodic_autosave
+        # is gated off here too). A per-doc doc_save to the MCP autosave dir would repoint the
+        # daemon doc's `path` OUTSIDE the daemon's recovery tier AND clear its dirty flag —
+        # which DEFEATS the daemon's retire-if-unsaved GC gate (server.cpp gcCloseDoc:
+        # isAutosavePath only recognizes the daemon's own dir) and could silently drop an
+        # abandoned, never-delivered agent doc when its mirror auto-closes. The daemon holds
+        # the doc across an MCP-server death anyway, so this pre-solve guard is redundant here.
+        return
     try:
         docs = (cb.call("doc_list", {}) or {}).get("docs", [])
     except Exception:  # noqa: BLE001

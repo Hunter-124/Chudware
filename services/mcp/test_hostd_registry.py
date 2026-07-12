@@ -299,6 +299,39 @@ def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
     assert all(e.get("doc_id") != doc for e in b.call("doc_list", {})["docs"]), "doc gone"
 
 
+def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path):
+    """The load-bearing 'no data loss, no nag' guarantee behind agent-finished auto-close:
+    when an abandoned doc is GC'd, one SAVED to a real user file closes clean (NO recovery
+    entry -> the user is never nagged about already-delivered AI work), while an unsaved doc
+    IS retired to the orphan tier (recoverable). Discriminates ship from regression."""
+    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")  # reap abandoned docs fast
+    keep = DaemonClient()
+    keep.connect()  # stays connected so the daemon doesn't linger-exit mid-test
+    scratch_daemon.append(_pid(keep))
+    a = DaemonClient()
+    a.connect()
+
+    saved = a.call("doc_new", {"name": "delivered"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": saved, "ops": BOX_OPS})
+    out = str(tmp_path / "delivered.step+")
+    assert a.call("doc_save", {"doc_id": saved, "path": out}).get("_is_error") is None
+
+    unsaved = a.call("doc_new", {"name": "scratch"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": unsaved, "ops": _box_ops("u")})
+
+    a.close()  # both docs unattached -> GC grace (1s) -> retire only the undelivered one
+
+    deadline = time.time() + 8
+    ids: set = set()
+    while time.time() < deadline:
+        time.sleep(0.5)
+        ids = {e.get("doc_id") for e in keep.call("recovery_list").get("entries", [])}
+        if unsaved in ids:
+            break
+    assert unsaved in ids, "an unsaved abandoned doc MUST be retired for recovery"
+    assert saved not in ids, "a doc saved to a real file must NOT flood the recovery prompt"
+
+
 # ------------------------------------------------------------ foreign edits
 
 

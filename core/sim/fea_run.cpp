@@ -21,6 +21,7 @@
 #include "sim/fea_static.h"
 #include "sim/fea_thermal.h"
 #include "sim/mesher.h"
+#include "util/resource_governor.h"
 
 using nlohmann::json;
 
@@ -319,6 +320,27 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
     }
 }
 
+// ── Governor admission: projected peak memory for a sparse FEA solve ─────────────
+// Triplet assembly storage is exact: (dof_per_node*npe)^2 entries/element × 16 B
+// (Eigen Triplet<double> = 8 B value + 2×4 B indices). The assembled CSC matrix is
+// bounded above by half the triplets (duplicates merge). Factor fill-in is the honest
+// unknown and the real killer — CHOLMOD's supernodal fill on bulky 3D solids was
+// MEASURED at multi-GB (see the CHOLMOD note in core/CMakeLists.txt) — so it enters
+// as a multiplier of K, env-tunable via AICAD_FEA_FILL for hosts where the default
+// proves loose/tight. Result fields (~20 doubles/node) are minor but included.
+uint64_t fea_estimate_bytes(size_t n_elems, size_t n_nodes, int npe, int dof_per_node) {
+    const double band = static_cast<double>(dof_per_node * npe);
+    const double triplets = static_cast<double>(n_elems) * band * band * 16.0;
+    double fill = 6.0;
+    if (const char* e = std::getenv("AICAD_FEA_FILL")) {
+        const double v = std::atof(e);
+        if (v > 0.0) fill = v;
+    }
+    const double K = triplets * 0.5;
+    const double fields = static_cast<double>(n_nodes) * 20.0 * 8.0;
+    return static_cast<uint64_t>(triplets + K + fill * K + fields);
+}
+
 }  // namespace
 
 std::vector<int> nodes_in_faceset(const std::vector<double>& points,
@@ -399,6 +421,18 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
 
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
+
+    // Governor admission: refuse a solve that would blow past the host's memory
+    // budget with a clear, actionable error instead of OOM-crashing the process
+    // (the GUI/MCP already render {"ok":false,"error"} gracefully).
+    {
+        std::string why;
+        const size_t n_elems_est = tets.size() / static_cast<size_t>(nodes_per_elem);
+        if (!aicad::governor::admit(
+                fea_estimate_bytes(n_elems_est, static_cast<size_t>(n_nodes), nodes_per_elem, 3),
+                "static FEA solve", why))
+            return json{{"ok", false}, {"error", why}};
+    }
 
     const json material = study.value("material", json::object());
     const double E_mpa = material.value("E_mpa", 0.0);
@@ -623,6 +657,16 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                                          : "modal uses 1st-order (tet4) elements");
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
+    // Governor admission (2x the static estimate: K + M plus eigensolver workspace).
+    {
+        std::string why;
+        const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
+        if (!aicad::governor::admit(
+                2 * fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 3),
+                "modal FEA solve", why))
+            return json{{"ok", false}, {"error", why}};
+    }
+
     const json material = study.value("material", json::object());
     const double E_mpa = material.value("E_mpa", 0.0);
     const double nu = material.value("nu", 0.0);
@@ -732,6 +776,16 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     std::vector<std::string> notes;
     if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+
+    // Governor admission (scalar field: 1 DOF/node).
+    {
+        std::string why;
+        const size_t ne = tets.size() / static_cast<size_t>(nodes_per_elem);
+        if (!aicad::governor::admit(
+                fea_estimate_bytes(ne, points.size() / 3, nodes_per_elem, 1),
+                "thermal FEA solve", why))
+            return json{{"ok", false}, {"error", why}};
+    }
 
     // Conductivity: W/(m·K) in the study, converted to the mesh unit (mm): W/(mm·K) = W/(m·K)/1000.
     const json material = study.value("material", json::object());

@@ -174,7 +174,8 @@ target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
 # aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
 add_library(aicad_util STATIC
   util/expr.cpp
-  util/aicm_handoff.cpp)
+  util/aicm_handoff.cpp
+  util/resource_governor.cpp)
 target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(UNIX AND NOT APPLE)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
@@ -197,7 +198,7 @@ add_library(aicad_sim STATIC
   sim/flow_run.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
-target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
+target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json aicad_util)
 
 # --- Optional CHOLMOD (SuiteSparse) supernodal Cholesky for the SPD FEA solve ------
 # Eigen's SimplicialLDLT is scalar + single-threaded; on a bulky 3D solid its fill-in
@@ -451,6 +452,14 @@ target_link_libraries(test_expr PRIVATE aicad_util)
 set_target_properties(test_expr PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME expr COMMAND test_expr)
+
+add_executable(test_governor
+  tests/test_governor.cpp)
+target_include_directories(test_governor PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_governor PRIVATE aicad_util)
+set_target_properties(test_governor PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME governor COMMAND test_governor)
 
 # --- libaicad geom-aicm (OCCT-free AICM v1 writer) ---------------------------
 # The encoder half of engine/doc/tessellate.py, kept OCCT-free so it builds and

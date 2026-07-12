@@ -3,6 +3,8 @@
 // trimesh voxelize+fill is replaced by a self-contained X-scanline parity fill (per body).
 #include "sim/flow_run.h"
 
+#include "util/resource_governor.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -147,8 +149,42 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     int Ny = std::max(4, (int)std::ceil(dom[1] / voxel));
     int Nz = std::max(4, (int)std::ceil(dom[2] / voxel));
 
-    double mem_gb = (double)Nx * Ny * Nz * 19.0 * 4.0 * 2.0 / (1024.0 * 1024.0 * 1024.0);
-    if (mem_gb > 2.0) { R.ok = false; R.error = "domain too large (" + std::to_string(mem_gb) + " GB) — lower cells"; return R; }
+    // Governor: the lattice must fit the HOST's memory budget (was a hard-coded 2 GB —
+    // too big for an 8 GB laptop, needlessly small on a big box). ~256 B/cell covers the
+    // two f-field copies (19 dirs × f32 × 2 = 152 B), macros (16 B), mask (1 B) and the
+    // collision scratch. Degrade gracefully: shrink the resolution (cells ~ cbrt(mem))
+    // and note it in R.warning, refusing only at the floor.
+    std::string governor_note;
+    {
+        constexpr double kBytesPerCell = 256.0;
+        const uint64_t mem_budget = aicad::governor::budget_bytes();
+        for (int tries = 0; tries < 4; ++tries) {
+            const double need = (double)Nx * Ny * Nz * kBytesPerCell;
+            if (mem_budget == UINT64_MAX || need <= (double)mem_budget) break;
+            const int cells_new = std::max(
+                16, (int)std::floor(cells * std::cbrt((double)mem_budget / need)));
+            if (cells_new >= cells) {  // at the floor and still over budget: refuse clearly
+                std::string why;
+                aicad::governor::admit((uint64_t)need, "CFD flow lattice", why);
+                R.ok = false;
+                R.error = why;
+                return R;
+            }
+            if (governor_note.empty()) {
+                char buf[192];
+                std::snprintf(buf, sizeof buf,
+                              "governor: grid reduced %d->%d cells to fit this machine's "
+                              "memory budget (raise AICAD_MEM_FRAC for more resolution)",
+                              cells, cells_new);
+                governor_note = buf;
+            }
+            cells = cells_new;
+            voxel = dom_longest / cells;
+            Nx = std::max(4, (int)std::ceil(dom[0] / voxel));
+            Ny = std::max(4, (int)std::ceil(dom[1] / voxel));
+            Nz = std::max(4, (int)std::ceil(dom[2] / voxel));
+        }
+    }
 
     // Offset geometry into the domain corner with the pads, then voxelize each body (OR).
     double off[3] = {up - lo[0], lat - lo[1], lat - lo[2]};
@@ -223,6 +259,8 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                     "under-resolved (lift/forces unreliable). Raise `cells` so the thinnest "
                     "feature spans >= 8 voxels, or simulate the wing/section alone.";
     }
+    if (!governor_note.empty())
+        R.warning = R.warning.empty() ? governor_note : (R.warning + "; " + governor_note);
     return R;
 }
 

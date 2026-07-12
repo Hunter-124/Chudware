@@ -12,6 +12,8 @@
 
 #include "sim/lbm.h"
 
+#include "util/resource_governor.h"
+
 #include <cmath>
 #include <cstddef>
 
@@ -472,6 +474,18 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             momentum_exchange(f, d, l);
             drag_hist.push_back(d);
             if (on_progress) on_progress(step, n_steps);  // live progress (read-only)
+            // Emergency stop (governor): the HOST is nearly out of memory — the lattice
+            // itself was admitted up-front, so this means some other process is eating
+            // RAM. Stop gracefully at this checkpoint instead of letting the OS swap or
+            // OOM-kill the app. Never trips in the parity gate (fixed small grids, and
+            // AICAD_GOVERNOR=0 disables outright).
+            if (aicad::governor::low_memory_now()) {
+                R.ok = false;
+                R.error = "CFD run stopped at step " + std::to_string(step) +
+                          ": host memory critically low (governor) — close other "
+                          "applications and re-run";
+                return R;
+            }
         }
     }
     step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value

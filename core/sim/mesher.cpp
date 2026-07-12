@@ -30,6 +30,7 @@
 
 #include "sim/hex_mesher.h"  // mesh_box_hex (structured hex path)
 #include "geom/booleans.h"   // geom::unify_same_domain (mesh-time geometry healing)
+#include "util/resource_governor.h"  // host-memory element ceiling (graceful degrade)
 
 #include <algorithm>
 #include <cmath>
@@ -528,14 +529,32 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     // an interactive study stays fast. Budget scales with fineness (Draft small .. Fine large)
     // and is overridable via AI_CAD_MESH_MAX_ELEMS. Explicit target_size_mm is honored verbatim.
     // n_tets ~= C * vol / base^3, C~=6 (empirical Netgen tet packing).
+    // Host-memory ceiling on the element count (governor). The downstream SOLVE is the
+    // real OOM risk — tet10 assembly+factorization runs tens of KB per element (same
+    // derivation as fea_estimate_bytes in fea_run.cpp: (3·npe)²·16 B triplets, +K, +fill·K)
+    // — so on a low-end machine the mesh coarsens here, with a note, instead of the solve
+    // OOM-crashing the app. Applies to BOTH auto sizing (folded into the interactivity
+    // budget below) and an explicit target_size_mm (verbatim honor yields only under
+    // memory pressure — graceful lag beats a crash). AICAD_GOVERNOR=0 disables.
+    const long mem_max_elems = [&]() -> long {
+        const uint64_t mem_budget = aicad::governor::budget_bytes();
+        if (mem_budget == UINT64_MAX) return 0;  // governor off / unknowable host
+        const int npe = (options.order == 2) ? 10 : 4;
+        const double band = 3.0 * npe;
+        const double per_elem = band * band * 16.0 * 4.5;  // triplets(1) + K(0.5) + fill(6)*K
+        const double cap = static_cast<double>(mem_budget) / per_elem;
+        return (cap >= 1.0 && cap < 2e18) ? static_cast<long>(cap) : 0;
+    }();
+    const double vol_est = solid_vol > 1e-9 ? solid_vol : (dx * dy * dz);
+    constexpr double kTetPack = 6.0;
     if (!explicit_size) {
-        const double vol = solid_vol > 1e-9 ? solid_vol : (dx * dy * dz);
+        const double vol = vol_est;
         long budget = static_cast<long>(8000.0 + 52000.0 * fineness);  // ~8k Draft .. 60k Fine
         if (const char* e = std::getenv("AI_CAD_MESH_MAX_ELEMS")) {
             const long b = std::atol(e);
             if (b > 0) budget = b;
         }
-        constexpr double kTetPack = 6.0;
+        if (mem_max_elems > 0 && mem_max_elems < budget) budget = mem_max_elems;
         if (vol > 1e-9 && base > 1e-9) {
             const double est = kTetPack * vol / (base * base * base);
             if (est > static_cast<double>(budget)) {
@@ -548,6 +567,22 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
                 out.note = out.note.empty() ? std::string(buf) : (out.note + "; " + buf);
                 base = base_new;
             }
+        }
+    } else if (mem_max_elems > 0 && vol_est > 1e-9 && base > 1e-9) {
+        // Explicit target: honored verbatim UNLESS the projected solve cannot fit the
+        // host's memory budget — then coarsen just enough to fit and say so.
+        const double est = kTetPack * vol_est / (base * base * base);
+        if (est > static_cast<double>(mem_max_elems)) {
+            const double base_new =
+                base * std::cbrt(est / static_cast<double>(mem_max_elems));
+            char buf[240];
+            std::snprintf(buf, sizeof(buf),
+                "governor: target size %.2f mm would need ~%.0fk elements, beyond this "
+                "machine's memory budget (~%ldk) -> element size raised to %.2f mm "
+                "(raise AICAD_MEM_FRAC or use a smaller model for more detail)",
+                base, est / 1000.0, mem_max_elems / 1000, base_new);
+            out.note = out.note.empty() ? std::string(buf) : (out.note + "; " + buf);
+            base = base_new;
         }
     }
 

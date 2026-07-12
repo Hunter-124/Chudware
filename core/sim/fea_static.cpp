@@ -39,15 +39,26 @@ namespace {
 // threads must keep running (Hunter: "let the GUI continue on at least 1 thread"). Caps both
 // CHOLMOD's own OpenMP loops and the OpenMP-based system BLAS (FlexiBLAS/OpenBLAS) it calls.
 // Env AI_CAD_FEA_THREADS overrides; default = hardware_concurrency - 2 (min 1).
-int fea_solver_threads() {
+int fea_solver_threads(long n_free) {
     if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
         const int n = std::atoi(e);
         if (n >= 1) return n;
     }
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    int cap = static_cast<int>(hw) - 2;  // leave 2 cores for GUI/render/IPC
-    return cap < 1 ? 1 : cap;
+    const int hw_cap = std::max(1, static_cast<int>(hw) - 2);  // always leave 2 cores for GUI/render/IPC
+    // Size-adaptive parallelism (measured on tet10 3D elasticity, this box):
+    //   * Tiny systems: thread spawn + OpenMP/BLAS setup costs MORE than the work. A ~10k-DOF
+    //     factorize is 31 ms on 1 thread but 65 ms on 10 — so serialize the small solves.
+    //   * Large systems: the supernodal DGEMM parallelizes, but past ~8 threads it saturates memory
+    //     bandwidth and the nested CHOLMOD-OpenMP × OpenBLAS-OpenMP pools oversubscribe — a 106k-DOF
+    //     factorize is 1.4 s at 8 threads but 2.3 s at 10. So cap at 8, which also frees more cores
+    //     for the live GUI than hw-2 would.
+    int want;
+    if      (n_free <  20000) want = 1;
+    else if (n_free <  60000) want = 4;
+    else                      want = 8;
+    return std::min(want, hw_cap);
 }
 
 void apply_solver_thread_cap(int n) {
@@ -500,12 +511,24 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         //   2. Eigen SimplicialLDLT — scalar Cholesky (used when SuiteSparse is absent, or if
         //      CHOLMOD's strict-SPD LLT rejects a near-singular reduced system).
         //   3. SparseLU (below) — final fallback.
-        const int nthreads = fea_solver_threads();
+        const int nthreads = fea_solver_threads(n_free);
         apply_solver_thread_cap(nthreads);
 #ifdef AICAD_WITH_CHOLMOD
         prof.note("solver=CholmodSupernodalLLT (SuiteSparse, %d threads)", nthreads);
         {
             Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
+            // Fill-reducing ordering. For 3D solids CHOLMOD's default (AMD-biased) leaves far more
+            // fill than METIS nested-dissection: measured 106k-DOF factorize 4.3 s default vs 2.7 s
+            // METIS (AMD alone is worst at 7.3 s). METIS's analyze carries a fixed ~25 ms overhead
+            // that isn't repaid on tiny systems, so switch it on only for large ones. AI_CAD_FEA_ORDER
+            // (metis|nesdis|amd|default) forces a specific ordering for benchmarking.
+            const char* ord = std::getenv("AI_CAD_FEA_ORDER");
+            const std::string o = ord ? ord : (n_free >= 50000 ? "metis" : "default");
+            cholmod_common& cc = chol.cholmod();
+            if      (o == "metis")  { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_METIS;  cc.postorder = 1; }
+            else if (o == "nesdis") { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_NESDIS; cc.postorder = 1; }
+            else if (o == "amd")    { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_AMD;    cc.postorder = 1; }
+            prof.note("CHOLMOD ordering = %s", o.c_str());
             chol.analyzePattern(Kff);
             prof.mark("CHOLMOD analyze");
             chol.factorize(Kff);

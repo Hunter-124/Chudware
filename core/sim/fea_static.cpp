@@ -9,7 +9,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
 
 #include <Eigen/Dense>
@@ -20,6 +24,40 @@
 namespace aicad::sim {
 
 namespace {
+
+// ── Lightweight, env-gated phase profiler ────────────────────────────────────────
+// Set AI_CAD_FEA_PROFILE=1 to get a per-phase wall-clock + size/memory breakdown of a
+// static solve on stderr. Each line is flushed immediately so, if the solve aborts
+// (e.g. std::bad_alloc on a too-fine mesh -> SIGABRT), the LAST line printed localizes
+// the death — a sampling profiler's report() never runs after an abort, this does.
+// Costs nothing when the env var is unset (one getenv per solve).
+struct FeaProf {
+    bool on = false;
+    std::chrono::steady_clock::time_point t0;
+    explicit FeaProf() {
+        const char* e = std::getenv("AI_CAD_FEA_PROFILE");
+        on = e && e[0] && e[0] != '0';
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    // Milliseconds since the previous mark(), then re-anchor. Prints "[fea] <label> = <ms>".
+    void mark(const char* label) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - t0).count();
+        std::fprintf(stderr, "[fea] %-22s %10.2f ms\n", label, ms);
+        std::fflush(stderr);
+        t0 = now;
+    }
+    template <typename... A>
+    void note(const char* fmt, A... args) {
+        if (!on) return;
+        std::fprintf(stderr, "[fea] ");
+        std::fprintf(stderr, fmt, args...);
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+};
 
 // Lamé parameters (MPa) from E, nu (fea_static.py::_lame_from_material).
 void lame(double E, double nu, double& lam, double& mu) {
@@ -205,6 +243,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                                  const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces,
                                  int nodes_per_elem) {
+    FeaProf prof;
     FeaStaticResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
@@ -280,10 +319,21 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         return res;
     }
 
+    prof.mark("setup+dof-map");
     // Assemble the reduced free-free stiffness directly (skip rows/cols of fixed DOFs).
     std::vector<Eigen::Triplet<double>> trips;
     const int edof = stride * 3;  // element DOFs (12 for tet4, 30 for tet10)
-    trips.reserve(static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(edof) * edof);
+    const std::size_t n_trips =
+        static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(edof) * edof;
+    // Size + memory census BEFORE the big reserve. On a too-fine mesh this reserve (or the
+    // factorization below) is where std::bad_alloc throws -> SIGABRT; this flushed line is
+    // the last thing printed, so it pins the ceiling DOF/element count that the box can take.
+    prof.note("nodes=%d  n_dof=%d  n_elems=%d  nodes/elem=%d  free_dof=%d", n_nodes, n_dof,
+              n_tets, nodes_per_elem, n_free);
+    prof.note("triplets=%zu  triplet_reserve=%.1f MB (%zu B/elem)", n_trips,
+              static_cast<double>(n_trips * sizeof(Eigen::Triplet<double>)) / 1.048576e6,
+              static_cast<std::size_t>(edof) * edof * sizeof(Eigen::Triplet<double>));
+    trips.reserve(n_trips);
     if (hex8) {
         // ── hex8 path (8-node trilinear, 2x2x2 Gauss) ────────────────────────
         const HexGauss8 hg;
@@ -377,6 +427,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         }
     }
 
+    prof.mark("assemble-elements");
     Eigen::SparseMatrix<double> Kff(n_free, n_free);
     Kff.setFromTriplets(trips.begin(), trips.end());
     Kff.makeCompressed();
@@ -384,6 +435,10 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         res.error = "fea_static: no valid elements contributed stiffness";
         return res;
     }
+    prof.note("Kff %dx%d  nnz=%lld  (~%.1f MB compressed)", n_free, n_free,
+              static_cast<long long>(Kff.nonZeros()),
+              static_cast<double>(Kff.nonZeros()) * (sizeof(double) + sizeof(int)) / 1.048576e6);
+    prof.mark("build-sparse-matrix");
 
     Eigen::VectorXd ff(n_free);
     for (int d = 0; d < n_dof; ++d)
@@ -397,22 +452,29 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     bool solved = false;
     if (tet10 || hex8) {
         // SPD systems with no Python-parity constraint: Cholesky is faster + lighter.
+        prof.note("solver=SimplicialLDLT (Cholesky, SPD)");
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
         ldlt.compute(Kff);
+        prof.mark("factorize (LDLT)");
         if (ldlt.info() == Eigen::Success) {
             uf = ldlt.solve(ff);
+            prof.mark("back-substitute");
             if (ldlt.info() == Eigen::Success) solved = true;
         }
     }
     if (!solved) {
+        prof.note("solver=SparseLU%s", (tet10 || hex8) ? " (LDLT fell back)" : " (tet4 parity)");
         Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
         lu.analyzePattern(Kff);
+        prof.mark("LU analyzePattern");
         lu.factorize(Kff);
+        prof.mark("LU factorize");
         if (lu.info() != Eigen::Success) {
             res.error = "fea_static: sparse factorization failed (singular system)";
             return res;
         }
         uf = lu.solve(ff);
+        prof.mark("LU back-substitute");
         if (lu.info() != Eigen::Success) {
             res.error = "fea_static: sparse solve failed";
             return res;
@@ -623,6 +685,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     res.n_nodes = n_nodes;
     res.n_elems = n_tets;
     res.ok = true;
+    prof.mark("stress-recovery");
     return res;
 }
 

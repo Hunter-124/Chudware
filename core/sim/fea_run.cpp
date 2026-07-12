@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <list>
@@ -371,6 +374,13 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
 }
 
 nlohmann::json fea_run_static(const nlohmann::json& study) {
+    // AI_CAD_FEA_PROFILE=1 -> coarse mesh-vs-solve wall-clock split on stderr (the per-solve
+    // phase breakdown is emitted by fea_static_solve under the same env var). Flushed so it
+    // survives an abort() on a too-fine mesh.
+    const char* pe = std::getenv("AI_CAD_FEA_PROFILE");
+    const bool fprof = pe && pe[0] && pe[0] != '0';
+    const auto t_start = std::chrono::steady_clock::now();
+
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
@@ -378,6 +388,14 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::string err;
     if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
         return json{{"ok", false}, {"error", err}};
+    if (fprof) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t_start).count();
+        std::fprintf(stderr, "[fea] %-22s %10.2f ms  (%zu nodes, %zu elems, order %d)\n",
+                     "MESH (resolve_mesh)", ms, points.size() / 3,
+                     tets.size() / static_cast<size_t>(nodes_per_elem), nodes_per_elem);
+        std::fflush(stderr);
+    }
 
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
@@ -512,8 +530,18 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     }
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
+    const auto t_solve0 = std::chrono::steady_clock::now();
     FeaStaticResult r = fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
                                          nodal_forces, nodes_per_elem);
+    if (fprof) {
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[fea] %-22s %10.2f ms\n[fea] %-22s %10.2f ms\n",
+                     "SOLVE (fea_static_solve)",
+                     std::chrono::duration<double, std::milli>(now - t_solve0).count(),
+                     "TOTAL (mesh+solve)",
+                     std::chrono::duration<double, std::milli>(now - t_start).count());
+        std::fflush(stderr);
+    }
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
 

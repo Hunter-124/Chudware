@@ -718,6 +718,15 @@ if(AICAD_WITH_OCCT)
   add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
   set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
 
+  # fea_profile: standalone profiling harness for the static-stress solve (NOT a ctest — a
+  # manual perf tool). Meshes a beam -> fea_run_static under the in-process sampling profiler
+  # + AI_CAD_FEA_PROFILE phase timers, sweeping fineness. Same OCCT/Netgen DLL deps as above.
+  add_executable(fea_profile tools/fea_profile.cpp)
+  target_include_directories(fea_profile PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(fea_profile PRIVATE aicad_mesh aicad_geom_occt aicad_prof)
+  set_target_properties(fea_profile PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
   # Mesher auto-pick + exotic-type regression: structured-hex fallback to tet on non-box,
   # auto_type hex/tet selection, thin-wall layering, quad_surface, detect_box_geometry.
   add_executable(test_mesher_autopick tests/test_mesher_autopick.cpp)

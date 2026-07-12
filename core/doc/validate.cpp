@@ -1860,6 +1860,10 @@ vector<string> validate_assembly(const json& doc) {
                 errs.push_back(loc + ".transform: must be 16 floats (row-major)");
             for (const char* flag : {"fixed", "suppressed"})
                 if (!get(k, flag).is_boolean()) errs.push_back(loc + "." + flag + ": required bool");
+            // `hidden` is optional (older docs omit it; absent => visible). Only its type is
+            // constrained. Renderer-only: a hidden component still solves mates / counts in BOM.
+            if (k.contains("hidden") && !k["hidden"].is_null() && !k["hidden"].is_boolean())
+                errs.push_back(loc + ".hidden: must be bool");
         }
     }
 

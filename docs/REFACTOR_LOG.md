@@ -1193,3 +1193,25 @@ solver), #27 full undeformed translucent ghost (scale slider + edge-cage referen
 overlay zeroed-DISP mode shape (core/python solver bug). Gotcha: sim_manager.cpp result draw path
 only calls drawSegments per band, so streamline arrowheads are wireframe barbs (band-colored), not
 solid cones. Live-process caution: never cp over dist .so (SIGBUS) — relink-only builds are safe.
+
+## 2026-07-12 — assembly open perf: build caches + no-copy placement + parallel loads
+
+Assembly opens were re-compiling and re-meshing all components every time (rocket-plane: 14.3s
+cold, 2.7s warm; >66% BRepMesh). Four changes: (1) `placed_world_shape` places rigid transforms
+via `Moved(TopLoc_Location)` instead of `BRepBuilderAPI_Transform(copy=true)` — the deep copy
+minted fresh TShapes so OCCT's triangulation cache never hit; non-rigid keeps the copy path.
+(2) `write_aicm_assembly` tessellates each component ONCE at identity into a per-TShape
+`AicmBody` cache (entry pins the shape — no pointer ABA) and emits instances via
+`geom::transform_body_rigid` (new, tessellate.{h,cpp}); `LoadedComponent` now builds its
+compound once so the TShape key is stable. (3) `doc_save` embeds `cache.brep`
+(`brep_cache_encode/decode`, stepplus.{h,cpp}) — compiled bodies, BinTools **no triangulation**
+(restored triangulation sends BRepMesh into runaway Delaunay on NURBS faces: 5.3GB RSS on the
+lofted wing, OCCT 7.9 — don't re-enable) — and assemblies get their own `cache.json`/`cache.aicm`
+gated on doc-hash + engine key + per-component `{path,size,mtime}` fingerprints + `solved:true`
+(only ever written after a fully-ok build; atomic tmp+rename ⇒ crash-safe). `doc_open`'s assembly
+branch replays it display-only (asm_result stays null; every consumer already lazy-rebuilds).
+(4) `compile_assembly` prefetches component loads on a thread pool (per-key shared_future dedup
+in `load_component`; kill switch `AICAD_ASM_PARALLEL_LOAD=0`). Contract §4 appended
+(contracts/stepplus.md). Measured (rocket-plane, 29 parts): cold 14.3s→8.3s, warm 2.7s→18ms,
+component-changed reopen →3.1s, unchanged reopen →51ms. Deferred: seed the assembly tess cache
+from a part's `cache.aicm` (needs a core-side AICM reader); LRU caps on the component/tess caches.

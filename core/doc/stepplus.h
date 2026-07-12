@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <TopoDS_Shape.hxx>
 
 namespace aicad::doc {
 
@@ -56,5 +57,17 @@ std::string stepplus_doc_hash(const nlohmann::json& doc);
 // change to the geometry compiler that could alter output MUST bump the schema constant so
 // stale caches from older engines are rejected. Mismatch on open -> full rebuild.
 std::string stepplus_cache_engine_key();
+
+// --- solved-bodies BREP cache blob (the `cache.brep` container entry) ---------------
+// doc_save embeds the compiled bodies (BREP **with triangulation**, BinTools VERSION_4)
+// so an assembly can load this part as a component WITHOUT re-running compile_document
+// or re-meshing. Same validity gates as cache.aicm (engine key + doc hash) plus an
+// explicit `solved: true` flag in the cache.json header — the flag is only ever written
+// after a fully-ok rebuild and the whole container is written atomically (tmp+rename),
+// so a crash mid-rebuild can never persist a half-built result.
+// Layout: "AICBREP1" magic, u64 body count, then per body u64 length + BinTools stream.
+std::string brep_cache_encode(const std::vector<TopoDS_Shape>& bodies);
+// Throws OpError("io_error", ...) on a corrupt blob; callers treat that as a cache miss.
+std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob);
 
 }  // namespace aicad::doc

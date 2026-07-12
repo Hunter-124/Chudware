@@ -332,4 +332,39 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
     return body;
 }
 
+void transform_body_rigid(aicm::AicmBody& body, const gp_Trsf& t) {
+    // 3x4 row-major from gp_Trsf (Value is 1-based: rows 1..3, cols 1..4).
+    double m[3][4];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) m[r][c] = t.Value(r + 1, c + 1);
+    auto xform_points = [&](aicm::CowVec<float>& a) {
+        const std::size_t n = a.size();
+        for (std::size_t i = 0; i + 2 < n; i += 3) {
+            const double x = a[i], y = a[i + 1], z = a[i + 2];
+            a[i]     = static_cast<float>(m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3]);
+            a[i + 1] = static_cast<float>(m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3]);
+            a[i + 2] = static_cast<float>(m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3]);
+        }
+    };
+    xform_points(body.pos);
+    xform_points(body.edge_pts);
+    // Normals: rotation only (rigid => inverse-transpose == rotation).
+    {
+        aicm::CowVec<float>& a = body.nrm;
+        const std::size_t n = a.size();
+        for (std::size_t i = 0; i + 2 < n; i += 3) {
+            const double x = a[i], y = a[i + 1], z = a[i + 2];
+            a[i]     = static_cast<float>(m[0][0] * x + m[0][1] * y + m[0][2] * z);
+            a[i + 1] = static_cast<float>(m[1][0] * x + m[1][1] * y + m[1][2] * z);
+            a[i + 2] = static_cast<float>(m[2][0] * x + m[2][1] * y + m[2][2] * z);
+        }
+    }
+    for (aicm::VertRec& vr : body.verts) {
+        const double x = vr.xyz[0], y = vr.xyz[1], z = vr.xyz[2];
+        vr.xyz[0] = static_cast<float>(m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3]);
+        vr.xyz[1] = static_cast<float>(m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3]);
+        vr.xyz[2] = static_cast<float>(m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3]);
+    }
+}
+
 }  // namespace geom

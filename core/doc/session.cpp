@@ -1989,7 +1989,11 @@ void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
     if (doc.contains("components") && doc["components"].is_array())
         for (json& c : doc["components"])
             if (c.value("id", std::string()) == kid) {
-                for (const char* k : {"transform", "name", "suppressed", "fixed"})
+                // `hidden`: component body is skipped in the renderer (host-side bodyVisible
+                // mask, re-derived from this flag on every load) but still participates in the
+                // mate solve / interference / BOM — unlike `suppressed`, which drops the
+                // component from the build entirely. Persisted so hide survives save + undo.
+                for (const char* k : {"transform", "name", "suppressed", "fixed", "hidden"})
                     if (op.contains(k) && !op[k].is_null()) c[k] = op[k];
                 return;
             }
@@ -3207,21 +3211,61 @@ void rebuild_assembly(Session& s) {
 
 // Tessellate each component (world-placed + optional explode offset) as one AICM body
 // and write the AICM (port of session.py::_write_aicm_assembly). Returns (path, bodies-meta).
-std::pair<std::string, json> write_aicm_assembly(Session& s) {
+// `blob_out` (optional) receives the raw AICM bytes so doc_save can persist them as the
+// assembly's cache.aicm without re-tessellating.
+std::pair<std::string, json> write_aicm_assembly(Session& s,
+                                                 std::vector<uint8_t>* blob_out = nullptr) {
     json bodies_meta = json::array();
     std::vector<aicm::AicmBody> tesses;
     std::map<std::string, Eigen::Vector3d> offsets;
     if (s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
     const AssemblyResult* ares = s.asm_result.get();
     if (ares) {
+        // Local-frame tessellation cache: each component's mesh is computed ONCE per TShape
+        // (across opens, re-solves, drags and explodes — the load cache keeps shapes alive and
+        // stable) and per-instance world meshes are produced by a cheap rigid vertex transform.
+        // Even a "skip" BRepMesh pass costs a full model build per face (pcurve sampling,
+        // FaceChecker) — measured >50% of warm assembly opens before this cache.
+        static std::mutex s_asm_tess_mtx;
+        struct AsmTessEntry {
+            TopoDS_Shape shape;  // pins the TShape so the pointer key can't be recycled (ABA)
+            std::shared_ptr<const aicm::AicmBody> body;
+        };
+        static std::map<const void*, AsmTessEntry> s_asm_tess_cache;
         for (const AsmBodyOut& body : ares->bodies) {
             std::optional<Eigen::Vector3d> off;
             auto oit = offsets.find(body.component_id);
             if (oit != offsets.end()) off = oit->second;
-            TopoDS_Shape world = placed_world_shape(body, off);
             float color[3] = {body.color[0], body.color[1], body.color[2]};
-            aicm::AicmBody bt = ::geom::tessellate_body(world, static_cast<uint32_t>(body.body_id),
-                                                        body.name, color);
+            const gp_Trsf t = placed_world_trsf(body, off);
+            const bool rigid = std::abs(t.ScaleFactor() - 1.0) < 1e-12 && !t.IsNegative();
+            aicm::AicmBody bt;
+            if (rigid) {
+                const void* key = body.shape_local.TShape().get();
+                std::shared_ptr<const aicm::AicmBody> local;
+                {
+                    std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                    auto it = s_asm_tess_cache.find(key);
+                    if (it != s_asm_tess_cache.end()) local = it->second.body;
+                }
+                if (!local) {
+                    // Tessellate at IDENTITY location so the mesh is reusable for every
+                    // instance/placement of this component.
+                    local = std::make_shared<const aicm::AicmBody>(::geom::tessellate_body(
+                        body.shape_local.Located(TopLoc_Location()), 0, std::string(), color));
+                    std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                    s_asm_tess_cache[key] = AsmTessEntry{body.shape_local, local};
+                }
+                bt = *local;  // COW buffers — O(1) until the transform detaches
+                bt.body_id = static_cast<uint32_t>(body.body_id);
+                bt.name = body.name;
+                bt.color[0] = color[0]; bt.color[1] = color[1]; bt.color[2] = color[2];
+                if (t.Form() != gp_Identity) ::geom::transform_body_rigid(bt, t);
+            } else {
+                TopoDS_Shape world = placed_world_shape(body, off);
+                bt = ::geom::tessellate_body(world, static_cast<uint32_t>(body.body_id),
+                                             body.name, color);
+            }
             tesses.push_back(std::move(bt));
             bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
                                    {"color", {body.color[0], body.color[1], body.color[2]}},
@@ -3231,6 +3275,7 @@ std::pair<std::string, json> write_aicm_assembly(Session& s) {
         }
     }
     std::vector<uint8_t> blob = aicm::write_aicm(tesses);
+    if (blob_out) *blob_out = blob;
     std::string path = publish_doc_aicm(s.doc_id, s.revision, blob);
     if (path.empty() && !blob.empty()) {
         // Last-resort file write if publish fully failed.
@@ -3242,8 +3287,9 @@ std::pair<std::string, json> write_aicm_assembly(Session& s) {
 }
 
 // The assembly ops-response (port of the assembly branch of session.py::_ops_response).
-json ops_response_assembly(Session& s, const json& id_map) {
-    auto [aicm_path, bodies_meta] = write_aicm_assembly(s);
+json ops_response_assembly(Session& s, const json& id_map,
+                           std::vector<uint8_t>* aicm_blob_out = nullptr) {
+    auto [aicm_path, bodies_meta] = write_aicm_assembly(s, aicm_blob_out);
     const AssemblyResult* ares = s.asm_result.get();
 
     json feature_status = json::array();
@@ -8903,6 +8949,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     // from features. Always erase first so a failed/again-uncached save never ships a stale cache.
     s.extra_entries.erase("cache.json");
     s.extra_entries.erase("cache.aicm");
+    s.extra_entries.erase("cache.brep");
     try {
         if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1") {
             const CompileResult& cr = ensure_compiled(s);
@@ -8913,17 +8960,55 @@ json doc_save(const std::string& doc_id, const std::string& path) {
                 json cached = ops_response(s, cr, json::object(), /*with_tess=*/true);
                 if (cached.contains("tess") && cached["tess"].is_object())
                     cached["tess"].erase("aicm_path");  // machine/temp-specific; rebuilt on open
+                // `solved: true` is the crash-safety gate: it is ONLY ever written here, after
+                // a fully-ok rebuild, and stepplus_save is atomic (tmp+rename) — a crash mid-
+                // rebuild can never persist a half-built cache. Readers treat absence as false.
                 json header = {{"engine", stepplus_cache_engine_key()},
                                {"doc_hash", stepplus_doc_hash(s.doc)},
+                               {"solved", true},
                                {"response", cached}};
                 s.extra_entries["cache.json"] = header.dump();
                 s.extra_entries["cache.aicm"] =
                     std::string(reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
+                // Solved-bodies BREP (with triangulation): lets an assembly load this part as
+                // a component without re-running compile_document or BRepMesh.
+                s.extra_entries["cache.brep"] = brep_cache_encode(cr.shapes);
+            }
+        } else if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.asm/1") {
+            // A cache-hit open leaves asm_result empty; rebuild here so a plain re-save
+            // doesn't strip the cache (components are hot in the load cache, so it's cheap).
+            if (!s.asm_result) rebuild_assembly(s);
+            // Assembly persisted-geometry cache: the solved, tessellated scene + the component
+            // fingerprints it was built from. doc_open replays it only when the doc hash,
+            // engine key AND every component file (path+size+mtime) are unchanged — display-
+            // only, asm_result stays empty until the first interactive op lazily rebuilds.
+            const AssemblyResult& ar = *s.asm_result;
+            bool all_ok = !ar.bodies.empty() && ar.converged;
+            for (const AsmComponentStatus& cs : ar.component_status)
+                if (!cs.ok) { all_ok = false; break; }
+            if (all_ok) {
+                std::vector<uint8_t> blob;
+                json cached = ops_response_assembly(s, json::object(), &blob);
+                if (cached.contains("tess") && cached["tess"].is_object())
+                    cached["tess"].erase("aicm_path");
+                const std::string base_dir =
+                    std::filesystem::path(target).parent_path().string();
+                json header = {{"engine", stepplus_cache_engine_key()},
+                               {"doc_hash", stepplus_doc_hash(s.doc)},
+                               {"solved", true},
+                               {"components", asm_component_fingerprints(s.doc, base_dir)},
+                               {"response", cached}};
+                if (!blob.empty()) {
+                    s.extra_entries["cache.json"] = header.dump();
+                    s.extra_entries["cache.aicm"] =
+                        std::string(reinterpret_cast<const char*>(blob.data()), blob.size());
+                }
             }
         }
     } catch (...) {
         s.extra_entries.erase("cache.json");  // never let cache generation break a save
         s.extra_entries.erase("cache.aicm");
+        s.extra_entries.erase("cache.brep");
     }
 
     std::string out = stepplus_save(s.doc, target, s.extra_entries);
@@ -8986,10 +9071,52 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     if (stored.is_assembly()) {
         // Assemblies compile via rebuild_assembly / asm_result — NOT compile_document —
         // exactly as doc_new(kind=assembly) does. base_dir is derived from stored.path
-        // inside rebuild_assembly, so the components' saved source paths resolve. The
-        // part-only geometry cache below does not apply, so we skip straight to the response.
-        rebuild_assembly(stored);
-        resp = ops_response_assembly(stored, json::object());
+        // inside rebuild_assembly, so the components' saved source paths resolve.
+        //
+        // Persisted-geometry fast path (assembly flavour of the part cache below): if the
+        // container carries a solved cache whose engine key + doc hash match AND every
+        // component file is byte-for-byte the one the cache was built from (path+size+mtime
+        // fingerprints), replay the saved response + mesh without loading a single
+        // component. asm_result stays empty — the first interactive op that needs real
+        // geometry lazily rebuilds (every consumer already guards with rebuild_assembly).
+        bool asm_cache_hit = false;
+        {
+            auto cj = stored.extra_entries.find("cache.json");
+            auto ca = stored.extra_entries.find("cache.aicm");
+            if (cj != stored.extra_entries.end() && ca != stored.extra_entries.end()) {
+                try {
+                    json header = json::parse(cj->second);
+                    const std::string base_dir =
+                        std::filesystem::path(path).parent_path().string();
+                    if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                        header.value("doc_hash", std::string()) ==
+                            stepplus_doc_hash(stored.doc) &&
+                        header.value("solved", false) &&
+                        header.contains("response") && header["response"].is_object() &&
+                        asm_fingerprints_match(stored.doc, base_dir,
+                                               header.value("components", json()))) {
+                        resp = header["response"];
+                        std::vector<uint8_t> blob(ca->second.begin(), ca->second.end());
+                        std::string ap = publish_doc_aicm(stored.doc_id, stored.revision, blob);
+                        if (!ap.empty()) {
+                            if (!resp.contains("tess") || !resp["tess"].is_object())
+                                resp["tess"] = json::object();
+                            resp["tess"]["aicm_path"] = ap;
+                        }
+                        resp["revision"] = stored.revision;
+                        resp["tree"] = stored.doc;
+                        resp["cache_hit"] = true;
+                        asm_cache_hit = true;
+                    }
+                } catch (...) {
+                    asm_cache_hit = false;  // stale/corrupt cache -> full rebuild
+                }
+            }
+        }
+        if (!asm_cache_hit) {
+            rebuild_assembly(stored);
+            resp = ops_response_assembly(stored, json::object());
+        }
     } else {
     // Fast cold-open via the persisted geometry cache: if the container carries a valid
     // cache.json/cache.aicm (engine key + doc hash both match the loaded tree), return the

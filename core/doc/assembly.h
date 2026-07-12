@@ -33,6 +33,7 @@
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
+#include <gp_Trsf.hxx>
 
 #include "mate/mate.h"
 
@@ -98,6 +99,18 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
                                 const std::optional<aicad::mate::WarmMap>& warm = std::nullopt,
                                 const std::optional<aicad::mate::Drag>& drag = std::nullopt);
 
+// Fingerprints of every non-suppressed component's resolved source file
+// ([{path, size, mtime}] — same identity the in-memory component cache keys on). Written
+// into the assembly's persisted-geometry cache header so doc_open can prove no component
+// file changed since the cache was saved; missing files fingerprint as size/mtime 0.
+nlohmann::json asm_component_fingerprints(const nlohmann::json& doc,
+                                          const std::string& base_dir);
+
+// True iff asm_component_fingerprints(doc, base_dir) == fp (order-sensitive — component
+// order is part of the identity). Any parse mismatch returns false (cache miss).
+bool asm_fingerprints_match(const nlohmann::json& doc, const std::string& base_dir,
+                            const nlohmann::json& fp);
+
 // Per-component explode offset vector (mm) from the doc's ``explode`` steps, scaled by
 // factor (port of assembly.py::explode_offsets).
 std::map<std::string, Eigen::Vector3d> explode_offsets(const nlohmann::json& doc, double factor);
@@ -106,5 +119,11 @@ std::map<std::string, Eigen::Vector3d> explode_offsets(const nlohmann::json& doc
 // offset) to its local shape. Port of assembly.py::placed_world_shape.
 TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
                                 const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
+
+// The gp_Trsf placed_world_shape applies (solved transform + optional explode offset).
+// Exposed so the assembly tessellation path can transform a CACHED local-frame mesh by
+// this instead of tessellating the world-placed shape per open/re-solve.
+gp_Trsf placed_world_trsf(const AsmBodyOut& body,
+                          const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
 
 }  // namespace aicad::doc

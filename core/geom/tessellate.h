@@ -10,6 +10,7 @@
 #include "geom/aicm.h"
 
 class TopoDS_Shape;
+class gp_Trsf;
 
 namespace geom {
 
@@ -31,6 +32,14 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
                                double lin_deflection = 0.0,
                                double ang_deflection = 0.35,
                                float metallic = 0.0f, float roughness = 0.5f);
+
+// Rigidly transform an already-tessellated body IN PLACE: positions, normals
+// (rotation only), edge polylines and B-rep vertex records. Lets the assembly
+// path tessellate each component ONCE in its local frame, cache the AicmBody,
+// and emit per-instance world meshes with a cheap vertex walk instead of
+// re-running BRepMesh per open/re-solve. Rigid transforms only (no scale/mirror
+// — callers keep the tessellate-the-world-shape path for those).
+void transform_body_rigid(aicm::AicmBody& body, const gp_Trsf& t);
 
 // --- tessellation micro-profiling (opt-in; near-zero when unread) ---------------
 // Splits tessellate_body's wall time into the BRepMesh meshing pass vs the

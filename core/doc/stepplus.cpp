@@ -17,8 +17,12 @@
 #include <ctime>
 #include <filesystem>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include <BinTools.hxx>
+#include <BinTools_FormatVersion.hxx>
 
 #include <miniz.h>
 
@@ -356,6 +360,60 @@ std::string stepplus_doc_hash(const json& doc) {
         return fnv1a_hex(canonical_doc_json(d));
     }
     return fnv1a_hex(canonical_doc_json(doc));
+}
+
+std::string brep_cache_encode(const std::vector<TopoDS_Shape>& bodies) {
+    std::string out = "AICBREP1";
+    auto put_u64 = [&out](uint64_t v) {
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    put_u64(bodies.size());
+    for (const TopoDS_Shape& s : bodies) {
+        std::ostringstream os(std::ios::binary);
+        // WITHOUT triangulation: BinTools-restored triangulation sends BRepMesh into a
+        // runaway Delaunay refinement on NURBS faces (measured 5.3GB RSS on a lofted wing
+        // vs 200MB for the same shape without it — OCCT 7.9). The shapes still skip
+        // compile_document; meshing happens once per session via the assembly tess cache,
+        // and unchanged-assembly reopens replay cache.aicm without meshing at all.
+        BinTools::Write(s, os, /*theWithTriangles=*/Standard_False,
+                        /*theWithNormals=*/Standard_False, BinTools_FormatVersion_VERSION_3);
+        std::string bytes = os.str();
+        put_u64(bytes.size());
+        out += bytes;
+    }
+    return out;
+}
+
+std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob) {
+    auto bad = [](const std::string& why) -> OpError {
+        return OpError("io_error", "cache.brep: " + why, json{{"reason", why}});
+    };
+    std::size_t pos = 0;
+    auto get_u64 = [&](const char* what) -> uint64_t {
+        if (pos + 8 > blob.size()) throw bad(std::string("truncated ") + what);
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i)
+            v |= static_cast<uint64_t>(static_cast<unsigned char>(blob[pos + i])) << (8 * i);
+        pos += 8;
+        return v;
+    };
+    if (blob.size() < 8 || blob.compare(0, 8, "AICBREP1") != 0) throw bad("bad magic");
+    pos = 8;
+    const uint64_t count = get_u64("count");
+    if (count > 100000) throw bad("implausible body count");
+    std::vector<TopoDS_Shape> bodies;
+    bodies.reserve(static_cast<std::size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        const uint64_t len = get_u64("length");
+        if (pos + len > blob.size()) throw bad("truncated body");
+        std::istringstream is(blob.substr(pos, static_cast<std::size_t>(len)), std::ios::binary);
+        pos += static_cast<std::size_t>(len);
+        TopoDS_Shape sh;
+        BinTools::Read(sh, is);
+        if (sh.IsNull()) throw bad("null shape");
+        bodies.push_back(sh);
+    }
+    return bodies;
 }
 
 std::string stepplus_cache_engine_key() {

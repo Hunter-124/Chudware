@@ -255,6 +255,7 @@ struct DocSession {
     std::vector<uint8_t>       bodyVisible;         // Solid Bodies hide/show mask (per renderer slot)
     std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
     std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
+    std::unordered_set<std::string> autoHiddenPlanes; // user datum planes auto-hidden once referenced
     std::string                modelInfo;            // (DocSession parked copy — see AppState field)
     std::vector<PartInfo>      asmParts;
     FitReport                  asmFit;
@@ -925,9 +926,20 @@ struct AppState {
     // route their eye straight to bodyVisible instead. Consulted by the sketch-ghost renderer; per-doc
     // (parked in DocSession, cleared by clearViewportForNewDoc).
     std::unordered_set<std::string> hiddenFeatures;
+    // Auto-hide bookkeeping for USER reference planes (datum-plane features). When a 3D feature
+    // starts referencing a user datum plane (directly, or via a sketch that sits on it), that
+    // plane's fid is auto-added to hiddenFeatures ONCE and recorded here (SolidWorks behavior).
+    // Recording it means the user can re-show the plane via the FM eye and the auto-hide won't
+    // fight the toggle on the next rebuild. Per-doc; cleared by clearViewportForNewDoc.
+    std::unordered_set<std::string> autoHiddenPlanes;
     // Push bodyVisible to the renderer (per-slot draw skip) and the id pass (pick skip). Call
     // after any toggle; loadDocMesh calls it after every setMeshes/setDoc.
     void applyBodyVisibility();
+    // Re-derive the Solid Bodies / assembly-component hide mask from the current doc tree after a
+    // rebuild. For assemblies: reads each non-suppressed component's `hidden` flag (persisted in
+    // document.json) and drops the matching renderer body slot. Also auto-hides user reference
+    // planes that a 3D feature now references. Called at the tail of the mesh load.
+    void applyDocDrivenVisibility(const nlohmann::json& tree);
     // Push hiddenFeatures to the renderer so hidden DATUM features (ref axis/plane/point/csys) drop
     // out of the reference-overlay draw immediately. Call after an eye toggle, a tab switch, and
     // every datum rebuild (the datum geometry is otherwise re-pushed only on a document mutation).

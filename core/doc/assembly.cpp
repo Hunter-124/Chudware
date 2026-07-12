@@ -9,11 +9,17 @@
 
 #define _USE_MATH_DEFINES
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <mutex>
+#include <thread>
+
+#include <TopLoc_Location.hxx>
 
 #include <BRep_Builder.hxx>
 #include <BRepAdaptor_Curve.hxx>
@@ -50,6 +56,9 @@ const std::vector<double> kIdent16 = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 
 // (faces/edges/verts described once, parallel to the kernel sub-shape lists).
 struct LoadedComponent {
     std::vector<TopoDS_Shape> bodies;             // LOCAL frame
+    TopoDS_Shape compound;                        // compound_of(bodies), built ONCE — a stable
+                                                  // TShape so downstream per-shape caches
+                                                  // (assembly tess cache) hit across rebuilds
     std::vector<TopoInfo> faces;                  // across all bodies, flat
     std::vector<TopoInfo> edges;
     std::vector<TopoInfo> verts;
@@ -57,8 +66,11 @@ struct LoadedComponent {
     std::vector<TopoDS_Shape> edge_shapes;
 };
 
+// Keyed by abspath:mtime. Values are shared_future-of-shared_ptr so concurrent loaders of
+// the SAME file share one load (first caller populates, the rest wait), while loads of
+// DIFFERENT files run fully in parallel — the mutex only guards the map itself.
 std::mutex g_cache_mtx;
-std::map<std::string, LoadedComponent> g_load_cache;
+std::map<std::string, std::shared_future<std::shared_ptr<const LoadedComponent>>> g_load_cache;
 
 std::string resolve_source_path(const std::string& path, const std::string& base_dir) {
     std::filesystem::path p(path);
@@ -107,6 +119,27 @@ std::vector<TopoDS_Shape> load_bodies(const std::string& abspath) {
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
         StepPlusDoc loaded = stepplus_open(abspath);  // throws OpError on a bad file
+        // Solved-bodies fast path: a part saved after a fully-ok rebuild embeds its compiled
+        // bodies as cache.brep (BREP + triangulation) with a `solved` flag in the cache.json
+        // header. When the engine key + doc hash still match, those bodies ARE the exact
+        // compile_document output — load them directly and skip the rebuild AND the re-mesh.
+        // Any mismatch/corruption falls through to the full compile.
+        {
+            auto cj = loaded.extra.find("cache.json");
+            auto cb = loaded.extra.find("cache.brep");
+            if (cj != loaded.extra.end() && cb != loaded.extra.end()) {
+                try {
+                    json header = json::parse(cj->second);
+                    if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                        header.value("doc_hash", std::string()) ==
+                            stepplus_doc_hash(loaded.doc) &&
+                        header.value("solved", false)) {
+                        std::vector<TopoDS_Shape> bodies = brep_cache_decode(cb->second);
+                        if (!bodies.empty()) return bodies;
+                    }
+                } catch (...) { /* stale/corrupt cache -> full compile below */ }
+            }
+        }
         CompileResult r = compile_document(loaded.doc, env_from_doc(loaded.doc));
         if (r.shapes.empty())
             throw OpError("import_failed", "component '" + abspath + "' produced no bodies",
@@ -125,12 +158,15 @@ std::vector<TopoDS_Shape> load_bodies(const std::string& abspath) {
     return bodies;
 }
 
+TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined below
+
 // Describe every face/edge/vertex of the component's bodies (local frame) for mate
 // resolution (port of assembly.py::_describe_component). Flat across all bodies in
 // body order; indices re-numbered contiguously.
 LoadedComponent describe_component(std::vector<TopoDS_Shape> bodies) {
     LoadedComponent lc;
     lc.bodies = std::move(bodies);
+    lc.compound = compound_of(lc.bodies);
     int fidx = 0, eidx = 0, vidx = 0;
     for (const TopoDS_Shape& bo : lc.bodies) {
         std::vector<TopoInfo> faces = describe_faces(bo);
@@ -153,19 +189,46 @@ LoadedComponent describe_component(std::vector<TopoDS_Shape> bodies) {
     return lc;
 }
 
-const LoadedComponent& load_component(const std::string& path, const std::string& base_dir) {
-    std::string abspath = resolve_source_path(path, base_dir);
+std::string component_cache_key(const std::string& abspath) {
     double mtime = 0.0;
     std::error_code ec;
     auto ftime = std::filesystem::last_write_time(abspath, ec);
     if (!ec) mtime = static_cast<double>(ftime.time_since_epoch().count());
-    std::string key = abspath + ":" + std::to_string(static_cast<long long>(mtime));
+    return abspath + ":" + std::to_string(static_cast<long long>(mtime));
+}
 
-    std::lock_guard<std::mutex> lk(g_cache_mtx);
-    auto it = g_load_cache.find(key);
-    if (it != g_load_cache.end()) return it->second;
-    LoadedComponent lc = describe_component(load_bodies(abspath));
-    return g_load_cache[key] = std::move(lc);
+const LoadedComponent& load_component(const std::string& path, const std::string& base_dir) {
+    const std::string abspath = resolve_source_path(path, base_dir);
+    const std::string key = component_cache_key(abspath);
+
+    // First caller for this key installs a promise and loads OUTSIDE the lock; concurrent
+    // callers for the same key wait on the shared future instead of loading twice.
+    std::shared_future<std::shared_ptr<const LoadedComponent>> fut;
+    std::shared_ptr<std::promise<std::shared_ptr<const LoadedComponent>>> mine;
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mtx);
+        auto it = g_load_cache.find(key);
+        if (it != g_load_cache.end()) {
+            fut = it->second;
+        } else {
+            mine = std::make_shared<std::promise<std::shared_ptr<const LoadedComponent>>>();
+            fut = g_load_cache[key] = mine->get_future().share();
+        }
+    }
+    if (mine) {
+        try {
+            auto lc = std::make_shared<const LoadedComponent>(
+                describe_component(load_bodies(abspath)));
+            mine->set_value(lc);
+        } catch (...) {
+            mine->set_exception(std::current_exception());
+            // A failed load is NOT cached (pre-existing semantics: a fixed file re-loads).
+            // Waiters already holding `fut` still get the exception; the map just forgets it.
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_load_cache.erase(key);
+        }
+    }
+    return *fut.get();  // re-throws the loader's exception for every waiter
 }
 
 // ---------------------------------------------------------------- mate-ref geometry
@@ -515,6 +578,38 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                            ? doc["mates"] : json::array();
 
     // --- load every component -------------------------------------------
+    // Prefetch pass: components are independent, so uncached loads (compile or cache.brep
+    // decode, both CPU-bound) run in parallel worker threads; the per-key shared_future in
+    // load_component dedups same-file components. The serial loop below then hits the cache.
+    // Kill-switch: AICAD_ASM_PARALLEL_LOAD=0.
+    {
+        const char* env = std::getenv("AICAD_ASM_PARALLEL_LOAD");
+        const bool par = !(env && env[0] == '0');
+        if (par && components.size() > 1) {
+            std::vector<std::string> paths;
+            for (const json& comp : components) {
+                const std::string p = comp.contains("source") && comp["source"].is_object()
+                                          ? comp["source"].value("path", std::string())
+                                          : std::string();
+                if (!p.empty()) paths.push_back(p);
+            }
+            const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+            const std::size_t n_workers = std::min<std::size_t>(paths.size(), hw);
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> pool;
+            pool.reserve(n_workers);
+            for (std::size_t w = 0; w < n_workers; ++w)
+                pool.emplace_back([&]() {
+                    for (std::size_t i = next.fetch_add(1); i < paths.size();
+                         i = next.fetch_add(1)) {
+                        try {
+                            load_component(paths[i], base_dir);
+                        } catch (...) { /* reported per-component in the serial loop */ }
+                    }
+                });
+            for (std::thread& t : pool) t.join();
+        }
+    }
     std::map<std::string, const LoadedComponent*> loaded;
     for (const json& comp : components) {
         const std::string cid = comp.value("id", std::string());
@@ -601,7 +696,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         body.component_id = cid;
         body.name = comp.contains("name") && comp["name"].is_string() && !comp["name"].get<std::string>().empty()
                         ? comp["name"].get<std::string>() : cid;
-        body.shape_local = compound_of(lit->second->bodies);
+        body.shape_local = lit->second->compound;
         body.transform = xform;
         body.color = component_color(ordinal - 1);
         res.bodies.push_back(std::move(body));
@@ -639,6 +734,35 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     return res;
 }
 
+json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
+    json fp = json::array();
+    if (!doc.contains("components") || !doc["components"].is_array()) return fp;
+    for (const json& c : doc["components"]) {
+        if (c.value("suppressed", false)) continue;
+        const std::string path = c.contains("source") && c["source"].is_object()
+                                     ? c["source"].value("path", std::string())
+                                     : std::string();
+        const std::string abspath = path.empty() ? path : resolve_source_path(path, base_dir);
+        uint64_t size = 0;
+        long long mtime = 0;
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(abspath, ec);
+        if (!ec) size = static_cast<uint64_t>(sz);
+        auto ft = std::filesystem::last_write_time(abspath, ec);
+        if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
+        fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+    }
+    return fp;
+}
+
+bool asm_fingerprints_match(const json& doc, const std::string& base_dir, const json& fp) {
+    try {
+        return fp.is_array() && asm_component_fingerprints(doc, base_dir) == fp;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::map<std::string, Eigen::Vector3d> explode_offsets(const json& doc, double factor) {
     std::map<std::string, Eigen::Vector3d> out;
     if (!doc.contains("explode") || !doc["explode"].is_array()) return out;
@@ -656,14 +780,28 @@ std::map<std::string, Eigen::Vector3d> explode_offsets(const json& doc, double f
     return out;
 }
 
-TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
-                                const std::optional<Eigen::Vector3d>& explode_offset) {
+gp_Trsf placed_world_trsf(const AsmBodyOut& body,
+                          const std::optional<Eigen::Vector3d>& explode_offset) {
     gp_Trsf t = trsf_from_xform16(body.transform);
     if (explode_offset && explode_offset->cwiseAbs().maxCoeff() > 1e-9) {
         gp_Trsf shift;
-        shift.SetTranslation(gp_Vec((*explode_offset)[0], (*explode_offset)[1], (*explode_offset)[2]));
+        shift.SetTranslation(
+            gp_Vec((*explode_offset)[0], (*explode_offset)[1], (*explode_offset)[2]));
         t = shift * t;  // Pos(off) * shape (explode applied in world)
     }
+    return t;
+}
+
+TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
+                                const std::optional<Eigen::Vector3d>& explode_offset) {
+    gp_Trsf t = placed_world_trsf(body, explode_offset);
+    // Rigid placement via TopLoc_Location — NO geometry copy. BRepBuilderAPI_Transform with
+    // copy=true minted fresh TShapes for every placement, so OCCT's per-face triangulation
+    // cache could never hit and the whole assembly re-meshed on every open/re-solve/explode
+    // (measured 50%+ of assembly-open time in BRepMesh). Mate transforms are rigid, so a
+    // Moved() location is exact; anything non-rigid (scale/mirror) keeps the copying path.
+    if (std::abs(t.ScaleFactor() - 1.0) < 1e-12 && !t.IsNegative())
+        return body.shape_local.Moved(TopLoc_Location(t));
     BRepBuilderAPI_Transform xf(body.shape_local, t, true);
     return xf.Shape();
 }

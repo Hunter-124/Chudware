@@ -33,3 +33,19 @@
 - Extension is literally `.step+`. Save As also offers plain `.step` (geometry only) with a
   one-time "parametrics are not included in plain STEP" notice.
 - Atomic save: write to `<name>.step+.tmp`, then replace (no torn files on crash).
+
+## 4. Persisted-geometry cache entries (additive, 2026-07-12)
+
+Optional, display/build-acceleration only; `document.json` stays the sole source of truth.
+All are written by `doc_save` ONLY after a fully-ok rebuild and are erased first on every
+save, so combined with atomic save a crash mid-rebuild can never persist a half-built cache.
+Readers validate `cache.json`'s `engine` (engine+cache-schema key) + `doc_hash` (FNV-1a of
+canonical `document.json`, volatile `id` stripped) + `solved: true` and treat ANY mismatch
+or parse error as a cache miss (full rebuild). Writers that don't understand these entries
+just preserve them (rule §3.1) or drop them — both are safe.
+
+| entry | doc kind | contents |
+|---|---|---|
+| `cache.json` | part + asm | header `{engine, doc_hash, solved: true, response}`; for assemblies also `components`: fingerprints `[{path, size, mtime}]` of every non-suppressed component's resolved source file — reopen replays the cache only if ALL still match |
+| `cache.aicm` | part + asm | the saved tessellation (AICM blob), STORED uncompressed |
+| `cache.brep` | part | compiled bodies as `"AICBREP1"` magic · u64 count · per-body u64 length + BinTools stream (**no triangulation** — BinTools-restored triangulation triggers runaway BRepMesh refinement on NURBS faces, OCCT 7.9); lets an assembly load this part as a component without re-running `compile_document` |

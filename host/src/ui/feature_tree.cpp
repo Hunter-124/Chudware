@@ -24,6 +24,7 @@
 #include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
 
 #include "feature_tree.h"
+#include "component_features.h"  // assembly tree: cached component `.step+` feature list
 #include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
@@ -1637,6 +1638,51 @@ static void categoryColorRGB(const std::string& type, bool isCut, float out[3]) 
     out[0] = c.x; out[1] = c.y; out[2] = c.z;
 }
 
+// Resolve a component's `source.path` (relative paths resolve against the OPEN assembly
+// file's directory) to an absolute on-disk path. Returns "" if there's no usable path
+// (e.g. the assembly was never saved so we have no anchor for a relative component).
+static std::string resolveComponentPath(const std::string& srcPath) {
+    if (srcPath.empty()) return std::string();
+    namespace fs = std::filesystem;
+    fs::path p(srcPath);
+    if (p.is_absolute()) return p.lexically_normal().string();
+    // Anchor against the active assembly's own directory (s_docPath == this doc's file).
+    if (s_docPath.empty()) return std::string();   // unsaved assembly: no anchor for a relative path
+    fs::path base = fs::path(s_docPath).parent_path();
+    return (base / p).lexically_normal().string();
+}
+
+// "Open Part" on a component row: open its source `.step+` as its OWN document tab, or —
+// if that file is already open in a (non-handoff) tab — just focus that tab instead of
+// opening a duplicate. Paths are compared with weakly_canonical so an assembly-relative
+// resolve matches a tab whose `.path` was stored verbatim from an earlier absolute open.
+// The actual open routes through the GL-thread request pump (st.requestOpenPath), the same
+// lane File>Open / Recent / file-drop use; it handles the aicad.asm-vs-part dispatch and
+// the DocMirror::open + tab creation.
+static void openComponentPart(AppState& st, const std::string& srcPath) {
+    const std::string abs = resolveComponentPath(srcPath);
+    if (abs.empty()) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Open Part: save the assembly first (component path is relative)");
+        return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path want = fs::weakly_canonical(fs::path(abs), ec);
+    if (ec) want = fs::path(abs).lexically_normal();
+    // Dedup against already-open non-handoff tabs (aiHandoff mirror tabs own their own
+    // lifecycle — never steal/focus those). Switch to the first match rather than reopening.
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const AppState::DocTab& t = st.docTabs[i];
+        if (t.aiHandoff || t.path.empty()) continue;
+        std::error_code e2;
+        fs::path have = fs::weakly_canonical(fs::path(t.path), e2);
+        if (e2) have = fs::path(t.path).lexically_normal();
+        if (have == want) { st.switchToTab(i); return; }
+    }
+    st.requestOpenPath = abs;   // drained next frame by app.cpp's GL-thread open pump
+}
+
 // ---- C20b: assembly tree (components + Mates folder) ----
 // Renders an aicad.asm/1 doc: each component as a "(f)"-fixed-marked row (SolidWorks), then a
 // Mates folder listing each mate as "Concentric1 (base<->peg)" with a suppress/delete context
@@ -1675,27 +1721,113 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (cname.empty()) cname = cid;
             bool fixed = jftbool(c, "fixed");
             bool suppressed = jftbool(c, "suppressed");
+            bool hidden = jftbool(c, "hidden");
             // Component vs subassembly icon (we only have parts for now; subassemblies = C24).
+            std::string srcPath;
             bool isAsm = false;
             if (c.contains("source") && c["source"].is_object()) {
-                std::string p = jfld(c["source"], "path");
-                std::string low = p; for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
+                srcPath = jfld(c["source"], "path");
+                std::string low = srcPath;
+                for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
                 isAsm = low.find(".asmstep") != std::string::npos;  // reserved; none today
             }
+            // A component with a source `.step+` is expandable — its OWN feature list nests
+            // underneath (read-only). Parts with no source path stay leaf nodes.
+            const bool expandable = !srcPath.empty();
             FStatus fs = getFeatureStatus(statusArr, cid);
 
             FmRowRect compRect = fmRowPill();
             // SolidWorks marks fixed components with a "(f)" prefix.
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
-            ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf |
-                ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                ImGuiTreeNodeFlags_FramePadding;   // pill-height node (red-pen round-2)
+            // A hidden component reads greyed/half-toned in the tree (mirrors the eye "closed" state).
+            if (hidden) ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
+            ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_SpanFullWidth |
+                ImGuiTreeNodeFlags_FramePadding |            // pill-height node (red-pen round-2)
+                ImGuiTreeNodeFlags_OpenOnArrow;             // expand via the arrow; double-click = Open Part
+            if (!expandable) lf |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
             ImVec2 compRowPos = ImGui::GetCursorScreenPos();
-            ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
-            treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]");
+            const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
+            treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]",
+                                hidden ? 0.5f : 1.0f);
+            if (hidden) ImGui::PopStyleColor();
+            // Double-click the row (not the toggle-arrow) opens the source part — the editing path.
+            if (expandable && ImGui::IsItemHovered() &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                !ImGui::IsMouseHoveringRect(compRowPos,
+                    ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
+                           compRowPos.y + ImGui::GetFontSize() * 1.5f)))
+                openComponentPart(st, srcPath);
+
+            // ---- component visibility ---------------------------------------------------------
+            // Persisted (asm_edit_component `hidden`), so undo/save work; a hidden component still
+            // solves mates / counts in BOM (only the body draw is skipped) — unlike suppress. Route
+            // the toggle through applyTreeOps like the mate suppress; the load path re-derives the
+            // renderer body mask from the flag. Both the right-edge eye and the right-click item
+            // drive the SAME op so they stay consistent (existing feature-row idiom).
+            ImVec2 cNodeMin = ImGui::GetItemRectMin();
+            ImVec2 cNodeMax = ImGui::GetItemRectMax();
+            float  cEyeSz   = 14.0f * ui::uiScale;
+            float  cEyePad  = 6.0f  * ui::uiScale;
+            ImVec2 cEyeMin(cNodeMax.x - cEyeSz - cEyePad,
+                           cNodeMin.y + (cNodeMax.y - cNodeMin.y - cEyeSz) * 0.5f);
+            ImVec2 cEyeMax(cEyeMin.x + cEyeSz, cEyeMin.y + cEyeSz);
+            bool   overCompEye = ImGui::IsMouseHoveringRect(cEyeMin, cEyeMax);
+            drawEyeGlyph(ImGui::GetWindowDrawList(), cEyeMin, cEyeMax, !hidden, overCompEye, fmSurf());
+            auto toggleCompHidden = [&](bool newHidden) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op","asm_edit_component"},{"id",cid},{"hidden",newHidden}}}), "component");
+            };
+            if (overCompEye) {
+                ImGui::SetTooltip(hidden ? "Show Component" : "Hide Component");
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
+            }
+            pushTreePopupGlass();
+            if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
+                if (expandable && ImGui::MenuItem("Open Part"))
+                    openComponentPart(st, srcPath);
+                if (expandable) ImGui::Separator();
+                if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
+                    toggleCompHidden(!hidden);
+                ImGui::EndPopup();
+            }
+            popTreePopupGlass();
+
             fmRowPillEnd(compRect);
             featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
+
+            // ---- nested feature list (read-only) ---------------------------------------------
+            // When expanded, show the component part's OWN features (icon + name), read from its
+            // `.step+` document.json via a (path, mtime) cache — no unzip/parse per frame, no
+            // blocking worker RPC. Editing is the Open-Part path, not these rows.
+            // `expandable && compOpen` == "the node actually pushed": a leaf returns compOpen=true
+            // under NoTreePushOnOpen but did NOT push, so it must skip TreePop (stack underflow).
+            if (expandable && compOpen) {
+                {
+                    const std::string abs = resolveComponentPath(srcPath);
+                    static const std::vector<ui::ComponentFeature> kNoFeats;
+                    const auto& feats = abs.empty() ? kNoFeats : ui::componentFeatures(abs);
+                    if (feats.empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.6f));
+                        ImGui::TextUnformatted(abs.empty() ? "(save the assembly to inspect)"
+                                                           : "(no features)");
+                        ImGui::PopStyleColor();
+                    }
+                    for (const auto& f : feats) {
+                        FmRowRect featRect = fmRowPill();
+                        ImGuiTreeNodeFlags ftf = ImGuiTreeNodeFlags_Leaf |
+                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
+                        ImVec2 fPos = ImGui::GetCursorScreenPos();
+                        ImGui::TreeNodeEx((f.name + "##cf_" + cid + "_" + f.id).c_str(), ftf);
+                        treeIconInArrowSlot(fPos, featureIcon(f.type), "[f]", 1.0f);
+                        fmRowPillEnd(featRect);
+                    }
+                }
+                ImGui::TreePop();   // matches the pushed (non-leaf) component node
+            }
             ++ci;
         }
     }

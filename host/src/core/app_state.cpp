@@ -1103,6 +1103,10 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
     st.hover = render::PickHit{};
     st.pickStatus.clear();
     st.hasDocMesh = true;
+    // Doc-driven visibility (runs AFTER docBodyIds/bodyVisible + hasDocMesh are set above): apply
+    // persisted assembly-component `hidden` flags to the body mask, and auto-hide user reference
+    // planes that a 3D feature now references. Guarded internally against non-matching schemas.
+    st.applyDocDrivenVisibility(st.docMirror.tree());
     return true;
 }
 
@@ -1128,6 +1132,7 @@ void AppState::clearViewportForNewDoc() {
     bodyVisible.clear();
     docBodyIds.clear();
     hiddenFeatures.clear();
+    autoHiddenPlanes.clear();
     // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
     // behavior). The FM eye toggle removes this entry to show it.
     hiddenFeatures.insert("point.origin");
@@ -1171,6 +1176,7 @@ void AppState::captureDocState(DocSession& s) {
     s.bodyVisible  = std::move(bodyVisible);
     s.docBodyIds   = std::move(docBodyIds);
     s.hiddenFeatures = std::move(hiddenFeatures);
+    s.autoHiddenPlanes = std::move(autoHiddenPlanes);
     s.modelInfo    = std::move(modelInfo);
     s.asmParts     = std::move(asmParts);
     s.asmFit       = std::move(asmFit);
@@ -1190,6 +1196,7 @@ void AppState::restoreDocState(DocSession& s) {
     bodyVisible  = std::move(s.bodyVisible);
     docBodyIds   = std::move(s.docBodyIds);
     hiddenFeatures = std::move(s.hiddenFeatures);
+    autoHiddenPlanes = std::move(s.autoHiddenPlanes);
     applyDatumVisibility();   // reflect this tab's datum hides in the renderer
     modelInfo    = std::move(s.modelInfo);
     asmParts     = std::move(s.asmParts);
@@ -1221,6 +1228,109 @@ void AppState::applyBodyVisibility() {
 
 void AppState::applyDatumVisibility() {
     if (renderer) renderer->setHiddenDatums(hiddenFeatures);
+}
+
+// Reserved reference datums (Front/Top/Right/origin/axes) are the app-owned overlays whose
+// auto-show/hide lives in viewport_panel (showPlane[]/originUserToggled). Only USER datum planes
+// (feature type "plane") are auto-hidden by this helper, so we never fight that path.
+static bool isReservedDatumFid(const std::string& s) {
+    return s == "origin" || s == "point.origin" ||
+           s == "plane.front" || s == "plane.top" || s == "plane.right" ||
+           s == "axis.x" || s == "axis.y" || s == "axis.z";
+}
+
+// Pull a datum feature id out of a selector value. Accepts {"kind":"datum","feature":"<fid>"}
+// (canonical) and the short {"datum":"<fid>"} form. Returns "" for face/edge/vertex selectors.
+static std::string datumFidOf(const nlohmann::json& sel) {
+    if (!sel.is_object()) return {};
+    if (sel.value("kind", std::string()) == "datum") {
+        auto it = sel.find("feature");
+        if (it != sel.end() && it->is_string()) return it->get<std::string>();
+    }
+    auto it = sel.find("datum");
+    if (it != sel.end() && it->is_string()) return it->get<std::string>();
+    return {};
+}
+
+void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
+    if (!tree.is_object()) return;
+    const bool isAsm = tree.value("schema", std::string()) == "aicad.asm/1";
+
+    if (isAsm) {
+        // Assembly: re-derive the per-component hide mask from document.json. The engine builds one
+        // body per NON-suppressed component, 1-based ordinal == body_id (assembly.cpp), so we walk
+        // components in tree order, skip suppressed (they produce no body), and for each `hidden`
+        // one drop the renderer slot whose docBodyId equals that ordinal. Suppressed components
+        // shift ordinals, so replicating the enumeration here is what keeps the mapping correct.
+        auto ci = tree.find("components");
+        if (ci == tree.end() || !ci->is_array()) return;
+        // Drive each component's body slot DIRECTLY from its `hidden` flag (two-way, idempotent).
+        // A same-body-set reload preserves bodyVisible (commitDocMeshFromParsed only resets it when
+        // the body-id list changes), and toggling `hidden` — unlike `suppressed` — leaves the body
+        // set identical. So an un-hide must actively set the slot back to 1: a one-way `=0` would
+        // never restore the body. In an assembly there's exactly one body per component, so keying
+        // the slot straight off the flag can't clobber a separate per-body toggle (there is none).
+        uint32_t ordinal = 0;
+        for (const auto& c : *ci) {
+            if (!c.is_object()) continue;
+            if (c.value("suppressed", false)) continue;   // no body built -> no slot
+            ++ordinal;                                      // matches assembly.cpp body_id
+            uint8_t vis = c.value("hidden", false) ? 0 : 1;
+            for (size_t slot = 0; slot < docBodyIds.size(); ++slot)
+                if (docBodyIds[slot] == ordinal && slot < bodyVisible.size())
+                    bodyVisible[slot] = vis;
+        }
+        applyBodyVisibility();
+        return;
+    }
+
+    // Part: auto-hide USER datum planes once a solid feature references them (SolidWorks tidies a
+    // reference plane out of view once you've sketched-and-built on it). We only act once there's
+    // a body (hasDocMesh) — the same "you've committed a 3D feature" signal the origin/plane
+    // auto-hide uses — and only ONCE per plane (recorded in autoHiddenPlanes), so a user who
+    // re-shows the plane via the FM eye keeps it shown across later rebuilds.
+    if (!hasDocMesh) return;
+    auto fi = tree.find("features");
+    if (fi == tree.end() || !fi->is_array()) return;
+
+    // 1) user datum-plane fids present in the tree.
+    std::unordered_set<std::string> userPlanes;
+    for (const auto& f : *fi) {
+        if (!f.is_object()) continue;
+        if (f.value("type", std::string()) != "plane") continue;
+        std::string fid = f.value("id", std::string());
+        if (!fid.empty() && !isReservedDatumFid(fid)) userPlanes.insert(fid);
+    }
+    if (userPlanes.empty()) return;
+
+    // 2) datum fids that a sketch sits on (sketch.refs.plane). A sketch is what a 3D feature
+    //    (extrude/revolve/…) consumes, so "sketch on plane P + a body exists" == "P is referenced
+    //    by a 3D feature" for the user's purposes. Also catch a 3D feature referencing a plane
+    //    directly via any datum-typed selector in its refs.
+    std::unordered_set<std::string> referenced;
+    auto scanRefsForDatums = [&](const nlohmann::json& refs) {
+        if (!refs.is_object()) return;
+        for (auto it = refs.begin(); it != refs.end(); ++it) {
+            const nlohmann::json& v = it.value();
+            if (v.is_object()) { std::string d = datumFidOf(v); if (!d.empty()) referenced.insert(d); }
+            else if (v.is_array())
+                for (const auto& e : v) { std::string d = datumFidOf(e); if (!d.empty()) referenced.insert(d); }
+        }
+    };
+    for (const auto& f : *fi) {
+        if (!f.is_object()) continue;
+        auto ri = f.find("refs");
+        if (ri != f.end()) scanRefsForDatums(*ri);
+    }
+
+    bool changed = false;
+    for (const std::string& p : userPlanes) {
+        if (!referenced.count(p)) continue;
+        if (autoHiddenPlanes.count(p)) continue;   // already auto-acted; respect any user re-show
+        autoHiddenPlanes.insert(p);
+        if (hiddenFeatures.insert(p).second) changed = true;
+    }
+    if (changed) applyDatumVisibility();
 }
 
 std::string AppState::pickLabel(const render::PickHit& h) const {

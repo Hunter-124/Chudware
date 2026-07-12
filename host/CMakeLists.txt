@@ -49,6 +49,21 @@ FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG v1.91.6-docking)
 
+# --- miniz (ZIP read for `.step+` component feature lists) ------------------
+# Same amalgamated release core uses (core/CMakeLists.txt). host talks to the
+# worker over IPC and does NOT link libaicad, so it vendors its own copy to read
+# document.json out of a component `.step+` for the assembly tree's nested rows.
+# The release ships miniz.c/miniz.h with no root CMakeLists, so populate + build
+# a tiny static lib ourselves (C is already enabled on this project).
+FetchContent_Declare(miniz
+  URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip)
+FetchContent_GetProperties(miniz)
+if(NOT miniz_POPULATED)
+  FetchContent_Populate(miniz)
+endif()
+add_library(aicad_host_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
+target_include_directories(aicad_host_miniz PUBLIC ${miniz_SOURCE_DIR})
+
 FetchContent_MakeAvailable(glfw stb json imgui)
 
 add_executable(Billet
@@ -86,6 +101,7 @@ add_executable(Billet
   ../services/worker/cpp_core.cpp
   ../services/worker/worker_router.cpp
   src/ui/feature_tree.cpp
+  src/ui/component_features.cpp  # assembly tree: cached read of a component `.step+` feature list
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)
   # --- end C16 ---
@@ -217,7 +233,7 @@ target_include_directories(Billet PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends)
-target_link_libraries(Billet PRIVATE glfw nlohmann_json::nlohmann_json)
+target_link_libraries(Billet PRIVATE glfw nlohmann_json::nlohmann_json aicad_host_miniz)
 if(UNIX AND NOT APPLE)
   target_link_libraries(Billet PRIVATE rt)  # shm_open (older glibc)
 endif()

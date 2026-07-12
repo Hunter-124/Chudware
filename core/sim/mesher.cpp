@@ -52,6 +52,8 @@
 #include <TopoDS_Shape.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <GProp_GProps.hxx>
+#include <BRepGProp.hxx>
 
 // nglib's C interface. The header declares plain function names but the implementation lives
 // inside `namespace nglib`, so include it in that namespace (the canonical usage — see
@@ -475,6 +477,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     // count across very different proportions: a thin plate, a long bracket and a cube all
     // mesh reasonably instead of the smallest-dimension heuristic exploding thin parts.
     double dx = 0.0, dy = 0.0, dz = 0.0;
+    double solid_vol = 0.0;  // real occupied volume (mm^3) — drives the element-count budget
     try {
         STEPControl_Reader rd;
         if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone)
@@ -490,6 +493,13 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         dx = std::fabs(xmax - xmin);
         dy = std::fabs(ymax - ymin);
         dz = std::fabs(zmax - zmin);
+        // Real solid volume for the mesh budget below (a bulky part has volume ~ diag^3, so
+        // diagonal-only sizing over-meshes it). Cheap; failure just falls back to bbox volume.
+        try {
+            GProp_GProps vp;
+            BRepGProp::VolumeProperties(shape, vp);
+            solid_vol = std::fabs(vp.Mass());
+        } catch (...) { solid_vol = 0.0; }
     } catch (...) {
         return fail("failed to read STEP bounding box");
     }
@@ -509,6 +519,37 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     // target is honored verbatim.)
     if (!explicit_size && std::isfinite(min_side) && min_side < 1e29)
         base = std::min(base, min_side);
+
+    // Volume-aware element budget. `base` comes from the DIAGONAL, but the tet count grows with
+    // the occupied VOLUME (~ base^-3): a BULKY solid (a plain block) silently explodes to
+    // hundreds of thousands of DOF — minutes of meshing + solving — while a slender part of the
+    // same diagonal stays small (measured: a 120x100x150 block hit 412k DOF / 96k tets at
+    // fineness 0.7). For AUTO sizing, estimate the linear-tet count and coarsen `base` upward so
+    // an interactive study stays fast. Budget scales with fineness (Draft small .. Fine large)
+    // and is overridable via AI_CAD_MESH_MAX_ELEMS. Explicit target_size_mm is honored verbatim.
+    // n_tets ~= C * vol / base^3, C~=6 (empirical Netgen tet packing).
+    if (!explicit_size) {
+        const double vol = solid_vol > 1e-9 ? solid_vol : (dx * dy * dz);
+        long budget = static_cast<long>(8000.0 + 52000.0 * fineness);  // ~8k Draft .. 60k Fine
+        if (const char* e = std::getenv("AI_CAD_MESH_MAX_ELEMS")) {
+            const long b = std::atol(e);
+            if (b > 0) budget = b;
+        }
+        constexpr double kTetPack = 6.0;
+        if (vol > 1e-9 && base > 1e-9) {
+            const double est = kTetPack * vol / (base * base * base);
+            if (est > static_cast<double>(budget)) {
+                const double base_new = base * std::cbrt(est / static_cast<double>(budget));
+                char buf[224];
+                std::snprintf(buf, sizeof(buf),
+                    "auto-coarsened for interactivity: est ~%.0fk tets exceeds %ldk budget -> "
+                    "element size %.2f->%.2f mm (raise Fine or set a target size for more detail)",
+                    est / 1000.0, budget / 1000, base, base_new);
+                out.note = out.note.empty() ? std::string(buf) : (out.note + "; " + buf);
+                base = base_new;
+            }
+        }
+    }
 
     // Auto size band. The lower bound used to be base*0.1 — a 10:1 spread. Combined with the
     // curvature refinement that can drive the local size down to MeshSizeMin, that let the

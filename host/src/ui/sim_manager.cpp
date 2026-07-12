@@ -1611,6 +1611,16 @@ void SimManager::applyResultField(AppState& st, Study& s) {
     st.colormapOn = true;
     st.renderer->setColormapMode(true);
     st.legendOn = st.docMeshHasScalar;
+    // Show the deformed shape at the auto (visible) scale EVERY time the result is (re)applied — not
+    // only on a fresh solve. clearResultOverlay() zeroes the renderer's deformScale_ whenever the
+    // overlay is hidden (tab/workspace switch, node change), and setMeshes re-applies only a *nonzero*
+    // standing scale — so without this a re-shown result would load correctly colored but perfectly
+    // FLAT. This is the single apply path, so the fresh-solve completion no longer sets it separately.
+    if (st.docMeshHasDisp && st.renderer)
+        st.renderer->setDeformScale(st.dispScaleHint > 0 ? st.dispScaleHint : 1.0f);
+    st.addLog(std::string("[sim] result view applied: deformed=") +
+              (st.docMeshHasDisp ? "yes" : "no") +
+              " scale=" + std::to_string(st.dispScaleHint));
     std::string label, unit; double fromSI = 1.0;
     fieldMeta(st, st.activeScalarField, label, unit, fromSI);
     st.legendTitle = label;
@@ -2734,16 +2744,22 @@ void SimManager::restoreModelMesh(AppState& st) {
 }
 
 void SimManager::syncResultView(AppState& st) {
-    // Show the result overlay ONLY while the Simulation tab + the selected study's Results node are
-    // up. Any other focus (different sub-node, different study, different left-pane tab) restores the
-    // editable model so the user isn't stuck on the (unpickable) FEA result mesh.
+    // Show the result overlay ONLY while the user is in the Simulate WORKSPACE and the selected
+    // study's Results node is up. Any other focus — a different sub-node, a different study, or
+    // switching to the Model / Manufacture / Drawing / Electronics workspace — restores the editable
+    // model so the part can be edited (the FEA result mesh has no pickable faces).
+    //
+    // NB: gate on activeWorkspace, NOT leftPaneTab. leftPaneTab==LP_Simulation persists after the user
+    // clicks away to another workspace tab (title_bar only flips activeWorkspace), so keying off it
+    // left the deformed overlay stuck on the Modeling viewport. activeWorkspace is what the workspace
+    // tabs actually set, so it hides/restores correctly on every workspace switch.
     const bool valid = sel_ >= 0 && sel_ < (int)studies_.size();
+    const bool onSimWs = st.activeWorkspace == AppState::Workspace::Simulate;
 
     // Motion studies manage the viewport via applyMotionFrame (setMeshes); they don't use
     // the overlay path and must not trigger restoreModelMesh while their Results node is active.
     const bool motionActive = valid && studies_[sel_].type == StudyType::Motion &&
-                              studies_[sel_].motionHasResult &&
-                              st.leftPaneTab == AppState::LP_Simulation &&
+                              studies_[sel_].motionHasResult && onSimWs &&
                               node_ == SimNode::Results;
     if (motionActive) {
         resultShown_  = true;
@@ -2751,7 +2767,7 @@ void SimManager::syncResultView(AppState& st) {
         return;
     }
 
-    const bool wantShow = valid && st.leftPaneTab == AppState::LP_Simulation &&
+    const bool wantShow = valid && onSimWs &&
                           node_ == SimNode::Results && studies_[sel_].hasResult &&
                           !studies_[sel_].overlayPath.empty();
     if (wantShow) {
@@ -2929,14 +2945,10 @@ void SimManager::tick(AppState& st) {
             st.activeScalarField = (s.type == StudyType::Modal)   ? "mode_amplitude"
                                  : (s.type == StudyType::Fatigue) ? "fatigue_fos"
                                                                   : "von_mises";
-            applyResultField(st, s);
+            applyResultField(st, s);   // loads the overlay AND applies the auto deform scale
             // syncResultView ran at the top of this tick (old state); mark the overlay shown for THIS
             // study so it isn't redundantly reloaded next frame. node_ is set to Results below.
             resultShown_ = true; shownStudyId_ = s.id;
-            // Show the deformed shape at the auto (visible) scale on a fresh result — SolidWorks
-            // displays the deformed model by default. The user can drop to 1x (true) or Off.
-            if (st.docMeshHasDisp && st.renderer)
-                st.renderer->setDeformScale(st.dispScaleHint > 0 ? st.dispScaleHint : 1.0f);
             s.freqs.clear();
             if (s.type == StudyType::Modal && res.contains("freqs_hz") && res["freqs_hz"].is_array()) {
                 std::string f = "Frequencies (Hz):";

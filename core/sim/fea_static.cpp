@@ -15,15 +15,56 @@
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <string>
+
+#include <thread>
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
+#ifdef AICAD_WITH_CHOLMOD
+#include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
+#endif
+#ifdef AICAD_HAVE_OPENMP
+#include <omp.h>
+#endif
+
 namespace aicad::sim {
 
 namespace {
+
+// Cap the solver's worker threads so a long solve never eats every core — the GUI/render
+// threads must keep running (Hunter: "let the GUI continue on at least 1 thread"). Caps both
+// CHOLMOD's own OpenMP loops and the OpenMP-based system BLAS (FlexiBLAS/OpenBLAS) it calls.
+// Env AI_CAD_FEA_THREADS overrides; default = hardware_concurrency - 2 (min 1).
+int fea_solver_threads() {
+    if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
+        const int n = std::atoi(e);
+        if (n >= 1) return n;
+    }
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    int cap = static_cast<int>(hw) - 2;  // leave 2 cores for GUI/render/IPC
+    return cap < 1 ? 1 : cap;
+}
+
+void apply_solver_thread_cap(int n) {
+#ifdef AICAD_HAVE_OPENMP
+    omp_set_num_threads(n);
+#endif
+    // Belt-and-suspenders for BLAS backends that read the env (FlexiBLAS/OpenBLAS honour these).
+    const std::string s = std::to_string(n);
+#if defined(_WIN32)
+    _putenv_s("OMP_NUM_THREADS", s.c_str());
+    _putenv_s("OPENBLAS_NUM_THREADS", s.c_str());
+#else
+    setenv("OMP_NUM_THREADS", s.c_str(), 1);
+    setenv("OPENBLAS_NUM_THREADS", s.c_str(), 1);
+#endif
+    (void)n;
+}
 
 // ── Lightweight, env-gated phase profiler ────────────────────────────────────────
 // Set AI_CAD_FEA_PROFILE=1 to get a per-phase wall-clock + size/memory breakdown of a
@@ -451,15 +492,47 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     Eigen::VectorXd uf;
     bool solved = false;
     if (tet10 || hex8) {
-        // SPD systems with no Python-parity constraint: Cholesky is faster + lighter.
-        prof.note("solver=SimplicialLDLT (Cholesky, SPD)");
-        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
-        ldlt.compute(Kff);
-        prof.mark("factorize (LDLT)");
-        if (ldlt.info() == Eigen::Success) {
-            uf = ldlt.solve(ff);
-            prof.mark("back-substitute");
-            if (ldlt.info() == Eigen::Success) solved = true;
+        // SPD systems with no Python-parity constraint. Solver preference (fastest first),
+        // each falling through to the next if it reports failure:
+        //   1. CHOLMOD supernodal LLT — BLAS3 dense-supernode kernels on the threaded system
+        //      BLAS. 10-50x faster than SimplicialLDLT on 3D solids AND multithreaded; this is
+        //      the fix for the 300s single-core factorize on bulky parts.
+        //   2. Eigen SimplicialLDLT — scalar Cholesky (used when SuiteSparse is absent, or if
+        //      CHOLMOD's strict-SPD LLT rejects a near-singular reduced system).
+        //   3. SparseLU (below) — final fallback.
+        const int nthreads = fea_solver_threads();
+        apply_solver_thread_cap(nthreads);
+#ifdef AICAD_WITH_CHOLMOD
+        prof.note("solver=CholmodSupernodalLLT (SuiteSparse, %d threads)", nthreads);
+        {
+            Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
+            chol.analyzePattern(Kff);
+            prof.mark("CHOLMOD analyze");
+            chol.factorize(Kff);
+            prof.mark("CHOLMOD factorize");
+            if (chol.info() == Eigen::Success) {
+                uf = chol.solve(ff);
+                prof.mark("CHOLMOD back-substitute");
+                if (chol.info() == Eigen::Success) solved = true;
+            }
+        }
+#endif
+        if (!solved) {
+            prof.note("solver=SimplicialLDLT (Cholesky, SPD)%s",
+#ifdef AICAD_WITH_CHOLMOD
+                      " (CHOLMOD unavailable/failed)"
+#else
+                      ""
+#endif
+            );
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+            ldlt.compute(Kff);
+            prof.mark("factorize (LDLT)");
+            if (ldlt.info() == Eigen::Success) {
+                uf = ldlt.solve(ff);
+                prof.mark("back-substitute");
+                if (ldlt.info() == Eigen::Success) solved = true;
+            }
         }
     }
     if (!solved) {

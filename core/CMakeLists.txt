@@ -199,6 +199,36 @@ target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
 
+# --- Optional CHOLMOD (SuiteSparse) supernodal Cholesky for the SPD FEA solve ------
+# Eigen's SimplicialLDLT is scalar + single-threaded; on a bulky 3D solid its fill-in
+# explodes (measured: 300s+, multi-GB RSS, one core pegged). CholmodSupernodalLLT runs
+# BLAS3 kernels on dense supernodes over the threaded system BLAS -> 10-50x faster AND
+# multithreaded. OPTIONAL: aicad_sim still builds pure-Eigen when SuiteSparse is absent
+# (fea_static falls back to SimplicialLDLT at runtime), so the standalone config is intact.
+# OpenMP is linked so fea_static can cap the solver's thread count (leave cores for the GUI).
+option(AICAD_WITH_CHOLMOD "Use SuiteSparse CHOLMOD supernodal Cholesky for FEA (SPD)" ON)
+if(AICAD_WITH_CHOLMOD)
+  find_path(CHOLMOD_INCLUDE_DIR cholmod.h PATH_SUFFIXES suitesparse)
+  find_library(CHOLMOD_LIBRARY cholmod)
+  find_library(SUITESPARSECONFIG_LIBRARY suitesparseconfig)
+  if(CHOLMOD_INCLUDE_DIR AND CHOLMOD_LIBRARY)
+    message(STATUS "aicad_sim: CHOLMOD supernodal FEA solver ENABLED (${CHOLMOD_LIBRARY})")
+    target_compile_definitions(aicad_sim PRIVATE AICAD_WITH_CHOLMOD)
+    target_include_directories(aicad_sim PRIVATE ${CHOLMOD_INCLUDE_DIR})
+    target_link_libraries(aicad_sim PUBLIC ${CHOLMOD_LIBRARY})
+    if(SUITESPARSECONFIG_LIBRARY)
+      target_link_libraries(aicad_sim PUBLIC ${SUITESPARSECONFIG_LIBRARY})
+    endif()
+  else()
+    message(STATUS "aicad_sim: CHOLMOD not found — FEA uses Eigen SimplicialLDLT fallback")
+  endif()
+endif()
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(aicad_sim PRIVATE OpenMP::OpenMP_CXX)
+  target_compile_definitions(aicad_sim PRIVATE AICAD_HAVE_OPENMP)
+endif()
+
 # --- libaicad cam (computer-aided machining: toolpaths + post + sim) ----------
 # The CAM suite: stock/tool/machine/op model, Clipper2-backed 2D geometry, the
 # 2.5D/3D/turning/cutting toolpath generators, feeds & speeds, the data-driven

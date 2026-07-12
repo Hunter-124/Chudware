@@ -109,7 +109,8 @@ def build_case(case_dir: str, stl_path: str,
                direction=(1.0, 0.0, 0.0), speed_mps: float = 10.0,
                preset: str = "coarse", aoa_deg: float = 0.0, sideslip_deg: float = 0.0,
                fluid: Optional[dict] = None, ref_area_mm2: float = 0.0,
-               n_proc: int = 1, thermal: Optional[dict] = None) -> CaseInfo:
+               n_proc: int = 1, thermal: Optional[dict] = None,
+               max_iters: Optional[int] = None) -> CaseInfo:
     """Write a full OpenFOAM case under ``case_dir``; return its :class:`CaseInfo`.
 
     ``thermal`` (optional) switches the case to steady buoyant heat transfer (buoyantSimpleFoam):
@@ -183,6 +184,11 @@ def build_case(case_dir: str, stl_path: str,
            0.5 * (box_min_m[2] + box_max_m[2]))
 
     iters = pre["iters"]
+    # Optional solver-iteration cap (mirrors lbm.run_wind_tunnel's max_steps): endTime and
+    # the write interval both follow the clamped count, so a capped case still writes its
+    # final fields. Used by smoke tests/benches to bound a live solve's wall clock.
+    if max_iters is not None and max_iters > 0:
+        iters = min(iters, int(max_iters))
     th = thermal if (thermal and thermal.get("enabled")) else None
 
     # ---- mesh dicts (identical for aero and thermal) ----

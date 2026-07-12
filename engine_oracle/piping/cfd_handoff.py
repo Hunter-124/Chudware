@@ -29,9 +29,19 @@ from __future__ import annotations
 import math
 import os
 import uuid
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from engine.piping.schema import SCHEMA_PIPING
+
+
+class _BoreSpec(NamedTuple):
+    """Minimal pipe-spec stand-in for an explicit ``bore_mm`` override (mm).
+
+    ``outer_dia`` only feeds the default bend radius (1.5·OD) in
+    :func:`_run_fluid_solid`; with no wall data the bore itself is the best stand-in.
+    """
+    inner_dia: float
+    outer_dia: float
 
 __all__ = [
     "PipingCFDError",
@@ -208,9 +218,20 @@ def internal_volume(
     for run in runs:
         if run.get("suppressed"):
             continue
-        spec = catalog.nearest_pipe(
-            nps=run.get("nps"), schedule=run.get("schedule", "40")
-        )
+        bore_override = run.get("bore_mm")
+        if bore_override:
+            # Explicit inner diameter (mm) beats the NPS/schedule catalog — the SAME
+            # precedence the 1-D solver applies (engine.piping.solve._build_network).
+            # Externally-supplied networks (e.g. the hydraulic→piping handoff, whose
+            # hose IDs are SAE dash sizes absent from the catalog) rely on this;
+            # ignoring it swept the wrong bore and the extracted fluid volume
+            # disagreed with π/4·d²·L (multiphysics regression suite).
+            spec = _BoreSpec(inner_dia=float(bore_override),
+                             outer_dia=float(bore_override))
+        else:
+            spec = catalog.nearest_pipe(
+                nps=run.get("nps"), schedule=run.get("schedule", "40")
+            )
         if isinstance(spec, dict):  # catalog failure
             warnings.append(
                 f"{run.get('id')}: pipe size unresolved — {spec.get('reason')}"

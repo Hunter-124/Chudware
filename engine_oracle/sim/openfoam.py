@@ -76,9 +76,13 @@ def run_openfoam_tunnel(
     try:
         kind = "thermal" if (thermal and thermal.get("enabled")) else "aero"
         prog("mesh", 2, f"Building OpenFOAM {kind} case ({preset})...")
+        # max_steps mirrors lbm.run_wind_tunnel: cap the solver iteration count (endTime).
+        # Before this plumb the parameter was accepted but silently ignored, so callers
+        # could not bound an OpenFOAM solve the way they bound an LBM one.
         info = build_case(case_dir, stl_path, direction=direction, speed_mps=speed_mps,
                           preset=preset, aoa_deg=aoa_deg, sideslip_deg=sideslip_deg,
-                          fluid=fluid, ref_area_mm2=ref_area_mm2, n_proc=1, thermal=thermal)
+                          fluid=fluid, ref_area_mm2=ref_area_mm2, n_proc=1, thermal=thermal,
+                          max_iters=max_steps)
 
         # ---- mesh ----
         prog("mesh", 6, "blockMesh (background domain)...")

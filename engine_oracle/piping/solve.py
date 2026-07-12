@@ -123,7 +123,7 @@ class _Node:
 
 class _Link:
     __slots__ = ("id", "a", "b", "length_m", "d_m", "area", "eps", "kfit",
-                 "kbreak", "pump", "flow", "fd", "spec_err")
+                 "kbreak", "pump", "flow", "fd", "spec_err", "mu", "rho")
 
     def __init__(self, id, a, b):
         self.id = id
@@ -139,6 +139,8 @@ class _Link:
         self.flow = 1e-4         # m³/s current iterate (a->b positive)
         self.fd = 0.02
         self.spec_err = None
+        self.mu = 0.0            # fluid viscosity Pa·s (set by _build_network;
+        self.rho = 0.0           # 0 = unknown → laminar closed form disabled)
 
 
 def _snap_nodes(runs, tol) -> tuple[list[_Node], dict[int, tuple[int, int]]]:
@@ -250,6 +252,10 @@ def _build_network(doc, fluid, tol) -> dict:
         lk.area = math.pi * lk.d_m ** 2 / 4.0
         mat = run.get("material") or doc_material
         lk.eps = _ROUGHNESS_M.get(mat, _DEFAULT_ROUGHNESS_M)
+        # fluid props on the link so _link_flow can pick the regime-consistent
+        # (laminar vs square-law) local head-flow relation
+        lk.mu = float((fluid or {}).get("mu") or 0.0)
+        lk.rho = float((fluid or {}).get("rho") or 0.0)
         if lk.length_m <= 0:
             warnings.append(f"{lk.id}: zero-length run skipped")
             continue
@@ -457,6 +463,29 @@ def _link_flow(lk: _Link, dH: float) -> tuple[float, float]:
     if r <= 0:
         return 0.0, 0.0
     if lk.pump is None:
+        # Regime-consistent local solve. The square-law form h = r·Q² with a stale
+        # Darcy fd is violently unstable on LAMINAR links (fd = 64/Re makes r ∝ 1/Q,
+        # so alternating fd↔Q oscillates the outer Newton into a stall — caught by
+        # the multiphysics regression suite on a 6 mm laminar line). In laminar the
+        # friction head is LINEAR in Q (Hagen-Poiseuille: h = 128·μ·L·Q/(ρ·g·π·D⁴)),
+        # so with fittings h = c_lam·Q + r_fit·Q² has a closed-form root. Use it
+        # whenever the resulting Re is actually laminar; else keep the square law.
+        if lk.mu > 0.0 and lk.rho > 0.0 and lk.d_m > 0.0:
+            c_lam = 128.0 * lk.mu * lk.length_m / (lk.rho * G * math.pi * lk.d_m ** 4)
+            r_fit = lk.kfit / (2.0 * G * lk.area ** 2)
+            if r_fit > 0.0:
+                q_mag = (-c_lam + math.sqrt(c_lam * c_lam + 4.0 * r_fit * abs(dH))) \
+                        / (2.0 * r_fit)
+            else:
+                q_mag = abs(dH) / c_lam if c_lam > 0.0 else 0.0
+            re = lk.rho * (q_mag / lk.area) * lk.d_m / lk.mu if lk.area else 0.0
+            if re < 2100.0:
+                # keep the link's fd diagnostic consistent with the laminar regime
+                lk.fd = max(64.0 / max(re, 1e-6), 1e-4)
+                q = math.copysign(q_mag, dH)
+                p = 1.0 / (c_lam + 2.0 * r_fit * q_mag) if (c_lam + 2.0 * r_fit * q_mag) > 0 \
+                    else 0.0
+                return q, p
         q = math.copysign(math.sqrt(abs(dH) / r), dH)
         return q, 1.0 / (2.0 * r * max(abs(q), _Q_JAC_FLOOR))
     sign = lk.pump["sign"]
@@ -561,6 +590,15 @@ def solve(doc: dict, *, boundary, fluid: Optional[dict] = None,
     it = 0
     if nfree == 0:
         converged = True
+    # Mass-balance tolerance (m³/s). ``tol_head`` is an absolute ceiling, but a
+    # micro-flow network (laminar hose lines, instrument tubing) can have every
+    # demand BELOW it — accepting a 1e-6 m³/s residual there is a ~100% relative
+    # mass error reported as "converged" (caught by the multiphysics regression
+    # suite: a 6 mm laminar line solved 37% under its Hagen-Poiseuille flow).
+    # Scale the tolerance to the network's own flow scale, never looser than
+    # tol_head and never tighter than 1e-12 (float headroom).
+    q_scale = max((abs(nd.demand) for nd in nodes), default=0.0)
+    tol_q = min(tol_head, max(1e-4 * q_scale, 1e-12)) if q_scale > 0 else tol_head
     for it in range(1, max_iter + 1) if nfree else []:
         for lk in links:
             lk.fd = _friction_factor(lk, max(abs(lk.flow), _MIN_ABS_Q), mu, rho)
@@ -587,7 +625,7 @@ def solve(doc: dict, *, boundary, fluid: Optional[dict] = None,
                 e[pos[nd.idx]] -= nd.demand   # demand leaves the system
 
         enorm = float(np.max(np.abs(e)))
-        if enorm < tol_head:
+        if enorm < tol_q:
             converged = True
             break
         try:

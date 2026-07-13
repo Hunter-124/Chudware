@@ -1599,11 +1599,16 @@ def test_assembly_tools_end_to_end(tmp_path):
     assert r["mate"], r
     bodies = {b["component"]: b for b in (r.get("world_bodies") or [])}
     assert "k2" in bodies, r
-    bb = bodies["k2"]["bbox"]
-    # concentric seats the pin's axis on the bore's axis: x=15, y=5 (±solver tol)
-    cx = (bb["min"][0] + bb["max"][0]) / 2.0
-    cy = (bb["min"][1] + bb["max"][1]) / 2.0
-    assert abs(cx - 15.0) < 1e-3 and abs(cy - 5.0) < 1e-3, bodies["k2"]
+    # concentric seats the pin's axis on the bore's axis at (x=15, y=5). Assert on the EXACT
+    # B-rep axis centroid (query_geometry), NOT the world-bbox centre: the bbox comes from
+    # BRepBndLib::Add on the placed shape, whose triangulation-based deflection enlargement is
+    # rotation-dependent and drifts the centre by ~2.5e-3 for a free-to-spin round pin. That is
+    # a measurement artefact — the solver itself lands the pin axis on the bore axis to ~1e-9.
+    q, _ = _call("query_geometry", {"doc_id": asm,
+                                    "query": {"component": "k2", "of": "face", "surf": "round"}})
+    assert q.get("matches"), q
+    cx, cy, _cz = q["matches"][0]["centroid"]
+    assert abs(cx - 15.0) < 1e-6 and abs(cy - 5.0) < 1e-6, q["matches"][0]
 
     # describe_assembly narrates it without error
     out, _ = _call("describe_assembly", {"doc_id": asm})

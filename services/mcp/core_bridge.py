@@ -84,8 +84,20 @@ class CoreError(RuntimeError):
 # ---------------------------------------------------------------- library resolution
 
 def _repo_root() -> Path:
-    # mcp_server/core_bridge.py -> repo root is two parents up.
-    return Path(__file__).resolve().parents[1]
+    """Locate the repo root even when this file is reached via a Windows junction.
+
+    ``mcp_server`` is a symlink/junction to ``services/mcp``. ``Path.resolve()``
+    follows that, so ``parents[1]`` is ``services/`` — wrong. Walk up looking for
+    the monorepo markers instead.
+    """
+    here = Path(__file__).resolve()
+    for p in [here.parent, *here.parents]:
+        if (p / "requirements.txt").is_file() and (
+            (p / "services" / "mcp").is_dir() or (p / "core" / "api" / "libaicad.h").is_file()
+        ):
+            return p
+    # Fallback: pre-junction layout (repo/mcp_server/core_bridge.py)
+    return here.parents[1]
 
 
 def _lib_name() -> str:
@@ -122,10 +134,18 @@ def _lib_candidates() -> list[Path]:
     if env_lib:
         out.append(Path(env_lib))
     out.append(dist_dir() / name)  # honours $AI_CAD_DIST; Windows stage default
-    if sys.platform != "win32":
+    root = _repo_root()
+    if sys.platform == "win32":
+        # Full engine first (OCCT + Netgen) — same precedence as Linux build-occt-linux.
+        # Ninja preset: build/windows-occt/bin; VS multi-config: core/build-occt/bin/Release.
+        out.append(root / "build" / "windows-occt" / "bin" / name)
+        out.append(root / "core" / "build-occt" / "bin" / "Release" / name)
+        out.append(root / "host" / "build-win" / "bin" / name)
+        # Slim beachhead last (no OCCT/Netgen) — only if nothing better exists.
+        out.append(root / "build" / "windows-core" / "bin" / name)
+    else:
         # No dist stage off-Windows: the .so is produced in a build dir (and copied next
         # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
-        root = _repo_root()
         # build-occt-linux is the FULL engine (OCCT + Netgen) the desktop app loads — it
         # carries the FEA/CFD sim RPCs (sim_run_static etc., gated behind #ifdef
         # AICAD_WITH_NETGEN in libaicad.cpp). It MUST come before the slim "build-linux"

@@ -111,13 +111,31 @@ bool CppCore::ensureLoaded(std::string& err) {
     loaded_ = true;
     return true;
 #else
-    // Candidate paths in priority order.
+    // Candidate paths in priority order (mirrors MCP core_bridge + Linux build-tree fallbacks).
     std::vector<std::wstring> candidates;
-    if (const char* env = std::getenv("AI_CAD_LIBAICAD"); env && env[0]) {
-        candidates.push_back(widen(env));
-    }
+    auto push_env = [&](const char* name) {
+        if (const char* env = std::getenv(name); env && env[0])
+            candidates.push_back(widen(env));
+    };
+    push_env("BILLET_LIBAICAD");
+    push_env("AI_CAD_LIBAICAD");
     std::wstring dir = exe_dir();
     if (!dir.empty()) candidates.push_back(dir + L"\\libaicad.dll");
+    // Dev-tree fallbacks: Ninja windows-occt preset, then VS multi-config OCCT build.
+    // Walk up from the exe (…/host/build-win/bin → repo root) when present.
+    if (!dir.empty()) {
+        // host/build-win/bin → ../../../build/windows-occt/bin
+        // host/build/bin/Release → ../../../../build/windows-occt/bin (rare)
+        const wchar_t* rels[] = {
+            L"\\..\\..\\..\\build\\windows-occt\\bin\\libaicad.dll",
+            L"\\..\\..\\..\\..\\build\\windows-occt\\bin\\libaicad.dll",
+            L"\\..\\..\\..\\core\\build-occt\\bin\\Release\\libaicad.dll",
+            L"\\..\\..\\..\\dist\\AI-CAD\\libaicad.dll",
+            L"\\..\\..\\..\\..\\dist\\AI-CAD\\libaicad.dll",
+        };
+        for (const wchar_t* rel : rels)
+            candidates.push_back(dir + rel);
+    }
     candidates.push_back(L"libaicad.dll");  // last resort: default search order
 
     HMODULE h = nullptr;

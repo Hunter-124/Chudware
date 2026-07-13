@@ -55,17 +55,39 @@ SERVER_NAME_LEGACY = "ai-cad"
 
 def _default_repo() -> str:
     """Resolve repo root whether the script lives under installer/ or services/installer/."""
-    here = Path(__file__).resolve().parent
-    for cand in (here.parent, here.parent.parent):
+    here = Path(__file__).resolve()
+    for cand in here.parents:
         if (cand / "services" / "mcp").is_dir() and (cand / "requirements.txt").is_file():
             return str(cand)
-    return str(here.parent)
+    return str(here.parents[1])
 
 
 def _env(repo: str, profile: str) -> dict:
     env = {"PYTHONPATH": repo}
     # Always pin the profile explicitly so clients don't inherit a stale shell default.
     env["AICAD_MCP_PROFILE"] = profile
+    # Prefer the staged full engine (OCCT + Netgen) when present so MCP and GUI share one.
+    for rel in (
+        Path("dist") / "AI-CAD" / "libaicad.dll",
+        Path("build") / "windows-occt" / "bin" / "libaicad.dll",
+        Path("dist") / "AI-CAD" / "libaicad.so",
+        Path("core") / "build-occt-linux" / "bin" / "libaicad.so",
+    ):
+        p = Path(repo) / rel
+        if p.is_file():
+            env["BILLET_LIBAICAD"] = str(p)
+            env["AI_CAD_LIBAICAD"] = str(p)  # legacy name still honored
+            break
+    for rel in (
+        Path("dist") / "AI-CAD" / "aicad-hostd.exe",
+        Path("build") / "windows-occt" / "bin" / "aicad-hostd.exe",
+        Path("dist") / "AI-CAD" / "aicad-hostd",
+        Path("core") / "build-occt-linux" / "bin" / "aicad-hostd",
+    ):
+        p = Path(repo) / rel
+        if p.is_file():
+            env["AICAD_HOSTD_BIN"] = str(p)
+            break
     return env
 
 

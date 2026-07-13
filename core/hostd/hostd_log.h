@@ -16,7 +16,11 @@ public:
     bool open(const std::string& dir);
 
     // printf-style, one line per call, prefixed with an ISO-8601 timestamp.
+#if defined(__GNUC__) || defined(__clang__)
     void line(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+#else
+    void line(const char* fmt, ...);  // MSVC: no format attribute equivalent here
+#endif
 
 private:
     void rotateIfNeeded();

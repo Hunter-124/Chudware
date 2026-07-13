@@ -14,12 +14,26 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace ui {
 
 struct ComponentFeature {
     std::string id;
     std::string name;
     std::string type;
+    // Display-only folder tag (feature objects may carry a "folder" field; empty if absent).
+    // Used by the nested renderer to group features into folders exactly as the part env does.
+    std::string folder;
+    // Full feature JSON object as parsed from the component's document.json "features" array.
+    // We store the whole object (rather than a pre-computed consumedSketchIds list) so the
+    // assembly nested renderer can run the EXACT same sketch-consumption analysis the part env
+    // uses on live features: iterate features with type=="sketch" to collect sketch ids, then
+    // recursively scan each feature's raw["refs"] for region selectors {"kind":"region",
+    // "sketch":"fX"} and bare sketch-ids under *sketch*/profile keys. Storing raw is future-proof
+    // (any new ref shape the part env learns is already carried) and keeps this data layer dumb.
+    // A component's feature list is small (a handful of KB of JSON), so the cache cost is trivial.
+    nlohmann::json raw;
 };
 
 // Return the cached feature list for the `.step+` at `absPath`, parsing + caching it on

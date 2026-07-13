@@ -71,9 +71,11 @@ std::vector<ComponentFeature> parse(const std::string& absPath, std::string* out
         for (const auto& f : j["features"]) {
             if (!f.is_object()) continue;
             ComponentFeature cf;
-            cf.id   = f.value("id", std::string());
-            cf.name = f.value("name", std::string());
-            cf.type = f.value("type", std::string());
+            cf.id     = f.value("id", std::string());
+            cf.name   = f.value("name", std::string());
+            cf.type   = f.value("type", std::string());
+            cf.folder = f.value("folder", std::string());
+            cf.raw    = f;  // full feature object (refs/params) for nested-tree consumption analysis
             if (cf.name.empty()) cf.name = cf.id.empty() ? std::string("feature") : cf.id;
             feats.push_back(std::move(cf));
         }

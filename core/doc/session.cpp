@@ -2024,6 +2024,16 @@ void op_asm_delete_component(json& doc, const json& op, std::size_t idx) {
     json kept_comps = json::array();
     for (const json& c : comps)
         if (c.value("id", std::string()) != kid) kept_comps.push_back(c);
+    // Re-anchor: the first inserted component is the fixed origin anchor (see
+    // op_asm_insert_component's `first`). If the deleted component was that anchor and no
+    // surviving component is still fixed, promote the first survivor so the assembly keeps
+    // an origin anchor (fall back to the next component up the tree).
+    if (!kept_comps.empty()) {
+        bool any_fixed = false;
+        for (const json& c : kept_comps)
+            if (c.value("fixed", false)) { any_fixed = true; break; }
+        if (!any_fixed) kept_comps[0]["fixed"] = true;
+    }
     doc["components"] = kept_comps;
     json kept_mates = json::array();
     for (const json& m : mates) {

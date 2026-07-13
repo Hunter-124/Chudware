@@ -2273,13 +2273,12 @@ static void doOpenDoc(AppState& st) {
 // the far right, and TWO small right-aligned icon buttons (Add Folder, then Name & group) sitting
 // just left of the chevron. They carry 2x a single button's right-indent (two buttons) mirroring the
 // chevron's own inset, per Hunter's spec. Returns the (possibly toggled) open state; sets
-// *addFolder / *nameGroup on the frame their button is clicked. addEn/ngEn gray the buttons out.
-static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder, bool* nameGroup) {
+// *addFolder on the frame its button is clicked. addEn grays the button out.
+static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
     const auto& pal = fmPalette();
     const float S = ui::uiScale;
     const float chev = 18.0f * S;
     const float btn = 18.0f * S;
-    const float bgap = 3.0f * S;
     ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::GetContentRegionAvail().x;
     const float lineH = ImGui::GetTextLineHeight();
@@ -2302,8 +2301,7 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder,
     // right, a hairline filling the gap, and the collapse chevron pinned far right (Hunter red-pen).
     const float chevX = p.x + w - chev;
     const float addX = p.x + 4.0f * S;
-    const float ngX = addX + btn + bgap;
-    const float textX = ngX + btn + 8.0f * S;   // label starts right of the button cluster
+    const float textX = addX + btn + 8.0f * S;   // label starts right of the Add Folder button
     const float textY = p.y + (rowH - lineH) * 0.5f;
     const ImU32 lineCol = ui::Palette::toU32(pal.border);
     dl->AddText(ImVec2(textX, textY),
@@ -2334,9 +2332,6 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool ngEn, bool* addFolder,
         *addFolder = iconBtn(addX, "folder_new", addEn,
                              "Add Folder\n(groups the selected features, or drops an empty folder to "
                              "drag features into)");
-    if (nameGroup)
-        *nameGroup = iconBtn(ngX, "name_group_features", ngEn,
-                             "Name & group features\n(auto-name every feature and sort into folders)");
 
     // Collapse chevron (down = open, right = closed).
     const ImVec2 cc(chevX + chev * 0.5f, cy);
@@ -2405,7 +2400,9 @@ static void createFolderFromSelection(AppState& st) {
 // Renames every feature to a conventional per-type name ("Boss-Extrude1", "Fillet2", ...) and
 // sorts dress-up / pattern / reference / sketch features into folders. One batched op set, one
 // rebuild. (A future revision can route this through the AI agent for semantic names.)
-static void nameAndGroupFeatures(AppState& st) {
+// SIDELINED (Hunter, 2026-07-12): the tree-header "Name & group" button was removed from the GUI
+// for now; this logic is kept intact so the button can be re-wired later without rewriting it.
+[[maybe_unused]] static void nameAndGroupFeatures(AppState& st) {
     const nlohmann::json& tree = st.docMirror.tree();
     if (!tree.is_object()) return;
     auto feat = tree.find("features");
@@ -3104,19 +3101,12 @@ void drawFeatureTreeBody(AppState& st,
         // ---- Features section — its own collapse, now hosting Add Folder + Name & group. ----
         {
             const bool isPartDoc = tree.is_object() && jfld(tree, "schema") != "aicad.asm/1";
-            int fCount = 0;
-            if (isPartDoc) {
-                auto fa = tree.find("features");
-                if (fa != tree.end() && fa->is_array()) fCount = (int)fa->size();
-            }
             // Add Folder no longer requires a selection: with features selected it groups them; with
             // nothing selected it drops a blank folder at the bottom to drag features into (Hunter).
             const bool addEn = canDocTree && isPartDoc;
-            const bool ngEn  = canDocTree && isPartDoc && fCount > 0;
-            bool addClicked = false, ngClicked = false;
-            fmFeaturesHeader(&s_featSecOpen, addEn, ngEn, &addClicked, &ngClicked);
+            bool addClicked = false;
+            fmFeaturesHeader(&s_featSecOpen, addEn, &addClicked);
             if (addClicked) createFolderFromSelection(st);
-            if (ngClicked)  nameAndGroupFeatures(st);
         }
         if (s_featSecOpen) {
             ImGui::Indent(kSecIndent);

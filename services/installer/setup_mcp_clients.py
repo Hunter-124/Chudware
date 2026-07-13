@@ -262,20 +262,24 @@ def _toml_strip_table(text: str, table: str) -> str:
 def _toml_upsert_table(text: str, table: str, body: str) -> str:
     """Replace or append a TOML table. ``body`` is the full table including the header line."""
     stripped = _toml_strip_table(text, table).rstrip()
-    # Drop orphaned billet fragments left by older broken rewrites (args/env without a header).
+    # Drop orphaned billet fragments left by older broken rewrites (env/args without a header).
     if table == f"mcp_servers.{SERVER_NAME}":
         cleaned: list[str] = []
         for line in stripped.splitlines(keepends=True):
             s = line.strip()
-            if s.startswith('["-m"') or (
-                s.startswith("env = {") and "AICAD_MCP_PROFILE" in s and "mcp_servers" not in s
-                and cleaned and cleaned[-1].strip() in ("",)
-            ):
-                # skip garbage remnants; also drop following enabled/timeout orphans
+            if not s:
+                cleaned.append(line)
                 continue
-            if s in ("enabled = true", "startup_timeout_sec = 60") and cleaned:
-                prev = cleaned[-1].strip()
-                if prev.startswith('["-m"') or prev.startswith("env = {"):
+            # Bare key/value lines that only make sense inside [mcp_servers.billet]
+            if s.startswith("env = {") and "AICAD_MCP_PROFILE" in s:
+                continue
+            if s.startswith("args = [") and "mcp_server.server" in s:
+                continue
+            if s.startswith('["-m"') or s.startswith("['-m'"):
+                continue
+            if s in ("enabled = true", "startup_timeout_sec = 60"):
+                # Orphan only if we have no open mcp section context in cleaned so far
+                if not any(x.strip().startswith("[mcp_servers.") for x in cleaned):
                     continue
             cleaned.append(line)
         stripped = "".join(cleaned).rstrip()

@@ -63,6 +63,74 @@ int fea_solver_threads(long n_free) {
     return std::min(want, hw_cap);
 }
 
+// Threads for the element loops (assembly + stress recovery) — P1. These are pure
+// per-element compute (B^T C B dense products) with deterministic output slots, so they
+// scale near-linearly; unlike the factorization they don't saturate memory bandwidth
+// early. Small meshes stay serial (thread spawn costs more than the work). Honours the
+// same AI_CAD_FEA_THREADS override as the solver cap; always leaves 2 cores for GUI/IPC.
+int fea_assembly_threads(int n_elems) {
+#ifndef AICAD_HAVE_OPENMP
+    (void)n_elems;
+    return 1;
+#else
+    if (n_elems < 4000) return 1;
+    if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
+        const int n = std::atoi(e);
+        if (n >= 1) return n;
+    }
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    return std::max(1, std::min(static_cast<int>(hw) - 2, 8));
+#endif
+}
+
+// Deterministic parallel element assembly (P1). Emits the IDENTICAL triplet sequence the
+// serial loop produced: pass 1 assigns every element a contiguous slot sized from its
+// free-DOF count alone (pure reduced[] lookups, no geometry), pass 2 fills the slots in
+// parallel. A degenerate element (ke_fn false — the serial code `continue`d) leaves its
+// slot as default (0,0,0.0) triplets, which add exactly 0.0 into K(0,0) — numerically
+// neutral. Exact-sized allocation also replaces the old full n*edof^2 over-reserve.
+template <int NPE, class KeFn>
+void assemble_elements_par(int n_tets, const std::vector<int>& tets,
+                           const std::vector<int>& reduced,
+                           std::vector<Eigen::Triplet<double>>& trips, KeFn&& ke_fn) {
+    constexpr int EDOF = NPE * 3;
+    std::vector<std::size_t> off(static_cast<std::size_t>(n_tets) + 1, 0);
+    for (int e = 0; e < n_tets; ++e) {
+        int nf = 0;
+        for (int j = 0; j < NPE; ++j) {
+            const int base = tets[static_cast<std::size_t>(e) * NPE + j] * 3;
+            for (int k = 0; k < 3; ++k)
+                if (reduced[base + k] >= 0) ++nf;
+        }
+        off[e + 1] = off[e] + static_cast<std::size_t>(nf) * nf;
+    }
+    trips.assign(off[static_cast<std::size_t>(n_tets)], Eigen::Triplet<double>(0, 0, 0.0));
+    const int nthreads = fea_assembly_threads(n_tets);
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(nthreads) if (nthreads > 1)
+#endif
+    for (int e = 0; e < n_tets; ++e) {
+        Eigen::Matrix<double, EDOF, EDOF> Ke;
+        if (!ke_fn(e, Ke)) continue;  // degenerate: zero-filled slot stays (neutral)
+        int dof_map[EDOF];
+        for (int j = 0; j < NPE; ++j) {
+            const int nid = tets[static_cast<std::size_t>(e) * NPE + j];
+            for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = nid * 3 + k;
+        }
+        std::size_t pos = off[e];
+        for (int a = 0; a < EDOF; ++a) {
+            const int ra = reduced[dof_map[a]];
+            if (ra < 0) continue;
+            for (int b = 0; b < EDOF; ++b) {
+                const int rb = reduced[dof_map[b]];
+                if (rb < 0) continue;
+                trips[pos++] = Eigen::Triplet<double>(ra, rb, Ke(a, b));
+            }
+        }
+    }
+}
+
 void apply_solver_thread_cap(int n) {
 #ifdef AICAD_HAVE_OPENMP
     omp_set_num_threads(n);
@@ -394,98 +462,56 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     prof.note("triplets=%zu  triplet_reserve=%.1f MB (%zu B/elem)", n_trips,
               static_cast<double>(n_trips * sizeof(Eigen::Triplet<double>)) / 1.048576e6,
               static_cast<std::size_t>(edof) * edof * sizeof(Eigen::Triplet<double>));
-    trips.reserve(n_trips);
+    // Element loops run through assemble_elements_par (P1): deterministic parallel
+    // assembly with the IDENTICAL triplet sequence the old serial loops emitted (each
+    // element writes a pre-assigned slot), so tet4 parity stays byte-for-byte.
     if (hex8) {
         // ── hex8 path (8-node trilinear, 2x2x2 Gauss) ────────────────────────
         const HexGauss8 hg;
-        for (int e = 0; e < n_tets; ++e) {
+        assemble_elements_par<8>(n_tets, tets, reduced, trips,
+                                 [&](int e, Eigen::Matrix<double, 24, 24>& Ke) {
             std::array<Eigen::Vector3d, 8> ep;
-            std::array<int, 8> tn;
-            for (int j = 0; j < 8; ++j) { tn[j] = tets[e * 8 + j]; ep[j] = node_pt(tn[j]); }
-            Eigen::Matrix<double, 24, 24> Ke = Eigen::Matrix<double, 24, 24>::Zero();
-            bool ok_elem = true;
+            for (int j = 0; j < 8; ++j) ep[j] = node_pt(tets[e * 8 + j]);
+            Ke.setZero();
             for (int g = 0; g < 8; ++g) {
                 Eigen::Matrix<double, 6, 24> B;
                 double detJ;
-                if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ)) {
-                    ok_elem = false;
-                    break;
-                }
+                if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ))
+                    return false;
                 Ke += B.transpose() * C * B * (std::abs(detJ) * hg.w[g]);
             }
-            if (!ok_elem) continue;
-            int dof_map[24];
-            for (int j = 0; j < 8; ++j)
-                for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
-            for (int a = 0; a < 24; ++a) {
-                int ra = reduced[dof_map[a]];
-                if (ra < 0) continue;
-                for (int b = 0; b < 24; ++b) {
-                    int rb = reduced[dof_map[b]];
-                    if (rb < 0) continue;
-                    trips.emplace_back(ra, rb, Ke(a, b));
-                }
-            }
-        }
+            return true;
+        });
     } else if (!tet10) {
-        // ── tet4 path (UNCHANGED — parity-critical) ──────────────────────────
-        for (int e = 0; e < n_tets; ++e) {
+        // ── tet4 path (parity-critical: element math UNCHANGED) ──────────────
+        assemble_elements_par<4>(n_tets, tets, reduced, trips,
+                                 [&](int e, Eigen::Matrix<double, 12, 12>& Ke) {
             std::array<Eigen::Vector3d, 4> ep;
-            std::array<int, 4> tn;
-            for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
+            for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
             Eigen::Matrix<double, 6, 12> B;
             double vol;
-            if (!tet4_B(ep, B, vol)) continue;
-            Eigen::Matrix<double, 12, 12> Ke = B.transpose() * C * B * vol;
-            int dof_map[12];
-            for (int j = 0; j < 4; ++j)
-                for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
-            for (int a = 0; a < 12; ++a) {
-                int ra = reduced[dof_map[a]];
-                if (ra < 0) continue;
-                for (int b = 0; b < 12; ++b) {
-                    int rb = reduced[dof_map[b]];
-                    if (rb < 0) continue;
-                    trips.emplace_back(ra, rb, Ke(a, b));
-                }
-            }
-        }
+            if (!tet4_B(ep, B, vol)) return false;
+            Ke = B.transpose() * C * B * vol;
+            return true;
+        });
     } else {
         // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
-        for (int e = 0; e < n_tets; ++e) {
+        assemble_elements_par<10>(n_tets, tets, reduced, trips,
+                                  [&](int e, Eigen::Matrix<double, 30, 30>& Ke) {
             std::array<Eigen::Vector3d, 10> ep;
-            std::array<int, 10> tn;
-            for (int j = 0; j < 10; ++j) {
-                tn[j] = tets[e * 10 + j];
-                ep[j] = node_pt(tn[j]);
-            }
-            Eigen::Matrix<double, 30, 30> Ke = Eigen::Matrix<double, 30, 30>::Zero();
-            bool ok_elem = true;
+            for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
+            Ke.setZero();
             for (int g = 0; g < 4; ++g) {
                 Eigen::Matrix<double, 6, 30> B;
                 double detJ;
                 Eigen::Matrix<double, 10, 3> dNxyz;
                 if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
-                                dNxyz)) {
-                    ok_elem = false;
-                    break;
-                }
+                                dNxyz))
+                    return false;
                 Ke += B.transpose() * C * B * (std::abs(detJ) * gauss.w[g]);
             }
-            if (!ok_elem) continue;
-            int dof_map[30];
-            for (int j = 0; j < 10; ++j)
-                for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
-            for (int a = 0; a < 30; ++a) {
-                int ra = reduced[dof_map[a]];
-                if (ra < 0) continue;
-                for (int b = 0; b < 30; ++b) {
-                    int rb = reduced[dof_map[b]];
-                    if (rb < 0) continue;
-                    trips.emplace_back(ra, rb, Ke(a, b));
-                }
-            }
-        }
+            return true;
+        });
     }
 
     prof.mark("assemble-elements");
@@ -613,11 +639,19 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     std::vector<int> vm_count(n_nodes, 0);
     std::vector<double> sx_accum(n_nodes, 0.0), sy_accum(n_nodes, 0.0), sz_accum(n_nodes, 0.0);
     std::vector<double> txy_accum(n_nodes, 0.0), tyz_accum(n_nodes, 0.0), txz_accum(n_nodes, 0.0);
+    // P1: two-phase recovery. Phase 1 computes each element's averaged stress + vm in
+    // PARALLEL (independent per element — this is the expensive B/C math); phase 2
+    // scatters to the shared per-node accumulators SERIALLY in element order, so the
+    // node sums accumulate in exactly the old order (tet4 parity byte-for-byte).
+    struct ElemStress { double vm, sx, sy, sz, txy, tyz, txz; bool ok; };
+    std::vector<ElemStress> es(static_cast<std::size_t>(n_tets), ElemStress{});
+    const int st_threads = fea_assembly_threads(n_tets);
     if (hex8) {
-        // ── hex8 stress recovery: average stress over the 8 Gauss points, then
-        // scatter that element stress onto all 8 corner nodes (same node-averaging
-        // scheme as tet4/tet10). ───────────────────────────────────────────────
+        // ── hex8: average stress over the 8 Gauss points, scatter to all corners. ──
         const HexGauss8 hg;
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
+#endif
         for (int e = 0; e < n_tets; ++e) {
             std::array<Eigen::Vector3d, 8> ep;
             std::array<int, 8> tn;
@@ -636,19 +670,18 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             }
             if (ngp == 0) continue;
             stress_avg /= static_cast<double>(ngp);
-            double sx = stress_avg(0), sy = stress_avg(1), sz = stress_avg(2);
-            double txy = stress_avg(3), tyz = stress_avg(4), txz = stress_avg(5);
-            double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
-                                         (sz - sx) * (sz - sx) +
-                                         6.0 * (txy * txy + tyz * tyz + txz * txz)));
-            for (int j = 0; j < 8; ++j) {
-                vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1;
-                sx_accum[tn[j]] += sx;  sy_accum[tn[j]] += sy;  sz_accum[tn[j]] += sz;
-                txy_accum[tn[j]] += txy; tyz_accum[tn[j]] += tyz; txz_accum[tn[j]] += txz;
-            }
+            const double sx = stress_avg(0), sy = stress_avg(1), sz = stress_avg(2);
+            const double txy = stress_avg(3), tyz = stress_avg(4), txz = stress_avg(5);
+            const double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
+                                               (sz - sx) * (sz - sx) +
+                                               6.0 * (txy * txy + tyz * tyz + txz * txz)));
+            es[e] = ElemStress{vm, sx, sy, sz, txy, tyz, txz, true};
         }
     } else if (!tet10) {
-        // ── tet4 stress recovery (UNCHANGED — parity-critical) ───────────────
+        // ── tet4 (parity-critical: element math UNCHANGED) ────────────────────────
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
+#endif
         for (int e = 0; e < n_tets; ++e) {
             std::array<Eigen::Vector3d, 4> ep;
             std::array<int, 4> tn;
@@ -661,22 +694,18 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                 for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
             Eigen::Matrix<double, 6, 1> strain = B * ue;
             Eigen::Matrix<double, 6, 1> stress = C * strain;
-            double sx = stress(0), sy = stress(1), sz = stress(2);
-            double txy = stress(3), tyz = stress(4), txz = stress(5);
-            double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
-                                         (sz - sx) * (sz - sx) +
-                                         6.0 * (txy * txy + tyz * tyz + txz * txz)));
-            for (int j = 0; j < 4; ++j) {
-                vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1;
-                sx_accum[tn[j]] += sx;  sy_accum[tn[j]] += sy;  sz_accum[tn[j]] += sz;
-                txy_accum[tn[j]] += txy; tyz_accum[tn[j]] += tyz; txz_accum[tn[j]] += txz;
-            }
+            const double sx = stress(0), sy = stress(1), sz = stress(2);
+            const double txy = stress(3), tyz = stress(4), txz = stress(5);
+            const double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
+                                               (sz - sx) * (sz - sx) +
+                                               6.0 * (txy * txy + tyz * tyz + txz * txz)));
+            es[e] = ElemStress{vm, sx, sy, sz, txy, tyz, txz, true};
         }
     } else {
-        // ── tet10 stress recovery: evaluate at the 4 Gauss points, average to a
-        // single element stress, then scatter that element stress onto ALL 10
-        // nodes (same node-averaging scheme as tet4). This reuses the per-node
-        // vm/principal/shear recovery below unchanged.
+        // ── tet10: average the 4 Gauss points, scatter to all 10 nodes. ──────────
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(st_threads) if (st_threads > 1)
+#endif
         for (int e = 0; e < n_tets; ++e) {
             std::array<Eigen::Vector3d, 10> ep;
             std::array<int, 10> tn;
@@ -702,16 +731,23 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             }
             if (ngp == 0) continue;
             stress_avg /= static_cast<double>(ngp);
-            double sx = stress_avg(0), sy = stress_avg(1), sz = stress_avg(2);
-            double txy = stress_avg(3), tyz = stress_avg(4), txz = stress_avg(5);
-            double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
-                                         (sz - sx) * (sz - sx) +
-                                         6.0 * (txy * txy + tyz * tyz + txz * txz)));
-            for (int j = 0; j < 10; ++j) {
-                vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1;
-                sx_accum[tn[j]] += sx;  sy_accum[tn[j]] += sy;  sz_accum[tn[j]] += sz;
-                txy_accum[tn[j]] += txy; tyz_accum[tn[j]] += tyz; txz_accum[tn[j]] += txz;
-            }
+            const double sx = stress_avg(0), sy = stress_avg(1), sz = stress_avg(2);
+            const double txy = stress_avg(3), tyz = stress_avg(4), txz = stress_avg(5);
+            const double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
+                                               (sz - sx) * (sz - sx) +
+                                               6.0 * (txy * txy + tyz * tyz + txz * txz)));
+            es[e] = ElemStress{vm, sx, sy, sz, txy, tyz, txz, true};
+        }
+    }
+    // Phase 2: serial in-order scatter (same accumulation order as the old code).
+    for (int e = 0; e < n_tets; ++e) {
+        if (!es[e].ok) continue;
+        const ElemStress& s = es[e];
+        for (int j = 0; j < stride; ++j) {
+            const int nid = tets[static_cast<std::size_t>(e) * stride + j];
+            vm_accum[nid] += s.vm; vm_count[nid] += 1;
+            sx_accum[nid] += s.sx;  sy_accum[nid] += s.sy;  sz_accum[nid] += s.sz;
+            txy_accum[nid] += s.txy; tyz_accum[nid] += s.tyz; txz_accum[nid] += s.txz;
         }
     }
     res.von_mises.assign(n_nodes, 0.0);

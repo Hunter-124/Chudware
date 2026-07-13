@@ -471,3 +471,67 @@ TEST_CASE("thermal: invalid inputs are rejected with ok=false") {
                                             {}, 0.0, {}, 4);
     CHECK_FALSE(r2.ok);
 }
+
+// ── Case 8: MULTIPLE independent flux loads (regression for the C3 defect). ─────────────
+// The fea_run steady path used to collapse every flux load onto ONE node set with the LAST
+// load's magnitude — two loads with different q were silently mis-applied. The per-load
+// overload superposes each load's own q·∫N dS.
+TEST_CASE("thermal: two flux loads superpose (same face, different magnitudes)") {
+    // 1-D wall: T fixed at x=0, fluxes q1 + q2 both into x=L as TWO separate loads.
+    // Exact linear field: T(L) = T0 + (q1+q2)·L/k. The old collapse gave q2 only.
+    const double L = 50.0, T0 = 20.0, k = 0.05, q1 = 0.002, q2 = 0.0007;
+    Box m = box_mesh(L, 10.0, 10.0, 8, 2, 2);
+    aicad::sim::ThermalFluxLoad f1, f2;
+    f1.nodes = m.xL; f1.q = q1;
+    f2.nodes = m.xL; f2.q = q2;
+    auto r = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, uniform(m.x0.size(), T0),
+                                           {f1, f2}, {}, 4);
+    REQUIRE(r.ok);
+    const double exactL = T0 + (q1 + q2) * L / k;
+    double got = 0.0;
+    for (int nid : m.xL) got = std::max(got, r.temperature[nid]);
+    MESSAGE("double-flux wall T(L) = ", got, " exact ", exactL);
+    CHECK(got == doctest::Approx(exactL).epsilon(1e-6));  // linear field -> solver tolerance
+}
+
+TEST_CASE("thermal: flux loads on different faces satisfy node-wise superposition") {
+    // Linearity: with the SAME Dirichlet datum T0, (q1 on xL) + (q2 on y=0) solved together
+    // must equal the sum of the single-load solutions minus the datum, at EVERY node.
+    const double L = 30.0, T0 = 25.0, k = 0.08, q1 = 0.0015, q2 = -0.0004;
+    Box m = box_mesh(L, 12.0, 9.0, 5, 3, 2);
+    std::vector<int> y0;  // nodes on the y≈0 lateral face
+    for (size_t n = 0; n < m.pts.size() / 3; ++n)
+        if (std::abs(m.pts[n * 3 + 1]) < 1e-9) y0.push_back(static_cast<int>(n));
+    REQUIRE(!y0.empty());
+    aicad::sim::ThermalFluxLoad f1, f2;
+    f1.nodes = m.xL; f1.q = q1;
+    f2.nodes = y0;   f2.q = q2;
+    const std::vector<double> temps = uniform(m.x0.size(), T0);
+    auto rA  = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1}, {}, 4);
+    auto rB  = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f2}, {}, 4);
+    auto rAB = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0, temps, {f1, f2}, {}, 4);
+    REQUIRE(rA.ok); REQUIRE(rB.ok); REQUIRE(rAB.ok);
+    double max_err = 0.0;
+    for (size_t i = 0; i < rAB.temperature.size(); ++i) {
+        const double expect = rA.temperature[i] + rB.temperature[i] - T0;
+        max_err = std::max(max_err, std::abs(rAB.temperature[i] - expect));
+    }
+    MESSAGE("multi-face superposition max node error = ", max_err);
+    CHECK(max_err < 1e-8);
+}
+
+// ── Case 9: the legacy single-flux signature matches the per-load overload bit-for-bit. ──
+TEST_CASE("thermal: legacy single-flux entry point delegates identically") {
+    const double L = 40.0, T0 = 10.0, k = 0.05, q = 0.001;
+    Box m = box_mesh(L, 10.0, 10.0, 6, 2, 2);
+    auto legacy = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
+                                                uniform(m.x0.size(), T0), m.xL, q, {}, 4);
+    aicad::sim::ThermalFluxLoad fl;
+    fl.nodes = m.xL; fl.q = q;
+    auto perload = aicad::sim::fea_thermal_solve(m.pts, m.tets, k, m.x0,
+                                                 uniform(m.x0.size(), T0), {fl}, {}, 4);
+    REQUIRE(legacy.ok); REQUIRE(perload.ok);
+    REQUIRE(legacy.temperature.size() == perload.temperature.size());
+    for (size_t i = 0; i < legacy.temperature.size(); ++i)
+        CHECK(legacy.temperature[i] == perload.temperature[i]);  // bit-for-bit
+}

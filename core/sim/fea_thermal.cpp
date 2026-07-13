@@ -166,7 +166,7 @@ void tri_surface_mass(bool tet10, double A, Eigen::Matrix<double, 6, 6>& M) {
 ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                 double k_cond, const std::vector<int>& fixed_nodes,
                                 const std::vector<double>& fixed_temps,
-                                const std::vector<int>& flux_nodes, double flux_q,
+                                const std::vector<ThermalFluxLoad>& fluxes,
                                 const std::vector<ThermalConvection>& convections,
                                 int nodes_per_elem) {
     ThermalResult res;
@@ -345,9 +345,13 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
         }
     };
 
-    if (!flux_nodes.empty() && std::isfinite(flux_q) && flux_q != 0.0) {
-        std::unordered_set<int> fs(flux_nodes.begin(), flux_nodes.end());
-        surface_pass(fs, /*do_flux*/ true, flux_q, /*do_conv*/ false, 0.0, 0.0);
+    // Each flux load contributes its OWN surface pass with its OWN magnitude — superposition
+    // over independent sources (the previous single-set/single-q form overwrote q when a
+    // study carried more than one flux load; see the C3 defect note in the header).
+    for (const auto& fl : fluxes) {
+        if (fl.nodes.empty() || !std::isfinite(fl.q) || fl.q == 0.0) continue;
+        std::unordered_set<int> fs(fl.nodes.begin(), fl.nodes.end());
+        surface_pass(fs, /*do_flux*/ true, fl.q, /*do_conv*/ false, 0.0, 0.0);
     }
     for (const auto& cv : convections) {
         if (cv.h <= 0.0 || cv.nodes.empty() || !std::isfinite(cv.h) || !std::isfinite(cv.t_amb))
@@ -402,6 +406,26 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     res.n_dof = n_free;
     res.ok = true;
     return res;
+}
+
+// Legacy single-flux entry point: one node set, one magnitude. Delegates to the per-load
+// overload with exactly one ThermalFluxLoad, so results are bit-for-bit identical to the
+// historical behaviour (same surface pass, same guards).
+ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::vector<int>& tets,
+                                double k_cond, const std::vector<int>& fixed_nodes,
+                                const std::vector<double>& fixed_temps,
+                                const std::vector<int>& flux_nodes, double flux_q,
+                                const std::vector<ThermalConvection>& convections,
+                                int nodes_per_elem) {
+    std::vector<ThermalFluxLoad> fluxes;
+    if (!flux_nodes.empty()) {
+        ThermalFluxLoad fl;
+        fl.nodes = flux_nodes;
+        fl.q = flux_q;
+        fluxes.push_back(std::move(fl));
+    }
+    return fea_thermal_solve(points, tets, k_cond, fixed_nodes, fixed_temps, fluxes,
+                             convections, nodes_per_elem);
 }
 
 // ═════════════════════════════ Transient (T-FIN18) ═══════════════════════════════════════

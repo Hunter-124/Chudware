@@ -873,11 +873,8 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     }
 
     // ── Loads: heat flux + convection film ──────────────────────────────────────────────
-    std::vector<int> flux_nodes;
-    std::unordered_set<int> flux_seen;
-    double flux_q_wm2 = 0.0;  // aggregate flux magnitude (W/m^2); one flux set per study
     std::vector<aicad::sim::ThermalConvection> convections;
-    std::vector<aicad::sim::ThermalFluxLoad> transient_fluxes;  // per-load (T-FIN18)
+    std::vector<aicad::sim::ThermalFluxLoad> flux_loads;  // per-load: steady AND transient
     struct FluxFaceLog { size_t n_nodes; double q_wm2; bool scheduled; };
     std::vector<FluxFaceLog> flux_log;
     const bool transient = study.contains("transient") && study["transient"].is_object();
@@ -893,19 +890,18 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             if (type == "flux") {
                 const double q_wm2 = load.contains("magnitude") && !load["magnitude"].is_null()
                                          ? load["magnitude"].get<double>()
-                                         : 0.0;
-                for (int nid : ids)
-                    if (flux_seen.insert(nid).second) flux_nodes.push_back(nid);
-                flux_q_wm2 = q_wm2;  // W/m^2 (positive = heat into the body)
+                                         : 0.0;  // W/m^2 (positive = heat into the body)
                 flux_log.push_back({ids.size(), q_wm2, load.contains("schedule")});
-                // Transient keeps loads SEPARATE so each carries its own schedule.
+                // Every load stays SEPARATE with its own node set + magnitude (+ schedule for
+                // transient). The old steady path collapsed all loads onto one node set with
+                // the LAST load's magnitude — silently wrong for >1 flux load (C3 defect).
                 aicad::sim::ThermalFluxLoad fl;
                 fl.nodes = ids;
                 fl.q = q_wm2 / 1.0e6;  // W/m^2 -> W/mm^2
                 std::string serr;
                 if (!parse_thermal_schedule(load.value("schedule", json()), fl.schedule, serr))
                     return json{{"ok", false}, {"error", "thermal load schedule: " + serr}};
-                transient_fluxes.push_back(std::move(fl));
+                flux_loads.push_back(std::move(fl));
                 if (!transient && load.contains("schedule"))
                     notes.push_back("Flux schedule ignored in a steady-state study");
             } else if (type == "convection") {
@@ -921,9 +917,6 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
             }
         }
     }
-    // Flux magnitude to the mesh unit: W/m^2 -> W/mm^2 = q/1e6.
-    const double flux_q_mm2 = flux_q_wm2 / 1.0e6;
-
     // ── Transient branch (T-FIN18) — the steady path below stays bit-for-bit intact. ─────
     if (transient) {
         const json& tr = study["transient"];
@@ -952,7 +945,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
         aicad::sim::ThermalTransientResult r = [&] {
             aicad::prof::phases::PhaseScope _p("solve.transient");
             return aicad::sim::fea_thermal_transient(
-                points, tets, k_cond, fixed_nodes, fixed_temps, transient_fluxes, convections,
+                points, tets, k_cond, fixed_nodes, fixed_temps, flux_loads, convections,
                 opts, nodes_per_elem);
         }();
         if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};
@@ -991,7 +984,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     aicad::sim::ThermalResult r = [&] {
         aicad::prof::phases::PhaseScope _p("solve");
         return aicad::sim::fea_thermal_solve(
-            points, tets, k_cond, fixed_nodes, fixed_temps, flux_nodes, flux_q_mm2, convections,
+            points, tets, k_cond, fixed_nodes, fixed_temps, flux_loads, convections,
             nodes_per_elem);
     }();
     if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};

@@ -80,6 +80,11 @@ struct ThermalResult {
 //   flux_nodes    : nodes on heat-flux faces (surface faces with all corners in the set get
 //                   q·∫N dS added to the load; q>0 = heat INTO the body)
 //   flux_q        : the applied surface flux q, W/L^2 (one value for the whole flux set)
+//
+// N.B. this single-flux signature is the LEGACY entry point (kept because external callers
+// and the bit-for-bit regression gate depend on it); it wraps the per-load overload below.
+// Studies with more than one flux load MUST use the ThermalFluxLoad overload — collapsing
+// them onto one shared magnitude silently drops/overwrites flux (the C3 defect).
 //   convections   : zero or more convection film boundaries
 //   nodes_per_elem: 4 (tet4) or 10 (tet10)
 //
@@ -121,6 +126,17 @@ struct ThermalFluxLoad {
     double q = 0.0;           // flux magnitude, W/L^2 (q>0 = heat INTO the body)
     ThermalSchedule schedule; // time modulation of q (empty = constant)
 };
+
+// Steady-state conduction with N independent flux loads, each with its OWN node set and
+// magnitude (schedules are ignored — steady state has no time axis). This is the primary
+// implementation; the single-flux signature above delegates here with one load, so a
+// single-flux study is bit-for-bit identical through either entry point.
+ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::vector<int>& tets,
+                                double k_cond, const std::vector<int>& fixed_nodes,
+                                const std::vector<double>& fixed_temps,
+                                const std::vector<ThermalFluxLoad>& fluxes,
+                                const std::vector<ThermalConvection>& convections,
+                                int nodes_per_elem = 4);
 
 struct ThermalTransientOptions {
     double rho_cp = 0.0;   // volumetric heat capacity rho*cp, J/(L^3·K); must be > 0

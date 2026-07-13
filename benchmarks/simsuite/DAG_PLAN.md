@@ -114,24 +114,35 @@ accuracy flags → `benchmarks/simsuite/results/<UTC>/REPORT.md`.
 
 ---
 
-## Outcome + next phase (PAUSED for greenlight)
+## Outcome
 
 All 9 domains landed green + verified (commits `201f733b`, `7b70868a`,
 `aa9becb2`, `33e43faf`, `4dc52e89`); governor `14af7756`; profiler `b78a3fc3`.
 ECAD-sim (7 fixes) + EM-wave (1 fix) now tested & working.
 
-**Solver phase — correctness first, then performance, each proven by re-running
-the affected bench with `prof_phases`:**
+## Solver phase — SHIPPED 2026-07-12 (all C1–C4 + P1–P5)
 
-1. **Correctness** — orient pressure fan normals (585% err, `fea_run.cpp`
-   accumulate_face_weights); densify curved-face sampling (`session.cpp:6447`);
-   steady thermal multi-flux drop (`fea_run.cpp:770`); modal free-free C++ root
-   cause (`fea_modal.cpp`, Python workaround already shipped).
-2. **Performance** — thread FEA assembly + LBM timestep (OpenMP linked, unused;
-   4–7×); wire CHOLMOD into modal + thermal (single-threaded LDLT; 3–50×); stop
-   uncached overlay re-mesh (`libaicad.cpp:2206/2294`); MeshOut copy-elision;
-   factorization reuse across load cases (creative, 10–100×); spatial-hash
-   `nodes_in_faceset`; lazy result marshalling.
+Correctness (each with a regression witness in the bench + tests):
 
-Full ranked list: workflow output + `benchmarks/simsuite/results/*/REPORT.md`.
-Task board item #3 carries the file:line detail.
+| id | fix | commit | proof |
+|---|---|---|---|
+| C1 | pressure fan normals oriented outward vs element centroid | `f7d51876` | native-pressure bar 585% → 0.37% rel_err; dynamic xfail → PASS |
+| C3 | steady thermal applies each flux load independently | `d2a922fe` | same-face double-flux exact; node-wise superposition 2.5e-13 |
+| C2 | analytic curved-face facesets (surface:{cylinder/cone/sphere/torus} from doc_face_points; exact distance-to-surface in the solver) | `d8f961df` | cylinder barrel 1516/1516 nodes, zero bleed; native curved pressure matches Lamé to 2.0% (`annulus_lame_native_tet10`) |
+| C4 | free-free modal resolves the full 6-mode rigid cluster in the engine (over-request + 3k+1 subspace + verified retry) | `b62d1694` | n_modes=8 tet10 beam: 6 rigid + 2 elastic exactly |
+
+Performance (all bit-identical / parity-proven; measured on the 7600X3D):
+
+| id | change | commit | measured |
+|---|---|---|---|
+| P1 | deterministic parallel FEA assembly + stress recovery (pre-assigned triplet slots; parallel compute + in-order scatter) | `547d9b74` | assembly ~4.6×; results byte-identical |
+| P2 | CHOLMOD supernodal LLT for modal shift-invert + thermal steady/transient (+ shared solver_threads.h cap) | `b5b528d3` | modal 26.4s → 2.0s (13×); thermal 0.67s → 0.25s (2.7×) @54k DOF |
+| P3 | LBM fused macros/feq/collide (feq buffer deleted), collapse(2) stream, link-list bounce-back, precomputed solid list + inlet row | `e6aca0de` | cfd bench 109s → 39.5s (2.8×); metrics bit-identical |
+| P4 | STEP parsed once per mesh_step (was up to 4×); shared_ptr mesh cache (no deep copy on HIT); sim_mesh RPC cached | `e5822ae3` | repeat mesh 0.982s → 0.019s (52×) |
+| P5 | degenerate-faceset short-circuits + lazy weight arrays + planar fast-reject in nodes_in_faceset | `52d5fc10` | oracle-loads Lamé solve_s 1.19s → 0.80s |
+
+Still on the backlog (not blocking): factorization reuse across load cases
+(needs a multi-load-case study API first); spatial-hash sample lookup for very
+fine meshes with huge sample clouds; remaining opt-scan findings in
+`benchmarks/simsuite/results/*/REPORT.md`. The pre-existing ctest `mirror`
+failure (UnifySameDomain seam merge) is tracked separately — unrelated to sim.

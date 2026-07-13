@@ -816,6 +816,30 @@ struct AppState {
     // Index of the tab whose docId matches the mirror's current doc, or -1.
     int  tabIndexForActiveDoc() const;
 
+    // ---- in-context component edit (SolidWorks "Edit Component"; app_state.cpp) ----
+    // While editing a component's model in-context, the component's part-doc becomes the REAL ACTIVE
+    // doc (so feature ops route to it for free — the "current doc" is process-wide) and the assembly
+    // is drawn as a dimmed static GHOST in the same viewport. The active-doc switch reuses the exact
+    // cached open/switch path openComponentPart uses (dedup→switchToTab, else requestOpenPath), so
+    // file caching (DocMirror::activateCached via cachedAicmPath/cachedRevision) is inherited — no
+    // fresh re-tessellate. The later wiring wave calls these from the feature-tree "Edit Model" menu.
+    struct ComponentEditCtx {
+        bool        active = false;
+        std::string componentId;      // the assembly component being edited (banner label)
+        std::string sourcePath;       // component's resolved absolute source .step+ path
+        std::string assemblyDocId;    // return target: the assembly doc to switch back to on exit
+    } componentEdit;
+    // Enter component-edit: remember the current (assembly) doc as the return target, capture its live
+    // mesh into the renderer ghost, then switch the ACTIVE doc to sourceAbsPath via the cached open/
+    // switch path. sourceAbsPath must already be resolved to an absolute on-disk .step+ (the caller
+    // owns resolveComponentPath). No-op if already in a component edit or sourceAbsPath is empty.
+    void enterComponentEdit(const std::string& componentId, const std::string& sourceAbsPath);
+    // Exit component-edit: switch the active doc back to the assembly (its cached mesh/revision via the
+    // same cached switch path — the assembly re-reads the edited component through the existing
+    // mtime-keyed component cache), clear the renderer ghost, and reset the context. No-op if inactive.
+    void exitComponentEdit();
+    bool inComponentEdit() const { return componentEdit.active; }
+
     // ---- multi-document per-session state (core/doc_tabs.cpp + app_state.cpp) ----
     // The active CAD tab's DocSession (null at the empty start state or on a Drawing/ECAD tab).
     DocSession* activeSession();

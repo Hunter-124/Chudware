@@ -1209,6 +1209,66 @@ void AppState::restoreDocState(DocSession& s) {
     sketchPlanePickActive = s.sketchPlanePickActive;
 }
 
+// ---- in-context component edit (SolidWorks "Edit Component") ----
+// Make a component's part-doc the REAL ACTIVE doc while drawing the assembly as a dimmed ghost. The
+// active-doc switch REUSES the exact path openComponentPart (feature_tree.cpp) uses: dedup the source
+// path against already-open non-handoff tabs and switchToTab() it (which routes through DocMirror::
+// tryActivateCached — the cached, no-re-tessellate switch), else set requestOpenPath so app.cpp's
+// GL-thread open pump opens it next frame. Either way, file caching is inherited for free.
+void AppState::enterComponentEdit(const std::string& componentId, const std::string& sourceAbsPath) {
+    if (componentEdit.active || sourceAbsPath.empty()) return;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path want = fs::weakly_canonical(fs::path(sourceAbsPath), ec);
+    if (ec) want = fs::path(sourceAbsPath).lexically_normal();
+
+    // Remember the assembly doc as the return target BEFORE we switch away from it. Prefer the active
+    // tab's docId (the assembly the component belongs to); fall back to the mirror's current doc.
+    std::string returnDocId;
+    if (activeTab >= 0 && activeTab < (int)docTabs.size())
+        returnDocId = docTabs[activeTab].docId;
+    if (returnDocId.empty()) returnDocId = docMirror.docId();
+
+    // Capture the assembly's CURRENT tessellated mesh into the renderer ghost NOW, while subs_ still
+    // holds it (before any switch frees/replaces subs_). Pure GPU-handle move — no re-tessellate.
+    if (renderer) renderer->captureCurrentAsGhost();
+
+    componentEdit.active         = true;
+    componentEdit.componentId    = componentId;
+    componentEdit.sourcePath     = sourceAbsPath;
+    componentEdit.assemblyDocId  = returnDocId;
+
+    // Dedup against already-open non-handoff tabs: switch to the first match (cached switch path)
+    // rather than reopening. Mirrors openComponentPart's dedup exactly.
+    for (int i = 0; i < (int)docTabs.size(); ++i) {
+        const DocTab& t = docTabs[i];
+        if (t.aiHandoff || t.path.empty()) continue;
+        std::error_code e2;
+        fs::path have = fs::weakly_canonical(fs::path(t.path), e2);
+        if (e2) have = fs::path(t.path).lexically_normal();
+        if (have == want) { switchToTab(i); return; }
+    }
+    // Not open yet: queue the GL-thread open pump (drained next frame by app.cpp). The ghost shows
+    // alone for that one frame until the component mesh loads.
+    requestOpenPath = sourceAbsPath;
+}
+
+// Exit component-edit: switch the active doc back to the assembly via the same cached switch path
+// (switchToTab → tryActivateCached), which re-reads the edited component through the assembly's
+// existing mtime-keyed component cache (no manual reparse), then clear the ghost + reset context.
+void AppState::exitComponentEdit() {
+    if (!componentEdit.active) return;
+    const std::string returnDocId = componentEdit.assemblyDocId;
+    // Reset context BEFORE the switch so any repaint during switchToTab sees us out of component-edit.
+    componentEdit = ComponentEditCtx{};
+    if (renderer) renderer->clearGhost();
+    if (!returnDocId.empty()) {
+        for (int i = 0; i < (int)docTabs.size(); ++i) {
+            if (docTabs[i].docId == returnDocId) { switchToTab(i); break; }
+        }
+    }
+}
+
 // Solid Bodies hide/show: push the host-side visibility mask to the renderer (per-slot draw
 // skip) and to the id pass (hidden-body pick skip), keeping both perfectly in sync. Safe to call
 // with no doc loaded (both sinks tolerate empty state).

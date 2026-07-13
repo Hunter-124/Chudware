@@ -129,6 +129,18 @@ public:
     // set (or alpha >= 1) to clear isolation and render everything opaque.
     void setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha);
     void clearPreviewIsolation() { previewFaces_.clear(); previewAlpha_ = 1.0f; }
+
+    // In-context component edit (SolidWorks "Edit Component"): while a component's part-doc is the
+    // active doc, the ASSEMBLY is drawn as a dimmed static ghost behind the live part so the user
+    // keeps assembly context. captureCurrentAsGhost() STEALS the currently-uploaded active mesh
+    // (`subs_`) into the ghost buffer — no re-tessellate, no file re-read (the assembly mesh is
+    // already on the GPU). The next setMeshes()/freeSubs() only touches `subs_`, so the ghost
+    // survives the switch to the component. clearGhost() frees the ghost buffers on exit. The ghost
+    // is drawn translucent (shaded alpha pass) and is NON-pickable (never wired into id_pass).
+    void captureCurrentAsGhost();
+    void clearGhost();
+    bool hasGhost() const { return showGhost_ && !ghostSubs_.empty(); }
+    void setGhostAlpha(float a) { ghostAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
     void renderOrbit(float yawDeg, float pitchDeg, float zoom);
     // W2-D: orbit with a world-space pan offset added to the look-at target. The orbit center
@@ -443,6 +455,11 @@ private:
     float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
+    // In-context component-edit ghost: the parked assembly mesh (moved out of subs_ on enter),
+    // drawn translucent behind the active component and excluded from picking. See captureCurrentAsGhost.
+    std::vector<Sub> ghostSubs_;
+    bool  showGhost_ = false;
+    float ghostAlpha_ = 0.28f;
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift baked into proj.m[8] (see setLensShiftX)

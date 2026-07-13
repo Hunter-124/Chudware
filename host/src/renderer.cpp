@@ -360,6 +360,7 @@ void eyeForView(const std::string& v, float& yaw, float& pitch) {
 
 Renderer::~Renderer() {
     freeSubs();
+    clearGhost();   // free the component-edit ghost buffers if one is active at teardown
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
@@ -584,6 +585,34 @@ void Renderer::freeSubs() {
         if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
     }
     subs_.clear();
+}
+
+// In-context component edit: steal the currently-uploaded active mesh (assembly) into the ghost
+// buffer. This is a pure GPU-handle move — NO re-tessellate, NO file re-read — the assembly mesh is
+// already on the GPU in subs_. The subsequent setMeshes(component) → freeSubs() only frees subs_,
+// so the ghost survives the switch. Any prior ghost is freed first.
+void Renderer::captureCurrentAsGhost() {
+    clearGhost();
+    ghostSubs_ = std::move(subs_);   // move GL handles; no reupload
+    subs_.clear();                   // moved-from vector -> explicit empty (defensive)
+    showGhost_ = true;
+    ++meshesRevision_;
+}
+
+// Free the ghost buffers and stop drawing the ghost (exit component edit / renderer teardown).
+void Renderer::clearGhost() {
+    for (auto& s : ghostSubs_) {
+        if (s.vao) glDeleteVertexArrays(1, &s.vao);
+        if (s.vboPos) glDeleteBuffers(1, &s.vboPos);
+        if (s.vboNrm) glDeleteBuffers(1, &s.vboNrm);
+        if (s.ebo) glDeleteBuffers(1, &s.ebo);
+        if (s.edgeVao) glDeleteVertexArrays(1, &s.edgeVao);
+        if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
+        if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
+    }
+    ghostSubs_.clear();
+    showGhost_ = false;
+    ++meshesRevision_;
 }
 
 void Renderer::setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha) {
@@ -958,6 +987,32 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                 if (!s.visible || s.faces.empty()) continue;
                 glBindVertexArray(s.vao);
                 drawSubFaces(s, /*editing=*/true);
+            }
+            glUniform1f(alphaLoc, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // In-context component edit: the parked assembly mesh renders as a dimmed static GHOST behind
+        // the live component, so the user keeps assembly context (SolidWorks "Edit Component"). Same
+        // translucent shaded pass as the edit-preview ghost above — a flat neutral tint at ghostAlpha_,
+        // depth-write OFF so it blends evenly, depth-TEST on so the opaque component correctly occludes
+        // it. Non-pickable by construction (ghostSubs_ is never fed to id_pass). HLR skips it (the
+        // ghost is only meaningful in a shaded style). Reuses the already-bound prog_ + camera/lights.
+        if (showGhost_ && !ghostSubs_.empty() && !hlr) {
+            const float gtint[3] = {0.55f, 0.60f, 0.68f};   // neutral cool grey ghost
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glUniform1i(useScalarLoc, 0);                   // flat tint, never the FEA colormap
+            glUniform1f(alphaLoc, ghostAlpha_);
+            glUniform3f(colorLoc, gtint[0], gtint[1], gtint[2]);
+            glUniform1f(metallicLoc, 0.0f);                 // matte dielectric for a clean tint
+            glUniform1f(roughnessLoc, 0.6f);
+            for (const auto& s : ghostSubs_) {
+                if (!s.visible) continue;
+                glBindVertexArray(s.vao);
+                glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
             }
             glUniform1f(alphaLoc, 1.0f);
             glDepthMask(GL_TRUE);

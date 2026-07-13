@@ -1683,6 +1683,151 @@ static void openComponentPart(AppState& st, const std::string& srcPath) {
     st.requestOpenPath = abs;   // drained next frame by app.cpp's GL-thread open pump
 }
 
+// ---- component nested feature tree (read-only, mirrors the part-env "3D Body" display) ----
+// A component in the assembly tree expands to show its OWN features nested exactly like the part
+// environment shows them: a "Reference" folder (datum planes/axes/points), the 3D history
+// features, and any profile sketch consumed by exactly one feature shown INDENTED under that
+// consumer. This borrows the part-env sketch-consumption ANALYSIS (see drawFeatureTreeBody near
+// L3171) but NOT its row renderer — featureRow()/drawOneRow are welded to live part state
+// (statusMap, ownerMap, editing, drag-drop) a foreign `.step+` component does not have. So these
+// are plain read-only rows in the existing flat-list idiom (icon + name), just nested.
+
+// Recursive ref-scan: collect every sketch id (from `sketchIds`) that `node` references via a
+// region selector {"kind":"region","sketch":"fX"} or a bare sketch id under a *sketch*/profile
+// key. Free function (not a std::function lambda) so we don't depend on <functional> here. Mirrors
+// the part-env scan at L3188; call it on a feature's `refs` object ONLY (scanning params would
+// false-match sketch-keyed values).
+static void componentScanSketchRefs(const nlohmann::json& node, const std::string& key,
+                                    const std::unordered_set<std::string>& sketchIds,
+                                    std::unordered_set<std::string>& seen) {
+    if (node.is_object()) {
+        if (jfld(node, "kind") == "region") {
+            std::string sk = jfld(node, "sketch");
+            if (!sk.empty() && sketchIds.count(sk)) seen.insert(sk);
+        }
+        for (auto it = node.begin(); it != node.end(); ++it)
+            componentScanSketchRefs(it.value(), it.key(), sketchIds, seen);
+    } else if (node.is_array()) {
+        for (const auto& e : node) componentScanSketchRefs(e, key, sketchIds, seen);
+    } else if (node.is_string()) {
+        bool keyImpliesSketch = key.find("sketch") != std::string::npos || key == "profile";
+        std::string v = node.get<std::string>();
+        if (keyImpliesSketch && sketchIds.count(v)) seen.insert(v);
+    }
+}
+
+// Render one read-only component feature row (icon-in-arrow-slot + name), leaf or collapsible.
+// Returns whether a collapsible node is OPEN (leaf always false — it never pushes). `expandable`
+// nodes (a consumer with a nested sketch) push and MUST be TreePop'd by the caller when open.
+// `nested` indents the whole row by the part-env indent constant.
+static bool drawComponentFeatureRow(const std::string& idSuffix, const std::string& label,
+                                    const char* icon, bool expandable, bool nested) {
+    const float nestIndent = 14.0f * ui::uiScale;
+    if (nested) ImGui::Indent(nestIndent);
+    FmRowRect featRect = fmRowPill();
+    ImGuiTreeNodeFlags ftf = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
+    if (expandable) ftf |= ImGuiTreeNodeFlags_OpenOnArrow;
+    else            ftf |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    ImVec2 fPos = ImGui::GetCursorScreenPos();
+    bool open = ImGui::TreeNodeEx((label + "##" + idSuffix).c_str(), ftf);
+    treeIconInArrowSlot(fPos, icon, "[f]", 1.0f);
+    fmRowPillEnd(featRect);
+    if (nested) ImGui::Unindent(nestIndent);
+    return expandable && open;
+}
+
+// Render a component's whole nested feature tree (Reference folder + history + nested sketches).
+// Called inside `if (expandable && compOpen)`; leaves the ImGui tree stack net-zero (each pushed
+// node is popped here). `cid` disambiguates ids so multiple expanded components never collide.
+static void drawComponentFeatureTree(const std::string& cid,
+                                     const std::vector<ui::ComponentFeature>& feats) {
+    const auto& pal = fmPalette();
+
+    // Identify sketches and reference features.
+    auto isReferenceFeat = [](const ui::ComponentFeature& f) {
+        return f.type == "plane" || f.type == "datum_plane" || f.type == "axis" ||
+               f.type == "point" || f.folder == "Reference";
+    };
+    std::unordered_set<std::string> sketchIds;
+    for (const auto& f : feats)
+        if (f.type == "sketch") sketchIds.insert(f.id);
+
+    // ---- sketch-consumption analysis (borrowed from the part env) ----
+    // A sketch consumed by EXACTLY ONE non-sketch feature (via its refs) nests under that
+    // consumer. No status-gating here: a foreign component has no rollback/error state to gate on.
+    std::unordered_map<std::string, int> consumeCount;      // sketch fid -> #consumers
+    std::unordered_map<std::string, std::string> consumer;  // sketch fid -> consumer fid
+    for (const auto& f : feats) {
+        if (f.type == "sketch") continue;             // a sketch isn't a consumer
+        auto refs = f.raw.find("refs");
+        if (refs == f.raw.end()) continue;
+        std::unordered_set<std::string> seen;
+        componentScanSketchRefs(*refs, std::string(), sketchIds, seen);
+        for (const auto& sk : seen) { ++consumeCount[sk]; consumer[sk] = f.id; }
+    }
+    std::unordered_map<std::string, std::vector<std::string>> childrenOf;  // consumer -> sketches
+    std::unordered_set<std::string> nestedSketchIds;
+    for (const auto& kv : consumer)
+        if (consumeCount[kv.first] == 1) {
+            childrenOf[kv.second].push_back(kv.first);
+            nestedSketchIds.insert(kv.first);
+        }
+
+    // Fast lookup of a feature by id (for rendering nested sketch children by name/icon).
+    auto findFeat = [&](const std::string& fid) -> const ui::ComponentFeature* {
+        for (const auto& f : feats) if (f.id == fid) return &f;
+        return nullptr;
+    };
+    auto featLabel = [](const ui::ComponentFeature& f) {
+        return f.name.empty() ? (f.type.empty() ? std::string("Feature") : f.type) : f.name;
+    };
+
+    // ---- Reference folder (datum planes/axes/points) collected explicitly up front ----
+    // Explicit collection (not the part-env contiguous folder-walk) because component features may
+    // not be folder-adjacent — a contiguous walk would emit duplicate "Reference" headers.
+    std::vector<const ui::ComponentFeature*> refFeats;
+    for (const auto& f : feats)
+        if (isReferenceFeat(f)) refFeats.push_back(&f);
+    if (!refFeats.empty()) {
+        FmRowRect fldRect = fmRowPill();
+        treeIcon("body_folder", "[F]", 16.0f);
+        ImGui::SameLine(0, 4 * ui::uiScale);
+        bool refOpen = ImGui::TreeNodeEx(("Reference##cref_" + cid).c_str(),
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+            ImGuiTreeNodeFlags_FramePadding);
+        fmRowPillEnd(fldRect);
+        if (refOpen) {
+            for (const auto* f : refFeats)
+                drawComponentFeatureRow("cf_" + cid + "_" + f->id, featLabel(*f),
+                                        featureIcon(f->type, &f->raw), false, false);
+            ImGui::TreePop();
+        }
+    }
+
+    // ---- history features (reference features + nested sketches skipped) ----
+    // Non-Reference folder tags (Dress-up/Patterns/...) are honored as a display prefix on the row
+    // name rather than a nested sub-node — the two things in the screenshot (Reference folder +
+    // sketch nesting) are the real deliverable; a full folder-tree for foreign components is left
+    // to a later wave (see summary).
+    for (const auto& f : feats) {
+        if (isReferenceFeat(f)) continue;
+        if (f.type == "sketch" && nestedSketchIds.count(f.id)) continue;  // shown under consumer
+
+        auto kids = childrenOf.find(f.id);
+        bool hasKids = kids != childrenOf.end() && !kids->second.empty();
+        bool rowOpen = drawComponentFeatureRow("cf_" + cid + "_" + f.id, featLabel(f),
+                                               featureIcon(f.type, &f.raw), hasKids, false);
+        if (rowOpen && hasKids) {
+            for (const auto& skId : kids->second)
+                if (const ui::ComponentFeature* sf = findFeat(skId))
+                    drawComponentFeatureRow("cf_" + cid + "_" + sf->id, featLabel(*sf),
+                                            featureIcon(sf->type, &sf->raw), false, true);
+            ImGui::TreePop();   // matches the pushed consumer node
+        }
+    }
+    (void)pal;
+}
+
 // ---- C20b: assembly tree (components + Mates folder) ----
 // Renders an aicad.asm/1 doc: each component as a "(f)"-fixed-marked row (SolidWorks), then a
 // Mates folder listing each mate as "Concentric1 (base<->peg)" with a suppress/delete context
@@ -1814,16 +1959,11 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                         ImGui::TextUnformatted(abs.empty() ? "(save the assembly to inspect)"
                                                            : "(no features)");
                         ImGui::PopStyleColor();
-                    }
-                    for (const auto& f : feats) {
-                        FmRowRect featRect = fmRowPill();
-                        ImGuiTreeNodeFlags ftf = ImGuiTreeNodeFlags_Leaf |
-                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
-                        ImVec2 fPos = ImGui::GetCursorScreenPos();
-                        ImGui::TreeNodeEx((f.name + "##cf_" + cid + "_" + f.id).c_str(), ftf);
-                        treeIconInArrowSlot(fPos, featureIcon(f.type), "[f]", 1.0f);
-                        fmRowPillEnd(featRect);
+                    } else {
+                        // Nested read-only tree that mirrors the part-env "3D Body" display:
+                        // Reference folder + history features + consumed sketches indented under
+                        // their consumer. Net-zero on the ImGui tree stack.
+                        drawComponentFeatureTree(cid, feats);
                     }
                 }
                 ImGui::TreePop();   // matches the pushed (non-leaf) component node

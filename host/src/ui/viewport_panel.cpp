@@ -1788,6 +1788,37 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // ---- in-context component-edit banner (SolidWorks "Edit Component") ----
+        // While a component's model is the active doc (assembly drawn as a dimmed ghost behind it),
+        // show a compact glass HUD banner "Editing model: <componentId>" with a "Return to assembly"
+        // button that exits back to the assembly doc. Mirrors the gizmo-HUD glass panel styling above.
+        if (st.inComponentEdit()) {
+            const float s = ui::uiScale;
+            const auto& palC = ui::palette;
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                ImVec4(palC.overlayBg[0], palC.overlayBg[1], palC.overlayBg[2], palC.overlayBg[3]));
+            ImGui::PushStyleColor(ImGuiCol_Border,
+                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 0.55f));
+            ImGui::BeginChild("##compEditHud", ImVec2(300 * s, 0),
+                              ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY,
+                              ImGuiWindowFlags_NoScrollbar);
+            const std::string& cid = st.componentEdit.componentId;
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palC.overlayText[0], palC.overlayText[1], palC.overlayText[2], 1.0f));
+            ImGui::Text("Editing model: %s", cid.empty() ? "(component)" : cid.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palC.accentDim[0], palC.accentDim[1], palC.accentDim[2], 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 1.0f));
+            if (ImGui::Button("Return to assembly", ImVec2(0, 0)))
+                st.exitComponentEdit();
+            ImGui::PopStyleColor(2);
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+        }
+
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
             ImGui::Separator();

@@ -6,12 +6,24 @@
 
 #include "sim/fea_modal.h"
 
+#include "sim/solver_threads.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
+#ifdef AICAD_WITH_CHOLMOD
+#include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
+#endif
+#ifdef AICAD_HAVE_OPENMP
+#include <omp.h>
+#endif
 
 #include <Spectra/MatOp/SparseSymMatProd.h>
 #include <Spectra/MatOp/SymShiftInvert.h>
@@ -22,6 +34,39 @@ namespace aicad::sim {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+
+#ifdef AICAD_WITH_CHOLMOD
+// Spectra shift-invert op backed by CHOLMOD supernodal LLT (P2). Spectra's stock
+// SymShiftInvert factorizes (K - sigma*M) with Eigen's scalar single-threaded LDLT —
+// the dominant modal cost on real meshes. sigma < 0 here (see the shift note below),
+// so K - sigma*M = K + |sigma|*M is strictly SPD and CHOLMOD's LLT applies. Throws on
+// factorization failure so the caller can fall back to the stock LDLT op.
+class CholmodShiftInvert {
+public:
+    using Scalar = double;
+    CholmodShiftInvert(const Eigen::SparseMatrix<double>& K,
+                       const Eigen::SparseMatrix<double>& M)
+        : K_(K), M_(M) {}
+    Eigen::Index rows() const { return K_.rows(); }
+    Eigen::Index cols() const { return K_.cols(); }
+    void set_shift(const double& sigma) {
+        Eigen::SparseMatrix<double> A = K_ - sigma * M_;
+        llt_.compute(A);
+        if (llt_.info() != Eigen::Success)
+            throw std::runtime_error("CHOLMOD LLT of (K - sigma*M) failed");
+    }
+    void perform_op(const double* x_in, double* y_out) const {
+        Eigen::Map<const Eigen::VectorXd> x(x_in, K_.rows());
+        Eigen::Map<Eigen::VectorXd> y(y_out, K_.rows());
+        y = llt_.solve(x);
+    }
+
+private:
+    const Eigen::SparseMatrix<double>& K_;
+    const Eigen::SparseMatrix<double>& M_;
+    Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> llt_;
+};
+#endif
 
 void lame(double E, double nu, double& lam, double& mu) {
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
@@ -358,19 +403,19 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     const double evscale = (mdiag > 0.0) ? kdiag / mdiag : 1.0;
     const double sigma = -1e-5 * evscale;
 
-    using OpType = Spectra::SymShiftInvert<double, Eigen::Sparse, Eigen::Sparse>;
     using BOpType = Spectra::SparseSymMatProd<double>;
-    OpType op(Kff, Mff);
     BOpType Bop(Mff);
+    cap_solver_threads_for_host();  // CHOLMOD/BLAS threads (P2) — leave cores for the GUI
 
     Eigen::VectorXd evals;
     Eigen::MatrixXd evecs;
-    auto eigensolve = [&](int ks) -> bool {
+    auto run_geigs = [&](auto& op, int ks) -> bool {
         // 3k+1 (not 2k+1): the wider subspace is what actually lets Lanczos pull a full
         // degenerate cluster through; measured negligible cost at these problem sizes.
         const int ncv = std::min(n_free, std::max(3 * ks + 1, 30));
-        Spectra::SymGEigsShiftSolver<OpType, BOpType, Spectra::GEigsMode::ShiftInvert> geigs(
-            op, Bop, ks, ncv, sigma);
+        Spectra::SymGEigsShiftSolver<std::decay_t<decltype(op)>, BOpType,
+                                     Spectra::GEigsMode::ShiftInvert>
+            geigs(op, Bop, ks, ncv, sigma);
         geigs.init();
         geigs.compute(Spectra::SortRule::LargestMagn, 10 * n_free, 1e-10,
                       Spectra::SortRule::SmallestAlge);
@@ -378,6 +423,23 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
         evals = geigs.eigenvalues();  // generalized eigenvalues (omega^2-ish)
         evecs = geigs.eigenvectors();  // (n_free, k)
         return true;
+    };
+    auto eigensolve = [&](int ks) -> bool {
+        // Prefer the CHOLMOD-backed shift-invert (multithreaded BLAS3 factorization of
+        // K + |sigma|·M); fall back to Spectra's stock single-threaded LDLT op when
+        // SuiteSparse is absent or its strict-SPD LLT rejects the system.
+#ifdef AICAD_WITH_CHOLMOD
+        try {
+            CholmodShiftInvert op(Kff, Mff);
+            if (run_geigs(op, ks)) return true;
+        } catch (const std::exception&) { /* fall through to LDLT */ }
+#endif
+        try {
+            Spectra::SymShiftInvert<double, Eigen::Sparse, Eigen::Sparse> op(Kff, Mff);
+            return run_geigs(op, ks);
+        } catch (const std::exception&) {
+            return false;
+        }
     };
     auto n_rigid = [&] {  // rigid-body modes read ≈0 Hz; elastic modes are orders above
         int n = 0;

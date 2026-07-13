@@ -11,6 +11,8 @@
 
 #include "sim/fea_thermal.h"
 
+#include "sim/solver_threads.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -20,6 +22,9 @@
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
+#ifdef AICAD_WITH_CHOLMOD
+#include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
+#endif
 
 namespace aicad::sim {
 
@@ -371,7 +376,23 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
 
     Eigen::VectorXd Tf;
     bool solved = false;
+#ifdef AICAD_WITH_CHOLMOD
+    // P2: CHOLMOD supernodal LLT first — BLAS3 + multithreaded, 3-15x the scalar
+    // single-threaded SimplicialLDLT on real conduction systems. Kff is SPD (reduced
+    // Dirichlet system, or Neumann + convection surface terms anchoring the datum);
+    // if CHOLMOD's strict-SPD LLT rejects a near-singular system we fall through to
+    // the LDLT → SparseLU ladder exactly as before.
     {
+        cap_solver_threads_for_host();
+        Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
+        chol.compute(Kff);
+        if (chol.info() == Eigen::Success) {
+            Tf = chol.solve(f);
+            if (chol.info() == Eigen::Success) solved = true;
+        }
+    }
+#endif
+    if (!solved) {
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
         ldlt.compute(Kff);
         if (ldlt.info() == Eigen::Success) {
@@ -830,18 +851,33 @@ ThermalTransientResult fea_thermal_transient(
         Cff.makeCompressed();
     }
 
+    // P2: factor A once with the fastest available ladder — CHOLMOD supernodal LLT
+    // (BLAS3, multithreaded; A = Kff + Cff/dt is SPD) → SimplicialLDLT → SparseLU.
+    // The one factorization is amortized over EVERY backward-Euler step, so this is
+    // where the transient solver's wall-clock actually lives.
+#ifdef AICAD_WITH_CHOLMOD
+    Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
+    bool use_chol = false;
+    cap_solver_threads_for_host();
+    chol.compute(A);
+    if (chol.info() == Eigen::Success) use_chol = true;
+#else
+    constexpr bool use_chol = false;
+#endif
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
     Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
     bool use_ldlt = false;
-    ldlt.compute(A);
-    if (ldlt.info() == Eigen::Success) {
-        use_ldlt = true;
-    } else {
-        lu.analyzePattern(A);
-        lu.factorize(A);
-        if (lu.info() != Eigen::Success) {
-            res.error = "fea_thermal_transient: iteration-matrix factorization failed";
-            return res;
+    if (!use_chol) {
+        ldlt.compute(A);
+        if (ldlt.info() == Eigen::Success) {
+            use_ldlt = true;
+        } else {
+            lu.analyzePattern(A);
+            lu.factorize(A);
+            if (lu.info() != Eigen::Success) {
+                res.error = "fea_thermal_transient: iteration-matrix factorization failed";
+                return res;
+            }
         }
     }
 
@@ -858,9 +894,21 @@ ThermalTransientResult fea_thermal_transient(
             const double s = thermal_schedule_scale(fluxes[k].schedule, t_next);
             if (s != 0.0) rhs += s * flux_vecs[k];
         }
-        if (use_ldlt) Tf = ldlt.solve(rhs);
-        else Tf = lu.solve(rhs);
-        if ((use_ldlt && ldlt.info() != Eigen::Success) || (!use_ldlt && lu.info() != Eigen::Success)) {
+        bool step_ok;
+#ifdef AICAD_WITH_CHOLMOD
+        if (use_chol) {
+            Tf = chol.solve(rhs);
+            step_ok = (chol.info() == Eigen::Success);
+        } else
+#endif
+        if (use_ldlt) {
+            Tf = ldlt.solve(rhs);
+            step_ok = (ldlt.info() == Eigen::Success);
+        } else {
+            Tf = lu.solve(rhs);
+            step_ok = (lu.info() == Eigen::Success);
+        }
+        if (!step_ok) {
             res.error = "fea_thermal_transient: sparse solve failed at step " + std::to_string(n);
             return res;
         }

@@ -40,6 +40,22 @@ the selection. Per-doc state lives on `AppState::DocTab` (`host/src/core/app_sta
 - Headless render modes exist for testing: `Billet --render <in.stl> <out.png>` and
   `--contact <in.stl> <out.png>`.
 
+## In-context component edit (ghost mesh)
+
+- Assembly "Edit Model" (see gui-ribbon-commands) makes the component's part-doc the active
+  doc and draws the backgrounded assembly as a translucent **ghost**. Renderer state:
+  `ghostSubs_` / `showGhost_` / `ghostAlpha_` (~0.28) / `ghostXform_`; API
+  `captureCurrentAsGhost()` (steals current `subs_` GL handles — no re-tessellate),
+  `clearGhost()`, `setGhostAlpha()`, `setGhostTransform(m16)`. Ghost is drawn in `drawCurrent`
+  after the isolate pass and is **excluded from the id/pick pass** (non-pickable).
+- `setGhostTransform` gets `inverse(component placement transform)` so the ghost realigns onto
+  the live part's origin frame (else mated components float away from their context). Match the
+  renderer's existing model-matrix convention exactly.
+- Entry/exit live on `AppState`: `enterComponentEdit`/`exitComponentEdit`/`inComponentEdit`
+  (`app_state.cpp`); exit does an async **save-then-rebuild** of the assembly. The viewport HUD
+  banner ("Editing model: …" + Return-to-assembly) is in `viewport_panel.cpp`; its button calls
+  `st.exitComponentEdit()`.
+
 ## Build & smoke
 
 ```bash

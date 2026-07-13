@@ -64,6 +64,25 @@ Python kernel executes → result drained per-frame by `host/src/core/engine_eve
 - Colors from `ui_theme` only; icon names must pass `scripts/gui_lint.py --rule icons`.
 - Interaction/gesture language: `contracts/interaction.md`.
 
+## Assembly component tree (feature_tree.cpp `drawAssemblyTree`)
+
+- Each component expands into a **nested read-only** mini feature-tree mirroring the part env:
+  a "Reference" folder (planes/axes/points) + history features with **sketches nested under
+  their consuming feature** (Extrude1 ▸ Sketch). Rendered by file-static helpers
+  `drawComponentFeatureTree` / `drawComponentFeatureRow` / `componentScanSketchRefs` (they
+  borrow the part-env consumption analysis but do NOT reuse `drawOneRow`, which is welded to
+  live part state). Data comes from `ui::componentFeatures()` (`component_features.*`), whose
+  `ComponentFeature` carries `folder` + full `raw` json. Non-Reference folders
+  (Dress-up/Patterns) aren't nested yet; only native `.step+` components populate (dumb STEP
+  imports have no feature list).
+- Component right-click menu: **"Edit"** (placement/mates → sets
+  `AppState::requestEditComponentMates`, consumed by `asm_panels.cpp` to focus the mate form)
+  and **"Edit Model"** (in-context model edit → `AppState::enterComponentEdit(cid, absPath)`);
+  double-click a component row also enters in-context edit. Ghost/edit-mode machinery is in
+  gui-viewport.
+- The AI "Name & group" tree-header button was removed (sidelined); `nameAndGroupFeatures`
+  is kept `[[maybe_unused]]` for later re-wiring.
+
 ## Build & verify
 
 `./build.sh` from repo root must compile; run `scripts/gui_lint.py --rule icons` if you

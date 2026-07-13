@@ -1231,7 +1231,51 @@ void AppState::enterComponentEdit(const std::string& componentId, const std::str
 
     // Capture the assembly's CURRENT tessellated mesh into the renderer ghost NOW, while subs_ still
     // holds it (before any switch frees/replaces subs_). Pure GPU-handle move — no re-tessellate.
-    if (renderer) renderer->captureCurrentAsGhost();
+    if (renderer) {
+        renderer->captureCurrentAsGhost();
+
+        // Relocate the ghost so the edited component's ghost copy lands on the live part at its own
+        // modelling origin (SolidWorks in-context edit). The ghost mesh was baked with each component
+        // already placed at its SOLVED assembly transform (the mate-solved placement is persisted back
+        // into doc["components"][].transform in session.cpp::rebuild_assembly, so the mirror tree
+        // carries exactly what the ghost was baked at). We therefore pre-multiply the whole ghost by
+        // inverse(thisComponent.placement): the edited component's ghost copy collapses onto the live
+        // part at origin while the rest of the assembly wraps correctly around it. Identity placement
+        // (the fixed/first component) inverts to identity → no shift.
+        //
+        // Convention: the stored 16-float transform is ROW-MAJOR (fed to gp_Trsf::SetValues in
+        // core/doc/assembly.cpp::trsf_from_xform16 — m[0..3]=row0, m[4..7]=row1, m[8..11]=row2, so the
+        // translation sits at m[3],m[7],m[11]). The renderer's Mat4 is COLUMN-MAJOR (translation at
+        // m[12..14]). For a rigid transform, inverse = [Rᵀ | -Rᵀt]; the row→column transpose and the
+        // rotation-inverse transpose cancel, so the rotation block copies straight across and only the
+        // translation is recomputed. setGhostTransform() consumes column-major, so we emit that here.
+        std::vector<double> a = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // kIdent16
+        const nlohmann::json& tree = docMirror.tree();
+        if (tree.contains("components") && tree["components"].is_array()) {
+            for (const auto& c : tree["components"]) {
+                if (c.value("id", std::string()) != componentId) continue;
+                if (c.contains("transform") && c["transform"].is_array() &&
+                    c["transform"].size() == 16) {
+                    auto v = c["transform"].get<std::vector<double>>();
+                    if (v.size() == 16) a = std::move(v);
+                }
+                break;
+            }
+        }
+        // Column-major inverse of the rigid row-major placement `a`.
+        float inv[16];
+        // Rotation block: Rᵀ (transpose-for-inverse) then transpose again for row→column ⇒ copy across.
+        inv[0]  = (float)a[0];  inv[4]  = (float)a[4];  inv[8]  = (float)a[8];   inv[12] = 0.0f;
+        inv[1]  = (float)a[1];  inv[5]  = (float)a[5];  inv[9]  = (float)a[9];   inv[13] = 0.0f;
+        inv[2]  = (float)a[2];  inv[6]  = (float)a[6];  inv[10] = (float)a[10];  inv[14] = 0.0f;
+        inv[3]  = 0.0f;         inv[7]  = 0.0f;         inv[11] = 0.0f;          inv[15] = 1.0f;
+        // Translation of the inverse = -Rᵀt, landing in the column-major translation slots (12,13,14).
+        const double tx = a[3], ty = a[7], tz = a[11];  // row-major translation of `a`
+        inv[12] = -(float)(a[0] * tx + a[4] * ty + a[8]  * tz);
+        inv[13] = -(float)(a[1] * tx + a[5] * ty + a[9]  * tz);
+        inv[14] = -(float)(a[2] * tx + a[6] * ty + a[10] * tz);
+        renderer->setGhostTransform(inv);
+    }
 
     componentEdit.active         = true;
     componentEdit.componentId    = componentId;

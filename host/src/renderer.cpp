@@ -612,6 +612,7 @@ void Renderer::clearGhost() {
     }
     ghostSubs_.clear();
     showGhost_ = false;
+    ghostXform_ = Mat4{};   // back to identity (no ghost shift) until the next component-edit sets one
     ++meshesRevision_;
 }
 
@@ -1001,6 +1002,13 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         // ghost is only meaningful in a shaded style). Reuses the already-bound prog_ + camera/lights.
         if (showGhost_ && !ghostSubs_.empty() && !hlr) {
             const float gtint[3] = {0.55f, 0.60f, 0.68f};   // neutral cool grey ghost
+            // Relocate the ghost by ghostXform_ (identity unless in component-edit): apply it to the
+            // ghost vertices BEFORE the camera, i.e. uMVP_ghost = mvp * ghostXform_ (mul() is a*b in
+            // column-major, so ghostXform_ is the innermost/first factor on the vertex). The caller
+            // feeds inverse(editedComponent.placement) so the ghost's copy of the edited component
+            // lands on the live part at its own origin. Restored to mvp after the loop.
+            const Mat4 ghostMvp = mul(mvp, ghostXform_);
+            glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, ghostMvp.m);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
@@ -1017,6 +1025,8 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glUniform1f(alphaLoc, 1.0f);
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
+            // Restore the unshifted MVP for any later prog_ pass in this frame (cheap insurance).
+            glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
         }
 
         glBindVertexArray(0);

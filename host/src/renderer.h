@@ -141,6 +141,12 @@ public:
     void clearGhost();
     bool hasGhost() const { return showGhost_ && !ghostSubs_.empty(); }
     void setGhostAlpha(float a) { ghostAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
+    // In-context component edit: relocate the ghost pass by this column-major 4x4 (applied to ghost
+    // vertices BEFORE the camera). Caller passes inverse(editedComponent.placement) so the ghost's
+    // copy of the edited component lands on the live part at its own modelling origin, while the rest
+    // of the assembly arranges around it. Identity (the default, and the fixed/first component's
+    // inverse) leaves the ghost exactly where it was baked. Reset to identity by clearGhost().
+    void setGhostTransform(const float m[16]) { for (int i = 0; i < 16; ++i) ghostXform_.m[i] = m[i]; }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
     void renderOrbit(float yawDeg, float pitchDeg, float zoom);
     // W2-D: orbit with a world-space pan offset added to the look-at target. The orbit center
@@ -460,6 +466,7 @@ private:
     std::vector<Sub> ghostSubs_;
     bool  showGhost_ = false;
     float ghostAlpha_ = 0.28f;
+    Mat4  ghostXform_;   // extra model xform for the ghost pass only (identity = no shift); see setGhostTransform
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift baked into proj.m[8] (see setLensShiftX)

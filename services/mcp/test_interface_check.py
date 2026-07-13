@@ -69,13 +69,19 @@ def _build_stack(dx: float):
 
 # --- doc_query body_id selector (shared engine path) -------------------------------------------
 def test_doc_query_body_id_selects_per_body():
-    """The 1-based body_id routes doc_query to a SPECIFIC body; default = last body."""
+    """The 1-based body_id routes doc_query to a SPECIFIC body; default = the WHOLE doc.
+
+    Default contract changed 2026-07-12 (asm-fea F1): an un-scoped query resolves across
+    EVERY body of a multi-body/assembly doc, not bodies[-1] — the last-body default made
+    FEA fixtures/loads unable to address any other component (constraints on an
+    assembly's wheels literally could not resolve). body_id keeps per-body selection.
+    """
     doc = _build_stack(dx=0.0)  # two coaxial plates, B lifted +10 in Z
     # Body 1 = bracket (holes around z=0), body 2 = plate copy (holes around z=10).
     q = {"of": "face", "surf": "round"}
     r1 = cb.call("doc_query", {"doc_id": doc, "query": {**q, "body_id": 1}})
     r2 = cb.call("doc_query", {"doc_id": doc, "query": {**q, "body_id": 2}})
-    rd = cb.call("doc_query", {"doc_id": doc, "query": dict(q)})  # default -> last body
+    rd = cb.call("doc_query", {"doc_id": doc, "query": dict(q)})  # default -> whole doc
 
     def zmean(res):
         cyl = [m for m in res.get("matches", []) if m.get("surf") == "cylinder"]
@@ -87,8 +93,10 @@ def test_doc_query_body_id_selects_per_body():
     assert n1 > 0 and n2 > 0, (n1, n2)
     # body 1 holes sit lower in Z than body 2 holes (lifted +10) -> per-body selection works.
     assert z1 < z2 - 3.0, (z1, z2)
-    # default query == last body (body 2).
-    assert abs(zd - z2) < 1e-6 and nd == n2, (zd, z2, nd, n2)
+    # default query == UNION of both bodies' faces (whole-doc resolution).
+    assert nd == n1 + n2, (nd, n1, n2)
+    lo, hi = min(z1, z2), max(z1, z2)
+    assert lo - 1e-6 < zd < hi + 1e-6, (zd, z1, z2)
 
 
 def test_doc_query_body_id_out_of_range():

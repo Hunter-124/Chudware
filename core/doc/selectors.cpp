@@ -565,6 +565,37 @@ ResolveResult resolve(const nlohmann::json& selector,
 
     // Step 3 — accept/reject.
     double margin = second_score - best_score;
+
+    // ── Exact-snapshot fast path (asm-fea F1) ────────────────────────────────────────
+    // A selector minted from a live match (doc_query / resolve_pick carries the face's
+    // recorded centroid + area verbatim, make_selector rounds at 1e-6) whose BEST candidate
+    // reproduces both to snapshot precision IS that face — accept it regardless of margin.
+    // On a multi-body/assembly compound (four identical wheels) the sibling wheels' faces
+    // sit inside the 0.05 ambiguity band (same kind/area/axis; the centroid term is diluted
+    // by the assembly-sized bbox diagonal), which dangled every re-resolution of a
+    // legitimately picked face. Predicate selectors ({"side":"bottom"}) have no centroid
+    // and never enter. Two byte-identical faces (coincident duplicate bodies) resolve to
+    // the deterministic sort winner — for facesets either is the same set of points.
+    if (selector.contains("centroid") && selector.at("centroid").is_array() &&
+        selector.at("centroid").size() == 3) {
+        const auto& sc = selector.at("centroid");
+        if (sc.at(0).is_number() && sc.at(1).is_number() && sc.at(2).is_number()) {
+            const Eigen::Vector3d s_c(sc.at(0).get<double>(), sc.at(1).get<double>(),
+                                      sc.at(2).get<double>());
+            const double cdist = (best_cand->centroid - s_c).norm();
+            bool area_ok = true;  // no recorded area -> centroid alone decides
+            if (selector.contains("area_or_len") && selector.at("area_or_len").is_number() &&
+                best_cand->measure.has_value()) {
+                const double sa = selector.at("area_or_len").get<double>();
+                const double m = *best_cand->measure;
+                area_ok = std::fabs(m - sa) <=
+                          1e-4 * std::max(std::max(std::fabs(sa), std::fabs(m)), 1.0);
+            }
+            if (cdist <= 1e-3 && area_ok)
+                return ResolveResult{best_cand->index, best_score, second_score, std::nullopt};
+        }
+    }
+
     if (best_score < 0.35 && margin > 0.05) {
         return ResolveResult{best_cand->index, best_score, second_score, std::nullopt};
     }

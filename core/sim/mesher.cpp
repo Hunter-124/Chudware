@@ -54,6 +54,8 @@
 #include <TopoDS_Shape.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopAbs_ShapeEnum.hxx>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
 
@@ -401,12 +403,13 @@ MeshOptions pick_options_for_geometry(const TopoDS_Shape& shape, const MeshOptio
 
 }  // namespace
 
-MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
-    // P4: parse the STEP ONCE and thread the shape through classify/pick/hex/netgen —
-    // the old flow re-read the same file at every stage (up to 4 STEPControl_Reader
-    // passes per mesh). A null shape (unreadable file) flows through untouched; each
-    // consumer keeps its own parse-and-fail path, so error messages are unchanged.
-    const TopoDS_Shape shape = read_step_shape(step_path);
+namespace {
+
+// The single-solid meshing pipeline (auto-pick -> hex/tet dispatch). `shape` is the
+// already-parsed geometry for `step_path` (P4 — may be null on parse failure; consumers
+// keep their own parse-and-fail paths, so error messages are unchanged).
+MeshOut mesh_step_single(const std::string& step_path, const MeshOptions& options,
+                         const TopoDS_Shape& shape) {
     const TopoDS_Shape* pre = shape.IsNull() ? nullptr : &shape;
 
     // (3) Auto-pick (Simple mode): classify the geometry and resolve concrete options before
@@ -455,6 +458,82 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         const std::string tet = (eff.order == 2) ? "tet10" : "tet4";
         out.mesh_type_used = tet + (thin ? "-thinwall" : "-autopick");
         out.note = out.note.empty() ? auto_note : (auto_note + "; " + out.note);
+    }
+    return out;
+}
+
+}  // namespace
+
+MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
+    // P4: parse the STEP ONCE and thread the shape through classify/pick/hex/netgen.
+    TopoDS_Shape shape = read_step_shape(step_path);
+
+    // (asm-mesh) A multi-solid STEP is an exported assembly / multi-body document. Netgen
+    // meshes every solid's boundary independently, so bodies that touch or overlap (real
+    // assemblies do both — press fits, coincident mount faces) produce intersecting surface
+    // elements and the volume mesher aborts with "boundary mesh is overlapping". Bond the
+    // bodies first: one general fuse welds overlapping volumes and glues flush contact,
+    // UnifySameDomain collapses the seam faces, and the bonded solid meshes as one conforming
+    // domain (load transfers across every interface — bonded-contact semantics). Outer faces
+    // keep their world position, so faceset resolution is unaffected. nglib's loader is
+    // path-based, so the bonded shape goes through a temp STEP beside the original. Fuse
+    // failure falls through to the raw compound — single-solid behavior and its error
+    // surfaces are unchanged.
+    std::string mesh_path = step_path;
+    std::string bonded_tmp;
+    std::string bonded_note;
+    int n_solids = 0;
+    if (!shape.IsNull())
+        for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next()) ++n_solids;
+    if (n_solids > 1) {
+        try {
+            std::vector<TopoDS_Shape> solids;
+            solids.reserve(static_cast<std::size_t>(n_solids));
+            for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next())
+                solids.push_back(e.Current());
+            const std::vector<TopoDS_Shape> tools(solids.begin() + 1, solids.end());
+            TopoDS_Shape fused = ::geom::fuse_many(solids.front(), tools);
+            if (!fused.IsNull()) {
+                TopoDS_Shape unified = ::geom::unify_same_domain(fused);
+                if (!unified.IsNull()) fused = unified;
+            }
+            int n_after = 0;
+            if (!fused.IsNull())
+                for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++n_after;
+            if (n_after >= 1) {
+                std::filesystem::path tmp(step_path);
+                tmp.replace_extension(".bonded.step");
+                STEPControl_Writer wr;
+                if (wr.Transfer(fused, STEPControl_AsIs) == IFSelect_RetDone &&
+                    wr.Write(tmp.string().c_str()) == IFSelect_RetDone) {
+                    bonded_tmp = tmp.string();
+                    mesh_path = bonded_tmp;
+                    shape = fused;
+                    bonded_note = "assembly bonded for meshing: " + std::to_string(n_solids) +
+                                  " solid bodies fused into " + std::to_string(n_after);
+                }
+            }
+        } catch (...) {
+            // best-effort — the raw compound still goes to the mesher, which reports
+            // its own (now-annotated) failure below
+        }
+    }
+
+    MeshOut out = mesh_step_single(mesh_path, options, shape);
+
+    if (!bonded_tmp.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(bonded_tmp, ec);
+    }
+    if (n_solids > 1) {
+        if (out.ok && !bonded_note.empty())
+            out.note = out.note.empty() ? bonded_note : (bonded_note + "; " + out.note);
+        if (!out.ok)
+            out.error += " [the STEP contains " + std::to_string(n_solids) +
+                         " solid bodies (assembly): bodies were " +
+                         (bonded_note.empty() ? std::string("NOT bondable (fuse failed)")
+                                              : std::string("fused for bonded meshing")) +
+                         " — check for invalid/self-intersecting component geometry]";
     }
     return out;
 }

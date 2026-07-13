@@ -946,9 +946,13 @@ def _describe_assembly_text(doc_id: str) -> str:
 
     # 4. Interference / clearance (best-effort)
     try:
+        # quick=True (asm-fea F4): narration only needs interference volumes (exact either
+        # way) + the tightest gap; far-pair clearances come back as bbox gaps ("approx")
+        # instead of paying exact all-pairs B-rep distances — 40 bodies took ~400s exact.
         if_r = cb.call("eval_interference", {"doc_id": doc_id,
                                              "include_coincident": False,
-                                             "min_clearance_mm": 0.0})
+                                             "min_clearance_mm": 0.0,
+                                             "quick": True})
         fit_text = _format_fit(if_r)
         if fit_text:
             lines.append("")

@@ -6188,29 +6188,53 @@ static std::string rebuild_failure_detail(const CompileResult& r) {
     throw OpError("invalid_op", base, {{"doc_id", doc_id}});
 }
 
+// (asm-fea) The whole document as ONE resolvable shape: every surviving body — assembly
+// components world-placed via gather_export_shapes — wrapped in a compound (a single body
+// passes through unwrapped, so part docs are bit-identical to the old path). doc_query and
+// doc_face_points used to resolve against bodies[-1] ONLY (bridge.py's single-body-era
+// policy), so on a multi-body/assembly doc a fixture or load query could never address any
+// face of the other bodies — "side":"bottom" on a 40-body vehicle landed on whichever
+// sliver compiled last instead of the wheels. Null shape = no bodies (caller throws).
+static TopoDS_Shape whole_doc_shape(Session& s) {
+    std::vector<TopoDS_Shape> bodies = gather_export_shapes(s);
+    if (bodies.empty()) return TopoDS_Shape();
+    if (bodies.size() == 1) return bodies.front();
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    for (const TopoDS_Shape& b : bodies)
+        if (!b.IsNull()) bld.Add(comp, b);
+    return comp;
+}
+
 json doc_query(const std::string& doc_id, const json& query) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    if (r.shapes.empty())
-        throw_no_bodies(doc_id, r, "query");
-    // Default: query the LAST body (bridge.py policy: bodies[-1]). An optional 1-based
-    // "body_id" in the query dict selects a SPECIFIC surviving solid instead — the same
-    // per-body selection eval_measure/eval_mass/eval_check already expose via eval_active_shape.
-    // This lets a caller (e.g. interface_check, T-BL49) enumerate each component's faces in a
-    // multibody/assembly doc, which the last-body-only default cannot do. 0/absent = last body.
+    // Default: query the WHOLE document — every body of a multi-body/assembly doc (see
+    // whole_doc_shape). An optional 1-based "body_id" in the query dict still selects a
+    // SPECIFIC surviving solid — the same per-body selection eval_measure/eval_mass/
+    // eval_check already expose via eval_active_shape (interface_check, T-BL49).
     int body_id = query.is_object() && query.contains("body_id") && query["body_id"].is_number()
                       ? query["body_id"].get<int>() : 0;
-    const TopoDS_Shape* shape = &r.shapes.back();
+    TopoDS_Shape shape;
     if (body_id >= 1) {
+        CompileResult r = compile_session(s);
+        if (r.shapes.empty())
+            throw_no_bodies(doc_id, r, "query");
         if (body_id > static_cast<int>(r.shapes.size()))
             throw OpError("invalid_op",
                           "body_id " + std::to_string(body_id) + " out of range (doc has " +
                               std::to_string(r.shapes.size()) + " bodies)",
                           {{"reason", "bad body_id"}});
-        shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
+        shape = r.shapes[static_cast<std::size_t>(body_id - 1)];
+    } else {
+        shape = whole_doc_shape(s);
+        if (shape.IsNull()) {
+            CompileResult r = compile_session(s);
+            throw_no_bodies(doc_id, r, "query");
+        }
     }
-    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(*shape, query);
+    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(shape, query);
     if (!qp.error.empty())
         throw OpError("invalid_op", qp.error);
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
@@ -6330,12 +6354,15 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     if (!selector.is_object() || selector.value("kind", std::string()) != "face")
         throw OpError("invalid_op", "face_points requires a face selector");
 
-    const CompileResult& r = ensure_compiled(s);
-    if (r.shapes.empty())
-        throw_no_bodies(doc_id, r, "evaluate");
-
-    // Resolve against the LAST body's faces (bridge.py policy: bodies[-1]).
-    const TopoDS_Shape& shape = r.shapes.back();
+    // Resolve against the WHOLE document (asm-fea) — every body of a multi-body/assembly
+    // doc, not bodies[-1]. Selector centroid/area scoring pins the exact face, so a GUI
+    // pick or doc_query match on ANY component (a wheel, a seat) resolves here instead of
+    // dangling against whichever body compiled last. Single-body docs are unchanged.
+    const TopoDS_Shape shape = whole_doc_shape(s);
+    if (shape.IsNull()) {
+        CompileResult rr_fail = compile_session(s);
+        throw_no_bodies(doc_id, rr_fail, "evaluate");
+    }
     const double diag = sim_bbox_diag(shape);
 
     std::vector<TopoInfo> infos = describe_faces(shape);
@@ -7674,14 +7701,17 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
 // `min_clearance_mm` (B4, default 0) tags a `clearances` entry below it with
 // `"warning":"below min clearance"`.
 json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members,
-                         bool include_coincident = false, double min_clearance_mm = 0.0) {
+                         bool include_coincident = false, double min_clearance_mm = 0.0,
+                         bool quick = false) {
     const std::size_t n = members.size();
     constexpr double INTERFERENCE_EPS = 1e-3;
     constexpr double kCoincidentTol = 1e-6;
 
     // Per-part bbox + volume (kernel.py::_bbox_dict uses build123d bounding_box() ->
-    // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean).
+    // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean). The Bnd_Boxes are
+    // kept for the pair loop's prefilter below.
     json parts = json::array();
+    std::vector<Bnd_Box> boxes(n);
     for (std::size_t i = 0; i < n; ++i) {
         const TopoDS_Shape& shp = members[i].second;
         json part = {{"name", members[i].first}, {"volume", eval_vol_or_zero(shp)}};
@@ -7695,6 +7725,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                 part["bbox"] = json{{"min", {xmn, ymn, zmn}},
                                     {"max", {xmx, ymx, zmx}},
                                     {"size", {xmx - xmn, ymx - ymn, zmx - zmn}}};
+                boxes[i] = box;
             } else {
                 part["bbox"] = nullptr;
             }
@@ -7704,6 +7735,18 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         parts.push_back(std::move(part));
     }
 
+    // Axis-aligned gap between two precise bboxes: 0 when they overlap/touch, else the
+    // Euclidean distance between the boxes — a LOWER bound on the true B-rep distance.
+    auto bbox_gap = [&](std::size_t i, std::size_t j) -> double {
+        if (boxes[i].IsVoid() || boxes[j].IsVoid()) return 0.0;  // unknown -> never prune
+        return boxes[i].Distance(boxes[j]);
+    };
+    // `quick` (asm-fea F4): pairs whose bbox gap exceeds this window report the bbox gap
+    // itself ("approx": true) instead of paying an exact BRepExtrema_DistShapeShape — on a
+    // 40-body vehicle assembly the exact all-pairs distance pass alone took minutes. The
+    // window keeps every possibly-tight pair exact (min-clearance warnings stay exact).
+    const double quick_window_mm = std::max(10.0, min_clearance_mm * 2.0);
+
     json interferences = json::array();
     json clearances = json::array();
     json contacts = json::array();
@@ -7711,21 +7754,32 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         const std::string& name_i = members[i].first;
         for (std::size_t j = i + 1; j < n; ++j) {
             const std::string& name_j = members[j].first;
+            const double gap_lb = bbox_gap(i, j);
             // overlap volume (None on boolean failure -> Python warns + continue).
+            // Disjoint bboxes (positive gap) mean the common volume is EXACTLY zero — skip
+            // the boolean, the result is identical (lossless prefilter, all callers).
             bool ov_ok = false;
             double ov = 0.0;
-            try {
-                BRepAlgoAPI_Common common(members[i].second, members[j].second);
-                common.Build();
-                if (common.IsDone()) {
-                    ov = eval_vol_or_zero(common.Shape());
-                    ov_ok = true;
+            if (gap_lb > 0.0) {
+                ov_ok = true;
+            } else {
+                try {
+                    BRepAlgoAPI_Common common(members[i].second, members[j].second);
+                    common.Build();
+                    if (common.IsDone()) {
+                        ov = eval_vol_or_zero(common.Shape());
+                        ov_ok = true;
+                    }
+                } catch (const Standard_Failure&) {
                 }
-            } catch (const Standard_Failure&) {
             }
             if (!ov_ok) continue;  // matches the warnings-sink "interference check failed" path
             if (ov > INTERFERENCE_EPS) {
                 interferences.push_back(json{{"a", name_i}, {"b", name_j}, {"volume", ov}});
+            } else if (quick && gap_lb > quick_window_mm) {
+                // Far pair in quick mode: the bbox gap stands in for the exact distance.
+                clearances.push_back(json{{"a", name_i}, {"b", name_j},
+                                          {"distance", gap_lb}, {"approx", true}});
             } else {
                 try {
                     BRepExtrema_DistShapeShape dss(members[i].second, members[j].second);
@@ -7815,7 +7869,12 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     const double min_clearance_mm = params.contains("min_clearance_mm") &&
                                             params["min_clearance_mm"].is_number()
                                         ? params["min_clearance_mm"].get<double>() : 0.0;
-    return interference_report(members, include_coincident, min_clearance_mm);
+    // `quick` (asm-fea F4, default false = oracle-exact): approximate FAR clearances by
+    // their bbox gap ("approx": true) so narration callers don't pay the all-pairs exact
+    // distance pass on large assemblies. Interference volumes stay exact either way.
+    const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
+                       params["quick"].get<bool>();
+    return interference_report(members, include_coincident, min_clearance_mm, quick);
 }
 
 // B2 — intra-part FEATURE-overlap detection (see session.h doc_eval_feature_overlap for the

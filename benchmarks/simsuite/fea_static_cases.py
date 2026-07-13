@@ -20,15 +20,16 @@ Analytic references (each carries its formula citation at the point of use):
     u_r(Ri) = (p·Ri/E)·((Ro²+Ri²)/(Ro²−Ri²) + ν)  (open ends / plane stress)
     — Timoshenko & Goodier, Theory of Elasticity, 3rd ed., §28.
 
-KNOWN CORE BUG (worked around here, reported upstream): the engine's native
-``type=="pressure"`` load path deposits per-face normals with ARBITRARY fan
-orientation (core/sim/fea_run.cpp, accumulate_face_weights ~L230-284: kTetFaces
-is not consistently outward-oriented and the normal sign is never corrected
-against the element interior). Measured on a 20×20 mm bar end face: 8 boundary
-faces, loaded area 400 mm² (correct) but deposit resultant (−1000, 0, 0) N for
-p=10 MPa instead of ±4000 N — a sign-mixed, non-convergent load field (axial
-displacement 3.5× (tet4) / 6.9× (tet10) the force-equivalent case). Until that
-is fixed + redeployed, pressure studies here use ``consistent_pressure_loads``:
+FIXED CORE BUG (2026-07-12, regression-witnessed by case_pressure_native_bar):
+the engine's native ``type=="pressure"`` load path used to deposit per-face
+normals with ARBITRARY fan orientation (core/sim/fea_run.cpp,
+accumulate_face_weights: kTetFaces was not consistently outward-oriented).
+Measured on a 20×20 mm bar end face: sign-mixed resultant (−1000, 0, 0) N for
+p=10 MPa instead of ±4000 N (axial displacement 3.5× tet4 / 6.9× tet10 the
+force-equivalent case). Fixed by flipping each fan normal outward against its
+element centroid; the native path now reads <0.5 % on the axial bar. Pressure
+studies below still use ``consistent_pressure_loads`` — it independently
+exercises the oracle-side traction math and keeps the two paths cross-checked:
 the textbook work-equivalent surface traction f_i = p·(∫N_i dA)·n̂_out computed
 in Python with outward orientation enforced, applied through single-node
 "force" loads (the force path is verified correct to <0.5 % on the cantilever).
@@ -513,11 +514,11 @@ def case_annulus_lame(case_id, order=2, fineness=0.25):
 
 
 def case_pressure_native_bar(case_id, order=2, fineness=0.3):
-    """KNOWN-BUG witness: engine-native axial 'pressure' vs analytic δ = σ·L/E
-    (uniaxial Hooke). Correct behaviour is rel_err ≲ 5 %; the unoriented-fan-normal
-    defect (core/sim/fea_run.cpp accumulate_face_weights) currently gives several-x.
-    Emitted with status 'fail' when out of tolerance so the baseline report keeps
-    the defect visible — do NOT loosen; fix the core instead."""
+    """Regression witness: engine-native axial 'pressure' vs analytic δ = σ·L/E
+    (uniaxial Hooke). Guards the unoriented-fan-normal defect fixed 2026-07-12
+    (core/sim/fea_run.cpp accumulate_face_weights — normals now flipped outward
+    vs element centroid; was several-x off before). Emits status 'fail' when out
+    of tolerance so any regression stays visible — do NOT loosen."""
     Lb, Bb, p = 200.0, 20.0, 10.0
     ref = p * Lb / STEEL["E_mpa"]                        # δ = σL/E = 0.0100 mm
     t0 = time.time()

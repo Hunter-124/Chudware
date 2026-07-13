@@ -265,7 +265,32 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
             }
             const double area = std::sqrt(nvx * nvx + nvy * nvy + nvz * nvz);
             if (area < 1e-12) continue;
-            const double nx = nvx / area, ny = nvy / area, nz = nvz / area;
+            double nx = nvx / area, ny = nvy / area, nz = nvz / area;
+            // Orient the fan normal OUTWARD. The face-table windings (kTetFaces/kHexFaces)
+            // are not consistently CCW-from-outside, so the raw fan normal can point into
+            // the element for some faces — mixed signs across a loaded surface corrupt the
+            // pressure resultant (measured 585% error on a plain bar). A boundary face's
+            // outward normal always points AWAY from its own element's centroid, so flip
+            // when it doesn't. Corner-node centroid is enough — exact for straight-edged
+            // faces and never near-tangent for any non-degenerate element.
+            {
+                const int nc = hexEl ? 8 : 4;  // corner nodes of the element
+                double cx = 0.0, cy = 0.0, cz = 0.0;
+                for (int i = 0; i < nc; ++i) {
+                    const double* p = &points[static_cast<size_t>(el[i]) * 3];
+                    cx += p[0]; cy += p[1]; cz += p[2];
+                }
+                cx /= nc; cy /= nc; cz /= nc;
+                double fx = 0.0, fy = 0.0, fz = 0.0;
+                for (int i = 0; i < fk; ++i) {
+                    const double* p = &points[static_cast<size_t>(cn[i]) * 3];
+                    fx += p[0]; fy += p[1]; fz += p[2];
+                }
+                fx /= fk; fy /= fk; fz /= fk;
+                if (nx * (fx - cx) + ny * (fy - cy) + nz * (fz - cz) < 0.0) {
+                    nx = -nx; ny = -ny; nz = -nz;
+                }
+            }
             auto add = [&](int node, double w) {
                 node_w[static_cast<size_t>(node)] += w;
                 node_nw[static_cast<size_t>(node) * 3 + 0] += w * nx;

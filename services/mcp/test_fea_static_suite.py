@@ -14,11 +14,11 @@ Coverage:
     radial displacement + hoop-stress bracket (Timoshenko & Goodier §28);
   * element-order hierarchy (tet10 beats tet4 on bending; structured hex8 beats
     tet4) — the accuracy/speed frontier's sanity backbone;
-  * pressure-load/force-load consistency — currently xfails on the KNOWN core
-    defect (core/sim/fea_run.cpp accumulate_face_weights deposits pressure with
-    unoriented fan normals; measured resultant (−1000,0,0) N for an expected
-    ±4000 N on a 20×20 bar end). The xfail is dynamic: once the core is fixed
-    and redeployed this test starts PASSING automatically — do not delete it.
+  * pressure-load/force-load consistency — regression witness for the core
+    defect FIXED 2026-07-12 (core/sim/fea_run.cpp accumulate_face_weights used
+    unoriented fan normals; now flipped outward vs element centroid). PASSES
+    against a fixed .so; the dynamic xfail remains as a regression tripwire —
+    do not delete it.
 
 Skips honestly (with the probe reason) when the staged libaicad.so lacks the
 Netgen FEA RPCs. Meshes are kept coarse — the whole module is a smoke-priced
@@ -160,12 +160,12 @@ def test_annulus_lame_hoop_stress_bracket():
 
 def test_pressure_load_matches_equivalent_force():
     """An axial pressure p on the bar end and an axial force p·A on the SAME face
-    must produce the same tip displacement (δ = σL/E, uniaxial Hooke). This is the
-    witness for the KNOWN core defect: fea_run.cpp accumulate_face_weights uses
-    kTetFaces fan normals without outward orientation, so the consistent-pressure
-    deposit p·∫N n̂ dA carries mixed signs (measured resultant (−1000,0,0) N vs
-    expected ±4000 N; δ ratio 3.5× tet4 / 6.9× tet10). Dynamic xfail: flips to a
-    real PASS once the core fix lands + the dist .so is redeployed."""
+    must produce the same tip displacement (δ = σL/E, uniaxial Hooke). Regression
+    witness for the core defect FIXED 2026-07-12: fea_run.cpp
+    accumulate_face_weights used kTetFaces fan normals without outward
+    orientation, so the consistent-pressure deposit p·∫N n̂ dA carried mixed signs
+    (δ ratio 3.5× tet4 / 6.9× tet10). Now oriented outward vs element centroid;
+    the dynamic xfail below stays as a tripwire should the fix regress."""
     c = _cached(("press_native",), lambda: fsc.case_pressure_native_bar("t"))
     rel = c["rel_err"]
     if rel is not None and rel > 0.05:

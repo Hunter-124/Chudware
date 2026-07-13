@@ -229,40 +229,72 @@ def _grok_section(entry: dict) -> str:
     return "\n".join(lines)
 
 
-_GROK_SECTION_RE = re.compile(
-    rf"(?ms)^\[mcp_servers\.{re.escape(SERVER_NAME)}\][^\[]*"
-)
-_GROK_LEGACY_RE = re.compile(
-    rf"(?ms)^\[mcp_servers\.{re.escape(SERVER_NAME_LEGACY)}\][^\[]*"
-)
+def _toml_strip_table(text: str, table: str) -> str:
+    """Remove a TOML table ``[name]`` and its body (until the next top-level ``[``)."""
+    lines = text.splitlines(keepends=True)
+    header = f"[{table}]"
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped == header or stripped.startswith(header + " "):
+            i += 1
+            while i < len(lines):
+                s = lines[i].lstrip()
+                if s.startswith("[") and not s.startswith("[["):
+                    break
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "".join(out)
+
+
+def _toml_upsert_table(text: str, table: str, body: str) -> str:
+    """Replace or append a TOML table. ``body`` is the full table including the header line."""
+    stripped = _toml_strip_table(text, table).rstrip()
+    # Drop orphaned billet fragments left by older broken rewrites (args/env without a header).
+    if table == f"mcp_servers.{SERVER_NAME}":
+        cleaned: list[str] = []
+        for line in stripped.splitlines(keepends=True):
+            s = line.strip()
+            if s.startswith('["-m"') or (
+                s.startswith("env = {") and "AICAD_MCP_PROFILE" in s and "mcp_servers" not in s
+                and cleaned and cleaned[-1].strip() in ("",)
+            ):
+                # skip garbage remnants; also drop following enabled/timeout orphans
+                continue
+            if s in ("enabled = true", "startup_timeout_sec = 60") and cleaned:
+                prev = cleaned[-1].strip()
+                if prev.startswith('["-m"') or prev.startswith("env = {"):
+                    continue
+            cleaned.append(line)
+        stripped = "".join(cleaned).rstrip()
+    body = body if body.endswith("\n") else body + "\n"
+    if not stripped:
+        return body
+    return stripped + "\n\n" + body
 
 
 def _apply_grok(t: dict, unregister: bool, dry_run: bool) -> dict:
     path: Path = t["path"]
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    has_server = bool(_GROK_SECTION_RE.search(existing))
-    has_legacy = bool(_GROK_LEGACY_RE.search(existing))
+    table = f"mcp_servers.{SERVER_NAME}"
+    legacy = f"mcp_servers.{SERVER_NAME_LEGACY}"
+    has_server = f"[{table}]" in existing
+    has_legacy = f"[{legacy}]" in existing
 
     if unregister:
-        new_txt = _GROK_SECTION_RE.sub("", existing)
-        new_txt = _GROK_LEGACY_RE.sub("", new_txt)
-        # Collapse excess blank lines left by section removal
+        new_txt = _toml_strip_table(existing, table)
+        new_txt = _toml_strip_table(new_txt, legacy)
         new_txt = re.sub(r"\n{3,}", "\n\n", new_txt).rstrip() + ("\n" if new_txt.strip() else "")
         changed = new_txt != existing
     else:
         section = _grok_section(t["entry"])
-        if has_server:
-            new_txt = _GROK_SECTION_RE.sub(section, existing)
-            # Ensure trailing newline
-            if not new_txt.endswith("\n"):
-                new_txt += "\n"
-            changed = new_txt != existing
-        else:
-            base = existing.rstrip()
-            new_txt = (base + "\n\n" + section) if base else section
-            if not new_txt.endswith("\n"):
-                new_txt += "\n"
-            changed = True
+        new_txt = _toml_upsert_table(existing, table, section)
+        if not new_txt.endswith("\n"):
+            new_txt += "\n"
+        changed = new_txt != existing
         # Leave legacy ai-cad section alone on register.
 
     if changed and not dry_run:

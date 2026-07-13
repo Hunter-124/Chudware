@@ -4,6 +4,7 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopTools_ListOfShape.hxx>
 
 namespace geom {
@@ -28,6 +29,13 @@ namespace geom {
 // inputs. SetNonDestructive(true) makes the op copy-on-touch instead — the RESULT shape
 // is geometrically identical either way; only the inputs are left untouched.
 namespace {
+// Count the solids in a shape (a single solid → 1, a disjoint compound → N).
+int solid_count(const TopoDS_Shape& s) {
+    int n = 0;
+    for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
+    return n;
+}
+
 // Run a two-operand boolean in parallel deferred form. `Op` is a BRepAlgoAPI_* algo type.
 template <class Op>
 TopoDS_Shape run_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
@@ -67,9 +75,17 @@ TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
     TopoDS_Shape out = op.Shape();
-    // No section edges => operands did not produce intersection geometry; skip unify.
+    // T-PERF10 skipped unify when SectionEdges() was empty, but that shortcut misses the
+    // FLUSH-WELD case: two solids sharing a coincident coplanar face (e.g. mirroring a body
+    // about its own +X face) merge into one solid yet produce NO section edges — coincident
+    // faces are "same domain", not a transversal intersection. That is exactly the case whose
+    // now-coplanar side faces need collapsing. Gate on whether a weld actually happened: unify
+    // iff the fuse reduced the solid count (flush contact OR overlap) or reported section
+    // edges. Genuinely disjoint operands keep their solid count (compound of N) and still skip
+    // the unify walk, so T-PERF10's perf win survives.
     const TopTools_ListOfShape& se = op.SectionEdges();
-    if (se.IsEmpty()) return out;
+    const bool merged = solid_count(out) < solid_count(a) + solid_count(b);
+    if (se.IsEmpty() && !merged) return out;
     return unify_same_domain(out);
 }
 

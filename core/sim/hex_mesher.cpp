@@ -49,7 +49,6 @@ void fill_hex_quality(MeshOut& out, double dx, double dy, double dz) {
 // Simple-mode auto-pick in mesher.cpp (to choose hex vs tet without duplicating OCCT reads).
 BoxGeomInfo detect_box_geometry(const std::string& step_path) {
     BoxGeomInfo info;
-
     TopoDS_Shape shape;
     try {
         STEPControl_Reader reader;
@@ -63,6 +62,13 @@ BoxGeomInfo detect_box_geometry(const std::string& step_path) {
         info.error = std::string("hex: STEP read threw: ") + e.what();
         return info;
     }
+    return detect_box_geometry(shape);
+}
+
+// Shape overload (P4): the classification proper — the path entry point above and the
+// once-parsed pipeline in mesh_step both land here, so nobody re-reads the STEP.
+BoxGeomInfo detect_box_geometry(const TopoDS_Shape& shape) {
+    BoxGeomInfo info;
     if (shape.IsNull()) {
         info.error = "hex: STEP produced no shape";
         return info;
@@ -128,50 +134,57 @@ BoxGeomInfo detect_box_geometry(const std::string& step_path) {
 }
 
 MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
-    // Per-phase record (prof/phases.h): "detect" (STEP classification) + "generate" (grid).
+    // Path entry point: one STEP parse, then the shape pipeline (P4 — the old code parsed
+    // the SAME file twice more inside: once in detect, once for the bbox-min recovery).
+    TopoDS_Shape shape;
+    try {
+        STEPControl_Reader reader;
+        if (reader.ReadFile(step_path.c_str()) != IFSelect_RetDone) {
+            MeshOut out;
+            out.nodes_per_elem = 8;
+            out.error = "hex: could not read STEP '" + step_path + "'";
+            return out;
+        }
+        reader.TransferRoots();
+        shape = reader.OneShape();
+    } catch (const std::exception& e) {
+        MeshOut out;
+        out.nodes_per_elem = 8;
+        out.error = std::string("hex: STEP read threw: ") + e.what();
+        return out;
+    }
+    return mesh_box_hex(shape, options);
+}
+
+MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
+    // Per-phase record (prof/phases.h): "detect" (classification) + "generate" (grid).
     aicad::prof::phases::StudyScope _study("mesh_hex");
     MeshOut out;
     out.nodes_per_elem = 8;
+    if (shape.IsNull()) {
+        out.error = "hex: STEP produced no shape";
+        return out;
+    }
 
     // Classify first: detect_box_geometry runs the 6-face + volume/bbox check. If the part is
     // not a mappable axis-aligned box, surface its error (the caller — mesh_step — falls back
     // to tet meshing when options.fallback_to_tet is set).
     const BoxGeomInfo info = [&] {
         aicad::prof::phases::PhaseScope _p("detect");
-        return detect_box_geometry(step_path);
+        return detect_box_geometry(shape);
     }();
     if (!info.is_box) {
         out.error = info.error;
         return out;
     }
     const double Lx = info.Lx, Ly = info.Ly, Lz = info.Lz;
-    // Everything from here (STEP re-read for the bbox origin + grid build) is "generate";
-    // destroyed before _study so it lands inside the mesh_hex study.
     aicad::prof::phases::PhaseScope _p_generate("generate");
 
-    // Recover the world-space bbox MIN corner for grid placement: the mesh must sit at the
-    // CAD part's actual position so FEA fixtures/loads resolve by node coordinate, and
-    // BoxGeomInfo carries only the dimensions. This STEP read is cheap and runs only on an
-    // explicit (or auto-picked) structured-hex request, never on the tet hot path.
+    // World-space bbox MIN corner for grid placement: the mesh must sit at the CAD part's
+    // actual position so FEA fixtures/loads resolve by node coordinate (BoxGeomInfo carries
+    // only the dimensions).
     double xmin = 0.0, ymin = 0.0, zmin = 0.0;
     {
-        TopoDS_Shape shape;
-        try {
-            STEPControl_Reader reader;
-            if (reader.ReadFile(step_path.c_str()) != IFSelect_RetDone) {
-                out.error = "hex: could not read STEP '" + step_path + "'";
-                return out;
-            }
-            reader.TransferRoots();
-            shape = reader.OneShape();
-        } catch (const std::exception& e) {
-            out.error = std::string("hex: STEP read threw: ") + e.what();
-            return out;
-        }
-        if (shape.IsNull()) {
-            out.error = "hex: STEP produced no shape";
-            return out;
-        }
         TopTools_IndexedMapOfShape verts;
         TopExp::MapShapes(shape, TopAbs_VERTEX, verts);
         xmin = ymin = zmin = std::numeric_limits<double>::infinity();

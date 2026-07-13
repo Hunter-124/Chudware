@@ -1116,32 +1116,47 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
 // Memoize mesh_step keyed on STEP file CONTENTS + every MeshOptions field. Re-running a
 // study that changed only loads/material/fixtures reuses the mesh (the mesher is the #1 FEA
 // cost). Content-keyed (not path) because the caller may write a fresh temp STEP each solve.
-MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options) {
-    // Hash the STEP bytes. On any read failure, skip the cache and mesh directly.
-    std::ifstream f(step_path, std::ios::binary);
-    if (!f) return mesh_step(step_path, options);
-    const std::string bytes((std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
-    if (bytes.empty()) return mesh_step(step_path, options);
+// P4: the cache stores shared_ptr<const MeshOut>, so a HIT hands back the resident mesh
+// without deep-copying megabytes of points/tets (the old map<key, MeshOut> copied the whole
+// mesh on every hit). LRU eviction just drops the cache's reference — an outstanding caller
+// keeps its mesh alive via its own shared_ptr.
+std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path,
+                                                    const MeshOptions& options) {
+    // Hash the STEP bytes (one block read — not the old istreambuf char-at-a-time slurp).
+    // On any read failure, skip the cache and mesh directly.
+    std::string bytes;
+    {
+        std::ifstream f(step_path, std::ios::binary | std::ios::ate);
+        if (f) {
+            const std::streamsize n = f.tellg();
+            if (n > 0) {
+                bytes.resize(static_cast<size_t>(n));
+                f.seekg(0);
+                if (!f.read(&bytes[0], n)) bytes.clear();
+            }
+        }
+    }
+    if (bytes.empty())
+        return std::make_shared<const MeshOut>(mesh_step(step_path, options));
     uint64_t key = fnv1a(bytes.data(), bytes.size());
     key = mesh_opts_key(options, key);
 
     static std::mutex mtx;
-    static std::unordered_map<uint64_t, MeshOut> cache;  // key -> mesh
-    static std::list<uint64_t> lru;                       // most-recent at front
-    constexpr size_t kCap = 8;                            // bound memory (fine meshes are MBs)
+    static std::unordered_map<uint64_t, std::shared_ptr<const MeshOut>> cache;
+    static std::list<uint64_t> lru;   // most-recent at front
+    constexpr size_t kCap = 8;        // bound memory (fine meshes are MBs)
     {
         std::lock_guard<std::mutex> lk(mtx);
         auto it = cache.find(key);
-        if (it != cache.end()) {                          // HIT: identical geometry + options
+        if (it != cache.end()) {      // HIT: identical geometry + options — no copy
             lru.remove(key);
             lru.push_front(key);
             return it->second;
         }
     }
     // MISS: mesh OUTSIDE the lock (mesh_step self-serializes), then store.
-    MeshOut m = mesh_step(step_path, options);
-    if (m.ok) {
+    auto m = std::make_shared<const MeshOut>(mesh_step(step_path, options));
+    if (m->ok) {
         std::lock_guard<std::mutex> lk(mtx);
         cache[key] = m;
         lru.remove(key);
@@ -1152,6 +1167,10 @@ MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& option
         }
     }
     return m;
+}
+
+MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options) {
+    return *mesh_step_cached_ptr(step_path, options);  // legacy by-value form (one copy)
 }
 
 }  // namespace aicad::sim

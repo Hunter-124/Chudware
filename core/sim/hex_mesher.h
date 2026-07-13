@@ -13,6 +13,8 @@
 
 #include "sim/mesher.h"  // MeshOut, MeshOptions
 
+class TopoDS_Shape;  // OCCT fwd decl — shape overloads below skip the STEP re-parse (P4)
+
 namespace aicad::sim {
 
 // Cheap geometry classification shared by the structured-hex path and the Simple-mode
@@ -28,6 +30,10 @@ struct BoxGeomInfo {
     std::string error;
 };
 BoxGeomInfo detect_box_geometry(const std::string& step_path);
+// Shape overload (P4): identical classification on an ALREADY-PARSED shape, so a caller
+// that owns the STEP parse (mesh_step reads the file once and threads the shape through
+// detect/pick/hex/netgen) doesn't pay another STEPControl_Reader pass here.
+BoxGeomInfo detect_box_geometry(const TopoDS_Shape& shape);
 
 // Mesh an axis-aligned box/rectangular-prism STEP into a regular grid of hex8 elements.
 // Sizing follows the same fineness model as the tet mesher (base from the bbox diagonal,
@@ -36,5 +42,7 @@ BoxGeomInfo detect_box_geometry(const std::string& step_path);
 // not exactly 6 faces, rotated, curved, …), returns ok=false with an actionable error
 // telling the caller to use tetrahedral meshing instead. Never throws.
 MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options);
+// Shape overload (P4): same mesh from an already-parsed shape (no STEP re-read).
+MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options);
 
 }  // namespace aicad::sim

@@ -269,20 +269,41 @@ std::string heal_step_for_mesh(const std::string& step_path) {
 // The Netgen meshing core (defined below); the public mesh_step wraps it with the
 // heal-and-retry fallback for fused-primitive geometry (Issue 6), the structured-hex ->
 // tet fallback, the quad-surface -> tet fallback, and the Simple-mode auto-pick.
-MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options);
+// `pre_shape` (P4): the caller's already-parsed OCCT shape for THIS step_path — used for
+// the bbox/volume sizing so the file isn't re-parsed (nglib still loads it internally, its
+// API is path-based). nullptr = parse here (old behaviour).
+MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options,
+                         const TopoDS_Shape* pre_shape = nullptr);
 
 namespace {
+
+// One STEP parse for the whole mesh_step pipeline (P4). The old flow parsed the SAME file
+// up to 4 times per mesh (auto-pick classify, auto-pick bbox, netgen bbox/volume, plus
+// twice inside mesh_box_hex) — each a full STEPControl_Reader pass. Null shape on failure;
+// every consumer falls back to its own parse-and-fail path, so errors surface unchanged.
+TopoDS_Shape read_step_shape(const std::string& step_path) {
+    try {
+        STEPControl_Reader rd;
+        if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone) return TopoDS_Shape();
+        rd.TransferRoots();
+        return rd.OneShape();
+    } catch (...) {
+        return TopoDS_Shape();
+    }
+}
 
 // Unstructured tet meshing with the heal-and-retry fallback (Issue 6): if the raw geometry
 // defeats the volume mesher (coincident coplanar faces / sliver edges on a fused-primitive
 // part), heal the STEP and retry ONCE before reporting failure. Clean geometry never pays
 // the cost — the heal only runs after a real miss.
-MeshOut mesh_tet_healed(const std::string& step_path, const MeshOptions& options) {
-    MeshOut out = mesh_step_netgen(step_path, options);
+MeshOut mesh_tet_healed(const std::string& step_path, const MeshOptions& options,
+                        const TopoDS_Shape* pre_shape) {
+    MeshOut out = mesh_step_netgen(step_path, options, pre_shape);
     if (out.ok) return out;
     std::string healed = heal_step_for_mesh(step_path);
     if (!healed.empty() && healed != step_path) {
-        MeshOut out2 = mesh_step_netgen(healed, options);
+        // Healed geometry differs from the original — never reuse pre_shape for it.
+        MeshOut out2 = mesh_step_netgen(healed, options, nullptr);
         std::error_code ec;
         std::filesystem::remove(healed, ec);
         if (out2.ok) return out2;
@@ -297,14 +318,15 @@ MeshOut mesh_tet_healed(const std::string& step_path, const MeshOptions& options
 // volume mesh, so when a quad_surface request yields no valid tet volume, retry ONCE without
 // quad-dominance and annotate the degradation. Non-quad requests take the first attempt
 // verbatim (no extra cost, identical behavior).
-MeshOut mesh_tet_quad_aware(const std::string& step_path, const MeshOptions& options) {
-    MeshOut out = mesh_tet_healed(step_path, options);
+MeshOut mesh_tet_quad_aware(const std::string& step_path, const MeshOptions& options,
+                            const TopoDS_Shape* pre_shape) {
+    MeshOut out = mesh_tet_healed(step_path, options, pre_shape);
     if (out.ok || !options.quad_surface) return out;
 
     // The quad-dominated surface defeated the volume mesher; fall back to a plain tet volume.
     MeshOptions tet_opts = options;
     tet_opts.quad_surface = false;
-    MeshOut fb = mesh_tet_healed(step_path, tet_opts);
+    MeshOut fb = mesh_tet_healed(step_path, tet_opts, pre_shape);
     if (!fb.ok) return out;  // even plain tet failed -> surface the ORIGINAL quad error
 
     // A valid tet volume was produced, but the requested quad surface was unavailable here.
@@ -324,35 +346,30 @@ MeshOut mesh_tet_quad_aware(const std::string& step_path, const MeshOptions& opt
 //                             thickness, which is FEA-inaccurate).
 //   • general curved solid -> tet with curvature-adaptive refinement.
 // Returns the effective MeshOptions; `note` describes the decision (for MeshOut::note).
-MeshOptions pick_options_for_geometry(const std::string& step_path, const MeshOptions& base,
+MeshOptions pick_options_for_geometry(const TopoDS_Shape& shape, const MeshOptions& base,
                                       std::string& note) {
     MeshOptions opts = base;
-    const BoxGeomInfo info = detect_box_geometry(step_path);
+    const BoxGeomInfo info = detect_box_geometry(shape);  // shape overload — no re-parse (P4)
     if (info.is_box) {
         opts.structured = true;
         note = "auto-pick: axis-aligned box -> hex8";
         return opts;
     }
     // Non-box: tetrahedral. A box's vertex bbox is exact, but a curved solid needs a real
-    // Bnd_Box to bound it — read the actual bbox here to drive the thin-wall sizing decision.
+    // Bnd_Box to bound it — computed from the shared parsed shape.
     opts.structured = false;
     opts.curvature = true;
     double dx = 0.0, dy = 0.0, dz = 0.0;
     try {
-        STEPControl_Reader rd;
-        if (rd.ReadFile(step_path.c_str()) == IFSelect_RetDone) {
-            rd.TransferRoots();
-            TopoDS_Shape shape = rd.OneShape();
-            if (!shape.IsNull()) {
-                Bnd_Box bb;
-                BRepBndLib::Add(shape, bb);
-                if (!bb.IsVoid()) {
-                    double xmin, ymin, zmin, xmax, ymax, zmax;
-                    bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
-                    dx = std::fabs(xmax - xmin);
-                    dy = std::fabs(ymax - ymin);
-                    dz = std::fabs(zmax - zmin);
-                }
+        if (!shape.IsNull()) {
+            Bnd_Box bb;
+            BRepBndLib::Add(shape, bb);
+            if (!bb.IsVoid()) {
+                double xmin, ymin, zmin, xmax, ymax, zmax;
+                bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+                dx = std::fabs(xmax - xmin);
+                dy = std::fabs(ymax - ymin);
+                dz = std::fabs(zmax - zmin);
             }
         }
     } catch (...) {
@@ -385,19 +402,26 @@ MeshOptions pick_options_for_geometry(const std::string& step_path, const MeshOp
 }  // namespace
 
 MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
+    // P4: parse the STEP ONCE and thread the shape through classify/pick/hex/netgen —
+    // the old flow re-read the same file at every stage (up to 4 STEPControl_Reader
+    // passes per mesh). A null shape (unreadable file) flows through untouched; each
+    // consumer keeps its own parse-and-fail path, so error messages are unchanged.
+    const TopoDS_Shape shape = read_step_shape(step_path);
+    const TopoDS_Shape* pre = shape.IsNull() ? nullptr : &shape;
+
     // (3) Auto-pick (Simple mode): classify the geometry and resolve concrete options before
     // dispatching. Gated behind auto_type so existing callers are unaffected.
     MeshOptions eff = options;
     std::string auto_note;
     const bool auto_picked = options.auto_type;
     if (auto_picked) {
-        eff = pick_options_for_geometry(step_path, options, auto_note);
+        eff = pick_options_for_geometry(shape, options, auto_note);
         eff.auto_type = false;  // resolved to concrete options; never re-enter auto-pick
     }
 
     if (eff.structured) {
         // Structured hexahedral: delegate to the OCCT box-grid mesher (no Netgen).
-        MeshOut hx = mesh_box_hex(step_path, eff);
+        MeshOut hx = pre ? mesh_box_hex(shape, eff) : mesh_box_hex(step_path, eff);
         if (hx.ok) {
             if (auto_picked) {
                 hx.mesh_type_used = "hex8-autopick";
@@ -412,7 +436,7 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         if (eff.fallback_to_tet) {
             MeshOptions tet_opts = eff;
             tet_opts.structured = false;
-            MeshOut to = mesh_tet_quad_aware(step_path, tet_opts);
+            MeshOut to = mesh_tet_quad_aware(step_path, tet_opts, pre);
             if (to.ok) {
                 to.mesh_type_used = (eff.order == 2) ? "tet10-fallback" : "tet4-fallback";
                 to.note = "structured hex not applicable, tet fallback used: " + hx.error;
@@ -423,7 +447,7 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
     }
 
     // Unstructured tetrahedral path (with heal-and-retry).
-    MeshOut out = mesh_tet_quad_aware(step_path, eff);
+    MeshOut out = mesh_tet_quad_aware(step_path, eff, pre);
     if (auto_picked && out.ok) {
         // mesh_step_netgen set mesh_type_used to tet4/tet10; relabel as the auto-pick variant
         // (thin-wall sizing vs. a general-solid pick) and surface the decision note.
@@ -451,7 +475,8 @@ struct NetgenSession {
     }
 };
 
-MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options) {
+MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options,
+                         const TopoDS_Shape* pre_shape) {
     std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
     // Per-phase record (prof/phases.h): load_step / generate / second_order / extract.
     // Opened AFTER the meshing mutex so lock-wait is not misattributed to meshing time.
@@ -484,11 +509,16 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     double dx = 0.0, dy = 0.0, dz = 0.0;
     double solid_vol = 0.0;  // real occupied volume (mm^3) — drives the element-count budget
     try {
-        STEPControl_Reader rd;
-        if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone)
-            return fail("could not read the STEP (is the path valid?)");
-        rd.TransferRoots();
-        TopoDS_Shape shape = rd.OneShape();
+        TopoDS_Shape shape;  // P4: reuse the caller's parse; only read the file ourselves
+        if (pre_shape && !pre_shape->IsNull()) {
+            shape = *pre_shape;
+        } else {
+            STEPControl_Reader rd;
+            if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone)
+                return fail("could not read the STEP (is the path valid?)");
+            rd.TransferRoots();
+            shape = rd.OneShape();
+        }
         if (shape.IsNull()) return fail("STEP contained no shape");
         Bnd_Box bb;
         BRepBndLib::Add(shape, bb);

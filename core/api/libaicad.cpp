@@ -2158,7 +2158,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             opts.quad_surface = params.value("quad_surface", false);
             opts.fallback_to_tet = params.value("fallback_to_tet", true);
             opts.thin_wall_layers = params.value("thin_wall_layers", 4.0);
-            aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, opts);
+            // P4: content+options-keyed cache — an unchanged geometry re-mesh (e.g. the GUI
+            // re-requesting the preview mesh after a solve) is a hit instead of a Netgen run.
+            auto rp = aicad::sim::mesh_step_cached_ptr(step_path, opts);
+            const aicad::sim::MeshOut& r = *rp;
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"points", r.points},
@@ -2225,11 +2228,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         // the overlay no longer pays a full duplicate mesh (measured ~75% of
                         // sim_run_static wall time on a small part). Content+options keyed,
                         // so the recovered nodes/tets are exactly the solved mesh.
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step_cached(step_path, opts);
-                        if (mo.ok) {
-                            vol = mo.points;
-                            tets = mo.tets;
-                            npe = mo.nodes_per_elem;
+                        auto mo = aicad::sim::mesh_step_cached_ptr(step_path, opts);
+                        if (mo->ok) {
+                            vol = mo->points;
+                            tets = mo->tets;
+                            npe = mo->nodes_per_elem;
                         }
                     } else {
                         // Inline mesh: read the connectivity + element order off the study.
@@ -2318,11 +2321,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         // the overlay no longer pays a full duplicate mesh (measured ~75% of
                         // sim_run_static wall time on a small part). Content+options keyed,
                         // so the recovered nodes/tets are exactly the solved mesh.
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step_cached(step_path, opts);
-                        if (mo.ok) {
-                            vol = mo.points;
-                            tets = mo.tets;
-                            npe = mo.nodes_per_elem;
+                        auto mo = aicad::sim::mesh_step_cached_ptr(step_path, opts);
+                        if (mo->ok) {
+                            vol = mo->points;
+                            tets = mo->tets;
+                            npe = mo->nodes_per_elem;
                         }
                     } else {
                         tets = flat_ints(study.value("tets", json::array()));

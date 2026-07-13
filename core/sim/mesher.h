@@ -14,6 +14,7 @@
 // The implementation (mesher.cpp) is compiled only under AICAD_WITH_OCCT.
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -144,5 +145,11 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options);
 // only safe false-MISS (re-mesh). Thread-safe; bounded LRU cache. On any file-read failure it
 // falls back to a direct mesh_step. Drop-in replacement for the options overload above.
 MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options);
+
+// P4: zero-copy flavour — a cache HIT returns the resident mesh (shared, immutable)
+// instead of deep-copying megabytes of points/tets. Prefer this in read-only consumers
+// (preview/overlay marshalling); the by-value form above stays for callers that mutate.
+std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path,
+                                                    const MeshOptions& options);
 
 }  // namespace aicad::sim

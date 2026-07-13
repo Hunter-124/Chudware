@@ -205,21 +205,30 @@ def _load(path: Path) -> dict | None:
     return {}
 
 
-def _toml_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+def _toml_str(s: str) -> str:
+    """TOML string literal safe for Windows paths.
+
+    Basic strings (\"...\") treat \\U as a unicode escape, so ``C:\\Users\\...`` is illegal.
+    Literal strings ('...') only forbid unescaped single quotes — perfect for paths.
+    """
+    if "'" in s:
+        # Fall back to basic string with full escaping.
+        esc = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{esc}"'
+    return f"'{s}'"
 
 
 def _grok_section(entry: dict) -> str:
     """Render a [mcp_servers.billet] TOML table for Grok's config.toml."""
-    cmd = _toml_escape(entry["command"])
-    args = ", ".join(f'"{_toml_escape(a)}"' for a in entry["args"])
+    cmd = _toml_str(entry["command"])
+    args = ", ".join(_toml_str(a) for a in entry["args"])
     env_pairs = []
     for k, v in (entry.get("env") or {}).items():
-        env_pairs.append(f'{k} = "{_toml_escape(str(v))}"')
+        env_pairs.append(f"{k} = {_toml_str(str(v))}")
     env_inline = ", ".join(env_pairs)
     lines = [
         f"[mcp_servers.{SERVER_NAME}]",
-        f'command = "{cmd}"',
+        f"command = {cmd}",
         f"args = [{args}]",
         f"env = {{ {env_inline} }}",
         "enabled = true",

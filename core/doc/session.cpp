@@ -78,6 +78,7 @@
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepClass_FaceClassifier.hxx>
 #include <BRepLProp_SLProps.hxx>
 #include <GCPnts_AbscissaPoint.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -6398,10 +6399,89 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     // read by fea_run.cpp's resolve_faceset_samples(). Falls back to old Euclidean tol
     // when no normal is present (backward compat — e.g. manually-constructed studies).
     std::optional<std::array<double, 3>> face_normal;
+    json surface_desc;  // analytic surface for CURVED faces (C2 fix — see fea_run.h)
     double tol_mm = std::max(0.5, diag * 0.02);  // default: old formula for curved faces
     {
         BRepAdaptor_Surface ad_face(face);
-        if (ad_face.GetType() == GeomAbs_Plane && static_cast<int>(pts.size()) <= 8) {
+        const GeomAbs_SurfaceType stype = ad_face.GetType();
+        // C2 FIX (curved analogue of Z1 below): triangulation vertices only appear where
+        // CURVATURE demands them, so a long cylinder barrel samples as two end rings — every
+        // mesh node in between is > tol away and gets DROPPED by nodes_in_faceset (loads /
+        // fixtures on curved faces under-resolved, mesh-fineness dependent). For the quadric
+        // types the fix exports the analytic surface itself: the solver keeps a node iff its
+        // exact distance-to-surface < perp_tol (tight) AND it is near ANY sample (large
+        // tol = trimmed-extent delimiter). Samples are densified with a UV grid filtered to
+        // the trimmed face so the extent test has no axial gaps.
+        if (stype == GeomAbs_Cylinder || stype == GeomAbs_Cone || stype == GeomAbs_Sphere ||
+            stype == GeomAbs_Torus) {
+            if (stype == GeomAbs_Cylinder) {
+                const gp_Cylinder cyl = ad_face.Cylinder();
+                const gp_Pnt o = cyl.Axis().Location();
+                const gp_Dir a = cyl.Axis().Direction();
+                surface_desc = {{"type", "cylinder"},
+                                {"origin", {o.X(), o.Y(), o.Z()}},
+                                {"axis", {a.X(), a.Y(), a.Z()}},
+                                {"radius", cyl.Radius()}};
+            } else if (stype == GeomAbs_Cone) {
+                const gp_Cone cone = ad_face.Cone();
+                const gp_Pnt apex = cone.Apex();
+                const gp_Dir a = cone.Axis().Direction();
+                surface_desc = {{"type", "cone"},
+                                {"origin", {apex.X(), apex.Y(), apex.Z()}},
+                                {"axis", {a.X(), a.Y(), a.Z()}},
+                                {"semi_angle_rad", std::fabs(cone.SemiAngle())}};
+            } else if (stype == GeomAbs_Sphere) {
+                const gp_Sphere sph = ad_face.Sphere();
+                const gp_Pnt c = sph.Location();
+                surface_desc = {{"type", "sphere"},
+                                {"origin", {c.X(), c.Y(), c.Z()}},
+                                {"radius", sph.Radius()}};
+            } else {
+                const gp_Torus tor = ad_face.Torus();
+                const gp_Pnt c = tor.Axis().Location();
+                const gp_Dir a = tor.Axis().Direction();
+                surface_desc = {{"type", "torus"},
+                                {"origin", {c.X(), c.Y(), c.Z()}},
+                                {"axis", {a.X(), a.Y(), a.Z()}},
+                                {"major_radius", tor.MajorRadius()},
+                                {"minor_radius", tor.MinorRadius()}};
+            }
+            // Trim-extent samples: a UV grid classified against the trimmed face (keeps the
+            // grid off holes/slots and outside-trim regions), added to the triangulation
+            // vertices. 16×16 caps the work and stays under the max_n=400 downsample line.
+            double u0, u1, v0, v1;
+            BRepTools::UVBounds(face, u0, u1, v0, v1);
+            Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
+            const int N = 16;
+            double max_step = 0.0;  // max world-space distance between adjacent kept samples
+            std::array<double, 3> prev{};
+            bool have_prev = false;
+            for (int ii = 0; ii < N; ++ii) {
+                have_prev = false;  // spacing is measured along each u-row only
+                const double u = u0 + (u1 - u0) * (ii + 0.5) / N;
+                for (int jj = 0; jj < N; ++jj) {
+                    const double v = v0 + (v1 - v0) * (jj + 0.5) / N;
+                    BRepClass_FaceClassifier cls(face, gp_Pnt2d(u, v), 1e-7);
+                    const TopAbs_State st = cls.State();
+                    if (st != TopAbs_IN && st != TopAbs_ON) { have_prev = false; continue; }
+                    gp_Pnt p = surf->Value(u, v);
+                    pts.push_back({p.X(), p.Y(), p.Z()});
+                    if (have_prev) {
+                        const double dx = p.X() - prev[0], dy = p.Y() - prev[1],
+                                     dz = p.Z() - prev[2];
+                        max_step = std::max(max_step, std::sqrt(dx * dx + dy * dy + dz * dz));
+                    }
+                    prev = {p.X(), p.Y(), p.Z()};
+                    have_prev = true;
+                }
+            }
+            // Lateral tol: enough to bridge between adjacent samples (nodes mid-gap must
+            // still hit one) but NOT the planar half-diagonal — on a periodic surface (a
+            // hole split into two half-cylinder faces at the seam) a huge lateral tol would
+            // bleed deep into the sibling face. The tight analytic perp test carries the
+            // off-surface rejection either way.
+            tol_mm = std::max(tol_mm, 1.25 * max_step);
+        } else if (stype == GeomAbs_Plane && static_cast<int>(pts.size()) <= 8) {
             // Planar face with few triangulation nodes (just the 4 boundary corners).
             // Use a dense UV-parametric grid so the face is well-sampled in-plane.
             double u0, u1, v0, v1;
@@ -6441,11 +6521,22 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
         for (int i = 0; i < n && static_cast<int>(ds.size()) < max_n; i += stride)
             ds.push_back(pts[static_cast<std::size_t>(i)]);
         pts = std::move(ds);
+        // A stride-k downsample multiplies the worst-case gap between surviving samples by
+        // ~k. For a curved face the samples ARE the trimmed-extent test, so scale the
+        // lateral tol to keep the coverage invariant (every on-face node within tol of a
+        // survivor). Planar faces already carry a face-diagonal tol — no scaling needed.
+        if (!surface_desc.is_null()) tol_mm *= stride;
     }
 
     json points = json::array();
     for (const auto& p : pts) points.push_back({p[0], p[1], p[2]});
     json result = json{{"points", points}, {"tol_mm", tol_mm}};
+    if (!surface_desc.is_null()) {
+        result["surface"] = surface_desc;
+        // Same tight ON-face threshold as the planar path: the analytic distance replaces
+        // the plane-normal dot, so 1.5mm rejects interior/adjacent-face nodes identically.
+        result["perp_tol_mm"] = 1.5;
+    }
     if (face_normal) {
         result["face_normal"] = {(*face_normal)[0], (*face_normal)[1], (*face_normal)[2]};
         // perp_tol: tight threshold in the face normal direction to exclude off-face nodes.

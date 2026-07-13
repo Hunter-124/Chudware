@@ -214,3 +214,59 @@ def test_regression_parts_solve_with_finite_fields():
         assert c["status"] == "ok", (geom, c)
         assert c["metric"] is not None and c["metric"] > 0.0, (geom, c)
         assert math.isfinite(c["metric"]), (geom, c)
+
+
+# ------------------------------------------- curved-face faceset (C2 regression)
+
+def test_curved_faceset_covers_cylinder_exactly():
+    """doc_face_points on a cylinder barrel must emit the analytic surface descriptor,
+    and the solver's membership test must then fix EXACTLY the lateral-face nodes —
+    no misses (the pre-fix triangulation sampling missed every node between the end
+    rings) and no interior/end-face bleed. Regression witness for the C2 fix
+    (session.cpp doc_face_points + fea_run.cpp nodes_in_faceset_surface)."""
+    def _run():
+        cb = fsc._cb()
+        doc = cb.call("doc_new", {"name": "c2_cyl_cover"})["doc_id"]
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{"op": "add_feature", "feature": {
+            "type": "cylinder", "params": {"radius": 10.0, "height": 100.0}}}]})
+        q = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "curved": True}})
+        sel = [m for m in q.get("matches", []) if m.get("kind") == "face"][0]
+        fp = cb.call("doc_face_points", {"doc_id": doc, "selector": sel})
+        step = fsc.export_step(doc)
+        mesh = fsc.mesh_step(step, order=2, fineness=0.3)
+        import os
+        os.unlink(step)
+        fsc.close_doc(doc)
+        return fp, mesh
+    fp, mesh = _cached(("c2_cyl",), _run)
+
+    # The analytic descriptor is present and correct.
+    surf = fp.get("surface")
+    assert surf and surf["type"] == "cylinder", fp.keys()
+    assert surf["radius"] == pytest.approx(10.0)
+    assert abs(surf["axis"][2]) == pytest.approx(1.0)
+    assert fp.get("perp_tol_mm") == pytest.approx(1.5)
+
+    # Membership through a real solve: fixture = the barrel faceset; fixed nodes are
+    # exactly the zero-displacement ones. Ground truth = nodes at hypot(x,y) ≈ R.
+    load = [{"faces": {"points": [[0, 0, 50]], "tol_mm": 3.0},
+             "type": "force", "vector": [100.0, 0.0, 0.0]}]
+    r = fsc.static_solve(mesh, [fp], load)
+    pts, dm = mesh["points"], r["disp_magnitude"]
+    n = len(pts) // 3
+    truth = {i for i in range(n) if abs(math.hypot(pts[3 * i], pts[3 * i + 1]) - 10.0) < 0.2}
+    fixed = {i for i in range(n) if dm[i] == 0.0}
+    missed = truth - fixed
+    bled = fixed - truth
+    assert not missed, f"{len(missed)}/{len(truth)} lateral nodes missed"
+    assert not bled, f"{len(bled)} non-lateral nodes wrongly fixed"
+
+
+def test_native_curved_pressure_matches_lame():
+    """End-to-end C1+C2: engine-native pressure on the annulus BORE face (surface
+    faceset from doc_face_points + oriented consistent-pressure deposition) must match
+    the Lamé radial displacement. Pre-fix this read several-x off (C1) on a mostly
+    missed node set (C2)."""
+    c = _cached(("lame_native",), lambda: fsc.case_annulus_lame_native("t"))
+    assert c["status"] == "ok", c
+    assert c["rel_err"] is not None and c["rel_err"] < 0.08, c

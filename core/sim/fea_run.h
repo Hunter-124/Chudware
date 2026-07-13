@@ -35,6 +35,38 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
                                   const double* face_normal = nullptr,
                                   double perp_tol_mm = 0.0);
 
+// Analytic surface descriptor for CURVED facesets (the C2 fix — the curved analogue of
+// face_normal/perp_tol above). doc_face_points emits it for quadric faces as
+//   surface: {type:"cylinder"|"cone"|"sphere"|"torus", origin:[x,y,z], axis:[x,y,z],
+//             radius | semi_angle_rad | major_radius+minor_radius}
+// so node membership uses an EXACT distance-to-surface test (tight, perp_tol_mm) plus
+// proximity to the sample cloud (large tol_mm, delimits the trimmed extent) instead of
+// relying on sparse CAD-triangulation samples with a small Euclidean tol — which missed
+// most mesh nodes on e.g. a long cylinder barrel (triangulation only puts vertices where
+// curvature demands; along a cylinder axis that is the two end rings).
+struct FacesetSurface {
+    enum Kind { kNone, kCylinder, kCone, kSphere, kTorus };
+    Kind kind = kNone;
+    double origin[3] = {0, 0, 0};  // axis point (cyl/torus), center (sphere), apex (cone)
+    double axis[3] = {0, 0, 1};    // unit axis direction (cyl/cone/torus; unused for sphere)
+    double r1 = 0.0;               // radius (cyl/sphere), major radius (torus)
+    double r2 = 0.0;               // minor radius (torus)
+    double semi_angle = 0.0;       // half-angle, radians (cone)
+};
+
+// Parse faceset["surface"] into `out`. Returns true when a valid descriptor is present.
+bool faceset_surface(const nlohmann::json& fs, FacesetSurface& out);
+
+// Unsigned distance from point p to the (infinite/untrimmed) analytic surface.
+double faceset_surface_distance(const FacesetSurface& s, const double* p);
+
+// nodes_in_faceset with an analytic surface test: a node is kept iff
+//   faceset_surface_distance(surface, node) <= perp_tol_mm   (ON the surface)
+//   AND 3D distance to the nearest sample <= tol_mm          (within the trimmed extent)
+std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
+                                          const std::vector<double>& sample, double tol_mm,
+                                          const FacesetSurface& surface, double perp_tol_mm);
+
 // Combined static run. `study` carries:
 //   step_path (string)  -> mesh via mesher::mesh_step(step_path, density)
 //   OR  points[n*3] + tets[m*4] inline (the deterministic parity-gate path)

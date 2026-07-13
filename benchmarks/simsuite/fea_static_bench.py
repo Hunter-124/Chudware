@@ -98,9 +98,13 @@ def run(quick: bool = False) -> list[dict]:
         cases.append(_guard(lambda o=order, f=fin, c=cid:
                             fsc.case_annulus_lame(c, order=o, fineness=f), cid))
 
-    # Native-pressure witness (KNOWN core bug — honest fail until fixed).
+    # Native-pressure witnesses (regression guards for the 2026-07-12 fixes):
+    #   flat face  -> C1 oriented fan normals (was 6.9x off);
+    #   curved bore -> C1 + C2 analytic curved-face facesets (was mostly-missed nodes).
     cases.append(_guard(lambda: fsc.case_pressure_native_bar(
         "pressure_native_bar_tet10"), "pressure_native_bar_tet10"))
+    cases.append(_guard(lambda: fsc.case_annulus_lame_native(
+        "annulus_lame_native_tet10"), "annulus_lame_native_tet10"))
 
     # Non-analytic regressions; bracket + loft get self-convergence references.
     # Ref fineness per geometry: the loft solves ~cubically with fineness (f0.5

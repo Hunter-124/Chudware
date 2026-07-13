@@ -1321,6 +1321,35 @@ def _resolve_face_points(doc_id: str, query: Union[str, dict]) -> list:
     return out
 
 
+def _merge_face_sets(faces: list) -> dict:
+    """Merge multiple doc_face_points sets into ONE faceset dict for a single load/BC.
+
+    Points concatenate. Geometry hints survive only where they stay valid for EVERY
+    merged face: face_normal/perp_tol from the first set (matches of one query share
+    orientation), and the analytic ``surface`` descriptor only when ALL sets carry an
+    IDENTICAL one (e.g. a hole split into two half-cylinder faces at the seam — the same
+    cylinder), because keeping one face's surface would make the tight distance-to-surface
+    test silently reject every node of the other faces. tol_mm takes the MAX of the sets
+    so the trimmed-extent proximity test still bridges each face's sample spacing."""
+    merged: dict = {"points": []}
+    for f in faces:
+        merged["points"].extend(f.get("points", []))
+    if not faces:
+        return merged
+    first = faces[0]
+    tols = [f["tol_mm"] for f in faces if "tol_mm" in f]
+    if tols:
+        merged["tol_mm"] = max(tols)
+    if "face_normal" in first:
+        merged["face_normal"] = first["face_normal"]
+    if "perp_tol_mm" in first:
+        merged["perp_tol_mm"] = first["perp_tol_mm"]
+    surfs = [f.get("surface") for f in faces]
+    if surfs[0] is not None and all(s == surfs[0] for s in surfs):
+        merged["surface"] = surfs[0]
+    return merged
+
+
 def _persist_study(doc_id: str, record: dict) -> Optional[str]:
     """Record a SOLVED simulation study (setup + RESULTS) into the document's `studies`
     array so it round-trips inside the native .step+ (save_part). Without this the FEA/CFD
@@ -3997,21 +4026,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 if not isinstance(ld, dict) or "face" not in ld:
                     raise ValueError(f"each load needs a 'face' query: {ld!r}")
                 faces = _resolve_face_points(d, ld["face"])
-                # Merge multiple face-point sets for this load. Keep face_normal + perp_tol
-                # from the FIRST face set (they're geometry-based and won't differ between
-                # matches of the same query). Without these, nodes_in_faceset falls back to
-                # pure Euclidean tol and may bleed across thin-plate faces (Bug Z1/Z2).
-                merged: dict = {"points": []}
-                for f in faces:
-                    merged["points"].extend(f.get("points", []))
-                if faces:
-                    first = faces[0]
-                    if "tol_mm" in first:
-                        merged["tol_mm"] = first["tol_mm"]
-                    if "face_normal" in first:
-                        merged["face_normal"] = first["face_normal"]
-                    if "perp_tol_mm" in first:
-                        merged["perp_tol_mm"] = first["perp_tol_mm"]
+                # Merge multiple face-point sets for this load (keeps face_normal/surface
+                # hints exactly when they stay valid — see _merge_face_sets).
+                merged = _merge_face_sets(faces)
                 spec: dict = {"faces": merged}
                 if "pressure" in ld:
                     spec["type"] = "pressure"
@@ -4519,11 +4536,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 if not isinstance(ld, dict) or "face" not in ld:
                     raise ValueError(f"each load needs a 'face' query: {ld!r}")
                 faces = _resolve_face_points(d, ld["face"])
-                merged: dict = {"points": []}
-                for f in faces:
-                    merged["points"].extend(f.get("points", []))
-                if faces and "face_normal" in faces[0]:
-                    merged["face_normal"] = faces[0]["face_normal"]
+                merged = _merge_face_sets(faces)
                 spec: dict = {"faces": merged}
                 if "pressure" in ld:
                     spec["type"] = "pressure"; spec["magnitude"] = float(ld["pressure"])
@@ -4658,15 +4671,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 cb.call("doc_export_step", {"doc_id": d, "path": step})
 
                 def _faceset(q):
-                    merged: dict = {"points": []}
-                    faces = _resolve_face_points(d, q)
-                    for f in faces:
-                        merged["points"].extend(f.get("points", []))
-                    if faces:
-                        first = faces[0]
-                        for key in ("tol_mm", "face_normal", "perp_tol_mm"):
-                            if key in first:
-                                merged[key] = first[key]
+                    merged = _merge_face_sets(_resolve_face_points(d, q))
                     return merged if merged["points"] else None
 
                 fixtures = []
@@ -5704,14 +5709,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
             load_specs = []
             for ld in loads:
                 faces = _resolve_face_points(part_doc, ld["face"])
-                merged: dict = {"points": []}
-                for fp in faces:
-                    merged["points"].extend(fp.get("points", []))
-                if faces:
-                    for k in ("tol_mm", "face_normal", "perp_tol_mm"):
-                        if k in faces[0]:
-                            merged[k] = faces[0][k]
-                load_specs.append({"faces": merged, "type": "force",
+                load_specs.append({"faces": _merge_face_sets(faces), "type": "force",
                                    "vector": ld["force"]})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness}

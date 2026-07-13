@@ -513,6 +513,60 @@ def case_annulus_lame(case_id, order=2, fineness=0.25):
                  extra={"quality": _quality(m), "vm_mid": vm_mid, "vm_ref": vm_ref})
 
 
+def case_annulus_lame_native(case_id, order=2, fineness=0.25):
+    """Lamé thick-wall cylinder driven by the ENGINE-NATIVE curved-face pressure path —
+    the combined witness for the two 2026-07-12 core fixes:
+      * C1  outward-oriented pressure fan normals (accumulate_face_weights), and
+      * C2  analytic curved-face facesets (doc_face_points emits surface:{cylinder,...};
+        nodes_in_faceset_surface keeps a node iff |dist_to_axis − R| < perp_tol).
+    The inner-bore faceset comes from doc_face_points on the live doc (no oracle-side
+    consistent_pressure_loads), so a regression in either fix reads several-x here.
+    Same analytic reference as case_annulus_lame: u_r(Ri) mid-height band."""
+    Ro, Ri, H, p = 40.0, 20.0, 120.0, 10.0
+    u_ref = (p * Ri / STEEL["E_mpa"]) * ((Ro ** 2 + Ri ** 2) / (Ro ** 2 - Ri ** 2)
+                                         + STEEL["nu"])
+    t0 = time.time()
+    doc, _ = build_annulus(Ro, Ri, H)
+    # Inner bore = the curved face whose analytic cylinder radius is Ri.
+    q = _cb().call("doc_query", {"doc_id": doc, "query": {"of": "face", "curved": True}})
+    bore = None
+    for mt in q.get("matches", []):
+        if mt.get("kind") != "face":
+            continue
+        fp = _cb().call("doc_face_points", {"doc_id": doc, "selector": mt})
+        surf = fp.get("surface") or {}
+        if surf.get("type") == "cylinder" and abs(surf.get("radius", 0.0) - Ri) < 1e-6:
+            bore = fp
+            break
+    if bore is None:
+        raise RuntimeError("annulus bore face not found via doc_face_points surface descriptor")
+    step = export_step(doc)
+    bot = plane_faceset([0, 0, -H / 2], [0, 0, -1], tol_mm=Ro + 1)
+    setup_s = time.time() - t0
+    t0 = time.time()
+    m = mesh_step(step, order=order, fineness=fineness)
+    mesh_s = time.time() - t0
+    t0 = time.time()
+    r = static_solve(m, [bot], [{"faces": bore, "type": "pressure", "magnitude": p}])
+    solve_s = time.time() - t0
+    os.unlink(step)
+    close_doc(doc)
+    pts, dm = m["points"], r["disp_magnitude"]
+    n = len(pts) // 3
+    band = [i for i in range(n)
+            if abs(math.hypot(pts[3 * i], pts[3 * i + 1]) - Ri) < 0.5
+            and abs(pts[3 * i + 2]) < H / 6]
+    u = sum(dm[i] for i in band) / len(band) if band else None
+    c = _case(case_id, setup_s, mesh_s, solve_s, u, u_ref,
+              detail=f"u_r(Ri) mm (Lamé) via NATIVE curved-face pressure "
+                     f"(surface faceset + oriented fan normals); "
+                     f"{m['mesh_type_used']} n={m['n_nodes']}",
+              extra={"quality": _quality(m)})
+    if c["rel_err"] is not None and c["rel_err"] > 0.08:
+        c["status"] = "fail"  # regression witness for C1+C2 — do NOT loosen
+    return c
+
+
 def case_pressure_native_bar(case_id, order=2, fineness=0.3):
     """Regression witness: engine-native axial 'pressure' vs analytic δ = σ·L/E
     (uniaxial Hooke). Guards the unoriented-fan-normal defect fixed 2026-07-12

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <string>
@@ -123,6 +124,22 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
     face_normal = {nj[0].get<double>(), nj[1].get<double>(), nj[2].get<double>()};
     perp_tol = fs.value("perp_tol_mm", 1.5);
     return true;
+}
+
+// Resolve a faceset object to mesh node indices with the best available geometry test,
+// in priority order: analytic surface (curved faces, C2) > face plane normal (planar,
+// Z1/Z2) > legacy pure-Euclidean proximity. Single entry point for every load/fixture/BC
+// resolution in this file so the three paths can never drift apart.
+std::vector<int> faceset_membership(const json& fs, const std::vector<double>& points) {
+    const std::vector<double> sample = faceset_sample(fs.value("points", json::array()));
+    const double tol = fs.value("tol_mm", 1.0);
+    FacesetSurface surf;
+    if (faceset_surface(fs, surf))
+        return nodes_in_faceset_surface(points, sample, tol, surf, fs.value("perp_tol_mm", 1.5));
+    std::array<double, 3> fn{};
+    double perp_tol = 0.0;
+    const bool has_fn = faceset_normal(fs, fn, perp_tol);
+    return nodes_in_faceset(points, sample, tol, has_fn ? fn.data() : nullptr, perp_tol);
 }
 
 // Resolve the mesh: inline points/tets if present, else mesh the STEP file.
@@ -422,6 +439,109 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
     return out;
 }
 
+// Parse faceset["surface"] (see fea_run.h). Returns true iff a usable descriptor exists.
+bool faceset_surface(const json& fs, FacesetSurface& out) {
+    if (!fs.contains("surface") || !fs["surface"].is_object()) return false;
+    const json& sj = fs["surface"];
+    const std::string type = sj.value("type", std::string());
+    auto vec3 = [&](const char* key, double* dst) {
+        if (!sj.contains(key) || !sj[key].is_array() || sj[key].size() < 3) return false;
+        for (int i = 0; i < 3; ++i) dst[i] = sj[key][i].get<double>();
+        return true;
+    };
+    auto unit_axis = [&] {
+        const double n = std::sqrt(out.axis[0] * out.axis[0] + out.axis[1] * out.axis[1] +
+                                   out.axis[2] * out.axis[2]);
+        if (n < 1e-12) return false;
+        for (double& c : out.axis) c /= n;
+        return true;
+    };
+    if (type == "cylinder") {
+        out.kind = FacesetSurface::kCylinder;
+        out.r1 = sj.value("radius", 0.0);
+        return vec3("origin", out.origin) && vec3("axis", out.axis) && unit_axis() &&
+               out.r1 > 0.0;
+    }
+    if (type == "sphere") {
+        out.kind = FacesetSurface::kSphere;
+        out.r1 = sj.value("radius", 0.0);
+        return vec3("origin", out.origin) && out.r1 > 0.0;
+    }
+    if (type == "cone") {
+        out.kind = FacesetSurface::kCone;
+        out.semi_angle = sj.value("semi_angle_rad", 0.0);
+        return vec3("origin", out.origin) && vec3("axis", out.axis) && unit_axis() &&
+               out.semi_angle > 0.0 && out.semi_angle < 1.5707963;
+    }
+    if (type == "torus") {
+        out.kind = FacesetSurface::kTorus;
+        out.r1 = sj.value("major_radius", 0.0);
+        out.r2 = sj.value("minor_radius", 0.0);
+        return vec3("origin", out.origin) && vec3("axis", out.axis) && unit_axis() &&
+               out.r1 > 0.0 && out.r2 > 0.0;
+    }
+    return false;
+}
+
+double faceset_surface_distance(const FacesetSurface& s, const double* p) {
+    const double vx = p[0] - s.origin[0], vy = p[1] - s.origin[1], vz = p[2] - s.origin[2];
+    switch (s.kind) {
+        case FacesetSurface::kSphere:
+            return std::fabs(std::sqrt(vx * vx + vy * vy + vz * vz) - s.r1);
+        case FacesetSurface::kCylinder: {
+            const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
+            const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1], rz = vz - h * s.axis[2];
+            return std::fabs(std::sqrt(rx * rx + ry * ry + rz * rz) - s.r1);
+        }
+        case FacesetSurface::kCone: {
+            // Distance from (h, r) in the meridian half-plane to the generator line
+            // r = h·tan(α) through the apex: |r·cosα − h·sinα|.
+            const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
+            const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1], rz = vz - h * s.axis[2];
+            const double r = std::sqrt(rx * rx + ry * ry + rz * rz);
+            return std::fabs(r * std::cos(s.semi_angle) - h * std::sin(s.semi_angle));
+        }
+        case FacesetSurface::kTorus: {
+            // Meridian plane: the tube center circle is at (r = major, h = 0); the surface
+            // is minor_r from it: | dist((r,h),(major,0)) − minor |.
+            const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
+            const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1], rz = vz - h * s.axis[2];
+            const double r = std::sqrt(rx * rx + ry * ry + rz * rz);
+            const double dr = r - s.r1;
+            return std::fabs(std::sqrt(dr * dr + h * h) - s.r2);
+        }
+        case FacesetSurface::kNone: break;
+    }
+    return std::numeric_limits<double>::infinity();
+}
+
+std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
+                                          const std::vector<double>& sample, double tol_mm,
+                                          const FacesetSurface& surface, double perp_tol_mm) {
+    // Curved analogue of the planar split-tolerance mode below: the analytic
+    // distance-to-surface is the tight ON-face test (replaces the plane-normal dot), and
+    // plain 3D proximity to the sample cloud (large tol) delimits the trimmed extent.
+    std::vector<int> out;
+    const size_t n = points.size() / 3;
+    const size_t k = sample.size() / 3;
+    if (k == 0 || n == 0 || surface.kind == FacesetSurface::kNone) return out;
+    for (size_t i = 0; i < n; ++i) {
+        const double* p = &points[i * 3];
+        if (faceset_surface_distance(surface, p) > perp_tol_mm) continue;  // off the surface
+        for (size_t s = 0; s < k; ++s) {
+            const double dx = p[0] - sample[s * 3 + 0];
+            const double dy = p[1] - sample[s * 3 + 1];
+            const double dz = p[2] - sample[s * 3 + 2];
+            if (dx * dx + dy * dy + dz * dz <= tol_mm * tol_mm) {
+                out.push_back(static_cast<int>(i));
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+
 nlohmann::json fea_run_static(const nlohmann::json& study) {
     // Per-study structured phase record (prof/phases.h): "mesh" / "setup" / "solve" here,
     // plus the solver-internal "solve.<label>" phases from fea_static_solve's FeaProf marks.
@@ -482,12 +602,8 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     if (study.contains("loads") && study["loads"].is_array()) {
         for (const auto& load : study["loads"]) {
             const json faces = load.contains("faces") ? load["faces"] : json::object();
-            std::vector<double> sample = faceset_sample(faces.value("points", json::array()));
             const double tol = faces.value("tol_mm", 1.0);
-            std::array<double, 3> fn{}; double perp_tol = 0.0;
-            const bool has_fn = faceset_normal(faces, fn, perp_tol);
-            std::vector<int> node_ids = nodes_in_faceset(points, sample, tol,
-                has_fn ? fn.data() : nullptr, perp_tol);
+            std::vector<int> node_ids = faceset_membership(faces, points);
             if (node_ids.empty()) {
                 notes.push_back("Load on empty node set (tol=" + std::to_string(tol) +
                                 " mm) — skipped");
@@ -582,12 +698,8 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     if (study.contains("fixtures") && study["fixtures"].is_array()) {
         std::unordered_set<int> seen;
         for (const auto& fx : study["fixtures"]) {
-            std::vector<double> sample = faceset_sample(fx.value("points", json::array()));
             const double tol = fx.value("tol_mm", 1.0);
-            std::array<double, 3> fn{}; double perp_tol = 0.0;
-            const bool has_fn = faceset_normal(fx, fn, perp_tol);
-            std::vector<int> node_ids = nodes_in_faceset(points, sample, tol,
-                has_fn ? fn.data() : nullptr, perp_tol);
+            std::vector<int> node_ids = faceset_membership(fx, points);
             if (node_ids.empty()) {
                 notes.push_back("Fixture on empty node set (tol=" + std::to_string(tol) +
                                 " mm) — skipped");
@@ -724,13 +836,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     if (study.contains("fixtures") && study["fixtures"].is_array()) {
         std::unordered_set<int> seen;
         for (const auto& fx : study["fixtures"]) {
-            std::vector<double> sample = faceset_sample(fx.value("points", json::array()));
-            const double tol = fx.value("tol_mm", 1.0);
-            std::array<double, 3> fn{}; double perp_tol = 0.0;
-            const bool has_fn = faceset_normal(fx, fn, perp_tol);
-            std::vector<int> node_ids = nodes_in_faceset(points, sample, tol,
-                has_fn ? fn.data() : nullptr, perp_tol);
-            for (int nid : node_ids)
+            for (int nid : faceset_membership(fx, points))
                 if (seen.insert(nid).second) fixed_nodes.push_back(nid);
         }
     }
@@ -761,12 +867,7 @@ namespace {
 // unique node ids; empty when the faceset resolves to nothing.
 std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>& points,
                                     const std::vector<int>& tets, int nodes_per_elem) {
-    std::vector<double> sample = faceset_sample(faces.value("points", json::array()));
-    const double tol = faces.value("tol_mm", 1.0);
-    std::array<double, 3> fn{};
-    double perp_tol = 0.0;
-    const bool has_fn = faceset_normal(faces, fn, perp_tol);
-    std::vector<int> ids = nodes_in_faceset(points, sample, tol, has_fn ? fn.data() : nullptr, perp_tol);
+    std::vector<int> ids = faceset_membership(faces, points);
     if (ids.empty()) return ids;
     std::unordered_set<int> node_set(ids.begin(), ids.end());
     add_midside_face_nodes(tets, nodes_per_elem, node_set);

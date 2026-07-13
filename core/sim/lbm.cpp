@@ -15,9 +15,16 @@
 #include "util/resource_governor.h"
 #include "prof/phases.h"  // per-phase timers (StudyScope "lbm")
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <thread>
+#ifdef AICAD_HAVE_OPENMP
+#include <omp.h>
+#endif
 
 namespace aicad::sim {
 
@@ -163,10 +170,32 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     const float u_lat = static_cast<float>(p.u_lat);
 
-    // -- Distribution buffers (float32). f, plus scratch for streaming + macros. --
+    // -- Distribution buffers (float32). f + scratch for streaming. (P3: the old feq
+    // buffer is gone — collision computes equilibrium per cell in registers, saving a
+    // full ncell*19 float write+read round-trip to memory every step.) --
     std::vector<float> f(ncell * NQ, 0.0f);
-    std::vector<float> feq(ncell * NQ, 0.0f);
     std::vector<float> fstream(ncell * NQ, 0.0f);
+
+    // P3: worker threads for the per-step lattice loops. The kernels are memory-bandwidth
+    // bound, so past ~8 threads this class of desktop gains nothing; tiny lattices stay
+    // serial (spawn overhead > work). AI_CAD_LBM_THREADS overrides for benchmarking.
+    // Every parallel loop below writes DISJOINT indices and computes each cell with the
+    // exact serial arithmetic, so results stay bit-identical to the oracle parity gate.
+    const int lbm_threads = [&]() -> int {
+#ifndef AICAD_HAVE_OPENMP
+        return 1;
+#else
+        if (ncell < 64 * 1024) return 1;
+        if (const char* e = std::getenv("AI_CAD_LBM_THREADS")) {
+            const int n = std::atoi(e);
+            if (n >= 1) return n;
+        }
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 4;
+        return std::max(1, std::min(static_cast<int>(hw) - 2, 8));
+#endif
+    }();
+    (void)lbm_threads;
     // macro fields
     std::vector<float> rho(ncell, 1.0f), ux(ncell, u_lat), uy(ncell, 0.0f), uz(ncell, 0.0f);
 
@@ -222,10 +251,16 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // ---- _stream(f): g[...,q] = np.roll(f[...,q], shift=(ex,ey,ez), axis=(0,1,2))
     // np.roll positive shift moves data toward higher index with wrap:
     //   g[x,y,z,q] = f[(x-ex) mod Nx, (y-ey) mod Ny, (z-ez) mod Nz, q].
+    // P3: pure gather — every (q,x,y,z) writes its own slot in G from a snapshot F, so
+    // the (q,x) collapse parallelizes with zero interaction (bit-identical copies).
     auto stream = [&](const std::vector<float>& F, std::vector<float>& G) {
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static) num_threads(lbm_threads) \
+    if (lbm_threads > 1)
+#endif
         for (int q = 0; q < NQ; ++q) {
-            const int ex = EQ[q][0], ey = EQ[q][1], ez = EQ[q][2];
             for (int x = 0; x < nx; ++x) {
+                const int ex = EQ[q][0], ey = EQ[q][1], ez = EQ[q][2];
                 int sx = x - ex;
                 sx %= nx;
                 if (sx < 0) sx += nx;
@@ -260,6 +295,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     struct Link {
         int q;
         std::vector<std::size_t> cells;  // fluid cell indices
+        std::vector<std::size_t> nbs;    // matching solid neighbour indices (P3 bounce-back)
     };
     std::vector<Link> links;
     for (int q = 1; q < NQ; ++q) {
@@ -278,12 +314,21 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                     if (nbz < 0) nbz += nz;
                     const std::size_t c = cidx(x, y, z);
                     const std::size_t nb = cidx(nbx, nby, nbz);
-                    if (solid[nb] && !solid[c]) lk.cells.push_back(c);
+                    if (solid[nb] && !solid[c]) {
+                        lk.cells.push_back(c);
+                        lk.nbs.push_back(nb);
+                    }
                 }
             }
         }
         if (!lk.cells.empty()) links.push_back(std::move(lk));
     }
+
+    // P3: solid-cell list, computed once — the per-step "zero solid cells" pass walks
+    // just these instead of scanning the whole lattice.
+    std::vector<std::size_t> solid_cells;
+    for (std::size_t c = 0; c < ncell; ++c)
+        if (solid[c]) solid_cells.push_back(c);
 
     // ---- momentum-exchange drag/lift (lattice units) ----------------------------
     // For each boundary link: contrib = sum_over_cells(f[cell,q]) * 2.0 (float64 sum
@@ -323,6 +368,19 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // (_CS_SMAG**2) * np.sqrt(np.float32(2.0)) constant-folds to this float32 value.
     const float SMAG_C = 0.04087077f;
 
+    // Inlet equilibrium row (P3): feq(rho=1, ux=u_lat, uy=uz=0) — identical arithmetic
+    // to the old per-step inner loop, evaluated once since rho/u never change.
+    float inlet_feq[NQ];
+    {
+        const float u2 = u_lat * u_lat;  // uy=uz=0
+        for (int q = 0; q < NQ; ++q) {
+            float eu = u_lat * static_cast<float>(EQ[q][0]);  // uy=uz=0 -> only x term
+            float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) -
+                         u2 / (2.0f * CS2);
+            inlet_feq[q] = W[q] * 1.0f * term;
+        }
+    }
+
     // Convergence sampling: record the drag at ~50 checkpoints through the run so we can report a
     // residual (how settled the force is) WITHOUT an early exit (the full n_steps still run, so the
     // lattice walk stays bit-identical to the oracle for the parity gate).
@@ -336,40 +394,62 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     int step = 0;
     for (step = 1; step <= n_steps; ++step) {
-        // --- Collision (BGK + Smagorinsky) ---
-        macros(f);
-        feq_compute(rho, ux, uy, uz, feq);
-
-        if (use_smag) {
-            // _smag_tau: pi_mag = sqrt(sum_q (f-feq)^2); nu_eff = nu0 + Cs^2*sqrt2*pi;
-            // tau_eff = float32(nu_eff/cs2 + 0.5) clipped [0.51,2.0]; omega=1/tau_eff.
-            for (std::size_t c = 0; c < ncell; ++c) {
-                const std::size_t base = c * sz_q;
-                // pi_mag = sqrt((fneq**2).sum(axis=-1)) — numpy forms the 19-vector
-                // fneq**2 then pairwise_sum-reduces it.
+        // --- Collision (BGK + Smagorinsky), FUSED (P3) ---
+        // macros -> feq -> collide used to be three full-lattice passes through memory
+        // (with a persistent ncell*19 feq buffer in the middle). Each cell's update is
+        // independent and uses only its own 19 distributions, so the whole thing fuses
+        // into ONE pass with the equilibrium held in registers. Per cell the arithmetic
+        // (pairwise sums, float32 expression order) is exactly the old sequence, so the
+        // lattice walk stays bit-identical to the oracle; cells write disjoint slots, so
+        // the OpenMP split changes nothing.
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(lbm_threads) if (lbm_threads > 1)
+#endif
+        for (std::int64_t ci = 0; ci < static_cast<std::int64_t>(ncell); ++ci) {
+            const std::size_t c = static_cast<std::size_t>(ci);
+            const std::size_t base = c * sz_q;
+            // _macros for this cell (same pairwise reductions as the macros() lambda).
+            float prod[NQ];
+            const float sr = pairwise_sum19(&f[base]);
+            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][0]);
+            const float sx = pairwise_sum19(prod);
+            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][1]);
+            const float sy = pairwise_sum19(prod);
+            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][2]);
+            const float szv = pairwise_sum19(prod);
+            const float rho_safe = (sr > 1e-10f) ? sr : 1.0f;
+            const float cux = sx / rho_safe, cuy = sy / rho_safe, cuz = szv / rho_safe;
+            // _feq_fast for this cell, in registers.
+            float feq_c[NQ];
+            const float u2 = cux * cux + cuy * cuy + cuz * cuz;
+            for (int q = 0; q < NQ; ++q) {
+                float eu = cux * static_cast<float>(EQ[q][0]);
+                eu += cuy * static_cast<float>(EQ[q][1]);
+                eu += cuz * static_cast<float>(EQ[q][2]);
+                float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) -
+                             u2 / (2.0f * CS2);
+                feq_c[q] = W[q] * sr * term;
+            }
+            if (use_smag) {
+                // _smag_tau: pi_mag = sqrt(sum_q (f-feq)^2); nu_eff = nu0 + Cs^2*sqrt2*pi;
+                // tau_eff = float32(nu_eff/cs2 + 0.5) clipped [0.51,2.0]; omega=1/tau_eff.
                 float sq[NQ];
                 for (int q = 0; q < NQ; ++q) {
-                    const float fn = f[base + q] - feq[base + q];
+                    const float fn = f[base + q] - feq_c[q];
                     sq[q] = fn * fn;
                 }
                 const float pi_mag = std::sqrt(pairwise_sum19(sq));
-                // smag = SMAG_C * pi_mag (all float32, see SMAG_C above).
                 const float smag = SMAG_C * pi_mag;
                 const float nu_eff = nu0 + smag;  // float32
-                // tau_eff = (nu_eff/_CS2 + float32(0.5)).astype(float32) — all float32.
                 float tau_eff = nu_eff / CS2 + 0.5f;
-                // np.clip(tau_eff, float32(0.51), float32(2.0))
                 if (tau_eff < 0.51f) tau_eff = 0.51f;
                 if (tau_eff > 2.0f) tau_eff = 2.0f;
                 const float omega = 1.0f / tau_eff;  // float32(1.0)/tau_arr
-                for (int q = 0; q < NQ; ++q) {
-                    // f = f - omega*(f-feq) ; result .astype(float32) (already float32)
-                    f[base + q] = f[base + q] - omega * (f[base + q] - feq[base + q]);
-                }
-            }
-        } else {
-            for (std::size_t i = 0; i < f.size(); ++i) {
-                f[i] = f[i] - omega_s * (f[i] - feq[i]);
+                for (int q = 0; q < NQ; ++q)
+                    f[base + q] = f[base + q] - omega * (f[base + q] - feq_c[q]);
+            } else {
+                for (int q = 0; q < NQ; ++q)
+                    f[base + q] = f[base + q] - omega_s * (f[base + q] - feq_c[q]);
             }
         }
         // f.astype(np.float32) — already float32; no-op.
@@ -379,20 +459,14 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         f.swap(fstream);
 
         // --- Boundary conditions ---
-        // Inlet (x=0): equilibrium injection feq(rho=1, ux=u_lat, uy=uz=0).
-        // _inlet_bc builds feq over the (Ny,Nz) face and assigns f[0,:,:,:].
+        // Inlet (x=0): equilibrium injection feq(rho=1, ux=u_lat, uy=uz=0). The 19
+        // values are CONSTANT for the whole run (fixed rho/u), so they're computed once
+        // outside the loop (inlet_feq below) and just copied here.
         {
             for (int y = 0; y < ny; ++y) {
                 for (int z = 0; z < nz; ++z) {
-                    const float u2 = u_lat * u_lat;  // uy=uz=0
                     const std::size_t base = fidx(0, y, z, 0);
-                    for (int q = 0; q < NQ; ++q) {
-                        float eu = u_lat * static_cast<float>(EQ[q][0]);
-                        // uy=uz=0 -> only x term
-                        float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) -
-                                     u2 / (2.0f * CS2);
-                        f[base + q] = W[q] * 1.0f * term;
-                    }
+                    for (int q = 0; q < NQ; ++q) f[base + q] = inlet_feq[q];
                 }
             }
         }
@@ -435,45 +509,38 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
         }
 
-        // Solid half-way bounce-back.
-        // For each q (1..18): solid_shifted[c]=solid[(c+e)] (np.roll shift -e); fluid
-        // at boundary = solid_shifted & ~solid. f_solid_q[c]=f[(c+e),q] (roll -e). Set
-        // f[c, opp(q)] = f_solid_q[c] = f[(c+e), q] for boundary fluid cells.
-        // CRITICAL: the oracle uses the SAME f for reads (roll of current f) and writes;
-        // np.roll snapshots f[...,q] BEFORE the per-q writes, and writes go into opp(q)
-        // which is a DIFFERENT slice than q, so within one q there is no read/write
-        // aliasing — but a later q' could read a slice opp(q'') written earlier. To match
-        // numpy EXACTLY we must read from the f as it stands at the start of each q
-        // iteration (the roll reads current f[...,q], writes f[...,opp]). Since each q
-        // reads slice q and writes slice opp(q), and opp(q) for q in 1..18 maps onto the
-        // same set 1..18, a write at q can be read by a later q' iff opp(q)==q'. We thus
-        // replicate the in-place sequential semantics directly on f.
-        for (int q = 1; q < NQ; ++q) {
-            const int ex = EQ[q][0], ey = EQ[q][1], ez = EQ[q][2];
+        // Solid half-way bounce-back over the PRECOMPUTED boundary links (P3).
+        // The old per-q full-lattice scan (18 sweeps of every cell, every step) touched
+        // O(18·ncell) cells to find an O(boundary) set that never changes — the links
+        // list (built once above) walks exactly the boundary pairs instead.
+        //
+        // Ordering note: every WRITE lands on a FLUID cell's opp(q) slot and every READ
+        // comes from a SOLID neighbour's q slot. The write set (fluid cells) and read
+        // set (solid cells) are disjoint, so the 18 q-passes never observe each other's
+        // writes at all — the oracle's in-place sequential semantics and this link walk
+        // (and its parallel split) are identical by construction. Within one q the
+        // (c, opp(q)) targets are unique, so threads write disjoint slots.
+        for (const Link& lk : links) {
+            const int q = lk.q;
             const int oq = OPP[q];
-            for (int x = 0; x < nx; ++x) {
-                int nbx = (x + ex) % nx;
-                if (nbx < 0) nbx += nx;
-                for (int y = 0; y < ny; ++y) {
-                    int nby = (y + ey) % ny;
-                    if (nby < 0) nby += ny;
-                    for (int z = 0; z < nz; ++z) {
-                        int nbz = (z + ez) % nz;
-                        if (nbz < 0) nbz += nz;
-                        const std::size_t c = cidx(x, y, z);
-                        const std::size_t nb = cidx(nbx, nby, nbz);
-                        if (solid[nb] && !solid[c]) {
-                            f[c * sz_q + oq] = f[nb * sz_q + q];
-                        }
-                    }
-                }
-            }
+            const std::int64_t n_lk = static_cast<std::int64_t>(lk.cells.size());
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(lbm_threads) \
+    if (lbm_threads > 1 && n_lk > 4096)
+#endif
+            for (std::int64_t i = 0; i < n_lk; ++i)
+                f[lk.cells[i] * sz_q + oq] = f[lk.nbs[i] * sz_q + q];
         }
 
-        // Zero solid cells.
-        for (std::size_t c = 0; c < ncell; ++c) {
-            if (solid[c]) {
-                const std::size_t base = c * sz_q;
+        // Zero solid cells (precomputed list — O(solid), not O(ncell)).
+        {
+            const std::int64_t n_sc = static_cast<std::int64_t>(solid_cells.size());
+#if defined(AICAD_HAVE_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(lbm_threads) \
+    if (lbm_threads > 1 && n_sc > 4096)
+#endif
+            for (std::int64_t i = 0; i < n_sc; ++i) {
+                const std::size_t base = solid_cells[i] * sz_q;
                 for (int q = 0; q < NQ; ++q) f[base + q] = 0.0f;
             }
         }

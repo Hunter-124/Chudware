@@ -339,7 +339,19 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     // scale) with a tiny coefficient — enough to dominate roundoff, far below the 1st mode.
     int k_req = std::min(n_modes, n_free - 2);
     if (k_req < 1) k_req = 1;
-    int ncv = std::min(n_free, std::max(2 * k_req + 1, 20));
+
+    // FREE-FREE (no fixed DOFs): the zero eigenvalue is 6-FOLD DEGENERATE (3 translations +
+    // 3 rotations). Shift-invert Lanczos converges degenerate clusters only when the Krylov
+    // subspace is comfortably larger than the cluster; with k_req = n_modes and ncv = 2k+1
+    // it routinely converged only PART of the rigid cluster and silently substituted higher
+    // elastic modes into the "lowest k" list (observed: n_modes=8 on a slender tet10 beam
+    // returned 3 rigid + 5 elastic — the C4 defect, previously papered over caller-side in
+    // cad_tools). Fix where it belongs: over-request so the subspace can resolve all 6
+    // rigid modes, VERIFY the rigid count, enlarge + retry if short, then truncate the
+    // ascending list back to the caller's k_req.
+    const bool free_free = fixed_nodes.empty();
+    int k_solve = free_free ? std::min(std::max(k_req + 6, 14), n_free - 2) : k_req;
+    if (k_solve < k_req) k_solve = k_req;
 
     double kdiag = 0.0, mdiag = 0.0;
     for (int i = 0; i < n_free; ++i) { kdiag += Kff.coeff(i, i); mdiag += Mff.coeff(i, i); }
@@ -350,22 +362,50 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     using BOpType = Spectra::SparseSymMatProd<double>;
     OpType op(Kff, Mff);
     BOpType Bop(Mff);
-    Spectra::SymGEigsShiftSolver<OpType, BOpType, Spectra::GEigsMode::ShiftInvert> geigs(
-        op, Bop, k_req, ncv, sigma);
-    geigs.init();
-    geigs.compute(Spectra::SortRule::LargestMagn, 10 * n_free, 1e-10, Spectra::SortRule::SmallestAlge);
-    if (geigs.info() != Spectra::CompInfo::Successful) {
+
+    Eigen::VectorXd evals;
+    Eigen::MatrixXd evecs;
+    auto eigensolve = [&](int ks) -> bool {
+        // 3k+1 (not 2k+1): the wider subspace is what actually lets Lanczos pull a full
+        // degenerate cluster through; measured negligible cost at these problem sizes.
+        const int ncv = std::min(n_free, std::max(3 * ks + 1, 30));
+        Spectra::SymGEigsShiftSolver<OpType, BOpType, Spectra::GEigsMode::ShiftInvert> geigs(
+            op, Bop, ks, ncv, sigma);
+        geigs.init();
+        geigs.compute(Spectra::SortRule::LargestMagn, 10 * n_free, 1e-10,
+                      Spectra::SortRule::SmallestAlge);
+        if (geigs.info() != Spectra::CompInfo::Successful) return false;
+        evals = geigs.eigenvalues();  // generalized eigenvalues (omega^2-ish)
+        evecs = geigs.eigenvectors();  // (n_free, k)
+        return true;
+    };
+    auto n_rigid = [&] {  // rigid-body modes read ≈0 Hz; elastic modes are orders above
+        int n = 0;
+        for (int i = 0; i < evals.size(); ++i) {
+            const double f = std::sqrt(std::max(evals(i), 0.0) * 1e6) / (2.0 * kPi);
+            if (f < 0.5) ++n;
+        }
+        return n;
+    };
+    if (!eigensolve(k_solve)) {
         res.error = "fea_modal: eigensolve did not converge";
         return res;
     }
-    Eigen::VectorXd evals = geigs.eigenvalues();        // generalized eigenvalues (omega^2-ish)
-    Eigen::MatrixXd evecs = geigs.eigenvectors();        // (n_free, k)
-    const int k = static_cast<int>(evals.size());
+    if (free_free) {
+        for (int attempt = 0; attempt < 2 && n_rigid() < std::min(6, k_solve); ++attempt) {
+            const int bigger = std::min(k_solve + 6, n_free - 2);
+            if (bigger <= k_solve) break;
+            k_solve = bigger;
+            if (!eigensolve(k_solve)) break;  // keep the last good result
+        }
+    }
+    const int k = std::min(static_cast<int>(evals.size()), k_req);  // truncate over-request
 
-    // omega[rad/s] = sqrt(max(eig,0) * 1e6); freq[Hz] = omega / 2pi. Sort ascending.
+    // omega[rad/s] = sqrt(max(eig,0) * 1e6); freq[Hz] = omega / 2pi. Rank EVERY computed
+    // mode ascending, then emit only the k lowest (drops the over-requested tail).
     std::vector<std::pair<double, int>> order;
-    order.reserve(k);
-    for (int i = 0; i < k; ++i) {
+    order.reserve(static_cast<size_t>(evals.size()));
+    for (int i = 0; i < static_cast<int>(evals.size()); ++i) {
         double ev = std::max(evals(i), 0.0);
         double freq = std::sqrt(ev * 1e6) / (2.0 * kPi);
         order.emplace_back(freq, i);

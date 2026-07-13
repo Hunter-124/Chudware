@@ -222,3 +222,31 @@ TEST_CASE("modal: free-free non-square body returns rigid-body modes, not an err
     CHECK(r.freqs_hz[6] > 50.0);                              // first elastic mode is positive
     CHECK(r.freqs_hz[7] >= r.freqs_hz[6]);                    // ascending
 }
+
+// C4 regression (fixed 2026-07-12): with n_modes=8 on a slender tet10 free-free beam the
+// old solver (k_req = n_modes, ncv = 2k+1) converged only PART of the 6-fold-degenerate
+// rigid cluster and silently substituted elastic modes — observed 3 rigid + 5 elastic.
+// The solver now over-requests + widens the subspace + verifies the rigid count
+// internally, so the caller gets all 6 rigid modes even at small n_modes.
+TEST_CASE("modal: free-free tet10 slender beam resolves ALL 6 rigid modes at n_modes=8 (C4)") {
+    Mesh m4 = beam_mesh(100.0, 12.0, 16, 2, 2);
+    Mesh10 m = to_tet10(m4);
+    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+                                         /*fixed*/ {}, /*n_modes*/ 8, /*npe*/ 10);
+    REQUIRE(r.ok);
+    REQUIRE(r.freqs_hz.size() == 8);  // truncated back to the caller's count
+    int rigid = 0;
+    for (double f : r.freqs_hz) if (f < 0.5) ++rigid;
+    CHECK(rigid == 6);                                    // the full degenerate cluster
+    CHECK(r.freqs_hz[6] > 100.0);                         // then real elastic modes
+    CHECK(r.freqs_hz[7] >= r.freqs_hz[6]);                // ascending
+}
+
+TEST_CASE("modal: free-free rigid cluster survives even when n_modes < 6") {
+    Mesh m = beam_mesh(100.0, 12.0, 10, 2, 2);
+    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+                                         /*fixed*/ {}, /*n_modes*/ 4);
+    REQUIRE(r.ok);
+    REQUIRE(r.freqs_hz.size() == 4);
+    for (double f : r.freqs_hz) CHECK(f < 0.5);  // the 4 lowest are all rigid (~0 Hz)
+}

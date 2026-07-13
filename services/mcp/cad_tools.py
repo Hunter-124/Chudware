@@ -4114,13 +4114,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
             def _solve() -> dict:
                 # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold
-                # degenerate, and the C++ shift-invert Lanczos (ncv = 2k+1) often
-                # converges only PART of that cluster for small k — silently
-                # substituting higher elastic modes into the "lowest n_modes" list
-                # (observed: n_modes=8 on a slender beam returned 3 rigid + 5
-                # elastic modes). Over-request so the Krylov subspace can resolve
-                # all 6 rigid modes, VERIFY the count, retry bigger if short, then
-                # truncate the ascending list back to the caller's n_modes.
+                # degenerate. FIXED IN THE ENGINE 2026-07-12 (fea_modal.cpp
+                # over-requests + widens the Krylov subspace + verifies the rigid
+                # count internally), so this caller-side over-request + verify is
+                # now a redundant SAFETY NET — kept because it is cheap and turns
+                # any regression into a visible warning note instead of silently
+                # wrong mode numbering.
                 free_free = not fixture_sets
                 solve_n = max(n_modes + 6, 14) if free_free else n_modes
                 res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})

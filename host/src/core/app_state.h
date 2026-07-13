@@ -840,6 +840,13 @@ struct AppState {
     void exitComponentEdit();
     bool inComponentEdit() const { return componentEdit.active; }
 
+    // ---- feature-tree → asm mate/placement panel request seam (asm_panels.cpp consumes) ----
+    // The tree's component "Edit" item sets this to the clicked component id; AsmPanels::draw() opens
+    // and focuses the Mate form on it once per frame, then clears the field. Kept tiny: the mate form
+    // is an add-mate workflow (no "show existing mates for X" state today), so "Edit" surfaces the
+    // placement/mate panel focused for that component rather than loading its existing mate list.
+    std::string requestEditComponentMates;
+
     // ---- multi-document per-session state (core/doc_tabs.cpp + app_state.cpp) ----
     // The active CAD tab's DocSession (null at the empty start state or on a Drawing/ECAD tab).
     DocSession* activeSession();

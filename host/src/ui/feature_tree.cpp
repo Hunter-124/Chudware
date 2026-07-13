@@ -1890,20 +1890,22 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_SpanFullWidth |
                 ImGuiTreeNodeFlags_FramePadding |            // pill-height node (red-pen round-2)
-                ImGuiTreeNodeFlags_OpenOnArrow;             // expand via the arrow; double-click = Open Part
+                ImGuiTreeNodeFlags_OpenOnArrow;             // expand via the arrow; double-click = Edit Model
             if (!expandable) lf |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
             ImVec2 compRowPos = ImGui::GetCursorScreenPos();
             const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
             treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]",
                                 hidden ? 0.5f : 1.0f);
             if (hidden) ImGui::PopStyleColor();
-            // Double-click the row (not the toggle-arrow) opens the source part — the editing path.
+            // Double-click the row (not the toggle-arrow) enters in-context model edit — same flow as
+            // the "Edit Model" context item (SolidWorks "Edit Component"). The assembly ghosts; the
+            // component's part-doc becomes active. ("Open Part" stays available on right-click.)
             if (expandable && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
                 !ImGui::IsMouseHoveringRect(compRowPos,
                     ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
                            compRowPos.y + ImGui::GetFontSize() * 1.5f)))
-                openComponentPart(st, srcPath);
+                st.enterComponentEdit(cid, resolveComponentPath(srcPath));
 
             // ---- component visibility ---------------------------------------------------------
             // Persisted (asm_edit_component `hidden`), so undo/save work; a hidden component still
@@ -1930,6 +1932,16 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             }
             pushTreePopupGlass();
             if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
+                // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
+                // route through the request seam AsmPanels::draw() consumes to open + focus the Mate
+                // panel for this component. Placed first (above "Edit Model") as the default edit.
+                if (ImGui::MenuItem("Edit"))
+                    st.requestEditComponentMates = cid;
+                // "Edit Model" = in-context model editing: the component's part-doc becomes the active
+                // doc with the assembly ghosted. Only when the component has a source .step+ to edit.
+                if (expandable && ImGui::MenuItem("Edit Model"))
+                    st.enterComponentEdit(cid, resolveComponentPath(srcPath));
+                ImGui::Separator();
                 if (expandable && ImGui::MenuItem("Open Part"))
                     openComponentPart(st, srcPath);
                 if (expandable) ImGui::Separator();

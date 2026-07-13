@@ -135,6 +135,10 @@ private:
         MateSurfKind surf = MateSurfKind::None;
     } picks_[3];                          // [0],[1] standard; [2] is width's jaw / symmetric's plane
     int  mateType_ = 0;                   // index into the auto-suggested STANDARD type list
+    // Component the Mate form was opened FOR via the tree "Edit" seam (requestEditComponentMates).
+    // Shown as a header note so the form reads as "editing this component's placement"; cleared when
+    // the form is closed/reopened. Empty for a plain ribbon-launched Mate.
+    std::string editComponentTarget_;
     // Explicit selected mate type. Set by BOTH the Standard suggested buttons (= suggestedMate())
     // and the Mechanical/Advanced buttons. Empty => fall back to suggestedMate(). This is the
     // single source of truth read by addMate / the parameter block / the Add gate.

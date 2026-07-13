@@ -1253,20 +1253,71 @@ void AppState::enterComponentEdit(const std::string& componentId, const std::str
     requestOpenPath = sourceAbsPath;
 }
 
-// Exit component-edit: switch the active doc back to the assembly via the same cached switch path
-// (switchToTab → tryActivateCached), which re-reads the edited component through the assembly's
-// existing mtime-keyed component cache (no manual reparse), then clear the ghost + reset context.
+// Exit component-edit: persist the edited component to disk, then switch back to the assembly with a
+// FORCED full rebuild so the edit actually shows.
+//
+// Why a forced rebuild (not the cheap cached switch): the assembly re-embeds each component by reading
+// its `.step+` OFF DISK, keyed by abspath:mtime (core/doc/assembly.cpp load_component → component_cache_key
+// → load_bodies). The cheap tab-switch is keyed on the ASSEMBLY doc's revision, which an in-context
+// component edit does NOT bump — so a plain switch-back would re-serve the pre-edit mesh. Two things are
+// therefore required, both only on this discrete exit action (the normal fast tab-switch path is untouched):
+//   1) SAVE the component doc to its source `.step+` first, bumping the file mtime so the assembly's
+//      abspath:mtime component cache misses and re-imports the edited geometry. The in-context edit lives
+//      only in the worker's in-memory doc until this save.
+//   2) After the save lands, invalidate the assembly tab session's cache (cachedRevision = -1) so
+//      switchToTab takes the `needs_rebuild` async doc_rebuild path (a real re-embed + re-tessellate)
+//      instead of tryActivateCached. doc_save is async, so the rebuild MUST be chained from the save's
+//      success callback — firing it sequentially would race the rebuild ahead of the on-disk write.
 void AppState::exitComponentEdit() {
     if (!componentEdit.active) return;
-    const std::string returnDocId = componentEdit.assemblyDocId;
+    const std::string returnDocId  = componentEdit.assemblyDocId;
+    const std::string sourcePath   = componentEdit.sourcePath;   // component's resolved abs .step+ path
+    // The component's part-doc is the ACTIVE doc at exit (we haven't switched back yet).
+    const std::string componentDocId = docMirror.docId();
     // Reset context BEFORE the switch so any repaint during switchToTab sees us out of component-edit.
     componentEdit = ComponentEditCtx{};
     if (renderer) renderer->clearGhost();
-    if (!returnDocId.empty()) {
+
+    // Switch back to the assembly with its session cache invalidated so switchToTab forces a full
+    // async doc_rebuild (re-reads the edited component from disk). Factored so both the post-save
+    // path and the fallback (no source path / no worker) can call it.
+    auto switchBackForced = [this, returnDocId]() {
+        if (returnDocId.empty()) return;
         for (int i = 0; i < (int)docTabs.size(); ++i) {
-            if (docTabs[i].docId == returnDocId) { switchToTab(i); break; }
+            if (docTabs[i].docId != returnDocId) continue;
+            if (docTabs[i].session) {
+                docTabs[i].session->cachedRevision = -1;   // force needs_rebuild (see doc_mirror.cpp)
+                docTabs[i].session->cachedAicmPath.clear();
+            }
+            switchToTab(i);
+            break;
         }
+    };
+
+    // Save the component to disk first (bump mtime), then force the assembly rebuild in the callback.
+    // Fall back to a bare forced switch when we can't save (no anchored source path or no worker):
+    // the rebuild is still correct if the component happened to be saved by hand during the edit.
+    if (!sourcePath.empty() && !componentDocId.empty() && workerStarted) {
+        const std::string savePath = sourcePath;
+        const std::string saveDocId = componentDocId;
+        ++rebuildsInFlight;
+        rpc.call("doc_save",
+                 nlohmann::json{{"doc_id", saveDocId}, {"path", savePath}},
+                 [this, switchBackForced, saveDocId](const core::RpcResult& r) {
+                     --rebuildsInFlight;
+                     if (!r.ok) {
+                         addLog("[asm] exit-edit: component save failed: " + r.err);
+                         toast(ui::ToastLevel::Warn,
+                               "Component didn't save — assembly may show the old model");
+                     } else {
+                         addLog("[asm] exit-edit: component saved (" + saveDocId +
+                                "), forcing assembly rebuild");
+                     }
+                     switchBackForced();   // rebuild regardless — a save error shouldn't strand us
+                 }, 120000);
+        return;
     }
+    switchBackForced();
 }
 
 // Solid Bodies hide/show: push the host-side visibility mask to the renderer (per-slot draw

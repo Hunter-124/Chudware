@@ -158,6 +158,17 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
 }
 
 void AsmPanels::draw(AppState& st) {
+    // Feature-tree "Edit" on a component → open + focus the Mate/placement panel for it. Consumed once
+    // per frame and cleared. The mate form is an add-mate workflow (no "existing mates for X" list state
+    // yet), so we surface it focused and remember the component so its next viewport/tree pick lands in
+    // the active reference well; the user picks the mating geometry as usual.
+    if (!st.requestEditComponentMates.empty()) {
+        const std::string cid = st.requestEditComponentMates;
+        st.requestEditComponentMates.clear();
+        beginMateForm();                 // sets mateOpen_ + mateFocus_, resets wells
+        editComponentTarget_ = cid;      // scope hint (used for the header note / pick routing)
+        st.addLog("[asm] edit mates for component " + cid);
+    }
     drawInsert(st);
     drawPartsLibrary(st);
     drawMateForm(st);
@@ -481,6 +492,7 @@ void AsmPanels::beginMateForm() {
     picks_[2] = MatePick{};
     mateType_ = 0;
     selectedMateType_.clear();
+    editComponentTarget_.clear();   // plain launch; the tree "Edit" seam re-stamps this after us
     aligned_ = true;
     auto initBuf = [](std::vector<char>& b, const char* v) {
         std::memset(b.data(), 0, b.size());
@@ -495,7 +507,7 @@ void AsmPanels::beginMateForm() {
     mateError_.clear();
 }
 
-void AsmPanels::closeMateForm() { mateOpen_ = false; }
+void AsmPanels::closeMateForm() { mateOpen_ = false; editComponentTarget_.clear(); }
 
 // The mate type acting this frame: an explicit Mechanical/Advanced pick (or a Standard pick that
 // also stamps selectedMateType_), else the surface-driven suggestion.
@@ -650,6 +662,13 @@ void AsmPanels::drawMateForm(AppState& st) {
         pushText(pal.text);
         ImGui::TextUnformatted("Mate");
         ImGui::PopStyleColor();
+        // Opened from the tree "Edit" on a component: note which component this placement edit is for.
+        if (!editComponentTarget_.empty()) {
+            pushText(pal.textDim);
+            ImGui::TextWrapped("Editing placement of: %s",
+                               componentName(st, editComponentTarget_).c_str());
+            ImGui::PopStyleColor();
+        }
         ImGui::Separator();
 
         // The effective type drives the well count + the parameter block + the Add gate.

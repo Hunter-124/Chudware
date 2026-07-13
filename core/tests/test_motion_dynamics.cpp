@@ -18,6 +18,8 @@
 // Tolerances reflect the trajectory finite-differencing (O(dt²)) — the solver
 // itself is exact linear algebra per frame.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+// MSVC only exposes M_PI from <cmath> when _USE_MATH_DEFINES is set (before the include).
+#define _USE_MATH_DEFINES
 #include <doctest/doctest.h>
 
 #include <cmath>

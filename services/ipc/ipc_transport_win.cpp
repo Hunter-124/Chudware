@@ -103,11 +103,12 @@ IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
         close();
         h_ = o.h_;
         ev_ = o.ev_;
-        eof_ = o.eof_;
+        // std::atomic is not assignable — mirror the Linux path (store/load).
+        eof_.store(o.eof_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         readBuf_ = std::move(o.readBuf_);
         o.h_ = nullptr;
         o.ev_ = nullptr;
-        o.eof_ = false;
+        o.eof_.store(false, std::memory_order_relaxed);
         o.readBuf_.clear();
     }
     return *this;

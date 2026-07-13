@@ -14,8 +14,9 @@ REM       installs requirements.txt.
 REM    2. Verifies the MCP server actually starts.
 REM    3. Writes/merges the right config file for each client (non-destructive).
 REM
-REM  Usage:   mcp_setup.bat              install / re-register
-REM           mcp_setup.bat uninstall   remove the billet (and legacy ai-cad) entries
+REM  Usage:   mcp_setup.bat              install / re-register (full profile)
+REM           mcp_setup.bat lite         install lite profile (capable models)
+REM           mcp_setup.bat uninstall    remove the billet (and legacy ai-cad) entries
 REM ===========================================================================
 
 set "REPO=%~dp0"
@@ -23,13 +24,19 @@ if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
 cd /d "%REPO%"
 
 set "MODE=register"
+set "PROFILE=full"
 if /i "%~1"=="uninstall"   set "MODE=unregister"
 if /i "%~1"=="--unregister" set "MODE=unregister"
 if /i "%~1"=="remove"      set "MODE=unregister"
+if /i "%~1"=="lite"        set "PROFILE=lite"
+if /i "%~1"=="--lite"      set "PROFILE=lite"
+if /i "%~1"=="full"        set "PROFILE=full"
+if /i "%~2"=="lite"        set "PROFILE=lite"
+if /i "%~2"=="--lite"      set "PROFILE=lite"
 
 echo(
 echo ===========================================================
-echo   Billet MCP setup  (%MODE%)
+echo   Billet MCP setup  (%MODE%, profile=%PROFILE%)
 echo   repo: %REPO%
 echo ===========================================================
 echo(
@@ -78,7 +85,7 @@ echo(
 REM ---- 3. write the client configs -----------------------------------------
 set "FLAG="
 if /i "%MODE%"=="unregister" set "FLAG=--unregister"
-"!PYEXE!" "%REPO%\installer\setup_mcp_clients.py" --python "!PYEXE!" --repo "%REPO%" !FLAG!
+"!PYEXE!" "%REPO%\installer\setup_mcp_clients.py" --python "!PYEXE!" --repo "%REPO%" --profile %PROFILE% !FLAG!
 if errorlevel 1 ( echo  ERROR: writing client configs failed. & goto :fail )
 
 echo(

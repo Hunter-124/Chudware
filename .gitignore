@@ -43,6 +43,8 @@ imgui.ini
 /opencode.json
 /.cursor/mcp.json
 /.vscode/mcp.json
+# Grok project-scoped MCP config (absolute machine paths) — written by setup_mcp_clients.py
+/.grok/
 
 # Scratch + spike outputs
 scratch/

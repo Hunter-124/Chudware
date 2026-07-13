@@ -693,7 +693,8 @@ std::map<std::string, std::string> compute_statuses(
         Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
         const auto& s = svd.singularValues();
         double smax = s.size() ? s(0) : 0.0;
-        double thr = std::max(J.rows(), (long)n_vars) * smax * 1e-10;
+        // Cast both to double so MSVC can pick std::max without Eigen::Index vs long ambiguity.
+        double thr = std::max(static_cast<double>(J.rows()), static_cast<double>(n_vars)) * smax * 1e-10;
         int rank = 0;
         for (int i = 0; i < s.size(); ++i)
             if (s(i) > thr) ++rank;
@@ -876,7 +877,8 @@ std::vector<FreeVar3> free_variables3(const json& sketch, const json& env) {
         Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
         const auto& s = svd.singularValues();
         double smax = s.size() ? s(0) : 0.0;
-        double thr = std::max(J.rows(), (long)n) * smax * 1e-10;
+        // Cast both to double so MSVC can pick std::max without Eigen::Index vs long ambiguity.
+        double thr = std::max(static_cast<double>(J.rows()), static_cast<double>(n)) * smax * 1e-10;
         int rank = 0;
         for (int i = 0; i < s.size(); ++i)
             if (s(i) > thr) ++rank;

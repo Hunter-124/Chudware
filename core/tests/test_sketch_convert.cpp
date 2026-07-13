@@ -18,6 +18,8 @@
 //     fix-pinned sketch entities the user can extrude (SolidWorks Convert Entities).
 // ONE-SHOT projection — no associative link to the source (follow-up: T-BL49).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+// MSVC only exposes M_PI from <cmath> when _USE_MATH_DEFINES is set (before the include).
+#define _USE_MATH_DEFINES
 #include <doctest/doctest.h>
 
 #include <cmath>

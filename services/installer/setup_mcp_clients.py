@@ -5,18 +5,26 @@ The server is registered under the new name ``billet`` (formerly ``ai-cad``). Ex
 tooling still referencing the old name continues to work; they are removed only on an
 explicit ``--unregister`` run.
 
-One server, five clients. This writes/merges the right config file in the right format
+One server, multiple clients. This writes/merges the right config file in the right format
 for each of:
 
   * Claude Code  -> <repo>/.mcp.json                         {"mcpServers": {...}}
   * Cursor       -> <repo>/.cursor/mcp.json                  {"mcpServers": {...}}
   * VS Code      -> <repo>/.vscode/mcp.json                  {"servers": {...}}  (type:stdio)
   * opencode     -> <repo>/opencode.json                     {"mcp": {...}}      (type:local)
+                    + ~/.config/opencode/opencode.json(c)    (global user config)
+  * Grok         -> ~/.grok/config.toml                      [mcp_servers.billet]
+                    + <repo>/.grok/config.toml               (project-scoped)
   * Antigravity  -> ~/.gemini/<antigravity*>/mcp_config.json {"mcpServers": {...}} (global)
 
-Claude Code / Cursor / VS Code / opencode are wired PROJECT-scoped (config lives in the repo)
-so the server only appears when you open this project, and so each machine gets paths that
-are correct for it. Antigravity has no project-scoped config, so it is wired globally.
+Claude Code / Cursor / VS Code / opencode (project) are PROJECT-scoped so the server only
+appears when you open this project, and so each machine gets paths that are correct for it.
+Grok is written both user-global and project-scoped. Antigravity is global-only.
+
+``--profile lite|full`` selects the MCP instruction/tool surface (env
+``AICAD_MCP_PROFILE``). ``lite`` keeps every CAD/sim capability but drops orchestration
+scaffolding (DAG/mission/ledger/workspace) — preferred for capable models (Grok, Claude
+Code, opencode). Default is ``full`` for backward compatibility with small local models.
 
 The writes are idempotent and non-destructive: existing servers in each file are preserved,
 each file is backed up (*.aicad-bak) before the first change, and re-running only rewrites a
@@ -26,13 +34,9 @@ Pure standard library on purpose -- it must run under any Python, including one 
 engine's heavy dependencies installed.
 
     python installer/setup_mcp_clients.py [--python <exe>] [--repo <dir>]
+                                          [--profile lite|full]
                                           [--unregister] [--dry-run]
                                           [--detect] [--wizard]
-
-First-run "connect your client" wizard groundwork: ``--detect`` reports which MCP clients
-this machine appears to have (and whether ai-cad is already wired); ``--wizard`` connects
-just the detected-but-unconnected ones (reusing the same idempotent writer). This is the
-seam a GUI first-run flow drives -- see contracts/providers.md (Pillar 12 MCP-first).
 """
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -48,53 +53,82 @@ SERVER_NAME = "billet"
 SERVER_NAME_LEGACY = "ai-cad"
 
 
+def _default_repo() -> str:
+    """Resolve repo root whether the script lives under installer/ or services/installer/."""
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent, here.parent.parent):
+        if (cand / "services" / "mcp").is_dir() and (cand / "requirements.txt").is_file():
+            return str(cand)
+    return str(here.parent)
+
+
+def _env(repo: str, profile: str) -> dict:
+    env = {"PYTHONPATH": repo}
+    # Always pin the profile explicitly so clients don't inherit a stale shell default.
+    env["AICAD_MCP_PROFILE"] = profile
+    return env
+
+
 # --------------------------------------------------------------------------- entry shapes
 
-def _claude_entry(py: str, repo: str) -> dict:
+def _claude_entry(py: str, repo: str, profile: str) -> dict:
     """Claude Code / Cursor / Antigravity share this shape."""
     return {
         "command": py,
         "args": ["-m", "mcp_server.server"],
         "cwd": repo,
-        "env": {"PYTHONPATH": repo},
+        "env": _env(repo, profile),
     }
 
 
-def _vscode_entry(py: str, repo: str) -> dict:
+def _vscode_entry(py: str, repo: str, profile: str) -> dict:
     return {
         "type": "stdio",
         "command": py,
         "args": ["-m", "mcp_server.server"],
         "cwd": repo,
-        "env": {"PYTHONPATH": repo},
+        "env": _env(repo, profile),
     }
 
 
-def _opencode_entry(py: str, repo: str) -> dict:
+def _opencode_entry(py: str, repo: str, profile: str) -> dict:
     return {
         "type": "local",
         "command": [py, "-m", "mcp_server.server"],
         "enabled": True,
-        "environment": {"PYTHONPATH": repo},
+        "environment": _env(repo, profile),
     }
 
 
 # ------------------------------------------------------------------------------ targets
 
-def _targets(py: str, repo: str) -> list[dict]:
+def _targets(py: str, repo: str, profile: str = "full") -> list[dict]:
     repo_p = Path(repo)
     home = Path.home()
     out = [
         {"client": "Claude Code", "path": repo_p / ".mcp.json",
-         "key": "mcpServers", "entry": _claude_entry(py, repo)},
+         "key": "mcpServers", "entry": _claude_entry(py, repo, profile)},
         {"client": "Cursor", "path": repo_p / ".cursor" / "mcp.json",
-         "key": "mcpServers", "entry": _claude_entry(py, repo)},
+         "key": "mcpServers", "entry": _claude_entry(py, repo, profile)},
         {"client": "VS Code", "path": repo_p / ".vscode" / "mcp.json",
-         "key": "servers", "entry": _vscode_entry(py, repo)},
-        {"client": "opencode", "path": repo_p / "opencode.json",
-         "key": "mcp", "entry": _opencode_entry(py, repo),
+         "key": "servers", "entry": _vscode_entry(py, repo, profile)},
+        {"client": "opencode (project)", "path": repo_p / "opencode.json",
+         "key": "mcp", "entry": _opencode_entry(py, repo, profile),
          "extra": {"$schema": "https://opencode.ai/config.json"}},
     ]
+    # Global opencode user config (json or jsonc). Prefer existing file name.
+    oc_dir = home / ".config" / "opencode"
+    oc_jsonc = oc_dir / "opencode.jsonc"
+    oc_json = oc_dir / "opencode.json"
+    oc_path = oc_jsonc if oc_jsonc.exists() or not oc_json.exists() else oc_json
+    out.append({
+        "client": "opencode (user)",
+        "path": oc_path,
+        "key": "mcp",
+        "entry": _opencode_entry(py, repo, profile),
+        "extra": {"$schema": "https://opencode.ai/config.json"},
+        "jsonc": oc_path.suffix == ".jsonc",
+    })
     # Antigravity: global, no project config. Write into each existing gemini profile
     # that already carries an mcp_config.json (antigravity, antigravity-ide, ...), but
     # never the *-backup copies. If none exist yet, seed the canonical one.
@@ -106,17 +140,41 @@ def _targets(py: str, repo: str) -> list[dict]:
         ag = [str(home / ".gemini" / "antigravity" / "mcp_config.json")]
     for p in ag:
         out.append({"client": f"Antigravity ({Path(p).parent.name})", "path": Path(p),
-                    "key": "mcpServers", "entry": _claude_entry(py, repo)})
+                    "key": "mcpServers", "entry": _claude_entry(py, repo, profile)})
+    # Grok: TOML configs (user + project). Handled separately in _apply_grok.
+    out.append({
+        "client": "Grok (user)",
+        "path": home / ".grok" / "config.toml",
+        "format": "grok_toml",
+        "entry": {"command": py, "args": ["-m", "mcp_server.server"],
+                  "env": _env(repo, profile)},
+    })
+    out.append({
+        "client": "Grok (project)",
+        "path": repo_p / ".grok" / "config.toml",
+        "format": "grok_toml",
+        "entry": {"command": py, "args": ["-m", "mcp_server.server"],
+                  "env": _env(repo, profile)},
+    })
     return out
 
 
 # -------------------------------------------------------------------------------- io
 
-def _load(path: Path) -> dict:
+def _load(path: Path) -> dict | None:
     if path.exists():
         txt = path.read_text(encoding="utf-8").strip()
         if not txt:
             return {}
+        # Strip // line comments for .jsonc (best-effort; does not handle strings with //)
+        if path.suffix == ".jsonc" or path.name.endswith(".jsonc"):
+            lines = []
+            for line in txt.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("//"):
+                    continue
+                lines.append(line)
+            txt = "\n".join(lines).strip() or "{}"
         try:
             return json.loads(txt)
         except Exception:  # noqa: BLE001 -- tolerate hand-edited / non-JSON files
@@ -125,7 +183,82 @@ def _load(path: Path) -> dict:
     return {}
 
 
+def _toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _grok_section(entry: dict) -> str:
+    """Render a [mcp_servers.billet] TOML table for Grok's config.toml."""
+    cmd = _toml_escape(entry["command"])
+    args = ", ".join(f'"{_toml_escape(a)}"' for a in entry["args"])
+    env_pairs = []
+    for k, v in (entry.get("env") or {}).items():
+        env_pairs.append(f'{k} = "{_toml_escape(str(v))}"')
+    env_inline = ", ".join(env_pairs)
+    lines = [
+        f"[mcp_servers.{SERVER_NAME}]",
+        f'command = "{cmd}"',
+        f"args = [{args}]",
+        f"env = {{ {env_inline} }}",
+        "enabled = true",
+        "startup_timeout_sec = 60",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+_GROK_SECTION_RE = re.compile(
+    rf"(?ms)^\[mcp_servers\.{re.escape(SERVER_NAME)}\][^\[]*"
+)
+_GROK_LEGACY_RE = re.compile(
+    rf"(?ms)^\[mcp_servers\.{re.escape(SERVER_NAME_LEGACY)}\][^\[]*"
+)
+
+
+def _apply_grok(t: dict, unregister: bool, dry_run: bool) -> dict:
+    path: Path = t["path"]
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    has_server = bool(_GROK_SECTION_RE.search(existing))
+    has_legacy = bool(_GROK_LEGACY_RE.search(existing))
+
+    if unregister:
+        new_txt = _GROK_SECTION_RE.sub("", existing)
+        new_txt = _GROK_LEGACY_RE.sub("", new_txt)
+        # Collapse excess blank lines left by section removal
+        new_txt = re.sub(r"\n{3,}", "\n\n", new_txt).rstrip() + ("\n" if new_txt.strip() else "")
+        changed = new_txt != existing
+    else:
+        section = _grok_section(t["entry"])
+        if has_server:
+            new_txt = _GROK_SECTION_RE.sub(section, existing)
+            # Ensure trailing newline
+            if not new_txt.endswith("\n"):
+                new_txt += "\n"
+            changed = new_txt != existing
+        else:
+            base = existing.rstrip()
+            new_txt = (base + "\n\n" + section) if base else section
+            if not new_txt.endswith("\n"):
+                new_txt += "\n"
+            changed = True
+        # Leave legacy ai-cad section alone on register.
+
+    if changed and not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            shutil.copy2(path, path.with_suffix(path.suffix + ".aicad-bak"))
+        path.write_text(new_txt, encoding="utf-8")
+
+    status = ("would change" if dry_run else "wrote") if changed else "unchanged"
+    if unregister and not (has_server or has_legacy) and not changed:
+        status = "unchanged"
+    return {"client": t["client"], "path": str(path), "status": status}
+
+
 def _apply_one(t: dict, unregister: bool, dry_run: bool) -> dict:
+    if t.get("format") == "grok_toml":
+        return _apply_grok(t, unregister, dry_run)
+
     path: Path = t["path"]
     cfg = _load(path)
     if cfg is None:
@@ -168,9 +301,18 @@ def _status_of(t: dict) -> dict:
 
     ``present`` = the client has left a footprint on this machine (its config file or the
     directory that holds it already exists) -- a good-enough, stdlib-only heuristic for a
-    first-run "we found these clients" prompt. ``connected`` = ai-cad is already registered.
+    first-run "we found these clients" prompt. ``connected`` = billet is already registered.
     """
     path: Path = t["path"]
+    if t.get("format") == "grok_toml":
+        present = path.exists() or path.parent.exists()
+        connected = False
+        if path.exists():
+            txt = path.read_text(encoding="utf-8")
+            connected = bool(_GROK_SECTION_RE.search(txt)) or bool(_GROK_LEGACY_RE.search(txt))
+        return {"client": t["client"], "path": str(path), "present": present,
+                "connected": connected}
+
     cfg = _load(path) if path.exists() else {}
     if not isinstance(cfg, dict):
         cfg = {}
@@ -180,15 +322,15 @@ def _status_of(t: dict) -> dict:
             "connected": connected}
 
 
-def detect(py: str, repo: str) -> list[dict]:
+def detect(py: str, repo: str, profile: str = "full") -> list[dict]:
     """Report every known MCP client target with presence + connection status."""
-    return [_status_of(t) for t in _targets(py, repo)]
+    return [_status_of(t) for t in _targets(py, repo, profile)]
 
 
-def _run_wizard(py: str, repo: str, dry_run: bool) -> list[dict]:
-    """Connect just the clients that are present but not yet wired to ai-cad."""
+def _run_wizard(py: str, repo: str, dry_run: bool, profile: str = "full") -> list[dict]:
+    """Connect just the clients that are present but not yet wired to billet."""
     results = []
-    for t in _targets(py, repo):
+    for t in _targets(py, repo, profile):
         st = _status_of(t)
         if st["connected"] or not st["present"]:
             results.append({"client": t["client"], "path": st["path"],
@@ -204,9 +346,12 @@ def main(argv: list[str]) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--python", default=sys.executable,
                     help="Python interpreter the server runs under (default: this one)")
-    ap.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent),
-                    help="Repository root (default: this script's parent)")
-    ap.add_argument("--unregister", action="store_true", help="Remove the ai-cad entries")
+    ap.add_argument("--repo", default=_default_repo(),
+                    help="Repository root (default: auto-detect from this script)")
+    ap.add_argument("--profile", choices=["lite", "full"], default="full",
+                    help="MCP profile: lite (capable models) or full (supervised/local). "
+                         "Sets AICAD_MCP_PROFILE in every client entry.")
+    ap.add_argument("--unregister", action="store_true", help="Remove the billet/ai-cad entries")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")
     ap.add_argument("--detect", action="store_true",
                     help="Report which MCP clients are present / already connected, then exit")
@@ -216,9 +361,10 @@ def main(argv: list[str]) -> int:
 
     py = str(Path(args.python).resolve())
     repo = str(Path(args.repo).resolve())
+    profile = args.profile
 
     if args.detect:
-        rows = detect(py, repo)
+        rows = detect(py, repo, profile)
         width = max(len(r["client"]) for r in rows)
         print("Detected MCP clients (present = footprint on this machine):\n")
         for r in rows:
@@ -230,14 +376,16 @@ def main(argv: list[str]) -> int:
     if args.wizard:
         action = "Connecting detected"
     print(f"{action} '{SERVER_NAME}' MCP server (legacy: '{SERVER_NAME_LEGACY}')")
-    print(f"  python : {py}")
-    print(f"  repo   : {repo}")
+    print(f"  python  : {py}")
+    print(f"  repo    : {repo}")
+    print(f"  profile : {profile}")
     print()
 
     if args.wizard:
-        results = _run_wizard(py, repo, args.dry_run)
+        results = _run_wizard(py, repo, args.dry_run, profile)
     else:
-        results = [_apply_one(t, args.unregister, args.dry_run) for t in _targets(py, repo)]
+        results = [_apply_one(t, args.unregister, args.dry_run)
+                   for t in _targets(py, repo, profile)]
     width = max(len(r["client"]) for r in results)
     for r in results:
         print(f"  {r['client']:<{width}}  {r['status']:<22}  {r['path']}")

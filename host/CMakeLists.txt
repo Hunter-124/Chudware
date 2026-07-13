@@ -253,8 +253,10 @@ if(WIN32)
     target_link_options(Billet PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the
     # global namespace; force-include the shim on C++ TUs only (see extern/fix_math.h).
+    # Do NOT quote the path inside /FI — under Ninja+MSVC the quotes become part of the
+    # filename (C1083). Ninja quotes the whole /FI<path> token correctly without them.
     target_compile_options(Billet PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:/FI"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h">)
+      $<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h>)
   endif()
 endif()
 

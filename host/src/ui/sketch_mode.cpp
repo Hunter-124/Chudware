@@ -5003,6 +5003,54 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     std::string fid, name;
 
+    // A datum POINT (the synthetic world origin + any user point-datums) is the tightest target of
+    // all, and the origin sits exactly where the three origin planes intersect — so it must win over
+    // both the axes and the planes, or a coincident plane always swallows the click and the origin is
+    // never selectable. Same grab-radius hit-test as drawPointPicker; the origin is only pickable via
+    // its glyph, never via a user-placed plane or model geometry.
+    {
+        const auto& cam = st.renderer->camera();
+        const ImVec2 mouse = io.MousePos;
+        const float grabRadius = 10.0f * ui::uiScale;
+        struct PointCandidate { float wx, wy, wz; std::string fid, name; };
+        std::vector<PointCandidate> pts;
+        if (!st.hiddenFeatures.count("point.origin"))
+            pts.push_back({0.0f, 0.0f, 0.0f, "point.origin", "Origin"});
+        const nlohmann::json& datums = st.docMirror.refDatums();
+        if (datums.is_array()) {
+            for (const auto& d : datums) {
+                if (!d.is_object() || d.value("kind", std::string()) != "point") continue;
+                std::string pfid = d.value("id", std::string());
+                if (pfid.empty() || st.hiddenFeatures.count(pfid)) continue;
+                const auto& pt = d.contains("point") ? d["point"] : nlohmann::json();
+                if (!pt.is_array() || pt.size() < 3) continue;
+                pts.push_back({(float)pt[0].get<double>(), (float)pt[1].get<double>(),
+                               (float)pt[2].get<double>(), pfid, d.value("name", pfid)});
+            }
+        }
+        float best = grabRadius; ImVec2 bestScreen;
+        for (const auto& c : pts) {
+            ImVec2 s;
+            if (!worldToScreen(cam, imgMin, vw, vh, c.wx, c.wy, c.wz, s)) continue;
+            float dx = mouse.x - s.x, dy = mouse.y - s.y;
+            float d = std::sqrt(dx * dx + dy * dy);
+            if (d < best) { best = d; fid = c.fid; name = c.name; bestScreen = s; }
+        }
+        if (!fid.empty()) {
+            wdl->PushClipRect(imgMin, imgMax, true);
+            wdl->AddCircle(bestScreen, grabRadius * 0.8f, col(ui::palette.accent, 0.95f),
+                           24, 2.0f * ui::uiScale);
+            wdl->PopClipRect();
+            st.requestCursor(ui::CursorKind::Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (!io.KeyCtrl) st.selection.clear();
+                st.selectedFeatureId = fid;
+                st.treeScrollToSelection = true;
+            }
+            return true;
+        }
+    }
+
     // A datum AXIS is a thin target, so it wins when the cursor is on the line (a big datum plane
     // behind it would otherwise swallow the click). Fall back to a created datum PLANE so a plane
     // can be selected in the viewport and then preselected for a sketch/feature (SolidWorks pick).

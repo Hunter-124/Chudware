@@ -250,6 +250,11 @@ static const int kHexFaces[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
 double accumulate_face_weights(const std::vector<double>& points, const std::vector<int>& tets,
                                int nodes_per_elem, const std::unordered_set<int>& node_set,
                                std::vector<double>& node_w, std::vector<double>& node_nw) {
+    // P5: a boundary face needs ALL 3 (tet) / 4 (hex) corners in the set — under 3 nodes
+    // no face can qualify, so the loaded area is exactly 0 and the whole element sweep is
+    // a no-op. Exact short-circuit (the caller's w_sum fallback branch fires, as before);
+    // saves O(n_loads * n_elems) on oracle-style many-single-node-load studies.
+    if (node_set.size() < 3) return 0.0;
     const bool hexEl = (nodes_per_elem == 8);
     const bool tet10 = (nodes_per_elem == 10);
     const int n_faces = hexEl ? 6 : 4;
@@ -350,6 +355,11 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
 void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
                             std::unordered_set<int>& node_set) {
     if (nodes_per_elem != 10) return;  // tet4 / hex8 have no mid-side nodes — unchanged.
+    // P5: an edge completes only when BOTH endpoint corners are in the set — with fewer
+    // than 2 nodes nothing can ever be added, so skip the full element sweep. Exact
+    // short-circuit; matters because oracle-style consistent-load studies carry hundreds
+    // of single-node loads, each of which used to pay this whole-mesh scan.
+    if (node_set.size() < 2) return;
     const size_t stride = 10;
     const size_t m = tets.size() / stride;
     // Mesher edge order: local 4={0,1} 5={1,2} 6={2,0} 7={3,0} 8={3,2} 9={3,1}.
@@ -410,10 +420,20 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
     const double nx = use_normal ? face_normal[0] : 0.0;
     const double ny = use_normal ? face_normal[1] : 0.0;
     const double nz = use_normal ? face_normal[2] : 0.0;
+    // P5 fast reject (planar mode): every sample lies ON the face plane, so a node's
+    // perpendicular distance is the same against ANY sample up to coplanarity roundoff.
+    // One O(1) plane test per node culls off-plane nodes before the O(k) sample scan —
+    // the surviving on-plane nodes still run the ORIGINAL per-sample loop, so membership
+    // decisions are unchanged (the 1e-9 mm slack dwarfs fp noise but admits nothing new).
+    const double plane_d0 =
+        use_normal ? (sample[0] * nx + sample[1] * ny + sample[2] * nz) : 0.0;
     for (size_t i = 0; i < n; ++i) {
         const double px = points[i * 3 + 0];
         const double py = points[i * 3 + 1];
         const double pz = points[i * 3 + 2];
+        if (use_normal &&
+            std::fabs(px * nx + py * ny + pz * nz - plane_d0) > perp_tol_mm + 1e-9)
+            continue;
         bool hit = false;
         for (size_t s = 0; s < k; ++s) {
             const double dx = px - sample[s * 3 + 0];
@@ -624,12 +644,20 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
             // pressure deposition loops below land on the SAME nodes the weights were put on.
             node_ids.assign(node_set.begin(), node_set.end());
             std::sort(node_ids.begin(), node_ids.end());
-            std::vector<double> node_w(static_cast<size_t>(n_nodes), 0.0);
-            std::vector<double> node_nw(static_cast<size_t>(n_nodes) * 3, 0.0);
-            const double loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
-                                                               node_set, node_w, node_nw);
+            // P5: the consistent-weight arrays are only meaningful when the set can hold a
+            // complete boundary face (>= 3 nodes) — oracle-style studies carry hundreds of
+            // single-node loads, and zero-filling 4*n_nodes doubles per load was real time.
+            std::vector<double> node_w, node_nw;
+            double loaded_area = 0.0;
+            if (node_set.size() >= 3) {
+                node_w.assign(static_cast<size_t>(n_nodes), 0.0);
+                node_nw.assign(static_cast<size_t>(n_nodes) * 3, 0.0);
+                loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
+                                                      node_set, node_w, node_nw);
+            }
             double w_sum = 0.0;
-            for (int nid : node_ids) w_sum += node_w[static_cast<size_t>(nid)];
+            if (!node_w.empty())
+                for (int nid : node_ids) w_sum += node_w[static_cast<size_t>(nid)];
 
             if (type == "force") {
                 std::array<double, 3> fv{0.0, 0.0, 0.0};

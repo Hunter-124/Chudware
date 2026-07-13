@@ -247,6 +247,9 @@ if(AI_CAD_ENABLE_CEF)
 endif()
 if(WIN32)
   target_link_libraries(Billet PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump
+  # windows.h min/max macros break CEF headers (std::numeric_limits<>::max()) and
+  # any other code that uses std::min/std::max — always define NOMINMAX on the host.
+  target_compile_definitions(Billet PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   # Emit debug info even in Release so crash stacks symbolize (PDB next to the exe).
   if(MSVC)
     target_compile_options(Billet PRIVATE $<$<CONFIG:Release>:/Zi>)

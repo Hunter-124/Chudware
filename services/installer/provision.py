@@ -42,7 +42,12 @@ def _find_repo() -> Path:
 
 REPO = _find_repo()
 REQUIREMENTS = REPO / "requirements.txt"
+# Top-level packages under the staged app/ dir (import as engine, agent, …).
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
+# Nested packages under services/ that the engine worker imports as services.X
+# (e.g. services.plm.worker_rpc for the PLM hub). Without these, plm_*/git_*
+# methods never register and the PLM tab sits on "Loading…".
+SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
 STAMP = paths.RUNTIME / ".ready.json"
 
 
@@ -163,11 +168,35 @@ def ensure_app_code(src: Path = REPO) -> Path:
     """Copy the app's Python packages into %APPDATA%/AI-CAD/app."""
     app = paths.ROOT / "app"
     app.mkdir(parents=True, exist_ok=True)
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "test_*", "tests")
     for pkg in APP_PACKAGES:
         s = src / pkg
         if s.exists():
-            shutil.copytree(s, app / pkg, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "build", "test_*"))
+            shutil.copytree(s, app / pkg, dirs_exist_ok=True, ignore=ignore)
+    # services.X packages — worker imports `from services.plm.worker_rpc …` etc.
+    # Stage under app/services/ so cwd=appDir() on the worker process can resolve them.
+    services_src = src / "services"
+    if services_src.is_dir():
+        services_dst = app / "services"
+        services_dst.mkdir(parents=True, exist_ok=True)
+        init_py = services_src / "__init__.py"
+        if init_py.exists():
+            shutil.copy2(init_py, services_dst / "__init__.py")
+        else:
+            (services_dst / "__init__.py").touch()
+        for name in SERVICE_PACKAGES:
+            s = services_src / name
+            if s.exists():
+                shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=ignore)
+        # services.agent is also the top-level `agent` package (junction). Mirror it
+        # under services/ so `from services.agent…` works without monorepo layout.
+        agent_src = src / "agent" if (src / "agent").exists() else services_src / "agent"
+        if agent_src.exists():
+            shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=ignore)
+        # services.mcp mirrors mcp_server for `from services.mcp…` imports.
+        mcp_src = src / "mcp_server" if (src / "mcp_server").exists() else services_src / "mcp"
+        if mcp_src.exists():
+            shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=ignore)
     if REQUIREMENTS.exists():
         shutil.copy2(REQUIREMENTS, app / "requirements.txt")
     return app

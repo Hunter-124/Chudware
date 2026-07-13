@@ -286,10 +286,16 @@ bool initialize() {
     // (--ui-screenshot, a doc path, …) are not Chromium switches and can make
     // ContentMain misclassify the process (e.g. take the subprocess ICU-fd path,
     // aborting with "Invalid file descriptor to ICU data received").
+    // Windows CefMainArgs is HINSTANCE-only (command line comes from the process);
+    // Linux/POSIX takes argc/argv so we can strip app flags here.
+#ifdef _WIN32
+    CefMainArgs args = cef_platform::main_args(g_argc, g_argv);
+#else
     static char  lang_sw[]     = "--lang=en-US";
     static char* clean_argv[2] = {g_argv ? g_argv[0] : const_cast<char*>("AI-CAD"),
                                   lang_sw};
     CefMainArgs args(2, clean_argv);
+#endif
     std::fprintf(stderr, "[cef] calling CefInitialize (subproc=%s)\n",
                  cef_platform::helper_path().c_str());
     g_initialized = CefInitialize(args, settings, g_app.get(), nullptr);

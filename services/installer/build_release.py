@@ -22,7 +22,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
-HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "AI-CAD.exe"
+# Nested packages under services/ that the engine worker imports as services.X
+# (services.plm drives the PLM hub; without it plm_*/git_* never register).
+SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
+HOST_EXE = REPO / "host" / "build-win" / "bin" / "Billet.exe"
+if not HOST_EXE.exists():
+    HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "AI-CAD.exe"
 # Engine host daemon (core/hostd). MSVC builds of aicad-hostd are new — absence is a
 # warning + skip, not a failure (the app falls back to legacy in-process engine mode).
 HOSTD_EXE_CANDIDATES = (
@@ -39,6 +44,26 @@ def stage_app(dst: Path) -> None:
         s = REPO / pkg
         if s.exists():
             shutil.copytree(s, app / pkg, dirs_exist_ok=True, ignore=_IGNORE)
+    # services.X packages for the engine worker (PLM hub, dag, browser, …)
+    services_src = REPO / "services"
+    if services_src.is_dir():
+        services_dst = app / "services"
+        services_dst.mkdir(parents=True, exist_ok=True)
+        init_py = services_src / "__init__.py"
+        if init_py.exists():
+            shutil.copy2(init_py, services_dst / "__init__.py")
+        else:
+            (services_dst / "__init__.py").write_text("", encoding="utf-8")
+        for name in SERVICE_PACKAGES:
+            s = services_src / name
+            if s.exists():
+                shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=_IGNORE)
+        agent_src = REPO / "agent" if (REPO / "agent").exists() else services_src / "agent"
+        if agent_src.exists():
+            shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=_IGNORE)
+        mcp_src = REPO / "mcp_server" if (REPO / "mcp_server").exists() else services_src / "mcp"
+        if mcp_src.exists():
+            shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=_IGNORE)
     # samples are handy to ship even though we ignore them above for other dirs
     sample_src = REPO / "engine" / "samples"
     if sample_src.exists():

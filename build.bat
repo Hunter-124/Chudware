@@ -65,14 +65,16 @@ if /i "%MODE%"=="clean" (
   set "MODE=default"
 )
 
-rem --- ensure MSVC is on PATH (Ninja builds need cl/link) ---------------------
-where cl >nul 2>&1
-if errorlevel 1 call :load_vcvars
-where cl >nul 2>&1
-if errorlevel 1 (
-  echo [build] ERROR: MSVC cl.exe not on PATH. Install VS C++ tools, or open
-  echo [build]        "x64 Native Tools Command Prompt" and re-run build.bat.
-  goto :fail
+rem --- ensure MSVC is on PATH when compiling (app/shortcut skip the toolchain)
+if /i not "%MODE%"=="app" if /i not "%MODE%"=="shortcut" (
+  where cl >nul 2>&1
+  if errorlevel 1 call :load_vcvars
+  where cl >nul 2>&1
+  if errorlevel 1 (
+    echo [build] ERROR: MSVC cl.exe not on PATH. Install VS C++ tools, or open
+    echo [build]        "x64 Native Tools Command Prompt" and re-run build.bat.
+    goto :fail
+  )
 )
 
 rem --- core only -------------------------------------------------------------
@@ -91,7 +93,22 @@ if /i not "%MODE%"=="app" (
 
   if not exist "%BUILD%\build.ninja" if not exist "%BUILD%\CMakeCache.txt" (
     echo [build] configuring host ^(Ninja + MSVC, Release^) ...
-    "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release || goto :fail
+    rem Auto-enable CEF when the Chromium 149 Windows SDK is under extern\cef\
+    rem (scripts\fetch_cef_windows.ps1). Forward-slash CEF_ROOT so CEF cmake
+    rem macros don't choke on Windows \U path escapes.
+    set "CEF_ROOT_CFG="
+    for /d %%D in ("%ROOT%\extern\cef\cef_binary_*") do (
+      if exist "%%~D\Release\libcef.dll" set "CEF_ROOT_CFG=%%~D"
+    )
+    if defined CEF_ROOT_CFG (
+      set "CEF_ROOT_CFG=%CEF_ROOT_CFG:\=/%"
+      echo [build] CEF SDK found — enabling AI_CAD_ENABLE_CEF
+      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_CAD_ENABLE_CEF=ON -DCEF_ROOT=%CEF_ROOT_CFG% || goto :fail
+    ) else (
+      echo [build] no CEF SDK under extern\cef — building without browser backend
+      echo [build]          ^(run scripts\fetch_cef_windows.ps1 to enable CEF^)
+      "%CMAKE%" -S "%ROOT%\host" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAI_CAD_ENABLE_CEF=OFF || goto :fail
+    )
   )
   echo [build] compiling Billet.exe ^(Release^) ...
   "%CMAKE%" --build "%BUILD%" --config Release --target Billet || goto :fail
@@ -126,6 +143,22 @@ if /i not "%MODE%"=="app" (
   if exist "%BUILD%\bin\Billet.pdb" copy /y "%BUILD%\bin\Billet.pdb" "%DIST%\Billet.pdb" >nul
   rem Compat name for older scripts that still look for AI-CAD.exe
   copy /y "%EXE%" "%DIST%\AI-CAD.exe" >nul 2>nul
+  rem CEF helper + runtime (libcef.dll, *.pak, locales/) when built with AI_CAD_ENABLE_CEF
+  if exist "%BUILD%\bin\ai_cad_cef_helper.exe" (
+    copy /y "%BUILD%\bin\ai_cad_cef_helper.exe" "%DIST%\ai_cad_cef_helper.exe" >nul
+  )
+  if exist "%BUILD%\Release\ai_cad_cef_helper.exe" if not exist "%DIST%\ai_cad_cef_helper.exe" (
+    copy /y "%BUILD%\Release\ai_cad_cef_helper.exe" "%DIST%\ai_cad_cef_helper.exe" >nul
+  )
+  if exist "%BUILD%\bin\libcef.dll" (
+    echo [build] staging CEF runtime from %BUILD%\bin ...
+    robocopy "%BUILD%\bin" "%DIST%" libcef.dll chrome_elf.dll libEGL.dll libGLESv2.dll d3dcompiler_47.dll dxcompiler.dll dxil.dll vk_swiftshader.dll vulkan-1.dll icudtl.dat v8_context_snapshot.bin resources.pak chrome_100_percent.pak chrome_200_percent.pak vk_swiftshader_icd.json /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    if errorlevel 8 goto :fail
+    if exist "%BUILD%\bin\locales" (
+      robocopy "%BUILD%\bin\locales" "%DIST%\locales" /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+      if errorlevel 8 goto :fail
+    )
+  )
 
   if exist "%ROOT%\host\assets" (
     robocopy "%ROOT%\host\assets" "%DIST%\assets" /MIR /XF Rubik-VF.ttf make_logo.py /XD __pycache__ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
@@ -169,9 +202,28 @@ if /i not "%MODE%"=="app" (
 rem Python app packages (junction names engine/agent/mcp_server/installer when present)
 for %%P in (engine agent mcp_server installer) do (
   if exist "%ROOT%\%%P\" (
-    robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 goto :fail
   )
+)
+rem services.X packages (PLM hub, dag, browser, …) — engine.worker imports these as
+rem `from services.plm.worker_rpc …`. Without them plm_*/git_* never register.
+if not exist "%DIST%\app\services" mkdir "%DIST%\app\services"
+if exist "%ROOT%\services\__init__.py" copy /y "%ROOT%\services\__init__.py" "%DIST%\app\services\__init__.py" >nul
+if not exist "%DIST%\app\services\__init__.py" type nul > "%DIST%\app\services\__init__.py"
+for %%P in (plm dag browser deliverables ipc serving verify) do (
+  if exist "%ROOT%\services\%%P\" (
+    robocopy "%ROOT%\services\%%P" "%DIST%\app\services\%%P" /MIR /XD __pycache__ build tests /XF *.pyc test_*.py /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    if errorlevel 8 goto :fail
+  )
+)
+if exist "%ROOT%\agent\" (
+  robocopy "%ROOT%\agent" "%DIST%\app\services\agent" /MIR /XD __pycache__ build tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+  if errorlevel 8 goto :fail
+)
+if exist "%ROOT%\mcp_server\" (
+  robocopy "%ROOT%\mcp_server" "%DIST%\app\services\mcp" /MIR /XD __pycache__ build tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+  if errorlevel 8 goto :fail
 )
 for %%P in (llamacpp models) do (
   if exist "%ROOT%\%%P\" (
@@ -206,9 +258,9 @@ for %%V in (
   "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
   "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
   "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-) do if exist %%~V (
+) do if exist "%%~V" (
   echo [build] loading MSVC env from %%~V
-  call %%~V >nul
+  call "%%~V" >nul
   exit /b 0
 )
 exit /b 1

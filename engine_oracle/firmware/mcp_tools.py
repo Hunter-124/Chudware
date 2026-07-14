@@ -491,3 +491,67 @@ def fw_debug_read_mem(params: dict) -> dict:
             "length": length,
             "ms": round((_time.perf_counter() - t0) * 1000.0, 2),
         }
+
+
+def fw_sensor_scenario(params: dict) -> dict:
+    """Build an ``aicad.fwscenario/1`` from a flight/CFD/kinematic profile (Wave-3 S1).
+
+    ``{profile|sim_result, sensor_map, duration_s?, dt_s?, name?}`` →
+    ``{scenario, n_tracks, devices, dt_s, duration_s, ms}`` or the §1 error envelope.
+
+    Pure bridge: physics models in ``engine.firmware.sensor_models`` convert the profile
+    into time-varying I2C register streams (MPU6050 / BMP280 / LIS3MDL / pitot) and
+    optional GNSS UART NMEA. The returned scenario is ready for ``fw_sim_run(scenario=…)``.
+    Renode is NOT required to *build* the scenario; running it still needs Renode (honest
+    skip from ``fw_sim_run`` when absent — Renode 1.16.1 is expected installed on the
+    flight-computer benchmark host).
+    """
+    import time as _time
+    from engine.firmware.sim_sensor_bridge import build_sensor_scenario
+
+    profile = params.get("profile")
+    if profile is None:
+        profile = params.get("sim_result")
+    if profile is None:
+        # allow the whole params body (minus control keys) as the profile
+        control = {"sensor_map", "duration_s", "dt_s", "name", "profile", "sim_result"}
+        maybe = {k: v for k, v in params.items() if k not in control}
+        if "t_s" in maybe or "samples" in maybe or "altitude_m" in maybe \
+                or "airspeed_m_s" in maybe:
+            profile = maybe
+    if profile is None:
+        return _err("invalid_request",
+                    "fw_sensor_scenario requires 'profile' (or 'sim_result') "
+                    "and 'sensor_map'")
+
+    sensor_map = params.get("sensor_map")
+    if not sensor_map:
+        return _err("invalid_request", "fw_sensor_scenario requires non-empty 'sensor_map'")
+
+    duration = params.get("duration_s")
+    dt = float(params.get("dt_s", 0.01))
+    name = params.get("name")
+
+    t0 = _time.perf_counter()
+    try:
+        scenario = build_sensor_scenario(
+            profile, sensor_map,
+            duration_s=float(duration) if duration is not None else None,
+            dt_s=dt,
+            name=name,
+        )
+    except (TypeError, ValueError) as e:
+        return _err("invalid_request", str(e))
+
+    devices = []
+    meta = scenario.get("meta") or {}
+    devices = list(meta.get("devices") or [])
+    return {
+        "scenario": scenario,
+        "n_tracks": len(scenario.get("tracks") or []),
+        "devices": devices,
+        "dt_s": float(meta.get("dt_s", dt)),
+        "duration_s": float(meta.get("t1_s", 0.0)) - float(meta.get("t0_s", 0.0)),
+        "ms": round((_time.perf_counter() - t0) * 1000.0, 2),
+    }
+

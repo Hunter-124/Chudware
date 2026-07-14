@@ -320,3 +320,76 @@ def register_firmware_tools(mcp) -> None:
         [~] Live run requires a connected DAP probe and a halted target.
         """
         return _dumps(_fw.fw_debug_read_mem({"chip": chip, "address": address, "length": length}))
+
+    @mcp.tool()
+    def fw_sensor_scenario(profile: str = "", sensor_map: Optional[list] = None,
+                           duration_s: float = 0.0, dt_s: float = 0.01,
+                           name: str = "", sim_result: str = "") -> str:
+        """Build an ``aicad.fwscenario/1`` from a flight/CFD/kinematic profile (Wave-3 S1).
+
+        Bridge from SIMULATED REALITY into the emulated MCU: physics-accurate sensor
+        models (MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GNSS, pitot/airspeed)
+        convert a time-series profile into time-varying ``i2c_register_stream`` tracks
+        (and GNSS ``uart_rx`` NMEA) that ``fw_sim_run`` can play back via Renode's
+        ``Mocks.DummyI2CSlave``.
+
+        Args:
+          profile: JSON object string of a flight profile / trajectory, e.g.
+            ``{"t_s":[...], "altitude_m":[...], "yaw_rad":[...], "vel_ned_m_s":[...],
+            "omega_body_rad_s":[...]}``. Also accepts CFD summaries
+            ``{"t_s":[...], "airspeed_m_s":[...], "altitude_m":[...]}``.
+          sensor_map: list of ``{device, bus?, address?, kind?, uart?}``. Devices:
+            ``mpu6050``/``imu``, ``bmp280``/``baro``, ``lis3mdl``/``mag``,
+            ``neo6m``/``gnss``/``gps``, ``pitot``/``airspeed``.
+          duration_s: optional run length (0 → use profile span).
+          dt_s: sample-and-hold grid step seconds (default 0.01).
+          name: optional scenario display name.
+          sim_result: alternate JSON string for the profile (same schema as profile).
+
+        Returns JSON ``{scenario, n_tracks, devices, dt_s, duration_s, ms}``. The
+        ``scenario`` object is a valid ``aicad.fwscenario/1`` ready for
+        ``fw_sim_run(scenario=...)``. Building the scenario is pure Python (no Renode
+        required); *running* it still needs Renode — when Renode is absent,
+        ``fw_sim_run`` honest-skips with an explanation in ``uart_log`` (Renode 1.16.1
+        is installed on the flight-computer benchmark host).
+
+        Example (climb+turn into IMU+baro)::
+
+            sc = fw_sensor_scenario(
+                profile='{"t_s":[0,1,2], "altitude_m":[100,105,110],
+                          "yaw_rad":[0,0.25,0.5], "vel_ned_m_s":[[25,0,-5],[25,0,-5],[25,0,-5]],
+                          "omega_body_rad_s":[[0,0,0.25],[0,0,0.25],[0,0,0.25]]}',
+                sensor_map=[{"device":"mpu6050","address":0x68},
+                            {"device":"bmp280","address":0x76}],
+                dt_s=0.05)
+            fw_sim_run(project_id, scenario=sc["scenario"], assertions=[...])
+        """
+        p: dict = {"dt_s": float(dt_s)}
+        if duration_s and float(duration_s) > 0:
+            p["duration_s"] = float(duration_s)
+        if name:
+            p["name"] = name
+        if sensor_map:
+            p["sensor_map"] = sensor_map
+        # profile / sim_result may arrive as JSON strings from the MCP wire
+        def _parse(blob: str):
+            if not blob:
+                return None
+            if isinstance(blob, (dict, list)):
+                return blob
+            try:
+                return json.loads(blob)
+            except (TypeError, json.JSONDecodeError) as exc:
+                return _err("invalid_request", f"profile is not valid JSON: {exc}")
+
+        if profile:
+            parsed = _parse(profile)
+            if isinstance(parsed, dict) and parsed.get("code"):
+                return _dumps(parsed)
+            p["profile"] = parsed
+        if sim_result:
+            parsed = _parse(sim_result)
+            if isinstance(parsed, dict) and parsed.get("code"):
+                return _dumps(parsed)
+            p["sim_result"] = parsed
+        return _dumps(_fw.fw_sensor_scenario(p))

@@ -23,6 +23,11 @@ Design posture (same as the rest of the firmware pillar):
   idiom the base .resc already uses for its run window), with ``echo "AICAD_T_MARK
   <ms>"`` markers after every sleep so UART lines can be coarsely time-stamped by the
   parser (enables the ``uart_within:`` assertion form).
+- **Time-varying I2C (Wave-3 S1).** Track kind ``i2c_register_stream`` (alias of the
+  sample-and-hold stream form of ``i2c_registers``) attaches one ``Mocks.DummyI2CSlave``
+  and, at each ``samples[i].t_ms``, re-enqueues that sample's ``response`` byte list so
+  a moving sensor value plays back over the emulation. Existing static ``i2c_registers``
+  stays byte-stable (setup-only EnqueueResponseByte).
 """
 from __future__ import annotations
 
@@ -52,7 +57,7 @@ _ADC_STUBS: dict[str, dict] = {
 }
 
 _TRACK_KINDS = ("gpio_edges", "button", "quadrature", "i2c_sensor", "i2c_registers",
-                "spi_stub", "uart_rx", "adc_waveform")
+                "i2c_register_stream", "spi_stub", "uart_rx", "adc_waveform")
 
 
 @dataclass
@@ -139,6 +144,31 @@ def _validate_pin(pin: Any) -> Optional[str]:
         return f"pin number out of range in {pin!r}"
     return None
 
+def _validate_i2c_samples(samples: Any, kind: str) -> list[str]:
+    """Validate a time-varying I2C sample-and-hold list."""
+    errs: list[str] = []
+    if not isinstance(samples, list) or not samples:
+        errs.append(f"{kind} needs a non-empty 'samples' list of "
+                    "{{t_ms:number, response:[byte]}}")
+        return errs
+    prev_t: Optional[float] = None
+    for i, s in enumerate(samples):
+        if not isinstance(s, dict):
+            errs.append(f"{kind} samples[{i}] must be an object")
+            continue
+        if not isinstance(s.get("t_ms"), (int, float)):
+            errs.append(f"{kind} samples[{i}] needs numeric 't_ms'")
+        elif prev_t is not None and float(s["t_ms"]) < prev_t:
+            errs.append(f"{kind} samples[{i}].t_ms must be non-decreasing")
+        if isinstance(s.get("t_ms"), (int, float)):
+            prev_t = float(s["t_ms"])
+        resp = s.get("response")
+        if not isinstance(resp, list) or not resp or \
+                not all(isinstance(b, int) and 0 <= b <= 255 for b in resp):
+            errs.append(f"{kind} samples[{i}] needs non-empty 'response' byte list (0-255)")
+    return errs
+
+
 
 def _validate_track(tr: dict) -> list[str]:
     kind = tr["kind"]
@@ -188,10 +218,26 @@ def _validate_track(tr: dict) -> list[str]:
     elif kind == "i2c_registers":
         if not isinstance(tr.get("address"), int):
             errs.append("i2c_registers needs an integer 7-bit 'address'")
+        # Static form: response:[byte]. Time-varying form (sample-and-hold):
+        # samples:[{t_ms, response:[byte]}, ...] — accepted on i2c_registers for
+        # forward-compat, or on the explicit i2c_register_stream kind.
+        samples = tr.get("samples")
         resp = tr.get("response")
-        if not isinstance(resp, list) or not resp or \
+        if samples is not None:
+            errs.extend(_validate_i2c_samples(samples, kind))
+        elif not isinstance(resp, list) or not resp or \
                 not all(isinstance(b, int) and 0 <= b <= 255 for b in resp):
-            errs.append("i2c_registers needs a non-empty 'response' byte list (0-255)")
+            errs.append("i2c_registers needs a non-empty 'response' byte list (0-255) "
+                        "or a non-empty 'samples' list of {t_ms, response}")
+    elif kind == "i2c_register_stream":
+        if not isinstance(tr.get("address"), int):
+            errs.append("i2c_register_stream needs an integer 7-bit 'address'")
+        samples = tr.get("samples")
+        if samples is None and isinstance(tr.get("response"), list):
+            # allow a single static response coerced to one sample at t=0
+            pass
+        else:
+            errs.extend(_validate_i2c_samples(samples, kind))
     elif kind == "spi_stub":
         if not isinstance(tr.get("bus"), str) or not tr["bus"]:
             errs.append("spi_stub needs the platform SPI peripheral name in 'bus' (e.g. 'spi1')")
@@ -357,7 +403,7 @@ def build_scenario_plan(scenario: dict, caps: dict, platform_text: str) -> Scena
             if add_gpio_pin(tr["pin_a"]) and add_gpio_pin(tr["pin_b"]):
                 for (t, pin, level) in _quadrature_edges(tr):
                     plan.timeline.append((t, edge_line(pin, level)))
-        elif kind in ("i2c_sensor", "i2c_registers"):
+        elif kind in ("i2c_sensor", "i2c_registers", "i2c_register_stream"):
             bus = tr.get("bus", "i2c1")
             if not caps.get("i2c") or f"{bus}:" not in platform_text:
                 plan.errors.append(
@@ -372,14 +418,46 @@ def build_scenario_plan(scenario: dict, caps: dict, platform_text: str) -> Scena
                     f'"{name}: Sensors.TMP103 @ {bus} {addr:#x}"')
                 plan.setup_lines.append(
                     f"sysbus.{bus}.{name} Temperature {float(tr['temperature_c']):g}")
-            else:  # generic register/response model — Mocks.DummyI2CSlave
+            else:
+                # Static i2c_registers OR time-varying stream (i2c_register_stream /
+                # i2c_registers with samples[]): Mocks.DummyI2CSlave + EnqueueResponseByte.
+                # Sample-and-hold: at each samples[i].t_ms re-enqueue that response so a
+                # moving sensor value plays back. DummyI2CSlave has no documented
+                # ClearResponse API, so each sample appends a fresh frame; firmware that
+                # reads once per sample window sees the newest enqueued bytes first when
+                # the queue is consumed per transaction (Renode drains one response
+                # sequence per master read). We also emit an echo mark for traceability.
                 name = f"aicadI2C{i2c_seq}"
                 plan.setup_lines.append(
                     f'machine LoadPlatformDescriptionFromString '
                     f'"{name}: Mocks.DummyI2CSlave @ {bus} {addr:#x}"')
-                for b in tr["response"]:
-                    plan.setup_lines.append(
-                        f"sysbus.{bus}.{name} EnqueueResponseByte {int(b):#x}")
+                samples = tr.get("samples")
+                if samples is None and kind == "i2c_register_stream" and \
+                        isinstance(tr.get("response"), list):
+                    samples = [{"t_ms": 0.0, "response": tr["response"]}]
+                if samples:
+                    # Seed with the first sample at setup so a read before t0 still works.
+                    first = samples[0]["response"]
+                    for b in first:
+                        plan.setup_lines.append(
+                            f"sysbus.{bus}.{name} EnqueueResponseByte {int(b):#x}")
+                    # Subsequent samples (including re-asserting sample 0 at its t_ms)
+                    # go on the timeline. For sample 0 with t_ms>0 the setup seed holds
+                    # until then; for t_ms==0 we skip the duplicate timeline enqueue.
+                    for si, s in enumerate(samples):
+                        t = float(s["t_ms"])
+                        if si == 0 and t <= 0.0:
+                            continue
+                        # Mark + re-enqueue full response (sample-and-hold update).
+                        plan.timeline.append(
+                            (t, f'echo "AICAD_I2C_SAMPLE {bus} {addr:#x} t_ms={t:g}"'))
+                        for b in s["response"]:
+                            plan.timeline.append(
+                                (t, f"sysbus.{bus}.{name} EnqueueResponseByte {int(b):#x}"))
+                else:
+                    for b in tr["response"]:
+                        plan.setup_lines.append(
+                            f"sysbus.{bus}.{name} EnqueueResponseByte {int(b):#x}")
             i2c_seq += 1
         elif kind == "spi_stub":
             bus = tr["bus"]

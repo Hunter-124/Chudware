@@ -1,0 +1,224 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "mission-ecad-electric-parts-serving-perfection-2026-07",
+  "name": "Perfect ECAD/electric sim + EM + emulators + parts libs + providers + compact MCP serving",
+  "nodes": [
+    {
+      "id": "n_gate_scope",
+      "type": "gate",
+      "name": "Freeze scope and disjoint write-sets",
+      "inputs": {
+        "request": "Confirm FEA mesh/solver is OUT of scope (separate project). Freeze five disjoint write-sets: electric-sim (core/sim/spice+netlist, engine.sim.devices+em, new em MCP tools, server registration), emulators (engine_oracle/firmware, firmware MCP), parts-libs (core/parts, ecad/library/starter), providers (parts_providers, browser adapters), mcp-serving (new result_serving helper, ecad_status/part_search shaping). Preserve uncommitted host GUI edits; contracts/* and libaicad.h append-only."
+      },
+      "tools": null,
+      "end_condition": "Every implementation node has an exact write set that does not overlap another running node.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_sim_devices",
+      "type": "simulate",
+      "name": "Close circuit device gaps (Switch, MOSFET caps)",
+      "inputs": {
+        "request": "Implement the voltage-controlled switch S (vt/vh/ron/roff hysteresis) in engine.sim.devices and the C++ spice.cpp port so both stamp it; add MOSFET small-signal Cgs/Cgd (Meyer or constant) so AC has a real pole; keep tet-style honesty docstrings and existing accuracy gates. Do NOT weaken existing validated analyses.",
+        "write_set": ["engine_oracle/sim/devices.py", "core/sim/spice.cpp", "core/sim/spice.h", "engine_oracle/sim/test_circuit.py", "core/tests/test_spice_netlist.cpp"],
+        "acceptance": ["Switch S on/off resistance within 1% of ron/roff across the control threshold", "MOSFET AC pole within 5% of 1/(2 pi R Cgs)", "all existing circuit accuracy gates still pass", "C++ and Python agree within 1% on a shared S and MOSFET case"]
+      },
+      "tools": null,
+      "end_condition": "Switch and MOSFET-cap devices work identically in Python and C++ with cited accuracy.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_em_mcp",
+      "type": "simulate",
+      "name": "Expose full-wave EM via MCP",
+      "inputs": {
+        "request": "Add MCP em_* tools (em_status, em_eigenmode, em_driven, em_timedomain) mirroring the validated worker RPCs over the builtin-FDFD + analytic adapters, with an honest openEMS skip when the binary is absent. NEVER block on installing external binaries. Register the new tool module in the MCP server. Compact result envelopes (summary-first; field arrays behind an explicit detail flag).",
+        "write_set": ["services/mcp/em_tools.py", "services/mcp/server.py", "engine_oracle/sim/em/worker_rpc.py", "services/mcp/test_em_tools.py"],
+        "acceptance": ["em_eigenmode WR-90 TE10 error < 1% via MCP", "em_driven analytic S21 matches worker path", "openEMS-absent returns honest skip, never a traceback", "result payloads bounded (no raw field mesh by default)"]
+      },
+      "tools": null,
+      "end_condition": "Agents can run validated EM analyses through MCP with bounded, honest results.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_emulator_fix",
+      "type": "firmware",
+      "name": "Fix emulator MCU routing and worker parity",
+      "inputs": {
+        "request": "Fix the MCU family vocabulary split so a board-linked STM32 selects a peripheral-capable platform (stm32f4/stm32f1) instead of the generic no-peripheral cortex-m; register fw_power_profile in the worker RPC method set; add an honest arm-none-eabi-gcc build preflight (toolchain_not_found instead of opaque compile error). Keep every absent-backend path an honest skip; no fabricated success.",
+        "write_set": ["engine_oracle/firmware/mcu_pinouts.py", "engine_oracle/firmware/platform_db.py", "engine_oracle/firmware/toolchains.py", "engine_oracle/firmware/worker_rpc.py", "engine_oracle/firmware/emulator.py", "engine_oracle/firmware/test_emulator.py", "engine_oracle/firmware/test_worker_rpc.py", "engine_oracle/firmware/test_mcp_tools.py"],
+        "acceptance": ["board-linked STM32F407 resolves to a platform whose canonical family has uart+gpio_observe", "worker method set includes fw_power_profile and roundtrips aicad.powerprofile/1", "missing arm-none-eabi-gcc yields toolchain_not_found", "live renode/qemu tests stay skip-clean when binaries absent"]
+      },
+      "tools": null,
+      "end_condition": "Board-linked firmware emulation targets the right platform and worker parity holds, all honest under missing tools.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_bearing",
+      "type": "source",
+      "name": "Fix bearing federation and mechanical parity",
+      "inputs": {
+        "request": "Make the core parametric catalog cover every bearing size the bolts YAML advertises (6005-6008, 6200-6208, 6300-6305, ...) so make_standard_part/parts_make succeed for any searchable bearing; add a test that every ISO 15 YAML size builds in core. Add a parity guard that core metric fastener dims match the YAML for shared standards. Keep tet-style doctests.",
+        "write_set": ["core/parts/catalog.cpp", "core/parts/parts_data.h", "core/parts/generate.cpp", "core/tests/test_parts.cpp"],
+        "acceptance": ["make_standard_part('bearing','6205') builds with bore 25 od 52 width 15", "every bolts YAML ISO 15 bearing size builds in core", "no searchable bearing record fails placement", "existing parts doctests still pass"]
+      },
+      "tools": null,
+      "end_condition": "Search and build agree for all standard bearings; no placeable-but-unbuildable records.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_ecad_lib",
+      "type": "source",
+      "name": "Fix ECAD pin/pad correctness and add board essentials",
+      "inputs": {
+        "request": "Fix pin/pad correctness: give OPAMP a correct LM358 DIP-8/SOIC-8 pinout (rename generic vs add real LM358) and make BJT/MOSFET symbol pin numbers map to their SOT-23 pads; add a test that every default-mapped symbol's pin numbers are a subset of its footprint pad numbers. Add real-board essentials to the starter library: a generic MCU (QFP-48-class), an LDO/regulator (AMS1117-3.3 / 7805), 2xN 2.54 headers, USB connector, inductor footprints (L_0603/L_0805), ferrite bead, electrolytic radial footprint — each pin-count-correct and resolvable via ecad_find_part.",
+        "write_set": ["engine_oracle/ecad/library/starter.py", "engine_oracle/ecad/test_library.py", "engine_oracle/ecad/orchestrator.py", "engine_oracle/ecad/test_hostboard.py"],
+        "acceptance": ["every _DEFAULT_FOOTPRINTS symbol pin set subset of footprint pads", "LM358 pinout matches datasheet", "ecad_find_part returns >=1 hit for mcu, regulator, usb, crystal, inductor", "a minimal 3V3 MCU board schematic places + ERC-clean using only starter parts"]
+      },
+      "tools": null,
+      "end_condition": "Starter symbols/footprints are pin-correct and cover a real PCB design end to end.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_providers",
+      "type": "source",
+      "name": "Wire pricing providers and repair catalog adapters",
+      "inputs": {
+        "request": "Wire the DigiKey Product Information v4 and Mouser SearchByPartNumber providers so a valid MPN + credentials returns a real VendorPart (price/stock/datasheet), degrading fail-closed without creds and never fabricating. Fix digikey_web product drill-down so a narrow MPN query yields purchasable SKU hits, and repair the dfrobot search path (or make it honestly login_required, never a silent 404). Make vendors_health report every login-wall adapter under needs_human_login and defer during an active wizard. Add offline fixture tests (monkeypatched tokens/JSON) for each wired provider.",
+        "write_set": ["engine_oracle/parts_providers.py", "services/browser/adapters/digikey_web.py", "services/browser/adapters/mouser.py", "services/browser/adapters/dfrobot.py", "services/browser/health.py", "engine_oracle/test_parts_providers.py", "services/browser/adapters/test_parts_provider.py"],
+        "acceptance": ["DigiKey/Mouser with mocked creds+JSON return mapped VendorPart; without creds fail-closed unchanged", "digikey_web narrow query returns kind=product hits parsed from fixture HTML", "dfrobot never returns a silent empty 404 result", "vendors_health needs_human_login subset == login-wall adapters; wizard-active defers", "bom price stays null when no provider resolves (never fabricated)"]
+      },
+      "tools": null,
+      "end_condition": "Pricing providers and catalog adapters return correct data or degrade honestly, all offline-testable.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_mcp_serving",
+      "type": "plan",
+      "name": "Compact-but-complete MCP result serving",
+      "inputs": {
+        "request": "Add a reusable services/mcp/result_serving helper: compact JSON (no indent by default), token counter matching the agent heuristic, ok/err envelopes, and a serve() with detail=summary|list|full, pagination, allowlist projection, and a priority-drop that NEVER drops ok/summary/counts/error/warning counts/hint/next_actions. Apply it: ecad_status default=summary (counts, power totals, ERC/DRC counts, unconnected count + small sample, components as ref/value/libid without pins, nets as name+size without members; detail/page/include for drill-down; drill-down must retain the same refs/net-names as today at detail=full). part_search projects rows to id/title/domain/vendor/price/designation/score with full record behind part_get. ecad_simulate: default probe caps + always use existing summarizers (no per-timestep arrays). Update the ecad_status docstring to match reality.",
+        "write_set": ["services/mcp/result_serving.py", "services/mcp/ecad_tools.py", "services/mcp/parts_tools.py", "services/mcp/test_result_serving.py", "services/mcp/test_ecad_tools.py", "services/mcp/test_parts_tools_v2.py"],
+        "acceptance": ["ecad_status default summary <= 800 tokens on a >=30-component board while keeping ok/summary/counts/next_actions", "detail=full retains full component ref + net name sets (set equality with pre-change)", "part_search default <= 1500 tokens; part_get still returns full record", "ecad_simulate tran/ac carry no per-timestep arrays", "existing teaching-envelope tests still pass"]
+      },
+      "tools": null,
+      "end_condition": "Large MCP results are summary-first and bounded while preserving all pertinent info and drill-down.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_electric",
+      "type": "verify",
+      "name": "Verify circuit + EM",
+      "inputs": {"request": "Run circuit accuracy gates, EM tests, ECAD sim/pack e2e, C++ spice ctest, and the new em MCP tests; confirm no accuracy regression and honest EM skips."},
+      "tools": null,
+      "end_condition": "All electric/EM suites pass with cited accuracy and honest degradation.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_emulator",
+      "type": "verify",
+      "name": "Verify emulators",
+      "inputs": {"request": "Run firmware unit + worker-rpc + mcp-tools tests; confirm STM32 platform routing, power-profile worker parity, honest toolchain skips."},
+      "tools": null,
+      "end_condition": "Firmware suites pass; live backends skip cleanly.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_parts",
+      "type": "verify",
+      "name": "Verify parts + ECAD library",
+      "inputs": {"request": "Run core parts ctest (incl 6205), ecad library tests, hostboard tests, and a minimal MCU board place+ERC smoke; probe make_standard_part + ecad_find_part coverage."},
+      "tools": null,
+      "end_condition": "Catalog build/search agree and starter covers a real PCB.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_providers",
+      "type": "verify",
+      "name": "Verify providers",
+      "inputs": {"request": "Run pricing-provider + browser-adapter + vendors_health tests offline; confirm mapped VendorPart with mocked creds, fail-closed without, honest walls, no fabricated prices."},
+      "tools": null,
+      "end_condition": "Providers correct or honestly degraded, offline-verified.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_serving",
+      "type": "verify",
+      "name": "Verify compact serving",
+      "inputs": {"request": "Run result_serving unit tests + ecad_status/part_search/ecad_simulate size + drill-down completeness tests; confirm bounded tokens with preserved key fields and full-detail set equality."},
+      "tools": null,
+      "end_condition": "Serving is bounded and lossless-on-drill-down.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_integration_gate",
+      "type": "gate",
+      "name": "Integration build + focused gates",
+      "inputs": {"request": "Unified ./build.sh core; run the union of focused suites; reject accuracy regressions, fabricated data, unbounded payloads, dishonest skips, or session/registration breakage. Pre-existing unrelated failures (e.g. ribbon handler audit) noted, not blocking."},
+      "tools": null,
+      "end_condition": "Core builds green and every focused suite passes or documents an environment skip.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_report",
+      "type": "report",
+      "name": "Report + land + graph update",
+      "inputs": {"request": "Log files changed, bugs fixed, new capabilities (EM MCP, providers, essentials pack, compact serving), verification commands + results, honest limitations, in docs/REFACTOR_LOG.md; commit per verified domain and push; graphify update."},
+      "tools": null,
+      "end_condition": "Every claim reproducible; verified units landed on master; graph refreshed.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    }
+  ],
+  "edges": [
+    {"from": "n_gate_scope", "to": "n_sim_devices"},
+    {"from": "n_gate_scope", "to": "n_em_mcp"},
+    {"from": "n_gate_scope", "to": "n_emulator_fix"},
+    {"from": "n_gate_scope", "to": "n_parts_bearing"},
+    {"from": "n_gate_scope", "to": "n_ecad_lib"},
+    {"from": "n_gate_scope", "to": "n_providers"},
+    {"from": "n_gate_scope", "to": "n_mcp_serving"},
+    {"from": "n_sim_devices", "to": "n_verify_electric"},
+    {"from": "n_em_mcp", "to": "n_verify_electric"},
+    {"from": "n_emulator_fix", "to": "n_verify_emulator"},
+    {"from": "n_parts_bearing", "to": "n_verify_parts"},
+    {"from": "n_ecad_lib", "to": "n_verify_parts"},
+    {"from": "n_providers", "to": "n_verify_providers"},
+    {"from": "n_mcp_serving", "to": "n_verify_serving"},
+    {"from": "n_verify_electric", "to": "n_integration_gate"},
+    {"from": "n_verify_emulator", "to": "n_integration_gate"},
+    {"from": "n_verify_parts", "to": "n_integration_gate"},
+    {"from": "n_verify_providers", "to": "n_integration_gate"},
+    {"from": "n_verify_serving", "to": "n_integration_gate"},
+    {"from": "n_integration_gate", "to": "n_report"}
+  ]
+}

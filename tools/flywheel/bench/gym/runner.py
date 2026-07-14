@@ -431,7 +431,8 @@ def _provider_for_tier(tier: str):
 
     Parameterized ``openrouter:<model-id>`` tiers resolve to OpenRouterProvider with
     that model (multi-provider leaderboard path). Cached by model id so paid cells
-    share the same adapter instance across the matrix.
+    share the same adapter instance across the matrix. Same for ``xai:<model-id>``
+    (subscription OAuth when connected, else API key).
 
     An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
@@ -444,7 +445,8 @@ def _provider_for_tier(tier: str):
     import os
     from services.agent import config
     from services.agent.tiers import (
-        LOCAL_TIER_MODELS, load_local_models, parse_openrouter_tier, provider_for_tier,
+        LOCAL_TIER_MODELS, load_local_models, parse_openrouter_tier, parse_xai_tier,
+        provider_for_tier,
     )
     if os.environ.get("AI_CAD_PROVIDER"):
         return config.get_provider()
@@ -452,6 +454,15 @@ def _provider_for_tier(tier: str):
     or_model = parse_openrouter_tier(tier)
     if or_model is not None:
         cache_key = f"openrouter:{or_model}"
+        prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
+        if prov is None:
+            prov = provider_for_tier(tier)
+            _LOCAL_PROVIDER_CACHE[cache_key] = prov
+        return prov
+    # xAI paid tiers: cache by model id (sub or API-key provider).
+    xai_model = parse_xai_tier(tier)
+    if xai_model is not None:
+        cache_key = f"xai:{xai_model}"
         prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
         if prov is None:
             prov = provider_for_tier(tier)

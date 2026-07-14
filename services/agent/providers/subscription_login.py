@@ -14,6 +14,8 @@ thread. Every path returns a contract-shaped dict — never a traceback.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 from . import sub_auth
 
 # Friendly id -> (provider_name, provider_id used in the credential store, human label).
@@ -23,6 +25,8 @@ _PROVIDERS = {
     "cursor": ("cursor-sub", "cursor", "Cursor (Pro)"),
     "xai": ("xai-sub", "xai-sub", "xAI Grok (SuperGrok / X Premium+)"),
 }
+
+ProgressCb = Callable[[dict], None]
 
 
 def _resolve(provider: str):
@@ -56,12 +60,20 @@ def providers() -> list[dict]:
             for fid, (name, _cred, label) in _PROVIDERS.items()]
 
 
-def login(provider: str, device: bool = False) -> dict:
+def login(
+    provider: str,
+    device: bool = False,
+    progress: ProgressCb | None = None,
+    open_browser: bool | None = None,
+) -> dict:
     """Run the OAuth login for *provider*. Blocks on the browser flow. Contract-shaped.
 
-    ``device=True`` uses the headless device-code flow (Codex / xAI) instead of a local
-    callback server — useful when the loopback port is busy or there's no local browser.
-    xAI is device-code-only; ``device`` is accepted for API symmetry.
+    ``device=True`` selects the headless device-code path for Codex (no local callback
+    server). xAI is device-code-only; for xAI the browser is ALWAYS opened by default
+    (device-code verification URL on accounts.x.ai) — ``device`` is accepted for API
+    symmetry and does NOT suppress the browser. Pass ``open_browser=False`` only for
+    truly headless environments; the verification URL + user_code still surface via
+    *progress* / status so the GUI can show a fallback link.
     """
     resolved = _resolve(provider)
     if resolved is None:
@@ -73,14 +85,19 @@ def login(provider: str, device: bool = False) -> dict:
         if device and name == "codex-sub":
             cred = prov.login_device()
         elif name == "xai-sub":
-            # xAI is device-code-only (accounts.x.ai); login() already opens the browser.
-            cred = prov.login_device(open_browser=not device) if device else prov.login()
+            # xAI is device-code-only. Always open the verification URL unless the
+            # caller explicitly opts out (headless). The previous open_browser=not
+            # device inversion meant the GUI's device:true path NEVER opened a
+            # browser — that was the "sign-in never reaches a browser" bug.
+            want_browser = True if open_browser is None else bool(open_browser)
+            cred = prov.login_device(open_browser=want_browser, progress=progress)
         else:
             cred = prov.login()
     except Exception as e:  # noqa: BLE001 — surface every failure as a clean dict for the GUI
         from .xai_sub_provider import XaiTierDeniedError, TIER_DENIED_HINT, TIER_DENIED_REASON
         if isinstance(e, XaiTierDeniedError):
-            return {"ok": False, "reason": e.reason or TIER_DENIED_REASON, "hint": e.hint or TIER_DENIED_HINT}
+            return {"ok": False, "reason": e.reason or TIER_DENIED_REASON,
+                    "hint": e.hint or TIER_DENIED_HINT}
         return {"ok": False, "reason": f"{label} login failed: {e}",
                 "hint": "Complete the login in the browser tab, or check your network and "
                         "subscription, then try again."}

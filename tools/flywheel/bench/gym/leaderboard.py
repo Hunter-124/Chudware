@@ -42,7 +42,9 @@ DIAG_LATEST = REPORTS_DIR / "diag" / "diag-latest.json"
 
 def model_id_for_tier(tier: str) -> dict[str, str]:
     """Map a gym tier string to leaderboard model identity fields."""
-    from services.agent.tiers import LOCAL_TIER_MODELS, parse_openrouter_tier, load_local_models
+    from services.agent.tiers import (
+        LOCAL_TIER_MODELS, parse_openrouter_tier, parse_xai_tier, load_local_models,
+    )
 
     or_model = parse_openrouter_tier(tier)
     if or_model is not None:
@@ -51,6 +53,15 @@ def model_id_for_tier(tier: str) -> dict[str, str]:
             "id": or_model,
             "label": label,
             "provider": "openrouter",
+            "kind": "paid",
+        }
+    xai_model = parse_xai_tier(tier)
+    if xai_model is not None:
+        wire = "grok-4.5" if xai_model == "grok-4-5" else xai_model
+        return {
+            "id": wire,
+            "label": wire.replace("-", " ").title(),
+            "provider": "xai",
             "kind": "paid",
         }
     if tier.startswith("local"):

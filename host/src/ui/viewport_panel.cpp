@@ -2860,13 +2860,58 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive)
             regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
+        // ---- Wave4: origin triad pick priority (before any plane hit-test) ----
+        // With planes force-shown the three origin quads all pass through the world origin, so a
+        // plane hit-test always swallows clicks on the origin glyph. Give the origin a generous
+        // screen-space grab radius (matches SketchMode::drawDatumSelect) and test it FIRST so the
+        // glyph wins for both hover affordance and click. Skipped while an axis/plane PM well owns
+        // datum picks (those wells want planes/axes, not the origin point).
+        bool originPickHot = false;
+        {
+            auto* pm = st.propertyManager;
+            const bool pmOwnsAxisPlane = pm && pm->active() &&
+                (pm->activeWellWantsAxis() || pm->activeWellWantsPlane());
+            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
+                !s_viewSelector.active() && !s_lmbDragActive && !pmOwnsAxisPlane &&
+                st.originVisEff) {
+                const float grabRadius = 20.0f * ui::uiScale;
+                const float originW[3] = {0.0f, 0.0f, 0.0f};
+                ImVec2 originS;
+                if (ppProject(renderer, vr0, vr1, vw, vh, originW, originS)) {
+                    const float dx = io.MousePos.x - originS.x;
+                    const float dy = io.MousePos.y - originS.y;
+                    if (std::sqrt(dx * dx + dy * dy) < grabRadius) {
+                        originPickHot = true;
+                        ImDrawList* wdl = ImGui::GetWindowDrawList();
+                        wdl->PushClipRect(vr0, vr1, true);
+                        float accA[4];
+                        ui::Palette::withAlpha(ui::palette.accent, accA, 0.95f);
+                        wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(accA),
+                                       24, 2.0f * ui::uiScale);
+                        wdl->PopClipRect();
+                        st.requestCursor(ui::CursorKind::Hand);
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                            if (!io.KeyCtrl) st.selection.clear();
+                            st.selectedFeatureId = "point.origin";
+                            st.planeEmphasis = -1;
+                            st.treeScrollToSelection = true;
+                            // Point-well PM: also route into the well (same as drawPointPicker).
+                            if (pm && pm->active() && pm->activeWellWantsPoint())
+                                pm->routeDatumPoint("point.origin", "Origin");
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- datum-plane picker (ref-axis "Two Planes", ref-plane "Mid Plane", …) ----
         // Runs when a feature PM with an active plane-accepting well is open. Returns true while the
         // cursor is over an origin datum plane, so the model-pick click below is suppressed (the
         // plane click routes a datum ref into the well instead). A click that is NOT over an origin
         // plane still falls through to model picking, so the same well can also take a planar face.
+        // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
         bool planePickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !originPickHot)
             planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
@@ -2875,15 +2920,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // axis click routes a datum ref into the well). A click off any axis still falls through to
         // the id-buffer, so the same well can still take a straight model edge.
         bool axisPickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !planePickerHot)
             axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- datum-point picker (world origin / user point-datum into a point well) ----
         // T-BL37: runs when a feature PM with an active point-accepting well is open. Highlights
         // the origin glyph on hover and routes "point.origin" on click. Model-pick is suppressed.
+        // Wave4: origin-priority block above already claims the synthetic origin; this still
+        // covers user-created point-datums (and is a no-op for origin when originPickHot).
         bool pointPickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot &&
-            !axisPickerHot)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !planePickerHot && !axisPickerHot)
             pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
@@ -2891,23 +2939,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // cursor is over a drawn curve datum, so the model-pick click below is suppressed (the curve
         // click routes the feature into the path well via routePathFeature).
         bool curvePickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot &&
-            !axisPickerHot && !pointPickerHot)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot)
             curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- general datum selection: click a displayed reference axis to select it ----
         // Runs in the normal (non-sketch, no-PM-picker) flow so a datum axis is clickable like any
         // other geometry. Returns true while the cursor is over a datum axis, suppressing the model
         // pick below (a click off the axis still falls through to the id-buffer).
+        // Wave4: origin already claimed above (same grab radius); drawDatumSelect still handles
+        // axes + planes + user point-datums when the origin is not hot.
         bool datumSelectHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot)
+            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot)
             datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
         bool blendDeselectHot = false;
-        if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot && !axisPickerHot &&
-            !pointPickerHot && !datumSelectHot)
+        if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && !originPickHot &&
+            !planePickerHot && !axisPickerHot && !pointPickerHot && !datumSelectHot)
             blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
@@ -2927,7 +2977,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear. (Both
             // are non-sketch features, so their guards are always false while in a sketch.)
-            if (imgHovered && !s_lmbDragActive && !regionPickerHot && !planePickerHot &&
+            if (imgHovered && !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
                 !s_pp.active && !s_dim.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
@@ -2959,16 +3009,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // C51: a click consumed by the region picker never falls through to model selection.
             // Instant3D: a click that started a push-pull / dimension drag is NOT a selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !s_lmbDragActive && !regionPickerHot && !planePickerHot && !axisPickerHot &&
-                !datumSelectHot && !blendDeselectHot && !s_pp.active && !s_dim.active) {
+                !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
+                !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot &&
+                !blendDeselectHot && !s_pp.active && !s_dim.active) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else if (st.hover.valid()) {
                     st.selection.selectOne(st.hover);
                 } else {
-                    // W2: a left click on empty 3D space (no pick hit) deselects ALL selection kinds
-                    // (topology + feature-tree multi-select + sketch entities), not just topology —
-                    // so clicking the open viewport clears the model the way SolidWorks does.
+                    // W2 / Wave4: a left click on empty 3D space (no pick hit) deselects ALL
+                    // selection kinds (topology + feature-tree multi-select + sketch entities +
+                    // plane/datum emphasis via clearSelection), so clicking the open viewport
+                    // clears the model the way SolidWorks does.
                     st.clearSelection();
                 }
             }
@@ -2995,6 +3047,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             } else {
                 st.pickStatus.clear();
             }
+        }
+
+        // ---- Wave4: empty-doc whitespace deselect ----
+        // Topology picking only runs while hasDocMesh (id-pass needs a body). On a body-less part
+        // the only selection is a plane/datum (viewport click, FM row, or plane chip). Without this
+        // branch, empty-space clicks never clear selectedFeatureId/planeEmphasis and the plane
+        // selection sticks. Same click-vs-drag threshold as the mesh path (s_lmbDragActive).
+        if (!picking && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !s_viewSelector.active() && imgHovered &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_lmbDragActive &&
+            !originPickHot && !regionPickerHot && !planePickerHot && !axisPickerHot &&
+            !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
+            !s_pp.active && !s_dim.active) {
+            st.clearSelection();
         }
 
         // ---- C25: mouse gesture wheel (right-drag) + 'S' shortcut bar ----

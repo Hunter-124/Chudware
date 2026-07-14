@@ -12,6 +12,7 @@ import pytest
 from services.agent.providers.mock_provider import MockProvider
 from services.agent.tiers import (
     parse_openrouter_tier,
+    parse_xai_tier,
     effort_tier_for,
     provider_for_tier,
 )
@@ -84,6 +85,41 @@ class TestOpenRouterTier:
         local = model_id_for_tier("local-24k")
         assert local["kind"] == "local"
         assert local["provider"] == "llamacpp"
+
+
+class TestXaiTier:
+    def test_parse_xai_tier_valid(self):
+        assert parse_xai_tier("xai:grok-4.5") == "grok-4.5"
+        assert parse_xai_tier("xai:grok-4-5") == "grok-4-5"
+        assert parse_xai_tier("xai: grok-4-1 ") == "grok-4-1"
+
+    def test_parse_xai_tier_rejects_non(self):
+        assert parse_xai_tier("local-24k") is None
+        assert parse_xai_tier("openrouter:x") is None
+        assert parse_xai_tier("xai:") is None
+        assert parse_xai_tier("") is None
+        assert parse_xai_tier(None) is None  # type: ignore[arg-type]
+
+    def test_effort_tier_for_xai_maps_to_frontier(self):
+        assert effort_tier_for("xai:grok-4.5") == "frontier"
+        assert effort_tier_for("xai:grok-4-5") == "frontier"
+
+    def test_provider_for_tier_xai_api_key(self, monkeypatch):
+        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+        # Ensure no subscription credential shadows the API-key path.
+        from services.agent.providers import sub_auth
+        monkeypatch.setattr(sub_auth, "load_credential", lambda _pid: None)
+        prov = provider_for_tier("xai:grok-4-5", cfg={})
+        assert prov.name in ("xai", "xai-sub")
+        assert getattr(prov, "model", None) in ("grok-4.5", "grok-4-5") or \
+            "grok-4" in str(getattr(prov, "model", ""))
+
+    def test_model_id_for_tier_xai(self):
+        m = model_id_for_tier("xai:grok-4-5")
+        assert m["id"] == "grok-4.5"
+        assert m["provider"] == "xai"
+        assert m["kind"] == "paid"
 
 
 # ---------------------------------------------------------------------------

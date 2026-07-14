@@ -11,7 +11,7 @@ from __future__ import annotations
 from .openai_provider import OpenAIProvider
 
 # https://docs.x.ai/docs — OpenAI-compatible root
-DEFAULT_MODEL = "grok-4"
+DEFAULT_MODEL = "grok-4.5"
 BASE_URL = "https://api.x.ai/v1"
 
 

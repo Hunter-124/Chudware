@@ -16,13 +16,21 @@ contract-shaped RuntimeError pointing at console.x.ai — never a traceback.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 import webbrowser
+from typing import Callable
 
 from .base import Provider
 from . import sub_auth
+
+log = logging.getLogger("agent.providers.xai_sub")
 
 # ── Endpoints / client (source: hermes-agent hermes_cli/auth.py) ─────────────
 # https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/auth.py
@@ -35,12 +43,14 @@ XAI_OAUTH_DEVICE_CODE_URL = f"{XAI_OAUTH_ISSUER}/oauth2/device/code"
 # Fallback token endpoint when OIDC discovery is unavailable (same issuer path
 # hermes discovers at runtime). Prefer discovery when online.
 XAI_OAUTH_TOKEN_URL_FALLBACK = f"{XAI_OAUTH_ISSUER}/oauth2/token"
+# Manual fallback verification page when the device-code response omits a URI.
+XAI_VERIFICATION_URL_FALLBACK = "https://accounts.x.ai/activate"
 
 API_BASE_URL = "https://api.x.ai/v1"
 CHAT_COMPLETIONS_URL = f"{API_BASE_URL}/chat/completions"
 MODELS_URL = f"{API_BASE_URL}/models"
 PROVIDER_ID = "xai-sub"
-DEFAULT_MODEL = "grok-4"
+DEFAULT_MODEL = "grok-4.5"
 # Access tokens are short-lived (~6h); refresh up to 1h early like hermes
 # (XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600).
 REFRESH_SKEW_MS = 60 * 60 * 1000
@@ -54,6 +64,9 @@ TIER_DENIED_HINT = (
     "or upgrade the SuperGrok tier that includes OAuth API access."
 )
 
+# progress callback payload keys (also mirrored into subscription_status)
+ProgressCb = Callable[[dict], None]
+
 
 class XaiTierDeniedError(RuntimeError):
     """HTTP 403 from xAI OAuth/API — subscription tier not API-enabled."""
@@ -66,6 +79,61 @@ class XaiTierDeniedError(RuntimeError):
         super().__init__(msg)
         self.reason = TIER_DENIED_REASON
         self.hint = TIER_DENIED_HINT
+
+
+def open_verification_url(url: str) -> bool:
+    """Open *url* in the user's default browser.
+
+    Tries ``webbrowser.open`` first (works for a desktop GUI process), then
+    ``xdg-open`` / ``open`` / ``start`` as a fallback. Returns True if a
+    launcher reported success. Never raises — headless envs just return False
+    so the GUI can show the URL + user_code for manual open.
+    """
+    if not url:
+        return False
+    try:
+        if webbrowser.open(str(url)):
+            log.info("xai oauth: opened browser via webbrowser.open (%s)", url)
+            return True
+    except Exception as exc:  # noqa: BLE001 — headless / no display is fine
+        log.info("xai oauth: webbrowser.open failed: %s", exc)
+
+    # Fallbacks for environments where webbrowser has no graphical controller.
+    candidates: list[list[str]] = []
+    if sys.platform.startswith("linux"):
+        for bin_name in ("xdg-open", "gio"):
+            path = shutil.which(bin_name)
+            if path:
+                candidates.append(
+                    [path, "open", url] if bin_name == "gio" else [path, url]
+                )
+    elif sys.platform == "darwin":
+        path = shutil.which("open")
+        if path:
+            candidates.append([path, url])
+    elif sys.platform == "win32":
+        # ``start`` is a shell builtin; use os.startfile when available.
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+            log.info("xai oauth: opened browser via os.startfile (%s)", url)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.info("xai oauth: os.startfile failed: %s", exc)
+
+    for cmd in candidates:
+        try:
+            subprocess.Popen(  # noqa: S603 — fixed launcher + user-supplied URL
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log.info("xai oauth: opened browser via %s (%s)", cmd[0], url)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.info("xai oauth: launcher %s failed: %s", cmd[0], exc)
+    log.warning("xai oauth: could not open a browser for %s (headless?)", url)
+    return False
 
 
 class XAISubProvider(Provider):
@@ -82,43 +150,125 @@ class XAISubProvider(Provider):
 
     # ── Auth flows ───────────────────────────────────────────────────────────
 
-    def login(self) -> dict:
+    def login(self, progress: ProgressCb | None = None) -> dict:
         """Device-code login (primary xAI path). Opens the verification URL."""
-        return self.login_device(open_browser=True)
+        return self.login_device(open_browser=True, progress=progress)
 
-    def login_device(self, open_browser: bool = True) -> dict:
+    def login_device(
+        self,
+        open_browser: bool = True,
+        progress: ProgressCb | None = None,
+    ) -> dict:
         """OAuth 2.0 device-code flow against auth.x.ai.
 
         Prints the verification URL + user code, optionally opens a browser,
         then polls the token endpoint until approved or timeout.
+
+        *progress* (if set) is invoked with a dict of UI-facing fields as soon
+        as the device code is issued so the Settings panel can show the code
+        and a fallback link while polling continues.
         """
-        token_endpoint = self._discover_token_endpoint()
-        device = self._request_device_code()
+        def _progress(payload: dict) -> None:
+            if progress is None:
+                return
+            try:
+                progress(payload)
+            except Exception as exc:  # noqa: BLE001 — UI callback must not abort login
+                log.warning("xai oauth: progress callback failed: %s", exc)
+
+        log.info("xai oauth: start (open_browser=%s)", open_browser)
+        _progress({"stage": "start", "browser_opened": False})
+
+        try:
+            token_endpoint = self._discover_token_endpoint()
+        except Exception as exc:
+            log.error("xai oauth: discovery failed: %s", exc)
+            _progress({"stage": "discovery", "error": str(exc)})
+            raise
+
+        try:
+            device = self._request_device_code()
+        except XaiTierDeniedError:
+            log.error("xai oauth: device-code request denied (403-tier)")
+            _progress({"stage": "device_code", "error": TIER_DENIED_REASON})
+            raise
+        except Exception as exc:
+            log.error("xai oauth: device-code request failed: %s", exc)
+            _progress({"stage": "device_code", "error": str(exc)})
+            raise
+
         verification_url = (
             device.get("verification_uri_complete")
             or device.get("verification_uri")
-            or "https://accounts.x.ai/device"
+            or XAI_VERIFICATION_URL_FALLBACK
         )
         user_code = str(device.get("user_code") or "")
         expires_in = int(device.get("expires_in") or 900)
         interval = max(1, int(device.get("interval") or 5))
         device_code = str(device["device_code"])
 
-        print(f"Go to {verification_url} and approve access"
-              + (f" (code: {user_code})" if user_code else ""))
-        if open_browser:
-            try:
-                webbrowser.open(str(verification_url))
-            except Exception:  # noqa: BLE001 — headless / no display is fine
-                pass
-
-        payload = self._poll_device_token(
-            token_endpoint=token_endpoint,
-            device_code=device_code,
-            expires_in=expires_in,
-            poll_interval=interval,
+        log.info(
+            "xai oauth: device code issued (user_code=%s url=%s expires_in=%s interval=%s)",
+            user_code, verification_url, expires_in, interval,
         )
-        return self._store_tokens(payload, token_endpoint=token_endpoint)
+        print(
+            f"Go to {verification_url} and approve access"
+            + (f" (code: {user_code})" if user_code else "")
+        )
+
+        browser_opened = False
+        if open_browser:
+            browser_opened = open_verification_url(str(verification_url))
+            log.info("xai oauth: browser_opened=%s", browser_opened)
+
+        _progress({
+            "stage": "awaiting_approval",
+            "user_code": user_code,
+            "verification_url": str(verification_url),
+            "verification_uri": str(
+                device.get("verification_uri") or XAI_VERIFICATION_URL_FALLBACK
+            ),
+            "browser_opened": browser_opened,
+            "expires_in": expires_in,
+            "interval": interval,
+        })
+
+        try:
+            payload = self._poll_device_token(
+                token_endpoint=token_endpoint,
+                device_code=device_code,
+                expires_in=expires_in,
+                poll_interval=interval,
+            )
+        except XaiTierDeniedError:
+            log.error("xai oauth: token poll denied (403-tier)")
+            _progress({"stage": "poll", "error": TIER_DENIED_REASON})
+            raise
+        except Exception as exc:
+            log.error("xai oauth: token poll/exchange failed: %s", exc)
+            _progress({"stage": "poll", "error": str(exc)})
+            raise
+
+        try:
+            cred = self._store_tokens(payload, token_endpoint=token_endpoint)
+        except Exception as exc:
+            log.error("xai oauth: store tokens failed: %s", exc)
+            _progress({"stage": "exchange", "error": str(exc)})
+            raise
+
+        log.info(
+            "xai oauth: login ok (email=%s account_id=%s)",
+            cred.get("email"), cred.get("account_id"),
+        )
+        _progress({
+            "stage": "connected",
+            "user_code": user_code,
+            "verification_url": str(verification_url),
+            "browser_opened": browser_opened,
+            "email": cred.get("email"),
+            "account_id": cred.get("account_id"),
+        })
+        return cred
 
     def _discover_token_endpoint(self) -> str:
         """OIDC discovery for the token endpoint; fall back to known path."""
@@ -130,9 +280,14 @@ class XAISubProvider(Provider):
             )
             endpoint = str(data.get("token_endpoint") or "").strip()
             if endpoint.startswith("https://") and "x.ai" in endpoint:
+                log.info("xai oauth: discovery token_endpoint=%s", endpoint)
                 return endpoint
-        except Exception:  # noqa: BLE001 — offline / discovery down → fallback
-            pass
+            log.warning(
+                "xai oauth: discovery returned unusable token_endpoint=%r; using fallback",
+                endpoint,
+            )
+        except Exception as exc:  # noqa: BLE001 — offline / discovery down → fallback
+            log.warning("xai oauth: discovery failed (%s); using fallback", exc)
         return XAI_OAUTH_TOKEN_URL_FALLBACK
 
     def _request_device_code(self) -> dict:
@@ -184,6 +339,7 @@ class XAISubProvider(Provider):
                     raise RuntimeError(
                         "xAI device-code token response missing refresh_token"
                     )
+                log.info("xai oauth: token exchange succeeded")
                 return resp
             except urllib.error.HTTPError as exc:
                 try:
@@ -261,6 +417,7 @@ class XAISubProvider(Provider):
             self._cred.get("token_endpoint")
             or XAI_OAUTH_TOKEN_URL_FALLBACK
         )
+        log.info("xai oauth: refresh via %s", endpoint)
         try:
             resp = sub_auth.post_form(
                 endpoint,
@@ -275,13 +432,16 @@ class XAISubProvider(Provider):
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:400]
             if exc.code == 403:
+                log.error("xai oauth: refresh 403-tier: %s", body)
                 raise XaiTierDeniedError(body) from exc
             if exc.code in (400, 401):
+                log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
                 raise RuntimeError(
                     "xAI OAuth refresh failed — re-authenticate via "
                     "Settings → Sign in with xAI. "
                     f"(HTTP {exc.code}: {body})"
                 ) from exc
+            log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
             raise RuntimeError(
                 f"xAI token refresh failed (HTTP {exc.code}): {body}"
             ) from exc

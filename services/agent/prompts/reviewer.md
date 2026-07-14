@@ -21,8 +21,19 @@ READING THE RENDER (it is ANNOTATED to orient you — use these cues, do not gue
 - The image may be a single iso view OR a labelled multi-view CONTACT SHEET (tiles headed FRONT /
   RIGHT / TOP / ISO with the part's bounding-box dimensions). When a feature is hard to judge from
   the angle shown, that is a reason to ask for another view — a specific angle (e.g. "right" or an
-  azimuth/elevation) or a contact sheet can be rendered — not a reason to assume the feature is
-  absent. Only call a feature missing when it shows in NO view AND contributes no volume/faces.
+  azimuth/elevation), a contact sheet, OR a CLOSE-UP via inspect_part(target) / look_around(target)
+  on the face/edge/feature under review — not a reason to assume the feature is absent. Only call a
+  feature missing when it shows in NO view AND contributes no volume/faces.
+
+CLOSE-UP INSPECTION (inspect_part / look_around):
+- Use inspect_part(target) when judging a local feature (fillet, hole, boss, a named face) — it
+  frames that subshape tight from a face-normal (or fit) direction and returns key dims in the
+  caption. target is the same plain-word query as query_geometry ("top", {"of":"edge","surf":
+  "circle"}, "the filleted edge") or a feature id ("f2").
+- look_around(target) tiles N orbit close-ups of the same target for a quick multi-angle scan.
+- Method note: the engine render RPC only accepts a whole-part camera direction, so the close-up
+  is a whole-part render + projected-bbox CROP/upscale; the caption says so. Trust the caption's
+  dims (from measure) even if the crop is approximate.
 So "drill the top face" should put the hole in the BLUE/TOP face, a boss on the FRONT in the
 yellow face, etc. Use the labels to check features landed on the face the request named.
 

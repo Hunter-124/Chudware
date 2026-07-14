@@ -690,7 +690,9 @@ void AppState::clearSelection() {
     treeScrollToSelection = false;
     // 3. FeatureManager multi-selection (file-static in feature_tree.cpp).
     ui::featureClearTreeMultiSel();
-    // 4. In-sketch entity + relation selection (no-op when not in a sketch).
+    // 4. Reference-plane emphasis (viewport/FM plane selection highlight).
+    planeEmphasis = -1;
+    // 5. In-sketch entity + relation selection (no-op when not in a sketch).
     if (sketchMode && sketchMode->active()) sketchMode->clearEntitySelection();
 }
 

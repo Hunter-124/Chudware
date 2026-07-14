@@ -216,14 +216,17 @@ inline void drawCompactTable(const Board& b, float /*sc*/) {
         ImGui::PopStyleColor();
     }
 
+    // Stretch weights leave room for the pass-rate bar + percent so the bar is never clipped
+    // when the Settings modal is at its default width. Numeric columns right-align.
     if (ImGui::BeginTable("##lb_compact", 5,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 0.34f);
-        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 0.16f);
-        ImGui::TableSetupColumn("Pass rate", ImGuiTableColumnFlags_WidthStretch, 0.22f);
-        ImGui::TableSetupColumn("Tool valid", ImGuiTableColumnFlags_WidthStretch, 0.14f);
-        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_NoHostExtendX)) {
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Pass rate", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("Tool valid", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.9f);
         ImGui::TableHeadersRow();
         for (const auto& m : b.models) {
             ImGui::TableNextRow();
@@ -245,17 +248,34 @@ inline void drawCompactTable(const Board& b, float /*sc*/) {
             }
             ImGui::TableNextColumn();
             {
+                // Reserve room for the percent label so the bar never clips under it.
+                const float pctW = 42.0f * S;
+                const float barW = std::max(48.0f * S, ImGui::GetContentRegionAvail().x - pctW - 6.0f * S);
                 char pct[32];
                 std::snprintf(pct, sizeof(pct), "%.0f%%", m.passRate * 100.f);
-                drawPassBar(m.passRate, -1.f, 8.0f * S);
-                ImGui::SameLine(0, 4.0f * S);
+                drawPassBar(m.passRate, barW, 8.0f * S);
+                ImGui::SameLine(0, 6.0f * S);
                 ImGui::TextUnformatted(pct);
             }
             ImGui::TableNextColumn();
-            ImGui::Text("%.0f%%", m.toolValidity * 100.f);
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.0f%%", m.toolValidity * 100.f);
+                const float tw = ImGui::CalcTextSize(buf).x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                     std::max(0.0f, ImGui::GetContentRegionAvail().x - tw));
+                ImGui::TextUnformatted(buf);
+            }
             ImGui::TableNextColumn();
-            if (m.costUsd < 0.f) ImGui::TextUnformatted("\xe2\x80\x94");
-            else ImGui::Text("$%.3f", m.costUsd);
+            {
+                char buf[32];
+                if (m.costUsd < 0.f) std::snprintf(buf, sizeof(buf), "\xe2\x80\x94");
+                else std::snprintf(buf, sizeof(buf), "$%.3f", m.costUsd);
+                const float tw = ImGui::CalcTextSize(buf).x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                     std::max(0.0f, ImGui::GetContentRegionAvail().x - tw));
+                ImGui::TextUnformatted(buf);
+            }
         }
         ImGui::EndTable();
     }

@@ -26,7 +26,9 @@ def _provider_for_tier(tier: str):
 
 
 def _model_meta(tier: str, provider: Any) -> dict[str, Any]:
-    from services.agent.tiers import LOCAL_TIER_MODELS, parse_openrouter_tier, load_local_models
+    from services.agent.tiers import (
+        LOCAL_TIER_MODELS, parse_openrouter_tier, parse_xai_tier, load_local_models,
+    )
 
     or_model = parse_openrouter_tier(tier)
     if or_model is not None:
@@ -34,6 +36,16 @@ def _model_meta(tier: str, provider: Any) -> dict[str, Any]:
             "id": or_model,
             "label": or_model.split("/")[-1].replace("-", " ").title(),
             "provider": "openrouter",
+            "kind": "paid",
+            "tier": tier,
+        }
+    xai_model = parse_xai_tier(tier)
+    if xai_model is not None:
+        wire = "grok-4.5" if xai_model == "grok-4-5" else xai_model
+        return {
+            "id": wire,
+            "label": wire.replace("-", " ").title(),
+            "provider": getattr(provider, "name", None) or "xai",
             "kind": "paid",
             "tier": tier,
         }

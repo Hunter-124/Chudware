@@ -340,7 +340,7 @@ def test_xai_login_403_is_contract_shaped(tmp_config, monkeypatch):
     """Device-code HTTP 403 surfaces the Heavy-gating reason, never a traceback."""
     from agent.providers import xai_sub_provider as xsp
 
-    def boom(self, open_browser=True):
+    def boom(self, open_browser=True, progress=None):
         raise xsp.XaiTierDeniedError("caller does not have permission")
 
     monkeypatch.setattr(xsp.XAISubProvider, "login_device", boom)
@@ -368,3 +368,122 @@ def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
     assert cred["email"] == "grok@x.ai"
     assert cred["account_id"] == "user-1"
     assert sub_auth.load_credential(PROVIDER_ID)["refresh_token"] == "rt"
+
+
+def test_xai_login_device_true_still_opens_browser(tmp_config, monkeypatch):
+    """GUI passes device=True; that must NOT suppress the browser open (regression)."""
+    from agent.providers import xai_sub_provider as xsp
+
+    seen = {}
+
+    def fake_login_device(self, open_browser=True, progress=None):
+        seen["open_browser"] = open_browser
+        if progress:
+            progress({
+                "stage": "awaiting_approval",
+                "user_code": "ABCD-1234",
+                "verification_url": "https://accounts.x.ai/activate?user_code=ABCD-1234",
+                "browser_opened": open_browser,
+            })
+        return {
+            "access_token": "t",
+            "refresh_token": "r",
+            "email": "u@x.ai",
+            "account_id": "a1",
+        }
+
+    monkeypatch.setattr(xsp.XAISubProvider, "login_device", fake_login_device)
+    out = sl.login("xai", device=True)
+    assert out["ok"] is True
+    assert seen["open_browser"] is True  # the bug was open_browser=not device → False
+
+
+def test_xai_login_open_browser_false_for_headless(tmp_config, monkeypatch):
+    from agent.providers import xai_sub_provider as xsp
+
+    seen = {}
+
+    def fake_login_device(self, open_browser=True, progress=None):
+        seen["open_browser"] = open_browser
+        return {"access_token": "t", "refresh_token": "r", "email": None, "account_id": None}
+
+    monkeypatch.setattr(xsp.XAISubProvider, "login_device", fake_login_device)
+    out = sl.login("xai", device=True, open_browser=False)
+    assert out["ok"] is True
+    assert seen["open_browser"] is False
+
+
+def test_xai_login_progress_callback_surfaces_code(tmp_config, monkeypatch):
+    from agent.providers import xai_sub_provider as xsp
+
+    events = []
+
+    def fake_login_device(self, open_browser=True, progress=None):
+        if progress:
+            progress({
+                "stage": "awaiting_approval",
+                "user_code": "WXYZ-9999",
+                "verification_url": "https://accounts.x.ai/activate",
+                "browser_opened": False,
+            })
+        return {"access_token": "t", "refresh_token": "r", "email": "e@x.ai", "account_id": "id"}
+
+    monkeypatch.setattr(xsp.XAISubProvider, "login_device", fake_login_device)
+    out = sl.login("xai", progress=lambda p: events.append(p))
+    assert out["ok"] is True
+    assert any(e.get("user_code") == "WXYZ-9999" for e in events)
+
+
+def test_open_verification_url_fallback_does_not_raise(monkeypatch):
+    from agent.providers import xai_sub_provider as xsp
+
+    monkeypatch.setattr(xsp.webbrowser, "open", lambda url: (_ for _ in ()).throw(RuntimeError("no display")))
+    monkeypatch.setattr(xsp.shutil, "which", lambda name: None)
+    assert xsp.open_verification_url("https://accounts.x.ai/activate") is False
+
+
+def test_xai_default_model_is_grok_45():
+    from agent.providers.xai_sub_provider import DEFAULT_MODEL as sub_default
+    from agent.providers.xai_provider import DEFAULT_MODEL as key_default
+    assert sub_default == "grok-4.5"
+    assert key_default == "grok-4.5"
+
+
+def test_parse_xai_tier_and_provider_resolution(tmp_config, monkeypatch):
+    """xai:<model> gym tiers prefer subscription when connected, else API key."""
+    from services.agent.tiers import parse_xai_tier, effort_tier_for, provider_for_tier
+    from services.agent import config as agent_config
+
+    assert parse_xai_tier("xai:grok-4.5") == "grok-4.5"
+    assert parse_xai_tier("xai:grok-4-5") == "grok-4-5"
+    assert parse_xai_tier("xai:") is None
+    assert parse_xai_tier("openrouter:x") is None
+    assert effort_tier_for("xai:grok-4.5") == "frontier"
+
+    monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+
+    # No subscription → API-key path.
+    calls = []
+
+    def tracked(name=None, cfg=None):
+        calls.append((name, (cfg or {}).get("model")))
+        return type("P", (), {"name": name, "model": (cfg or {}).get("model")})()
+
+    monkeypatch.setattr(agent_config, "get_provider", tracked)
+    monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+    prov = provider_for_tier("xai:grok-4-5", cfg={})
+    assert calls[-1][0] == "xai"
+    assert calls[-1][1] == "grok-4.5"  # hyphen normalised
+    assert prov.name == "xai"
+
+    # With subscription credential → xai-sub path.
+    calls.clear()
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "tok",
+        "refresh_token": "ref",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+    })
+    prov = provider_for_tier("xai:grok-4.5", cfg={})
+    assert calls[-1][0] == "xai-sub"
+    assert calls[-1][1] == "grok-4.5"
+    assert prov.name == "xai-sub"

@@ -17,7 +17,7 @@
 #include "../core/app_state.h"
 #include "../core/cpp_core.h"
 #include "../renderer.h"
-#include "legacy_chat.h"  // ui::drawProviderModelPicker (shared with the inline AI tab)
+#include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > AI)
 
@@ -108,6 +108,36 @@ static void helpMarker(const char* desc) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+// Shared Settings section chrome: accent title + even vertical rhythm across every tab.
+// Prefer this over raw ImGui::SeparatorText so Appearance/General/AI/… share one look.
+static void settingsSectionHeader(const char* title, bool first = false) {
+    const float sc = ui::uiScale;
+    ImGui::Dummy(ImVec2(0, first ? 2.0f * sc : 10.0f * sc));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
+    ImGui::TextUnformatted(title);
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+}
+
+// Frosted glass card around a group of related fields. Auto-height; id must be unique per tab.
+// Keeps label+widget pairs inside one child so scrolling cannot detach a caption from its field.
+static void settingsGlassSectionBegin(const char* id, const char* title) {
+    const float sc = ui::uiScale;
+    settingsSectionHeader(title);
+    ui::pushGlassChildStyle(10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * sc, 10.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * sc, 6.0f * sc));
+    ImGui::BeginChild(id, ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+}
+
+static void settingsGlassSectionEnd() {
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
+    ui::popGlassChildStyle();
 }
 
 // Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
@@ -229,8 +259,8 @@ void drawSettingsModal(AppState& st, bool busy) {
     const float margin = 28.0f * sc;
     const float maxW = std::max(360.0f * sc, vp->WorkSize.x - margin * 2.0f);
     const float maxH = std::max(420.0f * sc, vp->WorkSize.y - margin * 2.0f);
-    const float winW = std::min(680.0f * sc, maxW);
-    const float winH = std::min(720.0f * sc, maxH);
+    const float winW = std::min(760.0f * sc, maxW);
+    const float winH = std::min(760.0f * sc, maxH);
     if (s_settingsOpen) {
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -287,16 +317,14 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Appearance", nullptr,
                                     (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::SeparatorText("Theme");
+                settingsSectionHeader("Theme", /*first=*/true);
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
                 if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
                     applyThemeNow(st, isLight);
                 dimText("Switches the whole UI between the dark and light palettes. "
                         "Saved immediately.");
 
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Liquid Glass");
+                settingsSectionHeader("Liquid Glass");
                 dimText("Per-surface styling for the glass panels floating over the viewport. "
                         "Dynamic color auto-tints each panel for max contrast against the live "
                         "model; pin a tint below to override it. Saved immediately.");
@@ -440,8 +468,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // over the viewport it frosts the real backdrop with this group's resolved style;
                 // over chrome it falls back to the layered glass. One stable id per group (the
                 // adaptive cache requires the same group every frame for a given id).
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                ImGui::SeparatorText("Preview");
+                settingsSectionHeader("Preview");
                 {
                     static const char* kPreviewId[(size_t)ui::GlassGroup::Count] = {
                         "settings_glass_preview_global", "settings_glass_preview_fm",
@@ -471,9 +498,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("General", nullptr,
                                     (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-
-                ImGui::SeparatorText("Document");
+                settingsSectionHeader("Document", /*first=*/true);
                 ImGui::TextUnformatted("Units");
                 helpMarker("The unit system for dimension display and input. The model is always "
                            "stored in canonical millimeters; this only changes how lengths are "
@@ -495,8 +520,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
                 // users had to hand-edit config.json to re-root the File Explorer.
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Workspace");
+                settingsSectionHeader("Workspace");
                 ImGui::TextUnformatted("Workspace folder");
                 // Truthful default label: defaultWorkspaceDir() applies the alias rule
                 // (existing Documents/AI-CAD wins, else Documents/Billet).
@@ -525,8 +549,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 // Theme moved to the Appearance tab (the canonical control); engine routing +
                 // profiler are status/launchers, folded under one System section (audit P2).
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("System");
+                settingsSectionHeader("System");
                 // Reflect the REAL strangler-seam state (see worker_client.cpp): once the C++
                 // core (libaicad.dll) loads, doc ops route to it by default (AI_CAD_CPP_DOCS,
                 // default ON); sim/agent/ecad are explicit opt-ins. These mirror the flag reads
@@ -579,21 +602,26 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("AI", nullptr,
                                     (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::SeparatorText("Provider & model");
                 dimText(("Used by Design, Edit, and Help. Stored in " + configPath() + ".")
                             .c_str());
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                // Shared provider + availability-filtered model picker + reasoning effort +
-                // privacy/offline. The inline AI Settings tab renders the SAME widget.
-                ui::drawProviderModelPicker(st, busy);
 
-                // ---- Model Leaderboard (aicad.leaderboard/1) ----
-                ImGui::Dummy(ImVec2(0, 10 * sc));
-                ImGui::SeparatorText("Model Leaderboard");
+                // Glass-grouped sections — each child owns its label+widget pairs so a scroll
+                // boundary can never orphan a caption (the unlabeled "0" max-tokens bug).
+                settingsGlassSectionBegin("##ai_provider", "Provider & Model");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##ai_generation", "Generation");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation);
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##ai_privacy", "Privacy");
+                ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##ai_leaderboard", "Model Leaderboard");
                 dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
                         "MOCK badge when task_suite ends in -MOCK.");
-                ImGui::Dummy(ImVec2(0, 4 * sc));
                 {
                     static ui::leaderboard::Board s_lb;
                     static bool s_lbLoaded = false;
@@ -611,6 +639,29 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::Dummy(ImVec2(0, 2 * sc));
                     ui::leaderboard::drawCompactTable(s_lb, sc);
                 }
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
+                dimText("Repair the local CAD engine runtime, or trim which models appear in the "
+                        "composer's model picker.");
+                {
+                    const bool canSetup = !st.setupRunning.load() && !st.job.running.load();
+                    if (!canSetup) ImGui::BeginDisabled();
+                    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
+                        st.startSetup(true);
+                    if (!canSetup) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Rebuild the local Python/CAD runtime (same as "
+                                          "Billet \xe2\x86\x92 Repair / install runtime).");
+                    if (st.setupRunning.load()) {
+                        ImGui::SameLine();
+                        dimText("Running\xe2\x80\xa6");
+                    }
+                }
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                if (ImGui::CollapsingHeader("Manage models (chat picker)"))
+                    ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
+                settingsGlassSectionEnd();
 
                 ImGui::EndTabItem();
             }
@@ -618,7 +669,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Prompts", nullptr,
                                     (jumpToPrompts || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
                                                                       : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
+                settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
                 if (!s_promptsLoaded)
@@ -758,19 +809,21 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Agent", nullptr,
                                     (wantSettingsSel || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                                         : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::SeparatorText("Run behavior");
+                settingsSectionHeader("Run behavior", /*first=*/true);
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
                 dimText("The agent first drafts a build plan - the parts, concrete "
                         "dimensions and features - shows it in the conversation, then "
                         "writes the CAD code against it.");
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                ImGui::SeparatorText("Iteration budget");
-                ImGui::TextUnformatted("Refine-pass cap per request");
-                ImGui::SetNextItemWidth(140.0f * sc);
-                ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
-                                 settings.maxIters == 0 ? "automatic" : "%d passes");
-                ImGui::SameLine();
+                settingsSectionHeader("Iteration budget");
+                {
+                    const float labelW = 200.0f * sc;
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Refine-pass cap per request");
+                    ImGui::SameLine(labelW);
+                    ImGui::SetNextItemWidth(160.0f * sc);
+                    ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
+                                     settings.maxIters == 0 ? "automatic" : "%d passes");
+                }
                 dimText("0 = automatic (stops once the render matches)");
                 ImGui::EndTabItem();
             }
@@ -779,13 +832,11 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Experimental", nullptr,
                                     (jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2 * sc));
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");
 
                 // --- Model routing: command model vs. vision/spatial model ---
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                ImGui::SeparatorText("Model routing");
+                settingsSectionHeader("Model routing", /*first=*/true);
 
                 // Command model = the active main provider/model (emits + parses the CAD ops). It's
                 // chosen in the AI tab / composer picker; shown here read-only for clarity.
@@ -856,8 +907,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
 
                 // --- Parametric sequence mode (DeepCAD / CAD-Coder direction) ---
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Parametric sequence mode (experimental)");
+                settingsSectionHeader("Parametric sequence mode (experimental)");
                 ImGui::Checkbox("Prefer an editable feature sequence over a monolithic solid",
                                 &settings.expCadSequenceMode);
                 helpMarker("Nudges the modeler to build the part as an ordered sequence of "

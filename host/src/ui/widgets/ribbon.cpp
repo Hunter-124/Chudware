@@ -2065,8 +2065,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 if (glx < capL) glx = snap(capL);
                 // Caption strip sits under the content zone: contentY + contentH … bodyH2 - padY.
                 // Vertically center the label in that strip so it never collides with button tiles.
-                float  capTop = contentY + contentH;
-                float  capBot = bodyH2 - padY;
+                // Screen coords: cwinPos.y + relative strip (draw list is the parent ribbon window).
+                float  capTop = cwinPos.y + contentY + contentH;
+                float  capBot = cwinPos.y + bodyH2 - padY;
                 float  gly = snap(capTop + ((capBot - capTop) - gts.y) * 0.5f);
                 bool clipped = gts.x > (capR - capL);
                 dl->PushClipRect(ImVec2(capL, gly), ImVec2(capR, gly + gts.y), true);

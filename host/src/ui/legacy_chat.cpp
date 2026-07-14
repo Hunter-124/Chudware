@@ -2188,18 +2188,21 @@ static char* providerKeyBuf(Settings& s, int provider) {
 }
 
 // Availability helpers (defined with the model-dropdown section below; forward-declared so the
-// "Manage models" panel inside drawProviderModelPicker can call them).
+// "Manage models" panel inside drawAiSettingsSection can call them).
 static bool providerUsable(AppState& st, int provider);
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
-// Shared provider + model picker. Returns true if a setting changed this frame.
-bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
+// Shared AI settings, split by section so Settings can glass-group them.
+// ProviderModel = provider + model + auth/status; Generation = effort/tokens/window;
+// Privacy = offline + thoughts; ManageModels = chat-picker visibility.
+bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     (void)busy;
     Settings& s = st.settings;
     const float S = ui::uiScale;
     bool changed = false;
     refreshModelAvailability(st, false);
 
+    auto drawProviderModel = [&]() {
     // ---- provider ----
     ImGui::TextUnformatted("Provider");
     ImGui::SetNextItemWidth(-1);
@@ -2353,69 +2356,6 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
         }
     }
 
-    // ---- reasoning effort (only for reasoning-capable models) ----
-    {
-        const char* effLabels[8] = {};
-        const char* effValues[8] = {};
-        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
-        if (nEff > 0) {
-            ImGui::Dummy(ImVec2(0, 4 * S));
-            ImGui::TextUnformatted("Reasoning effort");
-            int effIdx = 0;
-            for (int i = 0; i < nEff; ++i)
-                if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##effort", &effIdx, effLabels, nEff)) {
-                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
-                changed = true;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
-                                  "Higher = better planning on hard parts, slower + more tokens.");
-        }
-    }
-
-    // ---- max response tokens (per model call) ----
-    // The lever for "budget exhausted" / "no JSON ops in reply": a reasoning model can spend its
-    // whole output budget thinking and emit no/truncated JSON. 0 = automatic per-provider default
-    // (4096 local, 8192 cloud, +4096 at high effort). Raise it if builds keep failing to parse.
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::TextUnformatted("Max response tokens");
-    ImGui::SetNextItemWidth(-1);
-    int mt = s.maxTokens;  // 0 = auto
-    if (ImGui::InputInt("##maxtokens", &mt, 1024, 4096)) {
-        if (mt < 0) mt = 0;
-        if (mt > 0 && mt < 512) mt = 512;
-        if (mt > 200000) mt = 200000;
-        s.maxTokens = mt;
-        changed = true;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Output token cap per model call. 0 = automatic.\n"
-                          "Raise this if the agent reports \"budget exhausted\" or \"no JSON ops\"\n"
-                          "— a reasoning model spent its budget thinking before emitting the build.");
-
-    // ---- model context window ----
-    // The model's TOTAL token window. The agent fits input (prompt) + output (above) inside it so
-    // a small LOCAL model never silently runs out of context mid-chain. 0 = automatic per-provider
-    // default (cloud large; local 8192). Set this to your local server's real window (e.g. 4096,
-    // 8192, 32768) so the prompt is trimmed to fit instead of being truncated blindly by the server.
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::TextUnformatted("Model context window");
-    ImGui::SetNextItemWidth(-1);
-    int cw = s.contextWindow;  // 0 = auto
-    if (ImGui::InputInt("##ctxwindow", &cw, 1024, 8192)) {
-        if (cw < 0) cw = 0;
-        if (cw > 0 && cw < 2048) cw = 2048;
-        if (cw > 2000000) cw = 2000000;
-        s.contextWindow = cw;
-        changed = true;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The model's total token context window. 0 = automatic\n"
-                          "(cloud large; local 8192). Set your LOCAL server's real window so the\n"
-                          "agent trims the prompt to fit instead of overrunning it and breaking the run.");
-
     // ---- credentials / connection ----
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
@@ -2446,8 +2386,12 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
         // Sign-in uses subscription_login{provider:"xai",device:true}; GUI polls subscription_status.
         static bool s_xaiLoginBusy = false;
         static bool s_xaiConnected = false;
+        static bool s_xaiBrowserOpened = false;
         static std::string s_xaiEmail;
         static std::string s_xaiError;
+        static std::string s_xaiUserCode;
+        static std::string s_xaiVerifyUrl;
+        static std::string s_xaiStage;
         static double s_xaiLastPoll = -1e9;
 
         auto pollXaiStatus = [&](bool force) {
@@ -2462,6 +2406,12 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
                 s_xaiConnected = x.value("connected", false);
                 s_xaiEmail = x.value("email", std::string());
                 s_xaiLoginBusy = x.value("login_in_progress", false);
+                s_xaiBrowserOpened = x.value("browser_opened", false);
+                s_xaiUserCode = x.value("user_code", std::string());
+                s_xaiVerifyUrl = x.value("verification_url", std::string());
+                if (s_xaiVerifyUrl.empty())
+                    s_xaiVerifyUrl = x.value("verification_uri", std::string());
+                s_xaiStage = x.value("login_stage", std::string());
                 if (auto err = x.value("last_error", std::string()); !err.empty())
                     s_xaiError = err;
                 else if (s_xaiConnected)
@@ -2472,7 +2422,39 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
 
         dimText("SuperGrok / X Premium+ subscription (device-code OAuth) or API key from console.x.ai.");
         if (s_xaiLoginBusy) {
-            ImGui::TextUnformatted("Waiting for browser approval\xe2\x80\xa6");
+            // Opening browser… then show the device code + fallback link.
+            if (s_xaiUserCode.empty() && s_xaiVerifyUrl.empty()) {
+                ImGui::TextUnformatted("Opening browser\xe2\x80\xa6");
+            } else {
+                if (s_xaiBrowserOpened)
+                    ImGui::TextUnformatted("Browser opened \xe2\x80\x94 approve access, then wait\xe2\x80\xa6");
+                else
+                    ImGui::TextUnformatted("Could not auto-open browser \xe2\x80\x94 open the link below:");
+                if (!s_xaiUserCode.empty()) {
+                    ImGui::Text("Code: %s", s_xaiUserCode.c_str());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Click 'Copy code' to copy this to the clipboard.");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Copy code##xai"))
+                        ImGui::SetClipboardText(s_xaiUserCode.c_str());
+                }
+                const std::string fallbackUrl =
+                    s_xaiVerifyUrl.empty() ? "https://accounts.x.ai/activate" : s_xaiVerifyUrl;
+                ImGui::TextWrapped("%s", fallbackUrl.c_str());
+                if (ImGui::SmallButton("Copy URL##xai"))
+                    ImGui::SetClipboardText(fallbackUrl.c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Open in browser##xai")) {
+                    // Best-effort local open when the worker process is headless.
+#if defined(_WIN32)
+                    std::system(("start \"\" \"" + fallbackUrl + "\"").c_str());
+#elif defined(__APPLE__)
+                    std::system(("open '" + fallbackUrl + "'").c_str());
+#else
+                    std::system(("xdg-open '" + fallbackUrl + "' >/dev/null 2>&1 &").c_str());
+#endif
+                }
+            }
             pollXaiStatus(true);
         } else if (s_xaiConnected) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
@@ -2487,12 +2469,20 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
                 s_xaiConnected = false;
                 s_xaiEmail.clear();
                 s_xaiError.clear();
+                s_xaiUserCode.clear();
+                s_xaiVerifyUrl.clear();
+                s_xaiStage.clear();
+                s_xaiBrowserOpened = false;
                 s_xaiLastPoll = -1e9;
             }
         } else {
             if (ImGui::Button("Sign in with xAI", ImVec2(-1, 0))) {
                 s_xaiLoginBusy = true;
                 s_xaiError.clear();
+                s_xaiUserCode.clear();
+                s_xaiVerifyUrl.clear();
+                s_xaiStage = "start";
+                s_xaiBrowserOpened = false;
                 st.rpc.call("subscription_login",
                             nlohmann::json{{"provider", "xai"}, {"device", true}},
                             [](const core::RpcResult& r) {
@@ -2576,11 +2566,80 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
         ImGui::PopStyleColor();
     }
 
-    // ---- manage which models appear in the chat picker (VS-Code-Copilot "Manage models") ----
-    // Advanced-only (T-G17): the full add/remove/configure management UI lives ONLY in the Advanced
-    // settings window; the in-tab settings view (slim) keeps just the quick provider/model picker.
-    if (!slim) ImGui::Dummy(ImVec2(0, 6 * S));
-    if (!slim && ImGui::CollapsingHeader("Manage models (chat picker)")) {
+    };
+
+    auto drawGeneration = [&]() {
+    // ---- Generation: reasoning effort + token budgets ----
+    // Labels share the row with their widgets so scroll never orphans an InputInt.
+    {
+        const float labelW = 180.0f * S;
+        const float fieldW = 160.0f * S;
+        auto labeledField = [&](const char* label) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(label);
+            ImGui::SameLine(labelW);
+            ImGui::SetNextItemWidth(fieldW);
+        };
+
+        const char* effLabels[8] = {};
+        const char* effValues[8] = {};
+        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+        if (nEff > 0) {
+            labeledField("Reasoning effort");
+            int effIdx = 0;
+            for (int i = 0; i < nEff; ++i)
+                if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+            if (ImGui::Combo("##effort", &effIdx, effLabels, nEff)) {
+                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
+                changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
+                                  "Higher = better planning on hard parts, slower + more tokens.");
+            ImGui::Dummy(ImVec2(0, 4 * S));
+        }
+
+        // Max response tokens (0 = auto). Keep label on the same row as the InputInt so a scroll
+        // boundary can never leave a bare "0" field without its caption (Settings AI tab bug).
+        labeledField("Max response tokens");
+        int mt = s.maxTokens;  // 0 = auto
+        if (ImGui::InputInt("##maxtokens", &mt, 1024, 4096)) {
+            if (mt < 0) mt = 0;
+            if (mt > 0 && mt < 512) mt = 512;
+            if (mt > 200000) mt = 200000;
+            s.maxTokens = mt;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Output token cap per model call. 0 = automatic.\n"
+                              "Raise this if the agent reports \"budget exhausted\" or \"no JSON ops\"\n"
+                              "— a reasoning model spent its budget thinking before emitting the build.");
+        ImGui::SameLine(0.0f, 8.0f * S);
+        ImGui::AlignTextToFramePadding();
+        if (mt == 0) dimText("0 = automatic");
+
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        labeledField("Model context window");
+        int cw = s.contextWindow;  // 0 = auto
+        if (ImGui::InputInt("##ctxwindow", &cw, 1024, 8192)) {
+            if (cw < 0) cw = 0;
+            if (cw > 0 && cw < 2048) cw = 2048;
+            if (cw > 2000000) cw = 2000000;
+            s.contextWindow = cw;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The model's total token context window. 0 = automatic\n"
+                              "(cloud large; local 8192). Set your LOCAL server's real window so the\n"
+                              "agent trims the prompt to fit instead of overrunning it and breaking the run.");
+        ImGui::SameLine(0.0f, 8.0f * S);
+        ImGui::AlignTextToFramePadding();
+        if (cw == 0) dimText("0 = automatic");
+    }
+
+    };
+
+    auto drawManageModels = [&]() {
         dimText("Uncheck a model to hide it from the composer's model dropdown. Only available "
                 "models (keyed cloud / loaded local) appear there; this just trims that list.");
         ImGui::Dummy(ImVec2(0, 2 * S));
@@ -2706,17 +2765,67 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
                 if (!en) ImGui::EndDisabled();
             }
         }
-    }
+    };
 
+    auto drawPrivacy = [&]() {
     // ---- privacy / offline ----
-    ImGui::Dummy(ImVec2(0, 6 * S));
-    ImGui::SeparatorText("Privacy");
-    if (ImGui::Checkbox("Offline mode (local models only — no network egress)", &s.offlineMode))
+    if (ImGui::Checkbox("Offline mode (local models only \xe2\x80\x94 no network egress)", &s.offlineMode))
         changed = true;
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Refuses any cloud provider (Gemini, Anthropic, OpenAI). Only a local "
-                          "loopback endpoint is allowed. Enforced before every run.");
+        ImGui::SetTooltip("Refuses any cloud provider (Gemini, Anthropic, OpenAI, xAI, OpenRouter).\n"
+                          "Only a local loopback endpoint is allowed. Enforced before every run.");
+    // Session-local (not persisted): matches the composer Permissions popup + Copilot overlay.
+    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
+    dimText("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+
+    };
+
+    switch (section) {
+    case AiSettingsSection::ProviderModel:
+        drawProviderModel();
+        break;
+    case AiSettingsSection::Generation:
+        drawGeneration();
+        break;
+    case AiSettingsSection::Privacy:
+        drawPrivacy();
+        break;
+    case AiSettingsSection::ManageModels:
+        drawManageModels();
+        break;
+    case AiSettingsSection::All:
+        drawProviderModel();
+        ImGui::Dummy(ImVec2(0, 8 * S));
+        ImGui::SeparatorText("Generation");
+        drawGeneration();
+        ImGui::Dummy(ImVec2(0, 6 * S));
+        if (ImGui::CollapsingHeader("Manage models (chat picker)"))
+            drawManageModels();
+        ImGui::Dummy(ImVec2(0, 6 * S));
+        ImGui::SeparatorText("Privacy");
+        drawPrivacy();
+        break;
+    }
     return changed;
+}
+
+// Full form: Provider + Generation + (Manage models unless slim) + Privacy.
+bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
+    if (slim) {
+        // Compact: provider/model/auth + generation + privacy (no manage-models dump).
+        bool changed = false;
+        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::ProviderModel);
+        ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
+        ImGui::SeparatorText("Generation");
+        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::Generation);
+        ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
+        ImGui::SeparatorText("Privacy");
+        changed |= drawAiSettingsSection(st, busy, AiSettingsSection::Privacy);
+        return changed;
+    }
+    return drawAiSettingsSection(st, busy, AiSettingsSection::All);
 }
 
 // Compact AI-settings OVERLAY body — fills the Copilot chat area when the header gear is

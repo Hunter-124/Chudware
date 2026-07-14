@@ -1229,6 +1229,600 @@ def _as_face_query(q: Union[str, dict]) -> dict:
         return q
     return {"of": "face", "side": str(q)}
 
+# --------------------------------------------------------------------------- close-up inspection
+# doc_render_view / doc_render_png only accept a WHOLE-PART camera direction (no bbox/eye
+# override). Close-up inspection therefore: (1) resolve the target, (2) pick a face-normal
+# (or fit) view dir, (3) render the whole part from that dir, (4) CROP the PNG to the
+# projected target bbox + margin and upscale. Caption is honest about the crop fallback.
+_RENDER_W = 512
+_RENDER_H = 400
+_RENDER_FIT = 0.85  # matches core/doc/session.cpp render_view_to_rgb
+
+
+def _v3(v, default=(0.0, 0.0, 0.0)) -> tuple:
+    if isinstance(v, (list, tuple)) and len(v) >= 3:
+        try:
+            return (float(v[0]), float(v[1]), float(v[2]))
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
+def _vnorm(v) -> tuple:
+    x, y, z = _v3(v)
+    n = math.sqrt(x * x + y * y + z * z)
+    if n < 1e-12:
+        return (0.0, 0.0, 1.0)
+    return (x / n, y / n, z / n)
+
+
+def _vcross(a, b) -> tuple:
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _vdot(a, b) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vsub(a, b) -> tuple:
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _parse_inspect_target(target: Union[str, dict]) -> dict:
+    """Normalize an inspect target into either a geom-query dict or a feature-id handle.
+
+    Accepts:
+      * geom-query dict  {"of":"face","side":"top"} / {"of":"edge","parallel":"z"}
+      * bare side word   "top" / "+z"  -> face query
+      * feature id       "f2" / "F3"   -> {"feature_id": "f2"}
+      * plain phrase     "the filleted edge" / "fillet faces" — light NL expansion onto the
+                         same query vocabulary (round faces / circle edges / feature name).
+    """
+    if isinstance(target, dict):
+        if target.get("feature_id") or target.get("feature"):
+            fid = str(target.get("feature_id") or target.get("feature")).strip()
+            return {"feature_id": fid}
+        if "of" in target or target.get("kind") == "query":
+            return dict(target)
+        # Resolved selector dict (sid/kind/centroid) — pass through for measure / bbox.
+        if target.get("kind") in ("face", "edge") and target.get("centroid") is not None:
+            return {"selector": target}
+        return dict(target)
+
+    s = str(target).strip()
+    if not s:
+        raise ValueError("inspect target is empty — pass a face/edge query or feature id")
+
+    # Feature id from the tree: f1 / F12.
+    import re as _re
+    m = _re.fullmatch(r"[fF](\d+)", s)
+    if m:
+        return {"feature_id": f"f{m.group(1)}"}
+
+    low = s.lower()
+    # Strip leading articles so "the top face" still resolves.
+    low_bare = _re.sub(r"^(the|a|an)\s+", "", low).strip()
+
+    # Side-word face shortcuts (same as query_geometry bare words).
+    side_words = {
+        "top", "bottom", "front", "back", "left", "right",
+        "+z", "-z", "+y", "-y", "+x", "-x",
+    }
+    if low_bare in side_words or low in side_words:
+        return {"of": "face", "side": low_bare if low_bare in side_words else low}
+
+    # Fillet / round phrasing → round faces (prefer) or circular edges.
+    if any(w in low for w in ("fillet", "filleted", "rounded", "round edge", "round face")):
+        if "edge" in low:
+            return {"of": "edge", "surf": "circle"}
+        return {"of": "face", "surf": "round"}
+
+    if "chamfer" in low:
+        if "edge" in low:
+            return {"of": "edge", "surf": "line", "pick": "shortest"}
+        return {"of": "face", "surf": "plane", "pick": "smallest"}
+
+    # "top face" / "vertical edges" style: peel the of-kind suffix.
+    if low_bare.endswith(" faces") or low_bare.endswith(" face"):
+        stem = _re.sub(r"\s+faces?$", "", low_bare).strip()
+        if stem in side_words:
+            return {"of": "face", "side": stem}
+        if stem in ("round", "rounded", "curved", "cylindrical"):
+            return {"of": "face", "surf": "round"}
+        return {"of": "face", "side": stem}
+    if low_bare.endswith(" edges") or low_bare.endswith(" edge"):
+        stem = _re.sub(r"\s+edges?$", "", low_bare).strip()
+        if stem in ("vertical", "upright"):
+            return {"of": "edge", "parallel": "z"}
+        if stem in ("horizontal",):
+            return {"of": "edge", "parallel": "x"}  # not perfect; caller can refine
+        if stem in side_words:
+            return {"of": "edge", "side": stem}
+        if stem in ("round", "rounded", "filleted", "circular", "circle"):
+            return {"of": "edge", "surf": "circle"}
+        return {"of": "edge", "side": stem}
+
+    # Last resort: treat as a face side word (query_geometry convention).
+    return {"of": "face", "side": s}
+
+
+def _feature_owned_matches(doc_id: str, feature_id: str) -> list:
+    """Join doc_tree.owner_map to doc_query matches for a feature's owned faces+edges.
+
+    owner_map keys faces/edges as [body_id, topo_id] (1-based). doc_query enumerates the
+    LAST body in first-encounter order, so topo_id == match_index+1 on that body
+    (same join as gsl_tools.describe_part).
+    """
+    tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+    owner_map = tree.get("owner_map") or {}
+    om = owner_map.get(feature_id)
+    if not om:
+        # Also allow matching by feature name (case-insensitive).
+        feats = ((tree.get("tree") or {}).get("features")) or []
+        for f in feats:
+            if isinstance(f, dict) and str(f.get("name", "")).lower() == feature_id.lower():
+                feature_id = f.get("id") or feature_id
+                om = owner_map.get(feature_id)
+                break
+    if not om:
+        raise ValueError(
+            f"No feature {feature_id!r} in the tree owner_map — use get_part / describe_part "
+            f"to list feature ids (f1, f2, …).")
+
+    last_body = 0
+    for pair in (om.get("faces") or []) + (om.get("edges") or []):
+        if isinstance(pair, list) and len(pair) == 2:
+            last_body = max(last_body, int(pair[0]))
+    if last_body <= 0:
+        raise ValueError(f"Feature {feature_id!r} owns no faces/edges yet.")
+
+    face_topos = {int(p[1]) for p in (om.get("faces") or [])
+                  if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
+    edge_topos = {int(p[1]) for p in (om.get("edges") or [])
+                  if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
+
+    out: list = []
+    if face_topos:
+        faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
+                 .get("matches") or [])
+        for i, m in enumerate(faces):
+            if (i + 1) in face_topos:
+                out.append(m)
+    if edge_topos:
+        edges = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}})
+                 .get("matches") or [])
+        for i, m in enumerate(edges):
+            if (i + 1) in edge_topos:
+                out.append(m)
+    if not out:
+        raise ValueError(
+            f"Feature {feature_id!r} is in the tree but no owned faces/edges resolved "
+            f"(body={last_body}).")
+    return out
+
+
+def _resolve_inspect_target(doc_id: str, target: Union[str, dict]) -> dict:
+    """Resolve target → {matches, query, label, kind}.
+
+    For a single-face/edge inspect we keep ALL matches when the target is a feature (so
+    the crop frames the whole feature). For a geom-query we accept 1+ matches and union
+    their bboxes; 0 matches raises a graceful error.
+    """
+    parsed = _parse_inspect_target(target)
+    if "feature_id" in parsed:
+        matches = _feature_owned_matches(doc_id, parsed["feature_id"])
+        return {
+            "matches": matches,
+            "query": parsed,
+            "label": f"feature {parsed['feature_id']}",
+            "kind": "feature",
+            "feature_id": parsed["feature_id"],
+        }
+    if "selector" in parsed:
+        return {
+            "matches": [parsed["selector"]],
+            "query": parsed["selector"],
+            "label": parsed["selector"].get("sid") or "selector",
+            "kind": parsed["selector"].get("kind") or "face",
+        }
+
+    q = parsed if isinstance(parsed, dict) else _as_face_query(parsed)
+    res = cb.call("doc_query", {"doc_id": doc_id, "query": q})
+    matches = list(res.get("matches") or [])
+    if not matches:
+        raise ValueError(
+            f"No geometry matched inspect target {target!r} "
+            f"(resolved query {q!r}). Use query_geometry(...) to explore faces/edges, "
+            f"or pass a feature id from the tree (f1, f2, …).")
+    kind = matches[0].get("kind") or q.get("of") or "face"
+    # Compact label for captions.
+    if isinstance(target, str):
+        label = target.strip()
+    else:
+        label = (q.get("side") or q.get("surf") or kind)
+        label = f"{kind} ({label})"
+    return {"matches": matches, "query": q, "label": label, "kind": kind}
+
+
+def _match_point_cloud(doc_id: str, match: dict) -> list:
+    """World-space sample points for a match (face triangulation, else centroid ± radius)."""
+    pts: list = []
+    if match.get("kind") == "face" or (match.get("surf") and match.get("kind") != "edge"):
+        try:
+            fp = cb.call("doc_face_points", {"doc_id": doc_id, "selector": match})
+            for p in fp.get("points") or []:
+                if isinstance(p, (list, tuple)) and len(p) >= 3:
+                    pts.append((float(p[0]), float(p[1]), float(p[2])))
+        except Exception:  # noqa: BLE001
+            pass
+    # If face points already frame the subshape, stop — do NOT inflate with a seed box
+    # derived from area_or_len (a large planar face would explode the crop).
+    if len(pts) >= 3:
+        return pts
+
+    if match.get("centroid") is None:
+        return pts
+    c = _v3(match.get("centroid"))
+    pts.append(c)
+    r = match.get("radius")
+    try:
+        rr = float(r) if r is not None else 0.0
+    except (TypeError, ValueError):
+        rr = 0.0
+    al = match.get("area_or_len")
+    try:
+        extent = float(al) if al is not None else 0.0
+    except (TypeError, ValueError):
+        extent = 0.0
+    # Seed a small box so edges without face points still project to a crop.
+    # Prefer radius (fillet/circle); fall back to a modest fraction of length/area.
+    if rr > 0:
+        half = max(rr, 1.0)
+    elif match.get("kind") == "edge" and extent > 0:
+        half = max(extent * 0.5, 1.0)  # half-length along an edge
+    elif extent > 0:
+        half = max(math.sqrt(extent) * 0.5, 1.0)
+    else:
+        half = 1.0
+    axis = _vnorm(match.get("axis") or match.get("normal") or (0, 0, 1))
+    seed = (1.0, 0.0, 0.0) if abs(axis[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = _vnorm(_vcross(axis, seed))
+    v = _vnorm(_vcross(axis, u))
+    for su in (-half, half):
+        for sv in (-half, half):
+            for sa in (-half * 0.25, half * 0.25):
+                pts.append((c[0] + su * u[0] + sv * v[0] + sa * axis[0],
+                            c[1] + su * u[1] + sv * v[1] + sa * axis[1],
+                            c[2] + su * u[2] + sv * v[2] + sa * axis[2]))
+    return pts
+
+
+
+def _bbox_from_points(pts: list) -> dict:
+    if not pts:
+        raise ValueError("empty point set — cannot build target bbox")
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]; zs = [p[2] for p in pts]
+    mn = (min(xs), min(ys), min(zs))
+    mx = (max(xs), max(ys), max(zs))
+    size = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
+    center = ((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5)
+    # Degenerate (point/edge) — pad so projection has non-zero extent.
+    pad = max(max(size) * 0.05, 0.5)
+    size = (max(size[0], pad), max(size[1], pad), max(size[2], pad))
+    mn = (center[0] - size[0] * 0.5, center[1] - size[1] * 0.5, center[2] - size[2] * 0.5)
+    mx = (center[0] + size[0] * 0.5, center[1] + size[1] * 0.5, center[2] + size[2] * 0.5)
+    return {"min": mn, "max": mx, "size": size, "center": center}
+
+
+def _target_bbox(doc_id: str, matches: list) -> dict:
+    pts: list = []
+    for m in matches:
+        pts.extend(_match_point_cloud(doc_id, m))
+    return _bbox_from_points(pts)
+
+
+def _camera_dir_for_target(matches: list, view: Optional[Union[str, dict]] = None) -> tuple:
+    """Pick a scene->camera direction. auto = mean face normal (faces) or iso-toward-centroid."""
+    if view is None or view == "auto":
+        normals = []
+        for m in matches:
+            n = m.get("normal")
+            if isinstance(n, (list, tuple)) and len(n) == 3:
+                normals.append(_vnorm(n))
+        if normals:
+            acc = [0.0, 0.0, 0.0]
+            for n in normals:
+                # Flip so the sum doesn't cancel antiparallel pairs.
+                if acc[0] or acc[1] or acc[2]:
+                    if _vdot(tuple(acc), n) < 0:
+                        n = (-n[0], -n[1], -n[2])
+                acc[0] += n[0]; acc[1] += n[1]; acc[2] += n[2]
+            return _vnorm(tuple(acc))
+        # Edges / no normals: look from a mild iso that faces +Z-up content.
+        return _vnorm((1.0, 1.0, 0.8))
+
+    if isinstance(view, str):
+        named = {
+            "front": (0.0, -1.0, 0.0), "back": (0.0, 1.0, 0.0),
+            "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+            "top": (0.0, 0.0, 1.0), "bottom": (0.0, 0.0, -1.0),
+            "iso": _vnorm((1.0, 1.0, 0.8)),
+        }
+        if view.lower() in named:
+            return named[view.lower()]
+        raise ValueError(f"Unknown named view {view!r}")
+
+    if isinstance(view, dict):
+        if "dir" in view:
+            return _vnorm(view["dir"])
+        if "azimuth" in view or "elevation" in view:
+            # Match doc_render_view convention: az 0 = front (−Y), 90 = right (+X); el 90 = top.
+            az = math.radians(float(view.get("azimuth", 0.0)))
+            el = math.radians(float(view.get("elevation", 20.0)))
+            # scene->camera
+            x = math.sin(az) * math.cos(el)
+            y = -math.cos(az) * math.cos(el)
+            z = math.sin(el)
+            return _vnorm((x, y, z))
+    raise ValueError(f"Unsupported view spec {view!r}")
+
+
+def _part_render_frame(part_bbox: dict, view_dir: tuple,
+                       W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
+    """Reproduce the orthographic projection frame of core render_view_to_rgb.
+
+    Returns {center, r, u, d, scale, cu, cv, W, H} so world points can be mapped to
+    screen pixels the same way the C++ software rasterizer does (fit scale 0.85).
+    """
+    c = _v3(part_bbox.get("center"))
+    d = _vnorm(view_dir)
+    up_ref = (0.0, 1.0, 0.0) if abs(d[2]) > 0.985 else (0.0, 0.0, 1.0)
+    r = _vnorm(_vcross(up_ref, d))
+    u = _vcross(d, r)  # already unit if r,d unit + orthogonal
+    u = _vnorm(u)
+
+    # Project the 8 corners of the part bbox to find screen extents (same as C++ mesh walk
+    # for axis-aligned bounds — exact for the bbox, slightly conservative for the mesh).
+    mn = _v3(part_bbox.get("min"))
+    mx = _v3(part_bbox.get("max"))
+    corners = [(x, y, z)
+               for x in (mn[0], mx[0])
+               for y in (mn[1], mx[1])
+               for z in (mn[2], mx[2])]
+    us, vs = [], []
+    for p in corners:
+        dp = _vsub(p, c)
+        us.append(_vdot(dp, r))
+        vs.append(_vdot(dp, u))
+    minu, maxu = min(us), max(us)
+    minv, maxv = min(vs), max(vs)
+    scale = _RENDER_FIT * min(W / max(maxu - minu, 1e-6), H / max(maxv - minv, 1e-6))
+    cu = 0.5 * (minu + maxu)
+    cv = 0.5 * (minv + maxv)
+    return {"center": c, "r": r, "u": u, "d": d, "scale": scale,
+            "cu": cu, "cv": cv, "W": W, "H": H}
+
+
+def _world_to_screen(pt, frame: dict) -> tuple:
+    dp = _vsub(_v3(pt), frame["center"])
+    pu = _vdot(dp, frame["r"])
+    pv = _vdot(dp, frame["u"])
+    sx = (pu - frame["cu"]) * frame["scale"] + frame["W"] / 2.0
+    sy = frame["H"] / 2.0 - (pv - frame["cv"]) * frame["scale"]
+    return (sx, sy)
+
+
+def _crop_rect_for_target(part_bbox: dict, target_bbox: dict, view_dir: tuple,
+                          margin: float = 0.15, zoom_factor: float = 1.0,
+                          W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
+    """Pixel crop rectangle that frames the target's projected bbox.
+
+    margin: fractional padding of the projected target size (0.15 = 15% on each side).
+    zoom_factor: >1 tightens the crop (more zoom), <1 loosens. Clamped to keep a usable window.
+    Returns {x0,y0,x1,y1, method:"crop"} in pixel coords (inclusive-exclusive style for PIL).
+    """
+    frame = _part_render_frame(part_bbox, view_dir, W, H)
+    tmin = _v3(target_bbox.get("min"))
+    tmax = _v3(target_bbox.get("max"))
+    corners = [(x, y, z)
+               for x in (tmin[0], tmax[0])
+               for y in (tmin[1], tmax[1])
+               for z in (tmin[2], tmax[2])]
+    sxs, sys_ = [], []
+    for p in corners:
+        sx, sy = _world_to_screen(p, frame)
+        sxs.append(sx); sys_.append(sy)
+    minx, maxx = min(sxs), max(sxs)
+    miny, maxy = min(sys_), max(sys_)
+    # Ensure a minimum projected size so thin edges still crop to something visible.
+    if maxx - minx < 4:
+        mid = 0.5 * (minx + maxx); minx, maxx = mid - 2, mid + 2
+    if maxy - miny < 4:
+        mid = 0.5 * (miny + maxy); miny, maxy = mid - 2, mid + 2
+
+    zf = max(float(zoom_factor), 0.25)
+    # zoom_factor>1 → shrink the window around the target center.
+    cx, cy = 0.5 * (minx + maxx), 0.5 * (miny + maxy)
+    half_w = 0.5 * (maxx - minx) / zf
+    half_h = 0.5 * (maxy - miny) / zf
+    minx, maxx = cx - half_w, cx + half_w
+    miny, maxy = cy - half_h, cy + half_h
+
+    pad_x = max((maxx - minx) * float(margin), 4.0)
+    pad_y = max((maxy - miny) * float(margin), 4.0)
+    x0 = int(math.floor(minx - pad_x))
+    y0 = int(math.floor(miny - pad_y))
+    x1 = int(math.ceil(maxx + pad_x))
+    y1 = int(math.ceil(maxy + pad_y))
+    # Clamp to image; if the target projected off-frame, fall back to a center window.
+    x0 = max(0, min(x0, W - 1))
+    y0 = max(0, min(y0, H - 1))
+    x1 = max(x0 + 1, min(x1, W))
+    y1 = max(y0 + 1, min(y1, H))
+    # Keep a usable minimum crop so upscale has something to work with.
+    min_side = 32
+    if (x1 - x0) < min_side:
+        mid = (x0 + x1) // 2
+        x0 = max(0, mid - min_side // 2)
+        x1 = min(W, x0 + min_side)
+    if (y1 - y0) < min_side:
+        mid = (y0 + y1) // 2
+        y0 = max(0, mid - min_side // 2)
+        y1 = min(H, y0 + min_side)
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "method": "crop", "W": W, "H": H,
+            "view_dir": list(view_dir)}
+
+
+def _crop_png_to_rect(src_png: str, rect: dict, out_png: Optional[str] = None,
+                      out_size: tuple = (_RENDER_W, _RENDER_H)) -> str:
+    """Crop src_png to rect and upscale to out_size. Returns the output path."""
+    from PIL import Image as PILImage  # noqa: PLC0415
+    out_png = out_png or _tmp(".png")
+    with PILImage.open(src_png) as im:
+        im = im.convert("RGB")
+        crop = im.crop((rect["x0"], rect["y0"], rect["x1"], rect["y1"]))
+        # NEAREST keeps the software-rasterizer's hard edges readable; BICUBIC softens labels.
+        try:
+            resample = PILImage.Resampling.BICUBIC
+        except AttributeError:  # pragma: no cover — older Pillow
+            resample = PILImage.BICUBIC
+        crop = crop.resize(out_size, resample)
+        crop.save(out_png, format="PNG")
+    return out_png
+
+
+def _measure_match(doc_id: str, match: dict) -> dict:
+    """Best-effort intrinsic measure of one match (area/length/radius)."""
+    out = {
+        "sid": match.get("sid"),
+        "kind": match.get("kind"),
+        "surf": match.get("surf"),
+        "side": match.get("side"),
+        "centroid": match.get("centroid"),
+        "radius": match.get("radius"),
+        "area_or_len": match.get("area_or_len"),
+        "normal": match.get("normal"),
+        "axis": match.get("axis"),
+    }
+    try:
+        m = cb.call("eval_measure", {"doc_id": doc_id, "refs": [match]})
+        out["measure"] = m
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _inspect_caption(doc_id: str, resolved: dict, target_bbox: dict, view_dir: tuple,
+                     method: str, n_matches: int) -> str:
+    """Text caption: what's framed + key dims so non-vision models still get a read."""
+    size = target_bbox.get("size") or (0, 0, 0)
+    center = target_bbox.get("center") or (0, 0, 0)
+    dims = (f"{size[0]:.3g}×{size[1]:.3g}×{size[2]:.3g} mm"
+            if isinstance(size, (list, tuple)) and len(size) >= 3 else "?")
+    cstr = (f"[{center[0]:.3g}, {center[1]:.3g}, {center[2]:.3g}]"
+            if isinstance(center, (list, tuple)) and len(center) >= 3 else "?")
+    dir_s = f"[{view_dir[0]:.2f}, {view_dir[1]:.2f}, {view_dir[2]:.2f}]"
+
+    # Key dims from the first few matches.
+    dim_bits = []
+    for m in (resolved.get("matches") or [])[:4]:
+        info = _measure_match(doc_id, m)
+        bit = info.get("sid") or info.get("kind") or "?"
+        meas = info.get("measure") or {}
+        if meas.get("kind") == "area" and meas.get("area") is not None:
+            bit += f" area={meas['area']:.4g} mm²"
+        elif meas.get("kind") == "length" and meas.get("length") is not None:
+            bit += f" length={meas['length']:.4g} mm"
+        elif meas.get("kind") == "radius" and meas.get("radius") is not None:
+            bit += f" radius={meas['radius']:.4g} mm"
+        elif info.get("radius") is not None:
+            bit += f" radius={info['radius']:.4g} mm"
+        elif info.get("area_or_len") is not None:
+            bit += f" size={info['area_or_len']:.4g}"
+        if info.get("surf"):
+            bit += f" ({info['surf']}"
+            if info.get("side"):
+                bit += f", {info['side']}"
+            bit += ")"
+        dim_bits.append(bit)
+
+    method_note = (
+        "Close-up via whole-part render + projected-bbox CROP/upscale "
+        "(doc_render_view has no bbox/eye camera override)."
+        if method == "crop" else
+        f"Render method: {method}."
+    )
+    parts = [
+        f"Close-up of {resolved.get('label')!r} "
+        f"({n_matches} subshape{'s' if n_matches != 1 else ''}).",
+        f"Target bbox {dims} centered at {cstr}.",
+        f"Camera dir (scene→camera) {dir_s}.",
+        method_note,
+    ]
+    if dim_bits:
+        parts.append("Key dims: " + "; ".join(dim_bits) + ".")
+    return " ".join(parts)
+
+
+def _orbit_view_dirs(base_dir: tuple, n: int = 4) -> list:
+    """N scene->camera dirs orbiting around world +Z (or base's perpendicular) at 90° steps.
+
+    First view is the base_dir itself; subsequent views rotate base around a stable up axis.
+    """
+    n = max(int(n), 1)
+    base = _vnorm(base_dir)
+    # Orbit axis: world +Z unless base is nearly parallel to it.
+    axis = (0.0, 0.0, 1.0)
+    if abs(_vdot(base, axis)) > 0.9:
+        axis = (0.0, 1.0, 0.0)
+    # Rodrigues rotation of base around axis.
+    def _rot(v, ax, ang):
+        ca, sa = math.cos(ang), math.sin(ang)
+        # v cos + (ax×v) sin + ax (ax·v) (1-cos)
+        cross = _vcross(ax, v)
+        dot = _vdot(ax, v)
+        return _vnorm((
+            v[0] * ca + cross[0] * sa + ax[0] * dot * (1 - ca),
+            v[1] * ca + cross[1] * sa + ax[1] * dot * (1 - ca),
+            v[2] * ca + cross[2] * sa + ax[2] * dot * (1 - ca),
+        ))
+    out = []
+    for i in range(n):
+        ang = (2.0 * math.pi * i) / n
+        out.append(_rot(base, axis, ang) if i else base)
+    return out
+
+
+def _tile_pngs(png_paths: list, out_png: str, labels: Optional[list] = None) -> str:
+    """Tile PNGs into a contact-sheet-like grid (2 columns)."""
+    from PIL import Image as PILImage, ImageDraw, ImageFont  # noqa: PLC0415
+    if not png_paths:
+        raise ValueError("no tiles to compose")
+    imgs = [PILImage.open(p).convert("RGB") for p in png_paths]
+    try:
+        tw, th = imgs[0].size
+        cols = 2 if len(imgs) > 1 else 1
+        rows = (len(imgs) + cols - 1) // cols
+        sheet = PILImage.new("RGB", (tw * cols, th * rows), (245, 245, 245))
+        draw = ImageDraw.Draw(sheet)
+        for i, im in enumerate(imgs):
+            r, c = divmod(i, cols)
+            sheet.paste(im.resize((tw, th)), (c * tw, r * th))
+            if labels and i < len(labels):
+                draw.text((c * tw + 6, r * th + 4), str(labels[i]), fill=(20, 20, 20))
+        sheet.save(out_png, format="PNG")
+        return out_png
+    finally:
+        for im in imgs:
+            try:
+                im.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 
 def _resolve_drawing_view_id(doc_id: str, view_id: str) -> str:
     """D7: Accept a numeric view-id (v1, v2, …) OR an orientation string ("front", "top", …).
@@ -1789,6 +2383,9 @@ WORKFLOW
                                             render_part(view="right" | {"azimuth":30,"elevation":20})
                                             for a specific angle; contact_sheet() for several
                                             labelled views (front/right/top/iso) in one image.
+                                            inspect_part(target) for a CLOSE-UP of one face/edge/
+                                            feature (zoom/pan like a human); look_around(target)
+                                            for N orbit close-ups of the same target.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
                                             persists in the .step+ and shows in render_part.
@@ -1851,6 +2448,9 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
                          from B-rep normals with NO occlusion modeling (says so inline). This is
                          the non-vision self-review step; do it instead of skipping the review.
+  inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
+                         face-normal camera + projected-bbox crop. Caption carries key dims.
+  look_around(target)    N orbit close-ups of the same target tiled as a contact sheet.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared
@@ -3327,6 +3927,125 @@ def register_cad_tools(mcp: FastMCP) -> None:
             raise ValueError(
                 f"Contact sheet failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
         return _captioned_render(png, d, view_list)
+
+    @mcp.tool()
+    def inspect_part(target: Union[str, dict],
+                     doc_id: Optional[str] = None,
+                     view: Optional[Union[str, dict]] = "auto",
+                     zoom_factor: float = 1.5,
+                     margin: float = 0.15,
+                     annotate: bool = True) -> list:
+        """CLOSE-UP inspection of a face/edge/feature — zoom/pan like a human scanning a part.
+
+        `render_part` / `contact_sheet` show the WHOLE part. Use this when you are working on a
+        specific feature and need the same kind of view a person gets by panning onto it:
+        the target framed tight, from a sensible direction, with key dims in the caption.
+
+        target: plain-word face/edge query (same vocabulary as query_geometry / measure_between
+          — e.g. "top", {"of":"face","side":"top"}, {"of":"edge","surf":"circle"},
+          "the filleted edge") OR a feature id from the tree ("f2").
+        view: "auto" (default) = look along the target's face normal (or a mild iso for edges);
+          or a named view / {"azimuth","elevation"} / {"dir":[x,y,z]} like render_part.
+        zoom_factor: >1 tightens the crop (more zoom). Default 1.5.
+        margin: fractional padding around the projected target bbox (default 0.15).
+        annotate: pass through to the underlying render (face labels / triad on by default).
+
+        Returns [image, caption]. Caption names what is framed + key dims of the target so a
+        non-vision model still gets the text equivalent. Method note: the render RPC only
+        accepts a whole-part camera *direction* (no bbox/eye override), so the close-up is a
+        whole-part render from the chosen dir, then a projected-bbox CROP + upscale.
+
+        For multi-angle scanning of the same target, use look_around(...).
+        """
+        d = _doc(doc_id)
+        resolved = _resolve_inspect_target(d, target)
+        matches = resolved["matches"]
+        target_bb = _target_bbox(d, matches)
+        try:
+            part_bb = cb.call("doc_bbox", {"doc_id": d})
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"doc_bbox failed: {e}") from e
+        if not part_bb or not part_bb.get("size"):
+            raise ValueError("no part bounding box — build geometry first")
+
+        view_dir = _camera_dir_for_target(matches, view)
+        png_full = _tmp(".png")
+        r = cb.call("doc_render_view", {
+            "doc_id": d, "out_path": png_full,
+            "view": {"dir": list(view_dir)},
+            # annotate is accepted by doc_render_png; doc_render_view always annotates today.
+            # Pass it for forward-compat; ignored harmlessly if unsupported.
+            "annotate": bool(annotate),
+        })
+        if not r.get("ok") or not os.path.exists(png_full):
+            # Fall back to legacy iso if a custom dir failed for any reason.
+            r2 = cb.call("doc_render_png",
+                         {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
+            if not r2.get("ok") or not os.path.exists(png_full):
+                raise ValueError(
+                    f"Inspect render failed: {r.get('reason', r.get('error', 'no bodies'))}")
+            view_dir = _vnorm((1.0, 1.0, 0.8))
+
+        rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
+                                    margin=float(margin), zoom_factor=float(zoom_factor))
+        png_out = _tmp(".png")
+        _crop_png_to_rect(png_full, rect, png_out)
+        caption = _inspect_caption(d, resolved, target_bb, view_dir,
+                                   method="crop", n_matches=len(matches))
+        return [Image(path=png_out), caption]
+
+    @mcp.tool()
+    def look_around(target: Union[str, dict],
+                    doc_id: Optional[str] = None,
+                    n_views: int = 4,
+                    zoom_factor: float = 1.25,
+                    margin: float = 0.2,
+                    annotate: bool = True) -> list:
+        """Orbit close-ups of a target as a contact sheet — 'scan the part' around one feature.
+
+        Resolves `target` the same way as inspect_part, then renders N close-ups (default 4 at
+        90° steps) orbiting the auto face-normal view and tiles them into one image.
+
+        Returns [image, caption]. Caption lists the orbit dirs + target dims. Same crop-fallback
+        method as inspect_part (whole-part render + projected-bbox crop per tile).
+        """
+        d = _doc(doc_id)
+        resolved = _resolve_inspect_target(d, target)
+        matches = resolved["matches"]
+        target_bb = _target_bbox(d, matches)
+        part_bb = cb.call("doc_bbox", {"doc_id": d})
+        if not part_bb or not part_bb.get("size"):
+            raise ValueError("no part bounding box — build geometry first")
+
+        base = _camera_dir_for_target(matches, "auto")
+        dirs = _orbit_view_dirs(base, n=max(int(n_views), 1))
+        tile_paths = []
+        labels = []
+        for i, vd in enumerate(dirs):
+            png_full = _tmp(".png")
+            r = cb.call("doc_render_view", {
+                "doc_id": d, "out_path": png_full,
+                "view": {"dir": list(vd)}, "annotate": bool(annotate),
+            })
+            if not r.get("ok") or not os.path.exists(png_full):
+                continue
+            rect = _crop_rect_for_target(part_bb, target_bb, vd,
+                                        margin=float(margin), zoom_factor=float(zoom_factor))
+            png_tile = _tmp(".png")
+            _crop_png_to_rect(png_full, rect, png_tile)
+            tile_paths.append(png_tile)
+            labels.append(f"orbit {i * (360 // max(len(dirs), 1))}°")
+        if not tile_paths:
+            raise ValueError("look_around: every orbit render failed")
+        out = _tmp(".png")
+        _tile_pngs(tile_paths, out, labels=labels)
+        caption = (
+            f"Look-around of {resolved.get('label')!r}: {len(tile_paths)} orbit close-ups. "
+            + _inspect_caption(d, resolved, target_bb, base, method="crop",
+                               n_matches=len(matches))
+        )
+        return [Image(path=out), caption]
+
 
     @mcp.tool()
     def set_material(material: Union[str, dict, list],

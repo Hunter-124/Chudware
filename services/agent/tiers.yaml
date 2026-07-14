@@ -38,10 +38,11 @@ local_models:
 # Parameterized paid tiers (gym multi-provider benchmark / leaderboard):
 #   openrouter:<model-id>  e.g. openrouter:anthropic/claude-opus-4
 #   openrouter:openai/gpt-4o
-# Resolved by services.agent.tiers.provider_for_tier → OpenRouterProvider with
-# that model id and OPENROUTER_API_KEY / config openrouter.api_key. Effort
-# budgets reuse the frontier profile (see tiers.effort_tier_for). These are
-# NOT listed as static profiles below — the model id is the tier parameter.
+#   xai:<model-id>         e.g. xai:grok-4.5  (or xai:grok-4-5)
+# Resolved by services.agent.tiers.provider_for_tier → OpenRouterProvider /
+# xai-sub (OAuth when connected) / xai (API key). Effort budgets reuse the
+# frontier profile (see tiers.effort_tier_for). These are NOT listed as static
+# profiles below — the model id is the tier parameter.
 
 profiles:
   local-24k:

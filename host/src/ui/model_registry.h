@@ -105,8 +105,10 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_OPENAI, "o3", "OpenAI o3", false, true},
         // xAI Grok — multimodal on 4.x; reasoning variants expose effort.
         // Model ids from hermes-agent catalog / console.x.ai (2026).
-        {PROV_XAI, "grok-4", "Grok 4", true, true},
+        // grok-4.5 is the current default (500k context; ~$2/$6 per Mtok).
+        {PROV_XAI, "grok-4.5", "Grok 4.5 (default, 500k)", true, true},
         {PROV_XAI, "grok-4-1", "Grok 4.1", true, true},
+        {PROV_XAI, "grok-4", "Grok 4", true, true},
         {PROV_XAI, "grok-4.20-0309-reasoning", "Grok 4.20 Reasoning", true, true},
         {PROV_XAI, "grok-build-0.1", "Grok Build 0.1", true, false},
     };
@@ -224,6 +226,8 @@ inline int defaultContextWindowForModel(int provider, const std::string& id) {
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
     if (has("qwen") || has("deepseek")) return 128000;
+    // Grok 4.5 ships with a 500k context window; older grok-4.x is ~128k.
+    if (has("grok-4.5") || has("grok-4-5")) return 500000;
     if (has("grok")) return 131072;
     switch (provider) {
         case PROV_GEMINI: return 1048576;

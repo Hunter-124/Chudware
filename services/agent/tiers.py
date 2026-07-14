@@ -272,16 +272,39 @@ def parse_openrouter_tier(tier: str) -> str | None:
     return model_id or None
 
 
+def parse_xai_tier(tier: str) -> str | None:
+    """Return the xAI model id when *tier* is ``xai:<model-id>``.
+
+    Examples::
+
+        xai:grok-4.5   →  "grok-4.5"
+        xai:grok-4-5   →  "grok-4-5"   (hyphen form also accepted)
+        xai:grok-4-1   →  "grok-4-1"
+
+    Returns ``None`` for any other tier string. Gym CLI / leaderboard use this
+    the same way as :func:`parse_openrouter_tier`.
+    """
+    if not tier or not isinstance(tier, str):
+        return None
+    prefix = "xai:"
+    if not tier.startswith(prefix):
+        return None
+    model_id = tier[len(prefix):].strip()
+    return model_id or None
+
+
 def effort_tier_for(tier: str | None) -> str | None:
     """Map a gym/CLI tier string onto a tiers.yaml profile name for effort.
 
-    Parameterized ``openrouter:<model-id>`` paid tiers reuse the ``frontier``
-    budget profile (same context class). Local / mid / frontier names pass
-    through unchanged so resolve_effort keeps working.
+    Parameterized ``openrouter:<model-id>`` and ``xai:<model-id>`` paid tiers
+    reuse the ``frontier`` budget profile (same context class). Local / mid /
+    frontier names pass through unchanged so resolve_effort keeps working.
     """
     if not tier:
         return tier
     if parse_openrouter_tier(tier) is not None:
+        return "frontier"
+    if parse_xai_tier(tier) is not None:
         return "frontier"
     return tier
 
@@ -312,10 +335,15 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     from config / ``OPENROUTER_API_KEY``. This is the multi-provider benchmark
     path that feeds the leaderboard (contracts/leaderboard.md).
 
+    Parameterized xAI tiers use ``xai:<model-id>`` (e.g. ``xai:grok-4.5`` /
+    ``xai:grok-4-5``). They prefer the SuperGrok subscription provider
+    (``xai-sub``) when a credential is stored, else fall back to the classic
+    API-key provider (``xai`` / ``XAI_API_KEY``).
+
     An explicit ``AI_CAD_PROVIDER`` env override always wins (tests pin it to
     ``mock``; a human can force a frontier key even for a nominally local
-    tier run). Every non-local, non-openrouter tier (``mid`` / ``frontier`` /
-    ``None``/unset) falls straight through to the ordinary
+    tier run). Every non-local, non-openrouter, non-xai tier (``mid`` /
+    ``frontier`` / ``None``/unset) falls straight through to the ordinary
     ``config.get_provider()`` resolution — behaviour is UNCHANGED for any
     caller that does not pass a tier at all, which is the point: this is a
     targeted fix, not a change to cloud-default usage.
@@ -345,6 +373,37 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
         merged_cfg["model"] = or_model
         merged_cfg.setdefault("openrouter", oc)
         return _config.get_provider("openrouter", cfg=merged_cfg)
+
+    # Parameterized xAI paid tiers: xai:<model-id>
+    # Prefer subscription OAuth when a credential is present; else API key.
+    xai_model = parse_xai_tier(tier) if tier else None
+    if xai_model is not None:
+        from services.agent.providers import sub_auth as _sub_auth
+        from services.agent.providers.xai_sub_provider import PROVIDER_ID as _XAI_SUB_ID
+
+        merged_cfg = dict(cfg or {})
+        # Normalise common CLI hyphen form (grok-4-5) to the dotted wire id
+        # (grok-4.5) when that is the documented slug; leave other ids alone.
+        wire_model = xai_model
+        if wire_model == "grok-4-5":
+            wire_model = "grok-4.5"
+        elif wire_model == "grok-4-1":
+            wire_model = "grok-4-1"  # already the catalog form
+        merged_cfg["model"] = wire_model
+
+        sub_cred = _sub_auth.load_credential(_XAI_SUB_ID)
+        if sub_cred and sub_cred.get("access_token"):
+            return _config.get_provider("xai-sub", cfg=merged_cfg)
+
+        xc = dict(merged_cfg.get("xai") or {})
+        key = (
+            xc.get("api_key")
+            or merged_cfg.get("api_key")
+            or os.environ.get("XAI_API_KEY")
+        )
+        merged_cfg["api_key"] = key
+        merged_cfg.setdefault("xai", xc)
+        return _config.get_provider("xai", cfg=merged_cfg)
 
     if not tier or not tier.startswith("local"):
         return _config.get_provider(cfg=cfg)
@@ -445,11 +504,10 @@ def resolve_effort(tier: str, **kwargs):
     pipeline, the design gym and the settings GUI all resolve through this ONE
     path.  Import is deferred (mirrors grammar_for_tier) to avoid cycles —
     effort.py imports this module.
-
-    Parameterized ``openrouter:<model-id>`` paid tiers share the frontier
-    budget profile (see :func:`effort_tier_for`).
+    Parameterized ``openrouter:<model-id>`` / ``xai:<model-id>`` paid tiers
+    share the frontier budget profile (see :func:`effort_tier_for`).
     """
-    # openrouter:<model-id> paid tiers share the frontier budget profile.
+    # openrouter:/xai: paid tiers share the frontier budget profile.
     tier = effort_tier_for(tier)
     from services.agent.effort import resolve_effort as _resolve
     return _resolve(tier, **kwargs)

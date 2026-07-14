@@ -14,14 +14,16 @@ several in one cycle (real hardware) to find the best local-model config:
       --tiers local-24k,local-24k-gemma3-qat,local-24k-gemma4-e4b
 
 Multi-provider paid tiers (leaderboard path): ``openrouter:<model-id>`` resolves
-to OpenRouterProvider with that model (OPENROUTER_API_KEY / config). Example:
+to OpenRouterProvider with that model (OPENROUTER_API_KEY / config). ``xai:<model-id>``
+resolves to the SuperGrok subscription provider when signed in, else the xAI API-key
+provider (XAI_API_KEY). Example:
 
   python3 -m tools.flywheel.bench.gym.cli run --real \\
-      --tiers openrouter:anthropic/claude-opus-4,openrouter:openai/gpt-4o --challenges C1
+      --tiers openrouter:anthropic/claude-opus-4,xai:grok-4-5 --challenges C1
 
 Diagnostic suites (leaderboard axes — never folded into primary pass rate):
 
-  python3 -m tools.flywheel.bench.gym.cli diag --tiers openrouter:anthropic/claude-opus-4
+  python3 -m tools.flywheel.bench.gym.cli diag --tiers xai:grok-4-5
   python -m tools.flywheel.bench.gym.leaderboard build
 
 No "council" (multi-model debate/judge) tier exists yet: services/agent/councils.py's
@@ -178,11 +180,11 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="run the challenge matrix + report")
     r.add_argument("--cycle", default="cycle-1")
     r.add_argument("--tiers", default=None,
-                   help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4 "
+                   help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4,xai:grok-4-5 "
                         "— local tokenmaxxing tiers: local-24k (qwen3-4b), "
                         "local-24k-gemma3-qat (gemma3-4b-qat, full GBNF), "
                         "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
-                        "paid: openrouter:<model-id> (OPENROUTER_API_KEY)")
+                        "paid: openrouter:<model-id> (OPENROUTER_API_KEY), xai:<model-id> (OAuth or XAI_API_KEY)")
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
     r.add_argument("--real", action="store_true",
@@ -194,7 +196,7 @@ def main(argv=None) -> int:
 
     d = sub.add_parser("diag", help="run diagnostic suites (leaderboard axes)")
     d.add_argument("--tiers", default="local-24k",
-                   help="comma list of tiers, e.g. local-24k,openrouter:anthropic/claude-opus-4")
+                   help="comma list of tiers, e.g. local-24k,openrouter:anthropic/claude-opus-4,xai:grok-4-5")
     d.add_argument("--axes", default=None,
                    help="comma list of axes (default: all four): "
                         "tool_validity,vision_fix,feature_id,vc_hygiene")

@@ -62,3 +62,18 @@ evaluated yet"), never an error.
 - Honest-zero policy: real runs that fail publish their real numbers. Mock/smoke runs
   MUST set `"task_suite"` with a `-MOCK` suffix and the GUI must badge them.
 - Producers append cycles; consumers must tolerate unknown extra keys (forward compat).
+
+## Additive extension (2026-07-14): divisions + discipline (`aicad.leaderboard/1` remains)
+
+Producers MAY add, consumers MUST tolerate (all optional, additive-only):
+
+- Per model: `divisions.{local|open}` = `{ pass_rate, cells_total, cells_passed, discipline_index }`;
+  `calibration` = `{ local_pass_rate, open_pass_rate, bridge_delta }`;
+  `axes` gains `discipline_index`, `verify_efficacy`, `checkpoint_util` (null = untested, never 0);
+  `per_challenge[]` entries gain optional `division`;
+  `instrumentation_summary` = `{ phase_mortality_top, top_misuse_fingerprint }`.
+- `primary.pass_rate` stays the mixed-division headline; division ranking prefers `divisions.*`.
+- Discipline Index = mean of applicable harness-observable HARD-compliance components
+  (verify-before-done, no-orphan-sketch, interference-if-assembly, checkpoint-before-destructive,
+  referential integrity, hard-invariant-clean); vision-independent, cross-division comparable.
+- Transport errors (rate limits, timeouts) are UNTESTED (null + error note), never scored 0.

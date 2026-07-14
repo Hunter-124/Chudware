@@ -462,6 +462,16 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 if (result.contains("tess") && result["tess"].is_object() &&
                     result["tess"].contains("aicm_path"))
                     data["aicm_path"] = result["tess"]["aicm_path"];
+                // Push the immutable revision snapshot with the mesh path. Additive fields let GUI
+                // viewers prewarm inactive-tab caches without a serialized follow-up doc_tree call.
+                if (result.contains("tree") && result["tree"].is_object())
+                    data["tree"] = result["tree"];
+                if (result.contains("owner_map") && result["owner_map"].is_object())
+                    data["owner_map"] = result["owner_map"];
+                if (result.contains("datums") && result["datums"].is_array())
+                    data["datums"] = result["datums"];
+                if (result.contains("rebuild") && result["rebuild"].is_object())
+                    data["rebuild"] = result["rebuild"];
                 if (result.contains("rebuild") && result["rebuild"].is_object() &&
                     result["rebuild"].contains("feature_status"))
                     data["feature_status"] = result["rebuild"]["feature_status"];

@@ -3914,6 +3914,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
         response may also carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis +
         editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
 
+        SKETCH MUTATIONS: any batch that includes sketch_add_entity / sketch_add_constraint /
+        sketch_set_dim / sketch_fillet / … auto-appends a compact ASCII + NL readback
+        (`ascii_block`, `sketch_summary`, `findings`) for each touched sketch. READ that
+        readback before the next sketch edit. Before declaring a sketch done, call
+        render_sketch_ascii(sketch) + sketch_health(sketch) (or check_sketch) and require dof 0.
+
         HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
         run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call
         budget, so it can never block past the MCP transport timeout (which would otherwise drop
@@ -4062,6 +4068,47 @@ def register_cad_tools(mcp: FastMCP) -> None:
                             log_preflight_override(d, "add_features", _pf_result)
                         except Exception:  # noqa: BLE001
                             pass
+                # Auto-readback for 2D sketch mutations (compact ASCII + NL summary).
+                # Best-effort: never fails the batch if the live sketch load is unavailable.
+                if ok:
+                    try:
+                        from mcp_server.ascii2d import (  # noqa: PLC0415
+                            sketch_ids_from_ops, live_sketch_readback,
+                        )
+                        sids = sketch_ids_from_ops(ops)
+                        # Also pick up newly-created sketch features referenced as $N
+                        # once id_map has resolved them for sketch-bearing add_feature.
+                        id_map = r.get("id_map") or {}
+                        for i, op in enumerate(ops or []):
+                            if not isinstance(op, dict):
+                                continue
+                            if op.get("op") != "add_feature":
+                                continue
+                            feat = op.get("feature") or {}
+                            if (feat.get("type") or "").lower() != "sketch":
+                                continue
+                            fid = id_map.get(f"${i}")
+                            if isinstance(fid, str) and fid not in sids:
+                                sids.append(fid)
+                        if sids:
+                            readbacks = []
+                            for sid in sids[:4]:
+                                rb = live_sketch_readback(d, sid)
+                                if rb:
+                                    readbacks.append(rb)
+                            if readbacks:
+                                out["sketch_readbacks"] = readbacks
+                                # Flatten first for models that expect top-level ascii/summary.
+                                primary = readbacks[0]
+                                out["ascii"] = primary.get("ascii")
+                                out["ascii_block"] = primary.get("ascii_block")
+                                out["sketch_summary"] = primary.get("summary")
+                                out["ascii_readback"] = primary
+                                out["readback_hint"] = primary.get("hint")
+                                if primary.get("findings") is not None:
+                                    out.setdefault("findings", primary.get("findings"))
+                    except Exception:  # noqa: BLE001
+                        pass
                 return out
 
             if background:
@@ -4160,9 +4207,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
                        dimension over-defines — prefer a relation or delete the duplicate)
           summary      one-line plain-English verdict + what to add/remove to reach dof 0
 
-        Workflow: after authoring a sketch, call this; if `under`, add the missing relations/driving
-        dimensions and re-check; if `over`, drop a conflicting/redundant constraint. Aim for dof 0 so
-        editing a driving dimension re-solves the geometry parametrically.
+        Workflow: after authoring a sketch, READ the ASCII readback from the mutation response
+        (or call render_sketch_ascii), then call this / sketch_health; if `under`, add the missing
+        relations/driving dimensions and re-check; if `over`, drop a conflicting/redundant
+        constraint. Aim for dof 0 so editing a driving dimension re-solves the geometry
+        parametrically. Before declaring a sketch done: render_sketch_ascii + sketch_health /
+        check_sketch with dof 0.
         """
         try:
             d = _doc(doc_id)

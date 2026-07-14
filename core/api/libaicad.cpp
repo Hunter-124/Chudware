@@ -1279,7 +1279,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 // OpenAI-compatible servers (vLLM, llama.cpp) only serve loaded models, so the
                 // absence of this endpoint just means "treat all listed as available".
                 // Skip LM Studio probe for cloud xAI / openai.com roots.
-                bool tryLmStudio = __omp_shell("base_url.empty() && provider != \"xai\" &&")
+                bool tryLmStudio = !base_url.empty() && provider != "xai" &&
                                    root.find("api.openai.com") == std::string::npos &&
                                    root.find("api.x.ai") == std::string::npos;
                 if (tryLmStudio) {
@@ -1352,7 +1352,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             }
             if (provider == "anthropic") {
                 // No keyless list endpoint; report availability by key presence + a static set.
-                bool ok = __omp_shell("api_key.empty();")
+                bool ok = !api_key.empty();
                 if (ok) {
                     json meta = heuristic_meta("claude-opus-4-8");
                     meta["label"] = "Claude Opus 4.8";

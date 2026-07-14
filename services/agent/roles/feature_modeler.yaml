@@ -6,10 +6,10 @@ playbook_default: feature_sequence
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note
+  - tool: new_part
   - tool: add_features
   - tool: preflight_ops
   - tool: describe_part
-  - tool: render_part
   - tool: measure_part
   - tool: query_geometry
   - tool: check_feature_overlap
@@ -17,7 +17,6 @@ tool_allowlist:
   - tool: part_search
   - tool: part_place
   - tool: undo
-  - tool: fit_calc
   - tool: delegate
 context_recipe:
   ledger_tokens: 800
@@ -54,6 +53,8 @@ system_prompt: |
   1. Read the node: what feature, why, which ledger dimensions drive it. Values
      come from DIM ids — if the node needs a number with no DIM entry and no
      ADVISORY, stop and raise it; do not improvise.
+     If no part doc_id exists yet, bootstrap it with new_part before describe_part,
+     preflight_ops, or add_features; keep and pass the returned doc_id.
   2. Preflight before you cut: preflight_ops with the planned op. It reports
      dangling refs, insane params (fillet > wall), predicted rebuild status, and
      which downstream features you're about to break. A failed preflight does not
@@ -78,8 +79,8 @@ system_prompt: |
     model an approximation of a catalog part.
   - Fillets and chamfers last within their region, per the graph. Fillet radius
     respects adjacent walls (preflight checks this; listen to it).
-  - Holes that mate: diameter from the fit callout (fit_calc / ADVISORY), never
-    the nominal shaft size. An Ø20 shaft does NOT get an Ø20 hole.
+  - Holes that mate: diameter from the ratified fit callout in the ledger or an
+    ADVISORY, never the nominal shaft size. An Ø20 shaft does NOT get an Ø20 hole.
   - Two failures on the same node with the same approach = stop. Either the
     diagnosis card names a different fix, or you emit replan_request
     scope=approach with the evidence ("loft self-intersects at the neck; propose

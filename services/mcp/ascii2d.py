@@ -6,14 +6,44 @@ and an English summary, plus structured ``findings``.
 
 Pure helpers accept plain dicts so tests run offline; MCP wrappers optionally
 load live ECAD / sketch sessions when a doc_id is given.
+
+Mutation tools (``add_features`` sketch ops, board place/route/via) auto-append a
+**compact** readback via :func:`sketch_mutation_readback` /
+:func:`board_mutation_readback` so non-vision models get an immediate ASCII + NL
+loop without a second tool call. Full renders stay on the explicit tools.
 """
 from __future__ import annotations
 
 import json
 import math
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from mcp.server.fastmcp import FastMCP
+
+# Compact auto-readback caps (mutation tool responses). Full render tools keep
+# their own larger defaults (60/80). Keep context cheap for the agent loop.
+READBACK_MAX_H = 40
+READBACK_MAX_W = 120
+READBACK_MAX_FINDINGS = 8
+READBACK_MAX_ENTITIES_NL = 24
+
+# Ops that mutate 2D sketch content inside add_features / doc_apply_ops batches.
+SKETCH_MUTATION_OPS: frozenset[str] = frozenset({
+    "sketch_add_entity",
+    "sketch_edit_entity",
+    "sketch_delete_entity",
+    "sketch_add_constraint",
+    "sketch_delete_constraint",
+    "sketch_set_dim",
+    "sketch_mirror_entities",
+    "sketch_pattern_entities",
+    "sketch_convert",
+    "sketch_move",
+    "sketch_fillet",
+    "sketch_chamfer",
+    "sketch_paste_entities",
+    "sketch_break_external_ref",
+})
 
 # --------------------------------------------------------------------------- util
 
@@ -1002,6 +1032,69 @@ def check_sketch_geometry(entities: list[dict],
     return findings
 
 
+def _entity_nl(ent: dict) -> str:
+    """One-line plain-English entity callout for non-vision models."""
+    eid = str(ent.get("id") or "?")
+    et = (ent.get("type") or "?").lower()
+    bits: list[str] = [f"{eid}:{et}"]
+    if et == "line":
+        try:
+            p1 = _xy(ent.get("p1")); p2 = _xy(ent.get("p2"))
+            bits.append(f"({p1[0]:g},{p1[1]:g})->({p2[0]:g},{p2[1]:g})")
+        except Exception:
+            pass
+    elif et == "circle":
+        try:
+            c = _xy(ent.get("center") or ent.get("c") or [0, 0])
+            r = ent.get("radius")
+            if isinstance(r, dict):
+                r = r.get("value", r)
+            bits.append(f"center=({c[0]:g},{c[1]:g}) r={r}")
+        except Exception:
+            pass
+    elif et == "arc":
+        try:
+            c = _xy(ent.get("center") or ent.get("c") or [0, 0])
+            r = ent.get("radius")
+            if isinstance(r, dict):
+                r = r.get("value", r)
+            bits.append(f"center=({c[0]:g},{c[1]:g}) r={r}")
+        except Exception:
+            pass
+    elif et == "point":
+        try:
+            p = _xy(ent.get("p") or ent.get("pos") or ent.get("at") or [0, 0])
+            bits.append(f"({p[0]:g},{p[1]:g})")
+        except Exception:
+            pass
+    if ent.get("construction"):
+        bits.append("construction")
+    return " ".join(str(b) for b in bits)
+
+
+def _constraint_nl(c: dict) -> str:
+    """One-line constraint / dimension callout with names and values."""
+    cid = str(c.get("id") or "?")
+    ct = str(c.get("type") or "?")
+    refs = c.get("refs") or c.get("entities") or c.get("handles") or []
+    if isinstance(refs, (list, tuple)):
+        ref_s = ",".join(str(r) for r in refs[:6])
+    else:
+        ref_s = str(refs)
+    val = c.get("value")
+    if isinstance(val, dict):
+        val = val.get("value", val)
+    driven = c.get("driven")
+    parts = [f"{cid}:{ct}"]
+    if ref_s:
+        parts.append(f"refs=[{ref_s}]")
+    if val is not None:
+        parts.append(f"value={val}")
+    if driven:
+        parts.append("driven")
+    return " ".join(parts)
+
+
 def summarize_sketch(entities: list[dict], constraints: list[dict],
                      findings: list[dict], health: Optional[dict] = None) -> str:
     type_counts: dict[str, int] = {}
@@ -1012,21 +1105,33 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
         type_counts[t] = type_counts.get(t, 0) + 1
     rel_counts: dict[str, int] = {}
     dims: list[str] = []
+    rel_details: list[str] = []
     for c in constraints or []:
         if not isinstance(c, dict):
             continue
         ct = c.get("type") or "?"
         if ct in ("distance", "angle", "radius", "diameter", "horizontal_distance",
-                  "vertical_distance"):
-            val = c.get("value")
-            dims.append(f"{ct}({c.get('id', '?')}={val})")
+                  "vertical_distance", "length"):
+            dims.append(_constraint_nl(c))
         else:
             rel_counts[ct] = rel_counts.get(ct, 0) + 1
+            rel_details.append(_constraint_nl(c))
 
     lines = [
         f"Sketch: {sum(type_counts.values())} entit(y/ies) "
         f"({', '.join(f'{n} {t}' for t, n in sorted(type_counts.items())) or 'none'}).",
     ]
+    # Named entity callouts (capped) so text-only models can address geometry.
+    ent_lines = [_entity_nl(e) for e in entities
+                 if isinstance(e, dict)][:READBACK_MAX_ENTITIES_NL]
+    if ent_lines:
+        lines.append("Entities:")
+        for el in ent_lines:
+            lines.append(f"  {el}")
+        n_more = sum(1 for e in entities if isinstance(e, dict)) - len(ent_lines)
+        if n_more > 0:
+            lines.append(f"  … +{n_more} more")
+
     if dims:
         lines.append("Dimensions: " + "; ".join(dims[:12])
                      + (f" … +{len(dims)-12}" if len(dims) > 12 else ""))
@@ -1034,8 +1139,34 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
         lines.append("Dimensions: (none listed)")
     if rel_counts:
         lines.append("Constraints: " + ", ".join(f"{n}× {t}" for t, n in sorted(rel_counts.items())))
+        for rd in rel_details[:12]:
+            lines.append(f"  {rd}")
+        if len(rel_details) > 12:
+            lines.append(f"  … +{len(rel_details)-12} more")
     else:
         lines.append("Constraints: (none listed)")
+
+    # Endpoint / open-closed status from geometry + health.
+    open_eps: list[str] = []
+    if health is not None:
+        closure = health.get("closure") or {}
+        raw_open = closure.get("open_endpoints") or []
+        open_eps = [str(x) for x in raw_open]
+        closed_ok = closure.get("closed_chains_ok")
+        if closed_ok is True and not open_eps:
+            lines.append("Profile: CLOSED (no dangling endpoints).")
+        elif open_eps:
+            lines.append("Profile: OPEN — dangling endpoints: "
+                         + ", ".join(open_eps[:12])
+                         + (f" … +{len(open_eps)-12}" if len(open_eps) > 12 else ""))
+        elif closed_ok is False:
+            lines.append("Profile: OPEN (health reports unclosed chains).")
+    # near-coincident notes from findings
+    near = [f for f in findings if f.get("code") == "near_coincident"]
+    if near:
+        lines.append("Endpoint coincidence notes:")
+        for f in near[:6]:
+            lines.append(f"  {f.get('message')}")
 
     if health is not None:
         try:
@@ -1043,7 +1174,9 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
             lines.append("")
             lines.append(sketch_health_text(health))
         except Exception:
-            lines.append(f"Health: status={health.get('status')!r} dof={health.get('dof')}")
+            lines.append(
+                f"Health: status={health.get('status')!r} dof={health.get('dof')}"
+                + (f" — {health.get('dof_narration')}" if health.get("dof_narration") else ""))
 
     if findings:
         lines.append(f"Findings ({len(findings)}):")
@@ -1052,6 +1185,286 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
     else:
         lines.append("Findings: none")
     return "\n".join(lines)
+
+
+def _cap_ascii(ascii_block: str, max_h: int = READBACK_MAX_H,
+               max_w: int = READBACK_MAX_W) -> tuple[str, int, int, bool]:
+    """Clamp an ASCII grid to max_h rows × max_w cols. Returns (text, h, w, truncated)."""
+    rows = (ascii_block or "").split("\n")
+    truncated = False
+    if len(rows) > max_h:
+        rows = rows[:max_h]
+        truncated = True
+    out_rows: list[str] = []
+    for r in rows:
+        if len(r) > max_w:
+            out_rows.append(r[:max_w])
+            truncated = True
+        else:
+            out_rows.append(r)
+    h = len(out_rows)
+    w = max((len(r) for r in out_rows), default=0)
+    return "\n".join(out_rows), h, w, truncated
+
+
+def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
+                             health: Optional[dict] = None,
+                             near_tol: float = 1e-2,
+                             max_h: int = READBACK_MAX_H,
+                             max_w: int = READBACK_MAX_W,
+                             sketch_id: str = "") -> dict:
+    """Compact deterministic ASCII + NL block for sketch mutation tool responses.
+
+    Caps the grid (default 40×120) so agent context stays cheap; full render remains
+    available via ``render_sketch_ascii``. Byte-stable for fixed inputs.
+    """
+    entities = list(sketch.get("entities") or [])
+    constraints = list(sketch.get("constraints") or [])
+    if health is None and isinstance(sketch.get("health"), dict):
+        health = sketch["health"]
+    # Render with a hard max_dim so the raster itself never exceeds the cap.
+    max_dim = max(8, min(max_h, max_w))
+    rendered = render_sketch_ascii(entities, pitch=pitch, max_dim=max_dim)
+    ascii_txt, h, w, truncated = _cap_ascii(rendered["ascii"], max_h=max_h, max_w=max_w)
+    findings = check_sketch_geometry(entities, near_tol=near_tol, health=health)
+    summary = summarize_sketch(entities, constraints, findings, health=health)
+    # compact findings payload
+    compact_findings = [
+        {"code": f.get("code"), "severity": f.get("severity"), "message": f.get("message")}
+        for f in findings[:READBACK_MAX_FINDINGS]
+    ]
+    sid = sketch_id or sketch.get("id") or ""
+    header = f"[sketch_readback id={sid or '?'} {w}x{h}"
+    if truncated:
+        header += " truncated=1"
+    header += "]"
+    return {
+        "ok": True,
+        "kind": "sketch_readback",
+        "sketch_id": sid or None,
+        "ascii": ascii_txt,
+        "ascii_block": f"{header}\n{ascii_txt}",
+        "summary": summary,
+        "findings": compact_findings,
+        "findings_total": len(findings),
+        "width": w,
+        "height": h,
+        "pitch": rendered.get("pitch"),
+        "truncated": truncated,
+        "caps": {"max_h": max_h, "max_w": max_w},
+        "hint": ("READ this ASCII + summary before the next sketch edit. "
+                 "Call render_sketch_ascii + sketch_health before declaring the sketch done."),
+    }
+
+
+def board_mutation_readback(board: dict, *, layer: Optional[str] = None,
+                            pitch_mm: float = 1.0,
+                            max_h: int = READBACK_MAX_H,
+                            max_w: int = READBACK_MAX_W,
+                            focus: Optional[Sequence[float]] = None,
+                            focus_radius_mm: float = 25.0) -> dict:
+    """Compact per-layer ASCII + NL connectivity delta for board mutation responses.
+
+    Renders one copper layer (default first / F.Cu), optionally cropped around
+    ``focus`` (x,y mm) so place/route/via changes stay local. Caps 40×120.
+    """
+    layers = [layer] if layer else _copper_layers(board)
+    if not layers:
+        layers = ["F.Cu"]
+    L = layers[0]
+    # Optional focus crop: build a shallow board view with only nearby geometry so
+    # the ASCII excerpt centres on the mutation without changing check_board.
+    view_board = board
+    if focus is not None and len(focus) >= 2:
+        fx, fy = float(focus[0]), float(focus[1])
+        r = float(focus_radius_mm)
+        view_board = _board_focus_crop(board, fx, fy, r)
+
+    max_dim = max(8, min(max_h, max_w))
+    block = render_board_layer_ascii(view_board, layer=L, pitch_mm=pitch_mm,
+                                     max_dim=max_dim)
+    ascii_txt, h, w, truncated = _cap_ascii(block["ascii"], max_h=max_h, max_w=max_w)
+    findings = check_board(board)  # full-board findings (not cropped)
+    summary = summarize_board(board, findings, [L])
+    compact_findings = [
+        {"code": f.get("code"), "severity": f.get("severity"), "message": f.get("message")}
+        for f in findings[:READBACK_MAX_FINDINGS]
+    ]
+    # Net/connectivity delta-friendly counts for the model.
+    pad_nets = _pad_nodes(board)
+    net_delta = {
+        "named_nets": len(board.get("nets") or []),
+        "tracks": len(board.get("tracks") or []),
+        "vias": len(board.get("vias") or []),
+        "footprints": len(board.get("footprints") or []),
+        "pad_net_count": len(pad_nets),
+        "unconnected_multi_pad": sum(
+            1 for f in findings if f.get("code") == "unconnected_net"),
+        "crossings": sum(1 for f in findings if f.get("code") == "trace_crossing"),
+        "courtyard_overlaps": sum(
+            1 for f in findings if f.get("code") == "courtyard_overlap"),
+    }
+    header = f"[board_readback layer={L} {w}x{h}"
+    if truncated:
+        header += " truncated=1"
+    if focus is not None and len(focus) >= 2:
+        header += f" focus=({float(focus[0]):g},{float(focus[1]):g})"
+    header += "]"
+    return {
+        "ok": True,
+        "kind": "board_readback",
+        "layer": L,
+        "ascii": ascii_txt,
+        "ascii_block": f"{header}\n{ascii_txt}",
+        "summary": summary,
+        "findings": compact_findings,
+        "findings_total": len(findings),
+        "net_delta": net_delta,
+        "width": w,
+        "height": h,
+        "pitch_mm": block.get("pitch_mm"),
+        "truncated": truncated,
+        "caps": {"max_h": max_h, "max_w": max_w},
+        "hint": ("READ this ASCII + net_delta before the next board edit. "
+                 "Call render_board_ascii before declaring the board done."),
+    }
+
+
+def _board_focus_crop(board: dict, fx: float, fy: float, radius: float) -> dict:
+    """Shallow copy of board keeping geometry near (fx,fy) for local ASCII excerpt."""
+    r2 = radius * radius
+
+    def _near_pt(p: Any) -> bool:
+        try:
+            x, y = _xy(p)
+        except Exception:
+            return False
+        dx, dy = x - fx, y - fy
+        return dx * dx + dy * dy <= r2
+
+    def _near_seg(p1: Any, p2: Any) -> bool:
+        return _near_pt(p1) or _near_pt(p2)
+
+    tracks = [t for t in (board.get("tracks") or [])
+              if isinstance(t, dict) and _near_seg(t.get("p1"), t.get("p2"))]
+    vias = [v for v in (board.get("vias") or [])
+            if isinstance(v, dict) and _near_pt(v.get("pos") or v.get("at"))]
+    fps = []
+    for fp in board.get("footprints") or []:
+        if not isinstance(fp, dict):
+            continue
+        pos = fp.get("pos") or [0, 0]
+        if _near_pt(pos):
+            fps.append(fp)
+            continue
+        # also keep if any pad is near
+        for pad in fp.get("pads") or []:
+            try:
+                px, py = _xy(pad.get("pos") or [0, 0])
+                ox, oy = float(pos[0]), float(pos[1])
+                if _near_pt([ox + px, oy + py]):
+                    fps.append(fp)
+                    break
+            except Exception:
+                continue
+    out = dict(board)
+    out["tracks"] = tracks
+    out["vias"] = vias
+    out["footprints"] = fps
+    # synthetic tight outline so bbox shrinks to the focus window
+    out["outline"] = {
+        "closed": True,
+        "shapes": [
+            {"type": "line", "p1": [fx - radius, fy - radius],
+             "p2": [fx + radius, fy - radius]},
+            {"type": "line", "p1": [fx + radius, fy - radius],
+             "p2": [fx + radius, fy + radius]},
+            {"type": "line", "p1": [fx + radius, fy + radius],
+             "p2": [fx - radius, fy + radius]},
+            {"type": "line", "p1": [fx - radius, fy + radius],
+             "p2": [fx - radius, fy - radius]},
+        ],
+    }
+    return out
+
+
+def attach_sketch_readback(response: dict, sketch: dict, **kwargs: Any) -> dict:
+    """Mutate *response* in place with ``ascii_readback`` / ``ascii`` / ``summary`` keys."""
+    try:
+        rb = sketch_mutation_readback(sketch, **kwargs)
+        response["ascii_readback"] = rb
+        response["ascii"] = rb["ascii"]
+        response["ascii_block"] = rb["ascii_block"]
+        # Prefer keeping any existing summary; surface NL under sketch_summary.
+        response["sketch_summary"] = rb["summary"]
+        if "summary" not in response or not response.get("summary"):
+            response["summary"] = rb["summary"]
+        response.setdefault("findings", rb["findings"])
+        response["readback_hint"] = rb["hint"]
+    except Exception as e:  # noqa: BLE001 — never fail the mutation on readback
+        response["ascii_readback"] = {
+            "ok": False, "error": f"sketch readback unavailable: {e}",
+        }
+    return response
+
+
+def attach_board_readback(response: dict, board: dict, **kwargs: Any) -> dict:
+    """Mutate *response* in place with compact board ASCII + net_delta."""
+    try:
+        rb = board_mutation_readback(board, **kwargs)
+        response["ascii_readback"] = rb
+        response["ascii"] = rb["ascii"]
+        response["ascii_block"] = rb["ascii_block"]
+        response["board_summary"] = rb["summary"]
+        if "summary" not in response or not response.get("summary"):
+            response["summary"] = rb["summary"]
+        response["net_delta"] = rb["net_delta"]
+        response.setdefault("findings", rb["findings"])
+        response["readback_hint"] = rb["hint"]
+    except Exception as e:  # noqa: BLE001
+        response["ascii_readback"] = {
+            "ok": False, "error": f"board readback unavailable: {e}",
+        }
+    return response
+
+
+def sketch_ids_from_ops(ops: Sequence[Any]) -> list[str]:
+    """Collect sketch feature ids touched by a batch of doc ops (deterministic order)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for op in ops or []:
+        if not isinstance(op, dict):
+            continue
+        name = op.get("op") or ""
+        if name not in SKETCH_MUTATION_OPS:
+            # also: add_feature of type sketch — no entity mutation yet, skip
+            continue
+        sid = op.get("sketch")
+        if not isinstance(sid, str) or not sid or sid.startswith("$"):
+            continue
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
+
+
+def live_sketch_readback(doc_id: str, sketch_id: str, **kwargs: Any) -> Optional[dict]:
+    """Best-effort live sketch load + compact readback (returns None on failure)."""
+    try:
+        data, health = _load_sketch(sketch_id, doc_id)
+        return sketch_mutation_readback(data, health=health, sketch_id=sketch_id, **kwargs)
+    except Exception:
+        return None
+
+
+def live_board_readback(doc_id: str = "", **kwargs: Any) -> Optional[dict]:
+    """Best-effort live board load + compact readback."""
+    try:
+        board = _load_board(doc_id or "")
+        return board_mutation_readback(board, **kwargs)
+    except Exception:
+        return None
+
 
 
 def sketch_ascii_report(sketch: dict, *, pitch: float = 0.5,
@@ -1314,6 +1727,11 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
         Renders components as refdes boxes, traces as path characters (- | / \\),
         vias as 'o', pads as '#', and marks same-cell different-net collisions as 'X'.
 
+        Call this (full render) before declaring a board done. Board mutation tools
+        (place/route/zone/autoplace/autoroute/board_from_schematic) already append a
+        compact auto-readback — READ that first after every mutation; use this tool for
+        the uncapped / multi-layer review.
+
         Args:
           doc_id: open PCB session id (default: current PCB).
           layer: copper layer id (e.g. 'F.Cu'); empty = all copper layers.
@@ -1348,6 +1766,10 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
         constraints are narrated in English. Checks flag open profiles, near-coincident
         endpoints, and under-dimensioned entities (wraps sketch_health when a live
         doc/sketch id is available — does not re-solve).
+
+        Call this (full render) before declaring a sketch done. Sketch mutation batches
+        via add_features already append a compact auto-readback — READ that first after
+        every edit; use this tool + sketch_health for the final verify loop.
 
         Args:
           sketch: sketch feature id (e.g. 's1') for a live part doc.

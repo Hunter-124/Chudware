@@ -37,7 +37,7 @@
 
 struct GLFWwindow;
 class Renderer;
-namespace render { class IdPass; class Overlays; }
+namespace render { class IdPass; class Overlays; struct DocMesh; }
 
 // W1-B: typed subsystem forward declarations — AppState borrows these as proper typed pointers
 // (replacing the old opaque void* + static_cast<...> sites scattered across host/src). The full
@@ -235,11 +235,10 @@ struct FitReport {
 // so a backgrounded doc's parked edit state (PM checkpoint id / preview batches against its worker
 // doc) stays valid and resumes exactly when its tab is reactivated.
 //
-// The DocMirror deliberately stays SINGLE on AppState (not per-session): it is already re-pointed at
-// the target worker doc via DocMirror::activate() on every switch, and is only ever mutated on behalf
-// of the active document — so one re-pointed mirror is correct, and its (single) listener always
-// drives the active doc's tree/mesh repaint. This mirrors the per-document precedent already set by
-// ECAD tabs (DocTab::ecadState, a shared_ptr to per-document editor state).
+// The DocMirror deliberately stays SINGLE on AppState (not per-session). Each DocSession parks an
+// immutable mirror snapshot at its last loaded revision; switching restores it locally and fires the
+// same listener, while a changed/cold tab asynchronously rebuilds from the worker. One live mirror
+// therefore remains correct without putting a serialized worker round-trip on the UI thread.
 struct DocSession {
     // Owned per-document UI subsystems. The full types live in their ui/*.h headers; this struct is
     // declared with only forward declarations, so its constructor + destructor are out-of-lined in
@@ -258,7 +257,8 @@ struct DocSession {
     std::vector<uint8_t>       bodyVisible;         // Solid Bodies hide/show mask (per renderer slot)
     std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
     std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
-    std::unordered_set<std::string> autoHiddenPlanes; // user datum planes auto-hidden once referenced
+    std::unordered_set<std::string> autoHiddenPlanes; // consumed default/user datum plane fids
+    std::unordered_set<std::string> datumPlanesUserToggled; // sticky user-plane eye overrides
     // Datum visibility control state — parked per-doc so force-show/auto-show decisions never
     // leak across tabs (issue: origin force-shown in doc A stayed shown in doc B).
     bool showPlane[3] = {false, false, false};
@@ -274,12 +274,13 @@ struct DocSession {
     std::vector<uint64_t>      featureHighlightFaces;
     bool                       sketchPlanePickActive = false;
 
-    // Fast-switch mesh cache (scales tab switching to big assemblies). Set on every switch-in to the
-    // doc's last-loaded AICM path + the revision it was at; on the NEXT switch-in DocMirror::
-    // activateCached reuses them (skipping the forced re-tessellating doc_rebuild) when the worker's
-    // revision is unchanged — a backgrounded doc can't be edited, so it usually is. -1 = no cache yet.
-    std::string                cachedAicmPath;
-    int                        cachedRevision = -1;
+    // Immutable content cache for instant already-open tab binds. The mirror snapshot, parsed AICM,
+    // and Renderer GPU entry all share the same doc id + revision identity. aiPulse/invalidation
+    // clears this path when a foreign edit changes a background document.
+    std::string                       cachedAicmPath;
+    int                               cachedRevision = -1;
+    core::DocMirrorSnapshot           cachedMirror;
+    std::shared_ptr<render::DocMesh>  cachedDocMesh;
 
     DocSession();
     ~DocSession();
@@ -620,6 +621,9 @@ struct AppState {
         // in the background is visible without stealing focus or the viewport. Cleared the moment the
         // user switches to the tab (switchToTab) or the poller refreshes it while it IS active.
         bool        aiPulse = false;
+        // A pushed foreign revision invalidated this tab's immutable mesh cache. The background
+        // parser clears it after prewarming the matching revision; switchToTab never binds while set.
+        bool        meshCacheInvalidated = false;
         // Ownership: the user ADOPTED this AI mirror tab by editing it (first edit flips it via
         // markActiveTabDirty). An adopted doc becomes user-owned — it is never auto-closed when
         // the agent finishes, IS included in the unsaved-work quit warning, and drops the "AI:"
@@ -829,8 +833,7 @@ struct AppState {
     // doc (so feature ops route to it for free — the "current doc" is process-wide) and the assembly
     // is drawn as a dimmed static GHOST in the same viewport. The active-doc switch reuses the exact
     // cached open/switch path openComponentPart uses (dedup→switchToTab, else requestOpenPath), so
-    // file caching (DocMirror::activateCached via cachedAicmPath/cachedRevision) is inherited — no
-    // fresh re-tessellate. The later wiring wave calls these from the feature-tree "Edit Model" menu.
+    // the per-session mirror/parsed-tess/GPU cache is inherited — no fresh re-tessellate.
     struct ComponentEditCtx {
         bool        active = false;
         std::string componentId;      // the assembly component being edited (banner label)
@@ -965,19 +968,20 @@ struct AppState {
     // route their eye straight to bodyVisible instead. Consulted by the sketch-ghost renderer; per-doc
     // (parked in DocSession, cleared by clearViewportForNewDoc).
     std::unordered_set<std::string> hiddenFeatures;
-    // Auto-hide bookkeeping for USER reference planes (datum-plane features). When a 3D feature
-    // starts referencing a user datum plane (directly, or via a sketch that sits on it), that
-    // plane's fid is auto-added to hiddenFeatures ONCE and recorded here (SolidWorks behavior).
-    // Recording it means the user can re-show the plane via the FM eye and the auto-hide won't
-    // fight the toggle on the next rebuild. Per-doc; cleared by clearViewportForNewDoc.
+    // Auto-hide bookkeeping for datum planes. Every plane consumed (directly or transitively) by
+    // a downstream 3D feature is recorded here. User-plane fids are also mirrored into
+    // hiddenFeatures; the three reserved plane fids drive viewport_panel's origin-plane overlays.
+    // Per-doc; cleared by clearViewportForNewDoc.
     std::unordered_set<std::string> autoHiddenPlanes;
+    // User-created datum planes whose FeatureManager eye has taken control. Auto-hide never changes
+    // these planes again, in either direction, so force-show and force-hide both survive rebuilds
+    // and tab switches. The three reserved planes use planesUserToggled/showPlane instead.
+    std::unordered_set<std::string> datumPlanesUserToggled;
     // Push bodyVisible to the renderer (per-slot draw skip) and the id pass (pick skip). Call
     // after any toggle; loadDocMesh calls it after every setMeshes/setDoc.
     void applyBodyVisibility();
-    // Re-derive the Solid Bodies / assembly-component hide mask from the current doc tree after a
-    // rebuild. For assemblies: reads each non-suppressed component's `hidden` flag (persisted in
-    // document.json) and drops the matching renderer body slot. Also auto-hides user reference
-    // planes that a 3D feature now references. Called at the tail of the mesh load.
+    // Re-derive document-driven visibility after a rebuild: assembly component masks plus datum
+    // planes consumed by the active feature dependency graph (parts and assemblies).
     void applyDocDrivenVisibility(const nlohmann::json& tree);
     // Push hiddenFeatures to the renderer so hidden DATUM features (ref axis/plane/point/csys) drop
     // out of the reference-overlay draw immediately. Call after an eye toggle, a tab switch, and
@@ -1077,25 +1081,23 @@ struct AppState {
     float animDur = 0.35f;       // smoothstep ease duration
     float animYaw0 = 0, animPitch0 = 0, animZoom0 = 1.0f, animPan0[3] = {0, 0, 0};
     float animYaw1 = 0, animPitch1 = 0, animZoom1 = 1.0f, animPan1[3] = {0, 0, 0};
-    // Reference planes (Front / Top / Right) shown faintly in the viewport; click a plane row in
-    // the FeatureManager to toggle it. planeEmphasis (0..2, -1=none) brightens one, dims the others.
-    // W4-K: hidden by default (SolidWorks behavior). Toggle a plane on via the FeatureManager row
-    // or it is forced visible during sketch-plane picking. Sketch mode hides them (grid owns view).
+    // Reference planes (Front / Top / Right) shown faintly in the viewport. Before the user takes
+    // control, viewport_panel shows each plane until the active dependency graph consumes it.
+    // showPlane becomes authoritative after the FeatureManager eye or viewport menu is used;
+    // planeEmphasis (0..2, -1=none) brightens one plane and dims the others.
     bool showPlane[3] = {false, false, false};
-    // Per-frame EFFECTIVE origin-plane visibility (showPlane OR-ed with the auto-show / pick /
-    // PM-well force-show), written by the viewport each frame right after it computes what the
-    // renderer draws. Plane hit-tests gate on THIS, not showPlane — otherwise a force-shown plane
-    // (new-sketch pick, body-less auto-show, ref-plane well) is drawn but not clickable.
+    // Per-frame EFFECTIVE origin-plane visibility after dependency auto-hide, the user's showPlane
+    // override, and temporary sketch/PM pick force-show. Plane hit-tests and FeatureManager eyes use
+    // this value so their state always matches what is actually drawn.
     bool planeVisEff[3] = {false, false, false};
     // Same "what the renderer actually draws" flag for the world-origin gizmo — written by the
     // viewport each frame right after it decides origin visibility (auto-hide / hiddenFeatures /
     // PM force-show). The origin PICK gates on THIS, not hiddenFeatures, so it is clickable exactly
     // when it is drawn (never through a body that auto-hid it, never in the default-hidden state).
     bool originVisEff = false;
-    // True once the user has explicitly toggled origin-plane visibility (eye / FeatureManager row).
-    // Until then, an empty part (no solid body) auto-shows all three planes (SolidWorks "pick a plane
-    // to start"); after the user takes control, showPlane is authoritative so a hide actually sticks
-    // even with no body yet. Per-doc (parked in DocSession); reset on a fresh doc.
+    // True once the user explicitly takes control of the three default planes. Until then every
+    // unconsumed plane is visible and every consumed plane is auto-hidden; afterward showPlane is
+    // authoritative. Per-doc (parked in DocSession); reset on a fresh document.
     bool planesUserToggled = false;
     // Same story for the world-origin gizmo (issue #30): auto-show it while there's no solid body
     // (reference for the first sketch), auto-hide once a body exists — until the user explicitly
@@ -1476,6 +1478,9 @@ struct AppState {
     // result while picking + highlighting still resolve against the un-rounded base body that the
     // session holds (suppressed). So the user sees the round form but every edge pick is exact.
     bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false);
+    // Restore a session's immutable mirror + parsed tessellation and bind its cached renderer
+    // buffers. Rebuilds only the independent pick/overlay buffers; no worker or disk round-trip.
+    bool bindCachedDocMesh(DocSession& session, std::string& err);
 
     // T-PERF3: non-blocking mesh load. Disk parse + pick-cache build run on a dedicated loader
     // thread; GL upload happens inside drainMeshLoads() (call once per frame after rpc.drain()).
@@ -1483,15 +1488,19 @@ struct AppState {
     // previous mesh stays on screen until a current completion commits. Safe to call from GL
     // thread; no-ops empty paths.
     void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false);
+    // Parse and upload an inactive document's pushed tessellation into its per-tab CPU/GPU cache
+    // without disturbing the visible document. Newer revisions supersede queued older ones.
+    void cacheBackgroundDocMeshAsync(const std::string& docId, int revision,
+                                     const std::string& aicmPath);
     void drainMeshLoads();   // GL thread, once per frame
     // Join the async mesh-loader thread (call once on run_gui teardown before exit).
     void stopMeshLoader();
     uint64_t meshGen() const { return meshGen_.load(); }
 
     // Drop shaded mesh + pick GPU buffers when the active doc has no tessellation (empty model /
-    // sketch-only). Does NOT clear selection, body visibility, or other per-doc fields — used on
-    // tab switch when activateCached returns an empty aicm_path so the leaving tab's mesh cannot
-    // linger on screen.
+    // sketch-only). Does NOT clear selection, body visibility, or other per-doc fields. Cold/changed
+    // switches call this after parking the leaving document's GPU buffers so stale geometry is never
+    // shown under the entering tab while its asynchronous rebuild is queued.
     void unloadDocMesh();
 
     // C34: reset the viewport to the fresh-document state — drops the legacy/demo mesh and any

@@ -705,28 +705,24 @@ def fetch_xai_usage_browser_scrape(cred: dict) -> dict:
         return base
 
     status = scraped.get("status")
-    # Structured degrade paths: keep browser_scrape source + dashboard, map usage.
+    # A login/challenge result is useful provenance, but it is not quota data.
+    # Preserve only rows the scraper actually returned, retaining a null fraction
+    # so consumers can render the status without inventing a 0% bar.
     if status in ("needs_login", "blocked"):
         out = dict(base)
         out["source"] = XAI_SOURCE_BROWSER
         out["dashboard_url"] = scraped.get("dashboard_url") or DASHBOARD_URLS["xai"]
-        usage_rows = scraped.get("usage") or []
-        if usage_rows:
-            out["usage"] = [
-                _usage_row(
-                    str(r.get("window") or "weekly"),
-                    str(r.get("label") or "Weekly pool"),
-                    r.get("used_fraction"),
-                    r.get("resets_at"),
-                    str(r.get("status") or status),
-                )
-                for r in usage_rows
-                if isinstance(r, dict)
-            ]
-        else:
-            out["usage"] = [
-                _usage_row("weekly", "Weekly pool", None, None, str(status)),
-            ]
+        out["usage"] = [
+            _usage_row(
+                str(r.get("window") or "unknown"),
+                str(r.get("label") or "Usage"),
+                r.get("used_fraction"),
+                r.get("resets_at") if isinstance(r.get("resets_at"), str) else None,
+                str(r.get("status") or status),
+            )
+            for r in (scraped.get("usage") or [])
+            if isinstance(r, dict)
+        ]
         if scraped.get("details"):
             out["details"] = scraped["details"]
         return out
@@ -815,16 +811,35 @@ def clear_cache() -> None:
     """Drop the in-process usage cache (tests)."""
     _cache.clear()
 
+def invalidate_account(provider: str, account_id: str | None = None) -> None:
+    """Drop cached usage for one account, or every account for a provider."""
+    resolved = sl._resolve(provider)
+    if resolved is None:
+        return
+    _friendly, _name, cred_id, _label = resolved
+    if account_id is not None:
+        _cache.pop(_cache_key(cred_id, str(account_id)), None)
+        return
+    prefix = f"{cred_id}::"
+    for key in [key for key in _cache if key.startswith(prefix)]:
+        _cache.pop(key, None)
+
 
 def get_cached(provider: str, account_id: str) -> dict | None:
     """Return a cached row for (friendly provider, account_id) if still fresh."""
     resolved = sl._resolve(provider)
     if resolved is None:
         return None
-    friendly, _name, cred_id, _label = resolved
+    _friendly, _name, cred_id, _label = resolved
     entry = _cache.get(_cache_key(cred_id, account_id))
     if not entry:
         return None
+    now = _now()
+    rate_until = float(entry.get("rate_limited_until") or 0)
+    fetched_at = float(entry.get("fetched_at") or 0)
+    if not (rate_until and now < rate_until):
+        if not fetched_at or (now - fetched_at) >= CACHE_TTL_S:
+            return None
     return dict(entry.get("row") or {})
 
 
@@ -871,7 +886,9 @@ def fetch_account_usage(
     now = _now()
     cached = _cache.get(key)
 
-    if not force and cached:
+    if cached:
+        # A server-requested freeze is stronger than force=True: once a provider
+        # returns 429, no caller may hammer that account again for five minutes.
         rate_until = float(cached.get("rate_limited_until") or 0)
         if rate_until and now < rate_until:
             row = dict(cached.get("row") or {})
@@ -879,7 +896,7 @@ def fetch_account_usage(
             row.setdefault("account_id", str(aid))
             return _merge_identity(row, stored)
         fetched_at = float(cached.get("fetched_at") or 0)
-        if fetched_at and (now - fetched_at) < CACHE_TTL_S:
+        if not force and fetched_at and (now - fetched_at) < CACHE_TTL_S:
             row = dict(cached.get("row") or {})
             row.setdefault("provider", friendly)
             row.setdefault("account_id", str(aid))

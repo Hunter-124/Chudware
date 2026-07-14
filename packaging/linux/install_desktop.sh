@@ -10,6 +10,7 @@
 # it for legacy scripts, but Exec points at the canonical host/build-linux/bin/Billet.
 #
 # Usage:  packaging/linux/install_desktop.sh
+#    or:  scripts/install_desktop.sh   (thin wrapper)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,18 +29,26 @@ ICONS="$HOME/.local/share/icons/hicolor"
 mkdir -p "$APPS"
 
 # Install the icon under the theme name "Billet" at several sizes so the shell can
-# pick a crisp one. Requires ImageMagick for downscaling; falls back to the 256px
-# source at 256x256 if `convert`/`magick` are unavailable.
+# pick a crisp one. Prefer ImageMagick; fall back to Python/Pillow; last resort
+# copy the 256px source only into the 256 slot.
 install_icon() {
   local size="$1"
   local dir="$ICONS/${size}x${size}/apps"
   mkdir -p "$dir"
+  local dest="$dir/Billet.png"
   if command -v magick >/dev/null 2>&1; then
-    magick "$ICON_SRC" -resize "${size}x${size}" "$dir/Billet.png"
+    magick "$ICON_SRC" -resize "${size}x${size}" "$dest"
   elif command -v convert >/dev/null 2>&1; then
-    convert "$ICON_SRC" -resize "${size}x${size}" "$dir/Billet.png"
+    convert "$ICON_SRC" -resize "${size}x${size}" "$dest"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$ICON_SRC" "$dest" "$size" <<'PY'
+import sys
+from PIL import Image
+src, dest, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+Image.open(src).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS).save(dest)
+PY
   elif [ "$size" = "256" ]; then
-    cp "$ICON_SRC" "$dir/Billet.png"
+    cp "$ICON_SRC" "$dest"
   fi
 }
 for s in 16 32 48 64 128 256; do install_icon "$s"; done
@@ -51,12 +60,20 @@ install_mime_icon() {
   local size="$1"
   local dir="$ICONS/${size}x${size}/mimetypes"
   mkdir -p "$dir"
+  local dest="$dir/$MIME_ICON_NAME.png"
   if command -v magick >/dev/null 2>&1; then
-    magick "$DOC_ICON_SRC" -resize "${size}x${size}" "$dir/$MIME_ICON_NAME.png"
+    magick "$DOC_ICON_SRC" -resize "${size}x${size}" "$dest"
   elif command -v convert >/dev/null 2>&1; then
-    convert "$DOC_ICON_SRC" -resize "${size}x${size}" "$dir/$MIME_ICON_NAME.png"
+    convert "$DOC_ICON_SRC" -resize "${size}x${size}" "$dest"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$DOC_ICON_SRC" "$dest" "$size" <<'PY'
+import sys
+from PIL import Image
+src, dest, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+Image.open(src).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS).save(dest)
+PY
   elif [ "$size" = "256" ]; then
-    cp "$DOC_ICON_SRC" "$dir/$MIME_ICON_NAME.png"
+    cp "$DOC_ICON_SRC" "$dest"
   fi
 }
 if [ -f "$DOC_ICON_SRC" ]; then

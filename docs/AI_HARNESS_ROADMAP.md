@@ -101,3 +101,17 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   `reports/runs/mega-2/findings.md` (relaunch Fixer2 wave; xAI concurrency
   timeout policy; new_part bootstrap; buildgraph_plan shape; mission phase gate
   vs DAG progress).
+
+- 2026-07-14 mega-4 (WS5): current-module relaunch under
+  `reports/runs/mega-4/` with xAI grok-4.5, maximum effort, org layer, and fresh
+  `mega-4-fc-rocket-20260714` run ID. Preflight passed delegate exposure on
+  `spec_writer`/`layout_engineer`/`feature_modeler`, but the 1,187s run made
+  **0 delegate calls / 0 child spawns / depth 0**; all 19 role turns stayed
+  frontier, so cheap-leaf auto assignment was not exercised. The DAG started
+  19/19 nodes (9 done, 10 failed), but BUILD created no part, board, or firmware:
+  0 features/build nodes and four retryable ~180s xAI read timeouts. Phase
+  reconciliation did run after `dag.run.done`, yet falsely backfilled successful
+  PLAN/BUILD gates despite failed nodes and no artifacts — liveness improved,
+  correctness still fails. Provider usage tokens/cost and semaphore occupancy
+  remain unobserved. Explicit verdicts, latency metrics, live Fixer4 fingerprints,
+  and TOP5 are in `reports/runs/mega-4/findings.md`.

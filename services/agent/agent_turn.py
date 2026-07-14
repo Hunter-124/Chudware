@@ -614,13 +614,13 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 # ---------------------------------------------------------------------------
 
 def _parse_directive(reply: str) -> dict | None:
-    """Extract the first JSON directive object from *reply*; None if absent/invalid.
+    """Extract the first tool/done directive from a model reply.
 
-    Accepts, in order: fenced ```json blocks (nested braces fine — the whole fence
-    body is parsed), a bare JSON object reply, and an UNTERMINATED fence (a local
-    model hitting its completion cap mid-fence still yields its complete JSON
-    object). ``raw_decode`` parses the first complete object and tolerates
-    trailing prose — never a truncated-brace parse."""
+    JSON is canonical. As a provider-compatibility fallback, also accepts xAI's
+    observed textual ``ethan tool call: NAME with ARG is VALUE`` rendering; only
+    the first call is returned so the normal bounded result-feedback loop remains
+    authoritative.
+    """
     if not reply:
         return None
     candidates: list[str] = [m.group(1) for m in _FENCE_RE.finditer(reply)]
@@ -638,7 +638,36 @@ def _parse_directive(reply: str) -> dict | None:
         obj = _loads_first_object(cand)
         if obj is not None:
             return obj
-    return None
+    return _parse_text_tool_call(reply)
+
+
+_TEXT_TOOL_CALL_RE = re.compile(
+    r"(?i)\bethan\s+tool\s+call:\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+with\s+)?(.*?)(?=\bethan\s+tool\s+call:|$)",
+    re.DOTALL,
+)
+_TEXT_TOOL_ARG_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+is\s+")
+
+
+def _parse_text_tool_call(reply: str) -> dict | None:
+    """Parse xAI's textual tool-call rendering into the canonical directive."""
+    match = _TEXT_TOOL_CALL_RE.search(reply or "")
+    if match is None:
+        return None
+    arg_text = match.group(2).strip()
+    markers = list(_TEXT_TOOL_ARG_RE.finditer(arg_text))
+    args: dict[str, Any] = {}
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(arg_text)
+        raw = arg_text[marker.end():end].strip()
+        if not raw:
+            continue
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            value = raw.strip("\"'")
+        args[marker.group(1)] = value
+    return {"tool": match.group(1), "args": args}
 
 
 def _loads_first_object(text: str) -> dict | None:

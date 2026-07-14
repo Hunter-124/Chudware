@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>  // activateCached: verify the cached AICM mesh file still exists
 #include <map>
 #include <string>
 
@@ -142,6 +141,36 @@ void DocMirror::storeOwnerMap(const nlohmann::json& ownerMapJson) {
             edgeOwner_[((uint64_t)be.first << 32) | (uint64_t)be.second] = fid;
         ownerMap_.emplace(fid, std::move(owned));
     }
+}
+
+DocMirrorSnapshot DocMirror::snapshot() const {
+    DocMirrorSnapshot s;
+    s.docId = docId_;
+    s.revision = revision_;
+    s.tree = tree_;
+    s.featureStatus = featureStatus_;
+    s.refDatums = refDatums_;
+    s.ownerMap = ownerMap_;
+    s.faceOwner = faceOwner_;
+    s.edgeOwner = edgeOwner_;
+    s.bodyOwners = bodyOwners_;
+    return s;
+}
+
+bool DocMirror::restoreSnapshot(const DocMirrorSnapshot& s) {
+    if (!s.valid()) return false;
+    docId_ = s.docId;
+    revision_ = s.revision;
+    tree_ = s.tree;
+    featureStatus_ = s.featureStatus;
+    refDatums_ = s.refDatums;
+    ownerMap_ = s.ownerMap;
+    faceOwner_ = s.faceOwner;
+    edgeOwner_ = s.edgeOwner;
+    bodyOwners_ = s.bodyOwners;
+    ++mutationGen_;  // any completion submitted for the leaving mirror is now superseded
+    notify();
+    return true;
 }
 
 // ---- resync on stale_revision ----
@@ -628,103 +657,6 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
     return true;
 }
 
-bool DocMirror::activateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
-                               const std::string& cachedAicm, std::string& aicmPath,
-                               bool& usedCache, std::string& err) {
-    usedCache = false;
-    aicmPath.clear();
-    if (docId.empty()) { err = "empty doc id"; return false; }
-    // No usable cache (never loaded, or the worker's mesh file is gone) -> full rebuild.
-    // T-PERF4: callers that can go async should treat err=="needs_rebuild" specially; we still
-    // fall back to sync activate() for headless/shot paths that need a blocking switch.
-    if (cachedRevision < 0 || cachedAicm.empty() ||
-        !std::filesystem::exists(std::filesystem::u8path(cachedAicm)))
-        return activate(w, docId, aicmPath, err);
-    // Cheap repoint: doc_tree carries tree/revision/feature_status/owner_map WITHOUT a re-tessellate.
-    nlohmann::json res;
-    if (!w.call("doc_tree", {{"doc_id", docId}}, res, err)) return false;
-    if (res.contains("code")) { err = jstr(res, "message"); return false; }
-    if (jint(res, "revision") != cachedRevision)
-        return activate(w, docId, aicmPath, err);   // changed while parked -> fresh rebuild + mesh
-    // Unchanged since we left it — adopt the doc_tree result + reuse the cached mesh (no rebuild).
-    docId_ = docId;
-    revision_ = cachedRevision;
-    tree_ = (res.contains("tree") && res["tree"].is_object()) ? res["tree"] : nlohmann::json{};
-    featureStatus_ = {};
-    if (res.contains("rebuild") && res["rebuild"].is_object()) {
-        const auto& rb = res["rebuild"];
-        if (rb.contains("feature_status") && rb["feature_status"].is_array())
-            featureStatus_ = rb["feature_status"];
-    }
-    if (res.contains("owner_map") && res["owner_map"].is_object())
-        storeOwnerMap(res["owner_map"]);
-    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
-             res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
-        storeOwnerMap(res["rebuild"]["owner_map"]);
-    else
-        storeOwnerMap(nlohmann::json());
-    if (res.contains("datums") && res["datums"].is_array())
-        refDatums_ = res["datums"];
-    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
-             res["rebuild"].contains("datums") && res["rebuild"]["datums"].is_array())
-        refDatums_ = res["rebuild"]["datums"];
-    else
-        refDatums_ = nlohmann::json::array();
-    aicmPath = cachedAicm;
-    usedCache = true;
-    notify();
-    return true;
-}
-
-// T-PERF4: cheap-only repoint. Returns true + usedCache when the parked mesh is still valid.
-// Returns false with err=="needs_rebuild" when a full doc_rebuild is required (no sync rebuild).
-// Other errors leave err as the transport/engine message.
-bool DocMirror::tryActivateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
-                                  const std::string& cachedAicm, std::string& aicmPath,
-                                  bool& usedCache, std::string& err) {
-    usedCache = false;
-    aicmPath.clear();
-    if (docId.empty()) { err = "empty doc id"; return false; }
-    if (cachedRevision < 0 || cachedAicm.empty() ||
-        !std::filesystem::exists(std::filesystem::u8path(cachedAicm))) {
-        err = "needs_rebuild";
-        return false;
-    }
-    nlohmann::json res;
-    if (!w.call("doc_tree", {{"doc_id", docId}}, res, err)) return false;
-    if (res.contains("code")) { err = jstr(res, "message"); return false; }
-    if (jint(res, "revision") != cachedRevision) {
-        err = "needs_rebuild";
-        return false;
-    }
-    docId_ = docId;
-    revision_ = cachedRevision;
-    tree_ = (res.contains("tree") && res["tree"].is_object()) ? res["tree"] : nlohmann::json{};
-    featureStatus_ = {};
-    if (res.contains("rebuild") && res["rebuild"].is_object()) {
-        const auto& rb = res["rebuild"];
-        if (rb.contains("feature_status") && rb["feature_status"].is_array())
-            featureStatus_ = rb["feature_status"];
-    }
-    if (res.contains("owner_map") && res["owner_map"].is_object())
-        storeOwnerMap(res["owner_map"]);
-    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
-             res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
-        storeOwnerMap(res["rebuild"]["owner_map"]);
-    else
-        storeOwnerMap(nlohmann::json());
-    if (res.contains("datums") && res["datums"].is_array())
-        refDatums_ = res["datums"];
-    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
-             res["rebuild"].contains("datums") && res["rebuild"]["datums"].is_array())
-        refDatums_ = res["rebuild"]["datums"];
-    else
-        refDatums_ = nlohmann::json::array();
-    aicmPath = cachedAicm;
-    usedCache = true;
-    notify();
-    return true;
-}
 
 // T-PERF4: adopt a finished doc_rebuild response (AsyncRpc) as activate() would.
 bool DocMirror::adoptActivateResponse(const std::string& docId, const nlohmann::json& res,

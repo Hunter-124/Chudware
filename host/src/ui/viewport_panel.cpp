@@ -1964,14 +1964,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             frameBBox(st, st.zoomToBBoxMin, st.zoomToBBoxMax);
         }
 
-        // Reference planes: hidden while sketching (the sketch grid owns the view), else per state.
-        // C25: a fresh part with no geometry auto-shows its datum planes (SolidWorks "pick a
-        // plane to start" state); once geometry exists, visibility is the user's toggle.
+        // Reference planes: hidden while sketching (the sketch grid owns the view), else user state.
+        // Until the user takes control, each default plane stays visible until a downstream 3D
+        // feature consumes it. AppState records those transitive dependency hits alongside consumed
+        // user-created planes; this replaces the old all-or-nothing "any body hides all planes".
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
-        // Auto-show all three on a body-less part (SolidWorks "pick a plane to start") — but ONLY
-        // until the user takes control of plane visibility, so an explicit hide actually sticks.
-        if (!st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled)
-            effPlane[0] = effPlane[1] = effPlane[2] = true;
+        if (st.docMirror.hasDoc() && !st.planesUserToggled) {
+            static const char* kPlaneFids[3] = {"plane.front", "plane.top", "plane.right"};
+            for (int i = 0; i < 3; ++i)
+                effPlane[i] = !st.autoHiddenPlanes.count(kPlaneFids[i]);
+        }
         // A feature PM with an active plane-accepting well (ref-axis "Two Planes", ref-plane "Mid
         // Plane", …): force-show the origin planes so the user can click one, same as the new-sketch
         // plane pick. The plane picker (drawPlanePicker) hit-tests them and feeds pmPlaneHover() back.
@@ -3172,10 +3174,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 s_sectionTool.toggle(st);
             // Hide/show submenu.
             if (ImGui::BeginMenu("Hide / Show")) {
-                bool allPlanes = st.showPlane[0] && st.showPlane[1] && st.showPlane[2];
+                bool allPlanes = st.planeVisEff[0] && st.planeVisEff[1] && st.planeVisEff[2];
                 if (ImGui::MenuItem("Reference Planes", nullptr, allPlanes)) {
                     bool nv = !allPlanes;
                     st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = nv;
+                    st.planesUserToggled = true;
                 }
                 ImGui::MenuItem("Origin Triad",  nullptr, &st.showTriad);
                 ImGui::MenuItem("Ground Shadow", nullptr, &st.showGroundShadow);
@@ -3470,10 +3473,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (clicked) ImGui::OpenPopup("##hu_hideshow");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
                 if (ImGui::BeginPopup("##hu_hideshow")) {
-                    bool allPlanes = st.showPlane[0] && st.showPlane[1] && st.showPlane[2];
+                    bool allPlanes = st.planeVisEff[0] && st.planeVisEff[1] && st.planeVisEff[2];
                     if (ImGui::MenuItem("Reference Planes", nullptr, allPlanes)) {
                         bool nv = !allPlanes;
                         st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = nv;
+                        st.planesUserToggled = true;
                     }
                     ImGui::MenuItem("Origin Triad",    nullptr, &st.showTriad);
                     ImGui::MenuItem("Ground Shadow",   nullptr, &st.showGroundShadow);

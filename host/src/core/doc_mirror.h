@@ -32,6 +32,21 @@ struct Owned {
     std::vector<std::pair<uint32_t, uint32_t>> edges;   // (body_id, edge_id)
 };
 
+// Complete host-side snapshot of an already-open document mirror. Tab switching restores this
+// immutable revision locally, avoiding a serialized worker round-trip when the tab has not changed.
+struct DocMirrorSnapshot {
+    std::string docId;
+    int revision = -1;
+    nlohmann::json tree;
+    nlohmann::json featureStatus;
+    nlohmann::json refDatums = nlohmann::json::array();
+    std::unordered_map<std::string, Owned> ownerMap;
+    std::unordered_map<uint64_t, std::string> faceOwner;
+    std::unordered_map<uint64_t, std::string> edgeOwner;
+    std::unordered_map<uint32_t, std::vector<std::string>> bodyOwners;
+    bool valid() const { return !docId.empty() && revision >= 0; }
+};
+
 // Represents an ops-response (doc_apply_ops / doc_undo / doc_redo).
 // The caller should feed tess.aicm_path into AppState::loadDocMesh().
 struct OpsResponse {
@@ -96,6 +111,11 @@ public:
     // renderer draws these as overlays — a datum produces no body, so without this it is invisible.
     // Empty for docs with no datum features (or an engine that doesn't ship the field).
     const nlohmann::json& refDatums() const { return refDatums_; }
+
+    // Capture/restore an immutable local revision for instant already-open tab binds. Restore fires
+    // the normal listener so every tree consumer observes the same state as a worker activation.
+    DocMirrorSnapshot snapshot() const;
+    bool restoreSnapshot(const DocMirrorSnapshot& snapshot);
 
     // W12+ — drawings restored by the most recent doc_open: an array of {doc_id, name,
     // source_doc_id}, one per embedded drawing the engine re-registered (their `source` already
@@ -239,24 +259,6 @@ public:
     bool activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
                   std::string& err);
 
-    // Multi-document FAST tab re-activation (scales tab switching to big assemblies). A backgrounded
-    // doc cannot be edited, so its revision is stable while parked. This first does a CHEAP doc_tree
-    // (tree/revision/owner_map, NO re-tessellate); if the worker's current revision still equals
-    // `cachedRevision` AND the `cachedAicm` mesh file still exists, it re-points the mirror from that
-    // doc_tree result and hands back `cachedAicm` — skipping the forced doc_rebuild that activate()
-    // would run (the per-switch re-tessellation that does NOT scale). Otherwise (doc changed while
-    // parked / no cache / mesh file gone) it transparently falls back to activate()'s full rebuild.
-    // `*usedCache` reports which path ran. Identical post-conditions to activate() either way.
-    bool activateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
-                        const std::string& cachedAicm, std::string& aicmPath,
-                        bool& usedCache, std::string& err);
-
-    // T-PERF4: cheap-only tab repoint (doc_tree + cached AICM). Does NOT run a full rebuild.
-    // On cache miss / revision change returns false with err == "needs_rebuild" so the caller
-    // can queue async doc_rebuild. Other failures set a real error string.
-    bool tryActivateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
-                           const std::string& cachedAicm, std::string& aicmPath,
-                           bool& usedCache, std::string& err);
 
     // T-PERF4: adopt a finished doc_rebuild JSON as activate() would (GL thread / drain).
     bool adoptActivateResponse(const std::string& docId, const nlohmann::json& res,

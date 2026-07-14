@@ -61,6 +61,9 @@ _LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
     "criterion": "criterion_result",
     "ac_result": "criterion_result",
     "acceptance": "criterion_result",
+    "assumption": "decision",
+    "verification": "artifact",
+    "verification_result": "artifact",
 }
 
 # Model-facing section aliases → canonical ledger state keys (mega-3 residual:
@@ -79,6 +82,12 @@ _LEDGER_GET_SECTION_ALIASES: dict[str, str] = {
     "acceptance": "artifacts",
     "acceptance_criteria": "artifacts",
     "ac": "artifacts",
+    "mission_brief": "brief",
+    "criterion_result": "criterion_results",
+    "criterion_results": "criterion_results",
+    "ac_results": "criterion_results",
+    "verification": "criterion_results",
+    "verifications": "criterion_results",
 }
 
 # T-DP1: kinds that require a `provenance` field on write (the "never recall a
@@ -167,9 +176,9 @@ class MissionDispatch:
         """Return the design ledger for this run, rendered within *budget_tokens*.
 
         section filters to one of brief | requirements | decisions | dimensions |
-        questions | stage_log | artifacts | features | geometry_specs | linkages |
-        build_nodes | manifest; omit (or section="all"/"*") for the full rendered
-        ledger. mega-2: models commonly pass section="all" meaning full render.
+        questions | stage_log | artifacts | criterion_results | features |
+        geometry_specs | linkages | build_nodes | manifest; omit (or
+        section="all"/"*") for the full rendered ledger.
         """
         led = self._ledger(run_id)
         if led is None:
@@ -188,7 +197,7 @@ class MissionDispatch:
             # mega-3: alias model-facing section names before allow-list.
             section = _LEDGER_GET_SECTION_ALIASES.get(section, section)
             allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts",
+                       "questions", "stage_log", "artifacts", "criterion_results",
                        # T-DP1 design-pipeline sections (contract §4/§9)
                        "features", "geometry_specs", "linkages", "build_nodes",
                        # mega-2: intake manifest surface (also under artifacts)
@@ -269,6 +278,8 @@ class MissionDispatch:
                 body["id"] = slug or f"{kind}_{len(getattr(led, 'events', []) or [])}"
             if not body.get("id"):
                 body["id"] = f"{kind}_{len(getattr(led, 'events', []) or [])}"
+        if kind == "artifact" and raw_kind != kind:
+            body.setdefault("kind", raw_kind)
         # decision alias from verdict often lacks stage/text/rationale
         if kind == "decision":
             body.setdefault("stage", body.get("phase") or "verify")

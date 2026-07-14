@@ -1,22 +1,22 @@
 // Document tabs (multi-document) — the per-tab operations on AppState.
 //
-// The host stays single-document at the DocMirror level: one "active" document view (tree, mesh,
-// selection, caches). The worker keeps every open doc alive in its registry, so a tab switch is
-// cheap: re-point DocMirror at the target doc (doc_rebuild pulls its tree + a fresh AICM mesh),
-// reset the per-doc host caches, reload the mesh, and restore that tab's camera. New Part / New
-// Assembly / Open append a tab + activate it (the caller already created the worker doc); closing
-// the active tab activates a neighbor, and closing the last tab drops back to the empty start
-// state the app shows on launch.
+// The host stays single-document at the live DocMirror level, while every DocSession parks an
+// immutable mirror snapshot, parsed tessellation, and renderer GPU buffers keyed by doc id+revision.
+// Switching an unchanged already-open tab restores/binds those caches without a worker or disk
+// round-trip. Changed/cold tabs clear stale geometry immediately and rebuild asynchronously.
 //
-// Safety: switching/closing first cleanly exits any in-progress sketch and cancels any open
-// PropertyManager form so no half-edited state leaks across documents (the "zombie state" the tree
-// and forms must never carry between docs).
+// Per-document PropertyManager, sketch, evaluate, selection, visibility, and camera state are parked
+// and restored with the same switch so an in-progress edit resumes in the correct document.
+#include <chrono>
+#include <cstdio>
 #include <set>
 #include <string>
 
 #include "app_state.h"
 
 #include "../worker_client.h"
+#include "../renderer.h"
+#include "../render/aicm_loader.h"    // complete DocMesh for per-session parsed tess cache
 #include "engine_backend.h"           // Phase 4: daemon mirror tabs detach, not doc_close
 #include "ipc_client.h"               // services/ipc EngineClient (daemon detach_doc)
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
@@ -76,6 +76,12 @@ static std::string jtab(const nlohmann::json& o, const char* k) {
 // erased in the rebuild-completion callback.
 static std::set<std::string> loadingToastInFlight;
 
+static void logTabPerf(AppState& st, const std::string& line) {
+    st.addLog(line);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+}
+
 // The display title for a document: its tree "name", else a kind-appropriate default.
 static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
     std::string n = tree.is_object() ? jtab(tree, "name") : std::string();
@@ -115,6 +121,9 @@ void AppState::addDocTab(bool isAssembly) {
     // becomes active, so switching BACK to it later restores its selection/mask/readouts (its PM /
     // sketch / measure already live on its own DocSession and survive regardless). Save its camera
     // too (mirrors the switchToTab leaving-camera capture).
+    // The worker mirror already points at the new document, but the renderer still owns the leaving
+    // tab's immutable buffers. Park them before the first upload for the new tab can replace them.
+    if (renderer) renderer->parkActiveMeshes();
     if (DocSession* prev = activeSession()) {
         DocTab& cur = docTabs[activeTab];
         cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
@@ -215,6 +224,8 @@ void AppState::switchToTab(int idx) {
 
 void AppState::switchToTabCore(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
+    const auto switchStarted = std::chrono::steady_clock::now();
+    const bool cacheInvalidated = docTabs[idx].meshCacheInvalidated;
     docTabs[idx].aiPulse = false;   // the user is now looking at it — stop the AI-activity glow
     // Already-active no-op early-out (part/asm: also require the mirror to match; drawing/ECAD: by
     // index, since they don't drive the DocMirror — their id lives in a separate worker registry).
@@ -296,22 +307,69 @@ void AppState::switchToTabCore(int idx) {
     DocTab& dst = docTabs[idx];
     ensureTabSession(dst);   // a never-activated tab gets its session on first switch-in
 
-    // 3) Re-point DocMirror at the destination doc. Prefer the fast path (doc_tree + cached AICM).
-    //    T-PERF4: on cache miss, queue async doc_rebuild instead of blocking the GL thread on a
-    //    full re-tessellate. Keep-last-good mesh until the rebuild drains.
+    // 3) Pure host-side bind for an unchanged already-open document. No WorkerClient call is made:
+    //    its global call mutex is intentionally bypassed, so an agent job on another document cannot
+    //    stall the UI. A pushed foreign revision binds only after its background prewarm completes.
     suppressTabDirty = true;
     std::string aicmPath, err;
-    bool usedCache = false;
-    bool ok = docMirror.tryActivateCached(worker, dst.docId, dst.session->cachedRevision,
-                                          dst.session->cachedAicmPath, aicmPath, usedCache, err);
-    if (!ok && err == "needs_rebuild") {
+    bool useLocalCache = false;
+    const bool awaitingPushedMesh =
+        cacheInvalidated && dst.session->cachedRevision >= 0 &&
+        dst.session->cachedMirror.valid() &&
+        dst.session->cachedMirror.docId == dst.docId &&
+        dst.session->cachedMirror.revision == dst.session->cachedRevision &&
+        !dst.session->cachedAicmPath.empty();
+    if (cacheInvalidated && !awaitingPushedMesh) {
+        if (renderer) renderer->discardCachedMeshes(dst.docId);
+        dst.session->cachedAicmPath.clear();
+        dst.session->cachedRevision = -1;
+        dst.session->cachedMirror = {};
+        dst.session->cachedDocMesh.reset();
+    } else if (!cacheInvalidated) {
+        useLocalCache = dst.session->cachedRevision >= 0 &&
+                        dst.session->cachedMirror.valid() &&
+                        dst.session->cachedMirror.docId == dst.docId &&
+                        dst.session->cachedMirror.revision == dst.session->cachedRevision &&
+                        dst.session->cachedDocMesh;
+        if (useLocalCache) aicmPath = dst.session->cachedAicmPath;
+    }
+    const bool ok = useLocalCache;
+    if (awaitingPushedMesh) {
+        // The push arrived before its background prewarm finished. Bind its tree immediately and
+        // promote the same AICM path to a visible async load — never serialize behind doc_rebuild.
+        if (renderer) renderer->parkActiveMeshes();
+        activeTab = idx;
+        if (activeWorkspace != Workspace::Model && activeWorkspace != Workspace::Simulate &&
+            activeWorkspace != Workspace::Manufacture)
+            activeWorkspace = Workspace::Model;
+        reseatActiveSubsystems(dst.session.get());
+        restoreDocState(*dst.session);
+        suppressTabDirty = true;
+        docMirror.restoreSnapshot(dst.session->cachedMirror);
+        dst.isAssembly = docMirror.tree().is_object() &&
+                         (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
+        dst.title = docTitle(docMirror.tree(), dst.isAssembly);
+        suppressTabDirty = false;
+        ui::featureTreeResetTransient();
+        zoomToBBoxRequested = false;
+        unloadDocMesh();
+        loadDocMeshAsync(dst.session->cachedAicmPath);
+        const double shellMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - switchStarted).count();
+        logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
+                   " path=pushed-async shell=" + std::to_string(shellMs) + "ms");
+        return;
+    }
+    if (!ok) {
         // Async rebuild path: finish the tab UI shell now, apply tree/mesh when rebuild drains.
         const std::string rebuildDocId = dst.docId;
         const int rebuildTabIdx = idx;
         if (loadingToastInFlight.insert(rebuildDocId).second)   // dedup: one toast per rebuild
             toast(ui::ToastLevel::Info, "Loading " + dst.title + "…");
         ++rebuildsInFlight;
-        // Optimistic: select the tab so the strip highlights; keep prior mesh until ready.
+        // Select the shell immediately but never show another document's stale geometry under it.
+        // Park the leaving doc's active GPU buffers first so its own next bind stays O(1).
+        if (renderer) renderer->parkActiveMeshes();
         activeTab = idx;
         if (activeWorkspace != Workspace::Model && activeWorkspace != Workspace::Simulate &&
             activeWorkspace != Workspace::Manufacture)
@@ -321,10 +379,20 @@ void AppState::switchToTabCore(int idx) {
         ui::featureTreeResetTransient();
         zoomToBBoxRequested = false;
         suppressTabDirty = false;
+        unloadDocMesh();
+        const auto rebuildQueuedAt = std::chrono::steady_clock::now();
+        const double shellMs = std::chrono::duration<double, std::milli>(
+            rebuildQueuedAt - switchStarted).count();
+        logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
+                   " path=async-rebuild shell=" + std::to_string(shellMs) + "ms");
         rpc.call("doc_rebuild", nlohmann::json{{"doc_id", rebuildDocId}},
-                 [this, rebuildDocId, rebuildTabIdx](const core::RpcResult& r) {
+                 [this, rebuildDocId, rebuildTabIdx, rebuildQueuedAt](const core::RpcResult& r) {
                      --rebuildsInFlight;
-                     loadingToastInFlight.erase(rebuildDocId);   // a fresh switch-in may toast again
+                     const double rebuildMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - rebuildQueuedAt).count();
+                     logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + rebuildDocId +
+                                      " total=" + std::to_string(rebuildMs) + "ms");
+                     loadingToastInFlight.erase(rebuildDocId);
                      if (rebuildTabIdx < 0 || rebuildTabIdx >= (int)docTabs.size() ||
                          docTabs[rebuildTabIdx].docId != rebuildDocId) {
                          addLog("[tabs] async rebuild for " + rebuildDocId +
@@ -360,9 +428,13 @@ void AppState::switchToTabCore(int idx) {
                                  addLog("[tabs] loadDocMesh on switch: " + lerr);
                          } else {
                              unloadDocMesh();
+                             renderer->setActiveMeshIdentity(rebuildDocId, docMirror.revision());
+                             d.session->cachedMirror = docMirror.snapshot();
+                             d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
                          }
                          d.session->cachedAicmPath = aicm;
                          d.session->cachedRevision = docMirror.revision();
+                         d.meshCacheInvalidated = false;
                          selection.mutableItems() = std::move(d.session->selItems);
                          d.session->selItems.clear();
                          hover = d.session->hover;
@@ -388,18 +460,6 @@ void AppState::switchToTabCore(int idx) {
                          }
                      }
                  }, 120000);
-        return;
-    }
-    suppressTabDirty = false;
-
-    if (!ok) {
-        addLog("[tabs] switch failed: " + err);
-        toast(ui::ToastLevel::Error, "Couldn't switch document: " + err);
-        // The mirror may now be in an inconsistent half-state; leave activeTab as-is on the strip
-        // but the doc id has likely changed — re-sync the active index to whatever the mirror holds
-        // and re-point the active subsystems at whatever session that resolves to.
-        activeTab = tabIndexForActiveDoc();
-        reseatActiveSubsystems(activeSession());
         return;
     }
 
@@ -428,25 +488,22 @@ void AppState::switchToTabCore(int idx) {
     ui::featureTreeResetTransient();
     zoomToBBoxRequested = false;
 
+    const auto meshBindStarted = std::chrono::steady_clock::now();
+    std::string bindErr;
+    if (!bindCachedDocMesh(*dst.session, bindErr)) {
+        suppressTabDirty = false;
+        unloadDocMesh();
+        addLog("[tabs] local cache bind failed for " + dst.docId + ": " + bindErr);
+        toast(ui::ToastLevel::Error, "Couldn't switch document: " + bindErr);
+        return;
+    }
+    const double meshBindMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - meshBindStarted).count();
+    suppressTabDirty = false;
+
     dst.isAssembly = docMirror.tree().is_object() &&
                      (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
     dst.title = docTitle(docMirror.tree(), dst.isAssembly);
-
-    // 5) Load the destination doc's mesh (empty path / empty doc → datum-plane fallback). With the
-    //    hidden-body mask already restored, loadDocMesh preserves it (body-id list unchanged).
-    if (!aicmPath.empty()) {
-        std::string lerr;
-        if (!loadDocMesh(aicmPath, lerr) && !lerr.empty())
-            addLog("[tabs] loadDocMesh on switch: " + lerr);
-    } else {
-        // Empty model (sketch-only / all solids suppressed): no tess file — drop the leaving tab's
-        // mesh + pick buffers without disturbing the session state we just restored.
-        unloadDocMesh();
-    }
-    // Refresh this session's fast-switch cache to the just-loaded mesh + revision, so the NEXT
-    // switch-in can skip the rebuild while the doc stays unedited (activateCached above).
-    dst.session->cachedAicmPath = aicmPath;
-    dst.session->cachedRevision = docMirror.revision();
 
     // 5b) Restore the viewport selection now that the mesh is loaded (loadDocMesh cleared it). Assign
     //     items directly so the resolved selectors survive and the observer isn't re-fired (the picks
@@ -469,21 +526,21 @@ void AppState::switchToTabCore(int idx) {
     if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
 
-    // Reveal the Simulation workspace when the entering part already carries studies, so a part with
-    // a saved simulation opens with the Simulation toolbar + study tree in view (the user shouldn't
-    // have to hunt for the gated tab). Cheap sim_study_list pull; no solve is triggered. We don't
-    // force it for assemblies (they default to the Assembly ribbon above).
-    if (!dst.isAssembly && simManager) {
-        simManager->refresh(*this);
-        if (simManager->studyCount() > 0) {
-            showSimulationTools = true;
-            ribbonTab = RT_Simulation;
-            leftPaneTab = LP_Simulation;
-        }
+    // SimManager is per-document and retains its known studies. Do not synchronously refresh here:
+    // even a read-only RPC shares the worker queue with agent jobs and used to turn a GPU-cache bind
+    // into a multi-second wait. The simulation panel refreshes when it is actually drawn.
+    if (!dst.isAssembly && simManager && simManager->studyCount() > 0) {
+        showSimulationTools = true;
+        ribbonTab = RT_Simulation;
+        leftPaneTab = LP_Simulation;
     }
 
     addLog("[tabs] switched to '" + dst.title + "' (doc " + dst.docId +
            ", rev " + std::to_string(docMirror.revision()) + ")");
+    const double totalMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - switchStarted).count();
+    logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
+                       std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
 }
 
 void AppState::closeDocTab(int idx, bool detachOnly) {
@@ -551,6 +608,7 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
         reseatActiveSubsystems(nullptr);
         docMirror.reset();
         clearViewportForNewDoc();
+        if (renderer) renderer->discardCachedMeshes(closing.docId);
         addLog("[tabs] closed last document — empty start state");
         return;
     }
@@ -569,6 +627,7 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
         if (idx < activeTab) --activeTab;
         reseatActiveSubsystems(activeSession());
     }
+    if (renderer) renderer->discardCachedMeshes(closing.docId);
     addLog("[tabs] closed '" + closing.title + "'");
 }
 

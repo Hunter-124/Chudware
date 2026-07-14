@@ -24,9 +24,10 @@ def register_ledger_tools(mcp) -> None:
         """Return the design ledger for *run_id*, rendered within *budget_tokens*.
 
         ``section`` filters to a single section (brief | requirements | decisions |
-        dimensions | questions | stage_log | artifacts | features | geometry_specs |
-        linkages | build_nodes | manifest); omit or pass ``all``/``*`` for the full
-        ledger render. ``budget_tokens`` controls the rendering budget (default 800).
+        dimensions | questions | stage_log | artifacts | criterion_results |
+        features | geometry_specs | linkages | build_nodes | manifest); omit or
+        pass ``all``/``*`` for the full ledger render. ``budget_tokens`` controls
+        the rendering budget (default 800).
         """
         try:
             from services.agent.ledger import Ledger, ledger_render
@@ -54,12 +55,18 @@ def register_ledger_tools(mcp) -> None:
                 "plan": "build_nodes",
                 "acceptance": "artifacts", "acceptance_criteria": "artifacts",
                 "ac": "artifacts",
+                "mission_brief": "brief",
+                "criterion_result": "criterion_results",
+                "criterion_results": "criterion_results",
+                "ac_results": "criterion_results",
+                "verification": "criterion_results",
+                "verifications": "criterion_results",
             }
             section = _SECTION_ALIASES.get(section, section)
             # Return raw state section as JSON (no token budget needed)
             state = ledger.state
             allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts",
+                       "questions", "stage_log", "artifacts", "criterion_results",
                        "features", "geometry_specs", "linkages", "build_nodes",
                        "manifest", "events"}
             if section not in allowed:
@@ -177,6 +184,8 @@ def register_ledger_tools(mcp) -> None:
             "report": "artifact", "battery": "artifact",
             "criterion": "criterion_result", "ac_result": "criterion_result",
             "acceptance": "criterion_result",
+            "assumption": "decision",
+            "verification": "artifact", "verification_result": "artifact",
         }
         raw_kind = (kind or "").strip().lower() if isinstance(kind, str) else ""
         kind = KIND_ALIASES.get(raw_kind, raw_kind)
@@ -184,6 +193,13 @@ def register_ledger_tools(mcp) -> None:
             return {"ok": False, "error": f"unknown kind {raw_kind!r}",
                     "valid_kinds": sorted(VALID_KINDS | set(KIND_ALIASES)),
                     "aliased_to": KIND_ALIASES}
+
+        payload = dict(payload or {})
+        if kind == "artifact" and raw_kind != kind:
+            payload.setdefault("id", str(
+                payload.get("deliverable") or payload.get("name") or raw_kind
+            ))
+            payload.setdefault("kind", raw_kind)
 
         if kind == "dimension" and not payload.get("provenance"):
             return {

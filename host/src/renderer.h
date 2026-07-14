@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -126,6 +127,15 @@ public:
     void resize(int width, int height);
     void setMesh(const Mesh& m);                          // single body, neutral color
     void setMeshes(const std::vector<PartMesh>& parts);   // multi-body, per-part colors
+    // Per-document GPU mesh cache. A content identity is the worker doc id + immutable revision;
+    // bindCachedMeshes swaps already-uploaded VAO/VBO handles into the active slot without reading
+    // AICM or issuing GL uploads. setActiveMeshIdentity marks the freshly uploaded active mesh.
+    void setActiveMeshIdentity(const std::string& docId, int revision);
+    bool bindCachedMeshes(const std::string& docId, int revision);
+    void cacheMeshes(const std::string& docId, int revision,
+                     const std::vector<PartMesh>& parts);
+    void parkActiveMeshes();
+    void discardCachedMeshes(const std::string& docId);
     // While framing is frozen, setMeshes() updates the geometry but PRESERVES center_/radius_,
     // so real-time rebuilds (e.g. a downstream extrude recomputing while a sketch is edited) do
     // not re-frame the camera. Used to stop the view "bouncing" during sketch editing — the view
@@ -384,6 +394,7 @@ private:
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();
+    void freeSubVector(std::vector<Sub>& subs);
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
@@ -495,6 +506,14 @@ private:
     float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
+    struct CachedMesh {
+        std::vector<Sub> subs;
+        Vec3 center;
+        float radius = 0.0f;
+    };
+    std::unordered_map<std::string, CachedMesh> meshCache_;
+    std::string activeMeshDocId_;
+    int activeMeshRevision_ = -1;
     // In-context component-edit ghost: the parked assembly mesh (moved out of subs_ on enter),
     // drawn translucent behind the active component and excluded from picking. See captureCurrentAsGhost.
     std::vector<Sub> ghostSubs_;

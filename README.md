@@ -138,6 +138,18 @@ Solo dev — main WIP happens on this machine, remote is mainly a backup. Canoni
 bash scripts/gate.sh    # check.py + core build/ctest + ui tests
 ```
 
+**Linux desktop app** (host GUI):
+```bash
+./build.sh                                   # host/build-linux/bin/Billet
+scripts/install_desktop.sh                   # once: ~/.local/share applications + hicolor icons
+./host/build-linux/bin/Billet                # run
+```
+`install_desktop.sh` writes `Billet.desktop` (`Name=Billet`, `StartupWMClass=Billet`,
+`Icon=Billet`) and resizes `assets/logo_icon.png` into the user hicolor theme — no root.
+The running window sets `WM_CLASS=Billet` (and Wayland `app_id`) so the taskbar / alt-tab /
+task manager bind to that entry. Verify: `xprop WM_CLASS` on the window should report
+`"Billet", "Billet"`. Re-pin any old AI-CAD launcher after the first install.
+
 **Windows desktop app** (VS 2022 + CMake):
 ```powershell
 py -3.11 -m installer.provision --with-app-code   # once: runtime venv -> %APPDATA%\AI-CAD

@@ -171,6 +171,7 @@ struct SubUsageWindow {
     std::string window;       // e.g. "5h", "7d"
     std::string label;        // display label
     float usedFraction = 0.f; // 0..1
+    bool hasFraction = false; // null means status-only; never render it as 0%
     std::string resetsAt;     // iso8601
     std::string status;       // ok|warn|blocked|unknown
 };
@@ -213,6 +214,11 @@ static const char* kSubProviderLabels[] = {
 static constexpr double kUsagePollIntervalSec = 5.0 * 60.0;
 static constexpr double kAccountsPollIntervalSec = 1.5;
 
+static std::string optionalJsonString(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
 // Parse optional usage array from an account / usage-row object.
 static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
     row.usage.clear();
@@ -223,13 +229,15 @@ static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
     for (const auto& u : *it) {
         if (!u.is_object()) continue;
         SubUsageWindow w;
-        w.window = u.value("window", std::string());
-        w.label  = u.value("label", std::string());
+        w.window = optionalJsonString(u, "window");
+        w.label  = optionalJsonString(u, "label");
         if (w.label.empty()) w.label = w.window.empty() ? "Usage" : w.window;
-        if (u.contains("used_fraction") && u["used_fraction"].is_number())
+        if (u.contains("used_fraction") && u["used_fraction"].is_number()) {
             w.usedFraction = (float)std::clamp(u["used_fraction"].get<double>(), 0.0, 1.0);
-        w.resetsAt = u.value("resets_at", std::string());
-        w.status   = u.value("status", std::string("unknown"));
+            w.hasFraction = true;
+        }
+        w.resetsAt = optionalJsonString(u, "resets_at");
+        w.status   = optionalJsonString(u, "status");
         if (w.status.empty()) w.status = "unknown";
         row.usage.push_back(std::move(w));
     }
@@ -237,11 +245,11 @@ static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
 
 // Fill optional identity fields from an accounts/status row (absent = unknown).
 static void parseAccountIdentity(const nlohmann::json& a, SubAccountRow& row) {
-    row.displayName = a.value("display_name", std::string());
-    row.plan        = a.value("plan", std::string());
+    row.displayName = optionalJsonString(a, "display_name");
+    row.plan        = optionalJsonString(a, "plan");
     // Prefer explicit email, then label, then account_id.
-    row.label = a.value("email", std::string());
-    if (row.label.empty()) row.label = a.value("label", std::string());
+    row.label = optionalJsonString(a, "email");
+    if (row.label.empty()) row.label = optionalJsonString(a, "label");
     if (row.label.empty())
         row.label = row.accountId.empty() ? "(account)" : row.accountId;
     parseUsageWindows(a, row);
@@ -253,8 +261,8 @@ static void mergeUsageRows(const nlohmann::json& rows) {
     if (!rows.is_array()) return;
     for (const auto& r : rows) {
         if (!r.is_object()) continue;
-        const std::string prov = r.value("provider", std::string());
-        const std::string aid  = r.value("account_id", std::string());
+        const std::string prov = optionalJsonString(r, "provider");
+        const std::string aid  = optionalJsonString(r, "account_id");
         for (auto& row : s_subAccts.rows) {
             if (row.provider != prov) continue;
             if (!aid.empty() && row.accountId != aid) continue;
@@ -341,6 +349,15 @@ static void drawPlanChip(const std::string& plan, float sc) {
 
 // One usage window: label + fraction bar + reset countdown, colored by status.
 static void drawUsageWindow(const SubUsageWindow& w, float sc) {
+    if (!w.hasFraction) {
+        const char* detail = "usage unavailable";
+        if (w.status == "needs_login") detail = "sign in required";
+        else if (w.status == "blocked") detail = "browser verification required";
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::Text("%s \xe2\x80\x94 %s", w.label.c_str(), detail);
+        ImGui::PopStyleColor();
+        return;
+    }
     const auto& pal = ui::palette;
     const float* role = usageStatusColor(w.status, w.usedFraction);
     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -430,7 +447,8 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             return;
         }
         if (r.result.value("ok", true) == false) {
-            s_subAccts.lastError = r.result.value("reason", std::string("accounts failed"));
+            auto reason = optionalJsonString(r.result, "reason");
+            s_subAccts.lastError = reason.empty() ? "accounts failed" : reason;
             return;
         }
         s_subAccts.lastError.clear();
@@ -446,8 +464,8 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
         for (const auto& a : arr) {
             if (!a.is_object()) continue;
             SubAccountRow row;
-            row.provider  = a.value("provider", std::string());
-            row.accountId = a.value("account_id", std::string());
+            row.provider  = optionalJsonString(a, "provider");
+            row.accountId = optionalJsonString(a, "account_id");
             row.active    = a.value("active", false);
             row.connected = a.value("connected", true);
             parseAccountIdentity(a, row);
@@ -474,14 +492,21 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             if (!it.value().is_object()) continue;
             SubLoginProgress& p = s_subAccts.login[it.key()];
             const auto& x = it.value();
+            const bool wasInProgress = p.inProgress;
             p.inProgress = x.value("login_in_progress", false);
             p.browserOpened = x.value("browser_opened", false);
-            p.userCode = x.value("user_code", std::string());
-            p.verifyUrl = x.value("verification_url", std::string());
+            p.userCode = optionalJsonString(x, "user_code");
+            p.verifyUrl = optionalJsonString(x, "verification_url");
             if (p.verifyUrl.empty())
-                p.verifyUrl = x.value("verification_uri", std::string());
-            p.stage = x.value("login_stage", std::string());
-            p.lastError = x.value("last_error", std::string());
+                p.verifyUrl = optionalJsonString(x, "verification_uri");
+            p.stage = optionalJsonString(x, "login_stage");
+            p.lastError = optionalJsonString(x, "last_error");
+            if (wasInProgress && !p.inProgress) {
+                // The start RPC completes immediately; status is the completion edge.
+                // Force both rows and usage now instead of waiting for their normal TTLs.
+                s_subAccts.lastAccountsPoll = -1e9;
+                s_subAccts.lastUsagePoll = -1e9;
+            }
         }
     });
 }
@@ -530,8 +555,16 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     nlohmann::json p;
                     p["provider"] = prov;
                     p["account_id"] = row.accountId;
-                    st.rpc.call("subscription_switch", p, [](const core::RpcResult&) {
-                        s_subAccts.lastAccountsPoll = -1e9;  // force refresh
+                    st.rpc.call("subscription_switch", p, [](const core::RpcResult& r) {
+                        const bool rejected = r.result.is_object() &&
+                                              r.result.value("ok", true) == false;
+                        if (!r.ok || rejected) {
+                            auto reason = rejected
+                                ? optionalJsonString(r.result, "reason") : r.err;
+                            s_subAccts.lastError =
+                                reason.empty() ? "account switch failed" : reason;
+                        }
+                        s_subAccts.lastAccountsPoll = -1e9;  // force refresh/rollback
                         s_subAccts.lastUsagePoll = -1e9;
                     });
                     // Optimistic local flip (seamless — no restart).
@@ -573,8 +606,16 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 nlohmann::json p;
                 p["provider"] = prov;
                 p["account_id"] = row.accountId;
-                st.rpc.call("subscription_logout", p, [](const core::RpcResult&) {
-                    s_subAccts.lastAccountsPoll = -1e9;
+                st.rpc.call("subscription_logout", p, [](const core::RpcResult& r) {
+                    const bool rejected = r.result.is_object() &&
+                                          r.result.value("ok", true) == false;
+                    if (!r.ok || rejected) {
+                        auto reason = rejected
+                            ? optionalJsonString(r.result, "reason") : r.err;
+                        s_subAccts.lastError =
+                            reason.empty() ? "sign out failed" : reason;
+                    }
+                    s_subAccts.lastAccountsPoll = -1e9;  // force refresh/rollback
                     s_subAccts.lastUsagePoll = -1e9;
                 });
                 // Optimistic remove.
@@ -658,8 +699,9 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 prog.stage = "start";
                 nlohmann::json p;
                 p["provider"] = prov;
-                // xAI is device-code only; others use browser OAuth.
-                if (std::string(prov) == "xai" || std::string(prov) == "codex")
+                // xAI is device-code only. Codex uses its browser callback flow here;
+                // its headless device flow cannot surface a code through this UI.
+                if (std::string(prov) == "xai")
                     p["device"] = true;
                 st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
                     SubLoginProgress& pr = s_subAccts.login[prov];
@@ -668,8 +710,8 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                         pr.lastError = r.err.empty() ? "login failed" : r.err;
                     } else if (r.result.is_object() && r.result.value("ok", true) == false) {
                         pr.inProgress = false;
-                        auto reason = r.result.value("reason", std::string());
-                        auto hint = r.result.value("hint", std::string());
+                        auto reason = optionalJsonString(r.result, "reason");
+                        auto hint = optionalJsonString(r.result, "hint");
                         pr.lastError = reason.empty() ? "login failed" : reason;
                         if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
                     }

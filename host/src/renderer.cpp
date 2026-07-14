@@ -360,6 +360,8 @@ void eyeForView(const std::string& v, float& yaw, float& pitch) {
 
 Renderer::~Renderer() {
     freeSubs();
+    for (auto& [_, cached] : meshCache_) freeSubVector(cached.subs);
+    meshCache_.clear();
     clearGhost();   // free the component-edit ghost buffers if one is active at teardown
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
@@ -574,8 +576,8 @@ void Renderer::resize(int width, int height) {
     allocTargets();
 }
 
-void Renderer::freeSubs() {
-    for (auto& s : subs_) {
+void Renderer::freeSubVector(std::vector<Sub>& subs) {
+    for (auto& s : subs) {
         if (s.vao) glDeleteVertexArrays(1, &s.vao);
         if (s.vboPos) glDeleteBuffers(1, &s.vboPos);
         if (s.vboNrm) glDeleteBuffers(1, &s.vboNrm);
@@ -584,7 +586,103 @@ void Renderer::freeSubs() {
         if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
         if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
     }
+    subs.clear();
+}
+
+void Renderer::freeSubs() {
+    freeSubVector(subs_);
+}
+
+void Renderer::setActiveMeshIdentity(const std::string& docId, int revision) {
+    if (docId.empty() || revision < 0) {
+        activeMeshDocId_.clear();
+        activeMeshRevision_ = -1;
+        return;
+    }
+    // A newly uploaded revision supersedes every parked revision of the same document.
+    discardCachedMeshes(docId);
+    activeMeshDocId_ = docId;
+    activeMeshRevision_ = revision;
+}
+
+void Renderer::parkActiveMeshes() {
+    if (activeMeshDocId_.empty() || activeMeshRevision_ < 0) {
+        freeSubs();
+        return;
+    }
+    const std::string activeKey =
+        activeMeshDocId_ + '\x1f' + std::to_string(activeMeshRevision_);
+    auto old = meshCache_.find(activeKey);
+    if (old != meshCache_.end()) {
+        freeSubVector(old->second.subs);
+        meshCache_.erase(old);
+    }
+    meshCache_.emplace(activeKey, CachedMesh{std::move(subs_), center_, radius_});
+    activeMeshDocId_.clear();
+    activeMeshRevision_ = -1;
+}
+
+void Renderer::cacheMeshes(const std::string& docId, int revision,
+                           const std::vector<PartMesh>& parts) {
+    if (docId.empty() || revision < 0) return;
+    if (activeMeshDocId_ == docId && activeMeshRevision_ == revision) return;
+
+    // Upload into a temporary active slot, then restore the visible document unchanged. This runs
+    // on the GL thread after background AICM parsing and makes the later tab switch a handle swap.
+    std::vector<Sub> visibleSubs = std::move(subs_);
+    const Vec3 visibleCenter = center_;
+    const float visibleRadius = radius_;
+    const std::string visibleDocId = activeMeshDocId_;
+    const int visibleRevision = activeMeshRevision_;
+    const bool wasFrozen = framingFrozen_;
     subs_.clear();
+    activeMeshDocId_.clear();
+    activeMeshRevision_ = -1;
+    framingFrozen_ = false;
+    setMeshes(parts);
+    CachedMesh uploaded{std::move(subs_), center_, radius_};
+    subs_ = std::move(visibleSubs);
+    center_ = visibleCenter;
+    radius_ = visibleRadius;
+    activeMeshDocId_ = visibleDocId;
+    activeMeshRevision_ = visibleRevision;
+    framingFrozen_ = wasFrozen;
+
+    discardCachedMeshes(docId);
+    const std::string key = docId + '\x1f' + std::to_string(revision);
+    meshCache_.emplace(key, std::move(uploaded));
+}
+
+bool Renderer::bindCachedMeshes(const std::string& docId, int revision) {
+    if (docId.empty() || revision < 0) return false;
+    if (activeMeshDocId_ == docId && activeMeshRevision_ == revision) return true;
+    const std::string targetKey = docId + '\x1f' + std::to_string(revision);
+    if (meshCache_.find(targetKey) == meshCache_.end()) return false;
+
+    parkActiveMeshes();  // may rehash meshCache_; reacquire the target iterator afterwards
+    auto target = meshCache_.find(targetKey);
+    if (target == meshCache_.end()) return false;
+    subs_ = std::move(target->second.subs);
+    center_ = target->second.center;
+    radius_ = target->second.radius;
+    meshCache_.erase(target);
+    activeMeshDocId_ = docId;
+    activeMeshRevision_ = revision;
+    ++meshesRevision_;
+    return true;
+}
+
+void Renderer::discardCachedMeshes(const std::string& docId) {
+    if (docId.empty()) return;
+    const std::string prefix = docId + '\x1f';
+    for (auto it = meshCache_.begin(); it != meshCache_.end();) {
+        if (it->first.compare(0, prefix.size(), prefix) == 0) {
+            freeSubVector(it->second.subs);
+            it = meshCache_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // In-context component edit: steal the currently-uploaded active mesh (assembly) into the ghost
@@ -595,6 +693,8 @@ void Renderer::captureCurrentAsGhost() {
     clearGhost();
     ghostSubs_ = std::move(subs_);   // move GL handles; no reupload
     subs_.clear();                   // moved-from vector -> explicit empty (defensive)
+    activeMeshDocId_.clear();        // ghost is intentionally not a switch-cache entry
+    activeMeshRevision_ = -1;
     showGhost_ = true;
     ++meshesRevision_;
 }
@@ -674,6 +774,10 @@ void Renderer::setMesh(const Mesh& m) {
 
 void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
     freeSubs();
+    // setMeshes is a content change/rebuild, not a tab bind. The caller marks the new immutable
+    // doc+revision identity after the upload succeeds.
+    activeMeshDocId_.clear();
+    activeMeshRevision_ = -1;
     Vec3 bbMin, bbMax;
     bool first = true;
     for (const auto& part : parts) {

@@ -124,8 +124,8 @@ def test_anthropic_429_freezes_cache(tmp_config, monkeypatch):
     assert n["n"] >= 1
 
     n["n"] = 0
-    # Subsequent fetch within TTL must NOT re-hit the network.
-    third = usage.fetch_account_usage("claude", "a1", force=False)
+    # A force refresh cannot override a provider-requested 429 freeze.
+    third = usage.fetch_account_usage("claude", "a1", force=True)
     assert n["n"] == 0
     assert third["usage"]
 
@@ -279,6 +279,32 @@ def test_xai_browser_scrape_uses_scrape_or_falls_back(tmp_config, monkeypatch):
     assert row["plan"] == "Premium+"
     assert row["usage"] == []
 
+    # A live CEF session that needs login is honest about having no quota data:
+    # the scraper's placeholder must not become a made-up 0% usage bar.
+    usage.clear_cache()
+
+    def needs_login(*_a, **_k):
+        return {
+            "ok": False,
+            "status": "needs_login",
+            "source": "browser_scrape",
+            "dashboard_url": "https://grok.com/?_s=usage",
+            "usage": [{
+                "window": "weekly",
+                "label": "Weekly pool",
+                "used_fraction": None,
+                "resets_at": None,
+                "status": "needs_login",
+            }],
+        }
+
+    monkeypatch.setattr(scrape_mod, "fetch_grok_usage", needs_login)
+    login_row = usage.fetch_account_usage("xai", "u1", force=True)
+    assert login_row["source"] == "browser_scrape"
+    assert len(login_row["usage"]) == 1
+    assert login_row["usage"][0]["used_fraction"] is None
+    assert login_row["usage"][0]["status"] == "needs_login"
+
     # Success path: scrape returns weekly pool fractions.
     usage.clear_cache()
 
@@ -331,6 +357,36 @@ def test_cache_ttl_skips_network(tmp_config, monkeypatch):
     usage.fetch_account_usage("claude", "a", force=True)
     assert n["n"] > c1  # force bypass
 
+
+
+def test_get_cached_expires_and_logout_invalidates_account(tmp_config, monkeypatch):
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "t", "account_id": "a", "email": "e@c.com",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="a")
+    clock = [1000.0]
+    monkeypatch.setattr(usage, "_now", lambda: clock[0])
+    monkeypatch.setattr(
+        usage,
+        "_FETCHERS",
+        {"claude": lambda _cred: {
+            "display_name": "E",
+            "plan": "pro",
+            "usage": [{"window": "5h", "label": "Session", "used_fraction": 0.2,
+                       "resets_at": None, "status": "ok"}],
+        }},
+    )
+
+    usage.fetch_account_usage("claude", "a", force=True)
+    assert usage.get_cached("claude", "a") is not None
+    clock[0] += usage.CACHE_TTL_S + 1
+    assert usage.get_cached("claude", "a") is None
+
+    clock[0] += 1
+    usage.fetch_account_usage("claude", "a", force=True)
+    assert usage.get_cached("claude", "a") is not None
+    assert usage.sl.logout("claude", account_id="a")["ok"] is True
+    assert usage.get_cached("claude", "a") is None
 
 # ── subscription_usage aggregate + RPC ───────────────────────────────────────
 

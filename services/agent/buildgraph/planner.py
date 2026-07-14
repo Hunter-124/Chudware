@@ -53,6 +53,14 @@ def _is_dag_plan(plan: dict) -> bool:
     return plan.get("schema") == "aicad.dag/1"
 
 
+def _is_buildgraph_plan(plan: dict) -> bool:
+    """True for a direct aicad.buildgraph/1 graph emitted by a planner role."""
+    return (
+        plan.get("schema") == "aicad.buildgraph/1"
+        or plan.get("format") == "aicad.buildgraph/1"
+    ) and isinstance(plan.get("nodes"), list)
+
+
 # ---------------------------------------------------------------------------
 # Build-plan → buildgraph
 # ---------------------------------------------------------------------------
@@ -314,6 +322,62 @@ def _nodes_from_dag_plan(
     return nodes
 
 
+def _nodes_from_buildgraph_plan(plan: dict) -> list[dict]:
+    """Normalize a direct buildgraph payload into the frozen node shape.
+
+    Planner roles commonly emit ``format`` plus compact ``title``/``deps``/
+    ``role`` fields.  They already supplied the graph; this adapter preserves its
+    dependency structure instead of routing it through BUILD PLAN inference.
+    """
+    edge_requires: dict[str, list[str]] = {}
+    for edge in plan.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("from") or "")
+        target = str(edge.get("to") or "")
+        if source and target:
+            edge_requires.setdefault(target, []).append(source)
+
+    nodes: list[dict] = []
+    for raw in plan.get("nodes", []):
+        if not isinstance(raw, dict):
+            continue
+        node_id = str(raw.get("id") or _bgid("bg"))
+        requires = raw.get("requires")
+        if not isinstance(requires, list):
+            requires = raw.get("deps")
+        if not isinstance(requires, list):
+            requires = []
+        requires = [
+            str(req) for req in [*requires, *edge_requires.get(node_id, [])] if req
+        ]
+        requires = list(dict.fromkeys(requires))
+        kind = str(raw.get("kind") or "op")
+        if kind not in {"part", "feature", "op", "verify", "checkpoint"}:
+            kind = "op"
+        status = str(raw.get("status") or "pending")
+        if status not in {"pending", "running", "done", "failed", "blocked"}:
+            status = "pending"
+        nodes.append({
+            "id": node_id,
+            "kind": kind,
+            "label": str(
+                raw.get("label") or raw.get("title") or raw.get("name") or node_id
+            ),
+            "doc_id": str(raw.get("doc_id") or ""),
+            "refs": raw.get("refs") if isinstance(raw.get("refs"), dict)
+                    else {"features": [], "parts": []},
+            "requires": requires,
+            "why": str(
+                raw.get("why")
+                or "dependencies supplied by the planner role"
+            ),
+            "status": status,
+            "assigned": raw.get("assigned") or raw.get("role"),
+        })
+    return nodes
+
+
 def _dag_type_to_bg_kind(dag_type: str) -> str:
     mapping = {
         "plan": "op",
@@ -372,6 +436,9 @@ def build_graph(
     elif _is_dag_plan(plan):
         nodes = _nodes_from_dag_plan(plan, advisories)
         name = plan.get("name", mission or "dag_mission")
+    elif _is_buildgraph_plan(plan):
+        nodes = _nodes_from_buildgraph_plan(plan)
+        name = plan.get("name", mission or "buildgraph")
     else:
         advisories.append(_advisory(
             "unknown_plan_shape",

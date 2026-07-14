@@ -4,6 +4,8 @@ Acceptance (owner item 5):
   * PCB fixture with a known same-layer crossing is flagged.
   * Open-profile sketch is flagged.
   * ASCII outputs are stable across runs (deterministic).
+  * Mutation readbacks (sketch + board) include ascii+summary, enforce caps,
+    and are byte-stable.
 
 Run:  python3 -m pytest services/mcp/test_ascii2d.py -q
 """
@@ -12,7 +14,12 @@ from __future__ import annotations
 import json
 
 from mcp_server.ascii2d import (
+    READBACK_MAX_H,
+    READBACK_MAX_W,
+    attach_board_readback,
+    attach_sketch_readback,
     board_ascii_report,
+    board_mutation_readback,
     check_board,
     check_sketch_geometry,
     register_ascii2d_tools,
@@ -20,6 +27,8 @@ from mcp_server.ascii2d import (
     render_board_layer_ascii,
     segments_cross,
     sketch_ascii_report,
+    sketch_ids_from_ops,
+    sketch_mutation_readback,
 )
 
 
@@ -297,3 +306,125 @@ def test_near_coincident_flagged():
         "closure": {"open_endpoints": ["a.start", "b.end"]},
     })
     assert any(f["code"] == "near_coincident" for f in findings), findings
+
+
+# --------------------------------------------------------------------------- mutation readback
+
+
+def test_sketch_mutation_readback_has_ascii_and_summary():
+    sk = _open_sketch()
+    rb = sketch_mutation_readback(sk, pitch=1.0, sketch_id="s1")
+    assert rb["ok"] is True
+    assert rb["kind"] == "sketch_readback"
+    assert rb["ascii"] and isinstance(rb["ascii"], str)
+    assert rb["ascii_block"].startswith("[sketch_readback")
+    assert "ascii" in rb and "summary" in rb
+    assert "Entities:" in rb["summary"] or "entit" in rb["summary"].lower()
+    assert "Dimensions:" in rb["summary"]
+    assert "Constraints:" in rb["summary"]
+    # open profile + under-dim should surface
+    codes = {f.get("code") for f in rb["findings"]}
+    assert "open_profile" in codes or "OPEN" in rb["summary"]
+    # NL parity: named entity / dim callouts
+    assert "e1" in rb["summary"] or "line" in rb["summary"].lower()
+    assert "distance" in rb["summary"].lower() or "c3" in rb["summary"]
+
+
+def test_sketch_mutation_readback_caps_and_determinism():
+    sk = _open_sketch()
+    a = sketch_mutation_readback(sk, pitch=0.1, max_h=40, max_w=120)
+    b = sketch_mutation_readback(sk, pitch=0.1, max_h=40, max_w=120)
+    assert a["ascii"] == b["ascii"]
+    assert a["summary"] == b["summary"]
+    assert a["findings"] == b["findings"]
+    assert a["ascii_block"] == b["ascii_block"]
+    rows = a["ascii"].split("\n")
+    assert len(rows) <= READBACK_MAX_H
+    assert all(len(r) <= READBACK_MAX_W for r in rows)
+    assert a["height"] <= READBACK_MAX_H
+    assert a["width"] <= READBACK_MAX_W
+    # force tiny cap to exercise truncation path
+    tiny = sketch_mutation_readback(sk, pitch=0.05, max_h=5, max_w=10)
+    assert tiny["height"] <= 5
+    assert tiny["width"] <= 10
+    assert all(len(r) <= 10 for r in tiny["ascii"].split("\n"))
+
+
+def test_board_mutation_readback_has_ascii_summary_net_delta():
+    board = _crossing_board()
+    rb = board_mutation_readback(board, pitch_mm=2.0, layer="F.Cu")
+    assert rb["ok"] is True
+    assert rb["kind"] == "board_readback"
+    assert rb["ascii"] and isinstance(rb["ascii"], str)
+    assert rb["ascii_block"].startswith("[board_readback")
+    assert "summary" in rb and isinstance(rb["summary"], str)
+    assert "net_delta" in rb
+    nd = rb["net_delta"]
+    assert nd["tracks"] >= 2
+    assert nd["footprints"] >= 2
+    assert nd["crossings"] >= 1 or any(
+        f.get("code") == "trace_crossing" for f in rb["findings"])
+    # NL connectivity
+    assert "Net connectivity" in rb["summary"] or "pad" in rb["summary"].lower()
+
+
+def test_board_mutation_readback_caps_and_determinism():
+    board = _crossing_board()
+    a = board_mutation_readback(board, pitch_mm=1.0, max_h=40, max_w=120)
+    b = board_mutation_readback(board, pitch_mm=1.0, max_h=40, max_w=120)
+    assert a["ascii"] == b["ascii"]
+    assert a["summary"] == b["summary"]
+    assert a["findings"] == b["findings"]
+    assert a["net_delta"] == b["net_delta"]
+    rows = a["ascii"].split("\n")
+    assert len(rows) <= READBACK_MAX_H
+    assert all(len(r) <= READBACK_MAX_W for r in rows)
+    tiny = board_mutation_readback(board, pitch_mm=0.5, max_h=6, max_w=12)
+    assert tiny["height"] <= 6
+    assert tiny["width"] <= 12
+
+
+def test_attach_helpers_mutate_response():
+    sk = _open_sketch()
+    board = _crossing_board()
+    resp_s: dict = {"ok": True, "doc_id": "d1"}
+    attach_sketch_readback(resp_s, sk, sketch_id="s1", pitch=1.0)
+    assert resp_s["ascii"]
+    assert resp_s["ascii_block"]
+    assert resp_s["sketch_summary"]
+    assert resp_s["ascii_readback"]["ok"] is True
+
+    resp_b: dict = {"ok": True, "doc_id": "pcb1"}
+    attach_board_readback(resp_b, board, pitch_mm=2.0, layer="F.Cu")
+    assert resp_b["ascii"]
+    assert resp_b["net_delta"]["tracks"] >= 1
+    assert resp_b["ascii_readback"]["ok"] is True
+
+
+def test_sketch_ids_from_ops_deterministic():
+    ops = [
+        {"op": "add_feature", "feature": {"type": "box"}},
+        {"op": "sketch_add_entity", "sketch": "s2",
+         "entity": {"type": "line", "p1": [0, 0], "p2": [1, 0]}},
+        {"op": "sketch_add_constraint", "sketch": "s1",
+         "constraint": {"type": "horizontal", "refs": ["e1"]}},
+        {"op": "sketch_set_dim", "sketch": "s2", "id": "c1", "value": 10},
+        {"op": "sketch_add_entity", "sketch": "$0",
+         "entity": {"type": "circle"}},  # placeholder — ignored
+    ]
+    ids = sketch_ids_from_ops(ops)
+    assert ids == ["s2", "s1"]
+    assert sketch_ids_from_ops(ops) == ids  # stable
+
+
+def test_summarize_sketch_nl_parity_fields():
+    """Text-only models need named dims, constraint list, open/closed notes."""
+    sk = _open_sketch()
+    report = sketch_ascii_report(sk, pitch=1.0)
+    s = report["summary"]
+    assert "Dimensions:" in s
+    assert "Constraints:" in s
+    # open status from health
+    assert "OPEN" in s or "open" in s.lower() or "dangling" in s.lower()
+    # entity id callouts
+    assert "e1" in s and "e2" in s

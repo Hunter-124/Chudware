@@ -100,11 +100,11 @@ def test_phase_gate_advances_when_join_done_despite_failed_workers(monkeypatch):
     assert stop_reason != "specify_incomplete", (reached, status, stop_reason)
 
 
-def test_phase_gate_advances_when_dag_past_specify_with_failed_workers(monkeypatch):
-    """Downstream BUILD/DELIVER done ⇒ do not freeze at specify_incomplete.
+def test_phase_cursor_advances_without_completing_failed_specify(monkeypatch):
+    """Downstream BUILD/DELIVER progress reconciles the cursor, not the gate.
 
-    mega-2 exact fingerprint: phases_completed=[intake], stop=specify_incomplete
-    while n_build_*/n_deliver_* were done.
+    A failed SPECIFY must not be listed in phases_completed merely because a
+    soft fan-in let later DAG nodes execute.
     """
     monkeypatch.setenv("AI_CAD_ADVISOR", "0")
     from services.dag.mission_template import build_mission_graph
@@ -128,10 +128,9 @@ def test_phase_gate_advances_when_dag_past_specify_with_failed_workers(monkeypat
     dag_result = {"status": "failed", "nodes": node_states}
 
     reached, status, stop_reason, completed, _ = _drive(manifest, graph, dag_result)
-    assert "specify" in completed, (completed, reached, stop_reason)
+    assert "specify" not in completed, (completed, reached, stop_reason)
     assert stop_reason != "specify_incomplete", (reached, status, stop_reason)
-    # Plan should also complete via n_plan join / workers-done / downstream.
-    assert "plan" in completed or reached != "specify", (completed, reached)
+    assert reached != "specify", (completed, reached)
 
 
 def test_phase_gate_still_blocks_when_specify_and_no_downstream(monkeypatch):

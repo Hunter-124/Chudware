@@ -721,3 +721,179 @@ def test_subscription_rpc_multi_account_shapes(tmp_config):
     # Methods registry includes new RPCs.
     assert "subscription_accounts" in rpc.SUBSCRIPTION_METHODS
     assert "subscription_switch" in rpc.SUBSCRIPTION_METHODS
+
+
+@pytest.mark.parametrize(
+    ("friendly", "provider_name", "cred_id"),
+    [
+        ("claude", "anthropic-sub", "anthropic-sub"),
+        ("codex", "codex-sub", "openai-codex"),
+        ("cursor", "cursor-sub", "cursor"),
+        ("xai", "xai-sub", "xai-sub"),
+    ],
+)
+def test_each_provider_login_persists_and_rpc_manages_only_selected_account(
+    tmp_config, monkeypatch, friendly, provider_name, cred_id
+):
+    """Mock the live browser boundary, then exercise the real store and RPC seam."""
+    credentials = [
+        {
+            "access_token": f"{friendly}-token-one",
+            "refresh_token": f"{friendly}-refresh-one",
+            "account_id": f"{friendly}-one",
+            "email": f"one@{friendly}.example",
+            "display_name": f"{friendly.title()} One",
+            "plan": "pro",
+            "expires_at_ms": int(time.time() * 1000) + 10**9,
+        },
+        {
+            "access_token": f"{friendly}-token-two",
+            "refresh_token": f"{friendly}-refresh-two",
+            "account_id": f"{friendly}-two",
+            "email": f"two@{friendly}.example",
+            "display_name": f"{friendly.title()} Two",
+            "plan": "max",
+            "expires_at_ms": int(time.time() * 1000) + 10**9,
+        },
+    ]
+
+    class FakeProvider:
+        def login(self):
+            return credentials.pop(0)
+
+        def login_device(self, open_browser=True, progress=None):
+            if progress:
+                progress({"stage": "approved", "browser_opened": open_browser})
+            return credentials.pop(0)
+
+    monkeypatch.setattr(sl, "_instantiate", lambda name: FakeProvider())
+    assert next(p for p in sl.providers() if p["id"] == friendly)["name"] == provider_name
+
+    from engine_oracle.parts_hub import subscription_rpc as rpc
+
+    emit = lambda *_a, **_k: None  # noqa: E731
+    with rpc._login_lock:
+        rpc._login_state.pop(friendly, None)
+    for _ in range(2):
+        started = rpc.SUBSCRIPTION_METHODS["subscription_login"](
+            {"provider": friendly, "open_browser": False}, emit
+        )
+        assert started["ok"] is True
+        for _attempt in range(200):
+            status = rpc.SUBSCRIPTION_METHODS["subscription_status"]({}, emit)
+            if not status["providers"][friendly]["login_in_progress"]:
+                break
+            time.sleep(0.005)
+        assert status["providers"][friendly]["login_in_progress"] is False
+        assert status["providers"][friendly]["last_error"] is None
+
+    on_disk = json.loads(tmp_config.read_text())["subscription_auth"][cred_id]
+    assert on_disk["active"] == f"{friendly}-two"
+    assert set(on_disk["accounts"]) == {f"{friendly}-one", f"{friendly}-two"}
+
+    status = rpc.SUBSCRIPTION_METHODS["subscription_status"]({}, emit)
+    active = status["providers"][friendly]
+    assert active["connected"] is True
+    assert active["email"] == f"two@{friendly}.example"
+    assert active["display_name"] == f"{friendly.title()} Two"
+    assert active["plan"] == "max"
+
+    listed = rpc.SUBSCRIPTION_METHODS["subscription_accounts"](
+        {"provider": friendly}, emit
+    )["accounts"]
+    assert len(listed) == 2
+    assert {a["display_name"] for a in listed} == {
+        f"{friendly.title()} One", f"{friendly.title()} Two"
+    }
+    assert {a["plan"] for a in listed} == {"pro", "max"}
+
+    switched = rpc.SUBSCRIPTION_METHODS["subscription_switch"](
+        {"provider": friendly, "account_id": f"{friendly}-one"}, emit
+    )
+    assert switched["ok"] is True
+    assert sub_auth.load_credential(cred_id)["access_token"] == f"{friendly}-token-one"
+
+    signed_out = rpc.SUBSCRIPTION_METHODS["subscription_logout"](
+        {"provider": friendly, "account_id": f"{friendly}-two"}, emit
+    )
+    assert signed_out["ok"] is True
+    assert sub_auth.load_credential(cred_id, f"{friendly}-two") is None
+    assert sub_auth.load_credential(cred_id)["access_token"] == f"{friendly}-token-one"
+
+
+def test_subscription_login_thread_failure_does_not_leave_status_stuck(
+    tmp_config, monkeypatch
+):
+    from engine_oracle.parts_hub import subscription_rpc as rpc
+
+    with rpc._login_lock:
+        rpc._login_state.clear()
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("mock browser callback crashed")
+
+    monkeypatch.setattr(sl, "login", explode)
+    emit = lambda *_a, **_k: None  # noqa: E731
+    started = rpc.SUBSCRIPTION_METHODS["subscription_login"](
+        {"provider": "claude"}, emit
+    )
+    assert started["ok"] is True
+
+    for _ in range(100):
+        status = rpc.SUBSCRIPTION_METHODS["subscription_status"]({}, emit)
+        claude = status["providers"]["claude"]
+        if not claude["login_in_progress"]:
+            break
+        time.sleep(0.01)
+    assert claude["login_in_progress"] is False
+    assert "mock browser callback crashed" in claude["last_error"]
+
+
+def test_cpp_settings_allowlist_merge_preserves_subscription_store(tmp_config):
+    """Model saveSettings' merge/erase/update rewrite against a populated fixture."""
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "x-token",
+        "refresh_token": "x-refresh",
+        "account_id": "x-account",
+        "email": "x@example.com",
+    }, account_id="x-account")
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "a-token",
+        "refresh_token": "a-refresh",
+        "account_id": "a-account",
+        "email": "a@example.com",
+    }, account_id="a-account")
+
+    fixture = json.loads(tmp_config.read_text())
+    fixture.update({
+        "provider": "openai",
+        "model": "old-model",
+        "api_key": "old-key",
+        "appearance": {"glass": 0.5},
+        "plm": {"server": "keep.example"},
+    })
+    tmp_config.write_text(json.dumps(fixture))
+
+    # Mirrors the fixed C++ pattern: load the whole object, erase only GUI-owned
+    # conditionals, then write updated GUI keys back into the merged object.
+    gui_owned = {
+        "provider", "model", "api_key", "openai", "llamacpp", "keys",
+        "reasoning_effort", "max_iters", "max_output_tokens", "context_window",
+        "system_prompt", "appearance", "workspace_dir", "hidden_models",
+        "disabled_providers", "experimental",
+    }
+    rewritten = json.loads(tmp_config.read_text())
+    for key in gui_owned:
+        rewritten.pop(key, None)
+    rewritten.update({
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "appearance": {"glass": 0.8},
+    })
+    tmp_config.write_text(json.dumps(rewritten))
+
+    assert sub_auth.load_credential("xai-sub", "x-account")["access_token"] == "x-token"
+    assert sub_auth.load_credential("anthropic-sub", "a-account")["access_token"] == "a-token"
+    round_trip = json.loads(tmp_config.read_text())
+    assert round_trip["subscription_auth"] == fixture["subscription_auth"]
+    assert round_trip["plm"] == {"server": "keep.example"}

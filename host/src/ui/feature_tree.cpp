@@ -24,7 +24,7 @@
 #include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
 
 #include "feature_tree.h"
-#include "component_features.h"  // assembly tree: cached component `.step+` feature list
+#include "feature_tree_nested.h"  // recursive cached component document data
 #include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
@@ -319,7 +319,12 @@ static bool featureEyeShown(AppState& st, const std::string& fid,
 // Solid Bodies folder agrees); other features => flip hiddenFeatures membership (the sketch-ghost
 // renderer honors it).
 static void toggleFeatureEye(AppState& st, const std::string& fid,
-                             const std::vector<uint32_t>& ownedBodies, bool currentlyShown) {
+                             const std::vector<uint32_t>& ownedBodies, bool currentlyShown,
+                             bool isDatumPlane) {
+    if (isDatumPlane) {
+        st.datumPlanesUserToggled.insert(fid);
+        st.autoHiddenPlanes.erase(fid);
+    }
     if (!ownedBodies.empty()) {
         for (uint32_t bid : ownedBodies) {
             int slot = slotForBodyId(st, bid);
@@ -1435,7 +1440,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (overEye) {
             ImGui::SetTooltip(shown ? "Hide" : "Show");
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                toggleFeatureEye(st, fid, c.ownedBodies, shown);
+                toggleFeatureEye(st, fid, c.ownedBodies, shown,
+                                 c.type == "plane" || c.type == "datum_plane");
                 // T-BL42: un-hiding an absorbed sketch selects + highlights it so it's easy
                 // to spot in the viewport (ghost goes visible; tree row gets selection card).
                 if (c.nested && !shown && c.type == "sketch") {
@@ -1638,194 +1644,335 @@ static void categoryColorRGB(const std::string& type, bool isCut, float out[3]) 
     out[0] = c.x; out[1] = c.y; out[2] = c.z;
 }
 
-// Resolve a component's `source.path` (relative paths resolve against the OPEN assembly
-// file's directory) to an absolute on-disk path. Returns "" if there's no usable path
-// (e.g. the assembly was never saved so we have no anchor for a relative component).
+// Resolve a component source relative to the active assembly. Nested assembly sources are already
+// normalized by feature_tree_nested.cpp and pass through unchanged.
 static std::string resolveComponentPath(const std::string& srcPath) {
-    if (srcPath.empty()) return std::string();
+    if (srcPath.empty()) return {};
     namespace fs = std::filesystem;
-    fs::path p(srcPath);
-    if (p.is_absolute()) return p.lexically_normal().string();
-    // Anchor against the active assembly's own directory (s_docPath == this doc's file).
-    if (s_docPath.empty()) return std::string();   // unsaved assembly: no anchor for a relative path
-    fs::path base = fs::path(s_docPath).parent_path();
-    return (base / p).lexically_normal().string();
+    fs::path path(srcPath);
+    if (path.is_absolute()) return path.lexically_normal().string();
+    if (s_docPath.empty()) return {};
+    return (fs::path(s_docPath).parent_path() / path).lexically_normal().string();
 }
 
-// "Open Part" on a component row: open its source `.step+` as its OWN document tab, or —
-// if that file is already open in a (non-handoff) tab — just focus that tab instead of
-// opening a duplicate. Paths are compared with weakly_canonical so an assembly-relative
-// resolve matches a tab whose `.path` was stored verbatim from an earlier absolute open.
-// The actual open routes through the GL-thread request pump (st.requestOpenPath), the same
-// lane File>Open / Recent / file-drop use; it handles the aicad.asm-vs-part dispatch and
-// the DocMirror::open + tab creation.
+// Open a referenced document in a normal tab, focusing an existing tab for the same canonical path.
 static void openComponentPart(AppState& st, const std::string& srcPath) {
     const std::string abs = resolveComponentPath(srcPath);
     if (abs.empty()) {
-        st.toast(ui::ToastLevel::Warn,
-                 "Open Part: save the assembly first (component path is relative)");
+        st.toast(ui::ToastLevel::Warn, "Referenced file has no resolvable path");
         return;
     }
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path want = fs::weakly_canonical(fs::path(abs), ec);
     if (ec) want = fs::path(abs).lexically_normal();
-    // Dedup against already-open non-handoff tabs (aiHandoff mirror tabs own their own
-    // lifecycle — never steal/focus those). Switch to the first match rather than reopening.
-    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-        const AppState::DocTab& t = st.docTabs[i];
-        if (t.aiHandoff || t.path.empty()) continue;
-        std::error_code e2;
-        fs::path have = fs::weakly_canonical(fs::path(t.path), e2);
-        if (e2) have = fs::path(t.path).lexically_normal();
-        if (have == want) { st.switchToTab(i); return; }
+    for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i) {
+        const AppState::DocTab& tab = st.docTabs[i];
+        if (tab.aiHandoff || tab.path.empty()) continue;
+        std::error_code tabEc;
+        fs::path have = fs::weakly_canonical(fs::path(tab.path), tabEc);
+        if (tabEc) have = fs::path(tab.path).lexically_normal();
+        if (have == want) {
+            st.switchToTab(i);
+            return;
+        }
     }
-    st.requestOpenPath = abs;   // drained next frame by app.cpp's GL-thread open pump
+    st.requestOpenPath = abs;
 }
 
-// ---- component nested feature tree (read-only, mirrors the part-env "3D Body" display) ----
-// A component in the assembly tree expands to show its OWN features nested exactly like the part
-// environment shows them: a "Reference" folder (datum planes/axes/points), the 3D history
-// features, and any profile sketch consumed by exactly one feature shown INDENTED under that
-// consumer. This borrows the part-env sketch-consumption ANALYSIS (see drawFeatureTreeBody near
-// L3171) but NOT its row renderer — featureRow()/drawOneRow are welded to live part state
-// (statusMap, ownerMap, editing, drag-drop) a foreign `.step+` component does not have. So these
-// are plain read-only rows in the existing flat-list idiom (icon + name), just nested.
+// A nested row starts an in-context component edit, then waits until the part document is active
+// before opening its real PropertyManager form. The PM owns debounced previews and DocMirror
+// mutation; AppState's component-edit lifecycle keeps the assembly as a ghost and forces its
+// component cache + mesh to refresh when the user exits the edit.
+struct PendingNestedEdit {
+    std::string componentId;
+    std::string sourcePath;
+    std::string featureId;
+    int waitFrames = 0;
+};
+static PendingNestedEdit s_pendingNestedEdit;
 
-// Recursive ref-scan: collect every sketch id (from `sketchIds`) that `node` references via a
-// region selector {"kind":"region","sketch":"fX"} or a bare sketch id under a *sketch*/profile
-// key. Free function (not a std::function lambda) so we don't depend on <functional> here. Mirrors
-// the part-env scan at L3188; call it on a feature's `refs` object ONLY (scanning params would
-// false-match sketch-keyed values).
+static void beginNestedFeatureEdit(AppState& st, const std::string& componentId,
+                                   const std::string& sourcePath,
+                                   const ui::NestedFeature& feature) {
+    if (sourcePath.empty() || feature.id.empty() || st.inComponentEdit()) return;
+    s_pendingNestedEdit = {componentId, sourcePath, feature.id, 0};
+    st.enterComponentEdit(componentId, sourcePath);
+}
+
+static void servicePendingNestedEdit(AppState& st) {
+    if (s_pendingNestedEdit.featureId.empty()) return;
+    if (++s_pendingNestedEdit.waitFrames > 900) {
+        st.toast(ui::ToastLevel::Warn, "Referenced feature did not become editable");
+        s_pendingNestedEdit = {};
+        return;
+    }
+    if (!st.inComponentEdit()) return;
+    const nlohmann::json& tree = st.docMirror.tree();
+    const auto features = tree.is_object() ? tree.find("features") : tree.end();
+    if (!tree.is_object() || features == tree.end() || !features->is_array()) return;
+    const nlohmann::json* target = nullptr;
+    for (const auto& feature : *features) {
+        if (feature.is_object() &&
+            feature.value("id", std::string()) == s_pendingNestedEdit.featureId) {
+            target = &feature;
+            break;
+        }
+    }
+    if (!target) return;
+
+    const std::string featureId = s_pendingNestedEdit.featureId;
+    const std::string type = target->value("type", std::string());
+    s_pendingNestedEdit = {};
+    bool opened = false;
+    if (type == "sketch" && st.sketchMode) {
+        opened = st.sketchMode->enterForFeature(st, featureId);
+    } else if (type == "sketch3d" && st.sketch3dMode) {
+        opened = st.sketch3dMode->enterForFeature(st, featureId);
+    } else if (st.propertyManager) {
+        opened = st.propertyManager->openForEdit(st, featureId);
+        if (opened) st.leftPaneTab = AppState::LP_PropertyManager;
+    }
+    if (!opened)
+        st.toast(ui::ToastLevel::Info, "This referenced feature has no editable form");
+}
+
+// Collect sketch references so a consumed profile remains nested under its owning feature, matching
+// the normal part tree rather than presenting a second foreign-tree convention.
 static void componentScanSketchRefs(const nlohmann::json& node, const std::string& key,
                                     const std::unordered_set<std::string>& sketchIds,
                                     std::unordered_set<std::string>& seen) {
     if (node.is_object()) {
         if (jfld(node, "kind") == "region") {
-            std::string sk = jfld(node, "sketch");
-            if (!sk.empty() && sketchIds.count(sk)) seen.insert(sk);
+            const std::string sketch = jfld(node, "sketch");
+            if (!sketch.empty() && sketchIds.count(sketch)) seen.insert(sketch);
         }
         for (auto it = node.begin(); it != node.end(); ++it)
             componentScanSketchRefs(it.value(), it.key(), sketchIds, seen);
     } else if (node.is_array()) {
-        for (const auto& e : node) componentScanSketchRefs(e, key, sketchIds, seen);
+        for (const auto& value : node)
+            componentScanSketchRefs(value, key, sketchIds, seen);
     } else if (node.is_string()) {
-        bool keyImpliesSketch = key.find("sketch") != std::string::npos || key == "profile";
-        std::string v = node.get<std::string>();
-        if (keyImpliesSketch && sketchIds.count(v)) seen.insert(v);
+        const bool sketchKey = key.find("sketch") != std::string::npos || key == "profile";
+        const std::string value = node.get<std::string>();
+        if (sketchKey && sketchIds.count(value)) seen.insert(value);
     }
 }
 
-// Render one read-only component feature row (icon-in-arrow-slot + name), leaf or collapsible.
-// Returns whether a collapsible node is OPEN (leaf always false — it never pushes). `expandable`
-// nodes (a consumer with a nested sketch) push and MUST be TreePop'd by the caller when open.
-// `nested` indents the whole row by the part-env indent constant.
-static bool drawComponentFeatureRow(const std::string& idSuffix, const std::string& label,
-                                    const char* icon, bool expandable, bool nested) {
+static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
+                                    const ui::NestedFeature& feature, bool expandable,
+                                    bool nested, const std::string& topComponentId,
+                                    const std::string& sourcePath, bool editable) {
     const float nestIndent = 14.0f * ui::uiScale;
     if (nested) ImGui::Indent(nestIndent);
-    FmRowRect featRect = fmRowPill();
-    ImGuiTreeNodeFlags ftf = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
-    if (expandable) ftf |= ImGuiTreeNodeFlags_OpenOnArrow;
-    else            ftf |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    ImVec2 fPos = ImGui::GetCursorScreenPos();
-    bool open = ImGui::TreeNodeEx((label + "##" + idSuffix).c_str(), ftf);
-    treeIconInArrowSlot(fPos, icon, "[f]", 1.0f);
-    fmRowPillEnd(featRect);
+    FmRowRect rect = fmRowPill();
+    ImGuiTreeNodeFlags flags =
+        ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
+    if (expandable) flags |= ImGuiTreeNodeFlags_OpenOnArrow;
+    else flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    const char* icon = featureIcon(feature.type, &feature.raw);
+    if (expandable) {
+        treeIcon(icon, "[f]", 16.0f);
+        ImGui::SameLine(0, 4 * ui::uiScale);
+    }
+    const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    const std::string name = feature.name.empty()
+        ? (feature.type.empty() ? std::string("Feature") : feature.type) : feature.name;
+    const bool open = ImGui::TreeNodeEx((name + "##" + idSuffix).c_str(), flags);
+    if (!expandable) treeIconInArrowSlot(rowPos, icon, "[f]");
+    fmRowPillEnd(rect);
+    const bool activate = editable && ImGui::IsItemHovered() &&
+                          ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    pushTreePopupGlass();
+    if (ImGui::BeginPopupContextItem(("##nested_feature_" + idSuffix).c_str())) {
+        if (!editable) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Edit in Assembly"))
+            beginNestedFeatureEdit(st, topComponentId, sourcePath, feature);
+        if (!editable) ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+    popTreePopupGlass();
+    if (activate) beginNestedFeatureEdit(st, topComponentId, sourcePath, feature);
     if (nested) ImGui::Unindent(nestIndent);
     return expandable && open;
 }
 
-// Render a component's whole nested feature tree (Reference folder + history + nested sketches).
-// Called inside `if (expandable && compOpen)`; leaves the ImGui tree stack net-zero (each pushed
-// node is popped here). `cid` disambiguates ids so multiple expanded components never collide.
-static void drawComponentFeatureTree(const std::string& cid,
-                                     const std::vector<ui::ComponentFeature>& feats) {
-    const auto& pal = fmPalette();
-
-    // Identify sketches and reference features.
-    auto isReferenceFeat = [](const ui::ComponentFeature& f) {
-        return f.type == "plane" || f.type == "datum_plane" || f.type == "axis" ||
-               f.type == "point" || f.folder == "Reference";
+static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
+                                     const std::string& topComponentId,
+                                     const std::string& sourcePath,
+                                     const std::vector<ui::NestedFeature>& features,
+                                     bool editable) {
+    auto isReference = [](const ui::NestedFeature& feature) {
+        return feature.type == "plane" || feature.type == "datum_plane" ||
+               feature.type == "axis" || feature.type == "point" ||
+               feature.folder == "Reference";
     };
     std::unordered_set<std::string> sketchIds;
-    for (const auto& f : feats)
-        if (f.type == "sketch") sketchIds.insert(f.id);
+    for (const auto& feature : features)
+        if (feature.type == "sketch") sketchIds.insert(feature.id);
 
-    // ---- sketch-consumption analysis (borrowed from the part env) ----
-    // A sketch consumed by EXACTLY ONE non-sketch feature (via its refs) nests under that
-    // consumer. No status-gating here: a foreign component has no rollback/error state to gate on.
-    std::unordered_map<std::string, int> consumeCount;      // sketch fid -> #consumers
-    std::unordered_map<std::string, std::string> consumer;  // sketch fid -> consumer fid
-    for (const auto& f : feats) {
-        if (f.type == "sketch") continue;             // a sketch isn't a consumer
-        auto refs = f.raw.find("refs");
-        if (refs == f.raw.end()) continue;
+    std::unordered_map<std::string, int> consumeCount;
+    std::unordered_map<std::string, std::string> consumer;
+    for (const auto& feature : features) {
+        if (feature.type == "sketch") continue;
+        const auto refs = feature.raw.find("refs");
+        if (refs == feature.raw.end()) continue;
         std::unordered_set<std::string> seen;
-        componentScanSketchRefs(*refs, std::string(), sketchIds, seen);
-        for (const auto& sk : seen) { ++consumeCount[sk]; consumer[sk] = f.id; }
-    }
-    std::unordered_map<std::string, std::vector<std::string>> childrenOf;  // consumer -> sketches
-    std::unordered_set<std::string> nestedSketchIds;
-    for (const auto& kv : consumer)
-        if (consumeCount[kv.first] == 1) {
-            childrenOf[kv.second].push_back(kv.first);
-            nestedSketchIds.insert(kv.first);
+        componentScanSketchRefs(*refs, {}, sketchIds, seen);
+        for (const auto& sketch : seen) {
+            ++consumeCount[sketch];
+            consumer[sketch] = feature.id;
         }
-
-    // Fast lookup of a feature by id (for rendering nested sketch children by name/icon).
-    auto findFeat = [&](const std::string& fid) -> const ui::ComponentFeature* {
-        for (const auto& f : feats) if (f.id == fid) return &f;
+    }
+    std::unordered_map<std::string, std::vector<std::string>> childrenOf;
+    std::unordered_set<std::string> nestedSketches;
+    for (const auto& item : consumer) {
+        if (consumeCount[item.first] == 1) {
+            childrenOf[item.second].push_back(item.first);
+            nestedSketches.insert(item.first);
+        }
+    }
+    auto findFeature = [&](const std::string& id) -> const ui::NestedFeature* {
+        for (const auto& feature : features)
+            if (feature.id == id) return &feature;
         return nullptr;
     };
-    auto featLabel = [](const ui::ComponentFeature& f) {
-        return f.name.empty() ? (f.type.empty() ? std::string("Feature") : f.type) : f.name;
-    };
 
-    // ---- Reference folder (datum planes/axes/points) collected explicitly up front ----
-    // Explicit collection (not the part-env contiguous folder-walk) because component features may
-    // not be folder-adjacent — a contiguous walk would emit duplicate "Reference" headers.
-    std::vector<const ui::ComponentFeature*> refFeats;
-    for (const auto& f : feats)
-        if (isReferenceFeat(f)) refFeats.push_back(&f);
-    if (!refFeats.empty()) {
-        FmRowRect fldRect = fmRowPill();
+    std::vector<const ui::NestedFeature*> references;
+    for (const auto& feature : features)
+        if (isReference(feature)) references.push_back(&feature);
+    if (!references.empty()) {
+        FmRowRect rect = fmRowPill();
         treeIcon("body_folder", "[F]", 16.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
-        bool refOpen = ImGui::TreeNodeEx(("Reference##cref_" + cid).c_str(),
+        const bool open = ImGui::TreeNodeEx(("Reference##cref_" + idPrefix).c_str(),
             ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
             ImGuiTreeNodeFlags_FramePadding);
-        fmRowPillEnd(fldRect);
-        if (refOpen) {
-            for (const auto* f : refFeats)
-                drawComponentFeatureRow("cf_" + cid + "_" + f->id, featLabel(*f),
-                                        featureIcon(f->type, &f->raw), false, false);
+        fmRowPillEnd(rect);
+        if (open) {
+            for (const auto* feature : references)
+                drawComponentFeatureRow(st, idPrefix + "_" + feature->id, *feature, false,
+                                        false, topComponentId, sourcePath, editable);
             ImGui::TreePop();
         }
     }
 
-    // ---- history features (reference features + nested sketches skipped) ----
-    // Non-Reference folder tags (Dress-up/Patterns/...) are honored as a display prefix on the row
-    // name rather than a nested sub-node — the two things in the screenshot (Reference folder +
-    // sketch nesting) are the real deliverable; a full folder-tree for foreign components is left
-    // to a later wave (see summary).
-    for (const auto& f : feats) {
-        if (isReferenceFeat(f)) continue;
-        if (f.type == "sketch" && nestedSketchIds.count(f.id)) continue;  // shown under consumer
-
-        auto kids = childrenOf.find(f.id);
-        bool hasKids = kids != childrenOf.end() && !kids->second.empty();
-        bool rowOpen = drawComponentFeatureRow("cf_" + cid + "_" + f.id, featLabel(f),
-                                               featureIcon(f.type, &f.raw), hasKids, false);
-        if (rowOpen && hasKids) {
-            for (const auto& skId : kids->second)
-                if (const ui::ComponentFeature* sf = findFeat(skId))
-                    drawComponentFeatureRow("cf_" + cid + "_" + sf->id, featLabel(*sf),
-                                            featureIcon(sf->type, &sf->raw), false, true);
-            ImGui::TreePop();   // matches the pushed consumer node
+    for (const auto& feature : features) {
+        if (isReference(feature)) continue;
+        if (feature.type == "sketch" && nestedSketches.count(feature.id)) continue;
+        const auto children = childrenOf.find(feature.id);
+        const bool hasChildren = children != childrenOf.end() && !children->second.empty();
+        const bool open = drawComponentFeatureRow(
+            st, idPrefix + "_" + feature.id, feature, hasChildren, false,
+            topComponentId, sourcePath, editable);
+        if (open && hasChildren) {
+            for (const std::string& sketchId : children->second) {
+                if (const ui::NestedFeature* sketch = findFeature(sketchId))
+                    drawComponentFeatureRow(st, idPrefix + "_" + sketch->id, *sketch, false,
+                                            true, topComponentId, sourcePath, editable);
+            }
+            ImGui::TreePop();
         }
     }
-    (void)pal;
+}
+
+static std::string nestedMaterialLabel(const std::string& key) {
+    if (key.empty()) return "Material: <not specified>";
+    for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+        if (key == kPhysicalMaterials[i].key)
+            return std::string("Material: ") + kPhysicalMaterials[i].name;
+    return "Material: " + key;
+}
+
+static void drawNestedInfoRow(const std::string& id, const std::string& label,
+                              const char* icon, const char* fallback,
+                              const std::string& tooltip = {}) {
+    FmRowRect rect = fmRowPill();
+    const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    ImGui::TreeNodeEx((label + "##" + id).c_str(),
+        ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+        ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
+    treeIconInArrowSlot(rowPos, icon, fallback);
+    fmRowPillEnd(rect);
+    if (!tooltip.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip.c_str());
+}
+
+static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix,
+                                       const std::string& topComponentId,
+                                       const std::string& sourcePath,
+                                       const ui::NestedDocument& document,
+                                       std::unordered_set<std::string>& pathStack,
+                                       int depth) {
+    drawNestedInfoRow(idPrefix + "_material", nestedMaterialLabel(document.materialKey),
+                      "material", "[M]");
+    const std::string fileLabel = document.fileName.empty()
+        ? std::string("File: <unresolved>") : "File: " + document.fileName;
+    drawNestedInfoRow(idPrefix + "_file", fileLabel, "open", "[F]", document.path);
+
+    if (document.state != ui::NestedDocumentState::Ready) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
+                   fmPalette().textDim[2], 0.72f));
+        ImGui::TextWrapped("%s", document.error.empty() ? "No feature history" : document.error.c_str());
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!document.features.empty())
+        drawComponentFeatureTree(st, idPrefix, topComponentId, sourcePath, document.features, true);
+
+    if (depth >= 16 || document.components.empty()) return;
+    for (const ui::NestedComponent& component : document.components) {
+        const std::string childId = idPrefix + "_component_" + component.id;
+        const bool resolved = !component.sourceAbsPath.empty();
+        const ui::NestedDocument& child = ui::featureTreeNestedDocument(component.sourceAbsPath);
+        const bool unavailable = !resolved ||
+            child.state == ui::NestedDocumentState::Missing ||
+            child.state == ui::NestedDocumentState::Unreadable;
+        std::string label = (component.fixed ? "(f) " : "") + component.name;
+        if (component.suppressed) label += " [S]";
+        if (unavailable || component.hidden)
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
+                       fmPalette().textDim[2], unavailable ? 0.55f : 0.72f));
+        FmRowRect rect = fmRowPill();
+        treeIcon(child.schema == "aicad.asm/1" ? "assembly" : "part",
+                 child.schema == "aicad.asm/1" ? "[A]" : "[P]", 16.0f,
+                 unavailable ? 0.5f : 1.0f);
+        ImGui::SameLine(0, 4 * ui::uiScale);
+        const bool open = ImGui::TreeNodeEx((label + "##" + childId).c_str(),
+            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
+            ImGuiTreeNodeFlags_OpenOnArrow);
+        fmRowPillEnd(rect);
+        if (unavailable || component.hidden) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            if (unavailable)
+                ImGui::SetTooltip("%s", resolved ? child.error.c_str() : "Component has no source path");
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !unavailable)
+                openComponentPart(st, component.sourceAbsPath);
+        }
+        pushTreePopupGlass();
+        if (ImGui::BeginPopupContextItem(("##nested_component_" + childId).c_str())) {
+            if (unavailable) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Open in new tab"))
+                openComponentPart(st, component.sourceAbsPath);
+            if (unavailable) ImGui::EndDisabled();
+            ImGui::EndPopup();
+        }
+        popTreePopupGlass();
+        if (open) {
+            if (!resolved) {
+                ImGui::TextDisabled("(unresolved source)");
+            } else if (pathStack.count(component.sourceAbsPath)) {
+                ImGui::TextDisabled("(cyclic component reference)");
+            } else {
+                pathStack.insert(component.sourceAbsPath);
+                drawNestedDocumentContents(st, childId, topComponentId,
+                                           component.sourceAbsPath, child, pathStack, depth + 1);
+                pathStack.erase(component.sourceAbsPath);
+            }
+            ImGui::TreePop();
+        }
+    }
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----
@@ -1867,45 +2014,49 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             bool fixed = jftbool(c, "fixed");
             bool suppressed = jftbool(c, "suppressed");
             bool hidden = jftbool(c, "hidden");
-            // Component vs subassembly icon (we only have parts for now; subassemblies = C24).
             std::string srcPath;
-            bool isAsm = false;
-            if (c.contains("source") && c["source"].is_object()) {
+            if (c.contains("source") && c["source"].is_object())
                 srcPath = jfld(c["source"], "path");
-                std::string low = srcPath;
-                for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
-                isAsm = low.find(".asmstep") != std::string::npos;  // reserved; none today
-            }
-            // A component with a source `.step+` is expandable — its OWN feature list nests
-            // underneath (read-only). Parts with no source path stay leaf nodes.
-            const bool expandable = !srcPath.empty();
+            const std::string absPath = resolveComponentPath(srcPath);
+            const ui::NestedDocument& nestedDoc = ui::featureTreeNestedDocument(absPath);
+            const bool unavailable = absPath.empty() ||
+                nestedDoc.state == ui::NestedDocumentState::Missing ||
+                nestedDoc.state == ui::NestedDocumentState::Unreadable;
+            const bool isAsm = nestedDoc.schema == "aicad.asm/1";
             FStatus fs = getFeatureStatus(statusArr, cid);
 
             FmRowRect compRect = fmRowPill();
             // SolidWorks marks fixed components with a "(f)" prefix.
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
-            // A hidden component reads greyed/half-toned in the tree (mirrors the eye "closed" state).
-            if (hidden) ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
+            // Missing/unreadable references and hidden components are visibly dimmed. The source
+            // error stays attached to the row as a tooltip instead of masquerading as "(no features)".
+            if (hidden || unavailable) ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2],
+                       unavailable ? 0.50f : 0.55f));
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_SpanFullWidth |
-                ImGuiTreeNodeFlags_FramePadding |            // pill-height node (red-pen round-2)
-                ImGuiTreeNodeFlags_OpenOnArrow;             // expand via the arrow; double-click = Edit Model
-            if (!expandable) lf |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_OpenOnArrow;
+            treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f,
+                     hidden || unavailable ? 0.5f : 1.0f);
+            ImGui::SameLine(0, 4 * ui::uiScale);
             ImVec2 compRowPos = ImGui::GetCursorScreenPos();
             const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
-            treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]",
-                                hidden ? 0.5f : 1.0f);
-            if (hidden) ImGui::PopStyleColor();
-            // Double-click the row (not the toggle-arrow) enters in-context model edit — same flow as
-            // the "Edit Model" context item (SolidWorks "Edit Component"). The assembly ghosts; the
-            // component's part-doc becomes active. ("Open Part" stays available on right-click.)
-            if (expandable && ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-                !ImGui::IsMouseHoveringRect(compRowPos,
-                    ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
-                           compRowPos.y + ImGui::GetFontSize() * 1.5f)))
-                st.enterComponentEdit(cid, resolveComponentPath(srcPath));
+            if (hidden || unavailable) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                if (unavailable) {
+                    const std::string why = absPath.empty()
+                        ? "Component source path is unresolved"
+                        : nestedDoc.error;
+                    ImGui::SetTooltip("%s", why.c_str());
+                }
+                // Component double-click is the explicit pop-out action. In-context feature editing
+                // starts from a nested feature row, preserving a clear distinction between the two.
+                if (!unavailable && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                    !ImGui::IsMouseHoveringRect(compRowPos,
+                        ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
+                               compRowPos.y + ImGui::GetFontSize() * 1.5f)))
+                    openComponentPart(st, absPath);
+            }
 
             // ---- component visibility ---------------------------------------------------------
             // Persisted (asm_edit_component `hidden`), so undo/save work; a hidden component still
@@ -1937,14 +2088,20 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 // panel for this component. Placed first (above "Edit Model") as the default edit.
                 if (ImGui::MenuItem("Edit"))
                     st.requestEditComponentMates = cid;
-                // "Edit Model" = in-context model editing: the component's part-doc becomes the active
-                // doc with the assembly ghosted. Only when the component has a source .step+ to edit.
-                if (expandable && ImGui::MenuItem("Edit Model"))
-                    st.enterComponentEdit(cid, resolveComponentPath(srcPath));
+                // Whole-model editing remains available, while an individual nested feature's
+                // Edit in Assembly action opens the real parameter form directly.
+                const bool editableModel =
+                    !unavailable && nestedDoc.state == ui::NestedDocumentState::Ready;
+                if (!editableModel) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Edit Model"))
+                    st.enterComponentEdit(cid, absPath);
+                if (!editableModel) ImGui::EndDisabled();
                 ImGui::Separator();
-                if (expandable && ImGui::MenuItem("Open Part"))
-                    openComponentPart(st, srcPath);
-                if (expandable) ImGui::Separator();
+                if (unavailable) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Open in new tab"))
+                    openComponentPart(st, absPath);
+                if (unavailable) ImGui::EndDisabled();
+                ImGui::Separator();
                 if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
                     toggleCompHidden(!hidden);
                 ImGui::EndPopup();
@@ -1954,31 +2111,23 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             fmRowPillEnd(compRect);
             featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
 
-            // ---- nested feature list (read-only) ---------------------------------------------
-            // When expanded, show the component part's OWN features (icon + name), read from its
-            // `.step+` document.json via a (path, mtime) cache — no unzip/parse per frame, no
-            // blocking worker RPC. Editing is the Open-Part path, not these rows.
-            // `expandable && compOpen` == "the node actually pushed": a leaf returns compOpen=true
-            // under NoTreePushOnOpen but did NOT push, so it must skip TreePop (stack underflow).
-            if (expandable && compOpen) {
-                {
-                    const std::string abs = resolveComponentPath(srcPath);
-                    static const std::vector<ui::ComponentFeature> kNoFeats;
-                    const auto& feats = abs.empty() ? kNoFeats : ui::componentFeatures(abs);
-                    if (feats.empty()) {
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.6f));
-                        ImGui::TextUnformatted(abs.empty() ? "(save the assembly to inspect)"
-                                                           : "(no features)");
-                        ImGui::PopStyleColor();
-                    } else {
-                        // Nested read-only tree that mirrors the part-env "3D Body" display:
-                        // Reference folder + history features + consumed sketches indented under
-                        // their consumer. Net-zero on the ImGui tree stack.
-                        drawComponentFeatureTree(cid, feats);
-                    }
+            // Cached recursive document tree: metadata, editable feature history, and nested
+            // assembly references. The cache keys on mtime+size, so a saved in-context edit is
+            // visible on the next frame without reparsing steady-state components.
+            if (compOpen) {
+                if (absPath.empty()) {
+                    drawNestedInfoRow("component_" + cid + "_material",
+                                      "Material: <unavailable>", "material", "[M]");
+                    drawNestedInfoRow("component_" + cid + "_file",
+                                      "File: <unresolved>", "open", "[F]");
+                    ImGui::TextDisabled("(component has no resolvable source path)");
+                } else {
+                    std::unordered_set<std::string> pathStack;
+                    pathStack.insert(absPath);
+                    drawNestedDocumentContents(st, "component_" + cid, cid, absPath,
+                                               nestedDoc, pathStack, 0);
                 }
-                ImGui::TreePop();   // matches the pushed (non-leaf) component node
+                ImGui::TreePop();
             }
             ++ci;
         }
@@ -2801,6 +2950,7 @@ void drawFeatureTreeBody(AppState& st,
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &lpSurf : nullptr);
     const auto& pal = fmPalette();
     s_fmStripeIdx = 0;
+    servicePendingNestedEdit(st);
 
     // Apply a drag-and-drop "file into folder" requested last frame BEFORE we capture the tree below,
     // so the rebuilt tree renders the feature under its new folder tag. Deferred here (not mid-walk)
@@ -3212,11 +3362,9 @@ void drawFeatureTreeBody(AppState& st,
                     // keep their front/top/right meaning. kOrder puts Top (X/Y) first in the list.
                     static const char* kPlanes[] = {"X/Z", "X/Y", "Y/Z"};
                     static const int   kOrder[3] = {1, 0, 2};   // display slots -> plane index
-                    bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
-                    auto takePlaneControl = [&st, planesAutoShow]() {
+                    auto takePlaneControl = [&st]() {
                         if (st.planesUserToggled) return;
-                        if (planesAutoShow)
-                            st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = true;
+                        for (int i = 0; i < 3; ++i) st.showPlane[i] = st.planeVisEff[i];
                         st.planesUserToggled = true;
                     };
                     for (int slot = 0; slot < 3; ++slot) {
@@ -3227,8 +3375,7 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_FramePadding;
                         // T-G18: selection is shown by fmRowPill's glass card (like feature rows);
                         // the ImGui Selected/Header paint on top read heavier than a feature row.
-                        bool planeShownEff = st.showPlane[pi] || planesAutoShow;
-                        bool hidden = !planeShownEff;
+                        bool hidden = !st.planeVisEff[pi];
                         // Pill FIRST (at the row's true left edge — drawing it after the icon left
                         // a misaligned slab starting right of the indent), then the node, then the
                         // icon into the leaf arrow slot. Hidden planes keep a readable dim state.

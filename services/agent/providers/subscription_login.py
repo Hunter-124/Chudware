@@ -110,6 +110,12 @@ def login(
                 "hint": "Complete the login in the browser tab, or check your network and "
                         "subscription, then try again."}
 
+    if not isinstance(cred, dict):
+        return {
+            "ok": False,
+            "reason": f"{label} login failed: provider returned no credential",
+            "hint": "Try signing in again. If the problem persists, restart the worker.",
+        }
     # Providers already call save_credential; re-key under a stable account id and
     # ensure that account is active. Prefer explicit account_id, then token metadata.
     if account_id is not None and str(account_id).strip():
@@ -128,6 +134,13 @@ def login(
             if sub_auth.get_active_account_id(cred_id) == aid:
                 sub_auth.clear_credential(cred_id, account_id=sub_auth.DEFAULT_ACCOUNT_ID)
 
+    # A re-login for the same identity must not reuse quota from the prior session.
+    try:
+        from . import usage as usage_mod
+        usage_mod.invalidate_account(_friendly, aid)
+    except Exception:
+        pass
+
     return {"ok": True, "provider": name, "label": label,
             "email": cred.get("email"), "account_id": aid}
 
@@ -138,8 +151,14 @@ def logout(provider: str, account_id: str | None = None) -> dict:
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
                 "hint": "Use one of: codex, claude, cursor, xai."}
-    _friendly, _name, cred_id, _label = resolved
+    friendly, _name, cred_id, _label = resolved
+    removed_id = account_id or sub_auth.get_active_account_id(cred_id)
     sub_auth.clear_credential(cred_id, account_id=account_id)
+    try:
+        from . import usage as usage_mod
+        usage_mod.invalidate_account(friendly, removed_id)
+    except Exception:
+        pass
     return {"ok": True}
 
 

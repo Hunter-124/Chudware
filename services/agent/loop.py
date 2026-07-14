@@ -2068,10 +2068,10 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     """Advance the PhaseMachine phase-by-phase using the DAG node outcomes,
     logging each phase (enter/exit + gate) to the ledger stage_log.
 
-    Returns ``(reached_phase, status, stop_reason)``.  Stops at the first phase
-    whose realising nodes did not all reach ``done`` (a paused/failed DAG); that
-    phase is entered (so mission_status shows the mission is *at* it) but not
-    exited.  On full completion the machine reaches DELIVER.
+    Returns ``(reached_phase, status, stop_reason)``. Stops at the first phase
+    whose realising nodes did not complete and whose DAG did not progress
+    downstream. Soft fan-in may reconcile the cursor past an incomplete phase,
+    but never records that phase's exit gate or completion.
 
     VERIFY is NOT derived from node completion (T-W30): before its gate runs the
     reviewer (``reviewer_exec.run_acceptance_checks``) executes each acceptance
@@ -2119,28 +2119,34 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                     return True
         return False
 
-    def _phase_nodes_complete(phase_name: str, prefixes: tuple[str, ...]) -> bool:
-        """Phase completes when its join is done, all workers are done, or the
-        DAG already progressed past it. Join failure alone does not block when
-        workers finished (soft-join overseer is advisory)."""
+    def _phase_completion(
+        phase_name: str, prefixes: tuple[str, ...],
+    ) -> tuple[bool, bool]:
+        """Return ``(advanced, reconciled)`` for one phase.
+
+        A completed join or worker set is a real phase completion. Downstream
+        progress only reconciles the phase cursor with the already-run DAG; it
+        must not fabricate a passed exit gate or add the phase to
+        ``phases_completed`` when its own nodes failed.
+        """
         nodes = _phase_nodes(prefixes)
         join = _PHASE_JOIN_NODES.get(phase_name)
         if join and _node_status(join) == "done":
-            return True
+            return True, False
         workers = [n for n in nodes if n != join] if join else list(nodes)
         # SPECIFY also historically matched n_spec_done via the n_spec_ prefix;
         # keep workers free of the advisory join even if join map is absent.
         if phase_name == "specify":
             workers = [n for n in workers if n != "n_spec_done"]
         if workers and all(_node_status(n) == "done" for n in workers):
-            return True
+            return True, False
         if _downstream_progressed(phase_name):
-            return True
-        return False
+            return True, True
+        return False, False
 
     for phase_name, prefixes in _PHASE_NODE_PREFIXES:
         phase = Phase(phase_name)
-        all_done = _phase_nodes_complete(phase_name, prefixes)
+        all_done, reconciled = _phase_completion(phase_name, prefixes)
 
         machine.enter(phase)
         emit_phase(phase, f"Phase {phase.value}")
@@ -2155,6 +2161,12 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                 dag_result.get("status"), "blocked")
             stop_reason = f"{phase.value}_incomplete"
             break
+
+        if reconciled:
+            # The DAG soft-advanced past failed/incomplete workers. Entering the
+            # later phase keeps mission status aligned with execution, but there
+            # is no truthful exit gate to record for this phase.
+            continue
 
         # T-W30: run the reviewer's acceptance checks at VERIFY entry, so the gate
         # reads REAL per-criterion results (not a fabricated PASS floor).

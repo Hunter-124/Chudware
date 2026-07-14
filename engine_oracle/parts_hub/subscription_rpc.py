@@ -114,13 +114,22 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
                 _login_state[provider] = cur
 
         def _run() -> None:
-            result = _sl().login(
-                provider,
-                device=device,
-                progress=_progress,
-                open_browser=open_browser,
-                account_id=account_id,
-            )
+            try:
+                result = _sl().login(
+                    provider,
+                    device=device,
+                    progress=_progress,
+                    open_browser=open_browser,
+                    account_id=account_id,
+                )
+                if not isinstance(result, dict):
+                    raise TypeError("login returned a non-object result")
+            except Exception as exc:  # noqa: BLE001 — never leave GUI progress stuck
+                result = {
+                    "ok": False,
+                    "reason": f"subscription login worker failed: {exc}",
+                    "hint": "Try signing in again. If the problem persists, restart the worker.",
+                }
             with _login_lock:
                 prev = dict(_login_state.get(provider) or {})
                 if result.get("ok"):
@@ -137,7 +146,7 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
                 else:
                     _login_state[provider] = {
                         "in_progress": False,
-                        "error": result.get("reason"),
+                        "error": result.get("reason") or "subscription login failed",
                         "stage": "error",
                         "user_code": prev.get("user_code"),
                         "verification_url": prev.get("verification_url"),

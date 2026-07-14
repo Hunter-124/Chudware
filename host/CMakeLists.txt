@@ -101,6 +101,7 @@ add_executable(Billet
   ../services/worker/cpp_core.cpp
   ../services/worker/worker_router.cpp
   src/ui/feature_tree.cpp
+  src/ui/feature_tree_nested.cpp # recursive cached referenced-part/assembly document tree
   src/ui/component_features.cpp  # assembly tree: cached read of a component `.step+` feature list
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)

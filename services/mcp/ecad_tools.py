@@ -481,6 +481,35 @@ def _apply(session, ops: list[dict]) -> dict:
     return ecad_session.apply_ops(session, session.revision, ops)
 
 
+def _attach_board_ascii_readback(payload: dict, doc_id: str = "",
+                                 focus: Optional[list] = None,
+                                 layer: str = "") -> dict:
+    """Best-effort compact ASCII + NL net_delta on a board mutation response.
+
+    Never raises — mutation success must not depend on the readback path.
+    """
+    if not isinstance(payload, dict) or not payload.get("ok", True):
+        return payload
+    try:
+        from mcp_server.ascii2d import (  # noqa: PLC0415
+            attach_board_readback, _load_board,
+        )
+        did = doc_id or payload.get("doc_id") or payload.get("board_doc_id") or ""
+        board = _load_board(str(did) if did else "")
+        kwargs: dict = {}
+        if layer:
+            kwargs["layer"] = layer
+        if focus is not None:
+            kwargs["focus"] = focus
+        attach_board_readback(payload, board, **kwargs)
+    except Exception:  # noqa: BLE001
+        payload.setdefault(
+            "ascii_readback",
+            {"ok": False, "error": "board readback unavailable"},
+        )
+    return payload
+
+
 # --------------------------------------------------------------------------- ERC formatting
 
 
@@ -1656,6 +1685,9 @@ def register_ecad_tools(mcp) -> None:
         schematic. Sim-only parts (V/I sources) and power symbols are skipped (they have no
         footprint). Run this AFTER the schematic is wired and BEFORE routing: the typical flow is
         update_from_sch -> ecad_autoroute -> ecad_fill_zones.
+
+        AUTO-READBACK: response includes compact layer ASCII + net_delta + findings. READ it
+        before the next place/route. Call render_board_ascii before declaring the board done.
         """
         sch_id = sch_doc_id or _ECAD["current_sch"]
         pcb_id = pcb_doc_id or _ECAD["current_pcb"]
@@ -1694,7 +1726,7 @@ def register_ecad_tools(mcp) -> None:
             next_actions.append("ecad_autoroute()  # connect the ratsnest, then ecad_fill_zones()")
         else:
             next_actions.append("ecad_run_drc()  # board populated; check spacing")
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": pcb_id, "sch_doc_id": sch_id, "kind": "pcb",
             "revision": resp.get("revision"),
             "footprints_added": added, "footprints_updated": updated,
@@ -1703,9 +1735,12 @@ def register_ecad_tools(mcp) -> None:
             "footprint_count": len(board.get("footprints", [])),
             "ratsnest_remaining": len(ratsnest),
             "warnings": warnings,
-            "hint": head + " Next: ecad_autoroute then ecad_fill_zones.",
+            "hint": head + " Next: ecad_autoroute then ecad_fill_zones. "
+                    "READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
-        })
+        }
+        _attach_board_ascii_readback(payload, doc_id=pcb_id)
+        return _dumps(payload)
 
     # ---------------------------------------------------------------- autoroute
 
@@ -1730,6 +1765,9 @@ def register_ecad_tools(mcp) -> None:
         greedy pass; 0 for the original single-pass behaviour.
 
         Returns per-pair skew/coupling stats in ``diff_pair_stats`` when pairs are routed.
+
+        AUTO-READBACK: response includes compact layer ASCII + net_delta (tracks/vias/crossings).
+        READ it before the next board edit. Call render_board_ascii before declaring done.
         """
         try:
             session = _get_pcb(doc_id or None)
@@ -1810,7 +1848,7 @@ def register_ecad_tools(mcp) -> None:
             next_actions.append(
                 "Check diff-pair results: skew > 0.2mm or coupled_pct < 80 means "
                 "the pair needs manual tuning or more board space.")
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": resp.get("revision"),
             "routed_nets": routed, "failed_nets": failed,
             "airwires_before": before, "airwires_after": after,
@@ -1823,9 +1861,12 @@ def register_ecad_tools(mcp) -> None:
             "warnings": warnings,
             "hint": head + (" All nets routed." if not failed else
                             f" {len(failed)} net(s) failed — manual routing or more space needed.")
-                  + (" " + "; ".join(dp_reading_lines) if dp_reading_lines else ""),
+                  + (" " + "; ".join(dp_reading_lines) if dp_reading_lines else "")
+                  + " READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
-        })
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
 
     # ---------------------------------------------------------------- zones
 
@@ -1838,6 +1879,9 @@ def register_ecad_tools(mcp) -> None:
         or an explicit polygon ``[[x, y], ...]`` (>=3 points). Omit it to flood the whole board
         outline bounding box (a full-board GND pour, the common case). The pour is not filled until
         ecad_fill_zones runs (compile fills a coarse preview automatically after this edit).
+
+        AUTO-READBACK: compact layer ASCII + findings after the zone is added. READ it before
+        fill/DRC. Call render_board_ascii before declaring the board done.
         """
         try:
             session = _get_pcb(doc_id or None)
@@ -1870,16 +1914,19 @@ def register_ecad_tools(mcp) -> None:
             return _err(f"could not add zone on {net!r}/{layer}: {e.message}", hint=e.message,
                         next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
         zones = session.doc.get("zones", [])
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "net": net, "layer": layer, "polygon": polygon,
             "zone_count": len(zones),
             "warnings": list(resp.get("warnings", [])),
             "hint": (f"Added a {net} copper pour on {layer} ({len(polygon)} vertices). "
-                     "Fill it (ecad_fill_zones) to compute the actual copper, then ecad_run_drc."),
+                     "Fill it (ecad_fill_zones) to compute the actual copper, then ecad_run_drc. "
+                     "READ the ascii_readback before the next board edit."),
             "next_actions": ["ecad_fill_zones()  # compute the poured copper",
                              "ecad_run_drc()  # confirm clearance to other-net copper"],
-        })
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id, layer=layer)
+        return _dumps(payload)
 
     @mcp.tool()
     def ecad_fill_zones(doc_id: str = "") -> str:
@@ -3478,6 +3525,9 @@ def register_ecad_tools(mcp) -> None:
 
         Typical agent path: ecad_design / capture schematic -> ecad_simulate (gate) ->
         board_from_schematic -> ecad_run_drc / ecad_run_dfm / ecad_run_pdn / thermal checks.
+
+        AUTO-READBACK: compact board ASCII + net_delta + findings. READ it before further
+        place/route. Call render_board_ascii before declaring the board done.
         """
         from mcp_server import board_flow as _bf
 
@@ -3577,7 +3627,7 @@ def register_ecad_tools(mcp) -> None:
         if not next_actions:
             next_actions.append("ecad_export('gerber')  # board ready for fab review")
 
-        return _dumps({
+        payload = {
             "ok": bool(result.get("ok", True)),
             "doc_id": board_id,
             "board_doc_id": board_id,
@@ -3603,9 +3653,13 @@ def register_ecad_tools(mcp) -> None:
             "warnings": list(result.get("warnings") or []) + residual_lines[:3],
             "summary": head,
             "hint": head + (" All multi-pad nets routed." if not failed else
-                            " Some nets need manual routing or more space."),
+                            " Some nets need manual routing or more space.")
+                    + " READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
-        })
+        }
+        if board_id:
+            _attach_board_ascii_readback(payload, doc_id=board_id)
+        return _dumps(payload)
 
     @mcp.tool()
     def ecad_autoplace(doc_id: str = "") -> str:
@@ -3614,6 +3668,9 @@ def register_ecad_tools(mcp) -> None:
         Seats footprints by net clusters: ICs near centre, decoupling caps next to IC power
         pads, connectors on the edge, passives near their highest-weight neighbour. Deterministic
         (seed=0). Run after ecad_update_from_sch (or board_from_schematic already did this).
+
+        AUTO-READBACK: compact layer ASCII + courtyard/net findings. READ before routing.
+        Call render_board_ascii before declaring the board done.
         """
         from mcp_server import board_flow as _bf
 
@@ -3645,7 +3702,7 @@ def register_ecad_tools(mcp) -> None:
         ]
         if n_err:
             next_actions.insert(0, f"ecad_run_drc()  # {n_err} residual error(s)")
-        return _dumps({
+        payload = {
             "ok": True,
             "doc_id": session.doc_id,
             "board_doc_id": session.doc_id,
@@ -3663,9 +3720,12 @@ def register_ecad_tools(mcp) -> None:
             "drc_errors": n_err,
             "warnings": list(result.get("warnings") or []),
             "summary": head,
-            "hint": head + " Next: ecad_autoroute then ecad_optimize_traces.",
+            "hint": head + " Next: ecad_autoroute then ecad_optimize_traces. "
+                    "READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
-        })
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
 
     @mcp.tool()
     def ecad_optimize_traces(targets: Optional[Union[dict, str]] = None,
@@ -3676,6 +3736,9 @@ def register_ecad_tools(mcp) -> None:
         ``targets`` is an optional ``{net_name: z0_ohm}`` map (or a JSON object string).
         DRC-guarded: each change that introduces a clearance error is reverted. Residual
         violations after the pass are listed honestly. Safe to re-run (idempotent).
+
+        AUTO-READBACK: compact layer ASCII + net_delta after polish. READ before fill/DRC.
+        Call render_board_ascii before declaring the board done.
         """
         from mcp_server import board_flow as _bf
 
@@ -3731,7 +3794,7 @@ def register_ecad_tools(mcp) -> None:
             next_actions.append(f"ecad_run_drc()  # {n_err} residual error(s)")
         next_actions.append("ecad_fill_zones()  # pour copper if needed")
         next_actions.append("ecad_to_3d()")
-        return _dumps({
+        payload = {
             "ok": True,
             "doc_id": session.doc_id,
             "board_doc_id": session.doc_id,
@@ -3752,9 +3815,12 @@ def register_ecad_tools(mcp) -> None:
             "warnings": list(result.get("warnings") or []) + residual_lines[:3],
             "summary": head,
             "hint": head + (" Traces polished." if n_err == 0 else
-                            " Residual DRC named — see residual_drc."),
+                            " Residual DRC named — see residual_drc.")
+                    + " READ the ascii_readback before the next board edit.",
             "next_actions": next_actions,
-        })
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
 
     # tools registered; nothing to return.
 

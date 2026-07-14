@@ -8,6 +8,7 @@
 #include "stb_image_resize2.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <condition_variable>
 #include <cstdio>
@@ -420,7 +421,7 @@ void setWindowIcon(GLFWwindow* win, const std::string& path) {
     unsigned char* src = stbi_load(path.c_str(), &w, &h, &n, 4);
     if (!src) return;
 
-    static const int kSizes[] = {16, 32, 48, 128, 256};
+    static const int kSizes[] = {16, 32, 48, 64, 128, 256};
     static const int kCount   = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
 
     GLFWimage imgs[kCount];
@@ -791,6 +792,49 @@ static Mesh meshFromBody(const render::BodyMesh& b) {
     return m;
 }
 
+static std::vector<Renderer::PartMesh> rendererPartsFromDoc(
+    const AppState& st, const render::DocMesh& doc) {
+    std::vector<Renderer::PartMesh> parts;
+    parts.reserve(doc.bodies.size());
+    for (const auto& b : doc.bodies) {
+        if (b.pos.empty()) continue;
+        Renderer::PartMesh pm;
+        pm.mesh = meshFromBody(b);
+        pm.color[0] = b.color[0];
+        pm.color[1] = b.color[1];
+        pm.color[2] = b.color[2];
+        pm.metallic = b.metallic;
+        pm.roughness = b.roughness;
+        pm.body_id = b.body_id;
+        pm.faces.reserve(b.faces.size());
+        for (const auto& fr : b.faces)
+            pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
+        const render::ScalarField* chosen = nullptr;
+        for (const auto& sc : doc.scalars) {
+            if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
+            if (sc.name == st.activeScalarField) {
+                chosen = &sc;
+                break;
+            }
+            if (!chosen) chosen = &sc;
+        }
+        if (chosen) {
+            pm.scalar = chosen->values;
+            pm.scalarMin = chosen->vmin;
+            pm.scalarMax = chosen->vmax;
+        }
+        for (const auto& df : doc.displacements) {
+            if (df.body_id == b.body_id && df.vec.size() == (size_t)b.n_verts * 3) {
+                pm.disp = df.vec;
+                pm.dispScaleHint = df.scale_hint;
+                break;
+            }
+        }
+        parts.push_back(std::move(pm));
+    }
+    return parts;
+}
+
 // Drop id-pass / overlay GPU buffers when the viewport has no document mesh (empty doc, tab
 // close, or a rebuild that produced zero bodies). Requires a current GL context.
 static void clearPickBuffers(render::IdPass* idPass, render::Overlays* overlays) {
@@ -811,6 +855,10 @@ struct MeshLoadJob {
     uint64_t gen = 0;
     std::string path;
     bool renderOnly = false;
+    bool cacheOnly = false;
+    std::string docId;
+    int revision = -1;
+    std::chrono::steady_clock::time_point queuedAt;
     bool ok = false;
     std::string err;
     render::DocMesh doc;
@@ -873,13 +921,23 @@ void AppState::stopMeshLoader() { stopMeshLoaderThread(); }
 // Commit a parsed DocMesh onto the GL-side state (setMeshes / id-pass / pick caches).
 // Shared by the sync loadDocMesh path and drainMeshLoads. Requires GL context.
 static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::string& err,
-                                    bool renderOnly);
+                                    bool renderOnly, bool shadedAlreadyBound = false);
 
 bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
     if (!render::loadAicmFile(aicmPath, doc, err)) return false;
-    return commitDocMeshFromParsed(*this, doc, err, renderOnly);
+    if (!commitDocMeshFromParsed(*this, doc, err, renderOnly)) return false;
+    if (!renderOnly && docMirror.hasDoc()) {
+        renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
+        if (DocSession* s = activeSession()) {
+            s->cachedAicmPath = aicmPath;
+            s->cachedRevision = docMirror.revision();
+            s->cachedMirror = docMirror.snapshot();
+            s->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(doc));
+        }
+    }
+    return true;
 }
 
 void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly) {
@@ -889,9 +947,40 @@ void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly) {
     const uint64_t gen = ++meshGen_;
     {
         std::lock_guard<std::mutex> lk(g_meshMtx);
-        // Drop queued (not yet parsing) jobs — latest-wins at the queue too.
-        g_meshQueue.clear();
-        g_meshQueue.push_back(MeshLoadJob{gen, aicmPath, renderOnly, false, {}, {}});
+        // Latest visible load wins, but pushed background-cache jobs are independent.
+        g_meshQueue.erase(
+            std::remove_if(g_meshQueue.begin(), g_meshQueue.end(),
+                           [](const MeshLoadJob& j) { return !j.cacheOnly; }),
+            g_meshQueue.end());
+        MeshLoadJob job;
+        job.gen = gen;
+        job.path = aicmPath;
+        job.renderOnly = renderOnly;
+        job.queuedAt = std::chrono::steady_clock::now();
+        g_meshQueue.push_back(std::move(job));
+    }
+    g_meshCv.notify_one();
+}
+
+void AppState::cacheBackgroundDocMeshAsync(const std::string& docId, int revision,
+                                           const std::string& aicmPath) {
+    if (docId.empty() || revision < 0 || aicmPath.empty() || !renderer) return;
+    ensureMeshLoader();
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        g_meshQueue.erase(
+            std::remove_if(g_meshQueue.begin(), g_meshQueue.end(),
+                           [&](const MeshLoadJob& j) {
+                               return j.cacheOnly && j.docId == docId;
+                           }),
+            g_meshQueue.end());
+        MeshLoadJob job;
+        job.path = aicmPath;
+        job.cacheOnly = true;
+        job.docId = docId;
+        job.revision = revision;
+        job.queuedAt = std::chrono::steady_clock::now();
+        g_meshQueue.push_back(std::move(job));
     }
     g_meshCv.notify_one();
 }
@@ -905,23 +994,75 @@ void AppState::drainMeshLoads() {
         ready.swap(g_meshReady);
     }
     const uint64_t cur = meshGen_.load();
-    // Apply only the newest ready job that still matches meshGen_ (drop everything older).
+    // Inactive pushed revisions prewarm their parsed+GPU caches without touching the viewport.
+    for (auto& j : ready) {
+        if (!j.cacheOnly) continue;
+        if (!j.ok) {
+            addLog("[daemon] background mesh parse failed for " + j.docId + ": " + j.err);
+            continue;
+        }
+        DocTab* cachedTab = nullptr;
+        for (auto& tab : docTabs) {
+            if (tab.docId == j.docId && tab.session &&
+                tab.session->cachedRevision == j.revision &&
+                tab.session->cachedAicmPath == j.path) {
+                cachedTab = &tab;
+                break;
+            }
+        }
+        if (!cachedTab) continue;  // tab closed or a newer pushed revision superseded this parse
+        DocSession* session = cachedTab->session.get();
+        const auto parts = rendererPartsFromDoc(*this, j.doc);
+        renderer->cacheMeshes(j.docId, j.revision, parts);
+        session->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(j.doc));
+        cachedTab->meshCacheInvalidated = false;
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - j.queuedAt).count();
+        const std::string perf = "[perf] live_mesh_prewarm doc=" + j.docId + " rev=" +
+            std::to_string(j.revision) + " total=" + std::to_string(ms) + "ms";
+        addLog(perf);
+        std::fprintf(stderr, "%s\n", perf.c_str());
+        std::fflush(stderr);
+    }
+    // Apply only the newest visible job that still matches meshGen_.
     MeshLoadJob* best = nullptr;
     for (auto& j : ready) {
-        if (j.gen == cur) best = &j;
+        if (!j.cacheOnly && j.gen == cur) best = &j;
     }
-    if (!best) return;  // all stale — keep last-good mesh on screen
+    if (!best) return;
     if (!best->ok) {
         addLog("[err] loadDocMeshAsync: " + best->err);
         return;
     }
     std::string err;
-    if (!commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly) && !err.empty())
-        addLog("[err] loadDocMeshAsync commit: " + err);
+    if (!commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly)) {
+        if (!err.empty()) addLog("[err] loadDocMeshAsync commit: " + err);
+        return;
+    }
+    if (!best->renderOnly && docMirror.hasDoc()) {
+        renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
+        if (DocSession* s = activeSession()) {
+            s->cachedAicmPath = best->path;
+            s->cachedRevision = docMirror.revision();
+            s->cachedMirror = docMirror.snapshot();
+            s->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(best->doc));
+        }
+        if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
+            docTabs[activeTab].docId == docMirror.docId()) {
+            docTabs[activeTab].meshCacheInvalidated = false;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - best->queuedAt).count();
+        const std::string perf = "[perf] live_mesh_refresh doc=" + docMirror.docId() + " rev=" +
+            std::to_string(docMirror.revision()) + " total=" + std::to_string(ms) + "ms";
+        addLog(perf);
+        std::fprintf(stderr, "%s\n", perf.c_str());
+        std::fflush(stderr);
+    }
 }
 
 static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::string& err,
-                                    bool renderOnly) {
+                                    bool renderOnly, bool shadedAlreadyBound) {
     if (!st.renderer || !st.idPass || !st.overlays) {
         err = "render objects not initialized";
         return false;
@@ -952,7 +1093,8 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
         // empty MODEL, not a load error. Clear the shaded view + pick caches so the viewport
         // tracks the document; before, the stale previous mesh kept rendering and the
         // rollback bar looked like it did nothing.
-        if (st.renderer) st.renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+        if (st.renderer && !shadedAlreadyBound)
+            st.renderer->setMeshes(std::vector<Renderer::PartMesh>{});
         clearPickBuffers(st.idPass, st.overlays);
         st.bodyVisible.clear();
         st.docBodyIds.clear();
@@ -1016,7 +1158,7 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
     // C48: unconditional — pms can be empty when every body has no triangles; keeping the
     // previous meshes would desync the viewport from the document (same stale-mesh bug as
     // the zero-bodies case above).
-    st.renderer->setMeshes(pms);
+    if (!shadedAlreadyBound) st.renderer->setMeshes(pms);
 
     // C19: surface overlay presence for the simulation panel's result controls.
     st.docMeshHasScalar = false;
@@ -1146,10 +1288,29 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
     st.hover = render::PickHit{};
     st.pickStatus.clear();
     st.hasDocMesh = true;
-    // Doc-driven visibility (runs AFTER docBodyIds/bodyVisible + hasDocMesh are set above): apply
-    // persisted assembly-component `hidden` flags to the body mask, and auto-hide user reference
-    // planes that a 3D feature now references. Guarded internally against non-matching schemas.
+    // Doc-driven visibility runs after body/datum geometry is bound: persisted assembly component
+    // masks plus consumed-plane auto-hide from the active feature dependency graph.
     st.applyDocDrivenVisibility(st.docMirror.tree());
+    return true;
+}
+
+bool AppState::bindCachedDocMesh(DocSession& s, std::string& err) {
+    if (!renderer || !idPass || !overlays) {
+        err = "render objects not initialized";
+        return false;
+    }
+    if (!s.cachedMirror.valid() || !s.cachedDocMesh ||
+        s.cachedMirror.revision != s.cachedRevision) {
+        err = "no immutable document cache";
+        return false;
+    }
+    if (!docMirror.restoreSnapshot(s.cachedMirror)) {
+        err = "invalid document mirror cache";
+        return false;
+    }
+    const bool gpuBound = renderer->bindCachedMeshes(s.cachedMirror.docId, s.cachedRevision);
+    if (!commitDocMeshFromParsed(*this, *s.cachedDocMesh, err, false, gpuBound)) return false;
+    renderer->setActiveMeshIdentity(s.cachedMirror.docId, s.cachedRevision);
     return true;
 }
 
@@ -1167,7 +1328,10 @@ void AppState::unloadDocMesh() {
 }
 
 void AppState::clearViewportForNewDoc() {
-    if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+    if (renderer) {
+        renderer->parkActiveMeshes();
+        renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+    }
     clearPickBuffers(idPass, overlays);
     hasDocMesh = false;
     // Solid Bodies visibility: a fresh doc starts with no bodies and nothing hidden (stale hides
@@ -1176,6 +1340,7 @@ void AppState::clearViewportForNewDoc() {
     docBodyIds.clear();
     hiddenFeatures.clear();
     autoHiddenPlanes.clear();
+    datumPlanesUserToggled.clear();
     // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
     // behavior). The FM eye toggle removes this entry to show it.
     hiddenFeatures.insert("point.origin");
@@ -1221,6 +1386,7 @@ void AppState::captureDocState(DocSession& s) {
     s.docBodyIds   = std::move(docBodyIds);
     s.hiddenFeatures = std::move(hiddenFeatures);
     s.autoHiddenPlanes = std::move(autoHiddenPlanes);
+    s.datumPlanesUserToggled = std::move(datumPlanesUserToggled);
     for (int i = 0; i < 3; ++i) s.showPlane[i] = showPlane[i];
     s.planesUserToggled = planesUserToggled;
     s.originUserToggled = originUserToggled;
@@ -1244,6 +1410,7 @@ void AppState::restoreDocState(DocSession& s) {
     docBodyIds   = std::move(s.docBodyIds);
     hiddenFeatures = std::move(s.hiddenFeatures);
     autoHiddenPlanes = std::move(s.autoHiddenPlanes);
+    datumPlanesUserToggled = std::move(s.datumPlanesUserToggled);
     for (int i = 0; i < 3; ++i) showPlane[i] = s.showPlane[i];
     planesUserToggled = s.planesUserToggled;
     originUserToggled = s.originUserToggled;
@@ -1262,9 +1429,8 @@ void AppState::restoreDocState(DocSession& s) {
 // ---- in-context component edit (SolidWorks "Edit Component") ----
 // Make a component's part-doc the REAL ACTIVE doc while drawing the assembly as a dimmed ghost. The
 // active-doc switch REUSES the exact path openComponentPart (feature_tree.cpp) uses: dedup the source
-// path against already-open non-handoff tabs and switchToTab() it (which routes through DocMirror::
-// tryActivateCached — the cached, no-re-tessellate switch), else set requestOpenPath so app.cpp's
-// GL-thread open pump opens it next frame. Either way, file caching is inherited for free.
+// path against already-open non-handoff tabs and switchToTab() it (which binds the parked immutable
+// mirror/tessellation/GPU cache), else set requestOpenPath so app.cpp opens it next frame.
 void AppState::enterComponentEdit(const std::string& componentId, const std::string& sourceAbsPath) {
     if (componentEdit.active || sourceAbsPath.empty()) return;
     namespace fs = std::filesystem;
@@ -1358,10 +1524,10 @@ void AppState::enterComponentEdit(const std::string& componentId, const std::str
 //   1) SAVE the component doc to its source `.step+` first, bumping the file mtime so the assembly's
 //      abspath:mtime component cache misses and re-imports the edited geometry. The in-context edit lives
 //      only in the worker's in-memory doc until this save.
-//   2) After the save lands, invalidate the assembly tab session's cache (cachedRevision = -1) so
-//      switchToTab takes the `needs_rebuild` async doc_rebuild path (a real re-embed + re-tessellate)
-//      instead of tryActivateCached. doc_save is async, so the rebuild MUST be chained from the save's
-//      success callback — firing it sequentially would race the rebuild ahead of the on-disk write.
+//   2) After the save lands, invalidate every assembly-tab cache layer so switchToTab takes the
+//      asynchronous doc_rebuild path (a real re-embed + re-tessellate). doc_save is async, so the
+//      rebuild MUST be chained from the save's success callback — firing it sequentially would race
+//      the rebuild ahead of the on-disk write.
 void AppState::exitComponentEdit() {
     if (!componentEdit.active) return;
     const std::string returnDocId  = componentEdit.assemblyDocId;
@@ -1382,7 +1548,10 @@ void AppState::exitComponentEdit() {
             if (docTabs[i].session) {
                 docTabs[i].session->cachedRevision = -1;   // force needs_rebuild (see doc_mirror.cpp)
                 docTabs[i].session->cachedAicmPath.clear();
+                docTabs[i].session->cachedMirror = {};
+                docTabs[i].session->cachedDocMesh.reset();
             }
+            if (renderer) renderer->discardCachedMeshes(returnDocId);
             switchToTab(i);
             break;
         }
@@ -1435,26 +1604,47 @@ void AppState::applyDatumVisibility() {
     if (renderer) renderer->setHiddenDatums(hiddenFeatures);
 }
 
-// Reserved reference datums (Front/Top/Right/origin/axes) are the app-owned overlays whose
-// auto-show/hide lives in viewport_panel (showPlane[]/originUserToggled). Only USER datum planes
-// (feature type "plane") are auto-hidden by this helper, so we never fight that path.
-static bool isReservedDatumFid(const std::string& s) {
-    return s == "origin" || s == "point.origin" ||
-           s == "plane.front" || s == "plane.top" || s == "plane.right" ||
-           s == "axis.x" || s == "axis.y" || s == "axis.z";
+// The three origin planes are renderer-owned overlays rather than datum features in the tree.
+static bool isDefaultPlaneFid(const std::string& fid) {
+    return fid == "plane.front" || fid == "plane.top" || fid == "plane.right";
 }
 
-// Pull a datum feature id out of a selector value. Accepts {"kind":"datum","feature":"<fid>"}
-// (canonical) and the short {"datum":"<fid>"} form. Returns "" for face/edge/vertex selectors.
-static std::string datumFidOf(const nlohmann::json& sel) {
-    if (!sel.is_object()) return {};
-    if (sel.value("kind", std::string()) == "datum") {
-        auto it = sel.find("feature");
-        if (it != sel.end() && it->is_string()) return it->get<std::string>();
+// Sketches and datum construction features do not consume their references by themselves. A plane
+// only becomes clutter once a downstream model feature reaches it through this dependency graph.
+static bool isDatumPlaneType(const std::string& type) {
+    return type == "plane" || type == "datum_plane";
+}
+
+static bool isReferenceOnlyFeature(const std::string& type) {
+    return isDatumPlaneType(type) || type == "axis" || type == "datum_axis" ||
+           type == "point" || type == "datum_point" || type == "csys" ||
+           type == "sketch" || type == "sketch3d";
+}
+
+// Collect feature-id and reserved-plane references from any canonical refs value. Selector refs use
+// nested objects (feature/owner_feature/sketch), feature lists use arrays of bare ids, and the three
+// default planes are bare strings, so recursively walking only `refs` is both complete and avoids
+// mistaking arbitrary parameter strings for dependencies.
+static void collectFeatureRefs(
+    const nlohmann::json& value,
+    const std::unordered_map<std::string, const nlohmann::json*>& activeFeatures,
+    std::unordered_set<std::string>& featureDeps,
+    std::unordered_set<std::string>& consumedPlanes) {
+    if (value.is_string()) {
+        const std::string ref = value.get<std::string>();
+        if (isDefaultPlaneFid(ref)) consumedPlanes.insert(ref);
+        if (activeFeatures.count(ref)) featureDeps.insert(ref);
+        return;
     }
-    auto it = sel.find("datum");
-    if (it != sel.end() && it->is_string()) return it->get<std::string>();
-    return {};
+    if (value.is_array()) {
+        for (const auto& item : value)
+            collectFeatureRefs(item, activeFeatures, featureDeps, consumedPlanes);
+        return;
+    }
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it)
+            collectFeatureRefs(it.value(), activeFeatures, featureDeps, consumedPlanes);
+    }
 }
 
 void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
@@ -1463,79 +1653,97 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
 
     if (isAsm) {
         // Assembly: re-derive the per-component hide mask from document.json. The engine builds one
-        // body per NON-suppressed component, 1-based ordinal == body_id (assembly.cpp), so we walk
-        // components in tree order, skip suppressed (they produce no body), and for each `hidden`
-        // one drop the renderer slot whose docBodyId equals that ordinal. Suppressed components
-        // shift ordinals, so replicating the enumeration here is what keeps the mapping correct.
+        // body per NON-suppressed component, 1-based ordinal == body_id (assembly.cpp).
         auto ci = tree.find("components");
-        if (ci == tree.end() || !ci->is_array()) return;
-        // Drive each component's body slot DIRECTLY from its `hidden` flag (two-way, idempotent).
-        // A same-body-set reload preserves bodyVisible (commitDocMeshFromParsed only resets it when
-        // the body-id list changes), and toggling `hidden` — unlike `suppressed` — leaves the body
-        // set identical. So an un-hide must actively set the slot back to 1: a one-way `=0` would
-        // never restore the body. In an assembly there's exactly one body per component, so keying
-        // the slot straight off the flag can't clobber a separate per-body toggle (there is none).
-        uint32_t ordinal = 0;
-        for (const auto& c : *ci) {
-            if (!c.is_object()) continue;
-            if (c.value("suppressed", false)) continue;   // no body built -> no slot
-            ++ordinal;                                      // matches assembly.cpp body_id
-            uint8_t vis = c.value("hidden", false) ? 0 : 1;
-            for (size_t slot = 0; slot < docBodyIds.size(); ++slot)
-                if (docBodyIds[slot] == ordinal && slot < bodyVisible.size())
-                    bodyVisible[slot] = vis;
+        if (ci != tree.end() && ci->is_array()) {
+            uint32_t ordinal = 0;
+            for (const auto& c : *ci) {
+                if (!c.is_object()) continue;
+                if (c.value("suppressed", false)) continue;
+                ++ordinal;
+                uint8_t vis = c.value("hidden", false) ? 0 : 1;
+                for (size_t slot = 0; slot < docBodyIds.size(); ++slot)
+                    if (docBodyIds[slot] == ordinal && slot < bodyVisible.size())
+                        bodyVisible[slot] = vis;
+            }
+            applyBodyVisibility();
         }
-        applyBodyVisibility();
-        return;
+        // Do not return: assembly-level features can consume datum planes too.
     }
 
-    // Part: auto-hide USER datum planes once a solid feature references them (SolidWorks tidies a
-    // reference plane out of view once you've sketched-and-built on it). We only act once there's
-    // a body (hasDocMesh) — the same "you've committed a 3D feature" signal the origin/plane
-    // auto-hide uses — and only ONCE per plane (recorded in autoHiddenPlanes), so a user who
-    // re-shows the plane via the FM eye keeps it shown across later rebuilds.
-    if (!hasDocMesh) return;
     auto fi = tree.find("features");
     if (fi == tree.end() || !fi->is_array()) return;
 
-    // 1) user datum-plane fids present in the tree.
+    // Build the ACTIVE graph only: suppressed and rolled-back features do not consume anything.
+    std::unordered_map<std::string, const nlohmann::json*> activeFeatures;
     std::unordered_set<std::string> userPlanes;
+    std::string rollbackAfter;
+    auto rollback = tree.find("rollback_after");
+    if (rollback != tree.end() && rollback->is_string())
+        rollbackAfter = rollback->get<std::string>();
+    bool pastRollback = false;
     for (const auto& f : *fi) {
-        if (!f.is_object()) continue;
-        if (f.value("type", std::string()) != "plane") continue;
-        std::string fid = f.value("id", std::string());
-        if (!fid.empty() && !isReservedDatumFid(fid)) userPlanes.insert(fid);
-    }
-    if (userPlanes.empty()) return;
-
-    // 2) datum fids that a sketch sits on (sketch.refs.plane). A sketch is what a 3D feature
-    //    (extrude/revolve/…) consumes, so "sketch on plane P + a body exists" == "P is referenced
-    //    by a 3D feature" for the user's purposes. Also catch a 3D feature referencing a plane
-    //    directly via any datum-typed selector in its refs.
-    std::unordered_set<std::string> referenced;
-    auto scanRefsForDatums = [&](const nlohmann::json& refs) {
-        if (!refs.is_object()) return;
-        for (auto it = refs.begin(); it != refs.end(); ++it) {
-            const nlohmann::json& v = it.value();
-            if (v.is_object()) { std::string d = datumFidOf(v); if (!d.empty()) referenced.insert(d); }
-            else if (v.is_array())
-                for (const auto& e : v) { std::string d = datumFidOf(e); if (!d.empty()) referenced.insert(d); }
+        if (!f.is_object() || pastRollback) continue;
+        const std::string fid = f.value("id", std::string());
+        if (!fid.empty() && !f.value("suppressed", false)) {
+            activeFeatures.emplace(fid, &f);
+            if (isDatumPlaneType(f.value("type", std::string()))) userPlanes.insert(fid);
         }
-    };
-    for (const auto& f : *fi) {
-        if (!f.is_object()) continue;
-        auto ri = f.find("refs");
-        if (ri != f.end()) scanRefsForDatums(*ri);
+        if (!rollbackAfter.empty() && fid == rollbackAfter) pastRollback = true;
     }
 
-    bool changed = false;
-    for (const std::string& p : userPlanes) {
-        if (!referenced.count(p)) continue;
-        if (autoHiddenPlanes.count(p)) continue;   // already auto-acted; respect any user re-show
-        autoHiddenPlanes.insert(p);
-        if (hiddenFeatures.insert(p).second) changed = true;
+    // Start only at actual model features, then walk their feature dependencies. This is the key
+    // distinction between "a sketch/ref-plane exists" and "a downstream 3D feature consumed it".
+    std::unordered_set<std::string> consumedPlanes;
+    for (const auto& featureEntry : activeFeatures) {
+        const nlohmann::json* root = featureEntry.second;
+        if (isReferenceOnlyFeature(root->value("type", std::string()))) continue;
+
+        std::unordered_set<std::string> pending;
+        auto refs = root->find("refs");
+        if (refs != root->end())
+            collectFeatureRefs(*refs, activeFeatures, pending, consumedPlanes);
+
+        std::unordered_set<std::string> visited;
+        while (!pending.empty()) {
+            auto next = pending.begin();
+            std::string depId = *next;
+            pending.erase(next);
+            if (!visited.insert(depId).second) continue;
+
+            auto dep = activeFeatures.find(depId);
+            if (dep == activeFeatures.end()) continue;
+            const nlohmann::json& feature = *dep->second;
+            if (isDatumPlaneType(feature.value("type", std::string())))
+                consumedPlanes.insert(depId);
+            auto depRefs = feature.find("refs");
+            if (depRefs != feature.end())
+                collectFeatureRefs(*depRefs, activeFeatures, pending, consumedPlanes);
+        }
     }
-    if (changed) applyDatumVisibility();
+
+    // Auto-managed planes follow graph consumption in both directions. A FeatureManager eye click
+    // moves a user plane into datumPlanesUserToggled, after which neither auto-hide nor auto-show
+    // touches it. Default-plane eye control is the aggregate planesUserToggled/showPlane path.
+    bool datumVisibilityChanged = false;
+    for (auto it = autoHiddenPlanes.begin(); it != autoHiddenPlanes.end(); ) {
+        if (consumedPlanes.count(*it) && !datumPlanesUserToggled.count(*it)) {
+            ++it;
+            continue;
+        }
+        if (userPlanes.count(*it) && !datumPlanesUserToggled.count(*it))
+            datumVisibilityChanged |= hiddenFeatures.erase(*it) != 0;
+        it = autoHiddenPlanes.erase(it);
+    }
+    for (const std::string& plane : consumedPlanes) {
+        if (userPlanes.count(plane) && !datumPlanesUserToggled.count(plane)) {
+            autoHiddenPlanes.insert(plane);
+            datumVisibilityChanged |= hiddenFeatures.insert(plane).second;
+        } else if (isDefaultPlaneFid(plane)) {
+            autoHiddenPlanes.insert(plane);
+        }
+    }
+    if (datumVisibilityChanged) applyDatumVisibility();
 }
 
 std::string AppState::pickLabel(const render::PickHit& h) const {

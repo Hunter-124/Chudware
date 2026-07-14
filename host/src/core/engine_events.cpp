@@ -10,6 +10,8 @@
 #include "app_state.h"
 #include "engine_backend.h"      // services/worker (include dir)
 #include "ipc_client.h"          // services/ipc (include dir)
+#include "../renderer.h"
+#include "../render/aicm_loader.h"
 #include "../ui/property_manager.h"
 #include "../ui/sketch_mode.h"
 
@@ -30,6 +32,17 @@ int tabIndexForDoc(AppState& st, const std::string& docId) {
     for (int i = 0; i < (int)st.docTabs.size(); ++i)
         if (st.docTabs[i].docId == docId) return i;
     return -1;
+}
+
+bool pushedSnapshot(const std::string& docId, const json& data,
+                    DocMirrorSnapshot& snapshot) {
+    if (!data.contains("tree") || !data["tree"].is_object()) return false;
+    DocMirror pushed;
+    std::string ignoredPath;
+    std::string err;
+    if (!pushed.adoptActivateResponse(docId, data, ignoredPath, err)) return false;
+    snapshot = pushed.snapshot();
+    return snapshot.valid() && snapshot.docId == docId;
 }
 
 // One-time daemon bootstrap: subscribe to every doc's events + mirror docs that
@@ -112,26 +125,42 @@ void openMirrorTab(AppState& st, const std::string& docId) {
     pendingOpen.erase(docId);
 }
 
-// Apply the latest foreign doc.changed for the ACTIVE tab: refresh the mirror
-// (cheap doc_tree resync) + load the event's mesh — the same aicm-path fast
-// path the GUI's own edits use (no doc reopen, no handoff file).
+// Apply a pushed foreign revision to the active live view without a blocking worker round-trip.
+// The event carries the immutable tree/owner map and AICM path; disk parse runs on the mesh loader.
 void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
     const int idx = tabIndexForDoc(st, docId);
     if (idx != st.activeTab) return;
     AppState::DocTab& t = st.docTabs[idx];
+    if (st.renderer) st.renderer->discardCachedMeshes(docId);
+    t.meshCacheInvalidated = true;
+
+    DocMirrorSnapshot snapshot;
+    const bool havePushedSnapshot = pushedSnapshot(docId, d, snapshot);
     const bool mirror = t.aiHandoff;
-    if (mirror) st.suppressTabDirty = true;  // a mirror refresh is not a user edit
-    st.docMirror.resync(st.worker);          // revision/tree/owner_map + listener
-    if (mirror) st.suppressTabDirty = false;
-    const std::string aicm = d.value("aicm_path", std::string());
-    if (!aicm.empty()) {
-        std::string le;
-        if (!st.loadDocMesh(aicm, le) && !le.empty())
-            st.addLog("[daemon] loadDocMesh (doc.changed): " + le);
+    if (mirror) st.suppressTabDirty = true;
+    if (havePushedSnapshot) {
+        st.docMirror.restoreSnapshot(snapshot);
+    } else {
+        // Compatibility with an older daemon that emitted only revision+aicm_path.
+        st.docMirror.resync(st.worker);
+        snapshot = st.docMirror.snapshot();
     }
-    if (DocSession* s = st.activeSession()) {  // keep the fast-switch cache honest
-        s->cachedAicmPath = aicm;
-        s->cachedRevision = st.docMirror.revision();
+    if (mirror) st.suppressTabDirty = false;
+
+    const std::string aicm = d.value("aicm_path", std::string());
+    if (t.session) {
+        t.session->cachedAicmPath = aicm;
+        t.session->cachedRevision = snapshot.revision;
+        t.session->cachedMirror = std::move(snapshot);
+        t.session->cachedDocMesh.reset();
+    }
+    if (!aicm.empty()) {
+        st.loadDocMeshAsync(aicm);
+    } else {
+        st.unloadDocMesh();
+        if (st.renderer) st.renderer->setActiveMeshIdentity(docId, st.docMirror.revision());
+        if (t.session) t.session->cachedDocMesh = std::make_shared<render::DocMesh>();
+        t.meshCacheInvalidated = false;
     }
     pendingChanged.erase(docId);
 }
@@ -190,7 +219,24 @@ void handleEvent(AppState& st, const json& evt) {
             return;
         }
         if (idx != st.activeTab) {
-            st.docTabs[idx].aiPulse = true;  // background: glow; switch-in refreshes
+            AppState::DocTab& tab = st.docTabs[idx];
+            tab.aiPulse = true;  // background activity remains visible in the tab strip
+            tab.meshCacheInvalidated = true;
+            if (st.renderer) st.renderer->discardCachedMeshes(docId);
+            DocMirrorSnapshot snapshot;
+            const std::string aicm = d.value("aicm_path", std::string());
+            if (tab.session && pushedSnapshot(docId, d, snapshot) && !aicm.empty()) {
+                tab.session->cachedAicmPath = aicm;
+                tab.session->cachedRevision = snapshot.revision;
+                tab.session->cachedMirror = std::move(snapshot);
+                tab.session->cachedDocMesh.reset();
+                st.cacheBackgroundDocMeshAsync(docId, tab.session->cachedRevision, aicm);
+            } else if (tab.session) {
+                tab.session->cachedAicmPath.clear();
+                tab.session->cachedRevision = -1;
+                tab.session->cachedMirror = {};
+                tab.session->cachedDocMesh.reset();
+            }
             return;
         }
         // Adopted mirrors stay live: the user's edits are already committed to the shared
@@ -200,6 +246,8 @@ void handleEvent(AppState& st, const json& evt) {
         if (userMidEdit(st) || (st.docTabs[idx].dirty && !st.docTabs[idx].userAdopted)) {
             pendingChanged[docId] = d;  // defer, retry when safe (poller semantics)
             st.docTabs[idx].aiPulse = true;
+            st.docTabs[idx].meshCacheInvalidated = true;
+            if (st.renderer) st.renderer->discardCachedMeshes(docId);
             return;
         }
         applyChangedActive(st, docId, d);

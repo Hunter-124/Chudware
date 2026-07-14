@@ -22,3 +22,13 @@ MCP tools + worker RPCs (identical shapes):
   {ok, checkpoint_id, restored_turn, content_hash, via}`
 
 Config: `plm.ai_vc: {keep_last: 0 (= keep all in session), full_every: 8, enabled: true}`.
+
+## v2 — prompt/tool-call granularity (2026-07-14, owner directive)
+- Checkpoint BEFORE every user prompt turn starts (`kind:"prompt"`, labeled with the prompt's
+  first ~60 chars) and BEFORE every mutating tool call (`kind:"tool"`, labeled with tool name),
+  still delta-encoded + deduped by content hash — same storage rules as v1.
+- Timeline rows gain: `kind: prompt|tool`, `msg_idx` (chat message ordinal), `call:{turn, i}`.
+- `plm_rollback.to` additionally accepts `"msg:<idx>"` (state before that user message) and
+  `"call:<turn>:<i>"` (state before that tool call). Rollback also returns `chat_truncate_to`
+  (msg_idx) so the chat UI can rewind the transcript consistently.
+- Silent invariant unchanged: never prompt the user about agent-authored file handling.

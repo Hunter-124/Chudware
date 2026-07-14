@@ -287,3 +287,12 @@ C++ read-side (`core/agent/run.cpp` provider selection + the `adapter` telemetry
 - C++ mirrors the same neutral layer; it is developed against the Python engine as the
   differential oracle (CONTRIBUTING.md). New neutral-layer changes land in Python first, then
   the C++ port matches.
+
+## §4.5 Subscription usage/identity (2026-07-14)
+Per-account optional fields (absent = unknown, UI must degrade): `display_name`, `plan`,
+`usage: [{window, label, used_fraction (0..1), resets_at (iso8601), status: ok|warn|blocked|unknown}]`.
+Producers: `services/agent/providers/usage.py` fetchers — anthropic `GET api.anthropic.com/api/oauth/usage`
+(+ profile), codex `GET chatgpt.com/backend-api/wham/usage` (ChatGPT-Account-Id header), cursor
+`GET api2.cursor.sh/auth/usage`; xai: none (infer from 403 tier-gate; link dashboard). Poll <=5min,
+never retry a 429'd usage fetch inside the window. Exposed via `subscription_status`/`subscription_accounts`
+and new `subscription_usage {provider?} -> {ok, rows:[{provider, account_id, display_name, plan, usage}]}`.

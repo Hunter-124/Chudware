@@ -71,6 +71,25 @@ _DEFAULT_FOOTPRINTS = {
     "Connector:Header_2x05": "Connector_PinHeader_2.54mm:Header_2x05",
     "Connector:USB_C": "Connector_USB:USB_C",
     "Connector:USB_B": "Connector_USB:USB_B",
+    # flight-computer + battery-charger parts pack (mission master, 2026-07)
+    "Sensor_Motion:MPU6050": "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm",
+    "Sensor_Pressure:BMP280": "Package_LGA:LGA-8_2x2.5mm",
+    "Sensor_Magnetic:LIS3MDL": "Package_LGA:LGA-12_2x2mm",
+    "RF_GPS:NEO6M": "RF_Module:GPS_Castellated_1x6",
+    "Regulator_Switching:Buck_3V3": "Package_TO_SOT_SMD:SOT-23-6",
+    "Device:Crystal_32k768": "Crystal:Crystal_SMD_3215-2Pin",
+    "Device:Crystal_HSE": "Crystal:Crystal_HC49-4H_Vertical",
+    "Connector:SWD_2x5": "Connector_PinHeader_2.54mm:Header_2x05",
+    "Battery_Management:MCP73831": "Package_TO_SOT_SMD:SOT-23-5",
+    "Battery_Management:SwitchingCharger_SOP8": "Package_SO:SOIC-8",
+    "Device:NMOS_Power": "Package_SO:SOIC-8",
+    "Device:PMOS_Power": "Package_SO:SOIC-8",
+    "Device:PMOS_Reverse": "Package_TO_SOT_SMD:SOT-23",
+    "Device:R_Sense": "Resistor_SMD:R_2512",
+    "Power_Management:Load_Switch": "Package_TO_SOT_SMD:SOT-23-5",
+    "Power_Management:LVD_Comparator": "Package_TO_SOT_SMD:SOT-23-5",
+    "Device:NTC": "Resistor_SMD:R_0603",
+    "Device:L_Power": "Inductor_SMD:L_Power_7x7",
 }
 
 

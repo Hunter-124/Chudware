@@ -922,6 +922,528 @@ def _make_symbols() -> dict:
         },
     )
 
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Flight-computer + battery-charger parts pack (clean-room, public pinouts)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── MPU-6050 class 6-axis IMU (QFN-24) ─────────────────────────────────
+    # InvenSense MPU-6050 public QFN-24 pin map (clean-room from datasheet):
+    # 1 CLKIN, 6 VDD, 7 GND, 8 FSYNC, 9 INT, 11 GND, 12 REGOUT, 13 CPOUT,
+    # 18 VLOGIC, 20 SCL/SCLK, 21 SDA/SDI, 22 nCS, 23 AD0/SDO; EP=25 GND.
+    # Reserved/unused package pins kept so pad set is a superset of symbol pins.
+    imu_w, imu_h = 12.7, 17.78
+    imu_named = {
+        1: ("CLKIN", "input"), 6: ("VDD", "power_in"), 7: ("GND", "power_in"),
+        8: ("FSYNC", "input"), 9: ("INT", "output"), 11: ("GND", "power_in"),
+        12: ("REGOUT", "passive"), 13: ("CPOUT", "passive"),
+        18: ("VLOGIC", "power_in"), 20: ("SCL", "bidirectional"),
+        21: ("SDA", "bidirectional"), 22: ("nCS", "input"),
+        23: ("AD0", "bidirectional"), 25: ("EP", "power_in"),
+    }
+    imu_pins = []
+    for i in range(1, 25):
+        if i <= 6:  # left
+            y = (3.5 - i) * 2.54
+            pos, ang = [-imu_w / 2 - 2.54, y], 180.0
+        elif i <= 12:  # bottom
+            x = (i - 9.5) * 2.54
+            pos, ang = [x, -imu_h / 2 - 2.54], 270.0
+        elif i <= 18:  # right
+            y = (i - 15.5) * 2.54
+            pos, ang = [imu_w / 2 + 2.54, y], 0.0
+        else:  # top
+            x = (21.5 - i) * 2.54
+            pos, ang = [x, imu_h / 2 + 2.54], 90.0
+        if i in imu_named:
+            nm, ptype = imu_named[i]
+        else:
+            nm, ptype = f"NC{i}", "no_connect"
+        imu_pins.append(_pin(str(i), nm, pos, ang, ptype))
+    imu_pins.append(_pin("25", "EP", [0.0, 0.0], 0.0, "power_in"))
+    syms["Sensor_Motion:MPU6050"] = _sym(
+        "Sensor_Motion:MPU6050", "MPU6050", "U", "MPU6050",
+        "MPU-6050 class 6-axis IMU (accel+gyro, I2C+SPI, QFN-24)",
+        "imu gyro gyroscope accelerometer accel 6axis mpu6050 motion i2c spi",
+        pins=imu_pins,
+        graphics=[_rect(-imu_w / 2, -imu_h / 2, imu_w / 2, imu_h / 2)],
+        footprint_filters=["QFN-24*", "Package_DFN_QFN*"],
+        eng={
+            "power_w": {"typ": 0.012, "max": 0.03},
+            "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 2.375, 3.3, 3.46, 0.0039, 0.000005),
+                _rail("VLOGIC", 1.71, 3.3, 3.46, 0.0001, None),
+            ], "voltage_domains": ["VDD", "VLOGIC"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: InvenSense MPU-6050 PS-MPU-6000A — "
+                        "VDD 2.375–3.46 V, Idd 3.9 mA typ (accel+gyro), sleep 5 uA; "
+                        "QFN-24 public pin map. Seed currents."],
+        },
+    )
+
+    # ── BMP280 class barometric pressure (LGA-8) ───────────────────────────
+    # Bosch BMP280 public LGA-8 pin map:
+    # 1 VDDIO, 2 GND1, 3 SDI, 4 SCK, 5 SDO, 6 CSB, 7 GND2, 8 VDD
+    bmp_w, bmp_h = 7.62, 12.7
+    bmp_pins = [
+        _pin("1", "VDDIO", [-bmp_w / 2 - 2.54, bmp_h / 2 - 1.27], 180.0, "power_in"),
+        _pin("2", "GND1", [-bmp_w / 2 - 2.54, bmp_h / 2 - 1.27 - 2.54], 180.0, "power_in"),
+        _pin("3", "SDI", [-bmp_w / 2 - 2.54, -bmp_h / 2 + 1.27 + 2.54], 180.0, "bidirectional"),
+        _pin("4", "SCK", [-bmp_w / 2 - 2.54, -bmp_h / 2 + 1.27], 180.0, "input"),
+        _pin("5", "SDO", [bmp_w / 2 + 2.54, -bmp_h / 2 + 1.27], 0.0, "bidirectional"),
+        _pin("6", "CSB", [bmp_w / 2 + 2.54, -bmp_h / 2 + 1.27 + 2.54], 0.0, "input"),
+        _pin("7", "GND2", [bmp_w / 2 + 2.54, bmp_h / 2 - 1.27 - 2.54], 0.0, "power_in"),
+        _pin("8", "VDD", [bmp_w / 2 + 2.54, bmp_h / 2 - 1.27], 0.0, "power_in"),
+    ]
+    syms["Sensor_Pressure:BMP280"] = _sym(
+        "Sensor_Pressure:BMP280", "BMP280", "U", "BMP280",
+        "BMP280 class barometric pressure sensor (I2C/SPI, LGA-8)",
+        "barometer pressure bmp280 sensor i2c spi altimeter",
+        pins=bmp_pins,
+        graphics=[_rect(-bmp_w / 2, -bmp_h / 2, bmp_w / 2, bmp_h / 2)],
+        footprint_filters=["LGA-8*", "Package_LGA*"],
+        eng={
+            "power_w": {"typ": 0.00001, "max": 0.00003},
+            "limits_c": {"tj_max": 85.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 1.71, 3.3, 3.6, 0.0000027, 0.0000001),
+                _rail("VDDIO", 1.2, 3.3, 3.6, 0.0000001, None),
+            ], "voltage_domains": ["VDD", "VDDIO"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: Bosch BMP280 — VDD 1.71–3.6 V, "
+                        "Idd ~2.7 uA typ ultra-low power, LGA-8 public pin map."],
+        },
+    )
+
+    # ── LIS3MDL class 3-axis magnetometer (LGA-12) ─────────────────────────
+    # ST LIS3MDL public LGA-12 pin map:
+    # 1 SCL/SPC, 2 CS, 3 SDA/SDI/SDO, 4 SDO/SA1, 6 GND, 8 GND,
+    # 9 VDD_IO, 10 INT, 11 DRDY, 12 VDD
+    mag_w, mag_h = 10.16, 15.24
+    mag_named = {
+        1: ("SCL", "bidirectional"), 2: ("CS", "input"),
+        3: ("SDA", "bidirectional"), 4: ("SDO", "bidirectional"),
+        6: ("GND", "power_in"), 8: ("GND", "power_in"),
+        9: ("VDD_IO", "power_in"), 10: ("INT", "output"),
+        11: ("DRDY", "output"), 12: ("VDD", "power_in"),
+    }
+    mag_pins = []
+    for i in range(1, 13):
+        if i <= 3:
+            y = (2 - i) * 2.54
+            pos, ang = [-mag_w / 2 - 2.54, y], 180.0
+        elif i <= 6:
+            x = (i - 4.5) * 2.54
+            pos, ang = [x, -mag_h / 2 - 2.54], 270.0
+        elif i <= 9:
+            y = (i - 8) * 2.54
+            pos, ang = [mag_w / 2 + 2.54, y], 0.0
+        else:
+            x = (10.5 - i) * 2.54
+            pos, ang = [x, mag_h / 2 + 2.54], 90.0
+        if i in mag_named:
+            nm, ptype = mag_named[i]
+        else:
+            nm, ptype = f"NC{i}", "no_connect"
+        mag_pins.append(_pin(str(i), nm, pos, ang, ptype))
+    syms["Sensor_Magnetic:LIS3MDL"] = _sym(
+        "Sensor_Magnetic:LIS3MDL", "LIS3MDL", "U", "LIS3MDL",
+        "LIS3MDL class 3-axis magnetometer (I2C/SPI, LGA-12)",
+        "magnetometer magnetic compass mag lis3mdl 3axis i2c spi sensor",
+        pins=mag_pins,
+        graphics=[_rect(-mag_w / 2, -mag_h / 2, mag_w / 2, mag_h / 2)],
+        footprint_filters=["LGA-12*", "Package_LGA*"],
+        eng={
+            "power_w": {"typ": 0.0009, "max": 0.002},
+            "limits_c": {"tj_max": 85.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 1.9, 3.3, 3.6, 0.00027, 0.000001),
+                _rail("VDD_IO", 1.71, 3.3, 3.6, 0.00001, None),
+            ], "voltage_domains": ["VDD", "VDD_IO"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: ST LIS3MDL — VDD 1.9–3.6 V, "
+                        "Idd 270 uA typ continuous, LGA-12 public pin map."],
+        },
+    )
+
+    # ── GNSS/GPS UART module (castellated breakout class) ──────────────────
+    # Clean-room 1x6 edge module inspired by common NEO-6M breakout pinouts:
+    # 1 VCC, 2 GND, 3 TXD, 4 RXD, 5 PPS, 6 NC  (not a copy of any vendor netlist)
+    gps_pins = [
+        _pin("1", "VCC", [-5.08, 6.35], 180.0, "power_in"),
+        _pin("2", "GND", [-5.08, 3.81], 180.0, "power_in"),
+        _pin("3", "TXD", [-5.08, 1.27], 180.0, "output"),
+        _pin("4", "RXD", [-5.08, -1.27], 180.0, "input"),
+        _pin("5", "PPS", [-5.08, -3.81], 180.0, "output"),
+        _pin("6", "NC", [-5.08, -6.35], 180.0, "no_connect"),
+    ]
+    syms["RF_GPS:NEO6M"] = _sym(
+        "RF_GPS:NEO6M", "NEO6M", "U", "NEO-6M",
+        "GNSS/GPS UART module (castellated breakout class)",
+        "gps gnss neo6m neo-6m uart module satellite navigation",
+        pins=gps_pins,
+        graphics=[_rect(-2.54, -8.89, 5.08, 8.89)],
+        footprint_filters=["GPS*", "Module*", "Castellated*"],
+        eng={
+            "power_w": {"typ": 0.15, "max": 0.25},
+            "limits_c": {"tj_max": 85.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VCC", 2.7, 3.3, 3.6, 0.045, 0.00002),
+            ], "voltage_domains": ["VCC"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: u-blox NEO-6 class module envelope — "
+                        "VCC 2.7–3.6 V, acquisition ~45 mA typ. Castellated breakout pin "
+                        "order is a clean-room 1x6 class map (VCC/GND/TX/RX/PPS/NC)."],
+        },
+    )
+
+    # ── 3V3 buck regulator SOT-23-6 (TPS562201-class) ──────────────────────
+    # TI TPS562201 public SOT-23-6 pin map:
+    # 1 VBST, 2 SW, 3 GND, 4 FB, 5 EN, 6 VIN
+    syms["Regulator_Switching:Buck_3V3"] = _sym(
+        "Regulator_Switching:Buck_3V3", "Buck_3V3", "U", "Buck_3V3",
+        "3.3 V synchronous buck regulator (SOT-23-6 / TPS562201-class)",
+        "buck regulator switching dcdc 3v3 3.3v switcher sot-23-6 tps562201",
+        pins=[
+            _pin("1", "VBST", [-7.62, 5.08], 180.0, "passive"),
+            _pin("2", "SW", [-7.62, 2.54], 180.0, "output"),
+            _pin("3", "GND", [-7.62, 0.0], 180.0, "power_in"),
+            _pin("4", "FB", [-7.62, -2.54], 180.0, "input"),
+            _pin("5", "EN", [-7.62, -5.08], 180.0, "input"),
+            _pin("6", "VIN", [7.62, 0.0], 0.0, "power_in"),
+        ],
+        graphics=[_rect(-5.08, -6.35, 5.08, 6.35)],
+        footprint_filters=["SOT-23-6*", "SOT-23*"],
+        eng={
+            "power_w": {"typ": 0.2, "max": 1.5},
+            "limits_c": {"tj_max": 150.0, "ta_max": 125.0},
+            "supply": {"rails": [
+                _rail("VIN", 4.5, 5.0, 17.0, 0.001, None),
+                _rail("VOUT", 3.2, 3.3, 3.4, None, None),
+            ], "voltage_domains": ["VIN", "VOUT"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: TI TPS562201-class 2 A buck — "
+                        "Vin 4.5–17 V, SOT-23-6 public pin map. Quiescent seed; load power "
+                        "is circuit-dependent."],
+        },
+    )
+
+    # ── 32.768 kHz crystal (2-pin) ─────────────────────────────────────────
+    syms["Device:Crystal_32k768"] = _sym(
+        "Device:Crystal_32k768", "Crystal_32k768", "Y", "32.768kHz",
+        "32.768 kHz watch crystal (2-pin)",
+        "crystal xtal 32768 32.768khz rtc oscillator watch",
+        pins=[
+            _pin("1", "1", [-3.81, 0.0], 180.0, "passive"),
+            _pin("2", "2", [3.81, 0.0], 0.0, "passive"),
+        ],
+        graphics=[
+            _rect(-1.5, -1.5, 1.5, 1.5),
+            _line(-3.81, 0.0, -1.5, 0.0),
+            _line(1.5, 0.0, 3.81, 0.0),
+            _line(-1.0, -1.0, -1.0, 1.0),
+            _line(1.0, -1.0, 1.0, 1.0),
+        ],
+        footprint_filters=["Crystal*", "XTAL*"],
+    )
+
+    # ── HSE crystal (2-pin, MCU high-speed external) ───────────────────────
+    syms["Device:Crystal_HSE"] = _sym(
+        "Device:Crystal_HSE", "Crystal_HSE", "Y", "8MHz",
+        "HSE high-speed crystal (2-pin, MCU external clock)",
+        "crystal xtal hse oscillator mcu clock 8mhz 16mhz",
+        pins=[
+            _pin("1", "1", [-3.81, 0.0], 180.0, "passive"),
+            _pin("2", "2", [3.81, 0.0], 0.0, "passive"),
+        ],
+        graphics=[
+            _rect(-1.5, -1.5, 1.5, 1.5),
+            _line(-3.81, 0.0, -1.5, 0.0),
+            _line(1.5, 0.0, 3.81, 0.0),
+            _line(-1.0, -1.0, -1.0, 1.0),
+            _line(1.0, -1.0, 1.0, 1.0),
+        ],
+        footprint_filters=["Crystal*", "XTAL*"],
+    )
+
+    # ── SWD 2x5 debug header (ARM 10-pin) ──────────────────────────────────
+    # Same 1..10 numbering as Connector:Header_2x05; keywords add SWD/debug.
+    swd = _header_2xn(5)
+    swd["libid"] = "Connector:SWD_2x5"
+    swd["name"] = "SWD_2x5"
+    swd["value"] = "SWD_2x5"
+    swd["description"] = "ARM 10-pin SWD/JTAG 2x5 header (2.54 mm)"
+    swd["keywords"] = "swd jtag debug arm cortex connector header 2x5 pinheader"
+    swd["footprint_filters"] = ["Header_2x05*", "PinHeader_2x*", "SWD*"]
+    syms["Connector:SWD_2x5"] = swd
+
+    # ── MCP73831 class linear Li-ion charger (SOT-23-5) ────────────────────
+    # Microchip MCP73831 public SOT-23-5 pin map:
+    # 1 STAT, 2 VSS, 3 VBAT, 4 VDD, 5 PROG
+    syms["Battery_Management:MCP73831"] = _sym(
+        "Battery_Management:MCP73831", "MCP73831", "U", "MCP73831",
+        "MCP73831 class linear Li-ion charge controller (SOT-23-5)",
+        "charger li-ion lithium battery mcp73831 linear charge management",
+        pins=[
+            _pin("1", "STAT", [-7.62, 2.54], 180.0, "open_collector"),
+            _pin("2", "VSS", [-7.62, 0.0], 180.0, "power_in"),
+            _pin("3", "VBAT", [-7.62, -2.54], 180.0, "power_out"),
+            _pin("4", "VDD", [7.62, 1.27], 0.0, "power_in"),
+            _pin("5", "PROG", [7.62, -1.27], 0.0, "passive"),
+        ],
+        graphics=[_rect(-5.08, -3.81, 5.08, 3.81)],
+        footprint_filters=["SOT-23-5*", "SOT-23*"],
+        eng={
+            "power_w": {"typ": 0.3, "max": 0.6},
+            "limits_c": {"tj_max": 150.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 3.75, 5.0, 6.0, 0.00055, None),
+                _rail("VBAT", 0.0, 4.2, 4.2, None, None),
+            ], "voltage_domains": ["VDD", "VBAT"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: Microchip MCP73831 — Vin 3.75–6 V, "
+                        "programmable charge current via PROG, SOT-23-5 public pin map. "
+                        "Dissipation is (Vin-Vbat)*Icharge."],
+        },
+    )
+
+    # ── Switching Li-ion charger SOP-8 class (CN3703/MP2607-class) ─────────
+    # Clean-room SOP-8 switching charger pin class (public common topology):
+    # 1 TEMP(NTC), 2 ISET, 3 GND, 4 VIN, 5 SW, 6 VCC, 7 BAT, 8 STAT
+    chg_w, chg_h = 10.16, 15.24
+    chg_pins = [
+        _pin("1", "TEMP", [-chg_w / 2 - 2.54, chg_h / 2 - 1.27], 180.0, "input"),
+        _pin("2", "ISET", [-chg_w / 2 - 2.54, chg_h / 2 - 1.27 - 2.54], 180.0, "passive"),
+        _pin("3", "GND", [-chg_w / 2 - 2.54, -chg_h / 2 + 1.27 + 2.54], 180.0, "power_in"),
+        _pin("4", "VIN", [-chg_w / 2 - 2.54, -chg_h / 2 + 1.27], 180.0, "power_in"),
+        _pin("5", "SW", [chg_w / 2 + 2.54, -chg_h / 2 + 1.27], 0.0, "output"),
+        _pin("6", "VCC", [chg_w / 2 + 2.54, -chg_h / 2 + 1.27 + 2.54], 0.0, "power_out"),
+        _pin("7", "BAT", [chg_w / 2 + 2.54, chg_h / 2 - 1.27 - 2.54], 0.0, "power_out"),
+        _pin("8", "STAT", [chg_w / 2 + 2.54, chg_h / 2 - 1.27], 0.0, "open_collector"),
+    ]
+    syms["Battery_Management:SwitchingCharger_SOP8"] = _sym(
+        "Battery_Management:SwitchingCharger_SOP8", "SwitchingCharger_SOP8", "U",
+        "SW_CHG",
+        "Switching Li-ion charge controller (SOP-8 class)",
+        "charger li-ion lithium battery switching buck charge management sop8",
+        pins=chg_pins,
+        graphics=[_rect(-chg_w / 2, -chg_h / 2, chg_w / 2, chg_h / 2)],
+        footprint_filters=["SOIC-8*", "SOP-8*", "Package_SO*"],
+        eng={
+            "power_w": {"typ": 0.5, "max": 2.0},
+            "limits_c": {"tj_max": 150.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VIN", 4.5, 12.0, 28.0, 0.002, None),
+                _rail("BAT", 0.0, 4.2, 4.2, None, None),
+            ], "voltage_domains": ["VIN", "BAT", "VCC"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: CN3703/MP2607-class switching Li-ion "
+                        "charger envelope — Vin up to ~28 V class, SOP-8 public topology "
+                        "pin class (TEMP/ISET/GND/VIN/SW/VCC/BAT/STAT). Seed only."],
+        },
+    )
+
+    # ── Power N-MOSFET SO-8 (multi-source / multi-drain) ───────────────────
+    # Common single N-ch SO-8 pin map: 1-3 Source, 4 Gate, 5-8 Drain
+    nmos_pwr_pins = [
+        _pin("1", "S", [-7.62, 3.81], 180.0, "passive"),
+        _pin("2", "S", [-7.62, 1.27], 180.0, "passive"),
+        _pin("3", "S", [-7.62, -1.27], 180.0, "passive"),
+        _pin("4", "G", [-7.62, -3.81], 180.0, "input"),
+        _pin("5", "D", [7.62, -3.81], 0.0, "passive"),
+        _pin("6", "D", [7.62, -1.27], 0.0, "passive"),
+        _pin("7", "D", [7.62, 1.27], 0.0, "passive"),
+        _pin("8", "D", [7.62, 3.81], 0.0, "passive"),
+    ]
+    syms["Device:NMOS_Power"] = _sym(
+        "Device:NMOS_Power", "NMOS_Power", "Q", "NMOS_PWR",
+        "N-channel power MOSFET (SO-8 multi-source/drain)",
+        "nmos mosfet power_mosfet power transistor so-8 so8",
+        pins=nmos_pwr_pins,
+        graphics=[_rect(-5.08, -5.08, 5.08, 5.08), _circle(0.0, 0.0, 2.0)],
+        sim={"model": "NMOS", "pin_order": ["D", "G", "S"]},
+        footprint_filters=["SOIC-8*", "SO-8*", "Package_SO*"],
+        eng={
+            "limits_c": {"tj_max": 150.0, "ta_max": None},
+            "sources": ["research_datasheet_fetch: SO-8 power N-MOSFET class (e.g. IRF7413) — "
+                        "Tj max 150 °C. Pd circuit-dependent; multi-S multi-D pin map."],
+        },
+    )
+
+    # ── Power P-MOSFET SO-8 ────────────────────────────────────────────────
+    # Same multi-pin SO-8 map: 1-3 Source, 4 Gate, 5-8 Drain
+    pmos_pwr_pins = [
+        _pin("1", "S", [-7.62, 3.81], 180.0, "passive"),
+        _pin("2", "S", [-7.62, 1.27], 180.0, "passive"),
+        _pin("3", "S", [-7.62, -1.27], 180.0, "passive"),
+        _pin("4", "G", [-7.62, -3.81], 180.0, "input"),
+        _pin("5", "D", [7.62, -3.81], 0.0, "passive"),
+        _pin("6", "D", [7.62, -1.27], 0.0, "passive"),
+        _pin("7", "D", [7.62, 1.27], 0.0, "passive"),
+        _pin("8", "D", [7.62, 3.81], 0.0, "passive"),
+    ]
+    syms["Device:PMOS_Power"] = _sym(
+        "Device:PMOS_Power", "PMOS_Power", "Q", "PMOS_PWR",
+        "P-channel power MOSFET (SO-8 multi-source/drain)",
+        "pmos mosfet power_mosfet power transistor so-8 so8 reverse protection",
+        pins=pmos_pwr_pins,
+        graphics=[_rect(-5.08, -5.08, 5.08, 5.08), _circle(0.0, 0.0, 2.0)],
+        sim={"model": "PMOS", "pin_order": ["D", "G", "S"]},
+        footprint_filters=["SOIC-8*", "SO-8*", "Package_SO*"],
+        eng={
+            "limits_c": {"tj_max": 150.0, "ta_max": None},
+            "sources": ["research_datasheet_fetch: SO-8 power P-MOSFET class — "
+                        "Tj max 150 °C. Common reverse-protection / high-side topology."],
+        },
+    )
+
+    # ── Reverse-protection P-MOSFET (SOT-23) ───────────────────────────────
+    # Same SOT-23 numbers as Device:PMOS (BSS84-class): 1=G, 2=S, 3=D
+    syms["Device:PMOS_Reverse"] = _sym(
+        "Device:PMOS_Reverse", "PMOS_Reverse", "Q", "PMOS_REV",
+        "P-channel MOSFET for reverse-polarity protection (SOT-23)",
+        "pmos mosfet reverse protection polarity battery ideal diode",
+        pins=[
+            _pin("1", "G", [-5.08, 0.0], 180.0, "input"),
+            _pin("2", "S", [0.0, 3.81], 90.0, "passive"),
+            _pin("3", "D", [0.0, -3.81], 270.0, "passive"),
+        ],
+        graphics=[
+            _line(-1.27, -2.0, -1.27, 2.0),
+            _line(-5.08, 0.0, -1.27, 0.0),
+            _line(0.0, -2.54, 0.0, 2.54),
+            _line(0.0, 2.54, 0.0, 3.81),
+            _line(0.0, -2.54, 0.0, -3.81),
+            _rect(-1.27, -2.8, 0.0, 2.8),
+            _circle(0.0, 0.0, 2.8),
+        ],
+        sim={"model": "PMOS", "pin_order": ["D", "G", "S"]},
+        footprint_filters=["SOT-23*"],
+        eng={
+            "limits_c": {"tj_max": 150.0, "ta_max": None},
+            "sources": ["research_datasheet_fetch: BSS84-class P-MOS reverse-protection — "
+                        "SOT-23 pin numbers 1=G 2=S 3=D."],
+        },
+    )
+
+    # ── Current-sense resistor (keyword-tagged; 2512 footprint class) ──────
+    syms["Device:R_Sense"] = _sym(
+        "Device:R_Sense", "R_Sense", "R", "R_SENSE",
+        "Current-sense shunt resistor (2512 class)",
+        "current sense shunt resistor rsense current_sense 2512",
+        pins=[
+            _pin("1", "~", [-2.54, 0.0], 180.0, "passive"),
+            _pin("2", "~", [2.54, 0.0], 0.0, "passive"),
+        ],
+        graphics=[
+            _rect(-1.016, -0.635, 1.016, 0.635),
+            _line(-2.54, 0.0, -1.016, 0.0),
+            _line(1.016, 0.0, 2.54, 0.0),
+        ],
+        sim={"model": "R", "pin_order": ["1", "2"]},
+        footprint_filters=["R_2512*", "R_*"],
+        eng={
+            "sources": ["research_datasheet_fetch: thick-film current-sense 2512 class — "
+                        "value and Pd are circuit-defined; footprint carries rated max."],
+        },
+    )
+
+    # ── Load switch SOT-23-5 (TPS22918-class) ──────────────────────────────
+    # TI TPS22918 public SOT-23-5 pin map: 1 VIN, 2 GND, 3 ON, 4 NC, 5 VOUT
+    syms["Power_Management:Load_Switch"] = _sym(
+        "Power_Management:Load_Switch", "Load_Switch", "U", "LOAD_SW",
+        "Load switch IC (SOT-23-5 / TPS22918-class)",
+        "load switch load_switch power switch tps22918 enable",
+        pins=[
+            _pin("1", "VIN", [-7.62, 2.54], 180.0, "power_in"),
+            _pin("2", "GND", [-7.62, 0.0], 180.0, "power_in"),
+            _pin("3", "ON", [-7.62, -2.54], 180.0, "input"),
+            _pin("4", "NC", [7.62, -1.27], 0.0, "no_connect"),
+            _pin("5", "VOUT", [7.62, 1.27], 0.0, "power_out"),
+        ],
+        graphics=[_rect(-5.08, -3.81, 5.08, 3.81)],
+        footprint_filters=["SOT-23-5*", "SOT-23*"],
+        eng={
+            "power_w": {"typ": 0.05, "max": 0.5},
+            "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VIN", 1.0, 3.3, 5.5, 0.00001, None),
+            ], "voltage_domains": ["VIN", "VOUT"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: TI TPS22918-class load switch — "
+                        "Vin 1–5.5 V, SOT-23-5 public pin map. Ron loss is I^2*Ron."],
+        },
+    )
+
+    # ── LVD / undervoltage comparator (SOT-23-5 class) ─────────────────────
+    # Clean-room LVD comparator class: 1 OUT, 2 VSS, 3 IN-, 4 IN+, 5 VDD
+    # (similar topology to open-drain UVLO / window-comparator packages)
+    syms["Power_Management:LVD_Comparator"] = _sym(
+        "Power_Management:LVD_Comparator", "LVD_Comparator", "U", "LVD",
+        "Low-voltage detect / undervoltage comparator (SOT-23-5)",
+        "lvd comparator undervoltage uvlo brownout load switch monitor",
+        pins=[
+            _pin("1", "OUT", [-7.62, 2.54], 180.0, "open_collector"),
+            _pin("2", "VSS", [-7.62, 0.0], 180.0, "power_in"),
+            _pin("3", "IN-", [-7.62, -2.54], 180.0, "input"),
+            _pin("4", "IN+", [7.62, -1.27], 0.0, "input"),
+            _pin("5", "VDD", [7.62, 1.27], 0.0, "power_in"),
+        ],
+        graphics=[_rect(-5.08, -3.81, 5.08, 3.81)],
+        footprint_filters=["SOT-23-5*", "SOT-23*"],
+        eng={
+            "power_w": {"typ": 0.00005, "max": 0.0002},
+            "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 1.6, 3.3, 5.5, 0.00001, None),
+            ], "voltage_domains": ["VDD"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: SOT-23-5 UVLO/LVD comparator class — "
+                        "VDD 1.6–5.5 V envelope. Pin class OUT/VSS/IN-/IN+/VDD."],
+        },
+    )
+
+    # ── NTC thermistor (2-pin) ─────────────────────────────────────────────
+    syms["Device:NTC"] = _sym(
+        "Device:NTC", "NTC", "RT", "NTC",
+        "NTC thermistor (2-pin)",
+        "ntc thermistor temperature sensor thermal battery",
+        pins=[
+            _pin("1", "~", [-2.54, 0.0], 180.0, "passive"),
+            _pin("2", "~", [2.54, 0.0], 0.0, "passive"),
+        ],
+        graphics=[
+            _rect(-1.016, -0.635, 1.016, 0.635),
+            _line(-2.54, 0.0, -1.016, 0.0),
+            _line(1.016, 0.0, 2.54, 0.0),
+            # temperature tick marks
+            _line(-0.5, 0.9, 0.5, 1.4),
+            _line(-0.3, 1.2, 0.3, 1.7),
+        ],
+        sim={"model": "R", "pin_order": ["1", "2"]},
+        footprint_filters=["R_*", "Thermistor*"],
+        eng={
+            "limits_c": {"tj_max": 125.0, "ta_max": 125.0},
+            "sources": ["research_datasheet_fetch: NTC thermistor class (e.g. 10k 0402/0603) — "
+                        "resistance is temperature-dependent; seed as passive R for netlist."],
+        },
+    )
+
+    # ── Power inductor (larger SMD class) ──────────────────────────────────
+    syms["Device:L_Power"] = _sym(
+        "Device:L_Power", "L_Power", "L", "L_PWR",
+        "Power inductor (SMD power-class footprint)",
+        "inductor power coil choke buck boost smd",
+        pins=[
+            _pin("1", "~", [0.0, 2.54], 90.0, "passive"),
+            _pin("2", "~", [0.0, -2.54], 270.0, "passive"),
+        ],
+        graphics=[
+            _polyline([0.0, 2.54], [0.0, 1.8], [0.7, 1.2], [0.0, 0.6],
+                      [-0.7, 0.0], [0.0, -0.6], [0.7, -1.2], [0.0, -1.8],
+                      [0.0, -2.54]),
+            _rect(-1.5, -2.0, 1.5, 2.0),
+        ],
+        sim={"model": "L", "pin_order": ["1", "2"]},
+        footprint_filters=["L_Power*", "Inductor*", "L_*"],
+        eng={
+            "sources": ["research_datasheet_fetch: power inductor class (e.g. 4.7 uH 7x7 mm) — "
+                        "Isat/Irms circuit-defined; footprint carries body dims."],
+        },
+    )
+
     return syms
 
 
@@ -1615,6 +2137,179 @@ def _make_footprints() -> dict:
         description="LQFP-48 7x7 mm 0.5 mm pitch",
     )
 
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Flight-computer + battery-charger footprints (clean-room / IPC-style)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── QFN-24 4x4 mm 0.5 mm pitch + EP (MPU-6050 class) ───────────────────
+    # 6 pads/side; pad 0.25x0.6 at body edge; EP pin 25.
+    qfn24_pads = []
+    for i in range(6):  # 1-6 left, top to bottom
+        y = (2.5 - i) * 0.5
+        qfn24_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -2.05, y, 0.6, 0.25, 0.25))
+    for i in range(6):  # 7-12 bottom, left to right
+        x = (i - 2.5) * 0.5
+        qfn24_pads.append(_smd_pad(f"p{i+7}", str(i + 7), x, -2.05, 0.25, 0.6, 0.25))
+    for i in range(6):  # 13-18 right, bottom to top
+        y = (i - 2.5) * 0.5
+        qfn24_pads.append(_smd_pad(f"p{i+13}", str(i + 13), 2.05, y, 0.6, 0.25, 0.25))
+    for i in range(6):  # 19-24 top, right to left
+        x = (2.5 - i) * 0.5
+        qfn24_pads.append(_smd_pad(f"p{i+19}", str(i + 19), x, 2.05, 0.25, 0.6, 0.25))
+    qfn24_pads.append(_smd_pad("p25", "25", 0.0, 0.0, 2.4, 2.4, 0.05))
+    fps["Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm"] = _fp(
+        "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm",
+        pads=qfn24_pads,
+        graphics=_silk_box(-2.1, -2.1, 2.1, 2.1) + _crtyd_box(-2.7, -2.7, 2.7, 2.7)
+        + [_circle(-2.4, 1.8, 0.12)],
+        description="QFN-24 4x4 mm 0.5 mm pitch with exposed pad (pin 25)",
+    )
+
+    # ── LGA-8 2.0x2.5 mm (BMP280 class) ────────────────────────────────────
+    # 4 pads/side along length; pads 1-4 left top→bottom, 5-8 right bottom→top.
+    lga8_pads = []
+    for i in range(4):
+        y = (1.5 - i) * 0.65
+        lga8_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -0.85, y, 0.4, 0.35, 0.25))
+    for i in range(4):
+        y = (i - 1.5) * 0.65
+        lga8_pads.append(_smd_pad(f"p{i+5}", str(i + 5), 0.85, y, 0.4, 0.35, 0.25))
+    fps["Package_LGA:LGA-8_2x2.5mm"] = _fp(
+        "Package_LGA:LGA-8_2x2.5mm",
+        pads=lga8_pads,
+        graphics=_silk_box(-1.1, -1.35, 1.1, 1.35) + _crtyd_box(-1.5, -1.7, 1.5, 1.7)
+        + [_circle(-1.2, 1.1, 0.1)],
+        description="LGA-8 2.0x2.5 mm (BMP280-class)",
+    )
+
+    # ── LGA-12 2.0x2.0 mm (LIS3MDL class) ──────────────────────────────────
+    # 3 pads/side; pads 1-3 left, 4-6 bottom, 7-9 right, 10-12 top.
+    lga12_pads = []
+    for i in range(3):
+        y = (1 - i) * 0.5
+        lga12_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -0.9, y, 0.35, 0.3, 0.25))
+    for i in range(3):
+        x = (i - 1) * 0.5
+        lga12_pads.append(_smd_pad(f"p{i+4}", str(i + 4), x, -0.9, 0.3, 0.35, 0.25))
+    for i in range(3):
+        y = (i - 1) * 0.5
+        lga12_pads.append(_smd_pad(f"p{i+7}", str(i + 7), 0.9, y, 0.35, 0.3, 0.25))
+    for i in range(3):
+        x = (1 - i) * 0.5
+        lga12_pads.append(_smd_pad(f"p{i+10}", str(i + 10), x, 0.9, 0.3, 0.35, 0.25))
+    fps["Package_LGA:LGA-12_2x2mm"] = _fp(
+        "Package_LGA:LGA-12_2x2mm",
+        pads=lga12_pads,
+        graphics=_silk_box(-1.05, -1.05, 1.05, 1.05) + _crtyd_box(-1.4, -1.4, 1.4, 1.4)
+        + [_circle(-1.15, 0.9, 0.1)],
+        description="LGA-12 2x2 mm (LIS3MDL-class magnetometer)",
+    )
+
+    # ── Castellated GPS module 1x6 edge (NEO-6M breakout class) ────────────
+    gps_pads = []
+    for i in range(6):
+        y = (2.5 - i) * 2.54
+        gps_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -8.0, y, 1.5, 1.2, 0.2))
+    fps["RF_Module:GPS_Castellated_1x6"] = _fp(
+        "RF_Module:GPS_Castellated_1x6",
+        pads=gps_pads,
+        graphics=_silk_box(-7.5, -8.5, 8.5, 8.5) + _crtyd_box(-9.0, -9.5, 9.5, 9.5),
+        description="Castellated GNSS/GPS module 1x6 edge pads",
+    )
+
+    # ── SOT-23-5 ───────────────────────────────────────────────────────────
+    # JEDEC MO-178: pins 1/2/3 bottom L→R, pins 4/5 top R→L (pin 5 above 1-side).
+    fps["Package_TO_SOT_SMD:SOT-23-5"] = _fp(
+        "Package_TO_SOT_SMD:SOT-23-5",
+        pads=[
+            _smd_pad("p1", "1", -0.95, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p2", "2", 0.0, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p3", "3", 0.95, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p4", "4", 0.95, 1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p5", "5", -0.95, 1.2, 0.55, 0.8, 0.25),
+        ],
+        graphics=_silk_box(-1.5, -0.8, 1.5, 0.8) + _crtyd_box(-1.9, -1.9, 1.9, 1.9),
+        description="SOT-23-5 5-lead",
+    )
+
+    # ── SOT-23-6 ───────────────────────────────────────────────────────────
+    # Pins 1/2/3 bottom L→R, pins 4/5/6 top R→L.
+    fps["Package_TO_SOT_SMD:SOT-23-6"] = _fp(
+        "Package_TO_SOT_SMD:SOT-23-6",
+        pads=[
+            _smd_pad("p1", "1", -0.95, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p2", "2", 0.0, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p3", "3", 0.95, -1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p4", "4", 0.95, 1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p5", "5", 0.0, 1.2, 0.55, 0.8, 0.25),
+            _smd_pad("p6", "6", -0.95, 1.2, 0.55, 0.8, 0.25),
+        ],
+        graphics=_silk_box(-1.5, -0.8, 1.5, 0.8) + _crtyd_box(-1.9, -1.9, 1.9, 1.9),
+        description="SOT-23-6 6-lead",
+    )
+
+    # ── Crystal 2-pin HC-49 / 3215 class ───────────────────────────────────
+    fps["Crystal:Crystal_HC49-4H_Vertical"] = _fp(
+        "Crystal:Crystal_HC49-4H_Vertical",
+        pads=[
+            _tht_pad("p1", "1", -2.45, 0.0, 0.8, 1.6, 1.6),
+            _tht_pad("p2", "2", 2.45, 0.0, 0.8, 1.6, 1.6),
+        ],
+        graphics=_silk_box(-5.5, -2.0, 5.5, 2.0) + _crtyd_box(-6.0, -2.5, 6.0, 2.5),
+        attr="tht",
+        description="Crystal HC-49 2-pin through-hole",
+    )
+    fps["Crystal:Crystal_SMD_3215-2Pin"] = _fp(
+        "Crystal:Crystal_SMD_3215-2Pin",
+        pads=[
+            _smd_pad("p1", "1", -1.0, 0.0, 1.2, 1.4, 0.25),
+            _smd_pad("p2", "2", 1.0, 0.0, 1.2, 1.4, 0.25),
+        ],
+        graphics=_silk_box(-1.7, -0.85, 1.7, 0.85) + _crtyd_box(-2.2, -1.2, 2.2, 1.2),
+        description="Crystal SMD 3215 2-pin (32.768 kHz class)",
+    )
+
+    # ── Current-sense resistor 2512 ────────────────────────────────────────
+    fps["Resistor_SMD:R_2512"] = _fp(
+        "Resistor_SMD:R_2512",
+        pads=[
+            _smd_pad("p1", "1", -2.65, 0.0, 1.8, 3.2, 0.2),
+            _smd_pad("p2", "2", 2.65, 0.0, 1.8, 3.2, 0.2),
+        ],
+        graphics=_silk_box(-3.2, -1.7, 3.2, 1.7) + _crtyd_box(-3.9, -2.2, 3.9, 2.2),
+        description="Resistor 2512 (current-sense class)",
+    )
+
+    # ── Power inductor 7x7 mm 2-pad ────────────────────────────────────────
+    fps["Inductor_SMD:L_Power_7x7"] = _fp(
+        "Inductor_SMD:L_Power_7x7",
+        pads=[
+            _smd_pad("p1", "1", -2.8, 0.0, 2.2, 3.5, 0.15),
+            _smd_pad("p2", "2", 2.8, 0.0, 2.2, 3.5, 0.15),
+        ],
+        graphics=_silk_box(-3.6, -3.6, 3.6, 3.6) + _crtyd_box(-4.2, -4.2, 4.2, 4.2),
+        description="Power inductor 7x7 mm 2-pad",
+    )
+
+    # ── Bulk electrolytic radial D8.0 mm pitch 3.5 mm ──────────────────────
+    fps["Capacitor_THT:CP_Radial_D8.0mm_P3.50mm"] = _fp(
+        "Capacitor_THT:CP_Radial_D8.0mm_P3.50mm",
+        pads=[
+            _tht_pad("p1", "1", -1.75, 0.0, 0.8, 1.8, 1.8),
+            _tht_pad("p2", "2", 1.75, 0.0, 0.8, 1.8, 1.8),
+        ],
+        graphics=[
+            {"type": "circle", "center": [0.0, 0.0], "radius": 4.0,
+             "layer": "F.SilkS", "width": _SILK_W},
+            _line(-0.6, 2.2, 0.6, 2.2),
+            _line(0.0, 1.6, 0.0, 2.8),
+        ] + _crtyd_box(-4.5, -4.5, 4.5, 4.5),
+        attr="tht",
+        description="Radial electrolytic capacitor D8.0 mm pitch 3.5 mm",
+    )
+
+
     # Final pass: clip every footprint's silk off its pads so no generated footprint
     # ships silk over copper (DFM silk_over_pad) — generic, covers all sizes + future parts.
     for fp in fps.values():
@@ -1681,6 +2376,19 @@ _FOOTPRINT_ENG: dict[str, dict] = {
     "Connector_USB:USB_B": _box(12.0, 11.0, 10.0),
     "Connector_USB:USB_C": _box(8.9, 7.3, 3.2),
     "Package_QFP:LQFP-48_7x7mm_P0.5mm": _box(7.0, 7.0, 1.4, theta_ja=45.0),
+    # Flight-computer / charger pack packages
+    "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm": _box(4.0, 4.0, 0.9, theta_ja=35.0),
+    "Package_LGA:LGA-8_2x2.5mm": _box(2.0, 2.5, 0.95, theta_ja=80.0),
+    "Package_LGA:LGA-12_2x2mm": _box(2.0, 2.0, 1.0, theta_ja=90.0),
+    "RF_Module:GPS_Castellated_1x6": _box(16.0, 12.2, 2.4),
+    "Package_TO_SOT_SMD:SOT-23-5": _box(2.9, 1.6, 1.15, theta_ja=220.0),
+    "Package_TO_SOT_SMD:SOT-23-6": _box(2.9, 1.6, 1.15, theta_ja=200.0),
+    "Crystal:Crystal_HC49-4H_Vertical": _box(11.0, 4.7, 3.5),
+    "Crystal:Crystal_SMD_3215-2Pin": _box(3.2, 1.5, 0.9),
+    "Resistor_SMD:R_2512": _box(6.3, 3.2, 0.7),
+    "Inductor_SMD:L_Power_7x7": _box(7.0, 7.0, 4.0),
+    "Capacitor_THT:CP_Radial_D8.0mm_P3.50mm":
+        _pkg_eng("cylinder", d_mm=8.0, h_mm=12.0, source=_JEDEC_SRC),
 }
 _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
     _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"]
@@ -1688,7 +2396,8 @@ _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
 # Rated max dissipation for the standard thick-film resistor of each size (power_w.typ
 # stays null — actual dissipation is circuit-defined and must come from sim/overrides).
 for _fpid, _pmax in (("Resistor_SMD:R_0402", 0.0625), ("Resistor_SMD:R_0603", 0.1),
-                     ("Resistor_SMD:R_0805", 0.125), ("Resistor_SMD:R_1206", 0.25)):
+                     ("Resistor_SMD:R_0805", 0.125), ("Resistor_SMD:R_1206", 0.25),
+                     ("Resistor_SMD:R_2512", 1.0)):
     _FOOTPRINT_ENG[_fpid]["power_w"] = {"max": _pmax}
     _FOOTPRINT_ENG[_fpid].setdefault("sources", []).append(_R_SRC)
 

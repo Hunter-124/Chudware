@@ -194,6 +194,11 @@ from mcp_server import tool_registry as _reg
 from mcp_server.cad_tools import register_cad_tools
 register_cad_tools(_reg.view(mcp, "cad"))
 
+# Nested-tree profiler (mission master): engine_profile_tree drills a call-tree / phase-tree
+# by path so an agent reads root + hot children first (context-frugal). Over prof/tree.{h,cpp}.
+from mcp_server.profile_tools import register_profile_tools
+register_profile_tools(_reg.view(mcp, "cad"))
+
 # GSL — Geometry-Semantics Layer: compact named part outline (describe_part), face-adjacency
 # graph (query_adjacency), and stable-id hover. The progressive-pull view of the geometry.
 from mcp_server.gsl_tools import register_gsl_tools

@@ -1,7 +1,9 @@
 // Implementation of the per-phase simulation timers. See phases.h for the design rationale.
 
 #include "prof/phases.h"
+#include "prof/tree.h"
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -185,6 +187,74 @@ json report(bool do_reset) {
         g_unscoped.clear();
     }
     return r;
+}
+
+json report_tree(const json& opts, bool do_reset) {
+    // Build from the same locked snapshot as report() so flat + tree agree.
+    std::lock_guard<std::mutex> lk(g_mtx);
+
+    // Root children = one node per completed study. When a domain appears more than
+    // once, suffix "@seq" so paths stay unique and stable.
+    std::map<std::string, int> domain_hits;
+    for (const auto& s : g_ring) domain_hits[s.domain] += 1;
+    // (domain_hits used below for unique labels)
+
+    tree::Node root;
+    root.name = "";
+    double root_total_ms = 0.0;
+
+    for (const auto& s : g_ring) {
+        std::vector<std::pair<std::string, std::pair<double, unsigned long long>>> phases;
+        phases.reserve(s.phases.size());
+        for (const auto& kv : s.phases) {
+            phases.emplace_back(kv.first,
+                                std::make_pair(kv.second.ms, kv.second.count));
+        }
+        tree::Node study = tree::build_phase_tree(phases, s.total_ms);
+        // Name the study node.
+        std::string label = s.domain;
+        if (domain_hits[s.domain] > 1) {
+            label += "@";
+            label += std::to_string(s.seq);
+        }
+        study.name = label;
+        // build_phase_tree leaves name=""; we overwrote it. total_ms already set.
+        root.children.push_back(std::move(study));
+        root_total_ms += s.total_ms;
+        root.total_samples += 1;  // one "sample" per study for ordering
+    }
+    root.total_ms = root_total_ms;
+
+    // Sort studies hot-first by total_ms (build_phase_tree already sorted each study).
+    std::sort(root.children.begin(), root.children.end(),
+              [](const tree::Node& a, const tree::Node& b) {
+                  if (a.total_ms != b.total_ms) return a.total_ms > b.total_ms;
+                  return a.name < b.name;
+              });
+    // pct_of_parent relative to root.
+    for (auto& c : root.children) {
+        c.pct_of_parent =
+            root.total_ms > 0.0 ? 100.0 * c.total_ms / root.total_ms : 100.0;
+    }
+    root.pct_of_parent = 100.0;
+
+    json tree_opts = json::object();
+    if (opts.contains("path")) tree_opts["path"] = opts["path"];
+    if (opts.contains("depth")) tree_opts["depth"] = opts["depth"];
+    if (opts.contains("top")) tree_opts["top"] = opts["top"];
+    tree_opts["mode"] = "ms";
+    json out = tree::tree_to_json(root, tree_opts);
+    out["completed"] = g_seq;
+    out["kept"] = g_ring.size();
+
+    if (do_reset) {
+        g_ring.clear();
+        g_seq = 0;
+        g_domain_totals.clear();
+        g_phase_totals.clear();
+        g_unscoped.clear();
+    }
+    return out;
 }
 
 void reset() {

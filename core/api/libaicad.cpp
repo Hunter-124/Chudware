@@ -936,6 +936,20 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "prof_phases") {
             return emit(aicad::prof::phases::report(params.value("reset", false)), out_json, 0);
         }
+        // prof_tree {path?, depth?, top?} -> nested call-tree over the current sampling
+        // aggregation (prof/tree.h). path drills into a subtree ("a/b/c"); depth caps
+        // nesting (-1 unlimited); top caps children per level (hot-first). Additive —
+        // folded/speedscope/flat report() is unchanged.
+        if (m == "prof_tree") {
+            return emit(aicad::prof::tree_report(params), out_json, 0);
+        }
+        // prof_phases_tree {path?, depth?, top?, reset?} -> nested study->phase->subphase
+        // tree with wall-clock self/total rollups (dotted phase names split on '.').
+        // reset=true clears AFTER building (same as prof_phases).
+        if (m == "prof_phases_tree") {
+            const bool do_reset = params.value("reset", false);
+            return emit(aicad::prof::phases::report_tree(params, do_reset), out_json, 0);
+        }
         // prof_contention {reset?} -> g_mtx lock wait/hold/queue-depth meters (Phase 1b).
         // The on-CPU sampler above sees only the ONE thread holding the lock; this reveals the
         // time OTHER threads spend BLOCKED on it — the dominant cost when many subagents drive

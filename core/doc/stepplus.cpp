@@ -34,6 +34,8 @@
 
 #include "doc/session.h"  // OpError
 
+#include "sim/sim_cache.h"
+
 namespace aicad::doc {
 
 using nlohmann::json;
@@ -231,7 +233,10 @@ std::string stepplus_save(const json& doc, const std::string& path,
     // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
     for (const auto& [name, data] : extra) {
         if (is_known_entry(name)) continue;
-        add(name, data, /*stored=*/ name == "cache.aicm");
+        // cache.aicm + studies/*/results.npz are large binary blobs — STORED (no deflate).
+        const bool stored = (name == "cache.aicm") ||
+                            (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
+        add(name, data, /*stored=*/stored);
     }
 
     if (!mz_zip_writer_finalize_archive(&zip)) {
@@ -425,6 +430,40 @@ std::string stepplus_cache_engine_key() {
 #else
     return std::string(kCacheSchema) + ";occt=none";
 #endif
+}
+
+// --- studies/<id>/results.npz -------------------------------------------------
+std::string stepplus_study_result_entry(const std::string& study_id) {
+    return aicad::sim::cache::study_result_entry(study_id);
+}
+
+void stepplus_erase_study_results(std::map<std::string, std::string>& extra) {
+    aicad::sim::cache::erase_study_results(extra);
+}
+
+bool stepplus_put_study_result(std::map<std::string, std::string>& extra,
+                               const std::string& study_id, const std::string& kind,
+                               const std::string& input_hash, const json& result) {
+    using aicad::sim::cache::Kind;
+    Kind k = Kind::FeaStatic;
+    if (kind == "fea_static") k = Kind::FeaStatic;
+    else if (kind == "fea_modal") k = Kind::FeaModal;
+    else if (kind == "fea_thermal") k = Kind::FeaThermal;
+    else if (kind == "spice") k = Kind::Spice;
+    else if (kind == "cfd") k = Kind::Cfd;
+    else if (kind == "em") k = Kind::Em;
+    else return false;
+    return aicad::sim::cache::put_study_result(extra, study_id, k, input_hash, result);
+}
+
+bool stepplus_get_study_result(const std::map<std::string, std::string>& extra,
+                               const std::string& study_id, std::string& kind_out,
+                               std::string& input_hash_out, json& result_out) {
+    aicad::sim::cache::Kind k;
+    if (!aicad::sim::cache::get_study_result(extra, study_id, k, input_hash_out, result_out))
+        return false;
+    kind_out = aicad::sim::cache::kind_name(k);
+    return true;
 }
 
 }  // namespace aicad::doc

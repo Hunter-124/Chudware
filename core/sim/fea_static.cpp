@@ -39,6 +39,7 @@
 #endif
 
 #include "util/resource_governor.h"
+#include "util/thread_pool.h"
 
 namespace aicad::sim {
 
@@ -47,7 +48,8 @@ namespace {
 // Cap the solver's worker threads so a long solve never eats every core — the GUI/render
 // threads must keep running (Hunter: "let the GUI continue on at least 1 thread"). Caps both
 // CHOLMOD's own OpenMP loops and the OpenMP-based system BLAS (FlexiBLAS/OpenBLAS) it calls.
-// Env AI_CAD_FEA_THREADS overrides; default = hardware_concurrency - 2 (min 1).
+// Env AI_CAD_FEA_THREADS overrides; default = governor plan capped at hw-2 / 8.
+// Size-adaptive: tiny systems stay serial (thread spawn costs more than the work).
 int fea_solver_threads(long n_free) {
     if (const char* e = std::getenv("AI_CAD_FEA_THREADS")) {
         const int n = std::atoi(e);
@@ -67,14 +69,19 @@ int fea_solver_threads(long n_free) {
     if      (n_free <  20000) want = 1;
     else if (n_free <  60000) want = 4;
     else                      want = 8;
-    return std::min(want, hw_cap);
+    // Fold through the shared governor/pool so nested solves share one budget.
+    const auto plan = aicad::governor::plan_for(0, "fea_solver", want);
+    const int governed = std::max(1, std::min({want, plan.workers, hw_cap, 8}));
+    aicad::pool::shared().set_max_workers(governed);
+    return governed;
 }
 
-// Threads for the element loops (assembly + stress recovery) — P1. These are pure
+// Threads for the element loops (assembly + stress recovery) — P1 / F3. These are pure
 // per-element compute (B^T C B dense products) with deterministic output slots, so they
 // scale near-linearly; unlike the factorization they don't saturate memory bandwidth
 // early. Small meshes stay serial (thread spawn costs more than the work). Honours the
-// same AI_CAD_FEA_THREADS override as the solver cap; always leaves 2 cores for GUI/IPC.
+// same AI_CAD_FEA_THREADS override as the solver cap; budget comes from the shared
+// governor/pool so nested FEA+CFD cannot oversubscribe.
 int fea_assembly_threads(int n_elems) {
 #ifndef AICAD_HAVE_OPENMP
     (void)n_elems;
@@ -87,7 +94,13 @@ int fea_assembly_threads(int n_elems) {
     }
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    return std::max(1, std::min(static_cast<int>(hw) - 2, 8));
+    const int hw_cap = std::max(1, std::min(static_cast<int>(hw) - 2, 8));
+    // ~1 KB working set per element as a coarse peak estimate for the assembly pass.
+    const uint64_t est = static_cast<uint64_t>(std::max(0, n_elems)) * 1024ull;
+    const auto plan = aicad::governor::plan_for(est, "fea_assembly", hw_cap);
+    const int n = std::max(1, std::min(plan.workers, hw_cap));
+    aicad::pool::shared().set_max_workers(n);
+    return n;
 #endif
 }
 

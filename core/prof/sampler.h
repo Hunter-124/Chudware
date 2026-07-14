@@ -91,7 +91,18 @@ struct TargetScope {
 //     "folded": "a;b;c 12\n...",          full folded text (also returned inline)
 //     "wrote": ["path", ...] }
 // On an unsupported platform, or when no samples were captured, returns {"ok":false,"error":...}.
+// The folded / speedscope / flat shapes are byte-stable; nested-tree views live in tree_report().
 nlohmann::json report(const nlohmann::json& opts);
+
+// Nested call-tree view over the current aggregation (ADDITIVE).
+// Symbolizes via report(), then builds a hierarchical tree from the folded stacks
+// (see prof/tree.h). opts (all optional):
+//   { "path": "a/b/c",   // drill into a subtree (empty = whole tree)
+//     "depth": int,      // -1 unlimited; 0 = selected node only; 1 = +direct children
+//     "top": int }       // max children per level (0 = unlimited); hot-first
+// Returns tree::to_json envelope, plus "summary" from the underlying report when ok.
+// Does NOT write folded/speedscope files (pass those to report() if needed).
+nlohmann::json tree_report(const nlohmann::json& opts = nlohmann::json::object());
 
 }  // namespace prof
 }  // namespace aicad

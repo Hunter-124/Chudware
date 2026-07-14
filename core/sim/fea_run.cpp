@@ -26,6 +26,7 @@
 #include "sim/fea_static.h"
 #include "sim/fea_thermal.h"
 #include "sim/mesher.h"
+#include "sim/sim_cache.h"
 #include "util/resource_governor.h"
 
 using nlohmann::json;
@@ -672,6 +673,21 @@ std::vector<int> faceset_membership(const nlohmann::json& fs,
 }
 
 nlohmann::json fea_run_static(const nlohmann::json& study) {
+    // Content-addressed solve-result cache (sim_cache): HIT returns the stored result
+    // (O(load)); ANY input change is a MISS. Tag the result with cache_hit so callers
+    // / tests can observe the path honestly.
+    const std::string input_hash =
+        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaStatic, study);
+    {
+        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaStatic, input_hash);
+        if (hit.hit) {
+            json out = hit.result;
+            out["cache_hit"] = true;
+            out["cache_reason"] = "hit";
+            out["input_hash"] = input_hash;
+            return out;
+        }
+    }
     // Per-study structured phase record (prof/phases.h): "mesh" / "setup" / "solve" here,
     // plus the solver-internal "solve.<label>" phases from fea_static_solve's FeaProf marks.
     // Surfaced via the prof_phases RPC (engine_profile action="phases").
@@ -1154,7 +1170,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     const double min_fos_tresca = clamp_fos(yield_mpa, max_tresca);
     const double min_fos_rankine = clamp_fos(yield_mpa, max_abs_principal);
 
-    return json{{"ok", true},
+    json out = {{"ok", true},
                 {"displacement", r.displacement},
                 {"disp_magnitude", r.disp_magnitude},
                 {"von_mises", r.von_mises},
@@ -1182,9 +1198,29 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                   {"max_tresca_mpa", round_nd(max_tresca, 4)},
                   {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
                 {"solver_notes", notes}};
+    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaStatic, input_hash, out);
+    out["cache_hit"] = false;
+    out["cache_reason"] = "miss";
+    out["input_hash"] = input_hash;
+    return out;
 }
 
 nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
+    // Cache key folds n_modes into the study inputs so a different mode count is a MISS.
+    json modal_key = study.is_object() ? study : json::object();
+    modal_key["n_modes"] = n_modes;
+    const std::string input_hash =
+        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaModal, modal_key);
+    {
+        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaModal, input_hash);
+        if (hit.hit) {
+            json out = hit.result;
+            out["cache_hit"] = true;
+            out["cache_reason"] = "hit";
+            out["input_hash"] = input_hash;
+            return out;
+        }
+    }
     aicad::prof::phases::StudyScope _study("fea_modal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
@@ -1244,7 +1280,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     }();
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
 
-    return json{{"ok", true},
+    json out = {{"ok", true},
                 {"freqs_hz", r.freqs_hz},
                 {"mode_shapes", r.mode_shapes},
                 {"n_modes", r.n_modes},
@@ -1252,6 +1288,11 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"n_dof", r.n_dof},
                 {"mesh_type_used", mesh_type_used},
                 {"solver_notes", notes}};
+    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaModal, input_hash, out);
+    out["cache_hit"] = false;
+    out["cache_reason"] = "miss";
+    out["input_hash"] = input_hash;
+    return out;
 }
 
 namespace {
@@ -1311,6 +1352,18 @@ bool parse_thermal_schedule(const nlohmann::json& js, aicad::sim::ThermalSchedul
 }  // namespace
 
 nlohmann::json fea_run_thermal(const nlohmann::json& study) {
+    const std::string input_hash =
+        aicad::sim::cache::hash_fea_study(aicad::sim::cache::Kind::FeaThermal, study);
+    {
+        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::FeaThermal, input_hash);
+        if (hit.hit) {
+            json out = hit.result;
+            out["cache_hit"] = true;
+            out["cache_reason"] = "hit";
+            out["input_hash"] = input_hash;
+            return out;
+        }
+    }
     aicad::prof::phases::StudyScope _study("fea_thermal");  // per-phase record (prof/phases.h)
     std::vector<double> points;
     std::vector<int> tets;
@@ -1456,7 +1509,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
         for (const auto& cv : convections)
             flux_summary.push_back({{"type", "convection"}, {"h_w_m2k", cv.h * 1.0e6},
                                     {"t_amb_c", cv.t_amb}, {"n_nodes", cv.nodes.size()}});
-        return json{{"ok", true},
+        json out = {{"ok", true},
                     {"transient", true},
                     {"frames", frames},
                     {"temperature", r.frames.back().temperature},  // final field (steady-compat)
@@ -1475,6 +1528,11 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                                   r.frames.back().temperature.end()), 4)}}},
                     {"flux_summary", flux_summary},
                     {"solver_notes", notes}};
+        aicad::sim::cache::store(aicad::sim::cache::Kind::FeaThermal, input_hash, out);
+        out["cache_hit"] = false;
+        out["cache_reason"] = "miss";
+        out["input_hash"] = input_hash;
+        return out;
     }
 
     aicad::sim::ThermalResult r = [&] {
@@ -1495,7 +1553,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                 {"t_amb_c", cv.t_amb},
                                 {"n_nodes", cv.nodes.size()}});
 
-    return json{{"ok", true},
+    json out = {{"ok", true},
                 {"temperature", r.temperature},
                 {"n_nodes", r.n_nodes},
                 {"n_dof", r.n_dof},
@@ -1505,6 +1563,11 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                  {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
+    aicad::sim::cache::store(aicad::sim::cache::Kind::FeaThermal, input_hash, out);
+    out["cache_hit"] = false;
+    out["cache_reason"] = "miss";
+    out["input_hash"] = input_hash;
+    return out;
 }
 
 // ── Mesh cache (public) ──────────────────────────────────────────────────────────

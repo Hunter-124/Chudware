@@ -73,7 +73,7 @@ void add(const char* name, double ms, unsigned long long count = 1);
 // Completed studies since process start / last reset (cheap, for status lines).
 unsigned long long completed_count();
 
-// Structured report:
+// Structured flat report (byte-stable shape — do not nest under "phases"):
 //   { "ok": true,
 //     "completed": <n studies completed since reset>,
 //     "kept": <n studies in the ring>,
@@ -85,6 +85,21 @@ unsigned long long completed_count();
 //     "unscoped": { "<name>": {"ms","count"}, ... } }
 // reset=true clears the ring + totals AFTER building the report.
 nlohmann::json report(bool reset = false);
+
+// Nested study -> phase -> subphase tree (ADDITIVE; flat report() is unchanged).
+// Phase names containing '.' are split into a hierarchy (e.g. "solve.assemble" becomes
+// solve / assemble) with wall-clock self/total rollups via prof/tree.h.
+// opts (all optional, same as tree::to_json):
+//   { "path": "domain/solve", "depth": 1, "top": 8 }
+// Returns:
+//   { "ok": true, "completed", "kept", "path", "depth", "top",
+//     "root": { name, self_ms, total_ms, self_samples, total_samples, pct_of_parent,
+//               path, children: [...] } }
+// Studies appear as children of the synthetic root, named "<domain>" (or
+// "<domain>@<seq>" when the same domain appears more than once in the ring).
+// reset=true clears AFTER building (same semantics as report()).
+nlohmann::json report_tree(const nlohmann::json& opts = nlohmann::json::object(),
+                           bool reset = false);
 
 // Clear the ring + totals (call before a measured run).
 void reset();

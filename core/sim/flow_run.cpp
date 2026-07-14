@@ -2,11 +2,15 @@
 // Domain layout + lattice-param derivation mirror engine/sim/lbm.py::run_wind_tunnel; the
 // trimesh voxelize+fill is replaced by a self-contained X-scanline parity fill (per body).
 #include "sim/flow_run.h"
+#include "sim/sim_cache.h"
+
+#include <nlohmann/json.hpp>
 
 #include "util/resource_governor.h"
 #include "prof/phases.h"  // per-phase timers (StudyScope "flow_run")
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace aicad {
 namespace sim {
@@ -91,11 +96,123 @@ void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& i
 
 }  // namespace
 
+namespace {
+
+nlohmann::json lbm_to_json(const LbmResult& R) {
+    return nlohmann::json{
+        {"ok", R.ok},
+        {"error", R.error},
+        {"nx", R.nx},
+        {"ny", R.ny},
+        {"nz", R.nz},
+        {"ux", R.ux},
+        {"uy", R.uy},
+        {"uz", R.uz},
+        {"rho", R.rho},
+        {"cd", R.cd},
+        {"drag_n", R.drag_n},
+        {"lift_n", R.lift_n},
+        {"frontal_area_mm2", R.frontal_area_mm2},
+        {"steps_run", R.steps_run},
+        {"diverged", R.diverged},
+        {"residual", R.residual},
+        {"converged", R.converged},
+        {"voxel_mm", R.voxel_mm},
+        {"ref_length_mm", R.ref_length_mm},
+        {"min_feature_mm", R.min_feature_mm},
+        {"min_feature_voxels", R.min_feature_voxels},
+        {"warning", R.warning},
+        {"backend", R.backend},
+        {"backend_fallback", R.backend_fallback},
+    };
+}
+
+LbmResult lbm_from_json(const nlohmann::json& j) {
+    LbmResult R;
+    R.ok = j.value("ok", false);
+    R.error = j.value("error", std::string());
+    R.nx = j.value("nx", 0);
+    R.ny = j.value("ny", 0);
+    R.nz = j.value("nz", 0);
+    if (j.contains("ux") && j["ux"].is_array()) R.ux = j["ux"].get<std::vector<float>>();
+    if (j.contains("uy") && j["uy"].is_array()) R.uy = j["uy"].get<std::vector<float>>();
+    if (j.contains("uz") && j["uz"].is_array()) R.uz = j["uz"].get<std::vector<float>>();
+    if (j.contains("rho") && j["rho"].is_array()) R.rho = j["rho"].get<std::vector<float>>();
+    R.cd = j.value("cd", 0.0);
+    R.drag_n = j.value("drag_n", 0.0);
+    R.lift_n = j.value("lift_n", 0.0);
+    R.frontal_area_mm2 = j.value("frontal_area_mm2", 0.0);
+    R.steps_run = j.value("steps_run", 0);
+    R.diverged = j.value("diverged", false);
+    R.residual = j.value("residual", -1.0);
+    R.converged = j.value("converged", false);
+    R.voxel_mm = j.value("voxel_mm", 0.0);
+    R.ref_length_mm = j.value("ref_length_mm", 0.0);
+    R.min_feature_mm = j.value("min_feature_mm", 0.0);
+    R.min_feature_voxels = j.value("min_feature_voxels", 0);
+    R.warning = j.value("warning", std::string());
+    R.backend = j.value("backend", std::string());
+    R.backend_fallback = j.value("backend_fallback", std::string());
+    return R;
+}
+
+// Content-addressed key for a wind-tunnel call: geometry + every FlowParams field.
+// progress_path is intentionally excluded (side-channel only).
+std::string cfd_input_hash(const std::vector<std::vector<float>>& body_pos,
+                           const std::vector<std::vector<uint32_t>>& body_idx,
+                           const FlowParams& fp) {
+    nlohmann::json bodies = nlohmann::json::array();
+    for (size_t b = 0; b < body_pos.size(); ++b) {
+        nlohmann::json body;
+        body["pos"] = body_pos[b];
+        if (b < body_idx.size()) body["idx"] = body_idx[b];
+        bodies.push_back(std::move(body));
+    }
+    nlohmann::json inputs = {
+        {"bodies", bodies},
+        {"velocity_ms", fp.velocity_ms},
+        {"aoa_deg", fp.aoa_deg},
+        {"nu_fluid", fp.nu_fluid},
+        {"rho_fluid", fp.rho_fluid},
+        {"cells", fp.cells},
+        {"n_steps", fp.n_steps},
+    };
+    return aicad::sim::cache::hash_cfd(inputs);
+}
+
+}  // namespace
+
 LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           const std::vector<std::vector<uint32_t>>& body_idx, const FlowParams& fp,
                           double* reynolds_out) {
     LbmResult R;
     if (body_pos.empty()) { R.ok = false; R.error = "no geometry"; return R; }
+
+    const std::string input_hash = cfd_input_hash(body_pos, body_idx, fp);
+    {
+        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::Cfd, input_hash);
+        if (hit.hit) {
+            R = lbm_from_json(hit.result);
+            // Reynolds is a pure function of inputs; recompute cheaply for the out-param.
+            if (reynolds_out) {
+                double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+                for (const auto& p : body_pos)
+                    for (size_t i = 0; i + 2 < p.size(); i += 3) {
+                        lo[0] = std::min(lo[0], (double)p[i]);
+                        hi[0] = std::max(hi[0], (double)p[i]);
+                        lo[1] = std::min(lo[1], (double)p[i + 1]);
+                        hi[1] = std::max(hi[1], (double)p[i + 1]);
+                        lo[2] = std::min(lo[2], (double)p[i + 2]);
+                        hi[2] = std::max(hi[2], (double)p[i + 2]);
+                    }
+                const double longest = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]});
+                const double speed = std::max(fp.velocity_ms, 1e-6);
+                *reynolds_out = (fp.nu_fluid > 0) ? speed * (longest * 1e-3) / fp.nu_fluid : 0.0;
+            }
+            return R;
+        }
+    }
+
     // Per-phase record (prof/phases.h): setup+voxelize / solve (the nested lbm_run also
     // opens its own "lbm" study with the init/loop/output split) / post.
     aicad::prof::phases::StudyScope _study("flow_run");
@@ -271,6 +388,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     }
     if (!governor_note.empty())
         R.warning = R.warning.empty() ? governor_note : (R.warning + "; " + governor_note);
+    if (R.ok) aicad::sim::cache::store(aicad::sim::cache::Kind::Cfd, input_hash, lbm_to_json(R));
     return R;
 }
 

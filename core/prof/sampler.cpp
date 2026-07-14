@@ -16,6 +16,7 @@
 // capture, the symbolizer, and the wall clock.
 
 #include "prof/sampler.h"
+#include "prof/tree.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1038,6 +1039,24 @@ json report(const json& opts) {
     (void)opts;
     return json{{"ok", false}, {"error", "sampling profiler is unsupported on this platform"}};
 #endif
+}
+
+json tree_report(const json& opts) {
+    // Pull a fresh symbolized report for the folded text ONLY — never forward write_*
+    // opts so this call cannot clobber files the caller didn't ask for.
+    json flat = report(json::object());
+    if (!flat.value("ok", false)) {
+        return flat;  // preserve ok:false / error envelope (no samples / unsupported)
+    }
+    const std::string folded = flat.value("folded", std::string());
+    json tree_opts = json::object();
+    if (opts.contains("path")) tree_opts["path"] = opts["path"];
+    if (opts.contains("depth")) tree_opts["depth"] = opts["depth"];
+    if (opts.contains("top")) tree_opts["top"] = opts["top"];
+    json out = tree::from_folded(folded, tree_opts);
+    if (flat.contains("summary")) out["summary"] = flat["summary"];
+    if (flat.contains("modules")) out["modules"] = flat["modules"];
+    return out;
 }
 
 }  // namespace prof

@@ -58,6 +58,28 @@ std::string stepplus_doc_hash(const nlohmann::json& doc);
 // stale caches from older engines are rejected. Mismatch on open -> full rebuild.
 std::string stepplus_cache_engine_key();
 
+// --- studies/<id>/results.npz (durable FEA solve-state cache) -------------------------
+// Contract: contracts/stepplus.md §1 `studies/<id>/results.npz`, cap 20 MB/study.
+// Mirrors the geometry-cache discipline: engine key + content (input) hash, erase-first
+// on save, validate-on-open. Payload is an AICRES1 blob (see sim/sim_cache.h). Larger
+// results are dropped on save (re-run to regenerate). Writers that don't understand the
+// entry just preserve it (rule §3.1).
+//
+// entry path: "studies/<study_id>/results.npz"
+std::string stepplus_study_result_entry(const std::string& study_id);
+// Erase every studies/*/results.* entry from an extra map (erase-first-on-save).
+void stepplus_erase_study_results(std::map<std::string, std::string>& extra);
+// Encode + put a result (erase-first for that study). Returns false when the payload
+// would exceed the 20 MB cap or the governor signals low memory (honest drop).
+bool stepplus_put_study_result(std::map<std::string, std::string>& extra,
+                               const std::string& study_id, const std::string& kind,
+                               const std::string& input_hash, const nlohmann::json& result);
+// Validate-on-open: engine key must match. Returns false on miss/corrupt/stale engine.
+// Caller compares input_hash_out against the current study's input hash.
+bool stepplus_get_study_result(const std::map<std::string, std::string>& extra,
+                               const std::string& study_id, std::string& kind_out,
+                               std::string& input_hash_out, nlohmann::json& result_out);
+
 // --- solved-bodies BREP cache blob (the `cache.brep` container entry) ---------------
 // doc_save embeds the compiled bodies (BREP **with triangulation**, BinTools VERSION_4)
 // so an assembly can load this part as a component WITHOUT re-running compile_document

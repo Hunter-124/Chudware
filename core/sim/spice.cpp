@@ -15,6 +15,7 @@
 #include "sim/spice.h"
 
 #include "sim/numpy_rng.h"
+#include "sim/sim_cache.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1002,6 +1003,28 @@ json eval_probe(const Setup& s, const std::vector<double>& x, const std::string&
 }  // namespace
 
 json spice_simulate(const json& circuit, const json& study) {
+    const std::string input_hash = aicad::sim::cache::hash_spice(circuit, study);
+    {
+        auto hit = aicad::sim::cache::lookup(aicad::sim::cache::Kind::Spice, input_hash);
+        if (hit.hit) {
+            json out = hit.result;
+            out["cache_hit"] = true;
+            out["cache_reason"] = "hit";
+            out["input_hash"] = input_hash;
+            return out;
+        }
+    }
+    auto finish = [&](json result) -> json {
+        // Strip transient cache tags before storing so stored payload is clean.
+        result.erase("cache_hit");
+        result.erase("cache_reason");
+        result.erase("input_hash");
+        aicad::sim::cache::store(aicad::sim::cache::Kind::Spice, input_hash, result);
+        result["cache_hit"] = false;
+        result["cache_reason"] = "miss";
+        result["input_hash"] = input_hash;
+        return result;
+    };
     json result = {{"log", json::array()}, {"convergence", json::object()}};
     auto log = [&](const std::string& m) { result["log"].push_back(m); };
 
@@ -1548,7 +1571,7 @@ json spice_simulate(const json& circuit, const json& study) {
         }
         result["step"] = {{"param", param}, {"values", values}, {"runs", runs}};
         result["convergence"]["step"] = all_ok;
-        return result;
+        return finish(std::move(result));
     }
 
     // mc / temp additive entries.
@@ -1609,7 +1632,7 @@ json spice_simulate(const json& circuit, const json& study) {
             for (auto& kv : sub.value("convergence", json::object()).items())
                 result["convergence"][kv.key()] = kv.value();
         }
-        return result;
+        return finish(std::move(result));
     }
 
     if (!mc_spec.is_null()) {
@@ -1656,7 +1679,7 @@ json spice_simulate(const json& circuit, const json& study) {
                             {"std", std::nan("")}, {"min", std::nan("")},
                             {"max", std::nan("")}, {"runs", 0}};
             result["convergence"]["mc"] = false;
-            return result;
+            return finish(std::move(result));
         }
 
         // Extract the key scalar for `probe` from a single inner result, priority
@@ -1770,7 +1793,7 @@ json spice_simulate(const json& circuit, const json& study) {
             for (auto& kv : sub.value("convergence", json::object()).items())
                 result["convergence"][kv.key()] = kv.value();
         }
-        return result;
+        return finish(std::move(result));
     }
 
     for (const json& a : inner_analyses) {
@@ -2482,7 +2505,7 @@ json spice_simulate(const json& circuit, const json& study) {
             log(atype + ": analysis not yet ported to the C++ core");
         }
     }
-    return result;
+    return finish(std::move(result));
 }
 
 }  // namespace aicad::sim

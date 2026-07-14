@@ -17,6 +17,7 @@
 #endif
 
 #include "util/resource_governor.h"
+#include "util/thread_pool.h"
 #include "prof/phases.h"  // per-phase timers (StudyScope "lbm")
 
 #include <algorithm>
@@ -221,11 +222,12 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     std::vector<float> f(ncell * NQ, 0.0f);
     std::vector<float> fstream(ncell * NQ, 0.0f);
 
-    // P3: worker threads for the per-step lattice loops. The kernels are memory-bandwidth
-    // bound, so past ~8 threads this class of desktop gains nothing; tiny lattices stay
-    // serial (spawn overhead > work). AI_CAD_LBM_THREADS overrides for benchmarking.
-    // Every parallel loop below writes DISJOINT indices and computes each cell with the
-    // exact serial arithmetic, so results stay bit-identical to the oracle parity gate.
+    // P3/F3: worker threads for the per-step lattice loops. Budget comes from the
+    // shared governor + pool so nested solves cannot oversubscribe; tiny lattices
+    // stay serial (spawn overhead > work). AI_CAD_LBM_THREADS overrides for
+    // benchmarking. Every parallel loop below writes DISJOINT indices and computes
+    // each cell with the exact serial arithmetic, so results stay bit-identical to
+    // the oracle parity gate.
     const int lbm_threads = [&]() -> int {
 #ifndef AICAD_HAVE_OPENMP
         return 1;
@@ -235,9 +237,14 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             const int n = std::atoi(e);
             if (n >= 1) return n;
         }
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 4;
-        return std::max(1, std::min(static_cast<int>(hw) - 2, 8));
+        // Estimate lattice peak (~256 B/cell: f+scratch+macros) so plan_for can
+        // grade under memory pressure; ample RAM keeps full allotted cores.
+        const uint64_t est = static_cast<uint64_t>(ncell) * 256ull;
+        const auto plan = aicad::governor::plan_for(est, "lbm", 0);
+        const int n = std::max(1, std::min(plan.workers, 8));
+        // Align shared pool with this op's budget (nested solves share one cap).
+        aicad::pool::shared().set_max_workers(n);
+        return n;
 #endif
     }();
     (void)lbm_threads;

@@ -140,7 +140,8 @@ set_property(TARGET aicad_clipper2 PROPERTY
 # unit test. See core/prof/sampler.{h,cpp} and docs/PROFILER.md.
 add_library(aicad_prof STATIC
   prof/sampler.cpp
-  prof/phases.cpp)
+  prof/phases.cpp
+  prof/tree.cpp)
 target_include_directories(aicad_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_prof PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
@@ -176,8 +177,10 @@ target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
 add_library(aicad_util STATIC
   util/expr.cpp
   util/aicm_handoff.cpp
-  util/resource_governor.cpp)
+  util/resource_governor.cpp
+  util/thread_pool.cpp)
 target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_util PUBLIC Threads::Threads)
 if(UNIX AND NOT APPLE)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
   target_link_libraries(aicad_util PUBLIC rt)
@@ -196,7 +199,8 @@ add_library(aicad_sim STATIC
   sim/numpy_rng.cpp
   sim/netlist.cpp
   sim/lbm.cpp
-  sim/flow_run.cpp)
+  sim/flow_run.cpp
+  sim/sim_cache.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 # aicad_util: host resource_governor (memory admission/degrade). aicad_prof: the per-phase
@@ -446,6 +450,15 @@ set_target_properties(test_prof_phases PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME prof_phases COMMAND test_prof_phases)
 
+# --- nested call-tree / phase-tree profiler unit test (OCCT-free) ------------
+add_executable(test_prof_tree
+  tests/test_prof_tree.cpp)
+target_include_directories(test_prof_tree PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_prof_tree PRIVATE aicad_prof)
+set_target_properties(test_prof_tree PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME prof_tree COMMAND test_prof_tree)
+
 add_executable(test_sketch
   tests/test_sketch.cpp)
 target_include_directories(test_sketch PRIVATE ${doctest_SOURCE_DIR})
@@ -501,6 +514,15 @@ target_link_libraries(test_governor PRIVATE aicad_util)
 set_target_properties(test_governor PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME governor COMMAND test_governor)
+
+# --- shared thread-pool unit test (governed concurrency, OCCT-free) ----------
+add_executable(test_thread_pool
+  tests/test_thread_pool.cpp)
+target_include_directories(test_thread_pool PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_thread_pool PRIVATE aicad_util)
+set_target_properties(test_thread_pool PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME thread_pool COMMAND test_thread_pool)
 
 # --- libaicad geom-aicm (OCCT-free AICM v1 writer) ---------------------------
 # The encoder half of engine/doc/tessellate.py, kept OCCT-free so it builds and
@@ -843,6 +865,17 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
   set_tests_properties(mesher_advanced PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Durable sim solve-state cache: FEA static HIT/MISS + .step+ studies/*.npz round-trip
+  # + SPICE/CFD result cache invalidation. Needs the real mesh path (aicad_mesh) + stepplus
+  # (aicad_doc) so it links the OCCT+Netgen targets like test_fatigue (same _fatigue_envmod).
+  add_executable(test_sim_cache tests/test_sim_cache.cpp)
+  target_include_directories(test_sim_cache PRIVATE ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sim_cache PRIVATE aicad_mesh aicad_doc aicad_geom_occt aicad_sim aicad_sketch aicad_geom aicad_util)
+  set_target_properties(test_sim_cache PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sim_cache COMMAND test_sim_cache)
+  set_tests_properties(sim_cache PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
   endif()  # AICAD_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
@@ -1065,7 +1098,7 @@ if(AICAD_WITH_OCCT)
     target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
   endif()
   target_link_libraries(aicad_doc PUBLIC
-    aicad_geom_occt aicad_sketch aicad_geom aicad_util
+    aicad_geom_occt aicad_sketch aicad_geom aicad_util aicad_sim
     aicad_mate
     aicad_miniz
     nlohmann_json::nlohmann_json)

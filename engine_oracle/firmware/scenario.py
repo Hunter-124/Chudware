@@ -16,9 +16,10 @@ Design posture (same as the rest of the firmware pillar):
   ``Mocks.DummySPISlave`` (fixed-pattern stub), ``sysbus.<uart> WriteChar`` for RX
   injection, and ``Python.PythonPeripheral`` for the memory-mapped ADC stub (no ADC
   peripheral model ships upstream for these families — the stub feeds programmed samples
-  through the family's real ADC register window). Renode-side syntax is [~] not
-  live-verified on this machine (Renode absent); canned .resc-generation tests carry
-  coverage, per the T-C3/T-FIN1 precedent.
+  through the family's real ADC register window). Renode 1.16.1's PythonPeripheral takes an
+  inline ``script:`` (not ``filename:``) with capitalized request properties
+  (``IsInit``/``IsRead``/``Offset``/``Value``); the ADC track emits an aux ``.repl`` that
+  carries that script and is loaded via ``machine LoadPlatformDescription``.
 - Timeline actions are realised as monitor ``sleep`` interleaving (the same wall-clock
   idiom the base .resc already uses for its run window), with ``echo "AICAD_T_MARK
   <ms>"`` markers after every sleep so UART lines can be coarsely time-stamped by the
@@ -67,8 +68,9 @@ class ScenarioPlan:
     ``setup_lines`` go right after the platform load (peripheral attachment +
     programming); ``timeline`` is a t_ms-sorted list of ``(t_ms, monitor_line)``
     stimulus actions realised via sleep interleaving; ``aux_files`` maps relative
-    filename → content (Python peripheral scripts) that the caller must write next to
-    the .resc; ``duration_ms`` is the minimum run window the timeline needs.
+    filename → content (e.g. the ADC stub ``.repl`` with an inline ``script:``) that the
+    caller must write next to the .resc; ``duration_ms`` is the minimum run window the
+    timeline needs.
     ``errors`` non-empty ⇒ the plan must NOT run (honest refusal).
     """
     setup_lines: list[str] = field(default_factory=list)
@@ -330,17 +332,28 @@ _ADC_SCRIPT_TEMPLATE = """\
 # AI-CAD ADC stub (aicad.fwscenario/1) — Python.PythonPeripheral script.
 # Feeds programmed samples through the family's real ADC register window:
 # SR read returns the ready flags; each DR read pops the next sample (cycling).
-if request.isInit:
+# Renode 1.16.1 request API: IsInit/IsRead/IsWrite/Offset/Value (capitalized).
+if request.IsInit:
     samples = {samples}
     idx = 0
-elif request.isRead:
-    if request.offset == {sr_offset:#x}:
-        request.value = {sr_value:#x}
-    elif request.offset == {dr_offset:#x}:
-        request.value = samples[idx % len(samples)]
+elif request.IsRead:
+    if request.Offset == {sr_offset:#x}:
+        request.Value = {sr_value:#x}
+    elif request.Offset == {dr_offset:#x}:
+        request.Value = samples[idx % len(samples)]
         idx = idx + 1
     else:
-        request.value = 0
+        request.Value = 0
+"""
+
+
+_ADC_REPL_TEMPLATE = """\
+aicadAdc: Python.PythonPeripheral @ sysbus {base:#x}
+    size: {size:#x}
+    initable: true
+    script: '''
+{script}\
+'''
 """
 
 
@@ -498,15 +511,18 @@ def build_scenario_plan(scenario: dict, caps: dict, platform_text: str) -> Scena
                     f"(registered: {', '.join(sorted(_ADC_STUBS))})")
                 continue
             samples = waveform_samples(tr["waveform"], float(tr.get("sample_ms", 1.0)))
-            script_name = "aicad_adc_stub.py"
-            plan.aux_files[script_name] = _ADC_SCRIPT_TEMPLATE.format(
+            script_body = _ADC_SCRIPT_TEMPLATE.format(
                 samples=samples, sr_offset=stub["sr_offset"], sr_value=stub["sr_value"],
                 dr_offset=stub["dr_offset"])
+            # Renode 1.16.1: PythonPeripheral takes inline script: (filename: + @path is
+            # E00). Emit an aux .repl so the triple-quoted script survives intact; the
+            # single-line LoadPlatformDescriptionFromString path cannot carry it.
+            repl_name = "aicad_adc_stub.repl"
+            plan.aux_files[repl_name] = _ADC_REPL_TEMPLATE.format(
+                base=stub["base"], size=stub["size"], script=script_body)
             plan.setup_lines.append(
-                f'machine LoadPlatformDescriptionFromString '
-                f'"aicadAdc: Python.PythonPeripheral @ sysbus {stub["base"]:#x} '
-                f'{{ size: {stub["size"]:#x}; initable: true; '
-                f'filename: @{{AICAD_SCENARIO_DIR}}/{script_name} }}"')
+                f"machine LoadPlatformDescription "
+                f"@{{AICAD_SCENARIO_DIR}}/{repl_name}")
 
     plan.timeline.sort(key=lambda item: item[0])
     if plan.timeline:

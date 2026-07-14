@@ -3,8 +3,8 @@
 Renode is absent on this machine (and in CI), so — per the T-C3/T-FIN1 precedent —
 coverage is carried by pure-function tests: schema validation, fixture library,
 waveform expansion, .resc-line generation, timeline rendering, the new assertion
-vocabulary, and mocked-subprocess plumbing through fw_sim_run. Live Renode stimulus
-syntax is [~] not verified here.
+vocabulary, and mocked-subprocess plumbing through fw_sim_run. The ADC PythonPeripheral
+script form is additionally live-checked against Renode 1.16.1 (inline script: + Is*).
 """
 from __future__ import annotations
 
@@ -183,9 +183,18 @@ def test_plan_adc_waveform_python_peripheral_on_stm32():
     plan = build_scenario_plan(sc, STM32F4_CAPS, STM32F4_REPL)
     assert plan.errors == []
     joined = "\n".join(plan.setup_lines)
-    assert "Python.PythonPeripheral @ sysbus 0x40012000" in joined
-    script = plan.aux_files["aicad_adc_stub.py"]
-    assert "[1, 2, 3]" in script and "request.isRead" in script and "0x4c" in script
+    assert "LoadPlatformDescription @{AICAD_SCENARIO_DIR}/aicad_adc_stub.repl" in joined
+    assert "Python.PythonPeripheral @ sysbus 0x40012000" not in joined  # lives in aux .repl
+    repl = plan.aux_files["aicad_adc_stub.repl"]
+    assert "Python.PythonPeripheral @ sysbus 0x40012000" in repl
+    assert "script: '''" in repl
+    assert "[1, 2, 3]" in repl
+    assert "request.IsInit" in repl and "request.IsRead" in repl
+    assert "request.Offset" in repl and "request.Value" in repl
+    assert "0x4c" in repl
+    # Old Renode API must not appear (filename: + lowercase request props).
+    assert "filename:" not in repl and "request.isInit" not in repl
+    assert "request.isRead" not in repl and "request.value" not in repl
 
 
 def test_plan_adc_refuses_honestly_off_stm32():
@@ -217,9 +226,12 @@ def test_materialize_aux_files_substitutes_dir(tmp_path):
               "waveform": {"type": "samples", "values": [7]}})
     plan = build_scenario_plan(sc, STM32F4_CAPS, STM32F4_REPL)
     materialize_aux_files(plan, tmp_path / "aux")
-    assert (tmp_path / "aux" / "aicad_adc_stub.py").exists()
+    assert (tmp_path / "aux" / "aicad_adc_stub.repl").exists()
     assert all("{AICAD_SCENARIO_DIR}" not in ln for ln in plan.setup_lines)
     assert any(str(tmp_path / "aux") in ln for ln in plan.setup_lines)
+    # Materialized .repl is loadable as-is by Renode (inline script: form).
+    repl_text = (tmp_path / "aux" / "aicad_adc_stub.repl").read_text(encoding="utf-8")
+    assert "script: '''" in repl_text and "request.IsInit" in repl_text
 
 
 # ---------------------------------------------------------------------------

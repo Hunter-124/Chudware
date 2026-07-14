@@ -318,20 +318,33 @@ def clear_credential(provider_id: str, account_id: str | None = None) -> None:
 
 
 def list_accounts(provider_id: str) -> list[dict]:
-    """List stored accounts for *provider_id* (no tokens). Empty when disconnected."""
+    """List stored accounts for *provider_id* (no tokens). Empty when disconnected.
+
+    Each item: account_id, email, label, active, connected, expires_at_ms, plus
+    optional identity fields ``display_name`` / ``plan`` when previously persisted
+    (contracts/providers.md §4.5).
+    """
     entry = _normalize_entry(_load_all().get(provider_id))
     active = entry["active"]
     out: list[dict] = []
     for aid, cred in entry["accounts"].items():
         email = cred.get("email")
-        out.append({
+        display_name = cred.get("display_name")
+        plan = cred.get("plan")
+        label = display_name or email or aid
+        item = {
             "account_id": aid,
             "email": email,
-            "label": email or aid,
+            "label": label,
             "active": aid == active,
             "connected": True,
             "expires_at_ms": cred.get("expires_at_ms"),
-        })
+        }
+        if display_name:
+            item["display_name"] = display_name
+        if plan:
+            item["plan"] = plan
+        out.append(item)
     # Stable order: active first, then account_id.
     out.sort(key=lambda a: (not a["active"], a["account_id"] or ""))
     return out

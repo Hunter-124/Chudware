@@ -402,6 +402,17 @@ class XAISubProvider(Provider):
         }
         if resp.get("id_token"):
             cred["id_token"] = resp["id_token"]
+        # Preserve plan across refresh; infer plan/display_name from JWT.
+        if self._cred and self._cred.get("plan"):
+            cred["plan"] = self._cred.get("plan")
+        if self._cred and self._cred.get("display_name") and not cred.get("display_name"):
+            cred["display_name"] = self._cred.get("display_name")
+        try:
+            from . import usage as usage_mod
+            cred = usage_mod.enrich_xai_identity(cred)
+        except Exception:
+            if email:
+                cred.setdefault("display_name", email)
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

@@ -100,3 +100,19 @@ try:
     WORKER_METHODS.update(_ROLE_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
+
+# CAD project graph (contracts/cad_graph.md v1) — get / blast / path.
+try:
+    from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS as _CAD_GRAPH_METHODS
+    WORKER_METHODS.update(_CAD_GRAPH_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass
+
+# Copilot skills (contracts/skills.md v1).
+try:
+    from engine_oracle.parts_hub.skills_rpc import SKILLS_METHODS as _SKILLS_METHODS
+    WORKER_METHODS.update(_SKILLS_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass
+
+

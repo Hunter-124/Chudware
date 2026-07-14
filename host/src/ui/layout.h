@@ -28,6 +28,7 @@ namespace ui {
 // Wave 1D: left-pane tab indices. These MUST match AppState::LeftPaneTab (LP_*) values 0..3; the
 // brief specifies the kLeftPane* spelling for this module, and the two enums are kept numerically
 // identical (Explorer=0, FeatureManager=1, PropertyManager=2, Configurations=3).
+// kLeftPanePLM (=5) lives in plm_overview.h — int leftPaneTab accepts it without an app_state.h edit.
 enum {
     kLeftPaneExplorer        = 0,
     kLeftPaneFeatureManager  = 1,

@@ -87,7 +87,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              tier: str | None = None,
              model_id: str | None = None,
              phase: str | None = None,
-             task_class: str | None = None) -> TurnResult:
+             task_class: str | None = None,
+             msg_idx: int | None = None,
+             doc_id: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -198,10 +200,46 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 
     messages: list[dict] = [{"role": "user", "content": _parts(_req)}]
 
+    # Skills catalog + activation (contracts/skills.md). Best-effort.
+    try:
+        from services.agent import skills as _skills  # noqa: PLC0415
+        _sid = subagent_id or run_id or name or "_turn"
+        _clean, _hits = _skills.resolve_slash(_req)
+        if _hits and _clean.strip():
+            _req = _clean
+            messages = [{"role": "user", "content": _parts(_req)}]
+        _sk = _skills.session_system_block(_sid, user_text=request, phase=_phase)
+        if _sk:
+            system = system.rstrip() + "\n\n" + _sk
+    except Exception:  # noqa: BLE001
+        pass
+
     calls: list[dict] = []
     tool_calls_made = 0
     last_reason = _NOCODE
     _prev_stage: str | None = None
+
+    # AI-VC v2: checkpoint BEFORE the user prompt turn (kind=prompt).
+    # msg_idx is the GUI chat message ordinal; optional, default None.
+    try:
+        from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
+        _ai_vc.set_session_context(
+            session_id=run_id,
+            turn_id=msg_idx if msg_idx is not None else 0,
+            msg_idx=msg_idx,
+            doc_id=doc_id,
+        )
+        _ai_vc.on_prompt_start(
+            request,
+            doc_id=doc_id,
+            msg_idx=msg_idx,
+            turn_id=msg_idx if msg_idx is not None else 0,
+            session_id=run_id,
+            ledger=ledger,
+            actor=actor or "agent_turn",
+        )
+    except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
+        pass
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
         # sub-agent session (subagent_id set), drain the cross-process steering queue
@@ -334,6 +372,29 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 _blocked = None
         if _blocked is None:
             _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
+        # AI-VC v2: checkpoint BEFORE mutating tool call (kind=tool).
+        # call.turn = msg_idx when provided, else internal tool-call ordinal.
+        if _blocked is None:
+            try:
+                from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
+                _call_turn = msg_idx if msg_idx is not None else tool_calls_made
+                _ai_vc.set_session_context(
+                    session_id=run_id,
+                    turn_id=_call_turn,
+                    msg_idx=msg_idx,
+                    doc_id=(args or {}).get("doc_id") or doc_id,
+                )
+                _ai_vc.on_before_tool(
+                    tool, args,
+                    turn_id=_call_turn,
+                    call_i=tool_calls_made - 1,
+                    msg_idx=msg_idx,
+                    session_id=run_id,
+                    ledger=ledger,
+                    actor=actor or "agent_turn",
+                )
+            except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
+                pass
         if _blocked is not None:
             result = {"ok": False, "error": _blocked}
             ok = False
@@ -362,19 +423,23 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
-        # AI-VC: silent deterministic checkpoint after every successful mutating
-        # AI tool call (agent/mixed docs only; user docs untouched).
+        # AI-VC: post-success path retains create tools (doc_id only after call)
+        # and stamps provenance. Pre-tool checkpoint (above) is the v2 primary.
         if ok:
             try:
                 from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
+                _call_turn = msg_idx if msg_idx is not None else tool_calls_made
                 _ai_vc.set_session_context(
                     session_id=run_id,
-                    turn_id=tool_calls_made,
+                    turn_id=_call_turn,
+                    msg_idx=msg_idx,
                 )
                 _ai_vc.on_ai_tool_success(
                     tool, args, result,
-                    turn_id=tool_calls_made,
+                    turn_id=_call_turn,
                     session_id=run_id,
+                    msg_idx=msg_idx,
+                    call_i=tool_calls_made - 1,
                     ledger=ledger,
                     actor=actor or "agent_turn",
                 )

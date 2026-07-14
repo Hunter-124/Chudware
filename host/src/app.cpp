@@ -73,6 +73,7 @@
 #include "ui/icons.h"
 #include "ui/appearance_common.h"  // Appearance tab: MaterialPreset table (kMaterials) for presets
 #include "ui/widgets/ribbon.h"
+#include "ui/widgets/interwebz.h"  // InterwebzDemoDraw (View > Interwebz demo)
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
@@ -3677,6 +3678,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
         // ---------- splash notifications (top-left glass; click to copy + clear) ----------
         ui::drawToasts(st);
+
+        // Interwebz widget-family demo window (View > Interwebz demo).
+        ui::InterwebzDemoDraw();
 
         // ---------- W1-B: consume this frame's cursor request (item 3) ----------
         // After all panels have had a chance to call st.requestCursor(); suspends ImGui cursor

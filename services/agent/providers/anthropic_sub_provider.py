@@ -99,6 +99,12 @@ class AnthropicSubProvider(Provider):
             "account_id": None,
             "email": None,
         }
+        # Best-effort profile fill (user:profile scope) — email/display_name/plan.
+        try:
+            from . import usage as usage_mod
+            cred = usage_mod.enrich_anthropic_profile(cred)
+        except Exception:
+            pass
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred
@@ -123,6 +129,8 @@ class AnthropicSubProvider(Provider):
             "expires_at_ms": now_ms + resp["expires_in"] * 1000 - REFRESH_SKEW_MS,
             "account_id": self._cred.get("account_id"),
             "email": self._cred.get("email"),
+            "display_name": self._cred.get("display_name"),
+            "plan": self._cred.get("plan"),
         }
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred

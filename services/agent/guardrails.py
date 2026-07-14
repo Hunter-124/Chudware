@@ -896,11 +896,12 @@ def take_auto_checkpoint(doc_id: str | None,
                             actor=actor)
         # Also record an AI-VC checkpoint when the doc is agent/mixed-authored
         # (silent, never blocks — engine doc_checkpoint above is the HARD path).
+        # v2: prefer pre-tool kind=tool; fall back to on_ai_tool_success.
         try:
             from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
             if _ai_vc.is_ai_policy_doc(doc_id):
-                _ai_vc.on_ai_tool_success(
-                    trigger_tool, {"doc_id": doc_id}, {"ok": True},
+                _ai_vc.on_before_tool(
+                    trigger_tool, {"doc_id": doc_id},
                     ledger=ledger, actor=actor,
                 )
         except Exception:  # noqa: BLE001

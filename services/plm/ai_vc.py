@@ -1,18 +1,24 @@
 """services.plm.ai_vc — silent, deterministic version control for AI-authored work.
 
-Contract (AI-VC):
+Contract (AI-VC) v1 + v2 (prompt/tool granularity):
   * Provenance: docs created/mutated by the agent loop or MCP carry
     ``authored_by: agent|user|mixed`` (agent edit on a user doc → mixed).
-  * Auto-VC: every successful MUTATING AI tool call on a doc triggers a
-    deterministic checkpoint. Idempotent id = sha256(doc_id, turn_id, op_batch)
-    — same inputs yield the same checkpoint id; retries never duplicate.
+  * Auto-VC v2: checkpoint BEFORE every user prompt turn
+    (``kind:"prompt"``, label = first ~60 chars of the prompt) and BEFORE every
+    mutating tool call (``kind:"tool"``, label = tool name) on agent/mixed docs.
+    Idempotent id = sha256(doc_id, turn_id, op_batch) — retries never duplicate.
   * Silent: no dialogs, no prompts. User-authored docs are never auto-
     checkpointed by this policy (their existing PLM/manual flows stay intact).
   * Storage: content-addressed delta chain under ``.aicadvault/ai_vc/`` (or a
     free-standing root for tests). zlib/zstd-compressed deltas against the
-    previous full snapshot; full snapshot every ``full_every`` deltas; identical
-    states deduped by content hash. At most one full snapshot is held in RAM
-    per checkpoint op.
+    previous snapshot; full snapshot every ``full_every`` checkpoints; identical
+    states deduped by content hash (no new full blob when unchanged). At most
+    one full snapshot is held in RAM per checkpoint op.
+  * Timeline rows: ``{id, turn, label, time, features_count, kind, msg_idx,
+    call}`` where ``kind`` is ``prompt|tool`` and ``call`` is ``{turn, i}``
+    for tool checkpoints. Storage encoding is ``storage_kind: full|delta``.
+  * Rollback: ``to`` accepts checkpoint id | ``turn:N`` | ``-N`` | ``msg:<idx>``
+    | ``call:<turn>:<i>``. Response includes ``chat_truncate_to`` (msg_idx).
   * Rollback surface: ``plm_rollback`` / ``plm_timeline`` (MCP + worker RPC).
 
 Config (``config.json`` key ``plm.ai_vc``)::
@@ -91,16 +97,29 @@ _AUTHORED_BY: dict[str, str] = {}  # doc_id -> agent|user|mixed
 _SESSION_TURN: dict[str, Any] = {
     "session_id": None,
     "turn_id": 0,
+    "msg_idx": None,
+    "doc_id": None,
 }
 
 
 def set_session_context(*, session_id: str | None = None,
-                        turn_id: int | None = None) -> None:
-    """Stamp the current agent/MCP session + turn for checkpoint attribution."""
+                        turn_id: int | None = None,
+                        msg_idx: int | None = None,
+                        doc_id: str | None = None) -> None:
+    """Stamp the current agent/MCP session + turn for checkpoint attribution.
+
+    *msg_idx* is the GUI chat message ordinal for the active user prompt turn
+    (threaded from the host through ``agent_turn.run_turn``).
+    *doc_id* is the active document for prompt-boundary checkpoints.
+    """
     if session_id is not None:
         _SESSION_TURN["session_id"] = session_id
     if turn_id is not None:
         _SESSION_TURN["turn_id"] = int(turn_id)
+    if msg_idx is not None:
+        _SESSION_TURN["msg_idx"] = int(msg_idx)
+    if doc_id is not None:
+        _SESSION_TURN["doc_id"] = str(doc_id)
 
 
 def get_session_context() -> dict[str, Any]:
@@ -417,6 +436,22 @@ class AiVcStore:
 
     # -- materialize (self-healing) ----------------------------------------
 
+    @staticmethod
+    def _storage_kind_of(rec: dict[str, Any]) -> str:
+        """Return full|delta for a chain record (v1 kind or v2 storage_kind)."""
+        sk = rec.get("storage_kind")
+        if sk in ("full", "delta"):
+            return sk
+        # v1 records used kind for storage encoding
+        k = rec.get("kind")
+        if k in ("full", "delta"):
+            return k
+        return "full"
+
+    @classmethod
+    def _is_full_storage(cls, rec: dict[str, Any]) -> bool:
+        return cls._storage_kind_of(rec) == "full"
+
     def materialize(self, doc_id: str, checkpoint_id_: str) -> bytes:
         """Reconstruct the full document bytes at *checkpoint_id_*.
 
@@ -433,7 +468,7 @@ class AiVcStore:
         idx = next(i for i, r in enumerate(chain) if r["id"] == checkpoint_id_)
         full_idx = None
         for i in range(idx, -1, -1):
-            if chain[i].get("kind") == "full":
+            if self._is_full_storage(chain[i]):
                 full_idx = i
                 break
         if full_idx is None:
@@ -444,11 +479,11 @@ class AiVcStore:
         while attempt_from is not None:
             try:
                 data, _ = self.get_object(chain[attempt_from]["object"])
-                if chain[attempt_from].get("kind") != "full":
+                if not self._is_full_storage(chain[attempt_from]):
                     raise ValueError("expected full")
                 for j in range(attempt_from + 1, idx + 1):
                     rec = chain[j]
-                    if rec.get("kind") == "full":
+                    if self._is_full_storage(rec):
                         data, _ = self.get_object(rec["object"])
                     else:
                         delta, _ = self.get_object(rec["object"])
@@ -462,7 +497,7 @@ class AiVcStore:
                 # self-heal: find earlier full
                 prev = None
                 for i in range(attempt_from - 1, -1, -1):
-                    if chain[i].get("kind") == "full":
+                    if self._is_full_storage(chain[i]):
                         prev = i
                         break
                 if prev is None:
@@ -482,8 +517,15 @@ class AiVcStore:
         label: str = "",
         session_id: str | None = None,
         force_full: bool = False,
+        kind: str = "tool",
+        msg_idx: int | None = None,
+        call: dict[str, Any] | None = None,
+        project_dir: str | None = None,
     ) -> dict[str, Any]:
         """Cut a deterministic checkpoint. Idempotent on (doc_id, turn_id, op_batch).
+
+        *kind* is the event kind (``prompt`` | ``tool``). Storage encoding is
+        recorded separately as ``storage_kind`` (``full`` | ``delta``).
 
         Memory: holds at most one full snapshot in RAM for the delta base.
         """
@@ -491,8 +533,13 @@ class AiVcStore:
             turn_id = _SESSION_TURN.get("turn_id", 0)
         if session_id is None:
             session_id = _SESSION_TURN.get("session_id")
+        if msg_idx is None:
+            mi = _SESSION_TURN.get("msg_idx")
+            msg_idx = int(mi) if mi is not None else None
         if op_batch is None:
             op_batch = label or "mutate"
+
+        event_kind = kind if kind in ("prompt", "tool") else "tool"
 
         cid = checkpoint_id(doc_id, turn_id, op_batch)
         chain = self.read_chain(doc_id)
@@ -500,7 +547,8 @@ class AiVcStore:
             if rec.get("id") == cid:
                 # idempotent hit
                 return {"ok": True, "id": cid, "dedup": True, "record": rec,
-                        "authored_by": get_authored_by(doc_id)}
+                        "authored_by": get_authored_by(doc_id),
+                        "content_unchanged": bool(rec.get("content_unchanged"))}
 
         raw = _canonical_bytes(content)
         ch = content_hash(raw)
@@ -509,10 +557,8 @@ class AiVcStore:
         full_every = max(1, int(self.cfg.get("full_every") or DEFAULT_CFG["full_every"]))
         n_since_full = 0
         last_full_raw: bytes | None = None
-        last_full_hash: str | None = None
         for rec in reversed(chain):
-            if rec.get("kind") == "full":
-                last_full_hash = rec.get("content_hash")
+            if self._is_full_storage(rec):
                 try:
                     last_full_raw, _ = self.get_object(rec["object"])
                 except Exception:  # noqa: BLE001
@@ -528,21 +574,20 @@ class AiVcStore:
 
         # identical content as previous HEAD → store as full pointer to same object
         prev_hash = chain[-1].get("content_hash") if chain else None
-        if prev_hash == ch and chain:
-            # reuse previous object (dedup), mark kind=full for cheap materialize
+        content_unchanged = bool(prev_hash == ch and chain)
+        if content_unchanged:
+            # reuse previous object (dedup), mark storage_kind=full for cheap materialize
             obj_h = chain[-1]["object"]
-            kind = "full"
+            storage_kind = "full"
             stored_bytes = self.object_size(obj_h)
         elif use_full:
             obj_h = self.put_object(raw, kind="full")
-            kind = "full"
+            storage_kind = "full"
             stored_bytes = self.object_size(obj_h)
-            # free the base from RAM after write
             last_full_raw = None
         else:
             assert last_full_raw is not None
-            # delta against the *previous materialized state* (HEAD), not only last full:
-            # better ratios for sequential edits. Materialize HEAD once.
+            # delta against HEAD (previous materialized state) for better ratios
             try:
                 head_raw = self.materialize(doc_id, chain[-1]["id"])
             except Exception:  # noqa: BLE001
@@ -551,16 +596,23 @@ class AiVcStore:
             # if delta is not a win, fall back to full
             if len(delta) >= len(raw) * 0.95:
                 obj_h = self.put_object(raw, kind="full")
-                kind = "full"
+                storage_kind = "full"
             else:
                 obj_h = self.put_object(delta, kind="delta")
-                kind = "delta"
+                storage_kind = "delta"
             stored_bytes = self.object_size(obj_h)
-            # drop base from RAM
             del head_raw
             last_full_raw = None
 
         now = time.time()
+        call_rec = None
+        if isinstance(call, dict) and call:
+            call_rec = {
+                "turn": call.get("turn", turn_id),
+                "i": call.get("i", 0),
+            }
+        feat_n = _features_count(
+            content if not isinstance(content, (bytes, bytearray)) else raw)
         rec = {
             "id": cid,
             "doc_id": doc_id,
@@ -568,9 +620,10 @@ class AiVcStore:
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "label": label or str(op_batch),
-            "features": _features_count(content if not isinstance(content, (bytes, bytearray)) else raw),
-            "features_count": _features_count(content if not isinstance(content, (bytes, bytearray)) else raw),
-            "kind": kind,
+            "features": feat_n,
+            "features_count": feat_n,
+            "kind": event_kind,              # prompt | tool (v2 timeline)
+            "storage_kind": storage_kind,    # full | delta (encoding)
             "object": obj_h,
             "content_hash": ch,
             "session_id": session_id,
@@ -578,6 +631,9 @@ class AiVcStore:
             "stored_bytes": stored_bytes,
             "raw_bytes": len(raw),
             "authored_by": get_authored_by(doc_id),
+            "msg_idx": msg_idx,
+            "call": call_rec,
+            "content_unchanged": content_unchanged,
         }
         self._append_chain(doc_id, rec)
         meta = self._read_meta(doc_id)
@@ -590,8 +646,10 @@ class AiVcStore:
         })
         self._write_meta(doc_id, meta)
         self._apply_retention(doc_id, session_id)
+        _notify_cad_graph(project_dir=project_dir, doc_id=doc_id)
         return {"ok": True, "id": cid, "dedup": False, "record": rec,
-                "authored_by": rec["authored_by"]}
+                "authored_by": rec["authored_by"],
+                "content_unchanged": content_unchanged}
 
     def _apply_retention(self, doc_id: str, session_id: str | None) -> None:
         """Thin older sessions when keep_last > 0; keep all within current session."""
@@ -632,7 +690,12 @@ class AiVcStore:
 
     @staticmethod
     def _public_cp(r: dict[str, Any]) -> dict[str, Any]:
-        return {
+        # Event kind for timeline: prompt|tool. Fall back for v1 records that
+        # stored full|delta in kind — surface as tool (post-mutation checkpoint).
+        event_kind = r.get("kind")
+        if event_kind in ("full", "delta") or not event_kind:
+            event_kind = "tool"
+        out = {
             "id": r.get("id"),
             "turn": r.get("turn"),
             "label": r.get("label") or "",
@@ -640,22 +703,74 @@ class AiVcStore:
             "when": r.get("when") or r.get("time") or "",
             "features": r.get("features", r.get("features_count", 0)),
             "features_count": r.get("features_count", r.get("features", 0)),
-            "kind": r.get("kind"),
+            "kind": event_kind,
             "content_hash": r.get("content_hash"),
             "authored_by": r.get("authored_by"),
             "doc_id": r.get("doc_id"),
             "stored_bytes": r.get("stored_bytes", 0),
             "raw_bytes": r.get("raw_bytes", 0),
+            "msg_idx": r.get("msg_idx"),
+            "call": r.get("call"),
+            "storage_kind": AiVcStore._storage_kind_of(r),
         }
+        return out
 
     def resolve_target(self, doc_id: str, to: str) -> dict[str, Any]:
-        """Resolve *to* (checkpoint id | 'turn:N' | '-N') to a chain record."""
+        """Resolve *to* to a chain record.
+
+        Accepted forms:
+          * bare checkpoint id
+          * ``turn:N``
+          * ``-N`` (relative from HEAD; -1 = HEAD)
+          * ``msg:<idx>`` — state before that user message (prompt kind)
+          * ``call:<turn>:<i>`` — state before that tool call
+        """
         chain = self.read_chain(doc_id)
         if not chain:
             raise KeyError("no checkpoints")
         to = str(to or "").strip()
         if not to:
             raise ValueError("empty rollback target")
+        if to.startswith("msg:"):
+            want = to.split(":", 1)[1]
+            try:
+                want_i = int(want)
+            except ValueError as e:
+                raise KeyError(f"invalid msg target {to}") from e
+            for r in reversed(chain):
+                mi = r.get("msg_idx")
+                if mi is None:
+                    continue
+                if int(mi) == want_i and r.get("kind") == "prompt":
+                    return r
+            # fallback: any checkpoint with that msg_idx (oldest first = before)
+            for r in chain:
+                mi = r.get("msg_idx")
+                if mi is not None and int(mi) == want_i:
+                    return r
+            raise KeyError(f"no checkpoint for msg {want}")
+        if to.startswith("call:"):
+            parts = to.split(":")
+            # call:<turn>:<i>
+            if len(parts) < 3:
+                raise KeyError(f"invalid call target {to}")
+            try:
+                want_turn = int(parts[1])
+                want_i = int(parts[2])
+            except ValueError as e:
+                raise KeyError(f"invalid call target {to}") from e
+            for r in reversed(chain):
+                c = r.get("call") or {}
+                if not isinstance(c, dict):
+                    continue
+                ct = c.get("turn")
+                ci = c.get("i")
+                try:
+                    if int(ct) == want_turn and int(ci) == want_i:
+                        return r
+                except (TypeError, ValueError):
+                    continue
+            raise KeyError(f"no checkpoint for call {want_turn}:{want_i}")
         if to.startswith("turn:"):
             want = to.split(":", 1)[1]
             try:
@@ -668,9 +783,7 @@ class AiVcStore:
             raise KeyError(f"no checkpoint for turn {want}")
         if to.startswith("-") and to[1:].isdigit():
             n = int(to)
-            # -1 = previous (HEAD-1? or HEAD?). Contract: -N relative steps back
-            # from HEAD. -1 = HEAD (most recent), -2 = one before, …
-            # Common git-ish: -1 = last. We'll treat -1 as HEAD, -2 as HEAD-1.
+            # -1 = HEAD (most recent), -2 = one before, …
             idx = len(chain) + n  # n negative
             if idx < 0 or idx >= len(chain):
                 raise KeyError(f"relative target {to} out of range")
@@ -692,7 +805,8 @@ class AiVcStore:
     ) -> dict[str, Any]:
         """Restore *doc_id* to target *to*. Applies *restore_fn(doc_id, bytes)* if given.
 
-        Always logs a ledger event when *ledger* is provided.
+        Always logs a ledger event when *ledger* is provided. Returns
+        ``chat_truncate_to`` (msg_idx) so the chat UI can rewind the transcript.
         """
         rec = self.resolve_target(doc_id, to)
         data = self.materialize(doc_id, rec["id"])
@@ -706,6 +820,10 @@ class AiVcStore:
         meta["head"] = rec["id"]
         meta["rolled_back_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self._write_meta(doc_id, meta)
+        chat_truncate_to = rec.get("msg_idx")
+        if chat_truncate_to is None and isinstance(rec.get("call"), dict):
+            # tool checkpoint: truncate to the turn that owned the call
+            chat_truncate_to = rec["call"].get("turn")
         if ledger is not None:
             try:
                 ledger.append(actor, "ai_vc_rollback", {
@@ -714,6 +832,7 @@ class AiVcStore:
                     "checkpoint_id": rec["id"],
                     "turn": rec.get("turn"),
                     "content_hash": rec.get("content_hash"),
+                    "chat_truncate_to": chat_truncate_to,
                 })
             except Exception:  # noqa: BLE001
                 pass
@@ -725,6 +844,9 @@ class AiVcStore:
             "via": "restore_fn" if applied else "materialize",
             "content": data,  # caller may drop; tests use it
             "engine_result": engine_result,
+            "chat_truncate_to": chat_truncate_to,
+            "msg_idx": rec.get("msg_idx"),
+            "kind": rec.get("kind"),
         }
 
     # -- storage stats -----------------------------------------------------
@@ -842,6 +964,19 @@ _CREATE_TOOLS = frozenset({
 })
 
 
+def _notify_cad_graph(*, project_dir: str | None = None,
+                      doc_id: str | None = None) -> None:
+    """Best-effort: tell CadGraph to rebuild after a successful AI-VC checkpoint."""
+    try:
+        from services.plm import cad_graph as _cg  # noqa: PLC0415
+    except ImportError:
+        return
+    try:
+        _cg.on_ai_vc_checkpoint(project_dir=project_dir, doc_id=doc_id)
+    except Exception:  # noqa: BLE001 — never break VC path
+        pass
+
+
 def _doc_id_from_args_result(tool: str, args: dict | None, result: Any) -> str | None:
     args = args or {}
     if isinstance(args, dict) and args.get("doc_id"):
@@ -870,6 +1005,237 @@ def _op_batch_from(tool: str, args: dict | None) -> Any:
     return {"tool": tool, "args": body} if body else tool
 
 
+def _prompt_label(text: str, limit: int = 60) -> str:
+    s = " ".join(str(text or "").split())
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _is_mutating(tool: str) -> bool:
+    try:
+        from services.agent.guardrails import is_mutating_tool  # noqa: PLC0415
+        return bool(is_mutating_tool(tool))
+    except Exception:  # noqa: BLE001
+        return tool in {
+            "add_features", "doc_apply_ops", "new_part", "new_assembly",
+            "asm_add_component", "asm_mate", "part_place", "set_material",
+            "delete_feature", "remove_feature", "regen_resolve",
+        }
+
+
+def _stamp_from_tool(tool: str, doc_id: str | None) -> None:
+    if not doc_id:
+        return
+    if tool in _CREATE_TOOLS:
+        stamp_authored(doc_id, "agent")
+    elif _is_mutating(tool):
+        stamp_authored(doc_id, "agent")
+
+
+def on_prompt_start(
+    prompt: str,
+    *,
+    doc_id: str | None = None,
+    msg_idx: int | None = None,
+    turn_id: Any = None,
+    session_id: str | None = None,
+    content: Any | None = None,
+    store: AiVcStore | None = None,
+    capture_fn: Callable[[str], bytes] | None = None,
+    cfg: dict | None = None,
+    ledger: Any = None,
+    actor: str = "ai_vc",
+    project_dir: str | None = None,
+) -> dict[str, Any] | None:
+    """v2: checkpoint BEFORE a user prompt turn starts (kind=prompt).
+
+    Label = first ~60 chars of the prompt. Content-hash dedup applies: if the
+    doc state is unchanged, no new full snapshot blob is written.
+    """
+    cfg_r = load_ai_vc_config(cfg)
+    if not cfg_r.get("enabled", True):
+        return None
+
+    if doc_id is None:
+        d = _SESSION_TURN.get("doc_id")
+        doc_id = str(d) if d else None
+    if not doc_id:
+        return None
+    # Prompt checkpoints only apply to agent/mixed policy docs (or first AI touch).
+    if not is_ai_policy_doc(doc_id) and doc_id not in _AUTHORED_BY:
+        # Unknown doc at prompt time: do not force-stamp; skip.
+        return None
+    if not is_ai_policy_doc(doc_id):
+        return None
+
+    if msg_idx is None:
+        mi = _SESSION_TURN.get("msg_idx")
+        msg_idx = int(mi) if mi is not None else None
+    if turn_id is None:
+        # Prefer msg_idx as the turn ordinal for prompt checkpoints.
+        turn_id = msg_idx if msg_idx is not None else _SESSION_TURN.get("turn_id", 0)
+    if session_id is None:
+        session_id = _SESSION_TURN.get("session_id")
+
+    set_session_context(session_id=session_id, turn_id=turn_id,
+                        msg_idx=msg_idx, doc_id=doc_id)
+
+    label = _prompt_label(prompt)
+    op_batch = {"kind": "prompt", "msg_idx": msg_idx, "label": label}
+
+    st = store or get_store(cfg=cfg)
+    try:
+        if content is not None:
+            raw = content
+        elif capture_fn is not None:
+            raw = capture_fn(doc_id)
+        else:
+            raw = capture_doc_bytes(doc_id, content=None)
+    except Exception as exc:  # noqa: BLE001
+        if ledger is not None:
+            try:
+                ledger.append(actor, "ai_vc_checkpoint", {
+                    "ok": False, "doc_id": doc_id, "kind": "prompt",
+                    "error": str(exc),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
+
+    out = st.checkpoint(
+        doc_id, raw,
+        turn_id=turn_id,
+        op_batch=op_batch,
+        label=label,
+        session_id=session_id,
+        kind="prompt",
+        msg_idx=msg_idx,
+        project_dir=project_dir,
+    )
+    if ledger is not None:
+        try:
+            ledger.append(actor, "ai_vc_checkpoint", {
+                "ok": True,
+                "doc_id": doc_id,
+                "kind": "prompt",
+                "checkpoint_id": out.get("id"),
+                "dedup": out.get("dedup"),
+                "content_unchanged": out.get("content_unchanged"),
+                "msg_idx": msg_idx,
+                "turn": turn_id,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def on_before_tool(
+    tool: str,
+    args: dict | None,
+    *,
+    turn_id: Any = None,
+    call_i: int | None = None,
+    msg_idx: int | None = None,
+    session_id: str | None = None,
+    content: Any | None = None,
+    store: AiVcStore | None = None,
+    capture_fn: Callable[[str], bytes] | None = None,
+    cfg: dict | None = None,
+    ledger: Any = None,
+    actor: str = "ai_vc",
+    project_dir: str | None = None,
+    result: Any = None,
+) -> dict[str, Any] | None:
+    """v2: checkpoint BEFORE a mutating tool call (kind=tool, label=tool name).
+
+    ``call:{turn, i}`` uses turn=msg_idx when provided, else the internal turn
+    ordinal. Idempotent + content-hash dedup as v1.
+    """
+    cfg_r = load_ai_vc_config(cfg)
+    if not cfg_r.get("enabled", True):
+        return None
+    if not _is_mutating(tool):
+        return None
+
+    doc_id = _doc_id_from_args_result(tool, args, result)
+    # Create tools may not have doc_id until after success — pre-checkpoint only
+    # when we already know the doc.
+    if not doc_id:
+        d = _SESSION_TURN.get("doc_id")
+        doc_id = str(d) if d else None
+    if not doc_id:
+        return None
+
+    _stamp_from_tool(tool, doc_id)
+    if not is_ai_policy_doc(doc_id):
+        return None
+
+    if msg_idx is None:
+        mi = _SESSION_TURN.get("msg_idx")
+        msg_idx = int(mi) if mi is not None else None
+    if turn_id is None:
+        turn_id = msg_idx if msg_idx is not None else _SESSION_TURN.get("turn_id", 0)
+    if session_id is None:
+        session_id = _SESSION_TURN.get("session_id")
+    if call_i is None:
+        call_i = 0
+
+    call = {"turn": int(turn_id) if str(turn_id).lstrip("-").isdigit() else turn_id,
+            "i": int(call_i)}
+    # Distinct op_batch from post-success so both can coexist if both fire.
+    op_batch = {"kind": "tool", "tool": tool, "call": call,
+                "args": _op_batch_from(tool, args)}
+
+    st = store or get_store(cfg=cfg)
+    try:
+        if content is not None:
+            raw = content
+        elif capture_fn is not None:
+            raw = capture_fn(doc_id)
+        else:
+            raw = capture_doc_bytes(doc_id, content=None)
+    except Exception as exc:  # noqa: BLE001
+        if ledger is not None:
+            try:
+                ledger.append(actor, "ai_vc_checkpoint", {
+                    "ok": False, "doc_id": doc_id, "tool": tool, "kind": "tool",
+                    "error": str(exc),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
+
+    out = st.checkpoint(
+        doc_id, raw,
+        turn_id=turn_id,
+        op_batch=op_batch,
+        label=tool,
+        session_id=session_id,
+        kind="tool",
+        msg_idx=msg_idx,
+        call=call,
+        project_dir=project_dir,
+    )
+    if ledger is not None:
+        try:
+            ledger.append(actor, "ai_vc_checkpoint", {
+                "ok": True,
+                "doc_id": doc_id,
+                "tool": tool,
+                "kind": "tool",
+                "checkpoint_id": out.get("id"),
+                "dedup": out.get("dedup"),
+                "content_unchanged": out.get("content_unchanged"),
+                "msg_idx": msg_idx,
+                "call": call,
+                "turn": turn_id,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def on_ai_tool_success(
     tool: str,
     args: dict | None,
@@ -883,58 +1249,53 @@ def on_ai_tool_success(
     cfg: dict | None = None,
     ledger: Any = None,
     actor: str = "ai_vc",
+    msg_idx: int | None = None,
+    call_i: int | None = None,
+    project_dir: str | None = None,
+    before: bool = False,
 ) -> dict[str, Any] | None:
-    """Silent auto-VC after a successful mutating AI tool call.
+    """Silent auto-VC for a mutating AI tool call.
 
-    Returns the checkpoint envelope, or None when the policy does not apply
-    (non-mutating, user-only doc, disabled, capture failure).
+    v2 default path is *before* the tool (``on_before_tool``). When *before*
+    is True this delegates there. Post-success remains for create tools that
+    only receive a doc_id after the call, and for back-compat callers.
     """
+    if before:
+        return on_before_tool(
+            tool, args,
+            turn_id=turn_id, call_i=call_i, msg_idx=msg_idx,
+            session_id=session_id, content=content, store=store,
+            capture_fn=capture_fn, cfg=cfg, ledger=ledger, actor=actor,
+            project_dir=project_dir, result=result,
+        )
+
     cfg_r = load_ai_vc_config(cfg)
     if not cfg_r.get("enabled", True):
         return None
 
-    # Import here to avoid cycles; MUTATING_TOOLS is the single source of truth.
-    try:
-        from services.agent.guardrails import (  # noqa: PLC0415
-            MUTATING_TOOLS, is_mutating_tool,
-        )
-    except Exception:  # noqa: BLE001
-        MUTATING_TOOLS = frozenset()  # type: ignore
-        def is_mutating_tool(t: str) -> bool:  # type: ignore
-            return t in {
-                "add_features", "doc_apply_ops", "new_part", "new_assembly",
-                "asm_add_component", "asm_mate", "part_place", "set_material",
-                "delete_feature", "remove_feature", "regen_resolve",
-            }
-
     doc_id = _doc_id_from_args_result(tool, args, result)
-    if tool in _CREATE_TOOLS and doc_id:
-        stamp_authored(doc_id, "agent")
-    elif doc_id and is_mutating_tool(tool):
-        # agent mutation: if previously user → mixed; if unknown → agent
-        prev = get_authored_by(doc_id)
-        if prev == "user" and doc_id in _AUTHORED_BY:
-            stamp_authored(doc_id, "agent")  # → mixed
-        elif doc_id not in _AUTHORED_BY:
-            # First touch via AI path without an explicit user mark → agent.
-            stamp_authored(doc_id, "agent")
-        else:
-            stamp_authored(doc_id, "agent")
+    _stamp_from_tool(tool, doc_id)
 
-    if not is_mutating_tool(tool):
+    if not _is_mutating(tool):
         return None
     if not doc_id:
         return None
     if not is_ai_policy_doc(doc_id):
-        # User-authored and never AI-touched → leave alone.
         return None
 
     st = store or get_store(cfg=cfg)
     op_batch = _op_batch_from(tool, args)
+    if msg_idx is None:
+        mi = _SESSION_TURN.get("msg_idx")
+        msg_idx = int(mi) if mi is not None else None
     if turn_id is None:
-        turn_id = _SESSION_TURN.get("turn_id", 0)
+        turn_id = msg_idx if msg_idx is not None else _SESSION_TURN.get("turn_id", 0)
     if session_id is None:
         session_id = _SESSION_TURN.get("session_id")
+    if call_i is None:
+        call_i = 0
+    call = {"turn": int(turn_id) if str(turn_id).lstrip("-").isdigit() else turn_id,
+            "i": int(call_i)}
 
     try:
         if content is not None:
@@ -954,13 +1315,17 @@ def on_ai_tool_success(
                 pass
         return {"ok": False, "reason": "capture_failed", "hint": str(exc)}
 
-    label = tool if not isinstance(op_batch, dict) else tool
+    label = tool
     out = st.checkpoint(
         doc_id, raw,
         turn_id=turn_id,
         op_batch=op_batch,
         label=label,
         session_id=session_id,
+        kind="tool",
+        msg_idx=msg_idx,
+        call=call,
+        project_dir=project_dir,
     )
     if ledger is not None:
         try:
@@ -968,8 +1333,12 @@ def on_ai_tool_success(
                 "ok": True,
                 "doc_id": doc_id,
                 "tool": tool,
+                "kind": "tool",
                 "checkpoint_id": out.get("id"),
                 "dedup": out.get("dedup"),
+                "content_unchanged": out.get("content_unchanged"),
+                "msg_idx": msg_idx,
+                "call": call,
                 "turn": turn_id,
             })
         except Exception:  # noqa: BLE001
@@ -999,13 +1368,17 @@ def plm_rollback(doc_id: str | None = None, to: str = "",
                  ledger: Any = None) -> dict[str, Any]:
     if not to:
         return {"ok": False, "reason": "invalid_mode",
-                "hint": "give a checkpoint id, turn:N, or -N to roll back to"}
+                "hint": ("give a checkpoint id, turn:N, -N, msg:<idx>, "
+                         "or call:<turn>:<i> to roll back to")}
     st = store or get_store()
     # If doc_id omitted, try to find the checkpoint across docs.
     if not doc_id:
         tl = st.timeline(None)
         match = next((c for c in tl.get("checkpoints", [])
-                      if c.get("id") == to or (to.startswith("turn:"))), None)
+                      if c.get("id") == to
+                      or to.startswith("turn:")
+                      or to.startswith("msg:")
+                      or to.startswith("call:")), None)
         if match and match.get("doc_id"):
             doc_id = match["doc_id"]
         elif tl.get("checkpoints"):

@@ -148,12 +148,13 @@ def status() -> dict:
 
     Backward-compatible shape: top-level fields describe the ACTIVE account.
     Also includes ``accounts`` (list of named accounts with active flags).
+    Optional identity fields (display_name, plan) from §4.5 when known.
     """
     out: dict[str, dict] = {}
     for friendly, (_name, cred_id, label) in _PROVIDERS.items():
         cred = sub_auth.load_credential(cred_id)  # active account
         accts = sub_auth.list_accounts(cred_id)
-        out[friendly] = {
+        entry = {
             "label": label,
             "connected": bool(cred),
             "email": (cred or {}).get("email"),
@@ -161,6 +162,12 @@ def status() -> dict:
             "expires_at_ms": (cred or {}).get("expires_at_ms"),
             "accounts": accts,
         }
+        if cred:
+            if cred.get("display_name"):
+                entry["display_name"] = cred.get("display_name")
+            if cred.get("plan"):
+                entry["plan"] = cred.get("plan")
+        out[friendly] = entry
     return out
 
 
@@ -184,14 +191,19 @@ def accounts(provider: str | None = None) -> list[dict]:
     out: list[dict] = []
     for friendly, cred_id, _label in targets:
         for acct in sub_auth.list_accounts(cred_id):
-            out.append({
+            item = {
                 "provider": friendly,
                 "account_id": acct["account_id"],
                 "label": acct.get("label") or acct.get("email") or acct["account_id"],
                 "email": acct.get("email"),
                 "active": bool(acct.get("active")),
                 "connected": True,
-            })
+            }
+            if acct.get("display_name"):
+                item["display_name"] = acct.get("display_name")
+            if acct.get("plan"):
+                item["plan"] = acct.get("plan")
+            out.append(item)
     return out
 
 

@@ -117,6 +117,17 @@ class CursorSubProvider(Provider):
             "account_id": None,
             "email": None,
         }
+        # Preserve identity across refresh when the poll payload omits it.
+        if self._cred:
+            for k in ("email", "display_name", "plan", "account_id"):
+                if self._cred.get(k) and not cred.get(k):
+                    cred[k] = self._cred[k]
+        # Best-effort stripe profile for membershipType / email.
+        try:
+            from . import usage as usage_mod
+            cred = usage_mod.enrich_cursor_profile(cred)
+        except Exception:
+            pass
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

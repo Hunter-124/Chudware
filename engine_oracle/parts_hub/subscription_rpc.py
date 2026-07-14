@@ -1,9 +1,9 @@
-"""Worker-RPC bridge for subscription-auth logins (§4.4) — the GUI Settings seam.
+"""Worker-RPC bridge for subscription-auth logins (§4.4 / §4.5) — the GUI Settings seam.
 
 Exposes ``subscription_status`` / ``subscription_login`` / ``subscription_logout`` /
-``subscription_accounts`` / ``subscription_switch`` as engine-worker methods so the
-C++/ImGui Settings panel reaches them over the same newline-delimited-JSON worker seam
-(``WorkerClient``) it uses for everything else.
+``subscription_accounts`` / ``subscription_switch`` / ``subscription_usage`` as
+engine-worker methods so the C++/ImGui Settings panel reaches them over the same
+newline-delimited-JSON worker seam (``WorkerClient``) it uses for everything else.
 
 ``subscription_login`` runs the browser OAuth flow on a daemon thread and returns
 IMMEDIATELY — the flow blocks up to ~120 s waiting on the local callback, and blocking the
@@ -20,8 +20,11 @@ Multi-account: ``subscription_accounts`` lists named accounts per provider;
 ``subscription_switch`` flips the active account; login/logout accept optional
 ``account_id``. Old call shapes remain valid (GUI still polls ``subscription_status``).
 
-Thin wrappers over :mod:`agent.providers.subscription_login`; all failures come back as a
-contract-shaped ``{"ok": false, "reason", "hint"}`` — never a traceback.
+``subscription_usage`` (§4.5) returns normalized per-account usage rows with optional
+``provider`` filter. GUI degrades to hidden when the method is unknown.
+
+Thin wrappers over :mod:`agent.providers.subscription_login` / ``usage``; all failures
+come back as a contract-shaped ``{"ok": false, "reason", "hint"}`` — never a traceback.
 """
 from __future__ import annotations
 
@@ -206,11 +209,36 @@ def _subscription_switch(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"subscription_switch failed: {exc}", "hint": ""}
 
 
+def _subscription_usage(params: dict, _emit: Callable) -> dict:
+    """Normalized per-account usage rows (contracts/providers.md §4.5).
+
+    Params: optional ``provider`` (friendly id), optional ``force`` to bypass cache.
+    Returns ``{ok, rows:[{provider, account_id, display_name, plan, usage:[...]}]}``.
+    """
+    try:
+        from agent.providers import usage as usage_mod
+
+        raw = (params or {}).get("provider")
+        provider = str(raw).strip().lower() if raw else None
+        if provider == "":
+            provider = None
+        force = bool((params or {}).get("force", False))
+        return usage_mod.subscription_usage(provider, force=force)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "reason": f"subscription_usage failed: {exc}",
+            "hint": "",
+            "rows": [],
+        }
+
+
 SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_status": _subscription_status,
     "subscription_login": _subscription_login,
     "subscription_logout": _subscription_logout,
     "subscription_accounts": _subscription_accounts,
     "subscription_switch": _subscription_switch,
+    "subscription_usage": _subscription_usage,
 }
 

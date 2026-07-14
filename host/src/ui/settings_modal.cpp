@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -20,7 +22,6 @@
 #include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
-#include <map>
 
 
 // ---- C22b prompt editor state ----
@@ -163,13 +164,26 @@ static void applyThemeNow(AppState& st, bool light) {
 }
 // ---- Subscription accounts (Settings → AI → Accounts) ----------------------
 // Consumes subscription_accounts / subscription_switch / subscription_login /
-// subscription_logout. Polls subscription_status for device-code UX fields.
+// subscription_logout / subscription_usage. Polls subscription_status for
+// device-code UX fields. Usage is optional per contracts/providers.md §4.5 —
+// absent fields degrade to a dim "usage unavailable" row.
+struct SubUsageWindow {
+    std::string window;       // e.g. "5h", "7d"
+    std::string label;        // display label
+    float usedFraction = 0.f; // 0..1
+    std::string resetsAt;     // iso8601
+    std::string status;       // ok|warn|blocked|unknown
+};
 struct SubAccountRow {
     std::string provider;
     std::string accountId;
-    std::string label;
+    std::string label;       // email / label fallback
+    std::string displayName; // optional §4.5
+    std::string plan;        // optional §4.5 plan chip
     bool active = false;
     bool connected = false;
+    bool hasUsage = false;   // true when usage array present (may be empty)
+    std::vector<SubUsageWindow> usage;
 };
 struct SubLoginProgress {
     bool inProgress = false;
@@ -182,8 +196,12 @@ struct SubLoginProgress {
 struct SubAccountsUi {
     std::vector<SubAccountRow> rows;
     std::map<std::string, SubLoginProgress> login;  // by provider friendly id
-    double lastPoll = -1e9;
-    bool pollInFlight = false;
+    double lastAccountsPoll = -1e9;
+    double lastUsagePoll = -1e9;
+    bool accountsPollInFlight = false;
+    bool usagePollInFlight = false;
+    bool usageRpcMissing = false;  // unknown_method → stop polling, dim degrade
+    int  lastDrawnFrame = -100;    // edge-detect section open for forced usage poll
     std::string lastError;
 };
 static SubAccountsUi s_subAccts;
@@ -191,16 +209,219 @@ static SubAccountsUi s_subAccts;
 static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor"};
 static const char* kSubProviderLabels[] = {
     "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor"};
+// 5-minute usage poll while the Accounts section is visible (§4.5).
+static constexpr double kUsagePollIntervalSec = 5.0 * 60.0;
+static constexpr double kAccountsPollIntervalSec = 1.5;
+
+// Parse optional usage array from an account / usage-row object.
+static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
+    row.usage.clear();
+    row.hasUsage = false;
+    auto it = src.find("usage");
+    if (it == src.end() || !it->is_array()) return;
+    row.hasUsage = true;
+    for (const auto& u : *it) {
+        if (!u.is_object()) continue;
+        SubUsageWindow w;
+        w.window = u.value("window", std::string());
+        w.label  = u.value("label", std::string());
+        if (w.label.empty()) w.label = w.window.empty() ? "Usage" : w.window;
+        if (u.contains("used_fraction") && u["used_fraction"].is_number())
+            w.usedFraction = (float)std::clamp(u["used_fraction"].get<double>(), 0.0, 1.0);
+        w.resetsAt = u.value("resets_at", std::string());
+        w.status   = u.value("status", std::string("unknown"));
+        if (w.status.empty()) w.status = "unknown";
+        row.usage.push_back(std::move(w));
+    }
+}
+
+// Fill optional identity fields from an accounts/status row (absent = unknown).
+static void parseAccountIdentity(const nlohmann::json& a, SubAccountRow& row) {
+    row.displayName = a.value("display_name", std::string());
+    row.plan        = a.value("plan", std::string());
+    // Prefer explicit email, then label, then account_id.
+    row.label = a.value("email", std::string());
+    if (row.label.empty()) row.label = a.value("label", std::string());
+    if (row.label.empty())
+        row.label = row.accountId.empty() ? "(account)" : row.accountId;
+    parseUsageWindows(a, row);
+}
+
+// Merge usage rows from subscription_usage into existing account rows by
+// (provider, account_id). Accounts poll is the source of truth for membership.
+static void mergeUsageRows(const nlohmann::json& rows) {
+    if (!rows.is_array()) return;
+    for (const auto& r : rows) {
+        if (!r.is_object()) continue;
+        const std::string prov = r.value("provider", std::string());
+        const std::string aid  = r.value("account_id", std::string());
+        for (auto& row : s_subAccts.rows) {
+            if (row.provider != prov) continue;
+            if (!aid.empty() && row.accountId != aid) continue;
+            if (r.contains("display_name") && r["display_name"].is_string()) {
+                const std::string dn = r["display_name"].get<std::string>();
+                if (!dn.empty()) row.displayName = dn;
+            }
+            if (r.contains("plan") && r["plan"].is_string()) {
+                const std::string pl = r["plan"].get<std::string>();
+                if (!pl.empty()) row.plan = pl;
+            }
+            parseUsageWindows(r, row);
+            if (aid.empty()) break;  // no account_id: first matching provider only
+        }
+    }
+}
+
+// Human countdown from an ISO-8601 timestamp ("resets in 2h 14m"). Empty on parse fail.
+static std::string formatResetCountdown(const std::string& iso) {
+    if (iso.empty()) return {};
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6)
+        return {};
+    std::tm tm{};
+    tm.tm_year = y - 1900;
+    tm.tm_mon  = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min  = mi;
+    tm.tm_sec  = s;
+#if defined(_WIN32)
+    const time_t target = _mkgmtime(&tm);
+#else
+    const time_t target = timegm(&tm);
+#endif
+    if (target == (time_t)-1) return {};
+    const time_t now = std::time(nullptr);
+    long long delta = (long long)(target - now);
+    if (delta <= 0) return "resets soon";
+    const long long days = delta / 86400;
+    delta %= 86400;
+    const long long hours = delta / 3600;
+    delta %= 3600;
+    const long long mins = delta / 60;
+    char buf[64];
+    if (days > 0)
+        std::snprintf(buf, sizeof(buf), "resets in %lldd %lldh", days, hours);
+    else if (hours > 0)
+        std::snprintf(buf, sizeof(buf), "resets in %lldh %lldm", hours, mins);
+    else
+        std::snprintf(buf, sizeof(buf), "resets in %lldm", mins);
+    return buf;
+}
+
+static const float* usageStatusColor(const std::string& status, float frac) {
+    if (status == "blocked") return ui::palette.statusErr;
+    if (status == "warn")    return ui::palette.statusWarn;
+    if (status == "ok")      return ui::palette.statusOk;
+    // unknown / empty: derive from fraction thresholds (matches context meter).
+    if (frac >= 0.95f) return ui::palette.statusErr;
+    if (frac >= 0.75f) return ui::palette.statusWarn;
+    return ui::palette.statusOk;
+}
+
+// Small plan pill (chipBg fill + accent border/text). No-op when plan empty.
+static void drawPlanChip(const std::string& plan, float sc) {
+    if (plan.empty()) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 ts = ImGui::CalcTextSize(plan.c_str());
+    const ImVec2 p  = ImGui::GetCursorScreenPos();
+    const float  h  = ts.y + 4.0f * sc;
+    const float  wd = ts.x + 12.0f * sc;
+    const auto& pal = ui::palette;
+    dl->AddRectFilled(p, ImVec2(p.x + wd, p.y + h),
+                      ui::Palette::toU32(pal.chipBg), h * 0.5f);
+    dl->AddRect(p, ImVec2(p.x + wd, p.y + h),
+                ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f)),
+                h * 0.5f, 0, 1.0f * sc);
+    dl->AddText(ImVec2(p.x + 6.0f * sc, p.y + 2.0f * sc),
+                ui::Palette::toU32(pal.accent), plan.c_str());
+    ImGui::Dummy(ImVec2(wd, h));
+}
+
+// One usage window: label + fraction bar + reset countdown, colored by status.
+static void drawUsageWindow(const SubUsageWindow& w, float sc) {
+    const auto& pal = ui::palette;
+    const float* role = usageStatusColor(w.status, w.usedFraction);
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(role[0], role[1], role[2], 1.0f));
+    ImGui::TextUnformatted(w.label.c_str());
+    ImGui::PopStyleColor();
+
+    const std::string countdown = formatResetCountdown(w.resetsAt);
+    char pctBuf[32];
+    std::snprintf(pctBuf, sizeof(pctBuf), "%.0f%%", w.usedFraction * 100.0f);
+
+    // Bar + percent + countdown on one row.
+    const float barH = 6.0f * sc;
+    const float barW = ImGui::GetContentRegionAvail().x;
+    char right[96];
+    if (!countdown.empty())
+        std::snprintf(right, sizeof(right), "%s  %s", pctBuf, countdown.c_str());
+    else
+        std::snprintf(right, sizeof(right), "%s", pctBuf);
+    const float rightW = ImGui::CalcTextSize(right).x + 8.0f * sc;
+    const float trackW = std::max(40.0f * sc, barW - rightW);
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float by0 = p.y + (ImGui::GetTextLineHeight() - barH) * 0.5f;
+    const float by1 = by0 + barH;
+    dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + trackW, by1),
+                      ui::Palette::toU32(pal.accentSoft), 2.0f * sc);
+    if (w.usedFraction > 0.f) {
+        dl->AddRectFilled(ImVec2(p.x, by0),
+                          ImVec2(p.x + trackW * w.usedFraction, by1),
+                          ImGui::ColorConvertFloat4ToU32(
+                              ImVec4(role[0], role[1], role[2], 0.95f)),
+                          2.0f * sc);
+    }
+    ImGui::Dummy(ImVec2(trackW, ImGui::GetTextLineHeight()));
+    ImGui::SameLine(0, 6.0f * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    ImGui::TextUnformatted(right);
+    ImGui::PopStyleColor();
+}
+
+static void pollSubscriptionUsage(AppState& st, bool force) {
+    if (s_subAccts.usageRpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_subAccts.lastUsagePoll) < kUsagePollIntervalSec) return;
+    if (s_subAccts.usagePollInFlight) return;
+    s_subAccts.lastUsagePoll = now;
+    s_subAccts.usagePollInFlight = true;
+    st.rpc.call("subscription_usage", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_subAccts.usagePollInFlight = false;
+        if (!r.ok) {
+            // unknown_method / worker down — keep last usage; mark missing once so we
+            // stop hammering and the UI stays on the dim "usage unavailable" path.
+            const std::string& err = r.err;
+            if (err.find("unknown_method") != std::string::npos ||
+                err.find("unknown method") != std::string::npos ||
+                err.find("not found") != std::string::npos) {
+                s_subAccts.usageRpcMissing = true;
+            }
+            return;
+        }
+        if (!r.result.is_object()) return;
+        if (r.result.value("ok", true) == false) {
+            // Soft failure (e.g. 429 / provider outage) — leave prior usage alone.
+            return;
+        }
+        mergeUsageRows(r.result.value("rows", nlohmann::json::array()));
+    });
+}
 
 static void pollSubscriptionAccounts(AppState& st, bool force) {
     const double now = ImGui::GetTime();
-    if (!force && (now - s_subAccts.lastPoll) < 1.5) return;
-    if (s_subAccts.pollInFlight) return;
-    s_subAccts.lastPoll = now;
-    s_subAccts.pollInFlight = true;
+    if (!force && (now - s_subAccts.lastAccountsPoll) < kAccountsPollIntervalSec) return;
+    if (s_subAccts.accountsPollInFlight) return;
+    s_subAccts.lastAccountsPoll = now;
+    s_subAccts.accountsPollInFlight = true;
     st.rpc.call("subscription_accounts", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
-        s_subAccts.pollInFlight = false;
+        s_subAccts.accountsPollInFlight = false;
         if (!r.ok || !r.result.is_object()) {
             // RPC missing / worker down — keep last list; surface once.
             if (!r.ok && s_subAccts.lastError.empty())
@@ -213,6 +434,12 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             return;
         }
         s_subAccts.lastError.clear();
+        // Preserve prior usage while rebuilding the membership list (usage poll
+        // re-merges; accounts rows may already carry optional usage fields).
+        std::map<std::string, SubAccountRow> prevByKey;
+        for (const auto& prev : s_subAccts.rows) {
+            prevByKey[prev.provider + "\n" + prev.accountId] = prev;
+        }
         s_subAccts.rows.clear();
         auto arr = r.result.value("accounts", nlohmann::json::array());
         if (!arr.is_array()) return;
@@ -221,11 +448,19 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
             SubAccountRow row;
             row.provider  = a.value("provider", std::string());
             row.accountId = a.value("account_id", std::string());
-            row.label     = a.value("label", std::string());
-            if (row.label.empty()) row.label = a.value("email", std::string());
-            if (row.label.empty()) row.label = row.accountId.empty() ? "(account)" : row.accountId;
             row.active    = a.value("active", false);
             row.connected = a.value("connected", true);
+            parseAccountIdentity(a, row);
+            // If this accounts payload lacked usage, keep the last merged usage.
+            if (!row.hasUsage) {
+                auto it = prevByKey.find(row.provider + "\n" + row.accountId);
+                if (it != prevByKey.end() && it->second.hasUsage) {
+                    row.hasUsage = true;
+                    row.usage = it->second.usage;
+                    if (row.displayName.empty()) row.displayName = it->second.displayName;
+                    if (row.plan.empty())        row.plan = it->second.plan;
+                }
+            }
             s_subAccts.rows.push_back(std::move(row));
         }
     });
@@ -253,8 +488,15 @@ static void pollSubscriptionAccounts(AppState& st, bool force) {
 
 static void drawSubscriptionAccounts(AppState& st, float sc) {
     dimText("Named subscription accounts per provider. Sign in adds another account; "
-            "Set active selects which credential the harness uses.");
+            "the radio selects which credential the harness uses (seamless switch).");
+
+    // Edge-detect section open (frame gap) → force a usage poll; while visible,
+    // refresh every 5 min per contracts/providers.md §4.5.
+    const int frame = ImGui::GetFrameCount();
+    const bool justOpened = (frame - s_subAccts.lastDrawnFrame) > 1;
+    s_subAccts.lastDrawnFrame = frame;
     pollSubscriptionAccounts(st, false);
+    pollSubscriptionUsage(st, justOpened);
 
     if (!s_subAccts.lastError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -266,7 +508,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         const char* prov = kSubProviders[pi];
         const char* plabel = kSubProviderLabels[pi];
         ImGui::PushID(prov);
-        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+        ImGui::Dummy(ImVec2(0, 6.0f * sc));
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
         ImGui::TextUnformatted(plabel);
@@ -275,43 +517,88 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         // Rows for this provider.
         bool any = false;
         for (size_t i = 0; i < s_subAccts.rows.size(); ++i) {
-            const SubAccountRow& row = s_subAccts.rows[i];
+            SubAccountRow& row = s_subAccts.rows[i];
             if (row.provider != prov) continue;
             any = true;
             ImGui::PushID((int)i);
-            // Radio for active account.
+
+            // ---- identity row: radio | display_name/email | plan chip | Sign out ----
             bool active = row.active;
-            char radioLbl[256];
-            std::snprintf(radioLbl, sizeof(radioLbl), "%s%s",
-                          row.label.c_str(),
-                          row.connected ? "" : " (disconnected)");
-            if (ImGui::RadioButton(radioLbl, active)) {
+            // Radio alone (empty label) — text drawn beside so we can chip + sign-out.
+            if (ImGui::RadioButton("##active", active)) {
                 if (!active) {
                     nlohmann::json p;
                     p["provider"] = prov;
                     p["account_id"] = row.accountId;
                     st.rpc.call("subscription_switch", p, [](const core::RpcResult&) {
-                        s_subAccts.lastPoll = -1e9;  // force refresh
+                        s_subAccts.lastAccountsPoll = -1e9;  // force refresh
+                        s_subAccts.lastUsagePoll = -1e9;
                     });
-                    // Optimistic local flip.
+                    // Optimistic local flip (seamless — no restart).
                     for (auto& r2 : s_subAccts.rows)
                         if (r2.provider == prov) r2.active = false;
                     s_subAccts.rows[i].active = true;
                 }
             }
+            ImGui::SameLine(0, 8.0f * sc);
+
+            // Primary identity line: display_name (if any) + email/label.
+            {
+                std::string primary = row.displayName.empty() ? row.label
+                    : (row.displayName + (row.label.empty() || row.label == row.displayName
+                                          ? std::string()
+                                          : ("  \xc2\xb7  " + row.label)));
+                if (!row.connected) primary += " (disconnected)";
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(primary.c_str());
+            }
+
+            if (!row.plan.empty()) {
+                ImGui::SameLine(0, 8.0f * sc);
+                ImGui::AlignTextToFramePadding();
+                drawPlanChip(row.plan, sc);
+            }
+
             ImGui::SameLine();
+            // Push Sign out to the right of the row.
+            {
+                const char* so = "Sign out";
+                const float soW = ImGui::CalcTextSize(so).x
+                    + ImGui::GetStyle().FramePadding.x * 2.0f;
+                const float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > soW + 4.0f * sc)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - soW);
+            }
             if (ImGui::SmallButton("Sign out")) {
                 nlohmann::json p;
                 p["provider"] = prov;
                 p["account_id"] = row.accountId;
                 st.rpc.call("subscription_logout", p, [](const core::RpcResult&) {
-                    s_subAccts.lastPoll = -1e9;
+                    s_subAccts.lastAccountsPoll = -1e9;
+                    s_subAccts.lastUsagePoll = -1e9;
                 });
                 // Optimistic remove.
                 s_subAccts.rows.erase(s_subAccts.rows.begin() + (long)i);
                 ImGui::PopID();
                 break;
             }
+
+            // ---- usage bars (indented under the identity row) ----
+            ImGui::Indent(ImGui::GetFrameHeight() + 8.0f * sc);
+            if (row.hasUsage && !row.usage.empty()) {
+                for (size_t wi = 0; wi < row.usage.size(); ++wi) {
+                    ImGui::PushID((int)wi);
+                    drawUsageWindow(row.usage[wi], sc);
+                    ImGui::PopID();
+                }
+            } else {
+                // Degrade: fields absent or RPC not yet registered.
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                ImGui::TextUnformatted("usage unavailable");
+                ImGui::PopStyleColor();
+            }
+            ImGui::Unindent(ImGui::GetFrameHeight() + 8.0f * sc);
+
             ImGui::PopID();
         }
         if (!any) {
@@ -360,9 +647,9 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             }
             pollSubscriptionAccounts(st, true);
         } else {
-            char signId[64];
-            std::snprintf(signId, sizeof(signId), "Sign in##%s", prov);
-            if (ImGui::SmallButton(signId)) {
+            char addId[64];
+            std::snprintf(addId, sizeof(addId), "Add account##%s", prov);
+            if (ImGui::SmallButton(addId)) {
                 prog.inProgress = true;
                 prog.lastError.clear();
                 prog.userCode.clear();
@@ -384,9 +671,10 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                         auto reason = r.result.value("reason", std::string());
                         auto hint = r.result.value("hint", std::string());
                         pr.lastError = reason.empty() ? "login failed" : reason;
-                        if (!hint.empty()) pr.lastError += " — " + hint;
+                        if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
                     }
-                    s_subAccts.lastPoll = -1e9;
+                    s_subAccts.lastAccountsPoll = -1e9;
+                    s_subAccts.lastUsagePoll = -1e9;
                 });
             }
             if (ImGui::IsItemHovered())

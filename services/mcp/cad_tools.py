@@ -1823,6 +1823,349 @@ def _tile_pngs(png_paths: list, out_png: str, labels: Optional[list] = None) -> 
                 pass
 
 
+def _tile_pngs_grid(png_paths: list, out_png: str, labels: Optional[list] = None,
+                    cols: int = 3) -> str:
+    """Tile PNGs into a labelled contact-sheet grid with an explicit column count."""
+    from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
+    if not png_paths:
+        raise ValueError("no tiles to compose")
+    imgs = [PILImage.open(p).convert("RGB") for p in png_paths]
+    try:
+        tw, th = imgs[0].size
+        cols = max(int(cols), 1)
+        rows = (len(imgs) + cols - 1) // cols
+        gap = 4
+        sheet = PILImage.new("RGB",
+                             (tw * cols + gap * (cols - 1),
+                              th * rows + gap * (rows - 1)),
+                             (30, 30, 32))
+        draw = ImageDraw.Draw(sheet)
+        for i, im in enumerate(imgs):
+            r, c = divmod(i, cols)
+            x = c * (tw + gap)
+            y = r * (th + gap)
+            sheet.paste(im.resize((tw, th)), (x, y))
+            if labels and i < len(labels):
+                # Dark halo + light label so the tile name is always readable.
+                label = str(labels[i]).upper()
+                draw.text((x + 7, y + 5), label, fill=(10, 10, 12))
+                draw.text((x + 6, y + 4), label, fill=(235, 240, 248))
+        sheet.save(out_png, format="PNG")
+        return out_png
+    finally:
+        for im in imgs:
+            try:
+                im.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- multi-view + emphasis (vision-graph §B)
+# Contact-sheet defaults, feature emphasis overlays, AABB framing helpers, and the
+# inspect_feature one-call composition. Emphasis is a deterministic POST-process on the
+# software-rasterized PNG (the C++ doc_render_* path has no per-face palette override):
+# projected face samples are painted high-contrast, context is desaturated, and the
+# palette is returned as structured metadata so tests/agents can assert identity without
+# pixel hashing.
+
+_STANDARD_ORTHO_VIEWS = ("front", "back", "left", "right", "top", "bottom", "iso")
+
+# Deterministic high-contrast palette for emphasis / per-face disambiguation.
+# Order is fixed so the same sid always maps to the same color across calls.
+_EMPHASIS_PALETTE = (
+    (255, 64, 64),    # red
+    (64, 180, 255),   # cyan-blue
+    (255, 200, 40),   # amber
+    (80, 220, 120),   # green
+    (220, 100, 255),  # magenta
+    (255, 140, 60),   # orange
+    (100, 160, 255),  # sky
+    (255, 100, 160),  # pink
+    (180, 255, 80),   # lime
+    (120, 220, 220),  # teal
+)
+_EMPHASIS_GLOW = (255, 255, 80)  # outline/glow around emphasized faces
+_CONTEXT_DESAT = 0.32            # 0 = full grey, 1 = original colour
+
+
+def _stable_color_for_key(key: str, palette: tuple = _EMPHASIS_PALETTE) -> tuple:
+    """Deterministic palette index from a stable string key (sid / feature id)."""
+    if not key:
+        return palette[0]
+    h = 0
+    for ch in str(key):
+        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+    return palette[h % len(palette)]
+
+
+def _match_color_key(match: dict, index: int = 0) -> str:
+    return str(match.get("sid") or match.get("owner_feature")
+               or match.get("kind") or f"m{index}")
+
+
+def _build_emphasis_palette(matches: list, mode: str = "emphasis") -> dict:
+    """Return {mode, entries:[{key, sid, rgb, role}], legend} for caption + tests.
+
+    mode:
+      * "emphasis" — all targets share one high-contrast EMPHASIS colour; context is
+        reported as desaturated greys (no per-face entry).
+      * "per_face"  — each match gets a distinct deterministic colour for disambiguation.
+    """
+    mode = (mode or "emphasis").lower().strip()
+    if mode not in ("emphasis", "per_face"):
+        mode = "emphasis"
+    entries = []
+    if mode == "emphasis":
+        rgb = _EMPHASIS_PALETTE[0]
+        for i, m in enumerate(matches or []):
+            key = _match_color_key(m, i)
+            entries.append({
+                "key": key,
+                "sid": m.get("sid"),
+                "rgb": list(rgb),
+                "role": "emphasis",
+            })
+        if not entries:
+            entries.append({"key": "target", "sid": None, "rgb": list(rgb), "role": "emphasis"})
+    else:
+        for i, m in enumerate(matches or []):
+            key = _match_color_key(m, i)
+            rgb = _stable_color_for_key(key)
+            entries.append({
+                "key": key,
+                "sid": m.get("sid"),
+                "rgb": list(rgb),
+                "role": "per_face",
+            })
+    legend = ", ".join(
+        f"{e.get('sid') or e['key']}=#{e['rgb'][0]:02X}{e['rgb'][1]:02X}{e['rgb'][2]:02X}"
+        for e in entries
+    )
+    return {
+        "mode": mode,
+        "entries": entries,
+        "legend": legend,
+        "context_desat": _CONTEXT_DESAT,
+        "glow_rgb": list(_EMPHASIS_GLOW),
+    }
+
+
+def _desaturate_rgb(r: int, g: int, b: int, amount: float = _CONTEXT_DESAT) -> tuple:
+    """Blend toward luminance; amount is how much ORIGINAL colour remains (0..1)."""
+    amount = max(0.0, min(1.0, float(amount)))
+    lum = int(0.299 * r + 0.587 * g + 0.114 * b)
+    return (
+        int(lum * (1.0 - amount) + r * amount),
+        int(lum * (1.0 - amount) + g * amount),
+        int(lum * (1.0 - amount) + b * amount),
+    )
+
+
+def _project_match_pixels(doc_id: str, match: dict, part_bbox: dict, view_dir: tuple,
+                          W: int = _RENDER_W, H: int = _RENDER_H) -> list:
+    """Screen-space sample pixels for a match (face points projected through the render frame)."""
+    frame = _part_render_frame(part_bbox, view_dir, W, H)
+    pts = _match_point_cloud(doc_id, match)
+    pixels = []
+    for p in pts:
+        sx, sy = _world_to_screen(p, frame)
+        ix, iy = int(round(sx)), int(round(sy))
+        if 0 <= ix < W and 0 <= iy < H:
+            pixels.append((ix, iy))
+    return pixels
+
+
+def _apply_emphasis_overlay(src_png: str, doc_id: str, matches: list, part_bbox: dict,
+                            view_dir: tuple, mode: str = "emphasis",
+                            out_png: Optional[str] = None,
+                            W: int = _RENDER_W, H: int = _RENDER_H) -> tuple:
+    """Desaturate context, paint emphasized faces, glow outline. Returns (path, palette)."""
+    from PIL import Image as PILImage, ImageDraw, ImageFilter, ImageEnhance  # noqa: PLC0415
+
+    palette = _build_emphasis_palette(matches, mode=mode)
+    out_png = out_png or _tmp(".png")
+    with PILImage.open(src_png) as im0:
+        im = im0.convert("RGB")
+        # If the source is a crop/upscale already sized differently, use its size.
+        W, H = im.size
+        # Desaturate whole image for context.
+        grey = ImageEnhance.Color(im).enhance(_CONTEXT_DESAT)
+        base = grey.convert("RGBA")
+        overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        color_by_key = {e["key"]: tuple(e["rgb"]) for e in palette["entries"]}
+        default_rgb = tuple(palette["entries"][0]["rgb"]) if palette["entries"] else _EMPHASIS_PALETTE[0]
+
+        all_pixels: list = []
+        for i, m in enumerate(matches or []):
+            key = _match_color_key(m, i)
+            rgb = color_by_key.get(key, default_rgb)
+            pixels = _project_match_pixels(doc_id, m, part_bbox, view_dir, W, H)
+            all_pixels.extend(pixels)
+            for (ix, iy) in pixels:
+                # Fat brush so sparse face samples still read as a filled region.
+                r = 4
+                draw.ellipse([ix - r, iy - r, ix + r, iy + r], fill=rgb + (220,))
+
+        # Glow / outline around the union of emphasized pixels.
+        if all_pixels:
+            mask = PILImage.new("L", (W, H), 0)
+            md = ImageDraw.Draw(mask)
+            for (ix, iy) in all_pixels:
+                md.ellipse([ix - 5, iy - 5, ix + 5, iy + 5], fill=255)
+            glow = mask.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(1.5))
+            glow_rgba = PILImage.new("RGBA", (W, H), tuple(_EMPHASIS_GLOW) + (0,))
+            # Put glow only on dilated ring (glow - original mask).
+            ring = ImageEnhance.Brightness(glow).enhance(1.0)
+            # Build ring: dilated where original was empty-ish.
+            from PIL import ImageChops  # noqa: PLC0415
+            ring_mask = ImageChops.subtract(glow, mask)
+            glow_rgba.putalpha(ring_mask)
+            base = PILImage.alpha_composite(base, glow_rgba)
+
+        base = PILImage.alpha_composite(base, overlay).convert("RGB")
+        # Legend strip at bottom so the image is self-describing.
+        legend = palette.get("legend") or ""
+        if legend:
+            strip_h = 18
+            sheet = PILImage.new("RGB", (W, H + strip_h), (28, 30, 34))
+            sheet.paste(base, (0, 0))
+            d2 = ImageDraw.Draw(sheet)
+            d2.text((6, H + 2), f"EMPHASIS [{palette['mode']}]: {legend}"[:120],
+                    fill=(230, 230, 235))
+            base = sheet
+        base.save(out_png, format="PNG")
+    return out_png, palette
+
+
+def _target_is_internal(matches: list, part_bbox: dict) -> bool:
+    """Heuristic: target is internal if it's a bore/hole, or its AABB is strictly inside
+    the part AABB with margin (pocket/internal geometry the exterior camera can't see)."""
+    if not matches or not part_bbox:
+        return False
+    for m in matches:
+        if (m.get("concavity") or "").lower() in ("bore", "concave", "hole"):
+            return True
+        surf = (m.get("surf") or "").lower()
+        if surf in ("cylinder", "cone") and m.get("kind") == "face":
+            # Cylindrical face alone isn't enough, but a bore-tagged cylinder is.
+            if m.get("radius") is not None and m.get("area_or_len"):
+                # Prefer explicit concavity; already handled above.
+                pass
+    # Geometry containment: target bbox fully inside part bbox with a surface margin.
+    try:
+        tmin = [1e30, 1e30, 1e30]
+        tmax = [-1e30, -1e30, -1e30]
+        any_c = False
+        for m in matches:
+            c = m.get("centroid")
+            if not (isinstance(c, (list, tuple)) and len(c) >= 3):
+                continue
+            any_c = True
+            for i in range(3):
+                tmin[i] = min(tmin[i], float(c[i]))
+                tmax[i] = max(tmax[i], float(c[i]))
+        if not any_c:
+            return False
+        pmin = _v3(part_bbox.get("min"))
+        pmax = _v3(part_bbox.get("max"))
+        psize = _v3(part_bbox.get("size"), default=(
+            pmax[0] - pmin[0], pmax[1] - pmin[1], pmax[2] - pmin[2]))
+        margin = max(max(psize) * 0.08, 0.5)
+        inside = all(
+            tmin[i] > pmin[i] + margin and tmax[i] < pmax[i] - margin
+            for i in range(3)
+        )
+        return bool(inside)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _auto_section_for_target(doc_id: str, matches: list, target_bbox: dict) -> dict:
+    """Pick a section plane through the target and return eval_section_props + plane name.
+
+    Reuses the existing eval_section_props machinery (inspect_section). Plane is the
+    axis-aligned datum whose normal is closest to the dominant target extent (so the cut
+    opens the largest face of the target AABB).
+    """
+    size = _v3(target_bbox.get("size"), default=(1, 1, 1))
+    # Largest target extent axis → cut with a plane NORMAL to a perpendicular principal axis.
+    # Prefer the plane whose normal aligns with the SMALLEST target size (cuts across the
+    # feature's thin dimension) so internals open up.
+    axes = [("right", 0), ("front", 1), ("top", 2)]  # plane name → axis index of its normal
+    # Smallest size axis is the normal of the cutting plane.
+    si = min(range(3), key=lambda i: size[i] if size[i] > 1e-9 else 1e9)
+    plane = axes[si][0]
+    # Override: if matches have a clear normal, cut perpendicular to it.
+    for m in matches or []:
+        n = m.get("normal") or m.get("axis")
+        if isinstance(n, (list, tuple)) and len(n) >= 3:
+            an = [abs(float(n[0])), abs(float(n[1])), abs(float(n[2]))]
+            si = max(range(3), key=lambda i: an[i])
+            plane = axes[si][0]
+            break
+    try:
+        res = cb.call("eval_section_props", {"doc_id": doc_id, "plane": plane}) or {}
+    except Exception as e:  # noqa: BLE001
+        return {"plane": plane, "ok": False, "error": str(e)}
+    area = res.get("area_mm2", 0.0)
+    summary = (f"auto-section plane '{plane}' area={area:.4g} mm²"
+               if area else f"auto-section plane '{plane}' produced empty cut")
+    return {"plane": plane, "ok": True, "summary": summary, **res}
+
+
+def _describe_part_excerpt(doc_id: str, max_chars: int = 900) -> str:
+    """Best-effort describe_part outline excerpt for inspect_feature (no hard dep cycle)."""
+    try:
+        from services.mcp import gsl_tools as _gsl  # noqa: PLC0415
+        d = _gsl._digest(doc_id)
+        text = _gsl._outline_text(d)
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        return text
+    except Exception as e:  # noqa: BLE001
+        # Fallback: compact tree + bbox.
+        try:
+            tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+            feats = ((tree.get("tree") or {}).get("features")) or []
+            names = [f"{f.get('id')}:{f.get('type') or f.get('name')}"
+                     for f in feats if isinstance(f, dict)][:12]
+            bb = cb.call("doc_bbox", {"doc_id": doc_id}) or {}
+            size = bb.get("size") or []
+            dims = (f"{size[0]:.3g}×{size[1]:.3g}×{size[2]:.3g} mm"
+                    if isinstance(size, (list, tuple)) and len(size) >= 3 else "?")
+            return f"bbox {dims}; features: {', '.join(names) or '(none)'}"
+        except Exception:  # noqa: BLE001
+            return f"(describe_part unavailable: {e})"
+
+
+def _normalize_view_list(views: Optional[list]) -> list:
+    """Normalize render_views `views` arg to a list of named specs (default 6-ortho+iso)."""
+    if not views:
+        return list(_STANDARD_ORTHO_VIEWS)
+    out = []
+    for v in views:
+        if isinstance(v, str) and v.strip():
+            name = v.strip().lower()
+            if name in ("isometric", "isometry"):
+                name = "iso"
+            out.append(name)
+        elif isinstance(v, dict):
+            out.append(v)
+        else:
+            out.append(v)
+    return out or list(_STANDARD_ORTHO_VIEWS)
+
+
+def _palette_caption_block(palette: Optional[dict]) -> str:
+    if not palette:
+        return ""
+    return (f" Emphasis palette ({palette.get('mode')}): {palette.get('legend')}. "
+            f"[palette_json={json.dumps({'mode': palette.get('mode'), 'entries': palette.get('entries'), 'glow_rgb': palette.get('glow_rgb')}, separators=(',', ':'))}]")
+
+
+
 
 def _resolve_drawing_view_id(doc_id: str, view_id: str) -> str:
     """D7: Accept a numeric view-id (v1, v2, …) OR an orientation string ("front", "top", …).
@@ -2381,11 +2724,15 @@ WORKFLOW
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
                                             render_part(view="right" | {"azimuth":30,"elevation":20})
-                                            for a specific angle; contact_sheet() for several
-                                            labelled views (front/right/top/iso) in one image.
-                                            inspect_part(target) for a CLOSE-UP of one face/edge/
-                                            feature (zoom/pan like a human); look_around(target)
-                                            for N orbit close-ups of the same target.
+                                            for a specific angle; render_part(emphasize="f2") for
+                                            feature EMPHASIS (high-contrast target, desaturated
+                                            context). render_views() for the full 6-ortho+iso
+                                            labelled grid; contact_sheet() for a smaller multi-
+                                            angle sheet. inspect_part(target) / inspect_feature(
+                                            target) for a CLOSE-UP (feature AABB frame + dims;
+                                            inspect_feature also returns a describe_part excerpt
+                                            + emphasis palette). look_around(target) for N orbit
+                                            close-ups. VERIFY LOOP after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
                                             persists in the .step+ and shows in render_part.
@@ -2449,7 +2796,12 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          from B-rep normals with NO occlusion modeling (says so inline). This is
                          the non-vision self-review step; do it instead of skipping the review.
   inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
-                         face-normal camera + projected-bbox crop. Caption carries key dims.
+                         face-normal camera + projected-bbox crop; emphasize=True for high-
+                         contrast target + desaturated context (palette in caption).
+  inspect_feature(target) ONE-CALL: framed EMPHASIS render + describe_part excerpt + dims +
+                         auto-section when the target is internal. Prefer after mutations.
+  render_views(views?)   6-ortho+iso labelled contact sheet (or a custom view list); optional
+                         target= frames every tile to a feature AABB.
   look_around(target)    N orbit close-ups of the same target tiled as a contact sheet.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
@@ -3555,10 +3907,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
-        Then call render_part() to LOOK at the result. On a validation error the whole batch is
-        rejected — read `error`, fix the ops, call again. A rebuild-failure response may also
-        carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis + editable fix_ops +
-        verifier verdict) — record your verdict with regen_resolve(card, action).
+        VERIFY LOOP (after every mutation): call render_part() or render_views() to SEE the
+        result, then measure_part()/query_geometry()/inspect_feature(target) on the changed
+        region, and before declaring done run verify_battery(doc_id). On a validation error
+        the whole batch is rejected — read `error`, fix the ops, call again. A rebuild-failure
+        response may also carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis +
+        editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
 
         HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
         run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call
@@ -3858,7 +4212,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def render_part(doc_id: Optional[str] = None,
-                    view: Optional[Union[str, dict]] = None) -> list:
+                    view: Optional[Union[str, dict]] = None,
+                    target: Optional[Union[str, dict]] = None,
+                    emphasize: Optional[Union[str, dict, list]] = None,
+                    emphasis_mode: str = "emphasis",
+                    annotate: bool = True) -> list:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
         The render is colour-coded and labelled exactly like the in-app vision reviewer: an XYZ
@@ -3872,34 +4230,133 @@ def register_cad_tools(mcp: FastMCP) -> None:
         {"azimuth": deg, "elevation": deg}  (azimuth 0 = front, 90 = right; elevation 90 = top), or
         {"dir": [x, y, z]}  (an explicit scene->camera direction). The image is headed with the
         resolved view name + bounding-box dimensions. Omit `view` for the labelled iso self-review.
-        Use contact_sheet(...) to get several angles tiled in one image.
+        Use render_views(...) for the full 6-ortho+iso labelled grid, or contact_sheet(...) for a
+        smaller multi-angle sheet.
+
+        Feature emphasis (optional — manufacturing-feature VLM legibility):
+          target / emphasize: plain-word face/edge query or feature id ("f2") whose owned faces
+            render with EMPHASIS — high-contrast fill + glow outline; the rest of the part is
+            desaturated so the target pops. Camera frames the target AABB with margin.
+          emphasis_mode: "emphasis" (default — shared high-contrast colour) or "per_face"
+            (each target face a distinct deterministic colour for disambiguation; legend in caption).
+
+        VERIFY LOOP: call after every mutation-adjacent change (add_features / edit / delete) so
+        you can SEE whether the op landed; pair with measure/inspect_feature and verify_battery
+        before declaring done.
 
         Returns [image, caption]: the PNG followed by a one-paragraph TEXT caption (resolved
-        view, bbox, the principal visible labelled faces) so a non-vision model reading the
-        tool transcript — or a vision model wanting a quick text digest — has something besides
-        a bare image blob.
+        view, bbox, principal visible labelled faces, and when emphasis is active the palette
+        metadata so non-vision models still know which colour maps to which sid).
         """
         d = _doc(doc_id)
         png = _tmp(".png")
-        view_name = view if isinstance(view, str) else "iso"
-        if view is not None:
-            r = cb.call("doc_render_view", {"doc_id": d, "out_path": png, "view": view})
+        view_name = view if isinstance(view, str) else ("iso" if view is None else "custom")
+
+        # Resolve emphasis target (accept either `target` or `emphasize`).
+        emp_spec = emphasize if emphasize is not None else target
+        emp_matches: list = []
+        emp_resolved: Optional[dict] = None
+        palette: Optional[dict] = None
+        if emp_spec is not None:
+            # A list of specs → union of matches.
+            specs = emp_spec if isinstance(emp_spec, list) else [emp_spec]
+            emp_matches = []
+            labels = []
+            for sp in specs:
+                rsl = _resolve_inspect_target(d, sp)
+                emp_matches.extend(rsl.get("matches") or [])
+                labels.append(rsl.get("label") or str(sp))
+            emp_resolved = {
+                "matches": emp_matches,
+                "label": ", ".join(labels) if labels else "target",
+                "kind": "emphasis",
+            }
+
+        # Camera: when emphasizing, frame along the target's auto normal (or explicit view).
+        view_dir = None
+        if emp_matches and (view is None or view == "auto"):
+            view_dir = _camera_dir_for_target(emp_matches, "auto")
+            view_name = "emphasis-auto"
+        elif view is not None:
+            if emp_matches and isinstance(view, str) and view.lower() == "auto":
+                view_dir = _camera_dir_for_target(emp_matches, "auto")
+            else:
+                # Named / dict view — let the engine resolve for non-emphasis; for emphasis we
+                # still need a dir for the overlay projection.
+                try:
+                    view_dir = _camera_dir_for_target(emp_matches or [], view)
+                except Exception:  # noqa: BLE001
+                    view_dir = _vnorm((1.0, 1.0, 0.8))
+
+        if view_dir is not None:
+            r = cb.call("doc_render_view", {
+                "doc_id": d, "out_path": png,
+                "view": {"dir": list(view_dir)}, "annotate": bool(annotate),
+            })
             if not r.get("ok") or not os.path.exists(png):
                 raise ValueError(
                     f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
-            return _captioned_render(png, d, [view_name])
-        r = cb.call("doc_render_png", {"doc_id": d, "out_path": png})
-        if (not r.get("ok") or not os.path.exists(png)):
-            # A 2D DRAWING doc has no 3D bodies — rasterize its views instead so the AI
-            # can still self-review the drawing it just made (Bug D-1).
+        elif view is not None:
+            r = cb.call("doc_render_view", {"doc_id": d, "out_path": png, "view": view,
+                                           "annotate": bool(annotate)})
+            if not r.get("ok") or not os.path.exists(png):
+                raise ValueError(
+                    f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
+            # Recover dir for optional crop when target present.
+            if emp_matches:
+                try:
+                    view_dir = _camera_dir_for_target(emp_matches, view)
+                except Exception:  # noqa: BLE001
+                    view_dir = _vnorm((1.0, 1.0, 0.8))
+        else:
+            r = cb.call("doc_render_png", {"doc_id": d, "out_path": png, "annotate": bool(annotate)})
+            if (not r.get("ok") or not os.path.exists(png)):
+                try:
+                    rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
+                except Exception:  # noqa: BLE001
+                    rd = {"ok": False}
+                if rd.get("ok") and os.path.exists(png):
+                    return _captioned_render(png, d, [view_name])
+                raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
+            if emp_matches:
+                view_dir = _vnorm((1.0, 1.0, 0.8))
+
+        caption_extra = ""
+        if emp_matches and view_dir is not None:
             try:
-                rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
+                part_bb = cb.call("doc_bbox", {"doc_id": d})
             except Exception:  # noqa: BLE001
-                rd = {"ok": False}
-            if rd.get("ok") and os.path.exists(png):
-                return _captioned_render(png, d, [view_name])
-            raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
-        return _captioned_render(png, d, [view_name])
+                part_bb = None
+            if part_bb and part_bb.get("size"):
+                target_bb = _target_bbox(d, emp_matches)
+                # Frame camera to feature AABB via crop (engine has no eye/bbox override).
+                rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
+                                            margin=0.18, zoom_factor=1.35)
+                png_crop = _tmp(".png")
+                _crop_png_to_rect(png, rect, png_crop)
+                png_emp, palette = _apply_emphasis_overlay(
+                    png_crop, d, emp_matches, part_bb, view_dir,
+                    mode=emphasis_mode or "emphasis")
+                png = png_emp
+                # Auto-section when the target is internal.
+                if _target_is_internal(emp_matches, part_bb):
+                    sec = _auto_section_for_target(d, emp_matches, target_bb)
+                    caption_extra += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
+                caption_extra += _palette_caption_block(palette)
+                if emp_resolved:
+                    caption_extra = (
+                        f" Emphasized {emp_resolved.get('label')!r}"
+                        f" ({len(emp_matches)} subshape"
+                        f"{'s' if len(emp_matches) != 1 else ''})."
+                    ) + caption_extra
+
+        result = _captioned_render(png, d, [view_name])
+        if caption_extra:
+            if isinstance(result, list) and len(result) == 2:
+                result = [result[0], (result[1] or "") + caption_extra]
+            else:
+                result = [result, caption_extra.strip()]
+        return result
 
     @mcp.tool()
     def contact_sheet(doc_id: Optional[str] = None,
@@ -3913,6 +4370,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
         views: a list of view specs, each either a named view ("front"/"back"/"top"/"bottom"/
         "left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or {"dir":[x,y,z]} —
         see render_part). Omit for the standard set: front + right + top + iso.
+        Prefer render_views() for the full manufacturing 6-ortho+iso grid.
+
+        VERIFY LOOP: use after mutations when a single iso is not enough to confirm a feature
+        on a back/bottom face. Pair with verify_battery before declaring done.
 
         Returns [image, caption]: the tiled PNG followed by a one-paragraph TEXT caption
         (resolved views, bbox, principal visible labelled faces per view) for non-vision models
@@ -3929,17 +4390,106 @@ def register_cad_tools(mcp: FastMCP) -> None:
         return _captioned_render(png, d, view_list)
 
     @mcp.tool()
+    def render_views(doc_id: Optional[str] = None,
+                     views: Optional[list] = None,
+                     target: Optional[Union[str, dict]] = None,
+                     annotate: bool = True) -> list:
+        """Multi-view contact sheet — 6 orthographic + iso by default, each tile labelled.
+
+        The VLM-standard multi-view set for manufacturing feature recognition (holes, bosses,
+        undercuts on back/bottom faces a single iso never shows). Default views:
+          front, back, left, right, top, bottom, iso
+        Override with `views=[...]` (named views and/or custom {"azimuth","elevation"} /
+        {"dir":[x,y,z]} specs — same vocabulary as render_part).
+
+        target (optional): when set, each tile is framed/cropped to the target AABB + margin
+        (feature-focused multi-view). Plain-word face/edge query or feature id ("f2").
+
+        annotate: pass face labels / triad through to the underlying render (default True).
+
+        VERIFY LOOP: call after mutations when you need full angular coverage; pair with
+        inspect_feature for a single emphasized close-up and verify_battery before done.
+
+        Returns [image, caption]. Caption lists the resolved view names + part bbox (+ target
+        dims when framed). Tiles are headed with their view name so the grid is self-describing.
+        """
+        d = _doc(doc_id)
+        view_list = _normalize_view_list(views)
+        # Prefer the native contact-sheet RPC when there is no target framing (fast path).
+        if target is None:
+            png = _tmp(".png")
+            r = cb.call("doc_render_contact_sheet",
+                        {"doc_id": d, "out_path": png, "views": view_list})
+            if not r.get("ok") or not os.path.exists(png):
+                raise ValueError(
+                    f"render_views failed: {r.get('reason', r.get('error', 'no bodies'))}")
+            # Engine may expand empty defaults differently — pin caption to our list.
+            names = r.get("views") or [
+                (v if isinstance(v, str) else "custom") for v in view_list
+            ]
+            result = _captioned_render(png, d, list(names))
+            extra = (f" render_views grid ({len(names)} tiles: "
+                     + ", ".join(str(n) for n in names) + ").")
+            if isinstance(result, list) and len(result) == 2:
+                return [result[0], (result[1] or "") + extra]
+            return [result, extra.strip()]
+
+        # Target-framed path: per-view render + crop + tile with labels.
+        resolved = _resolve_inspect_target(d, target)
+        matches = resolved["matches"]
+        target_bb = _target_bbox(d, matches)
+        part_bb = cb.call("doc_bbox", {"doc_id": d})
+        if not part_bb or not part_bb.get("size"):
+            raise ValueError("no part bounding box — build geometry first")
+
+        tile_paths = []
+        labels = []
+        for v in view_list:
+            try:
+                vd = _camera_dir_for_target(matches, v if v != "auto" else "auto")
+            except Exception:  # noqa: BLE001
+                vd = _vnorm((1.0, 1.0, 0.8))
+            png_full = _tmp(".png")
+            r = cb.call("doc_render_view", {
+                "doc_id": d, "out_path": png_full,
+                "view": {"dir": list(vd)}, "annotate": bool(annotate),
+            })
+            if not r.get("ok") or not os.path.exists(png_full):
+                continue
+            rect = _crop_rect_for_target(part_bb, target_bb, vd,
+                                        margin=0.18, zoom_factor=1.25)
+            png_tile = _tmp(".png")
+            _crop_png_to_rect(png_full, rect, png_tile)
+            tile_paths.append(png_tile)
+            labels.append(v if isinstance(v, str) else "custom")
+        if not tile_paths:
+            raise ValueError("render_views: every tile render failed")
+        out = _tmp(".png")
+        # 3-column grid reads better for 6–7 views than the 2-col look_around default.
+        _tile_pngs_grid(tile_paths, out, labels=labels, cols=3)
+        caption = (
+            f"render_views of {resolved.get('label')!r}: {len(tile_paths)} labelled tiles "
+            f"({', '.join(labels)}). "
+            + _inspect_caption(d, resolved, target_bb, _camera_dir_for_target(matches, "auto"),
+                               method="crop", n_matches=len(matches))
+        )
+        return [Image(path=out), caption]
+
+    @mcp.tool()
     def inspect_part(target: Union[str, dict],
                      doc_id: Optional[str] = None,
                      view: Optional[Union[str, dict]] = "auto",
                      zoom_factor: float = 1.5,
                      margin: float = 0.15,
-                     annotate: bool = True) -> list:
+                     annotate: bool = True,
+                     emphasize: bool = False,
+                     emphasis_mode: str = "emphasis") -> list:
         """CLOSE-UP inspection of a face/edge/feature — zoom/pan like a human scanning a part.
 
-        `render_part` / `contact_sheet` show the WHOLE part. Use this when you are working on a
-        specific feature and need the same kind of view a person gets by panning onto it:
-        the target framed tight, from a sensible direction, with key dims in the caption.
+        `render_part` / `contact_sheet` / `render_views` show the WHOLE part (or multi-view).
+        Use this when you are working on a specific feature and need the same kind of view a
+        person gets by panning onto it: the target framed tight (feature AABB + margin), from a
+        sensible direction, with key dims in the caption.
 
         target: plain-word face/edge query (same vocabulary as query_geometry / measure_between
           — e.g. "top", {"of":"face","side":"top"}, {"of":"edge","surf":"circle"},
@@ -3949,13 +4499,20 @@ def register_cad_tools(mcp: FastMCP) -> None:
         zoom_factor: >1 tightens the crop (more zoom). Default 1.5.
         margin: fractional padding around the projected target bbox (default 0.15).
         annotate: pass through to the underlying render (face labels / triad on by default).
+        emphasize: when True, paint the target with EMPHASIS (high-contrast fill + glow) and
+          desaturate context; palette metadata is embedded in the caption.
+        emphasis_mode: "emphasis" (shared colour) or "per_face" (distinct deterministic colours).
 
-        Returns [image, caption]. Caption names what is framed + key dims of the target so a
-        non-vision model still gets the text equivalent. Method note: the render RPC only
-        accepts a whole-part camera *direction* (no bbox/eye override), so the close-up is a
-        whole-part render from the chosen dir, then a projected-bbox CROP + upscale.
+        Camera frames the feature AABB with margin; when the target is internal (bore/pocket)
+        an auto-section plane is selected via the existing section machinery and reported in
+        the caption. Method note: the render RPC only accepts a whole-part camera *direction*
+        (no bbox/eye override), so the close-up is a whole-part render + projected-bbox CROP.
 
-        For multi-angle scanning of the same target, use look_around(...).
+        VERIFY LOOP: use after mutations that touch this feature; prefer inspect_feature(target)
+        for the one-call (render + describe excerpt + dims). Run verify_battery before done.
+
+        Returns [image, caption]. Caption names what is framed + key dims (+ palette when
+        emphasized). For multi-angle scanning of the same target, use look_around(...).
         """
         d = _doc(doc_id)
         resolved = _resolve_inspect_target(d, target)
@@ -3973,12 +4530,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
         r = cb.call("doc_render_view", {
             "doc_id": d, "out_path": png_full,
             "view": {"dir": list(view_dir)},
-            # annotate is accepted by doc_render_png; doc_render_view always annotates today.
-            # Pass it for forward-compat; ignored harmlessly if unsupported.
             "annotate": bool(annotate),
         })
         if not r.get("ok") or not os.path.exists(png_full):
-            # Fall back to legacy iso if a custom dir failed for any reason.
             r2 = cb.call("doc_render_png",
                          {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
             if not r2.get("ok") or not os.path.exists(png_full):
@@ -3990,8 +4544,20 @@ def register_cad_tools(mcp: FastMCP) -> None:
                                     margin=float(margin), zoom_factor=float(zoom_factor))
         png_out = _tmp(".png")
         _crop_png_to_rect(png_full, rect, png_out)
+
+        palette = None
+        if emphasize:
+            png_out, palette = _apply_emphasis_overlay(
+                png_out, d, matches, part_bb, view_dir,
+                mode=emphasis_mode or "emphasis")
+
         caption = _inspect_caption(d, resolved, target_bb, view_dir,
                                    method="crop", n_matches=len(matches))
+        if _target_is_internal(matches, part_bb):
+            sec = _auto_section_for_target(d, matches, target_bb)
+            caption += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
+        if palette:
+            caption += _palette_caption_block(palette)
         return [Image(path=png_out), caption]
 
     @mcp.tool()
@@ -4005,6 +4571,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         Resolves `target` the same way as inspect_part, then renders N close-ups (default 4 at
         90° steps) orbiting the auto face-normal view and tiles them into one image.
+
+        VERIFY LOOP: use after mutations when a single close-up is ambiguous; pair with
+        inspect_feature for dims/describe excerpt and verify_battery before done.
 
         Returns [image, caption]. Caption lists the orbit dirs + target dims. Same crop-fallback
         method as inspect_part (whole-part render + projected-bbox crop per tile).
@@ -4045,6 +4614,71 @@ def register_cad_tools(mcp: FastMCP) -> None:
                                n_matches=len(matches))
         )
         return [Image(path=out), caption]
+
+    @mcp.tool()
+    def inspect_feature(target: Union[str, dict],
+                        doc_id: Optional[str] = None,
+                        view: Optional[Union[str, dict]] = "auto",
+                        emphasis_mode: str = "emphasis",
+                        annotate: bool = True) -> list:
+        """One-call feature inspection: framed EMPHASIS render + describe_part excerpt + dims.
+
+        Resolves `target` (plain-word face/edge query or feature id "f2"), frames the camera
+        to the feature AABB with margin, paints the target with high-contrast emphasis
+        (desaturated context + glow outline; `emphasis_mode` "per_face" for distinct colours),
+        auto-sections when the target is internal, and returns a caption that already carries:
+          * key dims of the target (area/length/radius)
+          * a describe_part outline EXCERPT (feature placement / sids)
+          * the emphasis palette metadata (assertable without pixel hashing)
+
+        Prefer this over chaining inspect_part + describe_part + measure yourself when reviewing
+        a single feature after a mutation.
+
+        VERIFY LOOP: call after add_features/edit that touched this feature; then
+        verify_battery(doc_id) before declaring the design done.
+
+        Returns [image, caption].
+        """
+        d = _doc(doc_id)
+        resolved = _resolve_inspect_target(d, target)
+        matches = resolved["matches"]
+        target_bb = _target_bbox(d, matches)
+        part_bb = cb.call("doc_bbox", {"doc_id": d})
+        if not part_bb or not part_bb.get("size"):
+            raise ValueError("no part bounding box — build geometry first")
+
+        view_dir = _camera_dir_for_target(matches, view)
+        png_full = _tmp(".png")
+        r = cb.call("doc_render_view", {
+            "doc_id": d, "out_path": png_full,
+            "view": {"dir": list(view_dir)}, "annotate": bool(annotate),
+        })
+        if not r.get("ok") or not os.path.exists(png_full):
+            r2 = cb.call("doc_render_png",
+                         {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
+            if not r2.get("ok") or not os.path.exists(png_full):
+                raise ValueError(
+                    f"inspect_feature render failed: {r.get('reason', r.get('error', 'no bodies'))}")
+            view_dir = _vnorm((1.0, 1.0, 0.8))
+
+        rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
+                                    margin=0.18, zoom_factor=1.45)
+        png_crop = _tmp(".png")
+        _crop_png_to_rect(png_full, rect, png_crop)
+        png_out, palette = _apply_emphasis_overlay(
+            png_crop, d, matches, part_bb, view_dir,
+            mode=emphasis_mode or "emphasis")
+
+        caption = _inspect_caption(d, resolved, target_bb, view_dir,
+                                   method="crop", n_matches=len(matches))
+        excerpt = _describe_part_excerpt(d)
+        caption += f" describe_part excerpt: {excerpt}"
+        if _target_is_internal(matches, part_bb):
+            sec = _auto_section_for_target(d, matches, target_bb)
+            caption += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
+        caption += _palette_caption_block(palette)
+        return [Image(path=png_out), caption]
+
 
 
     @mcp.tool()
@@ -4364,7 +4998,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def undo(doc_id: Optional[str] = None) -> str:
-        """Undo the last edit on the current part."""
+        """Undo the last edit on the current part.
+
+        VERIFY LOOP: after undo, call render_part()/render_views() (and inspect_feature on the
+        affected region) to confirm the rolled-back state, then verify_battery before done.
+        """
         try:
             d = _doc(doc_id)
             r = cb.call("doc_undo", {"doc_id": d})
@@ -4375,7 +5013,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def redo(doc_id: Optional[str] = None) -> str:
-        """Redo the last undone edit on the current part."""
+        """Redo the last undone edit on the current part.
+
+        VERIFY LOOP: after redo, call render_part()/render_views() to SEE the restored state
+        and verify_battery before declaring done.
+        """
         try:
             d = _doc(doc_id)
             r = cb.call("doc_redo", {"doc_id": d})

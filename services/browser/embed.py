@@ -383,14 +383,9 @@ class EmbedManager:
     def _import_async_playwright(self) -> Callable[[], Any]:
         if self._async_playwright_factory is not None:
             return self._async_playwright_factory
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            raise RuntimeError(
-                "playwright not installed — run `pip install playwright` and "
-                "`playwright install chromium` (see services/browser/README.md)"
-            ) from exc
-        return async_playwright
+        # Residual async factory via :mod:`.driver` (BILLET_PW_BACKEND).
+        from . import driver as _driver
+        return _driver.resolve_async()
 
     def _ensure_thread(self) -> asyncio.AbstractEventLoop:
         with self._start_guard:

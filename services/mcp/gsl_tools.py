@@ -1548,10 +1548,11 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def describe_scene(views: Optional[list] = None, doc_id: Optional[str] = None) -> str:
         """Deterministic "what the render would show" per view, from B-rep face normals — the
-        non-vision fallback for render_part/contact_sheet.
+        non-vision fallback for render_part / render_views / contact_sheet.
 
         views: named views to describe, default ["front", "right", "top", "iso"] (same names
-        render_part accepts). For each view: the camera direction, then every face whose signed
+        render_part / render_views accept; pass the full 6-ortho+iso set to mirror
+        render_views()). For each view: the camera direction, then every face whose signed
         normal points toward the camera (dot > 0.15) as "sid surf side r<radius>/area" (capped at
         20/view). Also includes the part-level narrative once at the top (bbox + the A3 feature
         placement lines from describe_part). OCCLUSION IS NOT MODELED — a face behind another

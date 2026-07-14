@@ -79,14 +79,13 @@ def _apply_staged_cookies(context: Any, site: str) -> None:
 
 
 def _import_sync_playwright() -> Callable[[], Any]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "playwright not installed — run `pip install playwright` and "
-            "`playwright install chromium` (see services/browser/README.md)"
-        ) from exc
-    return sync_playwright
+    """Resolve residual sync Playwright factory via :mod:`.driver`.
+
+    Default ``BILLET_PW_BACKEND=cef`` keeps stock ``playwright`` (byte-identical
+    to the pre-factory import). ``patchright`` / ``camoufox`` selected via env.
+    """
+    from . import driver as _driver
+    return _driver.resolve_sync()
 
 
 def _off_loop(fn: Callable[..., dict], *args: Any, **kwargs: Any) -> dict:
@@ -248,8 +247,8 @@ def _export_cookies_cdp(port: int) -> list:
     """One-shot cookie dump via connect_over_cdp (call only AFTER login succeeded
     or the user is closing — never during captcha interaction)."""
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+        sync_playwright = _import_sync_playwright()
+    except RuntimeError:
         return []
     try:
         with sync_playwright() as pw:
@@ -265,8 +264,8 @@ def _export_cookies_cdp(port: int) -> list:
 def _export_cookies_relaunch(profile_path: Path) -> list:
     """Open the on-disk profile headless (Chrome already exited) and dump cookies."""
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+        sync_playwright = _import_sync_playwright()
+    except RuntimeError:
         return []
     try:
         with sync_playwright() as pw:
@@ -416,7 +415,7 @@ def _browser_login_native_chrome(site: str, *, timeout: float) -> dict:
                         saw_success = True
                         # One CDP attach AFTER success only — dump cookies + HTML.
                         try:
-                            from playwright.sync_api import sync_playwright
+                            sync_playwright = _import_sync_playwright()
                             with sync_playwright() as pw:
                                 b = pw.chromium.connect_over_cdp(
                                     f"http://127.0.0.1:{port}")

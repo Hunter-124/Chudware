@@ -1409,35 +1409,18 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
     }
 }
 
-// One user turn: a right-aligned, markdown-stripped bubble (DESIGN.md §5 "User message" block).
-static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW) {
-    const auto& pal = ui::palette;
-    const ImVec4 accentCol = semanticOnGlass(pal.accent, chatSurf());
-    // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
-    const float bw = ImGui::GetContentRegionAvail().x;
-    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
-    ImGui::BeginChild("##umsg", ImVec2(bw, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accentCol, "You");
-    ImGui::PopFont();
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
-    ImGui::PopStyleColor();
-    ImGui::EndChild();
-    ImRect bubble = endGlassBubble(gb);
-    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
-        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
-        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
-    ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
-}
+// Forward: user bubble + rewind/edit actions (defined after AI-VC helpers).
+static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
+                          float panelW, int msgIdx);
 
 // ============================ AI-VC (agent version control) ============================
-// Silent, deterministic checkpoints of AI-authored work. Worker RPCs (AiVcCore):
-//   plm_timeline {doc_id?} -> {ok, checkpoints:[{id, turn, when|time, label, features|features_count}]}
-//   plm_rollback {doc_id?, to: checkpoint_id|"turn:N"|"-N"} -> {ok, ...}
+// Silent, deterministic checkpoints of AI-authored work. Worker RPCs (AiVcCore / CheckpointsCore):
+//   plm_timeline {doc_id?} -> {ok, checkpoints:[{id, turn, when|time, label, features|features_count,
+//                                                 kind?, msg_idx?, call?:{turn,i}}]}
+//   plm_rollback {doc_id?, to: id|"turn:N"|"-N"|"msg:<idx>"|"call:<turn>:<i>"} ->
+//     {ok, ..., chat_truncate_to?}
 // Degrade: when the worker reports unknown_method the affordances hide permanently this session.
+// When v2 fields (kind/msg_idx/call) are absent, UI stays at turn-level Before/After only.
 
 namespace {
 
@@ -1447,6 +1430,11 @@ struct AiVcCheckpoint {
     std::string when;          // ISO timestamp
     std::string label;         // tool/op-batch summary
     int         features = 0;  // feature count at checkpoint
+    // v2 prompt/tool granularity (absent => -1 / empty → turn-level UI only)
+    std::string kind;          // "prompt" | "tool" | ""
+    int         msgIdx = -1;   // chat message ordinal for kind=prompt
+    int         callTurn = -1; // call.turn for kind=tool
+    int         callI = -1;    // call.i for kind=tool
 };
 
 struct AiVcUi {
@@ -1457,12 +1445,26 @@ struct AiVcUi {
     std::vector<AiVcCheckpoint> checkpoints;
     double      lastFetch = 0.0;
     std::string lastDocId;
-    // Inline confirm (click again) for per-turn restore — never a modal questionnaire.
+    // v2 capability flags — latched from the last successful timeline payload.
+    bool hasMsgGranularity  = false;  // any row carried msg_idx
+    bool hasCallGranularity = false;  // any row carried call:{turn,i}
+    // Inline confirm (click again) for per-turn / per-msg / per-call restore — never a modal.
     int    confirmMsgIdx = -1;  // chat index pending confirm, -1 = none
-    int    confirmKind   = 0;   // 1 = before this step, 2 = after this step
+    int    confirmKind   = 0;   // 1 = before, 2 = after, 3 = user-msg rewind
+    int    confirmCallI  = -1;  // tool-call index within turn when confirmKind is call-scoped
     double confirmUntil  = 0.0; // auto-clear after a few seconds
 };
 static AiVcUi s_aiVc;
+
+// Staged "Edit message" — rollback is deferred until the user actually sends. Esc restores
+// the pre-edit chat tail + composer without any plm_rollback.
+struct EditStage {
+    bool active = false;
+    int  msgIdx = -1;
+    std::string savedPrompt;                 // composer contents before edit
+    std::vector<ChatMsg> chatTail;           // messages [msgIdx..) parked for Esc restore
+};
+static EditStage s_edit;
 
 static std::string aiVcActiveDocId(AppState& st) {
     if (st.docMirror.hasDoc()) return st.docMirror.docId();
@@ -1558,10 +1560,34 @@ static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
     });
 }
 
+static void aiVcApplyChatTruncate(AppState& st, const nlohmann::json& res) {
+    // Prefer explicit chat_truncate_to (msg index); fall back to msg:N targets only.
+    int truncateTo = -1;
+    if (res.is_object() && res.contains("chat_truncate_to") &&
+        !res["chat_truncate_to"].is_null()) {
+        if (res["chat_truncate_to"].is_number_integer())
+            truncateTo = res["chat_truncate_to"].get<int>();
+        else if (res["chat_truncate_to"].is_number())
+            truncateTo = (int)res["chat_truncate_to"].get<double>();
+    }
+    if (truncateTo < 0) return;
+    if (truncateTo > (int)st.chat.size()) truncateTo = (int)st.chat.size();
+    if (truncateTo < (int)st.chat.size()) {
+        // Free textures on the tail before erase (GL-safe via freeChatTextures).
+        std::vector<ChatMsg> tail(st.chat.begin() + truncateTo, st.chat.end());
+        freeChatTextures(tail);
+        st.chat.erase(st.chat.begin() + truncateTo, st.chat.end());
+        // Invalidate height caches for remaining messages (layout may shift).
+        for (auto& m : st.chat) m.uiCachedH = -1.0f;
+    }
+}
+
 static void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast) {
     if (!s_aiVc.available || s_aiVc.busy || to.empty()) return;
     s_aiVc.busy = true;
     s_aiVc.confirmMsgIdx = -1;
+    s_aiVc.confirmKind = 0;
+    s_aiVc.confirmCallI = -1;
     nlohmann::json p = nlohmann::json::object();
     const std::string docId = aiVcActiveDocId(st);
     if (!docId.empty()) p["doc_id"] = docId;
@@ -1574,6 +1600,7 @@ static void aiVcRollback(AppState& st, const std::string& to, const std::string&
             return;
         }
         aiVcRefreshMirror(st, r.result);
+        aiVcApplyChatTruncate(st, r.result);
         st.toast(ui::ToastLevel::Success,
                  okToast.empty() ? std::string("Restored checkpoint") : okToast);
         s_aiVc.lastFetch = 0.0;  // force timeline refresh next open
@@ -1602,6 +1629,8 @@ static void aiVcFetchTimeline(AppState& st, bool force = false) {
         }
         s_aiVc.err.clear();
         s_aiVc.checkpoints.clear();
+        s_aiVc.hasMsgGranularity = false;
+        s_aiVc.hasCallGranularity = false;
         auto it = r.result.find("checkpoints");
         if (it == r.result.end() || !it->is_array()) return;
         for (const auto& c : *it) {
@@ -1623,6 +1652,25 @@ static void aiVcFetchTimeline(AppState& st, bool force = false) {
                 cp.features = c["features"].get<int>();
             else if (c.contains("features_count") && c["features_count"].is_number())
                 cp.features = c["features_count"].get<int>();
+            // v2: kind / msg_idx / call:{turn,i}
+            cp.kind = c.value("kind", std::string());
+            if (c.contains("msg_idx") && !c["msg_idx"].is_null()) {
+                if (c["msg_idx"].is_number_integer()) cp.msgIdx = c["msg_idx"].get<int>();
+                else if (c["msg_idx"].is_number()) cp.msgIdx = (int)c["msg_idx"].get<double>();
+                if (cp.msgIdx >= 0) s_aiVc.hasMsgGranularity = true;
+            }
+            if (c.contains("call") && c["call"].is_object()) {
+                const auto& call = c["call"];
+                if (call.contains("turn") && call["turn"].is_number())
+                    cp.callTurn = call["turn"].is_number_integer()
+                                      ? call["turn"].get<int>()
+                                      : (int)call["turn"].get<double>();
+                if (call.contains("i") && call["i"].is_number())
+                    cp.callI = call["i"].is_number_integer()
+                                   ? call["i"].get<int>()
+                                   : (int)call["i"].get<double>();
+                if (cp.callTurn >= 0 && cp.callI >= 0) s_aiVc.hasCallGranularity = true;
+            }
             s_aiVc.checkpoints.push_back(std::move(cp));
         }
     });
@@ -1690,7 +1738,11 @@ static void drawAiVcTimelinePopover(AppState& st) {
                                hov ? 0.42f : 0.28f);
 
         char title[160];
-        if (cp.turn >= 0 && !cp.label.empty())
+        if (cp.kind == "prompt" && !cp.label.empty())
+            std::snprintf(title, sizeof(title), "Prompt \xc2\xb7 %s", cp.label.c_str());
+        else if (cp.kind == "tool" && !cp.label.empty())
+            std::snprintf(title, sizeof(title), "Tool \xc2\xb7 %s", cp.label.c_str());
+        else if (cp.turn >= 0 && !cp.label.empty())
             std::snprintf(title, sizeof(title), "Turn %d \xc2\xb7 %s", cp.turn, cp.label.c_str());
         else if (cp.turn >= 0)
             std::snprintf(title, sizeof(title), "Turn %d", cp.turn);
@@ -1743,8 +1795,125 @@ static void drawAiVcTimelinePopover(AppState& st) {
     ImGui::EndChild();
 }
 
+// Draw a double-overlapping left-triangle glyph (◁◁) into `dl` inside `bb`.
+// Used for rewind / Before — never text (font may lack the glyph).
+static void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
+                                  ImU32 col) {
+    const float w = mx.x - mn.x, h = mx.y - mn.y;
+    const float cx = (mn.x + mx.x) * 0.5f;
+    const float cy = (mn.y + mx.y) * 0.5f;
+    const float th = h * 0.34f;   // triangle half-height
+    const float tw = h * 0.28f;   // triangle depth (points left)
+    // Two overlapping left-pointing triangles, slightly offset.
+    auto tri = [&](float ox) {
+        const float tipX = cx + ox - tw;
+        const float baseX = cx + ox + tw * 0.55f;
+        dl->AddTriangleFilled(ImVec2(tipX, cy),
+                              ImVec2(baseX, cy - th),
+                              ImVec2(baseX, cy + th), col);
+    };
+    tri(-w * 0.14f);
+    tri(+w * 0.10f);
+    (void)w;
+}
+
+// Shared rectangular less-rounded header button style for Sessions / Checkpoints / gear-as-box.
+// Returns true on click. `active` highlights like an open overlay.
+static bool drawHeaderTextButton(const char* id, const char* label, bool active, float minW = 0.0f) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const ImVec4 txt = surf.textPrimary;
+    const float round = ui::metrics::rounding(4.0f);  // less-rounded rectangular box
+    ImGui::PushID(id);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, round);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(8.0f * sc, 2.0f * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, active
+        ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
+                 ui::palette.chipBg[3])
+        : ImVec4(txt.x, txt.y, txt.z, 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
+    ImGui::PushStyleColor(ImGuiCol_Text, active ? surf.textPrimary : surf.textSecondary);
+    const float tw = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float bw = std::max(minW, tw);
+    const bool clicked = ImGui::Button(label, ImVec2(bw, 0));
+    ImGui::GetWindowDrawList()->AddRect(
+        ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+        ImGui::ColorConvertFloat4ToU32(ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
+        round, 0, ui::metrics::stroke(1.0f));
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
+    ImGui::PopID();
+    return clicked;
+}
+
+// Cancel staged edit: restore chat tail + composer, NO plm_rollback.
+static void cancelEditStage(AppState& st) {
+    if (!s_edit.active) return;
+    // Drop any messages that replaced the parked tail (UI-only truncation during edit).
+    if (s_edit.msgIdx >= 0 && s_edit.msgIdx <= (int)st.chat.size()) {
+        if (s_edit.msgIdx < (int)st.chat.size()) {
+            std::vector<ChatMsg> drop(st.chat.begin() + s_edit.msgIdx, st.chat.end());
+            freeChatTextures(drop);
+            st.chat.erase(st.chat.begin() + s_edit.msgIdx, st.chat.end());
+        }
+        for (auto& m : s_edit.chatTail) st.chat.push_back(std::move(m));
+    }
+    // Restore composer contents.
+    if (st.prompt.size() < s_edit.savedPrompt.size() + 1)
+        st.prompt.resize(s_edit.savedPrompt.size() + 64, 0);
+    std::memset(st.prompt.data(), 0, st.prompt.size());
+    if (!s_edit.savedPrompt.empty()) {
+        const size_t n = std::min(s_edit.savedPrompt.size(), st.prompt.size() - 1);
+        std::memcpy(st.prompt.data(), s_edit.savedPrompt.data(), n);
+        st.prompt[n] = 0;
+    }
+    s_edit = EditStage{};
+}
+
+// Begin staged edit of user message at msgIdx: park tail, prefill composer, no rollback yet.
+static void beginEditStage(AppState& st, int msgIdx) {
+    if (msgIdx < 0 || msgIdx >= (int)st.chat.size()) return;
+    if (!st.chat[msgIdx].fromUser) return;
+    if (s_edit.active) cancelEditStage(st);
+    s_edit.active = true;
+    s_edit.msgIdx = msgIdx;
+    // Snapshot composer.
+    s_edit.savedPrompt = st.prompt.data() ? std::string(st.prompt.data()) : std::string();
+    // Park [msgIdx..) and drop from live chat (UI-only).
+    s_edit.chatTail.assign(st.chat.begin() + msgIdx, st.chat.end());
+    st.chat.erase(st.chat.begin() + msgIdx, st.chat.end());
+    for (auto& m : st.chat) m.uiCachedH = -1.0f;
+    // Prefill composer with the edited message text.
+    const std::string& t = s_edit.chatTail.empty() ? std::string() : s_edit.chatTail.front().text;
+    if (st.prompt.size() < t.size() + 1) st.prompt.resize(t.size() + 256, 0);
+    std::memset(st.prompt.data(), 0, st.prompt.size());
+    if (!t.empty()) {
+        const size_t n = std::min(t.size(), st.prompt.size() - 1);
+        std::memcpy(st.prompt.data(), t.data(), n);
+        st.prompt[n] = 0;
+    }
+}
+
+// Commit staged edit on send: fire msg:N rollback, discard parked tail, clear stage.
+static void commitEditStageOnSend(AppState& st) {
+    if (!s_edit.active) return;
+    const int msgIdx = s_edit.msgIdx;
+    // Discard parked tail (textures free) — the new send rebuilds the conversation.
+    freeChatTextures(s_edit.chatTail);
+    s_edit.chatTail.clear();
+    s_edit.active = false;
+    s_edit.msgIdx = -1;
+    s_edit.savedPrompt.clear();
+    if (msgIdx >= 0 && s_aiVc.available)
+        aiVcRollback(st, "msg:" + std::to_string(msgIdx), "Rewound to edit");
+}
+
 // Hover actions on a mutating assistant turn: restore before / after this step.
-// Inline confirm = click again within a few seconds (no modal).
+// Glyph language (◁◁) for Before; text "After" kept. Inline confirm = click again.
+// When call granularity is present, Before uses call:<turn>:<i> for the first tool of the turn
+// if known; otherwise degrades to turn-level "turn:N-1" / "turn:N".
 static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
     if (!s_aiVc.available || turnNum <= 0 || s_aiVc.busy) return;
     const float sc = ui::uiScale;
@@ -1752,6 +1921,7 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
     if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
         s_aiVc.confirmMsgIdx = -1;
         s_aiVc.confirmKind = 0;
+        s_aiVc.confirmCallI = -1;
     }
     const bool pending = (s_aiVc.confirmMsgIdx == msgIdx);
 
@@ -1767,25 +1937,41 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
     const bool show = pending || latched;
     if (!show) return;
 
-    auto clickAction = [&](int kind, const char* idle, const char* confirm, const char* tip) {
+    auto glyphBtn = [&](int kind, const char* tip) {
         ImGui::SameLine(0, 6.0f * sc);
         const bool isPend = pending && s_aiVc.confirmKind == kind;
-        const char* lab = isPend ? confirm : idle;
+        const float sz = ImGui::GetFrameHeight();
+        ImGui::PushID(kind + 400);
         if (isPend) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
-            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
         }
-        if (ImGui::SmallButton(lab)) {
+        const bool clicked = ImGui::InvisibleButton("##rw", ImVec2(sz * 1.15f, sz));
+        const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ui::AdaptiveSurface& surf = chatSurf();
+        const ImU32 col = ImGui::ColorConvertFloat4ToU32(
+            isPend ? surf.textPrimary : surf.textSecondary);
+        // Soft chip bg on hover/pending.
+        if (isPend || ImGui::IsItemHovered())
+            dl->AddRectFilled(bmn, bmx,
+                ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                      surf.textPrimary.z, isPend ? 0.18f : 0.10f)),
+                ui::metrics::rounding(4.0f));
+        drawDoubleRewindGlyph(dl, bmn, bmx, col);
+        if (isPend) ImGui::PopStyleColor();
+        if (clicked) {
             if (!isPend) {
                 s_aiVc.confirmMsgIdx = msgIdx;
                 s_aiVc.confirmKind = kind;
                 s_aiVc.confirmUntil = now + 4.0;
             } else {
-                // kind 1 = before this step → turn:(N-1); kind 2 = after = turn:N
                 std::string to;
                 if (kind == 1) {
-                    if (turnNum <= 1) to = "turn:0";
+                    // Prefer call-granularity "before first tool of this turn" when available.
+                    if (s_aiVc.hasCallGranularity)
+                        to = "call:" + std::to_string(turnNum) + ":0";
+                    else if (turnNum <= 1) to = "turn:0";
                     else to = "turn:" + std::to_string(turnNum - 1);
                 } else {
                     to = "turn:" + std::to_string(turnNum);
@@ -1795,6 +1981,34 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
                                        : "Restored to after this step");
             }
         }
+        if (ImGui::IsItemHovered()) {
+            s_hovMsg = msgIdx;
+            s_hovUntil = now + 0.6;
+            ImGui::SetTooltip("%s", isPend ? "Click again to confirm." : tip);
+        }
+        ImGui::PopID();
+    };
+
+    auto textBtn = [&](int kind, const char* idle, const char* tip) {
+        ImGui::SameLine(0, 4.0f * sc);
+        const bool isPend = pending && s_aiVc.confirmKind == kind;
+        if (isPend) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
+        if (ImGui::SmallButton(isPend ? "Confirm?" : idle)) {
+            if (!isPend) {
+                s_aiVc.confirmMsgIdx = msgIdx;
+                s_aiVc.confirmKind = kind;
+                s_aiVc.confirmUntil = now + 4.0;
+            } else {
+                aiVcRollback(st, "turn:" + std::to_string(turnNum),
+                             "Restored to after this step");
+            }
+        }
+        ImGui::PopStyleVar();
         if (isPend) ImGui::PopStyleColor(2);
         if (ImGui::IsItemHovered()) {
             s_hovMsg = msgIdx;
@@ -1803,13 +2017,95 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
         }
     };
 
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
-    clickAction(1, "Before", "Confirm?", "Restore the part to the state before this step.");
-    clickAction(2, "After",  "Confirm?", "Restore the part to the state after this step.");
-    ImGui::PopStyleVar();
+    glyphBtn(1, "Restore the part to the state before this step.");
+    textBtn(2, "After", "Restore the part to the state after this step.");
 }
 
 }  // namespace
+
+// One user turn: right-aligned bubble + ◁◁ rewind + Edit message (AI-VC msg:N).
+static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
+                          float panelW, int msgIdx) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, chatSurf());
+    // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
+    const float bw = ImGui::GetContentRegionAvail().x;
+    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
+    ImGui::BeginChild("##umsg", ImVec2(bw, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "You");
+    ImGui::PopFont();
+
+    // ◁◁ rewind + Edit message — always shown when AI-VC is available (degrade: hide).
+    if (s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy) {
+        const double now = ImGui::GetTime();
+        if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
+            s_aiVc.confirmMsgIdx = -1;
+            s_aiVc.confirmKind = 0;
+        }
+        const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
+
+        ImGui::SameLine(0, 8.0f * sc);
+        const float sz = ImGui::GetFrameHeight();
+        // Rewind glyph button
+        {
+            if (pending) {
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
+            }
+            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(sz * 1.15f, sz));
+            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ui::AdaptiveSurface& surf = chatSurf();
+            if (pending || ImGui::IsItemHovered())
+                dl->AddRectFilled(bmn, bmx,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                          surf.textPrimary.z, pending ? 0.18f : 0.10f)),
+                    ui::metrics::rounding(4.0f));
+            drawDoubleRewindGlyph(dl, bmn, bmx,
+                ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+            if (pending) ImGui::PopStyleColor();
+            if (clicked) {
+                if (!pending) {
+                    s_aiVc.confirmMsgIdx = msgIdx;
+                    s_aiVc.confirmKind = 3;
+                    s_aiVc.confirmUntil = now + 4.0;
+                } else {
+                    // Prefer msg:N when the worker advertises msg granularity; else turn-level
+                    // degrade is not available for user rows — still send msg:N (core accepts it
+                    // per contract; unknown targets toast via aiVcOk).
+                    aiVcRollback(st, "msg:" + std::to_string(msgIdx),
+                                 "Rewound to before this message");
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(pending ? "Click again to confirm rewind."
+                                          : "Rewind — restore the part to before this message.");
+        }
+        // Edit message — stages UI truncation + composer prefill; rollback only on send.
+        ImGui::SameLine(0, 4.0f * sc);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
+        if (ImGui::SmallButton("Edit message")) {
+            beginEditStage(st, msgIdx);
+        }
+        ImGui::PopStyleVar();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImRect bubble = endGlassBubble(gb);
+    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
+        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+    ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
+}
 
 
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
@@ -1981,22 +2277,25 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    // Right-side control cluster: [Sessions|< Chat] [history clock] [settings gear] [status],
+    // Right-side control cluster: [Sessions|< Chat] [Checkpoints] [gear] [status],
     // hard-anchored to the column's right edge so every control is always on-screen (T-G17).
     // Sessions and Settings are mutually exclusive in-column overlays over the chat log.
-    // The history clock opens the AI checkpoints popover (hidden when AI-VC RPCs are absent).
-    const float gearW = lh;
+    // Checkpoints opens the AI-VC popover (hidden when AI-VC RPCs are absent).
+    // Sessions / Checkpoints / gear share drawHeaderTextButton (rectangular less-rounded boxes).
+    const float gearW = lh + 4.0f * sc;  // square-ish box for the gear glyph
     const bool sessionsOpen = st.showSessionsPicker;
     const bool settingsOpen = st.showAISettingsOverlay;
     const bool showAiVc = s_aiVc.available;
     const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
+    // Widths for anchoring: text buttons stretch to fit label (+ padding from helper).
     const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
-                                 ImGui::CalcTextSize("< Chat").x) + style.FramePadding.x * 2.0f;
-    const float histW = showAiVc ? gearW : 0.0f;
+                                 ImGui::CalcTextSize("< Chat").x) + 16.0f * sc;
+    const float ckptW = showAiVc
+        ? (ImGui::CalcTextSize("Checkpoints").x + 16.0f * sc) : 0.0f;
     const float histGap = showAiVc ? style.ItemSpacing.x : 0.0f;
     const float dotW  = lh;
     const float rightInset = ui::metrics::U(1);
-    const float cluster = sessW + style.ItemSpacing.x + histW + histGap + gearW +
+    const float cluster = sessW + style.ItemSpacing.x + ckptW + histGap + gearW +
                           style.ItemSpacing.x + dotW;
     const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
 
@@ -2033,7 +2332,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
     centerY(lh);
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton(sessLabel)) {
+    if (drawHeaderTextButton("##hdr_sess", sessLabel, sessionsOpen, sessW)) {
         st.showSessionsPicker = !st.showSessionsPicker;
         if (st.showSessionsPicker) st.showAISettingsOverlay = false;
     }
@@ -2042,30 +2341,17 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
                                        : "Sessions — switch between chats.");
 
-    // AI checkpoints clock — between Sessions and the settings gear. Hidden when the
-    // plm_timeline / plm_rollback worker RPCs are absent (AiVcCore still landing).
+    // Checkpoints text button — same style path as Sessions. Hidden when AI-VC RPCs absent.
     if (showAiVc) {
         ImGui::SameLine();
-        centerY(gearW);
-        IconUV hist = ui::getIcon("history", 20);
-        if (!hist.valid) hist = ui::getIcon("undo", 20);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * sc, 2 * sc));
-        bool histClicked = false;
-        if (hist.valid)
-            histClicked = ImGui::ImageButton("##aiheaderhist", hist.texId,
-                                            ImVec2(gearW - 4 * sc, gearW - 4 * sc),
-                                            hist.uv0, hist.uv1);
-        else
-            histClicked = ImGui::SmallButton("ck");
-        ImGui::PopStyleVar();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("AI checkpoints — restore the part to a prior step.");
-        if (histClicked) {
+        centerY(lh);
+        if (drawHeaderTextButton("##hdr_ckpt", "Checkpoints", false, ckptW)) {
             aiVcFetchTimeline(st, /*force=*/true);
             ImGui::OpenPopup("##ai_vc_timeline");
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("AI checkpoints — restore the part to a prior step.");
         if (ImGui::BeginPopup("##ai_vc_timeline")) {
-            // Keep the list fresh while open (throttled inside aiVcFetchTimeline).
             aiVcFetchTimeline(st, /*force=*/false);
             drawAiVcTimelinePopover(st);
             ImGui::EndPopup();
@@ -2073,31 +2359,44 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
 
     ImGui::SameLine();
-    centerY(gearW);
-    IconUV gear = ui::getIcon("settings", 20);
-    bool gearClicked = false;
-    // Highlight the gear when the settings overlay is open (same visual language as Sessions).
-    if (settingsOpen) {
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
-                   ui::palette.chipBg[3]));
+    centerY(lh);
+    // Gear as a rectangular box matching Sessions/Checkpoints (icon drawn inside).
+    {
+        const float round = ui::metrics::rounding(4.0f);
+        const ui::AdaptiveSurface& surf = chatSurf();
+        const ImVec4 txt = surf.textPrimary;
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, round);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.0f * sc, 2.0f * sc));
+        ImGui::PushStyleColor(ImGuiCol_Button, settingsOpen
+            ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
+                     ui::palette.chipBg[3])
+            : ImVec4(txt.x, txt.y, txt.z, 0.06f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
+        IconUV gear = ui::getIcon("settings", 20);
+        bool gearClicked = false;
+        if (gear.valid)
+            gearClicked = ImGui::ImageButton("##aiheadergear", gear.texId,
+                                             ImVec2(gearW - 4.0f * sc, gearW - 4.0f * sc),
+                                             gear.uv0, gear.uv1);
+        else
+            gearClicked = drawHeaderTextButton("##hdr_gear", settingsOpen ? "<" : "set",
+                                              settingsOpen, gearW);
+        ImGui::GetWindowDrawList()->AddRect(
+            ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+            ImGui::ColorConvertFloat4ToU32(
+                ImVec4(txt.x, txt.y, txt.z, settingsOpen ? 0.45f : 0.25f)),
+            round, 0, ui::metrics::stroke(1.0f));
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar(2);
+        if (gearClicked) {
+            st.showAISettingsOverlay = !st.showAISettingsOverlay;
+            if (st.showAISettingsOverlay) st.showSessionsPicker = false;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(settingsOpen ? "Back to the chat."
+                                           : "AI settings — provider, model, privacy.");
     }
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * sc, 2 * sc));
-    if (gear.valid)
-        gearClicked = ImGui::ImageButton("##aiheadergear", gear.texId,
-                                         ImVec2(gearW - 4 * sc, gearW - 4 * sc),
-                                         gear.uv0, gear.uv1);
-    else
-        gearClicked = ImGui::SmallButton(settingsOpen ? "<" : "set");
-    ImGui::PopStyleVar();
-    if (settingsOpen) ImGui::PopStyleColor();
-    if (gearClicked) {
-        st.showAISettingsOverlay = !st.showAISettingsOverlay;
-        if (st.showAISettingsOverlay) st.showSessionsPicker = false;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(settingsOpen ? "Back to the chat."
-                                       : "AI settings — provider, model, privacy.");
 
     ImGui::SameLine();
     centerY(lh);
@@ -4255,6 +4554,213 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
 }
 
+// ============================ Subscription usage box (copilot) ============================
+// Compact account/plan + per-window usage bars for the ACTIVE provider. Polls
+// subscription_usage every 5 min; file-static cache (Main: do not touch app_state.h).
+// Degrade: hide permanently on unknown_method; xAI shows plan chip + dim "no usage API".
+
+namespace {
+
+struct UsageWindow {
+    std::string window;
+    std::string label;
+    float usedFraction = -1.0f;  // <0 = unknown
+    std::string status;          // ok|warn|blocked|unknown
+};
+
+struct UsageCache {
+    bool available = true;   // false after unknown_method
+    bool loading = false;
+    bool hasRow = false;     // true when we have at least identity/plan for active provider
+    double lastFetch = -1e9;
+    std::string lastProvider;  // friendly id last requested
+    std::string displayName;
+    std::string plan;
+    std::string accountId;
+    std::string dashboardUrl;
+    std::string source;        // api|jwt_inference|unavailable|...
+    std::vector<UsageWindow> windows;
+};
+static UsageCache s_usage;
+
+// Map settings.provider int → subscription_usage friendly id (codex|claude|cursor|xai).
+// Non-subscription providers return empty → box hidden.
+static std::string usageFriendlyProvider(int provider) {
+    switch (provider) {
+        case ui::PROV_ANTHROPIC: return "claude";
+        case ui::PROV_OPENAI:    return "codex";  // ChatGPT/Codex sub
+        case ui::PROV_XAI:       return "xai";
+        // Cursor has no dedicated PROV_ yet in the picker; omit.
+        default: return {};
+    }
+}
+
+static bool usageIsAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (!r.result.is_object()) return false;
+    if (r.result.contains("code")) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+    }
+    if (!r.result.value("ok", true)) {
+        const std::string reason = r.result.value("reason", std::string());
+        if (reason == "unknown_method" || reason == "method_not_found" ||
+            reason == "not_implemented")
+            return true;
+    }
+    return false;
+}
+
+static void usageFetch(AppState& st, const std::string& provider, bool force) {
+    if (!s_usage.available || s_usage.loading || provider.empty()) return;
+    const double now = ImGui::GetTime();
+    if (!force && provider == s_usage.lastProvider && (now - s_usage.lastFetch) < 300.0)
+        return;
+    s_usage.loading = true;
+    s_usage.lastFetch = now;
+    s_usage.lastProvider = provider;
+    nlohmann::json p = nlohmann::json::object();
+    p["provider"] = provider;
+    st.rpc.call("subscription_usage", p, [provider](const core::RpcResult& r) {
+        s_usage.loading = false;
+        if (usageIsAbsent(r)) {
+            s_usage.available = false;
+            s_usage.hasRow = false;
+            s_usage.windows.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
+            // Soft fail — keep prior cache, don't hide forever.
+            return;
+        }
+        s_usage.displayName.clear();
+        s_usage.plan.clear();
+        s_usage.accountId.clear();
+        s_usage.dashboardUrl.clear();
+        s_usage.source.clear();
+        s_usage.windows.clear();
+        s_usage.hasRow = false;
+        auto rowsIt = r.result.find("rows");
+        if (rowsIt == r.result.end() || !rowsIt->is_array()) return;
+        for (const auto& row : *rowsIt) {
+            if (!row.is_object()) continue;
+            const std::string rp = row.value("provider", std::string());
+            if (!rp.empty() && rp != provider && rp != provider + "-sub") continue;
+            s_usage.hasRow = true;
+            s_usage.displayName = row.value("display_name", row.value("email", std::string()));
+            s_usage.plan = row.value("plan", std::string());
+            s_usage.accountId = row.value("account_id", std::string());
+            s_usage.dashboardUrl = row.value("dashboard_url", std::string());
+            s_usage.source = row.value("source", std::string());
+            if (row.contains("usage") && row["usage"].is_array()) {
+                for (const auto& u : row["usage"]) {
+                    if (!u.is_object()) continue;
+                    UsageWindow w;
+                    w.window = u.value("window", std::string());
+                    w.label = u.value("label", w.window);
+                    if (u.contains("used_fraction") && u["used_fraction"].is_number())
+                        w.usedFraction = (float)u["used_fraction"].get<double>();
+                    w.status = u.value("status", std::string("unknown"));
+                    s_usage.windows.push_back(std::move(w));
+                }
+            }
+            break;  // first matching active row
+        }
+    });
+}
+
+// Compact usage strip above the model picker. Hidden when RPC absent or provider has no sub.
+static void drawCopilotUsageBox(AppState& st) {
+    if (!s_usage.available) return;
+    const std::string prov = usageFriendlyProvider(st.settings.provider);
+    if (prov.empty()) return;
+    usageFetch(st, prov, /*force=*/false);
+    // Nothing to show until first successful row (or xAI plan-only degrade).
+    if (!s_usage.hasRow && !s_usage.loading) {
+        // Still show a one-shot probe result for xAI once fetch returns empty row with no plan —
+        // only paint when we have something.
+        return;
+    }
+    if (!s_usage.hasRow) return;
+
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const auto& pal = ui::palette;
+
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+    ImGui::BeginGroup();
+    // Line 1: display_name · plan chip
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        if (!s_usage.displayName.empty()) {
+            ImGui::TextUnformatted(s_usage.displayName.c_str());
+            if (!s_usage.plan.empty()) ImGui::SameLine(0, 6.0f * sc);
+        }
+        ImGui::PopStyleColor();
+        if (!s_usage.plan.empty()) {
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::TextUnformatted(s_usage.plan.c_str());
+            ImGui::PopStyleColor();
+            const ImVec2 p1 = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(
+                ImVec2(p0.x - 3.0f * sc, p0.y - 1.0f * sc),
+                ImVec2(p1.x + 3.0f * sc, p1.y + 1.0f * sc),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                      surf.textPrimary.z, 0.30f)),
+                ui::metrics::rounding(4.0f), 0, ui::metrics::stroke(1.0f));
+        }
+    }
+    // Line 2: usage bars OR dim "no usage API" for xAI-class empty windows.
+    if (s_usage.windows.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        if (prov == "xai")
+            ImGui::TextUnformatted("no usage API — check grok.com Settings \xe2\x86\x92 Usage");
+        else if (s_usage.source == "unavailable" || s_usage.source.empty())
+            ImGui::TextUnformatted("usage unavailable");
+        else
+            ImGui::TextUnformatted("no usage windows");
+        ImGui::PopStyleColor();
+    } else {
+        const float barH = 4.0f * sc;
+        const float barW = std::max(40.0f * sc, ImGui::GetContentRegionAvail().x * 0.45f);
+        for (const auto& w : s_usage.windows) {
+            const char* lab = w.label.empty() ? w.window.c_str() : w.label.c_str();
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted(lab);
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 6.0f * sc);
+            const float frac = w.usedFraction < 0.0f ? 0.0f
+                               : (w.usedFraction > 1.0f ? 1.0f : w.usedFraction);
+            ImVec4 fill = ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f);
+            if (w.status == "warn")
+                fill = semanticOnGlass(pal.errCad, surf);
+            else if (w.status == "blocked")
+                fill = semanticOnGlass(pal.statusErr, surf);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, fill);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f));
+            char overlay[16] = "";
+            if (w.usedFraction >= 0.0f)
+                std::snprintf(overlay, sizeof(overlay), "%.0f%%", frac * 100.0f);
+            ImGui::ProgressBar(w.usedFraction < 0.0f ? 0.0f : frac, ImVec2(barW, barH),
+                               w.usedFraction < 0.0f ? "" : overlay);
+            ImGui::PopStyleColor(2);
+        }
+    }
+    ImGui::EndGroup();
+    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+}
+
+}  // namespace
+
 // Toolbar row below the prompt: model picker + thinking effort + paperclip. The send/stop
 // control moved INSIDE the input box (drawComposerSendStop) — flagship-composer pattern.
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
@@ -4528,11 +5034,17 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;
     st.agentV2 = (st.aiInteraction == 1);
 
+    // Esc during staged "Edit message" restores chat/composer WITHOUT any plm_rollback.
+    if (s_edit.active && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        cancelEditStage(st);
+    }
+
     // Drain the message queue: once the assistant is free, auto-send the next queued message
     // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
     if (!aiTurnActive(st) && !st.queuedPrompts.empty() && canRun) {
         std::string next = st.queuedPrompts.front();
         st.queuedPrompts.erase(st.queuedPrompts.begin());
+        // Queued sends never commit a staged edit (stage should already be cleared).
         submitTurn(st, next);
     }
 
@@ -4640,6 +5152,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     drawComposerSendStop(st, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
                          composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
 
+    drawCopilotUsageBox(st);
     drawComposerToolbar(st, busy, true);
     ImGui::PopStyleVar();
 
@@ -4660,6 +5173,8 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                 st.prompt[0] = 0;
             }
         } else if (canStart) {
+            // Stage the rollback only on send (Esc cancelled without this).
+            if (s_edit.active) commitEditStageOnSend(st);
             submitTurn(st, std::string(st.prompt.data()));
             st.prompt[0] = 0;
         }
@@ -4690,7 +5205,8 @@ static void drawChatLogWindowed(AppState& st) {
         const float y = ImGui::GetCursorPosY();
         const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
         const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
-                                 (s_aiVc.confirmMsgIdx == (int)mi);
+                                 (s_aiVc.confirmMsgIdx == (int)mi) ||
+                                 (s_edit.active && s_edit.msgIdx == (int)mi);
         // Pre-count mutating assistant turns even when the row is off-screen (stable turn nums).
         int thisTurn = 0;
         if (!m.fromUser && chatMsgMutatedDoc(m)) {
@@ -4705,7 +5221,7 @@ static void drawChatLogWindowed(AppState& st) {
         }
         ImGui::BeginGroup();
         if (m.fromUser) {
-            drawUserBlock(m, fonts, logW);
+            drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
             drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn);
             ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));

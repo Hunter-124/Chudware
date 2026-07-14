@@ -167,6 +167,15 @@ class CodexSubProvider(Provider):
             "account_id": account_id,
             "email": email,
         }
+        # Preserve plan across refresh; fill display_name from JWT email.
+        if self._cred and self._cred.get("plan"):
+            cred["plan"] = self._cred.get("plan")
+        try:
+            from . import usage as usage_mod
+            cred = usage_mod.enrich_codex_identity(cred)
+        except Exception:
+            if email:
+                cred.setdefault("display_name", email)
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

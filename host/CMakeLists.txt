@@ -185,6 +185,8 @@ add_executable(Billet
   src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
   src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory → CEF (or NullWebView without the SDK)
+  src/ui/widgets/interwebz.cpp
+  src/ui/widgets/interwebz_demo.cpp
   src/ui/ribbon_def.cpp
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
@@ -200,6 +202,7 @@ add_executable(Billet
   src/ui/plm/plm_pages.cpp   # plmDraw*Page implementations (split out of plm_workspace)
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
+  src/ui/plm_overview.cpp        # compact PLM overview (left manager tab, left of Explorer)
   src/ui/ai/ai_workspace.cpp
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
   src/ui/firmware/fw_workspace.cpp    # T-FIN5 Firmware workspace (projects/build/emulation/trace)

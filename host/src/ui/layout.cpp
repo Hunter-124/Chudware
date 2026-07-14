@@ -20,6 +20,7 @@
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
 #include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
+#include "plm_overview.h"       // compact PLM overview tab (left of Explorer on Model)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
@@ -679,6 +680,7 @@ void drawLeftPane(AppState& st,
     // reserves chevRsv on its right so the two never collide. ----
     struct TabDef { int id; const char* icon; const char* fallback; const char* tip; };
     static const TabDef kTabs[] = {
+        { kLeftPanePLM,             "app",         "P", "PLM" },
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
         { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
@@ -752,7 +754,8 @@ void drawLeftPane(AppState& st,
             // row, vertically centered on the button row, NO icon — the highlighted tab button
             // already carries the glyph. Replaces the old centered header chip below the divider.
             const char* paneTitle = "Feature Manager";
-            if (st.leftPaneTab == kLeftPaneExplorer)            paneTitle = "Explorer";
+            if (st.leftPaneTab == kLeftPanePLM)                  paneTitle = "PLM";
+            else if (st.leftPaneTab == kLeftPaneExplorer)        paneTitle = "Explorer";
             else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
             ImDrawList* pdl = ImGui::GetWindowDrawList();
             const ImVec2 tsz = ImGui::CalcTextSize(paneTitle);
@@ -805,6 +808,10 @@ void drawLeftPane(AppState& st,
         // Title moved up into the tab-button row; the tree/body starts straight below the top
         // divider under the buttons (no centered header chip, no extra separator here).
         switch (st.leftPaneTab) {
+            case kLeftPanePLM:
+                drawPlmOverviewBody(st);
+                break;
+
             case kLeftPaneExplorer:
                 // Wave 3: the workspace file browser (file_explorer.cpp).
                 drawFileExplorerBody(st);

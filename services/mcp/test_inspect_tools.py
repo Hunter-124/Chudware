@@ -1,4 +1,5 @@
-"""Unit tests for close-up inspection helpers (inspect_part / look_around).
+"""Unit tests for close-up inspection helpers (inspect_part / look_around /
+render_views / inspect_feature / emphasis palette).
 
 Monkeypatches the render/query seams — no live engine / paid APIs required.
 Run:  python3 -m pytest services/mcp/test_inspect_tools.py -q
@@ -18,6 +19,27 @@ import pytest
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+
+def _extract_palette(caption: str) -> dict:
+    """Pull the embedded ``[palette_json=...]`` block out of an inspect caption."""
+    marker = "palette_json="
+    i = caption.find(marker)
+    assert i >= 0, f"no palette_json in caption: {caption!r}"
+    j = caption.find("{", i)
+    assert j >= 0
+    # Bracket-match the JSON object (entries array may contain nested braces).
+    depth = 0
+    for k in range(j, len(caption)):
+        ch = caption[k]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(caption[j : k + 1])
+    raise AssertionError(f"unbalanced palette_json in caption: {caption!r}")
 
 from services.mcp import cad_tools as ct  # noqa: E402
 
@@ -264,7 +286,7 @@ class TestInspectToolsE2E:
                 return part_bbox
             if method == "doc_face_points":
                 # A few points around the first match centroid.
-                c = matches[0]["centroid"]
+                c = matches[0]["centroid"] if matches else [0, 0, 0]
                 return {"points": [
                     [c[0] - 5, c[1] - 5, c[2]],
                     [c[0] + 5, c[1] - 5, c[2]],
@@ -272,44 +294,59 @@ class TestInspectToolsE2E:
                     [c[0] + 5, c[1] + 5, c[2]],
                 ]}
             if method == "eval_measure":
-                return {"kind": "area", "area": float(matches[0].get("area_or_len") or 1.0)}
+                area = float((matches[0].get("area_or_len") if matches else 1.0) or 1.0)
+                return {"kind": "area", "area": area}
             if method in ("doc_render_view", "doc_render_png"):
                 _fake_png(params["out_path"])
-                return {"ok": True, "path": params["out_path"]}
+                return {"ok": True, "path": params["out_path"],
+                        "view": "front", "dir": [0, -1, 0]}
+            if method == "doc_render_contact_sheet":
+                # Labeled multi-view grid (engine default 4 tiles; we accept any list).
+                views = params.get("views") or ["front", "back", "left", "right",
+                                               "top", "bottom", "iso"]
+                # Produce a wide sheet so size assertions pass.
+                n = max(len(views), 1)
+                cols = min(3, n)
+                rows = (n + cols - 1) // cols
+                _fake_png(params["out_path"], size=(512 * cols, 400 * rows),
+                          color=(170, 180, 190))
+                return {"ok": True, "path": params["out_path"], "views": list(views),
+                        "cols": cols, "rows": rows, "tile": [512, 400]}
             if method == "doc_tree":
-                return {"owner_map": {}, "tree": {"features": []}}
+                return {"owner_map": {}, "tree": {"features": [
+                    {"id": "f1", "name": "Box", "type": "box"},
+                ]}}
+            if method == "eval_section_props":
+                return {"area_mm2": 120.0, "centroid": [0, 0, 0],
+                        "Ixx": 1.0, "Iyy": 1.0, "Ixy": 0.0}
             raise AssertionError(f"unexpected method {method}")
 
         monkeypatch.setattr(ct.cb, "call", fake_call)
         # Pin _doc so we don't need a live current-doc.
         monkeypatch.setattr(ct, "_doc", lambda doc_id=None: doc_id or "doc-test")
+        # describe_part excerpt path may call gsl_tools — keep it offline.
+        monkeypatch.setattr(ct, "_describe_part_excerpt",
+                            lambda doc_id, max_chars=900: (
+                                "Part bbox 40x30x20 mm | features: f1:box | faces: top Ftop"))
         return calls
+
+    def _tool(self, name: str):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("test-inspect")
+        ct.register_cad_tools(mcp)
+        mgr = getattr(mcp, "_tool_manager", None) or getattr(mcp, "tool_manager", None)
+        tools = getattr(mgr, "_tools", {}) if mgr else {}
+        if name in tools:
+            return tools[name].fn
+        for n, t in (tools or {}).items():
+            if n == name or getattr(t, "name", None) == name:
+                return getattr(t, "fn", t)
+        raise AssertionError(f"{name} not registered; tools={list(tools)}")
 
     def test_inspect_part_returns_image_and_caption(
             self, monkeypatch, top_face_match, part_bbox, tmp_path):
         calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
-
-        # Build a minimal FastMCP stand-in: call the tool function directly via the
-        # module-level helpers the tool body uses (we re-implement the tool body
-        # path by importing register and extracting the function).
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP("test-inspect")
-        ct.register_cad_tools(mcp)
-
-        # Locate the registered tool callable.
-        tool_fn = None
-        # FastMCP stores tools in _tool_manager._tools in recent versions.
-        mgr = getattr(mcp, "_tool_manager", None) or getattr(mcp, " ste_manager", None)
-        tools = getattr(mgr, "_tools", {}) if mgr else {}
-        if "inspect_part" in tools:
-            tool_fn = tools["inspect_part"].fn
-        else:
-            # Fallback: walk registered tools.
-            for name, t in (tools or {}).items():
-                if name == "inspect_part" or getattr(t, "name", None) == "inspect_part":
-                    tool_fn = getattr(t, "fn", t)
-                    break
-        assert tool_fn is not None, f"inspect_part not registered; tools={list(tools)}"
+        tool_fn = self._tool("inspect_part")
 
         result = tool_fn(target="top", doc_id="doc-test", view="auto",
                          zoom_factor=1.5, margin=0.15, annotate=True)
@@ -326,24 +363,14 @@ class TestInspectToolsE2E:
     def test_inspect_part_unmatched_errors(
             self, monkeypatch, part_bbox, tmp_path):
         self._install_seams(monkeypatch, [], part_bbox, tmp_path)
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP("test-inspect")
-        ct.register_cad_tools(mcp)
-        mgr = getattr(mcp, "_tool_manager", None)
-        tools = getattr(mgr, "_tools", {}) if mgr else {}
-        tool_fn = tools["inspect_part"].fn
+        tool_fn = self._tool("inspect_part")
         with pytest.raises(ValueError, match="No geometry matched"):
             tool_fn(target={"of": "face", "side": "nope"}, doc_id="doc-test")
 
     def test_look_around_tiles(
             self, monkeypatch, top_face_match, part_bbox, tmp_path):
         calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP("test-inspect")
-        ct.register_cad_tools(mcp)
-        mgr = getattr(mcp, "_tool_manager", None)
-        tools = getattr(mgr, "_tools", {}) if mgr else {}
-        tool_fn = tools["look_around"].fn
+        tool_fn = self._tool("look_around")
         result = tool_fn(target="top", doc_id="doc-test", n_views=4)
         assert isinstance(result, list) and len(result) == 2
         img, caption = result
@@ -370,6 +397,153 @@ class TestInspectToolsE2E:
         assert bb["size"][1] == pytest.approx(10.0)
         assert bb["center"][2] == pytest.approx(10.0)
 
+    def test_render_views_default_grid(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("render_views")
+        result = tool_fn(doc_id="doc-test")
+        assert isinstance(result, list) and len(result) == 2
+        img, caption = result
+        png_path = getattr(img, "path", img)
+        assert os.path.exists(png_path)
+        from PIL import Image as PILImage
+        with PILImage.open(png_path) as im:
+            # Default 7 views (6 ortho + iso) tiled — wider than a single render.
+            assert im.size[0] >= 512 and im.size[1] >= 400
+        assert "render_views" in caption
+        # Default path hits the contact-sheet RPC once.
+        assert any(m == "doc_render_contact_sheet" for m, _ in calls)
+        # Caption names the standard views.
+        for name in ("front", "back", "top", "iso"):
+            assert name in caption.lower()
+
+    def test_render_views_custom_list(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("render_views")
+        result = tool_fn(doc_id="doc-test", views=["front", "top", "iso"])
+        img, caption = result
+        assert os.path.exists(getattr(img, "path", img))
+        cs = [p for m, p in calls if m == "doc_render_contact_sheet"]
+        assert cs and cs[0].get("views") == ["front", "top", "iso"]
+        assert "front" in caption.lower() and "iso" in caption.lower()
+
+    def test_render_views_target_framed(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("render_views")
+        result = tool_fn(doc_id="doc-test", views=["front", "top"], target="top")
+        img, caption = result
+        png_path = getattr(img, "path", img)
+        assert os.path.exists(png_path)
+        from PIL import Image as PILImage
+        with PILImage.open(png_path) as im:
+            assert im.size[0] >= 512
+        # Target-framed path uses per-view doc_render_view, not contact_sheet.
+        assert sum(1 for m, _ in calls if m == "doc_render_view") >= 2
+        assert "render_views" in caption
+
+    def test_inspect_part_emphasis_palette(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("inspect_part")
+        result = tool_fn(target="top", doc_id="doc-test", emphasize=True,
+                         emphasis_mode="emphasis")
+        img, caption = result
+        assert os.path.exists(getattr(img, "path", img))
+        assert "palette_json=" in caption
+        assert "EMPHASIS" in caption or "Emphasis" in caption or "emphasis" in caption
+        # Parse the embedded palette metadata (assert palette, not pixels).
+        palette = _extract_palette(caption)
+        assert palette["mode"] == "emphasis"
+        assert palette["entries"]
+        assert palette["entries"][0]["rgb"] == list(ct._EMPHASIS_PALETTE[0])
+        assert "glow_rgb" in palette
+
+    def test_inspect_part_per_face_palette_deterministic(
+            self, monkeypatch, top_face_match, fillet_face_match, part_bbox, tmp_path):
+        matches = [top_face_match, fillet_face_match]
+        self._install_seams(monkeypatch, matches, part_bbox, tmp_path)
+        # Build palette directly (same helper the tool uses).
+        p1 = ct._build_emphasis_palette(matches, mode="per_face")
+        p2 = ct._build_emphasis_palette(matches, mode="per_face")
+        assert p1["mode"] == "per_face"
+        assert len(p1["entries"]) == 2
+        # Deterministic across calls.
+        assert p1["entries"][0]["rgb"] == p2["entries"][0]["rgb"]
+        assert p1["entries"][1]["rgb"] == p2["entries"][1]["rgb"]
+        # Distinct colours for distinct sids.
+        assert p1["entries"][0]["rgb"] != p1["entries"][1]["rgb"]
+        # Keys track sids.
+        assert p1["entries"][0]["sid"] == "Ftop"
+        assert p1["entries"][1]["sid"] == "Ffillet"
+
+    def test_inspect_feature_one_call(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("inspect_feature")
+        result = tool_fn(target="top", doc_id="doc-test")
+        assert isinstance(result, list) and len(result) == 2
+        img, caption = result
+        png_path = getattr(img, "path", img)
+        assert os.path.exists(png_path)
+        assert "Close-up" in caption
+        assert "describe_part excerpt" in caption
+        assert "palette_json=" in caption
+        palette = _extract_palette(caption)
+        assert palette["mode"] == "emphasis"
+        assert palette["entries"][0]["sid"] == "Ftop"
+        assert any(meth == "doc_render_view" for meth, _ in calls)
+
+    def test_render_part_emphasis_palette_in_caption(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        tool_fn = self._tool("render_part")
+        result = tool_fn(doc_id="doc-test", emphasize="top", emphasis_mode="per_face")
+        assert isinstance(result, list) and len(result) == 2
+        img, caption = result
+        assert os.path.exists(getattr(img, "path", img))
+        assert "palette_json=" in caption
+        palette = _extract_palette(caption)
+        assert palette["mode"] == "per_face"
+        assert palette["entries"][0]["key"]
+
+
+class TestEmphasisHelpers:
+    def test_stable_color_deterministic(self):
+        a = ct._stable_color_for_key("Ftop")
+        b = ct._stable_color_for_key("Ftop")
+        c = ct._stable_color_for_key("Fother")
+        assert a == b
+        assert a != c
+
+    def test_normalize_view_list_default(self):
+        v = ct._normalize_view_list(None)
+        assert v == list(ct._STANDARD_ORTHO_VIEWS)
+        assert "front" in v and "iso" in v and len(v) == 7
+
+    def test_target_is_internal_bore(self, part_bbox):
+        bore = {
+            "kind": "face", "surf": "cylinder", "concavity": "bore",
+            "centroid": [0, 0, 0], "radius": 3.0, "area_or_len": 50.0,
+        }
+        assert ct._target_is_internal([bore], part_bbox) is True
+
+    def test_tile_pngs_grid_labels(self, tmp_path):
+        tiles = []
+        for i, color in enumerate([(200, 0, 0), (0, 200, 0), (0, 0, 200)]):
+            p = str(tmp_path / f"t{i}.png")
+            _fake_png(p, size=(64, 48), color=color)
+            tiles.append(p)
+        out = str(tmp_path / "grid.png")
+        ct._tile_pngs_grid(tiles, out, labels=["FRONT", "TOP", "ISO"], cols=3)
+        assert os.path.exists(out)
+        from PIL import Image as PILImage
+        with PILImage.open(out) as im:
+            # 3 cols × 64 with gaps
+            assert im.size[0] >= 64 * 3
+            assert im.size[1] >= 48
+
 
 class TestGuideMentions:
     def test_review_guide_mentions_inspect(self):
@@ -380,3 +554,20 @@ class TestGuideMentions:
     def test_gsl_guide_mentions_inspect(self):
         text = ct.cad_guide_text("gsl")
         assert "inspect_part" in text
+        assert "inspect_feature" in text
+        assert "render_views" in text
+
+    def test_overview_mentions_render_views(self):
+        text = ct.cad_guide_text("")  # default/overview
+        assert "render_views" in text or "inspect_feature" in text
+
+    def test_add_features_mentions_verify_loop(self):
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("test-inspect")
+        ct.register_cad_tools(mcp)
+        mgr = getattr(mcp, "_tool_manager", None)
+        tools = getattr(mgr, "_tools", {}) if mgr else {}
+        desc = tools["add_features"].description or ""
+        assert "VERIFY LOOP" in desc
+        assert "render_part" in desc or "render_views" in desc
+

@@ -510,6 +510,11 @@ register_mechanical_tools(mcp)
 from mcp_server.sketch3d_tools import register_sketch3d_tools
 register_sketch3d_tools(_reg.view(mcp, "cad"))
 
+# ASCII / plaintext 2D representations for non-vision models (owner item 5):
+# render_board_ascii, render_sketch_ascii, experimental render_ascii silhouette.
+from mcp_server.ascii2d import register_ascii2d_tools
+register_ascii2d_tools(_reg.view(mcp, "gsl"))
+
 # RE-ANCHOR(reveng): Reverse Engineering MCP family (contracts/reveng.md §8).
 # RE-02 wires: from services.mcp.reveng_tools import register_reveng_tools
 #              register_reveng_tools(_reg.view(mcp, "reveng"))

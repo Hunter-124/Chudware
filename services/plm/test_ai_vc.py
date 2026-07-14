@@ -5,7 +5,9 @@ Covers:
   * idempotent checkpoint ids (hash(doc_id, turn_id, op_batch))
   * delta chain integrity + self-heal from last full when a delta is corrupt
   * content-hash dedup
-  * rollback to id / turn:N / -N
+  * rollback to id / turn:N / -N / msg:<idx> / call:<turn>:<i>
+  * chat_truncate_to on rollback
+  * prompt + tool checkpoint kinds (v2)
   * user-doc non-interference
   * storage-size: delta chain < 30% of naive full snapshots on a 50-feature part
   * MCP tool + worker RPC shapes (plm_timeline / plm_rollback)
@@ -148,8 +150,8 @@ def test_delta_chain_and_materialize(store):
         raw = store.materialize("docB", cid)
         got = json.loads(raw.decode("utf-8"))
         assert got["features"][0]["params"]["wall"] == pytest.approx(3.0 + t * 0.05)
-    # chain has fulls every 4
-    kinds = [r["kind"] for r in store.read_chain("docB")]
+    # chain has fulls every 4 (storage_kind)
+    kinds = [r.get("storage_kind") or r["kind"] for r in store.read_chain("docB")]
     assert kinds[0] == "full"
     assert "delta" in kinds
 
@@ -165,7 +167,7 @@ def test_corrupt_delta_self_heals(store):
         ids.append(r["id"])
     chain = store.read_chain("docC")
     # find a delta record and corrupt its object on disk
-    delta_rec = next(r for r in chain if r["kind"] == "delta")
+    delta_rec = next(r for r in chain if (r.get("storage_kind") or r["kind"]) == "delta")
     obj_path = store._obj_path(delta_rec["object"])
     # overwrite with garbage
     obj_path.write_bytes(b"CORRUPTED_NOT_A_DELTA")
@@ -174,15 +176,18 @@ def test_corrupt_delta_self_heals(store):
     # (if the corrupt delta is between last full and target, materialize may
     #  re-start from an earlier full — or if the target itself is after a later
     #  full, it uses that full). Pick a target after a subsequent full.
-    later_full = next(r for r in chain if r["kind"] == "full" and r["id"] != chain[0]["id"])
+    later_full = next(
+        r for r in chain
+        if (r.get("storage_kind") or r["kind"]) == "full" and r["id"] != chain[0]["id"]
+    )
     # materialize the later full — does not need the corrupt delta
     raw = store.materialize("docC", later_full["id"])
     assert json.loads(raw.decode("utf-8"))["features"]
     # materialize the tip — should self-heal if corrupt is behind a full, or
     # raise cleanly only if no recoverable full exists (we have fulls).
     tip = chain[-1]
-    if tip["kind"] == "full" or any(
-        r["kind"] == "full" for r in chain
+    if (tip.get("storage_kind") or tip["kind"]) == "full" or any(
+        (r.get("storage_kind") or r["kind"]) == "full" for r in chain
         if chain.index(r) < chain.index(tip) and chain.index(r) > chain.index(delta_rec)
     ):
         raw2 = store.materialize("docC", tip["id"])
@@ -502,3 +507,142 @@ def test_config_defaults():
     assert cfg["enabled"] is True
     cfg2 = ai_vc.load_ai_vc_config({"plm": {"ai_vc": {"full_every": 3, "keep_last": 50}}})
     assert cfg2["full_every"] == 3 and cfg2["keep_last"] == 50
+
+
+# ---------------------------------------------------------------------------
+# v2 — prompt/tool granularity + msg/call rollback
+# ---------------------------------------------------------------------------
+
+def test_prompt_and_tool_checkpoints(store):
+    """kind=prompt before user message; kind=tool before mutating tool."""
+    ai_vc.clear_provenance()
+    ai_vc.stamp_authored("v2doc", "agent")
+    base = _part(5, wall=1.0)
+
+    p = ai_vc.on_prompt_start(
+        "please fillet the top edges of the bracket carefully",
+        doc_id="v2doc",
+        msg_idx=3,
+        content=base,
+        store=store,
+    )
+    assert p and p["ok"]
+    rec = p["record"]
+    assert rec["kind"] == "prompt"
+    assert rec["msg_idx"] == 3
+    assert rec["label"].startswith("please fillet")
+    assert len(rec["label"]) <= 60
+
+    t = ai_vc.on_before_tool(
+        "add_features",
+        {"doc_id": "v2doc", "ops": [{"op": "fillet", "r": 1}]},
+        turn_id=3,
+        call_i=0,
+        msg_idx=3,
+        content=base,  # same state → content-hash dedup, no new full blob
+        store=store,
+    )
+    assert t and t["ok"]
+    trec = t["record"]
+    assert trec["kind"] == "tool"
+    assert trec["label"] == "add_features"
+    assert trec["call"] == {"turn": 3, "i": 0}
+    assert trec["msg_idx"] == 3
+    # content unchanged → storage reuses object, no new full snapshot payload
+    assert t.get("content_unchanged") is True
+    assert trec["object"] == rec["object"]
+
+    # mutate then tool-checkpoint with new content → delta/full encoded
+    changed = _part(6, wall=2.0)
+    t2 = ai_vc.on_before_tool(
+        "add_features",
+        {"doc_id": "v2doc", "ops": [{"op": "extrude", "d": 5}]},
+        turn_id=3,
+        call_i=1,
+        msg_idx=3,
+        content=changed,
+        store=store,
+    )
+    assert t2 and t2["ok"] and not t2.get("content_unchanged")
+    assert t2["record"]["call"] == {"turn": 3, "i": 1}
+
+    tl = ai_vc.plm_timeline("v2doc", store=store)
+    assert tl["ok"] and len(tl["checkpoints"]) == 3
+    kinds = {c["kind"] for c in tl["checkpoints"]}
+    assert kinds == {"prompt", "tool"}
+    for c in tl["checkpoints"]:
+        assert "msg_idx" in c
+        assert c["kind"] in ("prompt", "tool")
+
+
+def test_content_hash_dedup_no_full_snapshot_when_unchanged(store):
+    """Unchanged content must not write a new object blob (storage stays delta-encoded)."""
+    ai_vc.stamp_authored("dedup2", "agent")
+    doc = _part(8)
+    r1 = store.checkpoint(
+        "dedup2", doc, turn_id=1, op_batch={"n": 1}, kind="prompt", msg_idx=1,
+        label="hello world",
+    )
+    objs_before = list((store.root / "objects").rglob("*"))
+    n_files_before = sum(1 for p in objs_before if p.is_file())
+    r2 = store.checkpoint(
+        "dedup2", doc, turn_id=1, op_batch={"n": 2}, kind="tool",
+        msg_idx=1, call={"turn": 1, "i": 0}, label="add_features",
+    )
+    assert r2["ok"] and r2.get("content_unchanged") is True
+    assert r1["record"]["object"] == r2["record"]["object"]
+    objs_after = list((store.root / "objects").rglob("*"))
+    n_files_after = sum(1 for p in objs_after if p.is_file())
+    assert n_files_after == n_files_before  # no new full snapshot file
+
+
+def test_msg_and_call_rollback_with_chat_truncate(store):
+    ai_vc.stamp_authored("rb2", "agent")
+    d0 = _part(4, wall=1.0)
+    d1 = _part(4, wall=2.0)
+    d2 = _part(4, wall=3.0)
+
+    r_prompt = store.checkpoint(
+        "rb2", d0, turn_id=5, op_batch={"kind": "prompt", "msg_idx": 5},
+        kind="prompt", msg_idx=5, label="make a boss",
+    )
+    r_call0 = store.checkpoint(
+        "rb2", d1, turn_id=5, op_batch={"kind": "tool", "call": {"turn": 5, "i": 0}},
+        kind="tool", msg_idx=5, call={"turn": 5, "i": 0}, label="add_features",
+    )
+    store.checkpoint(
+        "rb2", d2, turn_id=5, op_batch={"kind": "tool", "call": {"turn": 5, "i": 1}},
+        kind="tool", msg_idx=5, call={"turn": 5, "i": 1}, label="fillet",
+    )
+
+    restored = {}
+
+    def _restore(doc_id, data):
+        restored["doc"] = json.loads(data.decode("utf-8"))
+        return {"ok": True}
+
+    # msg:5 → state before that user message
+    out = ai_vc.plm_rollback(
+        "rb2", "msg:5", store=store, restore_fn=_restore,
+    )
+    assert out["ok"] and out["checkpoint_id"] == r_prompt["id"]
+    assert out["chat_truncate_to"] == 5
+    assert restored["doc"]["features"][0]["params"]["wall"] == 1.0
+
+    # call:5:0 → state before first tool call
+    out2 = ai_vc.plm_rollback(
+        "rb2", "call:5:0", store=store, restore_fn=_restore,
+    )
+    assert out2["ok"] and out2["checkpoint_id"] == r_call0["id"]
+    assert out2["chat_truncate_to"] == 5
+    assert restored["doc"]["features"][0]["params"]["wall"] == 2.0
+
+    # v1 forms still work
+    out3 = ai_vc.plm_rollback(
+        "rb2", "turn:5", store=store, restore_fn=_restore,
+    )
+    assert out3["ok"]
+    out4 = ai_vc.plm_rollback(
+        "rb2", "-1", store=store, restore_fn=_restore,
+    )
+    assert out4["ok"]

@@ -1153,6 +1153,27 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
     # prompt still takes over on a context overflow, as before.
     role_prompt = (getattr(session, "role_prompt", None) or "").strip()
     base_prompt = override or role_prompt or SYSTEM_PROMPT
+    # Skills catalog + any session-activated skill bodies (contracts/skills.md).
+    # Best-effort: skills module missing/broken must never break the design loop.
+    try:
+        from services.agent import skills as _skills  # noqa: PLC0415
+        _sk_block = _skills.catalog_block()
+        _sid = getattr(session, "name", None) or "_loop"
+        # Re-surface previously activated skill bodies after compaction.
+        if getattr(session, "_skills_need_reinject", False):
+            _skills.mark_compacted(_sid)
+            session._skills_need_reinject = False  # type: ignore[attr-defined]
+        _active = []
+        for _n in list(getattr(session, "_skills_active", None) or []):
+            _txt = _skills.activate_skill(_n, session_id=_sid, force=True)
+            if _txt:
+                _active.append(_txt)
+        if _sk_block:
+            base_prompt = base_prompt.rstrip() + "\n\n" + _sk_block
+        if _active:
+            base_prompt = base_prompt.rstrip() + "\n\n" + "\n\n".join(_active)
+    except Exception:  # noqa: BLE001
+        pass
     for level in range(_MAX_COMPACT_PASSES + 1):
         compact = session.compact or level > 0
         system = SYSTEM_PROMPT_COMPACT if compact else base_prompt
@@ -1163,6 +1184,7 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
             if not _is_context_overflow(e) or level >= _MAX_COMPACT_PASSES:
                 raise
             session.compact = True
+            session._skills_need_reinject = True  # type: ignore[attr-defined]
             _apply_compaction(session.messages, level + 1)
             _emit(on_event, kind="status", index=idx, turn=turn, phase="compacting",
                   text=f"Context full - auto-compacting history (pass {level + 1})...")
@@ -1199,6 +1221,33 @@ def run_turn(session: Session, request: str, provider: Provider,
             buildgraph_first = True  # A: buildgraph checklist with rigid plan
     except Exception:  # noqa: BLE001
         pass
+    # Skills slash-command + auto-trigger seam (contracts/skills.md). Best-effort.
+    # Strips /skill:<name> and /<name> from the user request and records activated
+    # skill names on the session so _generate can re-inject bodies after compaction.
+    try:
+        from services.agent import skills as _skills  # noqa: PLC0415
+        _sid = session.name or "_loop"
+        _cleaned, _slash_hits = _skills.resolve_slash(request)
+        _bodies = _skills.activate_for_prompt(
+            request, session_id=_sid,
+        )
+        if _slash_hits or _bodies:
+            active = list(getattr(session, "_skills_active", None) or [])
+            for _n, _a in _slash_hits:
+                if _n not in active:
+                    active.append(_n)
+            # also record auto-activated names from bodies headers
+            for _b in _bodies:
+                if _b.startswith("[SKILL: "):
+                    _nm = _b[len("[SKILL: "):].split(" ", 1)[0].split("(", 1)[0].strip()
+                    if _nm and _nm not in active:
+                        active.append(_nm)
+            session._skills_active = active  # type: ignore[attr-defined]
+        if _cleaned != request and _slash_hits:
+            request = _cleaned if _cleaned.strip() else request
+    except Exception:  # noqa: BLE001
+        pass
+
     if max_iters is None:
         max_iters = DEFAULT_MAX_ITERS
     # OFFLINE MODE defense-in-depth (C35): the legacy loop is the second call site (the

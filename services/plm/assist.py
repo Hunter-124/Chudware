@@ -227,10 +227,27 @@ def ai_vc_on_mutate(tool: str, args: dict | None, result: Any, **kwargs: Any) ->
     Thin re-export so guardrails / agent_turn / MCP can share one import path
     without depending on the vault assist tier (AI-VC is always-on for agent
     docs; the managed-tier ``auto_checkpoint`` above remains for project vault).
+
+    v2: pass ``before=True`` (or call :func:`ai_vc_before_tool`) to checkpoint
+    BEFORE the mutating tool; :func:`ai_vc_on_prompt` for user-prompt starts.
     """
     from services.plm import ai_vc
 
     return ai_vc.on_ai_tool_success(tool, args, result, **kwargs)
+
+
+def ai_vc_on_prompt(prompt: str, **kwargs: Any) -> dict[str, Any] | None:
+    """v2: checkpoint before a user prompt turn (kind=prompt)."""
+    from services.plm import ai_vc
+
+    return ai_vc.on_prompt_start(prompt, **kwargs)
+
+
+def ai_vc_before_tool(tool: str, args: dict | None, **kwargs: Any) -> dict[str, Any] | None:
+    """v2: checkpoint before a mutating tool call (kind=tool)."""
+    from services.plm import ai_vc
+
+    return ai_vc.on_before_tool(tool, args, **kwargs)
 
 
 def discard_entry(vault: Any, commit: str) -> dict[str, Any]:

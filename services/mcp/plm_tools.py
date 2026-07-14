@@ -384,8 +384,9 @@ def register_plm_tools(mcp: FastMCP) -> None:
     def plm_timeline(doc_id: str = "") -> str:
         """List AI-authored checkpoints for a document (newest first).
 
-        Each checkpoint: ``{id, turn, label, time, features_count}`` (aliases
-        ``when`` / ``features`` also present). Empty ``doc_id`` lists every
+        Each checkpoint: ``{id, turn, label, time, features_count, kind,
+        msg_idx, call}`` (aliases ``when`` / ``features`` also present).
+        ``kind`` is ``prompt`` | ``tool``. Empty ``doc_id`` lists every
         AI-VC chain. Returns ``{ok, checkpoints}``.
         """
         try:
@@ -402,9 +403,12 @@ def register_plm_tools(mcp: FastMCP) -> None:
     def plm_rollback(to: str, doc_id: str = "") -> str:
         """Roll an AI-authored document back to an earlier checkpoint.
 
-        ``to`` is a checkpoint id, ``turn:<n>``, or ``-N`` (relative from the
-        newest: ``-1`` = latest, ``-2`` = one before, …). Silent — never asks
-        the user. Returns ``{ok, checkpoint_id, restored_turn, content_hash, via}``.
+        ``to`` is a checkpoint id, ``turn:<n>``, ``-N`` (relative from the
+        newest: ``-1`` = latest, ``-2`` = one before, …), ``msg:<idx>``
+        (state before that user message), or ``call:<turn>:<i>`` (state
+        before that tool call). Silent — never asks the user. Returns
+        ``{ok, checkpoint_id, restored_turn, content_hash, via,
+        chat_truncate_to}``.
         """
         try:
             from services.plm import ai_vc

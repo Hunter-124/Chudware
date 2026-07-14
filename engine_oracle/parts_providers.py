@@ -375,9 +375,11 @@ class NexarProvider(PartProvider):
 class DigiKeyProvider(PartProvider):
     """Digi-Key Product Information API v4 (OAuth2 client_credentials, no scraping).
 
-    Scaffolded and wired; runs in graceful stub mode (raises :class:`ProviderError`) until a
-    ``DIGIKEY_CLIENT_ID`` / ``DIGIKEY_CLIENT_SECRET`` key pair is configured. The mapping seam
-    is documented so activating it is a config change plus a response-mapper, not a redesign.
+    Token endpoint + ``POST /products/v4/search/keyword`` → map the first product into a
+    priced :class:`VendorPart`. Credentials from config
+    (``parts_providers.digikey.{client_id,client_secret}``) or ``DIGIKEY_CLIENT_ID`` /
+    ``DIGIKEY_CLIENT_SECRET``. Absent credentials → :class:`ProviderError` (fail closed, no
+    network). Never scrapes digikey.com.
     """
 
     key = "digikey"
@@ -388,6 +390,191 @@ class DigiKeyProvider(PartProvider):
         c = _resolve_creds(self.key, {"client_id": "DIGIKEY_CLIENT_ID",
                                       "client_secret": "DIGIKEY_CLIENT_SECRET"})
         return c["client_id"], c["client_secret"]
+
+    def _get_token(self, client_id: str, client_secret: str) -> str:
+        """Exchange client credentials for a bearer token (monkeypatched in tests)."""
+        resp = _http_post_form(self.TOKEN_URL, {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        })
+        token = str(resp.get("access_token") or "").strip()
+        if not token:
+            raise ProviderError("Digi-Key returned no access token (check client_id/secret)")
+        return token
+
+    def _keyword_search(self, token: str, client_id: str, mpn: str) -> dict:
+        """Run the Product Information v4 keyword search (monkeypatched in tests)."""
+        return _http_post_json(
+            self.API_URL,
+            {"Keywords": mpn, "RecordCount": 1, "RecordStartPosition": 0},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-DIGIKEY-Client-Id": client_id,
+                "X-DIGIKEY-Locale-Site": "US",
+                "X-DIGIKEY-Locale-Language": "en",
+                "X-DIGIKEY-Locale-Currency": "USD",
+            },
+        )
+
+    @staticmethod
+    def _pick(d: dict, *keys: str):
+        """Return the first present key (PascalCase / camelCase tolerance)."""
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    def _price_breaks_from_product(self, product: dict) -> list[dict]:
+        """Collect StandardPricing tiers from ProductVariations (or top-level fallback)."""
+        tiers: list[dict] = []
+        variations = self._pick(product, "ProductVariations", "productVariations") or []
+        if isinstance(variations, list):
+            for var in variations:
+                if not isinstance(var, dict):
+                    continue
+                pricing = self._pick(var, "StandardPricing", "standardPricing") or []
+                for p in pricing or []:
+                    if not isinstance(p, dict):
+                        continue
+                    qty = self._pick(p, "BreakQuantity", "breakQuantity", "Quantity", "quantity")
+                    price = self._pick(p, "UnitPrice", "unitPrice", "Price", "price")
+                    if qty is None or price is None:
+                        continue
+                    try:
+                        tiers.append({"qty": int(qty), "unit_price": float(price)})
+                    except (TypeError, ValueError):
+                        continue
+        if not tiers:
+            # Some responses put a single UnitPrice on the product itself.
+            unit = self._pick(product, "UnitPrice", "unitPrice")
+            if unit is not None:
+                try:
+                    tiers.append({"qty": 1, "unit_price": float(unit)})
+                except (TypeError, ValueError):
+                    pass
+        # Deduplicate by qty, keep first, sort ascending.
+        by_qty: dict[int, float] = {}
+        for t in tiers:
+            by_qty.setdefault(int(t["qty"]), float(t["unit_price"]))
+        return [{"qty": q, "unit_price": by_qty[q]} for q in sorted(by_qty)]
+
+    def _map(self, mpn: str, data: dict) -> dict | None:
+        products = self._pick(data, "Products", "products") or []
+        if not isinstance(products, list) or not products:
+            return None
+        product = products[0] if isinstance(products[0], dict) else None
+        if product is None:
+            return None
+
+        manufacturer_obj = self._pick(product, "Manufacturer", "manufacturer") or {}
+        if isinstance(manufacturer_obj, dict):
+            manufacturer = str(self._pick(manufacturer_obj, "Name", "name") or "").strip()
+        else:
+            manufacturer = str(manufacturer_obj or "").strip()
+
+        part_number = str(
+            self._pick(product, "ManufacturerProductNumber", "manufacturerProductNumber")
+            or mpn
+        )
+        description = str(
+            self._pick(product, "ProductDescription", "productDescription",
+                       "DetailedDescription", "detailedDescription")
+            or ""
+        ).strip()
+        if not description and manufacturer:
+            description = f"{manufacturer} {part_number}".strip()
+
+        product_url = str(
+            self._pick(product, "ProductUrl", "productUrl", "DetailUrl", "detailUrl") or ""
+        )
+        datasheet = str(
+            self._pick(product, "DatasheetUrl", "datasheetUrl", "DataSheetUrl") or ""
+        )
+        if product_url and product_url.startswith("/"):
+            product_url = "https://www.digikey.com" + product_url
+
+        specs: dict[str, Any] = {}
+        if manufacturer:
+            specs["manufacturer"] = manufacturer
+        dkpn = self._pick(product, "DigiKeyPartNumber", "digiKeyPartNumber",
+                          "DigiKeyProductNumber", "digiKeyProductNumber")
+        if dkpn:
+            specs["digikey_pn"] = str(dkpn)
+        if datasheet:
+            specs["datasheet_url"] = datasheet
+
+        vp = VendorPart(
+            supplier="Digi-Key",
+            part_number=part_number,
+            description=description,
+            product_url=product_url or datasheet,
+            specs=specs,
+            source="api",
+        )
+
+        breaks = self._price_breaks_from_product(product)
+        vp.price_breaks = breaks
+        if breaks:
+            vp.unit_price = breaks[0]["unit_price"]
+        else:
+            unit = self._pick(product, "UnitPrice", "unitPrice")
+            if unit is not None:
+                try:
+                    vp.unit_price = float(unit)
+                except (TypeError, ValueError):
+                    pass
+
+        stock = self._pick(product, "QuantityAvailable", "quantityAvailable")
+        if stock is None:
+            # Fall back to first variation quantity if present.
+            variations = self._pick(product, "ProductVariations", "productVariations") or []
+            if isinstance(variations, list) and variations and isinstance(variations[0], dict):
+                stock = self._pick(variations[0], "QuantityAvailableforPackageType",
+                                   "quantityAvailableforPackageType",
+                                   "QuantityAvailable", "quantityAvailable")
+        if stock is not None:
+            try:
+                vp.stock = int(stock)
+            except (TypeError, ValueError):
+                pass
+
+        moq = self._pick(product, "MinimumOrderQuantity", "minimumOrderQuantity")
+        if moq is None:
+            variations = self._pick(product, "ProductVariations", "productVariations") or []
+            if isinstance(variations, list) and variations and isinstance(variations[0], dict):
+                moq = self._pick(variations[0], "MinimumOrderQuantity", "minimumOrderQuantity")
+        if moq is not None:
+            try:
+                vp.moq = int(moq)
+            except (TypeError, ValueError):
+                pass
+
+        lead = self._pick(product, "ManufacturerLeadWeeks", "manufacturerLeadWeeks",
+                          "StandardLeadTime", "standardLeadTime")
+        if lead is not None:
+            # Digi-Key often returns lead as weeks (int/str) or a free-text "X Weeks".
+            try:
+                if isinstance(lead, (int, float)):
+                    vp.lead_time_days = int(float(lead) * 7)
+                else:
+                    s = str(lead).strip()
+                    num = ""
+                    for ch in s:
+                        if ch.isdigit() or ch == ".":
+                            num += ch
+                        elif num:
+                            break
+                    if num:
+                        weeks = float(num)
+                        # Heuristic: values > 52 are already days; otherwise weeks.
+                        vp.lead_time_days = int(weeks) if weeks > 52 else int(weeks * 7)
+            except (TypeError, ValueError):
+                pass
+
+        vp.currency = "USD"
+        vp.fetched_ts = time.time()
+        return asdict(vp)
 
     def fetch(self, part_number: str) -> dict:
         mpn = (part_number or "").strip()
@@ -401,22 +588,21 @@ class DigiKeyProvider(PartProvider):
                 "DIGIKEY_CLIENT_ID / DIGIKEY_CLIENT_SECRET). AI-CAD does NOT scrape digikey.com; "
                 "it uses the approved Product Information API v4. See docs/PARTS_LIBRARY.md."
             )
-            _log.warning("DigiKeyProvider stub: %s", msg)
+            _log.warning("DigiKeyProvider: %s", msg)
             raise ProviderError(msg)
-        # Credentials present: OAuth token + keyword search would run here (wired in a later
-        # task once a live key is validated). Fail closed rather than emit unverified data.
-        raise ProviderError(
-            "Digi-Key API adapter is not wired yet. Credentials are configured, but the "
-            "approved v4 search + response mapping must be validated against a live key before "
-            "automated fetch can run."
-        )
+        token = self._get_token(client_id, client_secret)
+        rec = self._map(mpn, self._keyword_search(token, client_id, mpn))
+        if rec is None:
+            raise ProviderError(f"Digi-Key returned no products for MPN '{mpn}'")
+        return rec
 
 
 class MouserProvider(PartProvider):
     """Mouser Search API v2 — ``SearchByPartNumber`` (API-key auth, no scraping).
 
-    Scaffolded and wired; graceful stub (raises :class:`ProviderError`) until ``MOUSER_API_KEY``
-    is configured.
+    ``POST /api/v2/search/partnumber?apiKey=…`` with a ``SearchByPartRequest`` body.
+    Credentials from config (``parts_providers.mouser.api_key``) or ``MOUSER_API_KEY``.
+    Absent key → :class:`ProviderError` (fail closed, no network). Never scrapes mouser.com.
     """
 
     key = "mouser"
@@ -425,24 +611,183 @@ class MouserProvider(PartProvider):
     def _api_key(self) -> str:
         return _resolve_creds(self.key, {"api_key": "MOUSER_API_KEY"})["api_key"]
 
+    def _search_part(self, api_key: str, mpn: str) -> dict:
+        """Run SearchByPartNumber (monkeypatched in tests)."""
+        url = f"{self.API_URL}?{urllib.parse.urlencode({'apiKey': api_key})}"
+        return _http_post_json(url, {
+            "SearchByPartRequest": {
+                "mouserPartNumber": mpn,
+                "partSearchOptions": "None",
+            }
+        })
+
+    @staticmethod
+    def _parse_stock(availability: Any, factory_stock: Any) -> int | None:
+        """Mouser ``Availability`` is often ``'1,234 In Stock'``; FactoryStock is numeric."""
+        if factory_stock is not None:
+            try:
+                return int(str(factory_stock).replace(",", "").strip())
+            except (TypeError, ValueError):
+                pass
+        if availability is None:
+            return None
+        s = str(availability).strip()
+        # Pull the leading integer (handles "1234 In Stock", "0", "None").
+        num = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            elif ch in ",." and num:
+                continue
+            elif num:
+                break
+        if not num:
+            return None
+        try:
+            return int(num)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_lead_days(lead: Any) -> int | None:
+        if lead is None:
+            return None
+        if isinstance(lead, (int, float)):
+            return int(lead)
+        s = str(lead).strip().lower()
+        num = ""
+        for ch in s:
+            if ch.isdigit() or ch == ".":
+                num += ch
+            elif num:
+                break
+        if not num:
+            return None
+        try:
+            val = float(num)
+        except ValueError:
+            return None
+        if "week" in s:
+            return int(val * 7)
+        if "day" in s:
+            return int(val)
+        # Bare number: Mouser usually means days for LeadTime strings like "98 Days".
+        return int(val)
+
+    def _map(self, mpn: str, data: dict) -> dict | None:
+        root = data.get("SearchResults") or data.get("searchResults") or {}
+        parts = root.get("Parts") or root.get("parts") or []
+        if not isinstance(parts, list) or not parts:
+            # Surface API-level Errors honestly when present.
+            errors = data.get("Errors") or data.get("errors") or root.get("Errors") or []
+            if errors:
+                msg = "; ".join(
+                    str(e.get("Message") or e.get("message") or e)
+                    for e in errors if e
+                )
+                raise ProviderError(f"Mouser API error for MPN '{mpn}': {msg or errors}")
+            return None
+        part = parts[0] if isinstance(parts[0], dict) else None
+        if part is None:
+            return None
+
+        manufacturer = str(part.get("Manufacturer") or part.get("manufacturer") or "").strip()
+        part_number = str(
+            part.get("ManufacturerPartNumber")
+            or part.get("manufacturerPartNumber")
+            or mpn
+        )
+        description = str(part.get("Description") or part.get("description") or "").strip()
+        if not description and manufacturer:
+            description = f"{manufacturer} {part_number}".strip()
+
+        product_url = str(
+            part.get("ProductDetailUrl") or part.get("productDetailUrl") or ""
+        )
+        datasheet = str(part.get("DataSheetUrl") or part.get("dataSheetUrl") or "")
+
+        specs: dict[str, Any] = {}
+        if manufacturer:
+            specs["manufacturer"] = manufacturer
+        mouser_pn = part.get("MouserPartNumber") or part.get("mouserPartNumber")
+        if mouser_pn:
+            specs["mouser_pn"] = str(mouser_pn)
+        if datasheet:
+            specs["datasheet_url"] = datasheet
+
+        vp = VendorPart(
+            supplier="Mouser",
+            part_number=part_number,
+            description=description,
+            product_url=product_url or datasheet,
+            specs=specs,
+            source="api",
+        )
+
+        # PriceBreaks: [{Quantity, Price, Currency}, ...] — Price is often "$0.420".
+        raw_breaks = part.get("PriceBreaks") or part.get("priceBreaks") or []
+        tiers: list[dict] = []
+        currency = None
+        for pb in raw_breaks or []:
+            if not isinstance(pb, dict):
+                continue
+            qty = pb.get("Quantity") if pb.get("Quantity") is not None else pb.get("quantity")
+            price_raw = pb.get("Price") if pb.get("Price") is not None else pb.get("price")
+            if qty is None or price_raw is None:
+                continue
+            try:
+                price_s = str(price_raw).replace("$", "").replace(",", "").strip()
+                tiers.append({"qty": int(qty), "unit_price": float(price_s)})
+            except (TypeError, ValueError):
+                continue
+            cur = pb.get("Currency") or pb.get("currency")
+            if cur and not currency:
+                currency = str(cur)
+        tiers = sorted(tiers, key=lambda b: b["qty"])
+        vp.price_breaks = tiers
+        if tiers:
+            vp.unit_price = tiers[0]["unit_price"]
+        if currency:
+            vp.currency = currency
+
+        vp.stock = self._parse_stock(
+            part.get("Availability") or part.get("availability"),
+            part.get("FactoryStock") if part.get("FactoryStock") is not None
+            else part.get("factoryStock"),
+        )
+
+        moq = part.get("Min") if part.get("Min") is not None else part.get("min")
+        if moq is not None:
+            try:
+                vp.moq = int(moq)
+            except (TypeError, ValueError):
+                pass
+
+        vp.lead_time_days = self._parse_lead_days(
+            part.get("LeadTime") if part.get("LeadTime") is not None else part.get("leadTime")
+        )
+
+        vp.fetched_ts = time.time()
+        return asdict(vp)
+
     def fetch(self, part_number: str) -> dict:
         mpn = (part_number or "").strip()
         if not mpn:
             raise ProviderError("a manufacturer part number (MPN) is required")
-        if not self._api_key():
+        api_key = self._api_key()
+        if not api_key:
             msg = (
                 "Mouser provider is not configured. Add 'parts_providers.mouser' with "
                 "'api_key' to %APPDATA%/AI-CAD/config.json (or set MOUSER_API_KEY). AI-CAD does "
                 "NOT scrape mouser.com; it uses the approved Search API v2. "
                 "See docs/PARTS_LIBRARY.md."
             )
-            _log.warning("MouserProvider stub: %s", msg)
+            _log.warning("MouserProvider: %s", msg)
             raise ProviderError(msg)
-        raise ProviderError(
-            "Mouser API adapter is not wired yet. An API key is configured, but the approved "
-            "SearchByPartNumber response mapping must be validated against a live key before "
-            "automated fetch can run."
-        )
+        rec = self._map(mpn, self._search_part(api_key, mpn))
+        if rec is None:
+            raise ProviderError(f"Mouser returned no parts for MPN '{mpn}'")
+        return rec
 
 
 class ProviderChain:

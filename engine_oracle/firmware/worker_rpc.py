@@ -78,4 +78,5 @@ WORKER_METHODS: dict[str, Callable] = {
     "fw_debug_start": _wrap(_fw.fw_debug_start),
     "fw_debug_halt": _wrap(_fw.fw_debug_halt),
     "fw_debug_read_mem": _wrap(_fw.fw_debug_read_mem),
+    "fw_power_profile": _wrap(_fw.fw_power_profile),
 }

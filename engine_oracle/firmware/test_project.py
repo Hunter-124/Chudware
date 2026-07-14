@@ -104,7 +104,8 @@ def test_cmake_build_success_path_mocked(firmware_home, monkeypatch):
     p = fw.new_project(None, "cortex-m4", "cmake")
 
     monkeypatch.setattr(tc.shutil, "which",
-                        lambda tool: "/usr/bin/" + tool if tool in ("cmake", "ninja") else None)
+                        lambda tool: "/usr/bin/" + tool
+                        if tool in ("cmake", "ninja", "arm-none-eabi-gcc") else None)
 
     calls: list[list[str]] = []
 

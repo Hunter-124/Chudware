@@ -192,13 +192,183 @@ def test_nexar_env_fallback_supplies_creds() -> None:
         assert rec["part_number"] == "LM317T"
 
 
-def test_digikey_and_mouser_stub_when_keys_absent() -> None:
+def test_digikey_and_mouser_fail_closed_when_keys_absent() -> None:
     with tempfile.TemporaryDirectory() as td, _clean_env():
         _point_config_at(Path(td), None)
         for prov in (parts_providers.DigiKeyProvider(), parts_providers.MouserProvider()):
             with pytest.raises(ProviderError) as ei:
                 prov.fetch("LM317T")
             assert "not configured" in ei.value.message.lower()
+
+
+# Representative Digi-Key Product Information v4 keyword-search payload (PascalCase,
+# as returned by the live API). First product maps to the VendorPart under test.
+_DIGIKEY_RESPONSE = {
+    "Products": [{
+        "ManufacturerProductNumber": "LM317T",
+        "DigiKeyPartNumber": "LM317TFS-ND",
+        "ProductDescription": "IC REG LIN POS ADJ 1.5A TO220-3",
+        "Manufacturer": {"Name": "STMicroelectronics"},
+        "ProductUrl": "https://www.digikey.com/en/products/detail/stmicroelectronics/LM317T/604171",
+        "DatasheetUrl": "https://www.digikey.com/htmldatasheets/production/604171/0/0/1/lm317t.pdf",
+        "QuantityAvailable": 12345,
+        "MinimumOrderQuantity": 1,
+        "UnitPrice": 0.63,
+        "ManufacturerLeadWeeks": "16",
+        "ProductVariations": [{
+            "DigiKeyProductNumber": "LM317TFS-ND",
+            "MinimumOrderQuantity": 1,
+            "QuantityAvailableforPackageType": 12345,
+            "StandardPricing": [
+                {"BreakQuantity": 1, "UnitPrice": 0.63, "TotalPrice": 0.63},
+                {"BreakQuantity": 10, "UnitPrice": 0.52, "TotalPrice": 5.20},
+                {"BreakQuantity": 100, "UnitPrice": 0.41, "TotalPrice": 41.0},
+            ],
+        }],
+    }],
+    "ProductsCount": 1,
+}
+
+
+# Representative Mouser SearchByPartNumber v2 payload.
+_MOUSER_RESPONSE = {
+    "Errors": [],
+    "SearchResults": {
+        "NumberOfResult": 1,
+        "Parts": [{
+            "Availability": "5,432 In Stock",
+            "DataSheetUrl": "https://www.mouser.com/datasheet/2/389/lm317-1849662.pdf",
+            "Description": "LDO Voltage Regulators 1.5 A Adjustable",
+            "FactoryStock": "5432",
+            "LeadTime": "14 Weeks",
+            "Manufacturer": "STMicroelectronics",
+            "ManufacturerPartNumber": "LM317T",
+            "Min": "1",
+            "MouserPartNumber": "511-LM317T",
+            "ProductDetailUrl": "https://www.mouser.com/ProductDetail/STMicroelectronics/LM317T",
+            "PriceBreaks": [
+                {"Quantity": 1, "Price": "$0.66", "Currency": "USD"},
+                {"Quantity": 10, "Price": "$0.55", "Currency": "USD"},
+                {"Quantity": 100, "Price": "$0.44", "Currency": "USD"},
+            ],
+        }],
+    },
+}
+
+
+def _digikey_mocked(response: dict = _DIGIKEY_RESPONSE) -> parts_providers.DigiKeyProvider:
+    prov = parts_providers.DigiKeyProvider()
+    prov._get_token = lambda cid, secret: "dk-test-token"          # type: ignore[method-assign]
+    prov._keyword_search = lambda token, cid, mpn: response        # type: ignore[method-assign]
+    return prov
+
+
+def _mouser_mocked(response: dict = _MOUSER_RESPONSE) -> parts_providers.MouserProvider:
+    prov = parts_providers.MouserProvider()
+    prov._search_part = lambda api_key, mpn: response              # type: ignore[method-assign]
+    return prov
+
+
+def test_digikey_maps_keyword_search_to_vendorpart() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), {"parts_providers": {"digikey": {
+            "client_id": "cid", "client_secret": "secret"}}})
+        rec = _digikey_mocked().fetch("LM317T")
+        assert rec["supplier"] == "Digi-Key"
+        assert rec["part_number"] == "LM317T"
+        assert rec["unit_price"] == 0.63
+        assert rec["price_breaks"][0] == {"qty": 1, "unit_price": 0.63}
+        assert rec["price_breaks"][-1] == {"qty": 100, "unit_price": 0.41}
+        assert rec["stock"] == 12345
+        assert rec["moq"] == 1
+        assert rec["lead_time_days"] == 16 * 7
+        assert rec["currency"] == "USD"
+        assert "stmicroelectronics" in rec["description"].lower() or "REG" in rec["description"]
+        assert rec["specs"].get("manufacturer") == "STMicroelectronics"
+        assert rec["specs"].get("datasheet_url", "").endswith(".pdf")
+        assert isinstance(rec["fetched_ts"], float) and rec["fetched_ts"] > 0
+
+
+def test_digikey_with_creds_no_results_raises() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), {"parts_providers": {"digikey": {
+            "client_id": "cid", "client_secret": "secret"}}})
+        with pytest.raises(ProviderError) as ei:
+            _digikey_mocked({"Products": [], "ProductsCount": 0}).fetch("NOSUCH")
+        assert "no products" in ei.value.message.lower()
+
+
+def test_digikey_env_fallback_supplies_creds() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), None)
+        os.environ["DIGIKEY_CLIENT_ID"] = "cid"
+        os.environ["DIGIKEY_CLIENT_SECRET"] = "secret"
+        rec = _digikey_mocked().fetch("LM317T")
+        assert rec["part_number"] == "LM317T"
+        assert rec["unit_price"] == 0.63
+
+
+def test_mouser_maps_partnumber_search_to_vendorpart() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), {"parts_providers": {"mouser": {
+            "api_key": "test-key"}}})
+        rec = _mouser_mocked().fetch("LM317T")
+        assert rec["supplier"] == "Mouser"
+        assert rec["part_number"] == "LM317T"
+        assert rec["unit_price"] == 0.66
+        assert rec["price_breaks"] == [
+            {"qty": 1, "unit_price": 0.66},
+            {"qty": 10, "unit_price": 0.55},
+            {"qty": 100, "unit_price": 0.44},
+        ]
+        assert rec["stock"] == 5432
+        assert rec["moq"] == 1
+        assert rec["lead_time_days"] == 14 * 7
+        assert rec["currency"] == "USD"
+        assert rec["specs"].get("manufacturer") == "STMicroelectronics"
+        assert rec["specs"].get("mouser_pn") == "511-LM317T"
+        assert isinstance(rec["fetched_ts"], float) and rec["fetched_ts"] > 0
+
+
+def test_mouser_with_key_no_results_raises() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), {"parts_providers": {"mouser": {
+            "api_key": "test-key"}}})
+        with pytest.raises(ProviderError) as ei:
+            _mouser_mocked({"Errors": [], "SearchResults": {"NumberOfResult": 0, "Parts": []}}).fetch(
+                "NOSUCH")
+        assert "no parts" in ei.value.message.lower()
+
+
+def test_mouser_env_fallback_supplies_key() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), None)
+        os.environ["MOUSER_API_KEY"] = "test-key"
+        rec = _mouser_mocked().fetch("LM317T")
+        assert rec["part_number"] == "LM317T"
+        assert rec["stock"] == 5432
+
+
+def test_provider_chain_order_nexar_digikey_mouser() -> None:
+    chain = parts_providers.default_pricing_chain()
+    keys = [p.key for p in chain.providers]
+    assert keys == ["nexar", "digikey", "mouser"]
+
+
+def test_provider_chain_uses_digikey_when_nexar_declines() -> None:
+    with tempfile.TemporaryDirectory() as td, _clean_env():
+        _point_config_at(Path(td), {"parts_providers": {
+            "digikey": {"client_id": "cid", "client_secret": "secret"},
+        }})
+        chain = parts_providers.ProviderChain([
+            parts_providers.NexarProvider(),  # no creds → declines
+            _digikey_mocked(),
+            parts_providers.MouserProvider(),
+        ])
+        rec = chain.fetch("LM317T")
+        assert rec is not None
+        assert rec["supplier"] == "Digi-Key"
+        assert rec["unit_price"] == 0.63
 
 
 def test_provider_chain_falls_through_to_none_without_creds() -> None:

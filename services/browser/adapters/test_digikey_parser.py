@@ -121,3 +121,108 @@ def test_digikey_search_no_next_data_returns_empty(monkeypatch):
         lambda url, site: {"ok": True, "content": "<html><body>nope</body></html>"})
 
     assert digikey_web.ADAPTER.search("resistor") == []
+
+
+# --- Narrow-MPN product-results fixture (synthetic but field-faithful) ---------
+# DigiKey's product-results envelope carries SKUs under envelope.data.products
+# (and a single-product detail under envelope.data.product). Field names match
+# the Product Information API / Next.js payload (camelCase on the web, with
+# PascalCase accepted by the parser too).
+_PRODUCT_RESULTS = [
+    {
+        "manufacturerProductNumber": "LM317T",
+        "digiKeyProductNumber": "LM317TFS-ND",
+        "productDescription": "IC REG LIN POS ADJ 1.5A TO220-3",
+        "manufacturerName": "STMicroelectronics",
+        "productUrl": "/en/products/detail/stmicroelectronics/LM317T/604171",
+        "unitPrice": 0.63,
+        "quantityAvailable": 12345,
+        "datasheetUrl": "https://mm.digikey.com/Volume0/opasdata/d220001/datasheets/123/LM317T.pdf",
+    },
+    {
+        "ManufacturerProductNumber": "LM317T",
+        "DigiKeyPartNumber": "497-1572-5-ND",
+        "ProductDescription": "IC REG LIN POS ADJ 1.5A TO220AB",
+        "Manufacturer": {"Name": "STMicroelectronics"},
+        "ProductUrl": "/en/products/detail/stmicroelectronics/LM317T/605123",
+        "UnitPrice": 0.71,
+        "QuantityAvailable": 800,
+        "DatasheetUrl": "https://mm.digikey.com/Volume0/opasdata/d220001/datasheets/456/LM317T.pdf",
+    },
+]
+
+DIGIKEY_PRODUCT_SEARCH_HTML = (
+    '<!DOCTYPE html><html><head><title>LM317T | DigiKey</title></head>'
+    '<body><div id="__next"></div>'
+    '<script id="__NEXT_DATA__" type="application/json">'
+    + json.dumps(
+        {
+            "props": {
+                "pageProps": {
+                    "envelope": {
+                        "data": {
+                            "productCount": 2,
+                            "products": _PRODUCT_RESULTS,
+                            # topResults may still be present on mixed pages;
+                            # product hits must win over category tiles.
+                            "topResults": _TOP_RESULTS,
+                        }
+                    }
+                }
+            },
+        }
+    )
+    + "</script></body></html>"
+)
+
+DIGIKEY_SINGLE_PRODUCT_HTML = (
+    '<!DOCTYPE html><html><head><title>LM317T Detail | DigiKey</title></head>'
+    '<body><div id="__next"></div>'
+    '<script id="__NEXT_DATA__" type="application/json">'
+    + json.dumps(
+        {
+            "props": {
+                "pageProps": {
+                    "envelope": {
+                        "data": {
+                            "product": _PRODUCT_RESULTS[0],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    + "</script></body></html>"
+)
+
+
+def test_digikey_narrow_mpn_parses_kind_product_hits(monkeypatch):
+    monkeypatch.setattr(
+        session, "browser_fetch",
+        lambda url, site: {"ok": True, "content": DIGIKEY_PRODUCT_SEARCH_HTML})
+
+    hits = digikey_web.ADAPTER.search("LM317T")
+
+    assert len(hits) == 2
+    assert all(h["kind"] == "product" for h in hits)
+    assert hits[0]["mpn"] == "LM317T"
+    assert hits[0]["digikey_pn"] == "LM317TFS-ND"
+    assert hits[0]["site"] == "digikey"
+    assert hits[0]["url"].startswith("https://www.digikey.com/en/products/detail/")
+    assert "LM317T" in hits[0]["title"]
+    assert hits[0]["price"].startswith("$")
+    assert hits[0]["datasheet"].endswith(".pdf")
+    # Category tiles must NOT leak into a product-results response.
+    assert all(h.get("kind") != "category" for h in hits)
+
+
+def test_digikey_single_product_envelope_parses(monkeypatch):
+    monkeypatch.setattr(
+        session, "browser_fetch",
+        lambda url, site: {"ok": True, "content": DIGIKEY_SINGLE_PRODUCT_HTML})
+
+    hits = digikey_web.ADAPTER.search("LM317T")
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "product"
+    assert hits[0]["mpn"] == "LM317T"
+    assert hits[0]["price"] == "$0.63"

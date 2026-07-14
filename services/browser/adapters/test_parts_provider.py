@@ -245,3 +245,56 @@ def test_health_wizard_active_is_deferred_not_all_clear(monkeypatch):
         assert r.get("deferred") is True
         assert r["error"] == "needs_human_login"
         assert r.get("expected") is True
+
+
+def test_health_default_sites_are_login_wizard_sites(monkeypatch):
+    """Default run_health_check (sites=None) covers every login-wall adapter."""
+    from services.browser import adapters, health as h
+
+    class _Mgr:
+        def wizard_active(self):
+            return True
+
+    monkeypatch.setattr("services.browser.embed.get_manager", lambda: _Mgr())
+    rows = h.run_health_check(None)
+    wizard = set(adapters.login_wizard_sites())
+    assert wizard, "login_wizard_sites() must be non-empty"
+    row_sites = {r["site"] for r in rows}
+    # Every login-wall adapter must appear; health may also include canary leftovers.
+    assert wizard.issubset(row_sites), f"missing login-wall sites: {wizard - row_sites}"
+    for r in rows:
+        assert set(r) >= {"site", "ok", "latency_ms", "logged_in", "hit_count", "error"}
+        if r["site"] in wizard:
+            assert r["ok"] is False
+            assert r["error"] == "needs_human_login"
+            assert r.get("deferred") is True
+            assert r.get("expected") is True
+
+
+def test_health_row_shape_on_login_required(monkeypatch):
+    """login_required canary failures keep the required status-board fields."""
+    from services.browser import health as h
+    from services.browser import session
+
+    class _Mgr:
+        def wizard_active(self):
+            return False
+
+    monkeypatch.setattr("services.browser.embed.get_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        session, "browser_fetch",
+        lambda url, site: {
+            "ok": True,
+            "content": '<html><body><form class="login-form"><h1>Sign In</h1>'
+                       '<input id="signInName"/></form></body></html>',
+        })
+    # digikey is registered and has a canary; login wall → expected failure.
+    rows = h.run_health_check(["digikey"])
+    assert len(rows) == 1
+    r = rows[0]
+    assert set(r) >= {"site", "ok", "latency_ms", "logged_in", "hit_count", "error"}
+    assert r["site"] == "digikey"
+    assert r["ok"] is False
+    assert r["error"] in ("login_required", "needs_human_login")
+    assert r.get("expected") is True
+    assert r["logged_in"] is False

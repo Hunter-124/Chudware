@@ -108,7 +108,10 @@ class CMakeToolchain(Toolchain):
     ``arm-none-eabi`` cross-compiler selected by the template's toolchain file."""
 
     name = "cmake"
-    required_tools = ("cmake",)
+    # cmake alone is not enough: the toolchain file hard-requires arm-none-eabi-gcc on PATH.
+    # Preflight both so a missing cross-compiler yields toolchain_not_found, not an opaque
+    # CMake "No CMAKE_C_COMPILER could be found" wall of text.
+    required_tools = ("cmake", "arm-none-eabi-gcc")
 
     def build(self, project: FirmwareProject, *, timeout: float = _DEFAULT_TIMEOUT_S) -> BuildResult:
         t0 = time.perf_counter()
@@ -116,6 +119,8 @@ class CMakeToolchain(Toolchain):
         build_dir = project.build_path
         if shutil.which("cmake") is None:
             return _not_found("cmake", ["cmake"], t0)
+        if shutil.which("arm-none-eabi-gcc") is None:
+            return _not_found("arm-none-eabi-gcc", ["arm-none-eabi-gcc"], t0)
 
         generator = "Ninja" if shutil.which("ninja") else "Unix Makefiles"
         tc_file = root / "cmake" / "arm-none-eabi-toolchain.cmake"

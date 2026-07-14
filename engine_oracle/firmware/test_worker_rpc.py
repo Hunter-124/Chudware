@@ -21,7 +21,7 @@ def test_registry_mirrors_mcp_surface():
     expected = {
         "fw_status", "fw_projects", "fw_new_project", "fw_build", "fw_sources",
         "fw_sim_run", "fw_verify_board", "fw_flash", "fw_debug_start", "fw_debug_halt",
-        "fw_debug_read_mem",
+        "fw_debug_read_mem", "fw_power_profile",
     }
     assert expected == set(worker_rpc.WORKER_METHODS)
 

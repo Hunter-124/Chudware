@@ -285,7 +285,7 @@ def test_fw_verify_board_handler(tmp_path):
         "trace_path": str(trace_path),
     })
     assert res.get("ok") is True, res
-    assert res["mcu_family"] == "cortex-m4"
+    assert res["mcu_family"] == "stm32f4"
     assert res["dynamic"] == {"ran": True, "source": "trace"}
     rules = set(res["summary"]["rules"])
     assert "fw_missing_decouple" in rules and "fw_trace_drive_conflict" in rules

@@ -28,10 +28,16 @@ from typing import Any, Optional
 # Prefix (case-insensitive, substring — tolerant of libids like "MCU_ST_STM32F4:STM32F407VGTx")
 # → firmware mcu_family. Order matters: first hit wins. Extend as new families are supported.
 _FAMILY_PREFIXES: list[tuple[str, str]] = [
-    ("stm32", "cortex-m4"),      # T-C2: STM32*  -> cortex-m4
-    ("esp32", "xtensa-lx6"),     # T-C2: ESP32*  -> xtensa-lx6
-    ("atmega", "avr"),           # T-C2: ATmega* -> avr
-    ("attiny", "avr"),           # same toolchain family as ATmega
+    # More-specific STM32 lines first so BOM MPNs resolve to peripheral-capable platforms
+    # (platform_db.canonical_family: stm32f4/stm32f1 → uart+gpio_observe; bare cortex-m* stays generic).
+    ("stm32f4", "stm32f4"),
+    ("stm32f1", "stm32f1"),
+    ("nrf52", "nrf52"),
+    ("rp2040", "rp2040"),
+    ("stm32", "cortex-m4"),      # unspecified STM32 line → generic core (no peripheral platform claim)
+    ("esp32", "xtensa-lx6"),
+    ("atmega", "avr"),
+    ("attiny", "avr"),
 ]
 
 # BOM fields a caller might stash a real manufacturer part number under (the ECAD model has no
@@ -146,11 +152,13 @@ def resolve_board_doc(ref: Optional[str]) -> Optional[dict]:
 # (upper-cased): boards name these nets after the pin function (BOOT0, NRST, EN) or the physical
 # pin (ESP32 GPIO0). Extend alongside _FAMILY_PREFIXES as new families land.
 _STRAP_PIN_NAMES: dict[str, frozenset[str]] = {
-    # STM32 (all cortex-m*): BOOT0/BOOT1 sample at reset; NRST is the reset line.
+    # STM32 (all cortex-m* + family platform keys): BOOT0/BOOT1 sample at reset; NRST is reset.
     "cortex-m0": frozenset({"BOOT0", "BOOT1", "NRST"}),
     "cortex-m3": frozenset({"BOOT0", "BOOT1", "NRST"}),
     "cortex-m4": frozenset({"BOOT0", "BOOT1", "NRST"}),
     "cortex-m7": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    "stm32f4": frozenset({"BOOT0", "BOOT1", "NRST"}),
+    "stm32f1": frozenset({"BOOT0", "BOOT1", "NRST"}),
     # ESP32: EN is reset; GPIO0/GPIO2 select download boot; GPIO12/GPIO15 set flash voltage/mode.
     "xtensa-lx6": frozenset({"EN", "GPIO0", "GPIO2", "GPIO12", "GPIO15"}),
     # AVR: RESET (PC6 on ATmega328) — fuse-repurposable, still flagged.

@@ -104,9 +104,9 @@ def test_resolve_pin(name, expected):
 
 
 @pytest.mark.parametrize("mpn,family", [
-    ("STM32F103", "cortex-m4"),
-    ("STM32F407VGTx", "cortex-m4"),
-    ("MCU_ST_STM32F4:STM32F407VGTx", "cortex-m4"),
+    ("STM32F103", "stm32f1"),
+    ("STM32F407VGTx", "stm32f4"),
+    ("MCU_ST_STM32F4:STM32F407VGTx", "stm32f4"),
     ("ESP32-WROOM-32", "xtensa-lx6"),
     ("ATmega328P", "avr"),
     ("ATtiny85", "avr"),
@@ -120,7 +120,7 @@ def test_mpn_to_family(mpn, family):
 
 def test_select_mcu_family_from_board_bom():
     board = _board_with_nets("PA5", mcu_value="STM32F103")
-    assert mcu_pinouts.select_mcu_family(board) == "cortex-m4"
+    assert mcu_pinouts.select_mcu_family(board) == "stm32f1"
 
 
 def test_select_mcu_family_none_when_no_mcu():

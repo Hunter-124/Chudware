@@ -44,7 +44,7 @@ def test_fw_new_project_explicit_mcu():
 def test_fw_new_project_auto_selects_mcu_from_board_bom():
     ref = _open_board("PA5", "MISO", mcu_value="STM32F103")
     res = fw.fw_new_project({"name": "auto", "board_doc_ref": ref})  # no mcu_family
-    assert res["project"]["mcu_family"] == "cortex-m4"
+    assert res["project"]["mcu_family"] == "stm32f1"
     assert res["project"]["board_doc_ref"] == ref
 
 

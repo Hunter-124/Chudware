@@ -40,3 +40,6 @@ The ops cheatsheet (formats + few-shot examples) is included below; follow it ex
 
 Reply with EXACTLY one ```json block containing a JSON ARRAY of ops (even for a single op), no
 prose outside it. If the step needs no new geometry, emit `[]`.
+
+Capability SOFT rules (calc-before-model / verify cadence / templates) are
+appended by the harness per tier (A/B/C) — see [CAPABILITY_SOFT] block when present.

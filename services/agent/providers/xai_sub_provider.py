@@ -480,7 +480,9 @@ class XAISubProvider(Provider):
             "image_url": {"url": f"data:{mime};base64,{data}"},
         }
 
-    def _message(self, role: str, parts: list[dict]) -> dict:
+    def _message(self, role: str, parts) -> dict:
+        if isinstance(parts, str):
+            return {"role": role, "content": parts}
         if all(p["type"] == "text" for p in parts):
             return {
                 "role": role,

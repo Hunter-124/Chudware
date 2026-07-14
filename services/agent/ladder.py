@@ -146,8 +146,20 @@ def assemble_rung_prompt(card: RoleCard, ri: RungInput) -> tuple[str, list[dict]
     template}. There is NO conversation history — the messages list is freshly built
     from ``ri`` every call and never threaded from a previous rung.
     """
-    # System = the AUTHORED role card system_prompt (verbatim) + the rung tag.
-    system = f"{_rung_header(ri.rung)}\n\n{card.system_prompt.rstrip()}"
+    # System = the AUTHORED role card system_prompt + capability SOFT block
+    # (WI-16) + the rung tag. Default capability C when not supplied on ri.
+    try:
+        from services.agent.prompt_tiers import (  # noqa: PLC0415
+            assemble_system_for_capability,
+            letter_from_capability,
+        )
+        _cap = getattr(ri, "capability", None)
+        _letter = letter_from_capability(_cap)
+        _role_sys = assemble_system_for_capability(card.system_prompt, _letter)
+    except Exception:  # noqa: BLE001
+        _role_sys = card.system_prompt.rstrip()
+        _letter = "C"
+    system = f"{_rung_header(ri.rung)}\n\n{_role_sys}"
 
     # The turn content: ledger slice (spec), the scoped prior artifact(s), the
     # step-locked playbook template. assemble_context enforces the §9.1 slot order;
@@ -162,10 +174,14 @@ def assemble_rung_prompt(card: RoleCard, ri: RungInput) -> tuple[str, list[dict]
         advisory_block="",            # foreman-injected in the live pipeline
         playbook_step=playbook_text,  # the AUTHORED rung template
         history="",                   # deliberately empty — fresh context
+        capability=_letter,
     )
     # Strip the leading system prompt that assemble_context prepends (we send it as the
     # real system role) so the user turn is purely {ledger, prior artifact, template}.
-    if turn.startswith(card.system_prompt.rstrip()):
+    _sys_prefix = assemble_context(card, capability=_letter).split("\n\n")[0]
+    if turn.startswith(_sys_prefix):
+        turn = turn[len(_sys_prefix):].strip()
+    elif turn.startswith(card.system_prompt.rstrip()):
         turn = turn[len(card.system_prompt.rstrip()):].strip()
     messages = [{"role": "user", "content": [{"type": "text", "text": turn}]}]
     return system, messages

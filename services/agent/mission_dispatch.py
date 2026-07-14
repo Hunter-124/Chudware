@@ -71,7 +71,10 @@ class MissionDispatch:
 
     def __init__(self, *, run_id: str, ledger=None, autonomy: str = "auto",
                  graph: dict | None = None, delegation_tree=None,
-                 doc_id: str | None = None, provider=None, on_event=None) -> None:
+                 doc_id: str | None = None, provider=None, on_event=None,
+                 capability=None, tier: str | None = None,
+                 phase: str | None = None,
+                 task_class: str | None = None) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
@@ -86,6 +89,11 @@ class MissionDispatch:
         # from inside the sub-agent turn through the same drain).
         self.provider = provider
         self.on_event = on_event
+        # Capability dials (WI-2/4/…): optional profile or tier for scaffolds.
+        self.capability = capability
+        self.tier = tier
+        self.phase = phase
+        self.task_class = task_class
         self._handlers: dict[str, Callable[..., Any]] = {
             "ledger_get": self.ledger_get,
             "ledger_note": self.ledger_note,
@@ -306,7 +314,26 @@ class MissionDispatch:
                 card = _load_role(role)
             except Exception:  # noqa: BLE001 — unknown role → bare sub-agent
                 card = None
-            system_prompt = card.system_prompt if card is not None else None
+            system_prompt = None
+            if card is not None:
+                # WI-16: append per-capability SOFT phrasing at assembly time.
+                try:
+                    from services.agent.prompt_tiers import (  # noqa: PLC0415
+                        assemble_system_for_capability,
+                        letter_from_capability,
+                    )
+                    from services.agent.capability import resolve_capability  # noqa: PLC0415
+                    _tier = ""
+                    try:
+                        from services.agent.tiers import detect_tier_from_env  # noqa: PLC0415
+                        _tier = detect_tier_from_env() or ""
+                    except Exception:  # noqa: BLE001
+                        _tier = ""
+                    _cap = resolve_capability(_tier) if _tier else None
+                    system_prompt = assemble_system_for_capability(
+                        card.system_prompt, letter_from_capability(_cap))
+                except Exception:  # noqa: BLE001
+                    system_prompt = card.system_prompt
             allowed = card.concrete_tools if card is not None else None
             tools_text = None
             if allowed:
@@ -323,6 +350,26 @@ class MissionDispatch:
                 granted = 0
             derived = (granted // 2000) if granted > 0 else 10
             max_calls = max(4, min(12, derived))
+            # WI-4: capability phase caps (A/B HARD) override soft derived budget.
+            _cap = self.capability
+            if _cap is None and self.tier:
+                try:
+                    from services.agent.scaffolds import coerce_profile  # noqa: PLC0415
+                    _cap = coerce_profile(tier=self.tier)
+                except Exception:  # noqa: BLE001
+                    _cap = None
+            _phase = self.phase or str(node.get("phase") or node.get("stage") or "") or None
+            if _cap is not None:
+                try:
+                    from services.agent import scaffolds as _sc  # noqa: PLC0415
+                    max_calls, _ = _sc.apply_phase_cap(
+                        _cap, _phase, max_calls,
+                        ledger=self.ledger, actor=role,
+                    )
+                    if max_calls is None:
+                        max_calls = max(4, min(12, derived))
+                except Exception:  # noqa: BLE001
+                    pass
             result = _at.run_turn(
                 brief, self.provider, name=role, actor=role,
                 system_prompt=system_prompt,
@@ -331,7 +378,9 @@ class MissionDispatch:
                 mission_dispatch=self,
                 ledger=self.ledger, max_tool_calls=max_calls,
                 on_event=self.on_event, run_id=self.run_id,
-                node_id=node_id, subagent_id=node_id)
+                node_id=node_id, subagent_id=node_id,
+                capability=_cap, tier=self.tier, phase=_phase,
+                task_class=self.task_class)
             tokens = 0  # provider seam exposes no usage here; accrual stays honest at 0
             if result.stop_reason == "terminated_by_user":
                 try:

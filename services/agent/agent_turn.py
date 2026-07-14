@@ -79,7 +79,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              run_id: str | None = None,
              node_id: str | None = None,
              parent_id: str | None = None,
-             subagent_id: str | None = None) -> TurnResult:
+             subagent_id: str | None = None,
+             capability: Any | None = None,
+             tier: str | None = None,
+             model_id: str | None = None,
+             phase: str | None = None,
+             task_class: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -100,8 +105,39 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     *max_tokens* caps each model completion.  Callers on a known tier pass the
     tier's ``generation_headroom`` (tiers.yaml — the same budget source the
     aicad.effort/1 resolution path reads), so the turn is bounded by tier
-    budgets rather than an ad-hoc constant.  Default 2048 when no tier is known."""
-    budget = int(max_tool_calls if max_tool_calls is not None else 8)
+    budgets rather than an ad-hoc constant.  Default 2048 when no tier is known.
+
+    *capability* / *tier* / *model_id* resolve a CapabilityProfile for A/B
+    scaffolds (WI-2/4/6/7). Letter C is always a no-op for scaffolds.
+    *phase* applies HARD phase_caps (WI-4) when set.
+    *task_class* feeds WI-8 reference-build novelty (when injected upstream)."""
+    # Capability profile: prefer explicit, else mission_dispatch, else C.
+    try:
+        from services.agent import scaffolds as _sc  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        _sc = None  # type: ignore
+    _cap = capability
+    if _cap is None and mission_dispatch is not None:
+        _cap = getattr(mission_dispatch, "capability", None)
+    if _cap is None and _sc is not None:
+        _cap = _sc.coerce_profile(
+            tier=tier or getattr(mission_dispatch, "tier", None)
+            if mission_dispatch is not None else tier,
+            model_id=model_id,
+        )
+    _phase = phase or (
+        getattr(mission_dispatch, "phase", None) if mission_dispatch is not None else None
+    )
+    _budget_in = max_tool_calls if max_tool_calls is not None else 8
+    _capped = False
+    if _sc is not None and _cap is not None:
+        _budget_in, _capped = _sc.apply_phase_cap(
+            _cap, _phase, int(_budget_in) if max_tool_calls is not None else None,
+            ledger=ledger, actor=actor or name,
+        )
+        if _budget_in is None:
+            _budget_in = 8
+    budget = int(_budget_in)
     completion_cap = int(max_tokens) if max_tokens else 2048
     if tool_dispatch is not None:
         dispatch = tool_dispatch
@@ -115,6 +151,21 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         dispatch = _dispatch_tool
     allow = set(allowed_tools or [])
     actor = actor or name
+    # WI-8: inject reference builds into the user request for A/B specify.
+    _req = request
+    if _sc is not None and _cap is not None:
+        try:
+            _ref = _sc.reference_build_context(
+                _cap, request,
+                task_class=task_class or getattr(mission_dispatch, "task_class", None)
+                if mission_dispatch is not None else task_class,
+                phase=_phase or "specify",
+                ledger=ledger, actor=actor,
+            )
+            if _ref:
+                _req = request + "\n\n" + _ref
+        except Exception:  # noqa: BLE001
+            pass
 
     # M20: agent-execution event stream. Emit `agent.tool_call` (with human `target`
     # + latency) with a per-turn root span so the GUI can build the execution DAG
@@ -142,12 +193,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     elif allow:
         system += "\nAllowed tools: " + ", ".join(sorted(allow))
 
-    messages: list[dict] = [{"role": "user", "content": _parts(request)}]
+    messages: list[dict] = [{"role": "user", "content": _parts(_req)}]
 
     calls: list[dict] = []
     tool_calls_made = 0
     last_reason = _NOCODE
-
+    _prev_stage: str | None = None
     for _ in range(budget + 1):
         # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
         # sub-agent session (subagent_id set), drain the cross-process steering queue
@@ -237,14 +288,27 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             continue
 
         if tool_calls_made >= budget:
-            last_reason = _RETRY
+            last_reason = (
+                "phase_step_cap" if _capped else _RETRY
+            )
             break
 
         tool_calls_made += 1
         import time as _time  # noqa: PLC0415
         _t0 = _time.monotonic()
-        # HARD pre-dispatch (WI-12 auto-checkpoint, WI-15 ref integrity).
-        _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
+        # Scaffold pre-dispatch (WI-7 calc gate, WI-6 A aggressive checkpoint).
+        # HARD floors (WI-12/15) run next via _pre_dispatch_guardrail.
+        _blocked = None
+        if _sc is not None and _cap is not None:
+            try:
+                _blocked = _sc.pre_dispatch_scaffolds(
+                    tool, args, profile=_cap, ledger=ledger,
+                    calls=calls, actor=actor,
+                )
+            except Exception:  # noqa: BLE001
+                _blocked = None
+        if _blocked is None:
+            _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
         if _blocked is not None:
             result = {"ok": False, "error": _blocked}
             ok = False
@@ -273,7 +337,23 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
-    return TurnResult(tool_calls_made > 0 and last_reason == _RETRY,
+        # WI-2: auto-verify inject after successful mutating dispatch (A/B only).
+        if ok and _sc is not None and _cap is not None:
+            try:
+                _do_inject, _vtool, _prev_stage = _sc.should_auto_verify(
+                    _cap, tool, args, ok=ok, prev_stage=_prev_stage,
+                )
+                if _do_inject and _vtool:
+                    _vres = _sc.run_auto_verify(
+                        dispatch, _vtool, args,
+                        ledger=ledger, actor=actor, profile=_cap,
+                    )
+                    messages.append({"role": "user", "content": _parts(
+                        f"[auto-verify] Result of {_vtool}:\n{_as_text(_vres)}")})
+            except Exception:  # noqa: BLE001 — inject never breaks the turn
+                pass
+
+    return TurnResult(tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"),
                       last_reason, {"calls": calls,
                                     "tool_calls": tool_calls_made})
 

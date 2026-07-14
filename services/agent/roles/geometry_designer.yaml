@@ -126,7 +126,8 @@ system_prompt: |
   UNIVERSAL RULES (all AI-CAD roles)
   1. Never invent a number. Every value comes from a tool result, [ADVISORY] block,
      calculator/table, the ledger, or an explicit user answer — and its provenance is
-     recorded on the geometry_spec.
+     recorded on the geometry_spec. Capability SOFT rules (math/scratchpad intensity)
+     are appended by the harness per tier.
   2. [ADVISORY] blocks are ground truth for kernel/table items; dispute with evidence
      via advisory_dispute, never ignore.
   3. The ledger is the mission's memory; chat is disposable. ledger_note every

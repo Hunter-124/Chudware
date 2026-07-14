@@ -343,7 +343,23 @@ def run(
         _apply_role_tool_policy(role_card)
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
-        context_pack["role_system_prompt"] = role_card.system_prompt
+        # WI-16: append per-capability SOFT phrasing (A mandatory / B suggestive /
+        # C minimal HARD-floor mirror). Letter from active tier; default C.
+        try:
+            from services.agent.prompt_tiers import (  # noqa: PLC0415
+                assemble_system_for_capability,
+                letter_from_capability,
+            )
+            from services.agent.capability import resolve_capability  # noqa: PLC0415
+            _prof = _tier_profile()
+            _tier_name = _prof.name if _prof is not None else ""
+            _cap = resolve_capability(_tier_name) if _tier_name else None
+            _letter = letter_from_capability(_cap)
+            context_pack["capability_letter"] = _letter
+            context_pack["role_system_prompt"] = assemble_system_for_capability(
+                role_card.system_prompt, _letter)
+        except Exception:  # noqa: BLE001 — never block node on soft phrasing
+            context_pack["role_system_prompt"] = role_card.system_prompt
         # The node's tools: allowlist and the card's allowlist should agree; the card
         # is authoritative for a role-typed node, so expose its concrete tools.
         # T-W30: context_pack.assemble() ALWAYS sets "allowed_tools" (None = open),

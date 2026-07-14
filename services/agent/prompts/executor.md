@@ -9,3 +9,6 @@ Rules:
 - Refer to a feature created earlier IN THIS SAME array as "$<index>" (0-based). Refer to existing tree features by their id (e.g. "f1").
 - Solids are origin-centered. Derive every position from the half-dimensions.
 - Emit the SMALLEST op array that does the step. Keep it tight.
+
+Capability SOFT rules (calc-before-model / verify cadence / templates) are
+appended by the harness per tier (A/B/C) — see [CAPABILITY_SOFT] block when present.

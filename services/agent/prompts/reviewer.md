@@ -49,3 +49,6 @@ feature, a bad proportion, a feature that is not actually present.
 
 Reply with EXACTLY one ```json block, no prose outside it:
 {"done": <bool>, "issues": ["each concrete problem, '' list if done"]}
+
+Capability SOFT rules scale with tier: A is strict read-back; C only prefers
+verify_battery before done. The harness appends a [CAPABILITY_SOFT] block.

@@ -421,15 +421,27 @@ def _plan_text(plan: dict) -> str:
 
 
 def _make_plan(session: Session, request: str, provider: Provider,
-               on_event: EventFn | None) -> dict | None:
+               on_event: EventFn | None,
+               *, capability=None) -> dict | None:
     """Run the planning call. Best-effort: any failure just means we design without a
-    plan — planning must never block the build itself."""
+    plan — planning must never block the build itself.
+
+    *capability* (WI-3) selects rigid/structured/freeform plan prompt. C never
+    receives rigid template text.
+    """
     turn = session.turns + 1
     _emit(on_event, kind="status", index=0, turn=turn, phase="planning",
           text="Drafting a build plan (parts, dimensions, features)...")
+    plan_sys = PLAN_PROMPT
+    try:
+        from services.agent import scaffolds as _sc  # noqa: PLC0415
+        if capability is not None:
+            plan_sys = _sc.plan_prompt_for(capability, PLAN_PROMPT)
+    except Exception:  # noqa: BLE001
+        plan_sys = PLAN_PROMPT
     try:
         reply, _ = provider.complete_ex(
-            PLAN_PROMPT, [user([text_part(PLAN_USER.format(request=request))])],
+            plan_sys, [user([text_part(PLAN_USER.format(request=request))])],
             max_tokens=2000)
     except Exception as e:  # noqa: BLE001
         _emit(on_event, kind="status", index=0, turn=turn, phase="plan_failed",
@@ -440,6 +452,20 @@ def _make_plan(session: Session, request: str, provider: Provider,
         _emit(on_event, kind="status", index=0, turn=turn, phase="plan_failed",
               text="Plan wasn't parseable - designing directly.")
         return None
+    # WI-3: A rigid plan missing required slots fails handoff (no plan kept).
+    try:
+        from services.agent import scaffolds as _sc  # noqa: PLC0415
+        if capability is not None:
+            slot_errs = _sc.validate_plan_slots(plan, capability)
+            if slot_errs:
+                _emit(on_event, kind="status", index=0, turn=turn,
+                      phase="plan_invalid",
+                      text="Plan missing required slots: " + "; ".join(slot_errs))
+                fmt = str(getattr(capability, "plan_format", "") or "")
+                if fmt == "rigid_template":
+                    return None
+    except Exception:  # noqa: BLE001
+        pass
     session.plan = plan
     _emit(on_event, kind="plan", turn=turn, plan=plan, raw=_cap(reply, 4000))
     return plan
@@ -450,13 +476,15 @@ def _make_plan_with_buildgraph(
     request: str,
     provider: "Provider",
     on_event: "EventFn | None",
+    *,
+    capability=None,
 ) -> "dict | None":
     """Run planning then attach an ordered build checklist from aicad.buildgraph/1.
 
     T-W15 seam (behind AICAD_BUILDGRAPH_PLAN=1 env flag or buildgraph_first=True).
     Best-effort: buildgraph failure only emits an advisory; the plan itself is kept.
     """
-    plan = _make_plan(session, request, provider, on_event)
+    plan = _make_plan(session, request, provider, on_event, capability=capability)
     if plan is None:
         return None
     try:
@@ -1144,14 +1172,33 @@ def run_turn(session: Session, request: str, provider: Provider,
              on_event: EventFn | None = None, max_iters: int | None = None,
              plan_first: bool = False,
              buildgraph_first: bool = False,
-             role: str | None = None) -> AgentRun:
+             role: str | None = None,
+             capability=None,
+             tier: str | None = None) -> AgentRun:
     """Run one user turn against a persistent ``session``, refining until the render matches
     the request (the model declares "done"), it stops making progress, or ``max_iters`` is hit
     (default ``DEFAULT_MAX_ITERS``). With ``plan_first``, the first turn opens with a planning
     call (parts / dimensions / features) that is streamed as a "plan" event and injected into
     the design conversation. With ``buildgraph_first`` (T-W15), the plan is also run through
     the LLM-free build-order planner to produce an ordered checklist injected into the prompt.
+    *capability* / *tier* (WI-3/10): A forces plan_first + rigid template and caps refine
+    passes; C freeform + untouched refine budget.
     Streams progress via ``on_event`` and returns an AgentRun."""
+    # Resolve capability for scaffolds (default C = no scaffold tax).
+    _cap = capability
+    if _cap is None:
+        try:
+            from services.agent.scaffolds import coerce_profile  # noqa: PLC0415
+            _cap = coerce_profile(tier=tier)
+        except Exception:  # noqa: BLE001
+            _cap = None
+    try:
+        from services.agent import scaffolds as _sc  # noqa: PLC0415
+        if _cap is not None and _sc.plan_first_for(_cap):
+            plan_first = True
+            buildgraph_first = True  # A: buildgraph checklist with rigid plan
+    except Exception:  # noqa: BLE001
+        pass
     if max_iters is None:
         max_iters = DEFAULT_MAX_ITERS
     # OFFLINE MODE defense-in-depth (C35): the legacy loop is the second call site (the
@@ -1197,9 +1244,10 @@ def run_turn(session: Session, request: str, provider: Provider,
 
     if first_turn:
         if buildgraph_first:
-            _make_plan_with_buildgraph(session, request, provider, on_event)
+            _make_plan_with_buildgraph(session, request, provider, on_event,
+                                      capability=_cap)
         elif plan_first:
-            _make_plan(session, request, provider, on_event)
+            _make_plan(session, request, provider, on_event, capability=_cap)
         opening = FIRST_USER.format(request=request)
         if session.plan:
             opening += "\n\n" + _plan_text(session.plan)
@@ -1268,6 +1316,7 @@ def run_turn(session: Session, request: str, provider: Provider,
     prev_metrics = None               # (volume, triangles) of the previous successful build
     converged = False
     stop_reason = "max_iters"
+    stable_geometry_count = 0         # WI-10: successful geometry iterations this turn
 
     for i in range(max_iters):
         _iter_t0 = time.monotonic()
@@ -1472,6 +1521,21 @@ def run_turn(session: Session, request: str, provider: Provider,
             else:
                 stagnant = 0
                 last_built = new_code
+                stable_geometry_count += 1
+                # WI-10: A caps refine at ≤1 stable-geometry pass; B at 1+refine_passes.
+                try:
+                    from services.agent import scaffolds as _sc  # noqa: PLC0415
+                    if _sc.should_stop_refine(
+                            _cap, stable_geometry_count,
+                            ledger=_ledger, actor="loop"):
+                        converged = True
+                        stop_reason = "refine_cap"
+                        # Still show the successful render once, then stop after feedback.
+                        # Break immediately — first stable geometry is the allowed pass.
+                        if getattr(_cap, "refine_passes", 2) == 0:
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
                 prompt_text = VERIFY               # genuine progress -> normal verdict request
                 if noop_change:                    # edited code, byte-identical geometry
                     prompt_text = NOOP_CHANGE_NOTE + "\n" + VERIFY

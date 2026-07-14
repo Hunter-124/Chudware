@@ -31,8 +31,74 @@ from mcp.server.fastmcp import FastMCP
 # capability + calculator + sourcing helper but drops the orchestration/supervision families
 # and swaps in a short, non-prescriptive instruction block, so the model runs freer and we
 # don't spend input tokens on a workflow it won't follow.  Switch with AICAD_MCP_PROFILE=lite.
-_PROFILE = os.environ.get("AICAD_MCP_PROFILE", "full").strip().lower()
+# WI-16: capability letter also influences the default — C (frontier) prefers lite; A/B full.
+# Explicit AICAD_MCP_PROFILE always wins. AICAD_CAPABILITY=A|B|C or AI_CAD_TIER can select.
+_PROFILE_ENV = os.environ.get("AICAD_MCP_PROFILE", "").strip().lower()
+
+
+def _resolve_mcp_profile() -> str:
+    """full | lite — explicit env wins; else capability letter C → lite (WI-16)."""
+    if _PROFILE_ENV in ("full", "lite"):
+        return _PROFILE_ENV
+    letter = (os.environ.get("AICAD_CAPABILITY")
+              or os.environ.get("AI_CAD_CAPABILITY")
+              or "").strip().upper()
+    if letter not in ("A", "B", "C"):
+        # Best-effort: map active tier → capability letter without hard-importing
+        # the full agent package at MCP import time when unavailable.
+        try:
+            from services.agent.capability import resolve_capability  # noqa: PLC0415
+            tier = (os.environ.get("AI_CAD_TIER") or "").strip()
+            if tier:
+                letter = resolve_capability(tier).letter
+        except Exception:  # noqa: BLE001
+            letter = ""
+    if letter == "C":
+        return "lite"
+    if letter in ("A", "B"):
+        return "full"
+    return "full"  # historical default
+
+
+_PROFILE = _resolve_mcp_profile()
 _LITE = _PROFILE == "lite"
+
+# WI-16 SOFT phrasing tails (capability dial). Lite carries C (minimal); full
+# carries A mandatory discipline when the server is in supervised mode. B uses
+# full + suggestive block when AICAD_CAPABILITY=B.
+_SOFT_A = (
+    "\n[CAPABILITY_SOFT] A — MANDATORY DISCIPLINE (local scaffold)\n"
+    "calculate-before-model: never invent load-bearing numbers — run fit_calc / "
+    "research_* / the matching calculator before dimensioned features.\n"
+    "datum-first; fillet-last within a region; read-back after every mutation "
+    "(describe_part / check_sketch) before the next mutate; use plan/buildgraph "
+    "templates rather than free-forming the tree.\n"
+)
+_SOFT_B = (
+    "\n[CAPABILITY_SOFT] B — RECOMMENDED DISCIPLINE (budget)\n"
+    "Suggested build order: datums → solids → secondary → patterns → blends. "
+    "Verify after feature groups (not necessarily every call). Name features. "
+    "Preflight recommended on non-trivial ops. Calculate when uncertain.\n"
+)
+_SOFT_C = (
+    "\n[CAPABILITY_SOFT] C — HARD FLOORS ONLY (frontier freedom)\n"
+    "Prefer verify_battery before done; checkpoint before irreversible ops. "
+    "No prescribed build order beyond those process floors.\n"
+)
+
+
+def _soft_tail_for_profile() -> str:
+    letter = (os.environ.get("AICAD_CAPABILITY")
+              or os.environ.get("AI_CAD_CAPABILITY")
+              or "").strip().upper()
+    if letter not in ("A", "B", "C"):
+        letter = "C" if _LITE else "A"
+    if letter == "A":
+        return _SOFT_A
+    if letter == "B":
+        return _SOFT_B
+    return _SOFT_C
+
 
 _LITE_INSTRUCTIONS = (
     "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the desktop "
@@ -60,6 +126,7 @@ _LITE_INSTRUCTIONS = (
     "(make_report/drawing/presentation) are all available — reach for them when they help.\n"
     "BE ECONOMICAL: model, check what actually needs checking, and deliver. Don't over-verify, "
     "don't narrate every step, and keep outputs tight — no busywork, no redundant re-renders."
+    + _soft_tail_for_profile()
 )
 
 _FULL_INSTRUCTIONS = (
@@ -177,6 +244,7 @@ _FULL_INSTRUCTIONS = (
         "CONTENT GOLDEN DEMO (T-FIN25): scripts/demo_sensor_node.py is the living E2E worked "
         "example (sensor-node board → verify ladder → firmware → thermal → heatsink → budget → "
         "make_report); see docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md and cad_guide('simulation').\n"
+        + _soft_tail_for_profile()
 )
 
 mcp = FastMCP(

@@ -441,6 +441,21 @@ def flags(findings: Iterable[Finding]) -> list[Finding]:
 DescriberFn = Callable[[str, int], str]
 
 
+def system_prompt_for_capability(
+    card: RoleCard,
+    capability: Any = None,
+) -> str:
+    """Role system prompt + per-capability SOFT phrasing block (WI-16).
+
+    *capability* is a letter ``"A"|"B"|"C"``, a CapabilityProfile, or None
+    (defaults to C — frontier freedom, minimal SOFT block).
+    """
+    from services.agent.prompt_tiers import (  # noqa: PLC0415
+        assemble_system_for_capability,
+    )
+    return assemble_system_for_capability(card.system_prompt, capability)
+
+
 def assemble_context(
     card: RoleCard,
     *,
@@ -449,20 +464,26 @@ def assemble_context(
     advisory_block: str = "",
     playbook_step: str = "",
     history: str = "",
+    capability: Any = None,
 ) -> str:
     """Assemble one turn's context in the frozen §9.1 order:
 
-        role system prompt → ledger render → stage state → ADVISORY block
-        → playbook step (if step-locked) → history
+        role system prompt (+ capability SOFT block) → ledger render → stage
+        state → ADVISORY block → playbook step (if step-locked) → history
 
-    The advisory block and describer/stage-state renders are produced by the foreman
-    (T-W5) and the describer tools respectively — this assembler takes them as
-    already-rendered strings so it stays headless and testable (no live CAD doc, no
-    import of services/agent/advisor/). Empty slots are omitted; the ordering of
-    present slots is invariant.
+    The advisory block and describer/stage-state renders are produced by the
+    foreman (T-W5) and the describer tools respectively — this assembler takes
+    them as already-rendered strings so it stays headless and testable (no live
+    CAD doc, no import of services/agent/advisor/). Empty slots are omitted; the
+    ordering of present slots is invariant.
+
+    *capability* (WI-16): letter or CapabilityProfile selecting the SOFT
+    phrasing block appended to the role system prompt. Default None → C
+    (minimal HARD-floor mirror only).
     """
+    system = system_prompt_for_capability(card, capability)
     slots = [
-        card.system_prompt.rstrip(),
+        system.rstrip(),
         ledger_render.strip(),
         stage_state.strip(),
         advisory_block.strip(),

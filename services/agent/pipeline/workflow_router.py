@@ -267,7 +267,8 @@ class RouterResult:
 # ---------------------------------------------------------------------------
 
 def route(request: str, tier: str, *,
-          tuning: dict[str, Any] | None = None) -> RouterResult:
+          tuning: dict[str, Any] | None = None,
+          capability=None) -> RouterResult:
     """Classify *request* and return the scaffold level for *tier*.
 
     This is the auto-mode entry point.  It is:
@@ -279,12 +280,31 @@ def route(request: str, tier: str, *,
         request: the verbatim user request string.
         tier: the active tier name (e.g. ``"local-24k"``, ``"frontier-200k"``).
         tuning: optional injected tuning dict (tests); None → load from disk.
+        capability: optional CapabilityProfile — when workflow=supervised (A),
+            force MAXIMUM scaffold; autopilot (C) keeps eco/tier default.
 
     Returns:
         RouterResult with task_class, scaffold_level, tier, and reason.
     """
     cls = classify_task(request)
     level, reason = best_scaffold_for_class(cls, tier, tuning=tuning)
+    # WI-9: capability workflow dial overlays scaffold choice (SOFT).
+    # Only when an explicit CapabilityProfile is passed — never re-resolve from
+    # tier alone (would force MAXIMUM on every local-tier route call and break
+    # measured tuning defaults).
+    if capability is not None:
+        try:
+            wf = str(getattr(capability, "workflow", "") or "")
+            if wf == "supervised":
+                level = ScaffoldLevel.MAXIMUM
+                reason = f"capability A supervised → MAXIMUM ({reason})"
+            elif wf == "autopilot_verify":
+                if level == ScaffoldLevel.ECO:
+                    level = ScaffoldLevel.STANDARD
+                    reason = f"capability B autopilot_verify → STANDARD ({reason})"
+            # wf == "autopilot" (C): never invent new approve gates.
+        except Exception:  # noqa: BLE001
+            pass
     return RouterResult(
         task_class=cls,
         scaffold_level=level,

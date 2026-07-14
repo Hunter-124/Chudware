@@ -1,14 +1,18 @@
 // Shared Model Leaderboard UI (aicad.leaderboard/1) — Settings compact table + AI workspace pane.
 // Header-only so settings_modal.cpp and ai/ai_workspace.cpp share one parser + draw helpers.
+// Additive extension (2026-07-14): divisions, calibration, new axes, instrumentation_summary.
+// All new keys are optional; missing keys keep the previous rendering for old-format files.
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -22,11 +26,40 @@
 namespace ui {
 namespace leaderboard {
 
+// Optional float: present=false means JSON null / absent ("— untested", NEVER scored as 0).
+struct OptFloat {
+    float value = 0.f;
+    bool present = false;
+};
+
 struct ChallengeRow {
     std::string challenge;
     std::string tier;
+    std::string division;  // optional: "local" | "open" | empty
     float passRate = 0.f;
     int seeds = 0;
+};
+
+// Per-division slice: pass rate + Discipline Index (DI).
+struct DivisionStats {
+    bool present = false;
+    float passRate = 0.f;
+    int cellsTotal = 0;
+    int cellsPassed = 0;
+    OptFloat disciplineIndex;  // null = untested
+};
+
+struct CalibrationStats {
+    bool present = false;
+    OptFloat localPassRate;
+    OptFloat openPassRate;
+    OptFloat bridgeDelta;
+};
+
+struct InstrumentationSummary {
+    bool present = false;
+    std::string phaseMortalityTop;   // e.g. "specify 60%"
+    std::string topMisuseFingerprint;
 };
 
 struct ModelRow {
@@ -37,15 +70,27 @@ struct ModelRow {
     float passRate = 0.f;
     int cellsTotal = 0;
     int cellsPassed = 0;
+    // Legacy axes (kept as floats; null → 0 for backward-compat bar display).
     float toolValidity = 0.f;
     float visionFix = 0.f;
     float featureId = 0.f;
     float vcHygiene = 0.f;
+    // New axes: null = untested, NEVER rendered as 0.
+    OptFloat disciplineIndex;
+    OptFloat verifyEfficacy;
+    OptFloat checkpointUtil;
+    // Also track null for legacy vision_fix so we can show untested if wanted later.
+    bool visionFixPresent = false;
     float costUsd = -1.f;   // -1 = null/local
     float latencyS = 0.f;
     int tokensMed = 0;
     std::vector<std::pair<std::string, int>> failures;
     std::vector<ChallengeRow> perChallenge;
+    // Additive extension (optional):
+    DivisionStats divLocal;
+    DivisionStats divOpen;
+    CalibrationStats calibration;
+    InstrumentationSummary instrumentation;
 };
 
 struct Board {
@@ -90,6 +135,54 @@ inline float jnumf(const nlohmann::json& o, const char* k, float def = 0.f) {
     return def;
 }
 
+// Parse an optional numeric: null/absent → present=false (untested).
+inline OptFloat joptf(const nlohmann::json& o, const char* k) {
+    OptFloat out;
+    auto it = o.find(k);
+    if (it == o.end() || it->is_null()) return out;
+    if (it->is_number()) {
+        out.value = (float)it->get<double>();
+        out.present = true;
+    }
+    return out;
+}
+
+inline DivisionStats parseDivision(const nlohmann::json& o) {
+    DivisionStats d;
+    if (!o.is_object()) return d;
+    d.present = true;
+    d.passRate = jnumf(o, "pass_rate");
+    d.cellsTotal = o.value("cells_total", 0);
+    d.cellsPassed = o.value("cells_passed", 0);
+    d.disciplineIndex = joptf(o, "discipline_index");
+    return d;
+}
+
+// Best available Discipline Index for the compact table column.
+// Prefer axes.discipline_index; else max of division DIs that are present.
+inline OptFloat bestDiscipline(const ModelRow& m) {
+    if (m.disciplineIndex.present) return m.disciplineIndex;
+    OptFloat best;
+    if (m.divLocal.disciplineIndex.present) {
+        best = m.divLocal.disciplineIndex;
+    }
+    if (m.divOpen.disciplineIndex.present) {
+        if (!best.present || m.divOpen.disciplineIndex.value > best.value)
+            best = m.divOpen.disciplineIndex;
+    }
+    return best;
+}
+
+// Division badge letter(s): L, O, L/O, or empty when no division block present.
+inline const char* divisionBadge(const ModelRow& m) {
+    if (m.divLocal.present && m.divOpen.present) return "L/O";
+    if (m.divLocal.present) return "L";
+    if (m.divOpen.present) return "O";
+    // Infer from kind when no divisions block (old format): local → L, paid → O.
+    // Spec says badge per row when present; for old files leave empty so column is quiet.
+    return "";
+}
+
 inline Board load(const std::string& pathOverride = {}) {
     Board b;
     b.path = pathOverride.empty() ? resolvePath() : pathOverride;
@@ -131,15 +224,25 @@ inline Board load(const std::string& pathOverride = {}) {
             }
             if (auto it = m.find("axes"); it != m.end() && it->is_object()) {
                 r.toolValidity = jnumf(*it, "tool_validity");
-                r.visionFix    = jnumf(*it, "vision_fix");
-                r.featureId    = jnumf(*it, "feature_id");
-                r.vcHygiene    = jnumf(*it, "vc_hygiene");
+                {
+                    auto vf = joptf(*it, "vision_fix");
+                    r.visionFixPresent = vf.present;
+                    r.visionFix = vf.present ? vf.value : 0.f;
+                }
+                r.featureId = jnumf(*it, "feature_id");
+                r.vcHygiene = jnumf(*it, "vc_hygiene");
+                // New axes: null = untested, never 0.
+                r.disciplineIndex = joptf(*it, "discipline_index");
+                r.verifyEfficacy  = joptf(*it, "verify_efficacy");
+                r.checkpointUtil  = joptf(*it, "checkpoint_util");
             }
             if (auto it = m.find("cost"); it != m.end() && it->is_object()) {
                 auto c = it->find("usd_per_task_med");
                 if (c != it->end() && c->is_number()) r.costUsd = (float)c->get<double>();
                 r.latencyS  = jnumf(*it, "latency_s_med");
-                r.tokensMed = it->value("tokens_per_task_med", 0);
+                // tokens_per_task_med may be float (median); coerce carefully.
+                auto t = it->find("tokens_per_task_med");
+                if (t != it->end() && t->is_number()) r.tokensMed = (int)std::lround(t->get<double>());
             }
             if (auto it = m.find("failure_taxonomy"); it != m.end() && it->is_object()) {
                 for (auto ft = it->begin(); ft != it->end(); ++ft) {
@@ -157,10 +260,57 @@ inline Board load(const std::string& pathOverride = {}) {
                     ChallengeRow cr;
                     cr.challenge = c.value("challenge", std::string());
                     cr.tier      = c.value("tier", std::string());
+                    cr.division  = c.value("division", std::string());
                     cr.passRate  = jnumf(c, "pass_rate");
                     cr.seeds     = c.value("seeds", 0);
                     r.perChallenge.push_back(std::move(cr));
                 }
+            }
+            // Additive: divisions.{local,open}
+            if (auto it = m.find("divisions"); it != m.end() && it->is_object()) {
+                if (auto loc = it->find("local"); loc != it->end())
+                    r.divLocal = parseDivision(*loc);
+                if (auto op = it->find("open"); op != it->end())
+                    r.divOpen = parseDivision(*op);
+            }
+            // Additive: calibration bridge
+            if (auto it = m.find("calibration"); it != m.end() && it->is_object()) {
+                r.calibration.present = true;
+                r.calibration.localPassRate = joptf(*it, "local_pass_rate");
+                r.calibration.openPassRate  = joptf(*it, "open_pass_rate");
+                r.calibration.bridgeDelta   = joptf(*it, "bridge_delta");
+            }
+            // Additive: instrumentation_summary
+            if (auto it = m.find("instrumentation_summary"); it != m.end() && it->is_object()) {
+                r.instrumentation.present = true;
+                // phase_mortality_top may be object {phase: rate} or string.
+                auto pmt = it->find("phase_mortality_top");
+                if (pmt != it->end()) {
+                    if (pmt->is_string()) {
+                        r.instrumentation.phaseMortalityTop = pmt->get<std::string>();
+                    } else if (pmt->is_object() && !pmt->empty()) {
+                        // Pick the highest-rate phase.
+                        std::string topPhase;
+                        float topRate = -1.f;
+                        for (auto pit = pmt->begin(); pit != pmt->end(); ++pit) {
+                            if (!pit->is_number()) continue;
+                            float rate = (float)pit->get<double>();
+                            if (rate > topRate) {
+                                topRate = rate;
+                                topPhase = pit.key();
+                            }
+                        }
+                        if (!topPhase.empty()) {
+                            char buf[96];
+                            std::snprintf(buf, sizeof(buf), "%s %.0f%%",
+                                          topPhase.c_str(), topRate * 100.f);
+                            r.instrumentation.phaseMortalityTop = buf;
+                        }
+                    }
+                }
+                auto tmf = it->find("top_misuse_fingerprint");
+                if (tmf != it->end() && tmf->is_string())
+                    r.instrumentation.topMisuseFingerprint = tmf->get<std::string>();
             }
             b.models.push_back(std::move(r));
         }
@@ -189,7 +339,20 @@ inline void drawPassBar(float rate, float width, float height) {
     ImGui::Dummy(ImVec2(w, h));
 }
 
+// Format OptFloat as percent or "— untested" / "—".
+// compact=true uses a short em-dash only (settings table).
+inline void formatOptPct(char* buf, size_t n, const OptFloat& v, bool compact = false) {
+    if (!v.present) {
+        if (compact) std::snprintf(buf, n, "\xe2\x80\x94");  // —
+        else std::snprintf(buf, n, "\xe2\x80\x94 untested");
+        return;
+    }
+    std::snprintf(buf, n, "%.0f%%", v.value * 100.f);
+}
+
 // Compact table for Settings > AI (summary).
+// Columns: Model | Provider | Pass rate | Discipline | Tool valid | Cost
+// Discipline shows axes/division DI or "—"; division badge L/O on the model cell when present.
 inline void drawCompactTable(const Board& b, float /*sc*/) {
     const float S = ui::uiScale;
     if (!b.error.empty()) {
@@ -218,20 +381,31 @@ inline void drawCompactTable(const Board& b, float /*sc*/) {
 
     // Stretch weights leave room for the pass-rate bar + percent so the bar is never clipped
     // when the Settings modal is at its default width. Numeric columns right-align.
-    if (ImGui::BeginTable("##lb_compact", 5,
+    if (ImGui::BeginTable("##lb_compact", 6,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_NoHostExtendX)) {
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Pass rate", ImGuiTableColumnFlags_WidthStretch, 2.2f);
-        ImGui::TableSetupColumn("Tool valid", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+        ImGui::TableSetupColumn("Pass rate", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Discipline", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+        ImGui::TableSetupColumn("Tool valid", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.8f);
         ImGui::TableHeadersRow();
         for (const auto& m : b.models) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(m.label.empty() ? m.id.c_str() : m.label.c_str());
+            // Division badge (L / O / L/O) — only when divisions block present.
+            {
+                const char* badge = divisionBadge(m);
+                if (badge[0] != '\0') {
+                    ImGui::SameLine(0, 6.0f * S);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accentDim));
+                    ImGui::TextUnformatted(badge);
+                    ImGui::PopStyleColor();
+                }
+            }
             if (b.mock) {
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -260,6 +434,19 @@ inline void drawCompactTable(const Board& b, float /*sc*/) {
             ImGui::TableNextColumn();
             {
                 char buf[32];
+                formatOptPct(buf, sizeof(buf), bestDiscipline(m), /*compact=*/true);
+                const float tw = ImGui::CalcTextSize(buf).x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                     std::max(0.0f, ImGui::GetContentRegionAvail().x - tw));
+                if (!bestDiscipline(m).present)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                ImGui::TextUnformatted(buf);
+                if (!bestDiscipline(m).present)
+                    ImGui::PopStyleColor();
+            }
+            ImGui::TableNextColumn();
+            {
+                char buf[32];
                 std::snprintf(buf, sizeof(buf), "%.0f%%", m.toolValidity * 100.f);
                 const float tw = ImGui::CalcTextSize(buf).x;
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
@@ -279,6 +466,38 @@ inline void drawCompactTable(const Board& b, float /*sc*/) {
         }
         ImGui::EndTable();
     }
+}
+
+// Draw one division sub-table row block (Local or Open).
+inline void drawDivisionBlock(const char* title, const DivisionStats& d, float S) {
+    const auto& pal = ui::palette;
+    if (!d.present) return;
+    ImGui::TextUnformatted(title);
+    ImGui::Indent(8.0f * S);
+    {
+        char pct[32];
+        std::snprintf(pct, sizeof(pct), "%.0f%%  (%d/%d)", d.passRate * 100.f,
+                      d.cellsPassed, d.cellsTotal);
+        ImGui::Text("Pass");
+        ImGui::SameLine(110.0f * S);
+        drawPassBar(d.passRate, 180.0f * S, 8.0f * S);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(pct);
+    }
+    {
+        ImGui::Text("Discipline");
+        ImGui::SameLine(110.0f * S);
+        if (d.disciplineIndex.present) {
+            drawPassBar(d.disciplineIndex.value, 180.0f * S, 8.0f * S);
+            ImGui::SameLine();
+            ImGui::Text("%.0f%%", d.disciplineIndex.value * 100.f);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted("\xe2\x80\x94 untested");
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::Unindent(8.0f * S);
 }
 
 // Full pane for the AI workspace Leaderboard view.
@@ -320,28 +539,49 @@ inline void drawFullPane(Board& b, bool& wantRefresh) {
         return;
     }
 
-    // Summary table
-    if (ImGui::BeginTable("##lb_full", 6,
+    // Summary table (+ Discipline column)
+    if (ImGui::BeginTable("##lb_full", 7,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY,
                           ImVec2(0, 140.0f * S))) {
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 0.30f);
-        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 0.14f);
-        ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthStretch, 0.20f);
-        ImGui::TableSetupColumn("Tool", ImGuiTableColumnFlags_WidthStretch, 0.10f);
-        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.12f);
-        ImGui::TableSetupColumn("Latency", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 0.26f);
+        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 0.13f);
+        ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+        ImGui::TableSetupColumn("DI", ImGuiTableColumnFlags_WidthStretch, 0.10f);
+        ImGui::TableSetupColumn("Tool", ImGuiTableColumnFlags_WidthStretch, 0.09f);
+        ImGui::TableSetupColumn("Cost", ImGuiTableColumnFlags_WidthStretch, 0.11f);
+        ImGui::TableSetupColumn("Latency", ImGuiTableColumnFlags_WidthStretch, 0.13f);
         ImGui::TableHeadersRow();
         for (const auto& m : b.models) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(m.label.c_str());
+            {
+                const char* badge = divisionBadge(m);
+                if (badge[0] != '\0') {
+                    ImGui::SameLine(0, 4.0f * S);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.accentDim));
+                    ImGui::TextUnformatted(badge);
+                    ImGui::PopStyleColor();
+                }
+            }
             ImGui::TableNextColumn();
             ImGui::Text("%s · %s", m.provider.c_str(), m.kind.c_str());
             ImGui::TableNextColumn();
             drawPassBar(m.passRate, -1.f, 8.0f * S);
             ImGui::SameLine(0, 4.0f * S);
             ImGui::Text("%.0f%%", m.passRate * 100.f);
+            ImGui::TableNextColumn();
+            {
+                char buf[32];
+                OptFloat di = bestDiscipline(m);
+                formatOptPct(buf, sizeof(buf), di, /*compact=*/true);
+                if (!di.present)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextUnformatted(buf);
+                if (!di.present)
+                    ImGui::PopStyleColor();
+            }
             ImGui::TableNextColumn();
             ImGui::Text("%.0f%%", m.toolValidity * 100.f);
             ImGui::TableNextColumn();
@@ -355,11 +595,43 @@ inline void drawFullPane(Board& b, bool& wantRefresh) {
 
     ImGui::Dummy(ImVec2(0, 8.0f * S));
 
-    // Per-model detail cards: challenge bars + axes + failure taxonomy
+    // Per-model detail cards: divisions + calibration + challenge bars + axes + failures + instr.
     for (const auto& m : b.models) {
         ImGui::PushID(m.id.c_str());
         if (ImGui::CollapsingHeader(m.label.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Indent(8.0f * S);
+
+            // Division sub-tables — only when present (hidden for old-format files).
+            if (m.divLocal.present || m.divOpen.present) {
+                ImGui::TextUnformatted("Divisions");
+                if (m.divLocal.present)
+                    drawDivisionBlock("Local division", m.divLocal, S);
+                if (m.divOpen.present)
+                    drawDivisionBlock("Open division", m.divOpen, S);
+                ImGui::Dummy(ImVec2(0, 4.0f * S));
+            }
+
+            // Calibration bridge row — only when present.
+            if (m.calibration.present) {
+                ImGui::TextUnformatted("Calibration bridge");
+                ImGui::Indent(8.0f * S);
+                char localBuf[32], openBuf[32], deltaBuf[32];
+                formatOptPct(localBuf, sizeof(localBuf), m.calibration.localPassRate, true);
+                formatOptPct(openBuf, sizeof(openBuf), m.calibration.openPassRate, true);
+                if (m.calibration.bridgeDelta.present) {
+                    // bridge_delta is a signed rate difference; show signed percentage points.
+                    std::snprintf(deltaBuf, sizeof(deltaBuf), "%+.0f pp",
+                                  m.calibration.bridgeDelta.value * 100.f);
+                } else {
+                    std::snprintf(deltaBuf, sizeof(deltaBuf), "\xe2\x80\x94");
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::Text("local %s  ·  open %s  ·  bridge %s",
+                            localBuf, openBuf, deltaBuf);
+                ImGui::PopStyleColor();
+                ImGui::Unindent(8.0f * S);
+                ImGui::Dummy(ImVec2(0, 4.0f * S));
+            }
 
             ImGui::TextUnformatted("Per-challenge pass rate");
             if (m.perChallenge.empty()) {
@@ -368,12 +640,22 @@ inline void drawFullPane(Board& b, bool& wantRefresh) {
                 ImGui::PopStyleColor();
             } else {
                 for (const auto& c : m.perChallenge) {
-                    char lbl[64];
-                    std::snprintf(lbl, sizeof(lbl), "%s  %.0f%%",
-                                  c.challenge.empty() ? "?" : c.challenge.c_str(),
-                                  c.passRate * 100.f);
+                    char lbl[80];
+                    if (!c.division.empty()) {
+                        // Compact division tag on the challenge label.
+                        const char* tag = (c.division == "local") ? "L"
+                                        : (c.division == "open")  ? "O"
+                                                                  : c.division.c_str();
+                        std::snprintf(lbl, sizeof(lbl), "%s[%s]  %.0f%%",
+                                      c.challenge.empty() ? "?" : c.challenge.c_str(),
+                                      tag, c.passRate * 100.f);
+                    } else {
+                        std::snprintf(lbl, sizeof(lbl), "%s  %.0f%%",
+                                      c.challenge.empty() ? "?" : c.challenge.c_str(),
+                                      c.passRate * 100.f);
+                    }
                     ImGui::TextUnformatted(lbl);
-                    ImGui::SameLine(90.0f * S);
+                    ImGui::SameLine(110.0f * S);
                     drawPassBar(c.passRate, 180.0f * S, 8.0f * S);
                 }
             }
@@ -382,15 +664,39 @@ inline void drawFullPane(Board& b, bool& wantRefresh) {
             ImGui::TextUnformatted("Diagnostic axes");
             auto axis = [&](const char* name, float v) {
                 ImGui::Text("%s", name);
-                ImGui::SameLine(110.0f * S);
+                ImGui::SameLine(140.0f * S);
                 drawPassBar(v, 180.0f * S, 8.0f * S);
                 ImGui::SameLine();
                 ImGui::Text("%.0f%%", v * 100.f);
             };
+            auto axisOpt = [&](const char* name, const OptFloat& v) {
+                ImGui::Text("%s", name);
+                ImGui::SameLine(140.0f * S);
+                if (v.present) {
+                    drawPassBar(v.value, 180.0f * S, 8.0f * S);
+                    ImGui::SameLine();
+                    ImGui::Text("%.0f%%", v.value * 100.f);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                    ImGui::TextUnformatted("\xe2\x80\x94 untested");
+                    ImGui::PopStyleColor();
+                }
+            };
             axis("tool_validity", m.toolValidity);
-            axis("vision_fix",    m.visionFix);
-            axis("feature_id",    m.featureId);
-            axis("vc_hygiene",    m.vcHygiene);
+            if (m.visionFixPresent) axis("vision_fix", m.visionFix);
+            else {
+                ImGui::Text("vision_fix");
+                ImGui::SameLine(140.0f * S);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextUnformatted("\xe2\x80\x94 untested");
+                ImGui::PopStyleColor();
+            }
+            axis("feature_id", m.featureId);
+            axis("vc_hygiene", m.vcHygiene);
+            // New axes — null renders as "— untested", NEVER 0.
+            axisOpt("discipline_index", m.disciplineIndex);
+            axisOpt("verify_efficacy", m.verifyEfficacy);
+            axisOpt("checkpoint_util", m.checkpointUtil);
 
             ImGui::Dummy(ImVec2(0, 4.0f * S));
             ImGui::TextUnformatted("Failure taxonomy");
@@ -401,6 +707,20 @@ inline void drawFullPane(Board& b, bool& wantRefresh) {
             } else {
                 for (const auto& f : m.failures)
                     ImGui::BulletText("%s  ·  %d", f.first.c_str(), f.second);
+            }
+
+            // Instrumentation summary — small dim text, only when present.
+            if (m.instrumentation.present) {
+                ImGui::Dummy(ImVec2(0, 4.0f * S));
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::TextUnformatted("Instrumentation");
+                if (!m.instrumentation.phaseMortalityTop.empty())
+                    ImGui::Text("  top phase mortality: %s",
+                                m.instrumentation.phaseMortalityTop.c_str());
+                if (!m.instrumentation.topMisuseFingerprint.empty())
+                    ImGui::Text("  top misuse: %s",
+                                m.instrumentation.topMisuseFingerprint.c_str());
+                ImGui::PopStyleColor();
             }
 
             ImGui::Unindent(8.0f * S);

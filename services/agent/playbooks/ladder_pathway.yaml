@@ -2,6 +2,13 @@
 schema: aicad.playbook/1
 id: ladder_pathway
 stage: layout
+# WI-3 capability plan-template slots (structural; enforcement in scaffolds.py):
+# A rigid_template requires dimensions+datums+build_order+risks on plan handoff.
+# B structured_fields requires datums+build_order+risks.
+# C freeform: no template injection.
+capability_plan_slots:
+  rigid: [name, parts, dimensions, datums, build_order, risks]
+  structured: [datums, build_order, risks]
 steps:
   - id: orientation
     goal: Choose the build orientation and base feature - the decision everything else hangs on.

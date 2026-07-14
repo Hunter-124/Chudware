@@ -147,6 +147,13 @@ def grade_tool_validity(reply: str, task: dict[str, Any]) -> dict[str, Any]:
 
 def run_tool_validity(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     """Run all tool_validity tasks against *provider*. Returns axis result dict."""
+    from .transport import (
+        TransportExhausted,
+        complete_with_retry,
+        finalize_axis_result,
+        transport_error_task,
+    )
+
     system = (
         "You are an AI-CAD role agent. Allowed tools: "
         + ", ".join(_ALLOWED)
@@ -158,12 +165,20 @@ def run_tool_validity(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     _ = seed
     for task in TOOL_VALIDITY_TASKS:
         try:
-            reply = provider.complete(
+            reply, meta = complete_with_retry(
+                provider,
                 system,
                 [{"role": "user", "content": [{"type": "text", "text": task["prompt"]}]}],
                 max_tokens=512,
             )
-        except Exception as exc:  # noqa: BLE001 — honest provider failure
+        except TransportExhausted as exc:
+            results.append(transport_error_task(
+                task["id"],
+                exc,
+                extra={"parseable": False, "schema_valid": False},
+            ))
+            continue
+        except Exception as exc:  # noqa: BLE001 — non-transport provider failure
             results.append({
                 "id": task["id"],
                 "passed": False,
@@ -171,24 +186,19 @@ def run_tool_validity(provider: Any, *, seed: int = 1) -> dict[str, Any]:
                 "schema_valid": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "reply": "",
+                "error": False,
             })
             continue
         graded = grade_tool_validity(str(reply or ""), task)
         graded["id"] = task["id"]
         graded["reply"] = str(reply or "")[:500]
+        graded["attempts"] = meta.get("attempts", 1)
         results.append(graded)
 
-    n = len(results)
-    n_pass = sum(1 for r in results if r["passed"])
-    n_parseable = sum(1 for r in results if r.get("parseable"))
-    n_schema = sum(1 for r in results if r.get("schema_valid"))
-    return {
-        "axis": "tool_validity",
-        "score": round(n_pass / n, 4) if n else 0.0,
-        "n_tasks": n,
-        "n_passed": n_pass,
-        "n_parseable": n_parseable,
-        "n_schema_valid": n_schema,
-        "tasks": results,
-        "skipped": False,
-    }
+    n_parseable = sum(1 for r in results if r.get("parseable") and not r.get("error"))
+    n_schema = sum(1 for r in results if r.get("schema_valid") and not r.get("error"))
+    return finalize_axis_result(
+        "tool_validity",
+        results,
+        extra={"n_parseable": n_parseable, "n_schema_valid": n_schema},
+    )

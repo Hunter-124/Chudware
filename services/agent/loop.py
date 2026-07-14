@@ -564,6 +564,55 @@ def _extract_decision(reply: str) -> dict:
     return {"done": False, "notes": ""}
 
 
+def _loop_done_guardrail(decision: dict, res: Any, ledger: Any,
+                         *, is_assembly: bool = False) -> str | None:
+    """WI-11/13/14: reject loop done when HARD floors fail. ImportError-safe.
+
+    Quick-loop always mutates geometry (run_code_multi), so battery is required
+    unless waived via decision notes/waivers. Interference required for assemblies.
+    """
+    try:
+        from services.agent import guardrails as _gr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        handoff: dict = {}
+        if isinstance(decision, dict):
+            # Accept waivers nested under decision or notes JSON.
+            if isinstance(decision.get("waivers"), (list, dict)):
+                handoff["waivers"] = decision["waivers"]
+            if isinstance(decision.get("handoff"), dict):
+                handoff.update(decision["handoff"])
+            notes = decision.get("notes") or ""
+            if notes and not handoff.get("waivers"):
+                # Best-effort: notes may carry a JSON waivers blob.
+                try:
+                    import json as _json  # noqa: PLC0415
+                    maybe = _json.loads(notes) if notes.strip().startswith("{") else None
+                    if isinstance(maybe, dict) and maybe.get("waivers"):
+                        handoff["waivers"] = maybe["waivers"]
+                except Exception:  # noqa: BLE001
+                    pass
+        if is_assembly:
+            handoff["doc_kind"] = "assembly"
+        # Fabricate a synthetic mutating call so battery is required after a build.
+        calls = [{"tool": "add_features", "ok": True, "args": {}, "result": {"ok": True}}]
+        # If ledger already has battery evidence from prior tools, check_done sees it.
+        verdict = _gr.check_done(
+            handoff, ledger=ledger, calls=calls, actor="loop",
+            require_battery_if_no_mutation=True,
+            force_assembly=True if is_assembly else False,
+            # Orphan sketch: quick-loop has no doc tree; skip unless handoff supplies.
+            skip={"orphan_sketch"} if not handoff.get("doc_id") else set(),
+        )
+        if verdict.ok:
+            return None
+        return verdict.message or verdict.reason or _gr.MSG_VERIFY_BATTERY
+    except Exception:  # noqa: BLE001
+        return None
+
+
+
 def _dims(res: ModelResult) -> str:
     bb = res.bbox or {}
     size = bb.get("size")
@@ -1383,7 +1432,16 @@ def run_turn(session: Session, request: str, provider: Provider,
             # 1) The model confirms it's done — accept once it has seen a render THIS turn and
             #    is confirming the CURRENT design (not declaring done on a build it just changed
             #    and hasn't seen rendered yet; that one gets a render + a final confirm first).
+            #    HARD floors (WI-11/13/14): battery / interference / orphan-sketch before done.
             if decision["done"] and i >= 1 and not changed:
+                _done_block = _loop_done_guardrail(
+                    decision, res, _ledger, is_assembly=bool(res.is_assembly))
+                if _done_block:
+                    # Reject done: feed the guardrail message and keep iterating.
+                    session.messages.append(user([text_part(_done_block)]))
+                    prompt_text = _done_block
+                    last_built = new_code
+                    continue
                 converged = True
                 stop_reason = "confirmed"
                 # Ledger: record a decision event when the model declares done (best-effort).

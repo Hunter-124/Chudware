@@ -475,3 +475,58 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
     results += _detect_grind(events, grind_threshold)
     results += _detect_advisory_ignored(events)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Tool-misuse fingerprints (WI-11 instrumentation)
+# ---------------------------------------------------------------------------
+
+# Regex buckets for error-class tagging of failed tool_calls.
+_MISUSE_BUCKETS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("bad-arg", re.compile(r"bad.?arg|invalid.?arg|unexpected.?kw|type.?error|missing.?required|got an unexpected", re.I)),
+    ("wrong-face-ref", re.compile(r"face|edge|ref(erence)?|unknown.?feature|no such|does not exist|dangling", re.I)),
+    ("order-violation", re.compile(r"order|before|after|sequence|prerequisite|not yet|out of order", re.I)),
+    ("verify-skipped", re.compile(r"verify.?skip|battery.?required|must run verify|verify_battery", re.I)),
+    ("orphan-sketch", re.compile(r"orphan.?sketch|dangling.?sketch|unconsumed.?sketch", re.I)),
+    ("no-calc-before-dim", re.compile(r"calc.?before|fit_calc|scratchpad|no.?prior.?calc", re.I)),
+]
+
+
+def misuse_error_class(error: str | None) -> str:
+    """Map a tool error string to a misuse fingerprint bucket (or 'other')."""
+    text = str(error or "")
+    if not text:
+        return "other"
+    for name, pat in _MISUSE_BUCKETS:
+        if pat.search(text):
+            return name
+    return "other"
+
+
+def misuse_fingerprints(ledger: dict | None = None, *,
+                        events: list[dict] | None = None) -> list[dict]:
+    """Cluster (tool, error-class) from failed tool_calls for instrumentation.
+
+    Returns a list of ``{tool, error_class, count, fingerprint}`` sorted by count desc.
+    """
+    from collections import Counter
+    if events is None:
+        events = _events(ledger or {})
+    counts: Counter = Counter()
+    for _e, p in _tool_call_events(events):
+        if _call_succeeded(p):
+            continue
+        tool = str(p.get("tool") or "?")
+        err = str(p.get("error") or p.get("result") or "")
+        # Also accept explicit error_class tags from hard_guardrail / inject.
+        cls = p.get("error_class") or misuse_error_class(err)
+        counts[(tool, str(cls))] += 1
+    out = []
+    for (tool, cls), n in counts.most_common():
+        out.append({
+            "tool": tool,
+            "error_class": cls,
+            "count": n,
+            "fingerprint": f"{tool}:{cls}",
+        })
+    return out

@@ -1,4 +1,4 @@
-"""Design-gym challenge suite v1 (T-W27).
+"""Design-gym challenge suite v1 (T-W27) + two-division extension.
 
 Each challenge is a Python module exposing a module-level ``CHALLENGE`` :class:`Challenge`.
 A challenge is a deliverable-manifest fixture (contract §16) plus DETERMINISTIC
@@ -14,6 +14,13 @@ The suite (task spec):
   C6  modification on C1       — "fit a 25mm shaft"
   C7  shaft-housing assembly  — all-custom 2-part running fit + retaining groove
   C8  motor bracket + fasteners — custom parts + catalog M3 screws mated + sized
+  C9  edit-from-ref            — edit from description / screenshot
+  C10 fix-interference         — find and clear planted clash
+  C11 datasheet dims           — dimension from datasheet / calc
+  C12 undo recovery            — mid-mission checkpoint/undo recovery
+  C13 sketch repair            — under-constrained sketch fix
+  C14 interface layout         — mating-face / bolt-pattern layout
+  C15 ambiguity clarify        — blocking ambiguity / no silent invent
 
 Determinism: fixtures carry no wall-clock / random inputs; each challenge declares 3
 seeds (``seeds``) that select scripted agent-turn variants so the same seed reproduces
@@ -22,13 +29,30 @@ the same ledger byte-for-byte.
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 import re
 
 
 # A grader: (ledger_dict, run_context) -> (result: "PASS"|"FAIL", detail: str)
 ACGrader = Callable[[dict, dict], "tuple[str, str]"]
+
+# Vision-only tools stripped from LOCAL division cells (HARD filter).
+VISION_TOOLS: frozenset[str] = frozenset({
+    "render_part", "contact_sheet", "inspect_part", "look_around",
+})
+
+# Text-eye tools preferred under LOCAL.
+TEXT_EYE_TOOLS: frozenset[str] = frozenset({
+    "describe_part", "describe_sketch", "describe_scene", "describe_assembly",
+    "measure_part", "query_geometry", "sketch_health",
+})
+
+# C1–C8 text-solvable calibration subset (WI-1 / WI-2). C2 is dual-division but not
+# in the bridge subset (spec lists C1,C3,C6,C7 + C4/C5/C8 when vision-free graded).
+_DEFAULT_CALIBRATION_IDS: frozenset[str] = frozenset({
+    "C1", "C3", "C4", "C5", "C6", "C7", "C8",
+})
 
 
 @dataclass
@@ -41,7 +65,7 @@ class AcceptanceCheck:
 
 @dataclass
 class Challenge:
-    id: str                           # C1..C6
+    id: str                           # C1..C15
     name: str
     lane: str
     request: str                      # the verbatim user request run_mission receives
@@ -54,6 +78,13 @@ class Challenge:
     # a modification challenge names the base challenge whose output it edits.
     modifies: str | None = None
     notes: str = ""
+    # --- two-division fields (WI-1); defaults preserve C1–C8 dual-division behavior ---
+    divisions: tuple[str, ...] = ("local", "open")
+    calibration: bool = False
+    eyes: str = "either"              # "text" | "vision" | "either"
+    # GAP-INJECT (WI-6): runner applies each dict after N build tool_calls.
+    # Shape: {after_build_calls: int, fault: str, feature?: dict, note?: str}
+    inject_faults: list[dict] = field(default_factory=list)
 
     def grade(self, ledger: dict, ctx: dict) -> dict:
         """Run every ground-truth check → the gym's independent verdict."""
@@ -68,10 +99,24 @@ class Challenge:
         return {"challenge": self.id, "criteria": crit, "passed": passed}
 
 
-_CHALLENGE_MODULES = ("c1_flanged_bushing", "c2_clamshell_enclosure",
-                      "c3_bearing_block", "c4_two_part_hinge",
-                      "c5_bracket_cam", "c6_bushing_mod",
-                      "c7_shaft_housing_fit", "c8_motor_bracket_fasteners")
+# Pre-register C9–C15 module names; import-guarded so missing modules skip cleanly
+# until the challenge agents land them (WI-13).
+_CHALLENGE_MODULES = (
+    "c1_flanged_bushing", "c2_clamshell_enclosure",
+    "c3_bearing_block", "c4_two_part_hinge",
+    "c5_bracket_cam", "c6_bushing_mod",
+    "c7_shaft_housing_fit", "c8_motor_bracket_fasteners",
+    "c9_edit_from_ref", "c10_fix_interference", "c11_datasheet_dims",
+    "c12_undo_recovery", "c13_sketch_repair", "c14_interface_layout",
+    "c15_ambiguity_clarify",
+)
+
+
+def _apply_legacy_defaults(ch: Challenge) -> Challenge:
+    """Stamp C1–C8 calibration defaults without requiring each module to re-declare."""
+    if ch.id in _DEFAULT_CALIBRATION_IDS and not ch.calibration:
+        return replace(ch, calibration=True)
+    return ch
 
 
 def load_challenges(*, strict: bool = False) -> list[Challenge]:
@@ -88,7 +133,7 @@ def load_challenges(*, strict: bool = False) -> list[Challenge]:
             continue
         ch = getattr(mod, "CHALLENGE", None)
         if isinstance(ch, Challenge):
-            out.append(ch)
+            out.append(_apply_legacy_defaults(ch))
     return out
 
 
@@ -97,6 +142,26 @@ def load_challenge(cid: str) -> Challenge:
         if ch.id == cid:
             return ch
     raise KeyError(f"unknown challenge {cid!r}")
+
+
+def tools_for_division(division: str, tools: list[str] | None = None) -> list[str]:
+    """Filter a tool list for the division HARD surface (WI-1.4).
+
+    LOCAL never offers vision tools. OPEN is unrestricted.
+    """
+    tools = list(tools or [])
+    if division == "local":
+        return [t for t in tools if t not in VISION_TOOLS]
+    return tools
+
+
+def assert_division_eyes_allowed(challenge: Challenge, division: str) -> None:
+    """Refuse vision-eyes challenges under the LOCAL division (WI-1.3)."""
+    if division == "local" and challenge.eyes == "vision":
+        raise ValueError(
+            f"challenge {challenge.id} requires eyes='vision' and cannot run "
+            f"under division='local'"
+        )
 
 
 # ---------------------------------------------------------------------------

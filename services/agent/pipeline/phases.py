@@ -500,6 +500,10 @@ def _gate_verify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     ``criterion_results`` is ``{ac_id: "PASS"|"FAIL"}``; ``waived`` is the set of
     ac_ids the user waived via ask_user.  A FAIL that is not waived blocks VERIFY
     (routes to CORRECT via ``next_phase`` because it populates open_failure_cards).
+
+    WI-11: missing verify_battery is FAIL not silent when the mission context
+    indicates geometry was built (``geometry_built`` / ``mutating_tools_ran`` /
+    ``require_battery``) and no battery evidence/waiver is present.
     """
     results = ctx.get("criterion_results") or {}
     waived = set(ctx.get("waived_criteria") or [])
@@ -508,6 +512,19 @@ def _gate_verify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     if failing:
         return GateResult(False, "criteria_pass_or_waived",
                           [f"acceptance criteria failed and not waived: {failing}"])
+
+    # HARD floor: battery-before-done (WI-11). ImportError-safe.
+    try:
+        from services.agent import guardrails as _gr  # noqa: PLC0415
+        if _gr.battery_missing_for_mission(ctx):
+            return GateResult(
+                False, "criteria_pass_or_waived",
+                ["verify_battery missing (run battery or waive with reason) — "
+                 "HARD guardrail WI-11"],
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     return GateResult(True, "criteria_pass_or_waived")
 
 

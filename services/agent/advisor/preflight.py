@@ -320,6 +320,12 @@ def _check_refs_resolve(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
     return checks
 
 
+# Public alias for HARD ref-integrity (WI-15 / guardrails). Full preflight stays
+# advisory (freedom rule); this cheap id-set check is what the harness hard-rejects on.
+check_refs_resolve = _check_refs_resolve  # noqa: F841 — re-export
+
+
+
 def _check_params_sane(ops: list[dict], clone_id: str, cb: Any) -> list[dict]:
     """Check parameters for obvious invalidity (negative dims, fillet vs wall, hole depth vs extent)."""
     issues: list[str] = []

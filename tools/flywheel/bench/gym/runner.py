@@ -28,7 +28,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .challenges import Challenge, load_challenges
+from .challenges import (
+    Challenge, load_challenges, assert_division_eyes_allowed,
+    tools_for_division, VISION_TOOLS,
+)
 from .taxonomy import classify_ledger
 
 _HERE = Path(__file__).resolve().parent
@@ -268,6 +271,98 @@ def _actor_for(kind: str, dl_id: str) -> str:
     }.get(kind, "feature_modeler")
 
 
+
+# Tools that count as BUILD-stage mutating ops for GAP-INJECT (WI-6).
+_BUILD_MUTATING_TOOLS: frozenset[str] = frozenset({
+    "add_features", "new_part", "extrude", "revolve", "loft", "sweep",
+    "fillet", "chamfer", "shell", "hole", "pattern", "mirror",
+    "boolean", "cut", "delete_feature", "doc_apply_ops",
+})
+
+
+def _is_build_mutating_tool(tool: str) -> bool:
+    t = (tool or "").lower()
+    if t in _BUILD_MUTATING_TOOLS:
+        return True
+    # heuristic: feature-ish ops
+    for key in ("extrude", "revolve", "fillet", "pattern", "hole", "cut", "boolean"):
+        if key in t:
+            return True
+    return False
+
+
+def apply_inject_faults(ledger, challenge: Challenge) -> list[dict]:
+    """GAP-INJECT: apply ``challenge.inject_faults`` after N build tool_calls (WI-6).
+
+    Each fault dict: ``{after_build_calls: int, fault: str, feature?: dict, note?: str}``.
+    Emits ledger events so C12 graders can observe the inject without editing runner.
+    Returns the list of applied fault records.
+    """
+    faults = list(getattr(challenge, "inject_faults", None) or [])
+    if not faults:
+        return []
+
+    # Count build mutating tool_calls currently in the ledger.
+    from .taxonomy import _tool_call_events  # local import; same package
+    events = list(getattr(ledger, "events", None) or [])
+    # Ledger object may expose .events; if empty, try to_dict path.
+    if not events and hasattr(ledger, "to_dict"):
+        events = list((ledger.to_dict() or {}).get("events") or [])
+    # Prefer reading from the on-disk document via the ledger's internal list.
+    if hasattr(ledger, "events"):
+        events = list(ledger.events)
+
+    build_count = 0
+    for _e, p in _tool_call_events(events):
+        if _is_build_mutating_tool(str(p.get("tool") or "")):
+            build_count += 1
+
+    applied: list[dict] = []
+    for fault in faults:
+        after_n = int(fault.get("after_build_calls") or 0)
+        if build_count < after_n:
+            continue
+        note = fault.get("note") or f"injected fault {fault.get('fault')!r}"
+        feature = fault.get("feature") or {}
+        # Emit an injected bad feature tool_call + artifact so graders see it.
+        ledger.append("gym_inject", "tool_call", {
+            "tool": str(feature.get("op") or "add_features"),
+            "args": dict(feature) if isinstance(feature, dict) else {},
+            "ok": False,
+            "error": f"injected_fault:{fault.get('fault', 'unknown')}",
+            "injected": True,
+            "fault": fault.get("fault"),
+            "note": note,
+        })
+        ledger.append("gym_inject", "artifact", {
+            "id": f"injected_fault:{fault.get('fault', 'unknown')}",
+            "kind": "injected_fault",
+            "fault": fault.get("fault"),
+            "after_build_calls": after_n,
+            "feature": feature,
+            "note": note,
+        })
+        ledger.append("gym_inject", "decision", {
+            "id": "injected_fault",
+            "fault": fault.get("fault"),
+            "text": note,
+        })
+        applied.append(dict(fault))
+    return applied
+
+
+def default_tools_for_division(division: str) -> list[str]:
+    """Representative tools_slot list used for division HARD filtering tests."""
+    base = [
+        "new_part", "add_features", "measure_part", "query_geometry",
+        "describe_part", "describe_sketch", "describe_scene", "describe_assembly",
+        "sketch_health", "check_sketch", "verify_battery", "check_interference",
+        "plm_checkpoint", "undo", "fit_calc",
+        "render_part", "contact_sheet", "inspect_part", "look_around",
+    ]
+    return tools_for_division(division, base)
+
+
 # ---------------------------------------------------------------------------
 # One cell: challenge x tier x seed
 # ---------------------------------------------------------------------------
@@ -284,24 +379,33 @@ class CellResult:
     mission_status: str = ""
     mission_phase: str = ""
     run_dir: str = ""
+    division: str = "local"           # "local" | "open" (WI-1)
+    # tools offered after division filter (LOCAL strips vision)
+    tools_offered: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "challenge": self.challenge, "tier": self.tier, "seed": self.seed,
+            "division": self.division,
             "mode": self.mode, "passed": self.passed, "graded": self.graded,
             "classifications": [c.to_dict() for c in self.classifications],
             "mission_status": self.mission_status, "mission_phase": self.mission_phase,
             "run_dir": self.run_dir,
+            "tools_offered": list(self.tools_offered),
         }
 
 
 def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
              probe: ExecProbe, grind_threshold: int = 3,
-             runs_dir: Path | None = None, real: bool = False) -> CellResult:
-    """Run one (challenge, tier, seed) cell end to end and grade + classify it.
+             runs_dir: Path | None = None, real: bool = False,
+             division: str = "local") -> CellResult:
+    """Run one (challenge, division, tier, seed) cell end to end and grade + classify it.
 
     *runs_dir* overrides the output root (default ``reports/runs``); tests pass a tmp
     dir so the suite never writes under the committed ``reports/`` tree.
+
+    *division* is ``"local"`` or ``"open"`` (WI-1). Vision-eyes challenges refuse
+    LOCAL. LOCAL cells strip vision tools from the offered tools surface.
 
     *real* (T-W30): when True AND the probe reports a real-runnable environment,
     drive the FULL pipeline with execute_dag=True, the node_runner's real
@@ -312,10 +416,19 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     """
     from services.agent.ledger import Ledger
 
+    assert_division_eyes_allowed(challenge, division)
+    if division not in getattr(challenge, "divisions", ("local", "open")):
+        raise ValueError(
+            f"challenge {challenge.id} does not support division={division!r} "
+            f"(allowed={challenge.divisions})"
+        )
+
     real_mode = bool(real and probe.can_run_real)
-    run_id = f"gym_{challenge.id}_{tier}_s{seed}"
+    run_id = f"gym_{challenge.id}_{division}_{tier}_s{seed}"
     base = runs_dir if runs_dir is not None else (REPORTS_DIR / "runs")
-    run_dir = Path(base) / cycle / f"{challenge.id}_{tier}_s{seed}"
+    # Keep legacy dir shape when division is default-local for backward paths;
+    # include division in the folder so local/open cells do not collide.
+    run_dir = Path(base) / cycle / f"{challenge.id}_{division}_{tier}_s{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Fresh ledger for this cell (its own file under the run dir). A cell is
@@ -347,11 +460,18 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         mission = _run_mission_safe(challenge, run_id)
         replay_turns_into_ledger(ledger, challenge, seed)
 
+    # GAP-INJECT (WI-6): after scripted/real build tool_calls, apply declared faults.
+    apply_inject_faults(ledger, challenge)
+
     ledger_doc = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
+
+    # Division HARD tool surface (WI-1.4): LOCAL never offers vision tools.
+    tools_offered = default_tools_for_division(division)
 
     # Independent grading + taxonomy classification.
     ctx = {"challenge": challenge.id, "seed": seed, "tier": tier,
-           "effort": effort_profile.to_payload()}
+           "division": division, "effort": effort_profile.to_payload(),
+           "tools_offered": tools_offered}
     graded = challenge.grade(ledger_doc, ctx)
     classifications = classify_ledger(
         ledger_doc, manifest=challenge.manifest, graded=graded,
@@ -363,7 +483,9 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         passed=bool(graded["passed"]), graded=graded, classifications=classifications,
         mission_status=(mission or {}).get("status", "n/a"),
         mission_phase=(mission or {}).get("phase", "n/a"),
-        run_dir=str(run_dir))
+        run_dir=str(run_dir),
+        division=division,
+        tools_offered=tools_offered)
 
     # Persist the replayable artifacts.
     (run_dir / "graded.json").write_text(json.dumps(graded, indent=2), encoding="utf-8")
@@ -575,15 +697,35 @@ class CycleResult:
                 "cells": [c.to_dict() for c in self.cells]}
 
 
+def _default_divisions_for_tier(tier: str) -> list[str]:
+    """Map a tier string to the divisions it can schedule under.
+
+    Local tiers → LOCAL only by default; mid/frontier/openrouter/xai → OPEN
+    (and LOCAL when the challenge is in the calibration subset — handled by the
+    challenge.divisions filter + explicit --division CLI).
+    """
+    t = (tier or "").lower()
+    if t.startswith("local") or t.startswith("llamacpp"):
+        return ["local"]
+    if t.startswith("openrouter:") or t.startswith("xai:") or "frontier" in t or t == "mid":
+        return ["open"]
+    return ["local", "open"]
+
+
 def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
               challenge_ids: list[str] | None = None,
               grind_threshold: int = 3,
               runs_dir: Path | None = None,
-              real: bool = False) -> CycleResult:
-    """Run the full challenge x tier x seed matrix and return the cycle result.
+              real: bool = False,
+              divisions: list[str] | None = None) -> CycleResult:
+    """Run the full challenge x division x tier x seed matrix and return the cycle result.
 
     *runs_dir* overrides the output root (tests pass a tmp dir; the CLI leaves it None
     so the committed ``reports/runs`` tree is written for cycle-1).
+
+    *divisions* restricts which divisions to schedule (default: derive per tier —
+    local tiers → local; frontier/openrouter → open). Calibration challenges that
+    list both divisions still only run the divisions present in this list.
 
     *real* (T-W30): request REAL execution (honoured per-cell only when the probe
     reports a real-runnable environment)."""
@@ -595,10 +737,18 @@ def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
 
     result = CycleResult(cycle=cycle, tiers=tiers, probe=probe)
     for ch in challenges:
+        ch_divs = set(getattr(ch, "divisions", ("local", "open")) or ("local", "open"))
         for tier in tiers:
-            for seed in ch.seeds:
-                result.cells.append(
-                    run_cell(ch, tier, seed, cycle=cycle, probe=probe,
-                             grind_threshold=grind_threshold, runs_dir=runs_dir,
-                             real=real))
+            tier_divs = divisions if divisions is not None else _default_divisions_for_tier(tier)
+            for division in tier_divs:
+                if division not in ch_divs:
+                    continue
+                # HARD refuse: vision-eyes never under LOCAL
+                if division == "local" and getattr(ch, "eyes", "either") == "vision":
+                    continue
+                for seed in ch.seeds:
+                    result.cells.append(
+                        run_cell(ch, tier, seed, cycle=cycle, probe=probe,
+                                 grind_threshold=grind_threshold, runs_dir=runs_dir,
+                                 real=real, division=division))
     return result

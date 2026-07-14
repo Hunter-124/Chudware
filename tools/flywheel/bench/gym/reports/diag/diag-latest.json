@@ -1,6 +1,6 @@
 {
   "schema": "aicad.diag/1",
-  "generated": "2026-07-14T14:14:47Z",
+  "generated": "2026-07-14T15:17:03Z",
   "seed": 1,
   "axes": [
     "tool_validity",
@@ -9,11 +9,632 @@
     "vc_hygiene"
   ],
   "tiers": [
+    "openrouter:google/gemma-4-31b-it:free",
+    "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+    "openrouter:qwen/qwen3-coder:free",
     "local-24k-gemma3-qat",
     "local-24k"
   ],
   "mock": false,
   "results": [
+    {
+      "tier": "openrouter:google/gemma-4-31b-it:free",
+      "model": {
+        "id": "google/gemma-4-31b-it:free",
+        "label": "Gemma 4 31B It:Free",
+        "provider": "openrouter",
+        "kind": "paid",
+        "tier": "openrouter:google/gemma-4-31b-it:free"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_parseable": 0,
+          "n_schema_valid": 0,
+          "tasks": [
+            {
+              "id": "tv1_describe",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv2_measure",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv3_add_features",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv4_done_handoff",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv5_nested_args",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "vf1_missing_boss",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "vf2_good_part",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "vf3_fillet_too_large",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "vf4_cut_vs_boss",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "vf5_mirror_missing",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "fi1_bore",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi2_fillet",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi3_bolt_circle",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041440000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi4_extrude_depth",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041500000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi5_cut",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041500000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 0.4,
+          "n_tasks": 5,
+          "n_passed": 2,
+          "tasks": [
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "sequence": [
+                "checkpoint",
+                "delete_feature"
+              ],
+              "reply": "```json\n[\n  {\"tool\": \"checkpoint\", \"args\": {}},\n  {\"tool\": \"delete_feature\", \"args\": {\"feature_name\": \"Extrude_Boss\"}}\n]\n```",
+              "id": "vc1_delete_feature"
+            },
+            {
+              "id": "vc2_cut_through",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041500000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint', 'edit_feature']; checkpoint@0 before destructive@1",
+              "sequence": [
+                "checkpoint",
+                "edit_feature"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_name\": \"Extrude_Boss\", \"parameters\": {\"depth\": 50}}}\n```",
+              "id": "vc3_edit_params"
+            },
+            {
+              "id": "vc4_suppress",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Google AI Studio', 'is_byok': False}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "id": "vc5_boolean_cut",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-min. ', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '16', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1784041500000'}, 'provider_name': None}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 37.493,
+      "supports_vision": true
+    },
+    {
+      "tier": "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+      "model": {
+        "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "label": "Nemotron 3 Ultra 550B A55B:Free",
+        "provider": "openrouter",
+        "kind": "paid",
+        "tier": "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 1.0,
+          "n_tasks": 5,
+          "n_passed": 5,
+          "n_parseable": 5,
+          "n_schema_valid": 5,
+          "tasks": [
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool describe_part ok",
+              "parsed": {
+                "tool": "describe_part",
+                "args": {}
+              },
+              "id": "tv1_describe",
+              "reply": "```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool measure_part ok",
+              "parsed": {
+                "tool": "measure_part",
+                "args": {
+                  "query": "bore diameter"
+                }
+              },
+              "id": "tv2_measure",
+              "reply": "```json\n{\"tool\": \"measure_part\", \"args\": {\"query\": \"bore diameter\"}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool add_features ok",
+              "parsed": {
+                "tool": "add_features",
+                "args": {
+                  "ops": [
+                    {
+                      "op": "extrude",
+                      "depth": 20
+                    }
+                  ]
+                }
+              },
+              "id": "tv3_add_features",
+              "reply": "```json\n{\"tool\": \"add_features\", \"args\": {\"ops\": [{\"op\": \"extrude\", \"depth\": 20}]}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "done handoff ok",
+              "parsed": {
+                "done": true,
+                "handoff": {
+                  "summary": "ok"
+                }
+              },
+              "id": "tv4_done_handoff",
+              "reply": "```json\n{\"done\": true, \"handoff\": {\"summary\": \"ok\"}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool edit_feature ok",
+              "parsed": {
+                "tool": "edit_feature",
+                "args": {
+                  "feature_id": "F2",
+                  "params": {
+                    "depth": 12.5,
+                    "draft": 2
+                  }
+                }
+              },
+              "id": "tv5_nested_args",
+              "reply": "```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_id\": \"F2\", \"params\": {\"depth\": 12.5, \"draft\": 2}}}\n```"
+            }
+          ],
+          "skipped": false
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "vf1_missing_boss",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf2_good_part",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf3_fillet_too_large",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf4_cut_vs_boss",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf5_mirror_missing",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 0.4,
+          "n_tasks": 5,
+          "n_passed": 2,
+          "tasks": [
+            {
+              "id": "fi1_bore",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "fi2_fillet",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "passed": true,
+              "detail": "reply='BoltCircle_4xM6' expected_any=['bolt_circle', 'boltcircle', 'boltcircle_4xm6', 'boltcircle_4xm6 (pcd 48, currently 4 holes)']",
+              "reply": "BoltCircle_4xM6",
+              "id": "fi3_bolt_circle"
+            },
+            {
+              "passed": true,
+              "detail": "reply='Extrude_Boss' expected_any=['extrude', 'extrude_boss', 'extrude_boss (depth 15 mm \u2014 should be 25)']",
+              "reply": "Extrude_Boss",
+              "id": "fi4_extrude_depth"
+            },
+            {
+              "id": "fi5_cut",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 1.0,
+          "n_tasks": 5,
+          "n_passed": 5,
+          "tasks": [
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "sequence": [
+                "checkpoint",
+                "delete_feature"
+              ],
+              "reply": "[\n  {\"tool\": \"checkpoint\", \"args\": {}},\n  {\"tool\": \"delete_feature\", \"args\": {\"feature_name\": \"Extrude_Boss\"}}\n]",
+              "id": "vc1_delete_feature"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
+              "id": "vc2_cut_through"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint', 'edit_feature']; checkpoint@0 before destructive@1",
+              "sequence": [
+                "checkpoint",
+                "edit_feature"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"label\": \"Before changing Extrude_Boss depth\"}}\n```\n```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_id\": \"Extrude_Boss\", \"parameters\": {\"depth\": 50}}}\n```",
+              "id": "vc3_edit_params"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint', 'suppress_feature', 'suppress_feature']; checkpoint@0 before destructive@1",
+              "sequence": [
+                "checkpoint",
+                "suppress_feature",
+                "suppress_feature"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"label\": \"before_suppress_fillet_rim_and_shell_1\"}}\n```\n```json\n{\"tool\": \"suppress_feature\", \"args\": {\"name\": \"Fillet_Rim\"}}\n```\n```json\n{\"tool\": \"suppress_feature\", \"args\": {\"name\": \"Shell_1\"}}\n```",
+              "id": "vc4_suppress"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"label\": \"Before boolean cut tool from stock\"}}\n```",
+              "id": "vc5_boolean_cut"
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 42.443,
+      "supports_vision": true
+    },
+    {
+      "tier": "openrouter:qwen/qwen3-coder:free",
+      "model": {
+        "id": "qwen/qwen3-coder:free",
+        "label": "Qwen3 Coder:Free",
+        "provider": "openrouter",
+        "kind": "paid",
+        "tier": "openrouter:qwen/qwen3-coder:free"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_parseable": 0,
+          "n_schema_valid": 0,
+          "tasks": [
+            {
+              "id": "tv1_describe",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 29, 'retry_after_seconds_raw': 28.823, 'headers': {'Retry-After': '29'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv2_measure",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.25, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv3_add_features",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.499, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv4_done_handoff",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 29, 'retry_after_seconds_raw': 28.937, 'headers': {'Retry-After': '29'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "tv5_nested_args",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.375, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "vf1_missing_boss",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf2_good_part",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf3_fillet_too_large",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf4_cut_vs_boss",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "vf5_mirror_missing",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "fi1_bore",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "fi2_fillet",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            },
+            {
+              "id": "fi3_bolt_circle",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.437, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi4_extrude_depth",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 29, 'retry_after_seconds_raw': 28.803, 'headers': {'Retry-After': '29'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "reply": ""
+            },
+            {
+              "id": "fi5_cut",
+              "passed": false,
+              "detail": "provider error: NotFoundError: Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [
+            {
+              "id": "vc1_delete_feature",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 29, 'retry_after_seconds_raw': 28.909, 'headers': {'Retry-After': '29'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "id": "vc2_cut_through",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.366, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "id": "vc3_edit_params",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.563, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "id": "vc4_suppress",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 30, 'retry_after_seconds_raw': 29.036, 'headers': {'Retry-After': '30'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            },
+            {
+              "id": "vc5_boolean_cut",
+              "passed": false,
+              "detail": "provider error: RateLimitError: Error code: 429 - {'error': {'message': 'Provider returned error', 'code': 429, 'metadata': {'raw': 'qwen/qwen3-coder:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations', 'provider_name': 'Venice', 'is_byok': False, 'retry_after_seconds': 29, 'retry_after_seconds_raw': 28.789, 'headers': {'Retry-After': '29'}}}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+              "sequence": [],
+              "reply": ""
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 719.675,
+      "supports_vision": true
+    },
     {
       "tier": "local-24k-gemma3-qat",
       "model": {
@@ -172,7 +793,7 @@
               "sequence": [
                 "describe_part"
               ],
-              "reply": "Okay, I understand. My primary directive is to carefully execute the mission, prioritizing version control with checkpoints and avoiding destructive edits without prior inspection. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
+              "reply": "Okay, I understand. My primary directive is to meticulously proceed, always initiating a checkpoint before any potentially destructive operation. I will adhere strictly to the allowed tools and the established workflow. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
               "id": "vc1_delete_feature"
             },
             {
@@ -208,14 +829,14 @@
               "sequence": [
                 "boolean_cut"
               ],
-              "reply": "```json\n{\"tool\": \"boolean_cut\", \"args\": {\"cut_body\": true, \"cut_feature\": \"tool_body\", \"stock\": \"stock\"}}\n```",
+              "reply": "{\"tool\": \"boolean_cut\", \"args\": {\"sketch\": {\"points\": [{\"x\": 0, \"y\": 0}, {\"x\": 10, \"y\": 0}, {\"x\": 10, \"y\": 10}, {\"x\": 0, \"y\": 10}], \"cut_type\": \"through\"}, \"profile\": {\"profile_name\": \"tool_body\"}}}\n",
               "id": "vc5_boolean_cut"
             }
           ],
           "skipped": false
         }
       },
-      "elapsed_s": 5.808,
+      "elapsed_s": 5.257,
       "supports_vision": false
     },
     {
@@ -366,9 +987,9 @@
         },
         "vc_hygiene": {
           "axis": "vc_hygiene",
-          "score": 0.8,
+          "score": 0.6,
           "n_tasks": 5,
-          "n_passed": 4,
+          "n_passed": 3,
           "tasks": [
             {
               "passed": false,
@@ -376,7 +997,7 @@
               "sequence": [
                 "describe_part"
               ],
-              "reply": "Okay, I understand. My primary goal is to carefully execute the mission, utilizing the available tools responsibly and always prioritizing a checkpoint before any potentially destructive operations. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
+              "reply": "Okay, I understand. My primary directive is to execute the mission systematically and safely, prioritizing checkpointing before any potentially destructive operations. I will adhere strictly to the allowed tools and will not invent results. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
               "id": "vc1_delete_feature"
             },
             {
@@ -394,7 +1015,7 @@
               "sequence": [
                 "checkpoint"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"checkpoint_name\": \"before_extrude_depth_change\"}}\n```",
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"checkpoint_name\": \"Before Extrude Depth Change\"}}\n```",
               "id": "vc3_edit_params"
             },
             {
@@ -407,19 +1028,19 @@
               "id": "vc4_suppress"
             },
             {
-              "passed": true,
-              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "passed": false,
+              "detail": "seq=['boolean_cut']; destructive@0 without prior checkpoint (ckpt=None)",
               "sequence": [
-                "checkpoint"
+                "boolean_cut"
               ],
-              "reply": "Okay, let's begin. My goal is to boolean-cut the tool body from the stock.\n\n```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
+              "reply": "```json\n{\"tool\": \"boolean_cut\", \"args\": {\"profile\": \"tool body\", \"cut_body\": \"stock\"}}\n```",
               "id": "vc5_boolean_cut"
             }
           ],
           "skipped": false
         }
       },
-      "elapsed_s": 2.848,
+      "elapsed_s": 2.469,
       "supports_vision": false
     }
   ]

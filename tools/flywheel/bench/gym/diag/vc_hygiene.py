@@ -203,6 +203,13 @@ VC_HYGIENE_TASKS: list[dict[str, Any]] = [
 
 def run_vc_hygiene(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     """Run vc_hygiene tasks against *provider*."""
+    from .transport import (
+        TransportExhausted,
+        complete_with_retry,
+        finalize_axis_result,
+        transport_error_task,
+    )
+
     _ = seed
     system = (
         "You are an AI-CAD role agent. Before ANY destructive edit "
@@ -217,31 +224,32 @@ def run_vc_hygiene(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for task in VC_HYGIENE_TASKS:
         try:
-            reply = provider.complete(
+            reply, meta = complete_with_retry(
+                provider,
                 system,
                 [{"role": "user", "content": [{"type": "text", "text": task["prompt"]}]}],
                 max_tokens=512,
             )
-        except Exception as exc:  # noqa: BLE001
+        except TransportExhausted as exc:
+            results.append(transport_error_task(
+                task["id"],
+                exc,
+                extra={"sequence": []},
+            ))
+            continue
+        except Exception as exc:  # noqa: BLE001 — non-transport provider failure
             results.append({
                 "id": task["id"],
                 "passed": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "sequence": [],
                 "reply": "",
+                "error": False,
             })
             continue
         graded = grade_vc_hygiene(str(reply or ""), task)
         graded["id"] = task["id"]
+        graded["attempts"] = meta.get("attempts", 1)
         results.append(graded)
 
-    n = len(results)
-    n_pass = sum(1 for r in results if r["passed"])
-    return {
-        "axis": "vc_hygiene",
-        "score": round(n_pass / n, 4) if n else 0.0,
-        "n_tasks": n,
-        "n_passed": n_pass,
-        "tasks": results,
-        "skipped": False,
-    }
+    return finalize_axis_result("vc_hygiene", results)

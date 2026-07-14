@@ -156,18 +156,23 @@ def grade_vision_fix(reply: str, task: dict[str, Any]) -> dict[str, Any]:
 
 def run_vision_fix(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     """Run vision_fix tasks. Returns score null when provider lacks vision."""
+    from .transport import (
+        TransportExhausted,
+        complete_with_retry,
+        finalize_axis_result,
+        transport_error_task,
+    )
+
     _ = seed
     supports = bool(getattr(provider, "supports_vision", True))
     if not supports:
-        return {
-            "axis": "vision_fix",
-            "score": None,  # untested — NEVER a dishonest 0
-            "n_tasks": len(VISION_FIX_TASKS),
-            "n_passed": 0,
-            "tasks": [],
-            "skipped": True,
-            "skip_reason": "provider.supports_vision=False",
-        }
+        return finalize_axis_result(
+            "vision_fix",
+            [],
+            skipped=True,
+            skip_reason="provider.supports_vision=False",
+            extra={"n_tasks": len(VISION_FIX_TASKS)},
+        )
 
     system = (
         "You are an AI-CAD vision reviewer. Look at the attached render and the "
@@ -184,30 +189,27 @@ def run_vision_fix(provider: Any, *, seed: int = 1) -> dict[str, Any]:
         if img.is_file():
             parts.append(image_part(str(img)))
         try:
-            reply = provider.complete(
+            reply, meta = complete_with_retry(
+                provider,
                 system,
                 [{"role": "user", "content": parts}],
                 max_tokens=256,
             )
-        except Exception as exc:  # noqa: BLE001
+        except TransportExhausted as exc:
+            results.append(transport_error_task(task["id"], exc))
+            continue
+        except Exception as exc:  # noqa: BLE001 — non-transport provider failure
             results.append({
                 "id": task["id"],
                 "passed": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "reply": "",
+                "error": False,
             })
             continue
         graded = grade_vision_fix(str(reply or ""), task)
         graded["id"] = task["id"]
+        graded["attempts"] = meta.get("attempts", 1)
         results.append(graded)
 
-    n = len(results)
-    n_pass = sum(1 for r in results if r["passed"])
-    return {
-        "axis": "vision_fix",
-        "score": round(n_pass / n, 4) if n else 0.0,
-        "n_tasks": n,
-        "n_passed": n_pass,
-        "tasks": results,
-        "skipped": False,
-    }
+    return finalize_axis_result("vision_fix", results)

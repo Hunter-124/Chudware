@@ -84,9 +84,14 @@ def test_full_matrix_all_classes_fire(tmp_path):
     counts = rep["taxonomy"]["counts"]
     fired = {k for k, v in counts.items() if v > 0}
     assert fired == set(TAXONOMY), f"classes never fired: {set(TAXONOMY) - fired}"
-    # tool_misuse must be exactly the 4 designed cells (C1s2, C4s3, C5s3, C7s3) on 1 tier —
-    # the C6-seed3 build-tool false-positive must stay fixed.
-    assert counts["tool_misuse"] == 4, f"tool_misuse should be 4 on 1 tier, got {counts}"
+    # tool_misuse on the ORIGINAL C1-C8 suite must be exactly the 4 designed cells
+    # (C1s2, C4s3, C5s3, C7s3) on 1 tier — the C6-seed3 build-tool false-positive must
+    # stay fixed. C9-C15 add their own designed tool_misuse seeds, so scope to C1-C8.
+    legacy = {f"C{i}" for i in range(1, 9)}
+    legacy_misuse = sum(
+        1 for c in cr.cells if c.challenge in legacy
+        for x in c.classifications if x.failure_class == "tool_misuse")
+    assert legacy_misuse == 4, f"C1-C8 tool_misuse should be 4 on 1 tier, got {legacy_misuse}"
 
 
 def test_grind_dial_delta_is_real(tmp_path):

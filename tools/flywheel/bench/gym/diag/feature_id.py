@@ -113,6 +113,13 @@ def grade_feature_id(reply: str, task: dict[str, Any]) -> dict[str, Any]:
 
 def run_feature_id(provider: Any, *, seed: int = 1) -> dict[str, Any]:
     """Run feature_id tasks against *provider*."""
+    from .transport import (
+        TransportExhausted,
+        complete_with_retry,
+        finalize_axis_result,
+        transport_error_task,
+    )
+
     _ = seed
     supports_vision = bool(getattr(provider, "supports_vision", True))
     system = (
@@ -129,30 +136,27 @@ def run_feature_id(provider: Any, *, seed: int = 1) -> dict[str, Any]:
         if img_path and supports_vision and Path(img_path).is_file():
             parts.append(image_part(str(img_path)))
         try:
-            reply = provider.complete(
+            reply, meta = complete_with_retry(
+                provider,
                 system,
                 [{"role": "user", "content": parts}],
                 max_tokens=128,
             )
-        except Exception as exc:  # noqa: BLE001
+        except TransportExhausted as exc:
+            results.append(transport_error_task(task["id"], exc))
+            continue
+        except Exception as exc:  # noqa: BLE001 — non-transport provider failure
             results.append({
                 "id": task["id"],
                 "passed": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "reply": "",
+                "error": False,
             })
             continue
         graded = grade_feature_id(str(reply or ""), task)
         graded["id"] = task["id"]
+        graded["attempts"] = meta.get("attempts", 1)
         results.append(graded)
 
-    n = len(results)
-    n_pass = sum(1 for r in results if r["passed"])
-    return {
-        "axis": "feature_id",
-        "score": round(n_pass / n, 4) if n else 0.0,
-        "n_tasks": n,
-        "n_passed": n_pass,
-        "tasks": results,
-        "skipped": False,
-    }
+    return finalize_axis_result("feature_id", results)

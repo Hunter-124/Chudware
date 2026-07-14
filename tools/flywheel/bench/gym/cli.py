@@ -123,13 +123,17 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
 def cmd_run(args) -> int:
     tiers = args.tiers.split(",") if args.tiers else None
     challenge_ids = args.challenges.split(",") if args.challenges else None
+    divisions = None
+    if getattr(args, "division", None):
+        divisions = [d.strip() for d in args.division.split(",") if d.strip()]
     if args.smoke:
         tiers = ["local-24k"]
         challenge_ids = challenge_ids or ["C1"]
+        divisions = divisions or ["local"]
 
     cycle = args.cycle
     cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids,
-                   real=args.real)
+                   real=args.real, divisions=divisions)
 
     applied, deltas = ([], {})
     # The assess-adjust-rerun dials are mock-replay measurements; skip them for a
@@ -186,6 +190,9 @@ def main(argv=None) -> int:
                         "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
                         "paid: openrouter:<model-id> (OPENROUTER_API_KEY), xai:<model-id> (OAuth or XAI_API_KEY)")
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
+    r.add_argument("--division", default=None,
+                   help="comma list of divisions to schedule: local,open "
+                        "(default: derive per tier — local tiers→local, frontier→open)")
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
     r.add_argument("--real", action="store_true",
                    help="REAL execution: execute_dag=True + real agent_fn + resolved "

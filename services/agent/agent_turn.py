@@ -203,13 +203,22 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             # nothing actionable (no_code).
             _log(ledger, actor, {"event": "turn", "kind": "text", "text": reply[:400]})
             if tool_calls_made > 0:
+                bare_handoff = {"text": reply[:2000]}
+                block = _done_guardrail_block(bare_handoff, ledger, actor, calls)
+                if block is not None:
+                    messages.append({"role": "user", "content": _parts(block)})
+                    continue
                 return TurnResult(True, _DONE,
-                                  {"handoff": {"text": reply[:2000]}, "calls": calls})
+                                  {"handoff": bare_handoff, "calls": calls})
             last_reason = _NOCODE
             break
 
         if parsed.get("done"):
             handoff = parsed.get("handoff") or {}
+            block = _done_guardrail_block(handoff, ledger, actor, calls)
+            if block is not None:
+                messages.append({"role": "user", "content": _parts(block)})
+                continue
             _log(ledger, actor, {"event": "turn", "kind": "done", "handoff": handoff})
             return TurnResult(True, _DONE, {"handoff": handoff, "calls": calls})
 
@@ -234,12 +243,18 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         tool_calls_made += 1
         import time as _time  # noqa: PLC0415
         _t0 = _time.monotonic()
-        try:
-            result = dispatch(tool, args)
-            ok = True
-        except Exception as exc:  # noqa: BLE001 — dispatch error fed back to model
-            result = {"ok": False, "error": str(exc)}
+        # HARD pre-dispatch (WI-12 auto-checkpoint, WI-15 ref integrity).
+        _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
+        if _blocked is not None:
+            result = {"ok": False, "error": _blocked}
             ok = False
+        else:
+            try:
+                result = dispatch(tool, args)
+                ok = True
+            except Exception as exc:  # noqa: BLE001 — dispatch error fed back to model
+                result = {"ok": False, "error": str(exc)}
+                ok = False
         _latency_ms = (_time.monotonic() - _t0) * 1000.0
         call_rec = {"tool": tool, "args": args, "ok": ok,
                     "result": _truncate(result)}
@@ -360,6 +375,42 @@ def _truncate(result: Any, limit: int = 1000) -> Any:
     s = _as_text(result)
     return s if len(s) <= limit else s[:limit] + "…"
 
+
+
+def _done_guardrail_block(handoff: dict, ledger, actor: str,
+                          calls: list) -> str | None:
+    """WI-11/13/14 done intercept. Return model-visible block message or None."""
+    try:
+        from services.agent import guardrails as _gr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — ImportError-safe: treat as profile C no-op
+        return None
+    try:
+        verdict = _gr.check_done(
+            handoff if isinstance(handoff, dict) else {},
+            ledger=ledger, calls=calls, actor=actor or "agent_turn",
+        )
+        if verdict.ok:
+            return None
+        return verdict.message or verdict.reason or _gr.MSG_VERIFY_BATTERY
+    except Exception:  # noqa: BLE001 — never break the turn on guardrail bugs
+        return None
+
+
+def _pre_dispatch_guardrail(tool: str, args: dict, ledger, actor: str) -> str | None:
+    """WI-12/15 pre-dispatch. Return error string to feed the model, or None."""
+    try:
+        from services.agent import guardrails as _gr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        verdict = _gr.pre_dispatch(
+            tool, args or {}, ledger=ledger, actor=actor or "agent_turn",
+        )
+        if verdict is None or verdict.ok:
+            return None
+        return verdict.message or verdict.reason or "hard guardrail blocked tool"
+    except Exception:  # noqa: BLE001
+        return None
 
 def _log(ledger, actor: str, payload: dict) -> None:
     if ledger is None:

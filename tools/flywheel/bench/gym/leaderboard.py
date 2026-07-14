@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "aicad.leaderboard/1"
-TASK_SUITE = "gym-C1..C8 + diag-v1"
+TASK_SUITE = "gym-C1..C15 + diag-v1"
 
 _HERE = Path(__file__).resolve().parent
 REPORTS_DIR = _HERE / "reports"
@@ -134,13 +134,27 @@ def discover_cells(reports_dir: Path) -> list[dict[str, Any]]:
         if not isinstance(graded, dict):
             continue
         classifications = _load_json(run_dir / "classifications.json") or []
-        # Infer challenge/tier/seed from dirname: C1_local-24k_s1 or C1_openrouter:x_s1
+        # Infer challenge/division/tier/seed from dirname:
+        #   C1_local_local-24k_s1  (new, with division)
+        #   C1_local-24k_s1        (legacy, no division → default local)
+        #   C1_openrouter:x_s1
         name = run_dir.name
-        m = re.match(r"^(?P<ch>[A-Za-z0-9-]+)_(?P<tier>.+)_s(?P<seed>\d+)$", name)
+        division = "local"
+        m = re.match(
+            r"^(?P<ch>[A-Za-z0-9-]+)_(?P<div>local|open)_(?P<tier>.+)_s(?P<seed>\d+)$",
+            name,
+        )
         if m:
-            challenge, tier, seed = m.group("ch"), m.group("tier"), int(m.group("seed"))
+            challenge = m.group("ch")
+            division = m.group("div")
+            tier = m.group("tier")
+            seed = int(m.group("seed"))
         else:
-            challenge, tier, seed = graded.get("challenge", "?"), "unknown", 0
+            m = re.match(r"^(?P<ch>[A-Za-z0-9-]+)_(?P<tier>.+)_s(?P<seed>\d+)$", name)
+            if m:
+                challenge, tier, seed = m.group("ch"), m.group("tier"), int(m.group("seed"))
+            else:
+                challenge, tier, seed = graded.get("challenge", "?"), "unknown", 0
         # Cycle name = parent folder under runs/
         try:
             cycle = run_dir.relative_to(runs).parts[0]
@@ -150,6 +164,7 @@ def discover_cells(reports_dir: Path) -> list[dict[str, Any]]:
             "challenge": challenge,
             "tier": tier,
             "seed": seed,
+            "division": division,
             "cycle": cycle,
             "passed": bool(graded.get("passed")),
             "graded": graded,
@@ -246,12 +261,19 @@ def extract_cost_metrics(cells: list[dict[str, Any]]) -> dict[str, float | None]
 # ---------------------------------------------------------------------------
 
 def _axis_scores_for_model(diag: dict[str, Any] | None, model_id: str, tier: str) -> dict[str, float | None]:
-    """Pull diagnostic axis scores for a model; missing axes → null."""
+    """Pull diagnostic axis scores for a model; missing axes → null.
+
+    Transport-error honesty: an axis with ``score is None`` and an ``errors``
+    note (or ``skipped``) is untested, never a dishonest 0.
+    """
     axes = {
         "tool_validity": None,
         "vision_fix": None,
         "feature_id": None,
         "vc_hygiene": None,
+        "discipline_index": None,
+        "verify_efficacy": None,
+        "checkpoint_util": None,
     }
     if not diag:
         return axes
@@ -265,8 +287,9 @@ def _axis_scores_for_model(diag: dict[str, Any] | None, model_id: str, tier: str
                     continue
                 if not isinstance(payload, dict):
                     continue
-                if payload.get("skipped"):
-                    axes[axis] = None  # untested
+                # skipped OR score null (incl. >50% transport errors) → untested
+                if payload.get("skipped") or payload.get("score") is None:
+                    axes[axis] = None
                 else:
                     sc = payload.get("score")
                     axes[axis] = float(sc) if sc is not None else None
@@ -393,6 +416,117 @@ def aggregate(
 
         axes = _axis_scores_for_model(diag, mid, tier)
 
+        # --- additive division / discipline keys (WI-12) ---
+        def _div_stats(div: str) -> dict:
+            dcells = [c for c in mcells if (c.get("division") or "local") == div]
+            nt = len(dcells)
+            np_ = sum(1 for c in dcells if c.get("passed"))
+            di_vals = [float(c["discipline_index"])
+                       for c in dcells
+                       if c.get("discipline_index") is not None]
+            # also accept nested graded / report fields
+            if not di_vals:
+                for c in dcells:
+                    for key in ("discipline_index",):
+                        v = c.get(key)
+                        if isinstance(v, (int, float)):
+                            di_vals.append(float(v))
+            di_mean = round(sum(di_vals) / len(di_vals), 4) if di_vals else None
+            return {
+                "pass_rate": round(np_ / nt, 4) if nt else 0.0,
+                "cells_total": nt,
+                "cells_passed": np_,
+                "discipline_index": di_mean if di_mean is not None else 0.0,
+            }
+
+        divisions = {
+            "local": _div_stats("local"),
+            "open": _div_stats("open"),
+        }
+        # calibration subset: challenges marked calibration or shared dual-div cells
+        cal_local = [c for c in mcells
+                     if (c.get("division") or "local") == "local"
+                     and c.get("calibration", True)]
+        cal_open = [c for c in mcells
+                    if (c.get("division") or "local") == "open"
+                    and c.get("calibration", True)]
+        def _pr(xs):
+            return round(sum(1 for c in xs if c.get("passed")) / len(xs), 4) if xs else 0.0
+        local_pr = _pr(cal_local) if cal_local else divisions["local"]["pass_rate"]
+        open_pr = _pr(cal_open) if cal_open else divisions["open"]["pass_rate"]
+        calibration = {
+            "local_pass_rate": local_pr,
+            "open_pass_rate": open_pr,
+            "bridge_delta": round(local_pr - open_pr, 4),
+        }
+
+        # Fold report-level instrumentation if cells carry it; else null axes stay null.
+        di_all = [float(c["discipline_index"]) for c in mcells
+                  if isinstance(c.get("discipline_index"), (int, float))]
+        if di_all:
+            axes["discipline_index"] = round(sum(di_all) / len(di_all), 4)
+        # verify_efficacy / checkpoint_util from cell fields when present
+        ve_vals = [c["verify_efficacy"] for c in mcells
+                   if isinstance(c.get("verify_efficacy"), (int, float))]
+        if ve_vals:
+            axes["verify_efficacy"] = round(sum(ve_vals) / len(ve_vals), 4)
+        cu_vals = [c["checkpoint_util"] for c in mcells
+                   if isinstance(c.get("checkpoint_util"), (int, float))]
+        if cu_vals:
+            axes["checkpoint_util"] = round(sum(cu_vals) / len(cu_vals), 4)
+
+        # per_challenge gains optional division
+        per_ch_div: dict[tuple, list[bool]] = defaultdict(list)
+        for c in mcells:
+            key = (c["challenge"], c.get("division") or "local", c["tier"])
+            per_ch_div[key].append(bool(c.get("passed")))
+        per_challenge = [
+            {
+                "challenge": ch,
+                "division": div,
+                "tier": t,
+                "pass_rate": round(sum(vs) / len(vs), 4) if vs else 0.0,
+                "seeds": len(vs),
+            }
+            for (ch, div, t), vs in sorted(per_ch_div.items())
+        ]
+
+        # instrumentation_summary from cycle reports when available
+        phase_top: dict = {}
+        top_fp = None
+        for rep in cycle_reports:
+            inst = rep.get("instrumentation") or {}
+            summary = rep.get("instrumentation_summary") or inst.get("summary") or {}
+            if summary.get("phase_mortality_top"):
+                phase_top = summary["phase_mortality_top"]
+            if summary.get("top_misuse_fingerprint"):
+                top_fp = summary["top_misuse_fingerprint"]
+            # also dig rates
+            rates = (inst.get("phase_mortality") or {}).get("rates") or {}
+            if rates and not phase_top:
+                top = max(rates.items(), key=lambda kv: kv[1])
+                phase_top = {top[0]: top[1]}
+            fps = inst.get("misuse_fingerprints") or []
+            if fps and not top_fp:
+                top_fp = fps[0].get("fingerprint") if isinstance(fps[0], dict) else str(fps[0])
+            di_rep = rep.get("discipline_index") or {}
+            if axes.get("discipline_index") is None:
+                # prefer mixed mean of local/open from report
+                vals = [v for v in (di_rep.get("local"), di_rep.get("open")) if v is not None]
+                if vals:
+                    axes["discipline_index"] = round(sum(vals) / len(vals), 4)
+            ve = (inst.get("verify_efficacy") or {}).get("rate")
+            if ve is not None and axes.get("verify_efficacy") is None:
+                axes["verify_efficacy"] = ve
+            cu = (inst.get("checkpoint_util") or {}).get("overall")
+            if cu is not None and axes.get("checkpoint_util") is None:
+                axes["checkpoint_util"] = cu
+
+        instrumentation_summary = {
+            "phase_mortality_top": phase_top,
+            "top_misuse_fingerprint": top_fp,
+        }
+
         models_out.append({
             "id": meta["id"],
             "label": meta.get("label") or meta["id"],
@@ -409,6 +543,9 @@ def aggregate(
             "failure_taxonomy": dict(tax),
             "cost": cost,
             "per_challenge": per_challenge,
+            "divisions": divisions,
+            "calibration": calibration,
+            "instrumentation_summary": instrumentation_summary,
         })
 
     # Mock detection: force flag, diag.mock, or all cycle reports in mock mode.
@@ -461,7 +598,8 @@ def validate_leaderboard(doc: dict[str, Any]) -> list[str]:
             if k not in primary:
                 errs.append(f"models[{i}].primary missing {k}")
         axes = m.get("axes") or {}
-        for k in ("tool_validity", "vision_fix", "feature_id", "vc_hygiene"):
+        for k in ("tool_validity", "vision_fix", "feature_id", "vc_hygiene",
+                  "discipline_index", "verify_efficacy", "checkpoint_util"):
             if k not in axes:
                 errs.append(f"models[{i}].axes missing {k}")
         cost = m.get("cost") or {}

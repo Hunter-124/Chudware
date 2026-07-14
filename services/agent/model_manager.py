@@ -48,6 +48,7 @@ __all__ = [
     "list_models",
     "get_model_path",
     "structured_output_for",
+    "capability_profile_for",
     "model_for_role_shape",
     "ModelProvisionError",
     "_REGISTRY",
@@ -66,6 +67,10 @@ __all__ = [
 #                      deadlock; bench GBNF success 0.0) so it uses prompted-JSON
 #                      + roles.validate_handoff (bench JSON first-pass 1.00).
 #                      gemma3-4b-qat follows schema_to_gbnf grammars at 100%.
+#   capability_profile Optional "A"|"B"|"C" override (harness-tiers-spec §0.1).
+#                      When set, wins over the tier's capability_profile for
+#                      resolve_capability(tier, model_id). Default: unset →
+#                      inherit from tier (same pattern as structured_output).
 #   role_shape         "fanout"      — speed / parallel fan-out roles
 #                      (qwen3-4b: 175 tok/s single-stream, 476 tok/s @ N=8);
 #                      "gbnf_worker" — grammar-constrained worker roles
@@ -403,6 +408,24 @@ def structured_output_for(model_id: str, default: str = "gbnf") -> str:
     if entry is None:
         return default
     return str(entry.get("structured_output", default))
+
+
+def capability_profile_for(model_id: str) -> str | None:
+    """Return the optional per-model capability letter override, or ``None``.
+
+    When a registry entry sets ``capability_profile`` to ``"A"|"B"|"C"``, that
+    letter wins over the tier default in ``capability.resolve_capability``.
+    Unknown models and entries without the key return ``None`` (inherit tier).
+    Mirrors :func:`structured_output_for` but returns ``None`` (not a default)
+    so the resolver can distinguish "unset" from an explicit letter.
+    """
+    entry = _REGISTRY.get(model_id)
+    if entry is None:
+        return None
+    val = entry.get("capability_profile")
+    if val is None or val == "":
+        return None
+    return str(val)
 
 
 def model_for_role_shape(shape: str) -> str | None:

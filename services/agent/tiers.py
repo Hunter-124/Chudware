@@ -131,6 +131,9 @@ class TierProfile:
     max_tools_per_role: int
     deliberation: str           # full | standard | minimal  (§8 1.3 addendum)
     tool_schema_trim: bool
+    # Coercion level A/B/C — orthogonal to deliberation (effort). A = scaffold hard,
+    # B = soft gates, C = freedom + HARD floors only. See capability.py.
+    capability_profile: str = "C"  # A | B | C
 
     @property
     def available_tokens(self) -> int:
@@ -169,6 +172,13 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         raise TierError(f"{source} [{name}]: missing fields: {missing}")
 
     budgets = _parse_budgets(raw["budgets"], f"{source} [{name}]")
+    # capability_profile is required for shipped tiers.yaml; synthetic/test YAML
+    # may omit it and inherit the dataclass default ("C").
+    cap = raw.get("capability_profile", "C")
+    if cap not in ("A", "B", "C"):
+        raise TierError(
+            f"{source} [{name}]: capability_profile must be A|B|C, got {cap!r}"
+        )
     profile = TierProfile(
         name=name,
         context_tokens=int(raw["context_tokens"]),
@@ -180,6 +190,7 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         max_tools_per_role=int(raw["max_tools_per_role"]),
         deliberation=str(raw["deliberation"]),
         tool_schema_trim=bool(raw["tool_schema_trim"]),
+        capability_profile=str(cap),
     )
     # Enforce the §8 budget invariant.
     if not profile.budget_ok():

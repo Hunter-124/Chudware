@@ -483,3 +483,270 @@ class TestDiagRunnerAndLeaderboard:
         assert isinstance(doc["models"], list)
         # Existing cycle-1 cells should produce at least the local model.
         assert any(m["kind"] == "local" for m in doc["models"]) or doc["models"] == []
+
+
+# ---------------------------------------------------------------------------
+# Transport-error honesty (retry / exclude / null axis)
+# ---------------------------------------------------------------------------
+
+class _RateLimitError(Exception):
+    """Mimic openai.RateLimitError by name for is_transport_error."""
+
+
+# Re-bind the class name so type(exc).__name__ == "RateLimitError".
+_RateLimitError.__name__ = "RateLimitError"
+_RateLimitError.__qualname__ = "RateLimitError"
+
+
+class _FlakyThenOkProvider:
+    """Fails with 429 for the first N complete() calls, then succeeds."""
+
+    name = "mock"
+    supports_vision = True
+
+    def __init__(self, fails_before_ok: int, reply: str = "ok"):
+        self.fails_before_ok = fails_before_ok
+        self.reply = reply
+        self.calls = 0
+
+    def complete(self, system, messages, max_tokens=8000):
+        self.calls += 1
+        if self.calls <= self.fails_before_ok:
+            raise _RateLimitError(
+                "Error code: 429 - free-models-per-min rate limited; retry shortly"
+            )
+        return self.reply
+
+
+class _AlwaysRateLimitedProvider:
+    name = "mock"
+    supports_vision = True
+
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, system, messages, max_tokens=8000):
+        self.calls += 1
+        raise _RateLimitError(
+            "Error code: 429 - Provider returned error; temporarily rate-limited upstream"
+        )
+
+
+class _PartialTransportProvider:
+    """First *n_fail* tasks always 429; remaining tasks return *ok_reply*."""
+
+    name = "mock"
+    supports_vision = False  # skip vision so we only exercise text axes if needed
+
+    def __init__(self, n_fail: int, ok_reply: str):
+        self.n_fail = n_fail
+        self.ok_reply = ok_reply
+        self.task_calls = 0
+        self.total_complete_calls = 0
+
+    def complete(self, system, messages, max_tokens=8000):
+        self.total_complete_calls += 1
+        # Each task may retry; count a new task when attempt sequence resets after success
+        # or after TransportExhausted. Simpler: track by successful+exhausted task slots.
+        # We advance task index only on first attempt of each task by using a flag.
+        if not getattr(self, "_in_task", False):
+            self.task_calls += 1
+            self._in_task = True
+            self._attempts_this_task = 0
+        self._attempts_this_task += 1
+        if self.task_calls <= self.n_fail:
+            # Always fail this task (all attempts).
+            if self._attempts_this_task >= 4:
+                self._in_task = False
+            raise _RateLimitError("Error code: 429 - rate limit")
+        # Succeed on first attempt for remaining tasks.
+        self._in_task = False
+        return self.ok_reply
+
+
+class TestTransportRetryHelper:
+    def test_is_transport_error_429(self):
+        from tools.flywheel.bench.gym.diag.transport import is_transport_error
+
+        assert is_transport_error(_RateLimitError("Error code: 429 - rate limit"))
+        assert is_transport_error(TimeoutError("timed out"))
+        assert is_transport_error(ConnectionError("connection refused"))
+        # Non-transport capability error
+        class NotFoundError(Exception):
+            pass
+        assert not is_transport_error(
+            NotFoundError("Error code: 404 - No endpoints found that support image input")
+        )
+
+    def test_retry_then_succeed(self):
+        from tools.flywheel.bench.gym.diag.transport import complete_with_retry
+
+        sleeps: list[float] = []
+        prov = _FlakyThenOkProvider(fails_before_ok=2, reply="hello")
+        reply, meta = complete_with_retry(
+            prov,
+            "sys",
+            [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            max_tokens=64,
+            sleep_fn=sleeps.append,
+            rng=lambda: 0.5,  # deterministic jitter factor 1.0× base
+        )
+        assert reply == "hello"
+        assert meta["attempts"] == 3
+        assert meta["retried"] is True
+        assert prov.calls == 3
+        # Two sleeps: bases 2s then 8s (with rng=0.5 → factor 1.0)
+        assert len(sleeps) == 2
+        assert sleeps[0] == pytest.approx(2.0)
+        assert sleeps[1] == pytest.approx(8.0)
+
+    def test_exhaust_raises_transport_exhausted(self):
+        from tools.flywheel.bench.gym.diag.transport import (
+            TransportExhausted,
+            complete_with_retry,
+            MAX_TRANSPORT_ATTEMPTS,
+        )
+
+        prov = _AlwaysRateLimitedProvider()
+        with pytest.raises(TransportExhausted) as ei:
+            complete_with_retry(
+                prov,
+                "sys",
+                [{"role": "user", "content": []}],
+                sleep_fn=lambda _d: None,
+                rng=lambda: 0.0,
+            )
+        assert ei.value.attempts == MAX_TRANSPORT_ATTEMPTS
+        assert prov.calls == MAX_TRANSPORT_ATTEMPTS
+
+    def test_non_transport_propagates(self):
+        from tools.flywheel.bench.gym.diag.transport import complete_with_retry
+
+        class Boom(Exception):
+            pass
+
+        class P:
+            name = "mock"
+
+            def complete(self, *a, **k):
+                raise Boom("schema bad")
+
+        with pytest.raises(Boom):
+            complete_with_retry(P(), "s", [], sleep_fn=lambda _d: None)
+
+
+class TestTransportAxisScoring:
+    _TV_REPLIES = [
+        '```json\n{"tool": "describe_part", "args": {}}\n```',
+        '```json\n{"tool": "measure_part", "args": {"query": "bore diameter"}}\n```',
+        '```json\n{"tool": "add_features", "args": {"ops": []}}\n```',
+        '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```',
+        '```json\n{"tool": "edit_feature", "args": {"feature_id": "F2", "params": {"depth": 12.5}}}\n```',
+    ]
+
+    def test_exhaust_error_excluded_from_denominator(self):
+        """Exhausted transport tasks are error=true and out of the score denom."""
+        from tools.flywheel.bench.gym.diag.tool_validity import run_tool_validity
+
+        # Task 0 always rate-limited; tasks 1..4 return matching valid tool calls.
+        class Prov:
+            name = "mock"
+            supports_vision = True
+
+            def __init__(self):
+                self.task_idx = 0
+                self.attempts = 0
+
+            def complete(self, system, messages, max_tokens=8000):
+                if self.task_idx == 0:
+                    self.attempts += 1
+                    if self.attempts >= 4:
+                        self.task_idx = 1
+                        self.attempts = 0
+                    raise _RateLimitError("Error code: 429 - rate limited")
+                reply = TestTransportAxisScoring._TV_REPLIES[self.task_idx]
+                self.task_idx += 1
+                return reply
+
+        out = run_tool_validity(Prov(), seed=1)
+        assert out["n_errors"] == 1
+        assert out["n_scored"] == 4
+        assert out["n_passed"] == 4
+        assert out["score"] == 1.0  # 4/4 scored; errored excluded
+        assert out["errors"]["n_errors"] == 1
+        err_tasks = [t for t in out["tasks"] if t.get("error")]
+        assert len(err_tasks) == 1
+        assert err_tasks[0]["error"] is True
+        assert "transport exhausted" in err_tasks[0]["detail"]
+
+    def test_majority_errors_null_axis(self):
+        """>50% transport errors → axis score null (untested), not 0."""
+        from tools.flywheel.bench.gym.diag.tool_validity import run_tool_validity
+
+        # Tasks 0,1,2 fail completely (3/5 = 60% > 50%); 3,4 succeed.
+        class Prov:
+            name = "mock"
+            supports_vision = True
+
+            def __init__(self):
+                self.task_idx = 0
+                self.attempts = 0
+
+            def complete(self, system, messages, max_tokens=8000):
+                if self.task_idx < 3:
+                    self.attempts += 1
+                    if self.attempts >= 4:
+                        self.task_idx += 1
+                        self.attempts = 0
+                    raise _RateLimitError("Error code: 429 - rate limited")
+                reply = TestTransportAxisScoring._TV_REPLIES[self.task_idx]
+                self.task_idx += 1
+                return reply
+
+        out = run_tool_validity(Prov(), seed=1)
+        assert out["n_errors"] == 3
+        assert out["n_scored"] == 2
+        assert out["score"] is None  # untested — majority transport errors
+        assert out["errors"]["n_errors"] == 3
+        assert "axis_null_reason" in out["errors"]
+
+    def test_leaderboard_null_with_errors_is_untested(self):
+        from tools.flywheel.bench.gym.leaderboard import _axis_scores_for_model
+
+        diag = {
+            "results": [{
+                "tier": "openrouter:google/gemma-4-31b-it:free",
+                "model": {
+                    "id": "google/gemma-4-31b-it:free",
+                    "label": "Gemma",
+                    "provider": "openrouter",
+                    "kind": "paid",
+                },
+                "axes": {
+                    "tool_validity": {
+                        "axis": "tool_validity",
+                        "score": None,
+                        "n_errors": 5,
+                        "errors": {
+                            "n_errors": 5,
+                            "first_detail": "provider error (transport exhausted…)",
+                            "axis_null_reason": "5/5 tasks transport-errored (>50%)",
+                        },
+                        "skipped": False,
+                    },
+                    "vision_fix": {"score": 0.0, "skipped": False},
+                    "feature_id": {"score": None, "skipped": True},
+                    "vc_hygiene": {"score": 0.8, "skipped": False},
+                },
+            }],
+        }
+        axes = _axis_scores_for_model(
+            diag,
+            "google/gemma-4-31b-it:free",
+            "openrouter:google/gemma-4-31b-it:free",
+        )
+        # null-with-errors and skipped → untested None; never dishonest 0 from errors
+        assert axes["tool_validity"] is None
+        assert axes["feature_id"] is None
+        assert axes["vision_fix"] == 0.0  # real capability zero stays
+        assert axes["vc_hygiene"] == 0.8

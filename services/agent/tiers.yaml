@@ -63,6 +63,7 @@ profiles:
     max_tools_per_role: 14
     deliberation: full      # councils, ponders, trigger packs all on
     tool_schema_trim: true  # strip tool descriptions to first sentence
+    capability_profile: A   # local: scaffold hard; force grounding + read-back
 
   local-48k:
     # Context: 49152 tokens.
@@ -82,6 +83,7 @@ profiles:
     max_tools_per_role: 14
     deliberation: full      # same as local-24k: local tokens are free
     tool_schema_trim: true
+    capability_profile: A   # local: scaffold hard
 
   mid:
     # Context: 131072 tokens (128k). Generous — no aggressive trimming needed.
@@ -101,6 +103,7 @@ profiles:
     max_tools_per_role: 14
     deliberation: standard              # mid point: risk-gated councils
     tool_schema_trim: false
+    capability_profile: B               # budget: full tools + soft gates
 
   frontier:
     # Context: 200000 tokens (200k, e.g. Claude/GPT-4o class).
@@ -120,3 +123,4 @@ profiles:
     max_tools_per_role: 14
     deliberation: minimal               # frontier tokens cost money; councils only where risk warrants
     tool_schema_trim: false
+    capability_profile: C               # frontier: freedom; HARD floors only

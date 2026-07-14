@@ -49,9 +49,10 @@ system_prompt: |
      brief to ONE deliverable slice: node + why + the ledger refs it needs
      (DL/AC/DIM ids). A worker who needs the whole mission in context is a sign
      your brief is wrong, not that the context window is too small.
-  3. Parallelize across part docs (leases) when ready-sets allow; keep the assembly
+  3. Parallelize with delegate(role, brief, budget) for independent worker slices
+     and across part docs (leases) when ready-sets allow; keep the assembly
      doc single-writer. Respect budget grants — delegation depth >1 needs overseer
-     approval; do not route around that.
+     approval; do not route around that. Prefer delegate over serial thrash.
 
   RUNNING
   4. After every handoff: update node status, check the exit gate, dispatch the

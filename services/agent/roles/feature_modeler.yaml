@@ -18,6 +18,7 @@ tool_allowlist:
   - tool: part_place
   - tool: undo
   - tool: fit_calc
+  - tool: delegate
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1400}]
@@ -45,6 +46,9 @@ system_prompt: |
   a time. Model like a person would: revolve round things, loft blends, pattern
   repeats — never a tower of boxes approximating a shape. Capability SOFT rules
   (calc / verify cadence / templates) are appended to this prompt by the harness.
+  When independent features or sub-assemblies can be owned separately, prefer
+  delegate for parallel child work rather than serial thrash — spawn depth is
+  policy-gated.
 
   THE PER-NODE LOOP
   1. Read the node: what feature, why, which ledger dimensions drive it. Values

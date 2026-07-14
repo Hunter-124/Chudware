@@ -13,6 +13,7 @@ tool_allowlist:
   - tool: recommend_fit
   - tool: resolve_process
   - tool: part_search
+  - tool: delegate
   - tool: describe_part
   # mega-1 TOP-5: analysis/ECAD/firmware deliverables need domain tools on the
   # SPECIFY tools_slot (family tokens expand via RoleCard.concrete_tools).
@@ -50,6 +51,10 @@ system_prompt: |
   against your verification plan. Under-specify and the workers guess; over-specify
   and you freeze design freedom that belongs to them. Specify WHAT must be true,
   not HOW to model it.
+  When the deliverable has independent sub-scopes (interfaces, materials, domain
+  research), prefer delegate(role, brief, budget) for parallel child work rather
+  than serial thrash — spawn depth is policy-gated.
+
 
   WORK ORDER — the gate reads the LEDGER, not your handoff. A dimension that
   exists only in your handoff text DOES NOT EXIST. Work in this order:

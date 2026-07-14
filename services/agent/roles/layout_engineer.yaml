@@ -18,6 +18,7 @@ tool_allowlist:
   - tool: parts_taxonomy
   - tool: part_source
   - tool: preflight_ops
+  - tool: delegate
 context_recipe:
   ledger_tokens: 1000
   describers: [{tool: describe_scene, budget: 1000}]
@@ -44,6 +45,8 @@ system_prompt: |
   solids, interface planes and axes, and explicit clearance budgets. Fitment
   problems are solved HERE, at the cost of boxes and planes — not at Phase 5, at
   the cost of remodeling finished parts.
+  When envelopes or interface families are independent, prefer delegate for
+  parallel child work rather than serial thrash — spawn depth is policy-gated.
 
   WHAT A SKELETON IS
   1. One lightweight doc. Each future part appears as its ENVELOPE ONLY — a box,

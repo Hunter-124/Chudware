@@ -50,6 +50,10 @@ _LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
     "audit": "decision",
     "ruling": "decision",
     "spec": "decision",
+    # mega-3 residual: intake/organize models write kind=manifest_confirm
+    "manifest_confirm": "decision",
+    "confirm": "decision",
+    "confirmation": "decision",
     "deliverables_manifest": "artifact",
     "manifest": "artifact",
     "report": "artifact",
@@ -57,6 +61,24 @@ _LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
     "criterion": "criterion_result",
     "ac_result": "criterion_result",
     "acceptance": "criterion_result",
+}
+
+# Model-facing section aliases → canonical ledger state keys (mega-3 residual:
+# interfaces / results / notes thrash after Fixer2 all/events/manifest).
+_LEDGER_GET_SECTION_ALIASES: dict[str, str] = {
+    "interfaces": "dimensions",
+    "interface": "dimensions",
+    "fits": "dimensions",
+    "results": "artifacts",
+    "result": "artifacts",
+    "outcomes": "artifacts",
+    "notes": "stage_log",
+    "note": "stage_log",
+    "log": "stage_log",
+    "plan": "build_nodes",
+    "acceptance": "artifacts",
+    "acceptance_criteria": "artifacts",
+    "ac": "artifacts",
 }
 
 # T-DP1: kinds that require a `provenance` field on write (the "never recall a
@@ -163,6 +185,8 @@ class MissionDispatch:
                 "event_count": len(led.events),
             }
         if section:
+            # mega-3: alias model-facing section names before allow-list.
+            section = _LEDGER_GET_SECTION_ALIASES.get(section, section)
             allowed = {"brief", "requirements", "decisions", "dimensions",
                        "questions", "stage_log", "artifacts",
                        # T-DP1 design-pipeline sections (contract §4/§9)
@@ -171,7 +195,8 @@ class MissionDispatch:
                        "manifest", "events"}
             if section not in allowed:
                 return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed) + ["all"]}
+                        "allowed": sorted(allowed) + ["all"],
+                        "aliases": dict(_LEDGER_GET_SECTION_ALIASES)}
             if section == "manifest":
                 arts = led.state.get("artifacts") or []
                 manifests = [a for a in arts

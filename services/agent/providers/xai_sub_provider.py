@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 import webbrowser
@@ -54,6 +55,59 @@ DEFAULT_MODEL = "grok-4.5"
 # Access tokens are short-lived (~6h); refresh up to 1h early like hermes
 # (XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600).
 REFRESH_SKEW_MS = 60 * 60 * 1000
+
+# Concurrent chat-completion cap (mega-2 fingerprint: provider_read_timeout_storm).
+# 5-way SPECIFY fan-out + later pairs hammered xAI with parallel long reads →
+# "The read operation timed out" classified as budget death. Bound sibling
+# complete_ex calls process-wide. Override via AICAD_XAI_MAX_CONCURRENT (int ≥1).
+_DEFAULT_MAX_CONCURRENT = 2
+_DEFAULT_READ_TIMEOUT_S = 180.0
+_sem_lock = threading.Lock()
+_request_sem: threading.Semaphore | None = None
+
+
+def _max_concurrent_requests() -> int:
+    raw = (
+        os.environ.get("AICAD_XAI_MAX_CONCURRENT")
+        or os.environ.get("AI_CAD_XAI_MAX_CONCURRENT")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_MAX_CONCURRENT
+
+
+def _read_timeout_s() -> float:
+    raw = (
+        os.environ.get("AICAD_XAI_READ_TIMEOUT")
+        or os.environ.get("AI_CAD_XAI_READ_TIMEOUT")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_READ_TIMEOUT_S
+
+
+def _request_semaphore() -> threading.Semaphore:
+    """Process-wide semaphore shared by every XAISubProvider instance."""
+    global _request_sem
+    with _sem_lock:
+        if _request_sem is None:
+            _request_sem = threading.Semaphore(_max_concurrent_requests())
+        return _request_sem
+
+
+def _reset_request_semaphore_for_tests() -> None:
+    """Test hook: drop the cached semaphore so env changes take effect."""
+    global _request_sem
+    with _sem_lock:
+        _request_sem = None
 
 # Contract-shaped message for the Heavy-only OAuth API gate (issue #26847).
 TIER_DENIED_REASON = (
@@ -510,7 +564,7 @@ class XAISubProvider(Provider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=_read_timeout_s()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
@@ -540,19 +594,26 @@ class XAISubProvider(Provider):
             "messages": msgs,
             "max_tokens": max_tokens,
         }
+        # Bound concurrent sibling DL calls (mega-2 timeout storm under fan-out).
+        sem = _request_semaphore()
+        acquired = sem.acquire()
         try:
-            resp = self._post_once(body)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 401:
-                body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
-                if exc.code == 403:
-                    raise XaiTierDeniedError(body_excerpt) from exc
-                raise RuntimeError(
-                    f"POST {CHAT_COMPLETIONS_URL} returned HTTP {exc.code}: "
-                    f"{body_excerpt}"
-                ) from exc
-            self.refresh()
-            resp = self._post_once(body)
+            try:
+                resp = self._post_once(body)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
+                    if exc.code == 403:
+                        raise XaiTierDeniedError(body_excerpt) from exc
+                    raise RuntimeError(
+                        f"POST {CHAT_COMPLETIONS_URL} returned HTTP {exc.code}: "
+                        f"{body_excerpt}"
+                    ) from exc
+                self.refresh()
+                resp = self._post_once(body)
+        finally:
+            if acquired:
+                sem.release()
 
         choices = resp.get("choices") or []
         if not choices:

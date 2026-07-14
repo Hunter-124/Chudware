@@ -44,6 +44,18 @@ def register_ledger_tools(mcp) -> None:
                 "event_count": len(ledger.events),
             }
         if section:
+            # mega-3 residual: interfaces/results/notes model thrash.
+            _SECTION_ALIASES = {
+                "interfaces": "dimensions", "interface": "dimensions",
+                "fits": "dimensions",
+                "results": "artifacts", "result": "artifacts",
+                "outcomes": "artifacts",
+                "notes": "stage_log", "note": "stage_log", "log": "stage_log",
+                "plan": "build_nodes",
+                "acceptance": "artifacts", "acceptance_criteria": "artifacts",
+                "ac": "artifacts",
+            }
+            section = _SECTION_ALIASES.get(section, section)
             # Return raw state section as JSON (no token budget needed)
             state = ledger.state
             allowed = {"brief", "requirements", "decisions", "dimensions",
@@ -52,7 +64,8 @@ def register_ledger_tools(mcp) -> None:
                        "manifest", "events"}
             if section not in allowed:
                 return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed) + ["all"]}
+                        "allowed": sorted(allowed) + ["all"],
+                        "aliases": dict(_SECTION_ALIASES)}
             if section == "manifest":
                 arts = state.get("artifacts") or []
                 manifests = [a for a in arts
@@ -158,6 +171,8 @@ def register_ledger_tools(mcp) -> None:
         KIND_ALIASES = {
             "verdict": "decision", "review_verdict": "decision",
             "audit": "decision", "ruling": "decision", "spec": "decision",
+            "manifest_confirm": "decision", "confirm": "decision",
+            "confirmation": "decision",
             "deliverables_manifest": "artifact", "manifest": "artifact",
             "report": "artifact", "battery": "artifact",
             "criterion": "criterion_result", "ac_result": "criterion_result",

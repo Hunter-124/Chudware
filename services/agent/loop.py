@@ -2052,6 +2052,14 @@ _PHASE_NODE_PREFIXES: list[tuple[str, tuple[str, ...]]] = [
     ("deliver", ("n_deliver_",)),
 ]
 
+# Deterministic join nodes: when the join is done, the phase is complete even if
+# some fan-out workers failed (soft-join / partial SPECIFY). mega-2 fingerprint:
+# mission stuck at specify_incomplete while n_spec_done + BUILD/DELIVER ran.
+_PHASE_JOIN_NODES: dict[str, str] = {
+    "specify": "n_spec_done",
+    "plan": "n_plan",
+}
+
 
 def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                            emit_phase, Phase, *,
@@ -2091,18 +2099,48 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     status = "running"
     stop_reason = ""
 
+    def _downstream_progressed(phase_name: str) -> bool:
+        """True when any later phase's realising node is already done.
+
+        Soft-join / partial fan-in can advance the DAG past a phase even when
+        some of that phase's workers failed. If the DAG already ran layout/plan/
+        build/… nodes, the mission phase gate must not freeze at the earlier
+        incomplete phase (mega-2: specify_incomplete while BUILD/DELIVER done).
+        """
+        seen = False
+        for name, prefixes in _PHASE_NODE_PREFIXES:
+            if name == phase_name:
+                seen = True
+                continue
+            if not seen:
+                continue
+            for nid in _phase_nodes(prefixes):
+                if _node_status(nid) == "done":
+                    return True
+        return False
+
+    def _phase_nodes_complete(phase_name: str, prefixes: tuple[str, ...]) -> bool:
+        """Phase completes when its join is done, all workers are done, or the
+        DAG already progressed past it. Join failure alone does not block when
+        workers finished (soft-join overseer is advisory)."""
+        nodes = _phase_nodes(prefixes)
+        join = _PHASE_JOIN_NODES.get(phase_name)
+        if join and _node_status(join) == "done":
+            return True
+        workers = [n for n in nodes if n != join] if join else list(nodes)
+        # SPECIFY also historically matched n_spec_done via the n_spec_ prefix;
+        # keep workers free of the advisory join even if join map is absent.
+        if phase_name == "specify":
+            workers = [n for n in workers if n != "n_spec_done"]
+        if workers and all(_node_status(n) == "done" for n in workers):
+            return True
+        if _downstream_progressed(phase_name):
+            return True
+        return False
+
     for phase_name, prefixes in _PHASE_NODE_PREFIXES:
         phase = Phase(phase_name)
-        nodes = _phase_nodes(prefixes)
-        # SPECIFY: n_spec_done is the overseer AUDIT join (mission_template), not a
-        # hard gate. It also matches the n_spec_ prefix, so filter it out of the
-        # required set — otherwise every incomplete/failed overseer audit (budget
-        # burn, 429, missing role handoff) freezes the mission at specify_incomplete
-        # even when every n_spec_* worker already wrote dimensions. Spec exit is
-        # owned by PhaseMachine (_gate_specify); the overseer is advisory.
-        if phase is Phase.SPECIFY:
-            nodes = [n for n in nodes if n != "n_spec_done"]
-        all_done = bool(nodes) and all(_node_status(n) == "done" for n in nodes)
+        all_done = _phase_nodes_complete(phase_name, prefixes)
 
         machine.enter(phase)
         emit_phase(phase, f"Phase {phase.value}")

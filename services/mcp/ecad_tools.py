@@ -3457,6 +3457,305 @@ def register_ecad_tools(mcp) -> None:
             raise out
         return out
 
+    # ---------------------------------------------------------------- board flow (Wave 2b)
+    # Deterministic schematic->preliminary-PCB + standalone place/optimize tools.
+    # Engine lives in mcp_server.board_flow (reuses E1 place_board + E2 optimize_traces).
+
+    @mcp.tool()
+    def board_from_schematic(sch_doc_id: str = "", optimize: bool = True,
+                             doc_id: str = "") -> str:
+        """ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware),
+        autoroute, then (by default) optimize traces (arc corners / teardrops / impedance).
+
+        Takes the active schematic (or ``sch_doc_id``) and emits a placed + pre-routed board.
+        Reuses the E1 placer and E2 trace optimizer — no duplicate layout engine. Deterministic
+        for a fixed seed (default 0): re-running on an unchanged schematic yields the same
+        placement + routing.
+
+        Residual DRC violations are listed honestly in ``residual_drc`` (never hidden). Use
+        ``optimize=False`` to skip the post-route polish pass. ``doc_id`` is accepted as an
+        alias for ``sch_doc_id`` (same meaning as on other ecad tools).
+
+        Typical agent path: ecad_design / capture schematic -> ecad_simulate (gate) ->
+        board_from_schematic -> ecad_run_drc / ecad_run_dfm / ecad_run_pdn / thermal checks.
+        """
+        from mcp_server import board_flow as _bf
+
+        sch_id = sch_doc_id or doc_id or _ECAD.get("current_sch")
+        if not sch_id:
+            return _err(
+                "no active schematic for board_from_schematic",
+                hint="Build or open a schematic first (ecad_new_schematic / ecad_design), "
+                     "or pass sch_doc_id=...",
+                next_actions=["ecad_design('your circuit')",
+                              "ecad_new_schematic('mydesign')"],
+            )
+        try:
+            sch_sess = ecad_session.get_session(str(sch_id))
+            if sch_sess.kind != "sch":
+                return _err(
+                    f"doc '{sch_id}' is a {sch_sess.kind}, not a schematic",
+                    hint="Pass the doc_id of a SCHEMATIC.",
+                    next_actions=["ecad_status()"],
+                )
+        except OpError as e:
+            return _err(e.message, hint="That schematic doc_id is not open.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+
+        _autosave_all_open_ecad()
+
+        def _flow() -> dict:
+            return _bf.board_from_schematic(
+                sch_sess,
+                {"optimize": bool(optimize), "seed": 0, "pcb_name": "Board1"},
+            )
+
+        status, result = _run_with_budget(_flow)
+        if status == "timeout":
+            return _budget_timeout_err(
+                "board_from_schematic",
+                simplify="The preliminary board flow is too heavy for one call. Run steps "
+                         "separately: ecad_update_from_sch(), ecad_autoplace(), "
+                         "ecad_autoroute(pitch=0.3), ecad_optimize_traces().",
+                next_actions=[
+                    "ecad_update_from_sch()",
+                    "ecad_autoplace()",
+                    "ecad_autoroute(pitch=0.3)",
+                    "ecad_optimize_traces()",
+                ],
+            )
+        if status == "error":
+            e = result
+            if isinstance(e, OpError):
+                return _err(f"board_from_schematic failed: {e.message}",
+                            hint=e.message,
+                            next_actions=["ecad_status()"],
+                            detail=getattr(e, "detail", {}))
+            raise e
+
+        board_id = result.get("board_doc_id")
+        if board_id:
+            _ECAD["current_pcb"] = board_id
+            _ECAD["current"] = board_id
+
+        rep = result.get("report") or {}
+        residual = result.get("residual_drc") or []
+        n_err = sum(1 for v in residual if v.get("severity") == "error")
+        failed = result.get("failed_nets") or rep.get("failed_nets") or []
+        placed = int(result.get("placed") or 0)
+        routed = int(result.get("routed") or 0)
+        corners = int(rep.get("corners_rounded") or 0)
+        tears = int(rep.get("teardrops") or 0)
+        tuned = int(rep.get("nets_tuned") or 0)
+        rn_before = rep.get("ratsnest_before", 0)
+        rn_after = rep.get("ratsnest_after", 0)
+
+        residual_lines = [
+            f"[{v.get('severity', '?')}] {v.get('rule', '?')}: {v.get('message', '')}"
+            for v in residual[:8]
+        ]
+        head = (
+            f"preliminary board: {placed} footprint(s), routed={routed}, "
+            f"ratsnest {rn_before}->{rn_after}, "
+            f"opt corners={corners}/teardrops={tears}/z0={tuned}; "
+            f"DRC residual errors={n_err}."
+        )
+        if failed:
+            head += f" Unrouted nets: {', '.join(map(str, failed[:6]))}."
+
+        next_actions: list[str] = []
+        if failed:
+            next_actions.append(
+                f"ecad_autoroute(pitch=0.15)  # retry unrouted: "
+                f"{', '.join(map(str, failed[:4]))}")
+        if n_err:
+            next_actions.append(
+                f"ecad_run_drc()  # {n_err} residual DRC error(s) named in residual_drc")
+        if not optimize:
+            next_actions.append("ecad_optimize_traces()  # arc/teardrop/impedance polish")
+        next_actions.append("ecad_to_3d()  # STEP + enclosure design")
+        if not next_actions:
+            next_actions.append("ecad_export('gerber')  # board ready for fab review")
+
+        return _dumps({
+            "ok": bool(result.get("ok", True)),
+            "doc_id": board_id,
+            "board_doc_id": board_id,
+            "sch_doc_id": result.get("sch_doc_id") or sch_id,
+            "revision": result.get("revision"),
+            "placed": placed,
+            "routed": routed,
+            "routed_nets": result.get("routed_nets") or [],
+            "failed_nets": failed,
+            "residual_drc": residual,
+            "residual_drc_lines": residual_lines,
+            "drc_errors": n_err,
+            "report": {
+                "ratsnest_before": rn_before,
+                "ratsnest_after": rn_after,
+                "corners_rounded": corners,
+                "teardrops": tears,
+                "nets_tuned": tuned,
+                "drc_errors": n_err,
+                "seed": rep.get("seed", 0),
+                "steps": rep.get("steps") or [],
+            },
+            "warnings": list(result.get("warnings") or []) + residual_lines[:3],
+            "summary": head,
+            "hint": head + (" All multi-pad nets routed." if not failed else
+                            " Some nets need manual routing or more space."),
+            "next_actions": next_actions,
+        })
+
+    @mcp.tool()
+    def ecad_autoplace(doc_id: str = "") -> str:
+        """Connectivity-aware placement on the active board (E1 placer).
+
+        Seats footprints by net clusters: ICs near centre, decoupling caps next to IC power
+        pads, connectors on the edge, passives near their highest-weight neighbour. Deterministic
+        (seed=0). Run after ecad_update_from_sch (or board_from_schematic already did this).
+        """
+        from mcp_server import board_flow as _bf
+
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Autoplace needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')",
+                                      "board_from_schematic()"])
+
+        try:
+            result = _bf.autoplace_board(session, {"seed": 0})
+        except OpError as e:
+            return _err(f"ecad_autoplace failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+
+        rep = result.get("report") or {}
+        residual = result.get("residual_drc") or []
+        n_err = sum(1 for v in residual if v.get("severity") == "error")
+        moved = int(result.get("moved") or rep.get("moved") or 0)
+        n_fp = int(result.get("placed") or rep.get("n_footprints") or 0)
+        rn = rep.get("ratsnest_len_mm", 0.0)
+        head = (f"autoplace: moved {moved}/{n_fp} footprint(s); "
+                f"ratsnest_len={float(rn):.2f} mm; overlaps={rep.get('overlaps', 0)}; "
+                f"DRC residual errors={n_err}.")
+        next_actions = [
+            "ecad_autoroute()  # route the ratsnest after placement",
+            "ecad_optimize_traces()  # post-route polish",
+        ]
+        if n_err:
+            next_actions.insert(0, f"ecad_run_drc()  # {n_err} residual error(s)")
+        return _dumps({
+            "ok": True,
+            "doc_id": session.doc_id,
+            "board_doc_id": session.doc_id,
+            "revision": result.get("revision") or session.revision,
+            "placed": n_fp,
+            "moved": moved,
+            "report": {
+                "ratsnest_len_mm": rn,
+                "moved": moved,
+                "overlaps": rep.get("overlaps", 0),
+                "n_footprints": n_fp,
+                "seed": rep.get("seed", 0),
+            },
+            "residual_drc": residual,
+            "drc_errors": n_err,
+            "warnings": list(result.get("warnings") or []),
+            "summary": head,
+            "hint": head + " Next: ecad_autoroute then ecad_optimize_traces.",
+            "next_actions": next_actions,
+        })
+
+    @mcp.tool()
+    def ecad_optimize_traces(targets: Optional[Union[dict, str]] = None,
+                             doc_id: str = "") -> str:
+        """Post-route polish on the active board (E2): round ~90° corners to arcs, add
+        teardrops at pad/via junctions, and retune track widths toward impedance targets.
+
+        ``targets`` is an optional ``{net_name: z0_ohm}`` map (or a JSON object string).
+        DRC-guarded: each change that introduces a clearance error is reverted. Residual
+        violations after the pass are listed honestly. Safe to re-run (idempotent).
+        """
+        from mcp_server import board_flow as _bf
+
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Trace optimization needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')",
+                                      "board_from_schematic()"])
+
+        opt_opts: dict = {}
+        if targets is not None:
+            if isinstance(targets, str):
+                if targets.strip():
+                    try:
+                        parsed = json.loads(targets)
+                    except (TypeError, ValueError) as e:
+                        return _err(
+                            f"targets is not valid JSON: {e}",
+                            hint='Pass a dict or JSON object, e.g. \'{"CLK": 50}\'.',
+                            next_actions=["ecad_optimize_traces(targets={'CLK': 50})"],
+                        )
+                    if not isinstance(parsed, dict):
+                        return _err("targets must be a JSON object {net: z0_ohm}",
+                                    hint='e.g. \'{"CLK": 50, "USB_DP": 90}\'.')
+                    opt_opts["targets"] = parsed
+            elif isinstance(targets, dict):
+                opt_opts["targets"] = targets
+            else:
+                return _err("targets must be a dict or JSON object string",
+                            hint='e.g. targets={"CLK": 50}')
+
+        try:
+            result = _bf.optimize_board_traces(session, opt_opts)
+        except OpError as e:
+            return _err(f"ecad_optimize_traces failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+
+        residual = result.get("residual_drc") or []
+        n_err = int(result.get("drc_errors") or
+                    sum(1 for v in residual if v.get("severity") == "error"))
+        corners = int(result.get("corners_rounded") or 0)
+        tears = int(result.get("teardrops") or 0)
+        tuned = int(result.get("nets_tuned") or 0)
+        head = (f"optimize_traces: corners_rounded={corners}, teardrops={tears}, "
+                f"nets_tuned={tuned}; DRC residual errors={n_err}.")
+        residual_lines = [
+            f"[{v.get('severity', '?')}] {v.get('rule', '?')}: {v.get('message', '')}"
+            for v in residual[:6]
+        ]
+        next_actions: list[str] = []
+        if n_err:
+            next_actions.append(f"ecad_run_drc()  # {n_err} residual error(s)")
+        next_actions.append("ecad_fill_zones()  # pour copper if needed")
+        next_actions.append("ecad_to_3d()")
+        return _dumps({
+            "ok": True,
+            "doc_id": session.doc_id,
+            "board_doc_id": session.doc_id,
+            "revision": result.get("revision") or session.revision,
+            "corners_rounded": corners,
+            "teardrops": tears,
+            "nets_tuned": tuned,
+            "report": {
+                "corners_rounded": corners,
+                "teardrops": tears,
+                "nets_tuned": tuned,
+                "drc_errors": n_err,
+                "drc_ok": n_err == 0,
+            },
+            "residual_drc": residual,
+            "residual_drc_lines": residual_lines,
+            "drc_errors": n_err,
+            "warnings": list(result.get("warnings") or []) + residual_lines[:3],
+            "summary": head,
+            "hint": head + (" Traces polished." if n_err == 0 else
+                            " Residual DRC named — see residual_drc."),
+            "next_actions": next_actions,
+        })
+
     # tools registered; nothing to return.
 
 

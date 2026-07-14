@@ -6,9 +6,11 @@
 // the time-stepping loop (BE bootstrap, source breakpoints), Newton damping/limiting, and
 // probe evaluation mirror engine/sim/circuit.py + engine/sim/devices.py. The dense
 // PartialPivLU solve matches numpy's linalg.solve for the small systems these circuits
-// produce. Nonlinear devices ported: Diode (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1).
-// Mutual inductance (K) and behavioral (B) are implemented here; deck parsing and
-// subckt expansion live in sim/netlist.cpp.
+// produce. Nonlinear devices ported: Diode (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1
+// with constant Cgs/Cgd/Cds), voltage-controlled Switch (S). Mutual inductance (K) and
+// behavioral (B) are implemented here; deck parsing and subckt expansion live in
+// sim/netlist.cpp.
+
 
 #include "sim/spice.h"
 
@@ -365,8 +367,9 @@ inline double xat(const std::vector<double>& x, int i) {
 
 // True if a device kind needs Newton iteration (nonlinear DC/transient).
 bool kind_is_nonlinear(const std::string& kind) {
-    return kind == "D" || kind == "Q" || kind == "M";
+    return kind == "D" || kind == "Q" || kind == "M" || kind == "S";
 }
+
 
 // Stamp the static linear devices common to DC and transient (R, V, I, E, G); the
 // reactive devices (C, L) are stamped by the caller (DC-open/short vs companion).
@@ -570,7 +573,10 @@ void stamp_bjt_dc(const Setup& s, Mna& mna, const json& d, const std::vector<dou
     mna.I(e, -sign * ieq_e);
 }
 
-void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x) {
+// MOSFET level-1 bias + conductances (devices.py::Mosfet._bias / _stamp_conductances).
+void mosfet_bias(const Setup& s, const json& d, const std::vector<double>& x,
+                 int& dn, int& g, int& sn, double& sign, double& id_, double& gm, double& gds,
+                 double& vgs, double& vds) {
     double VTO = mp(d, s.models, "VTO", 1.0);
     double KP = mp(d, s.models, "KP", 2e-5);
     double LAMBDA = mp(d, s.models, "LAMBDA", 0.0);
@@ -579,13 +585,13 @@ void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<
     std::string typ = lower(model_str(d, s.models, "type", "nmos"));
     double beta = KP * W / L;
     const json& nodes = d["nodes"];
-    int dn = s.n(nodes[0].get<std::string>()), g = s.n(nodes[1].get<std::string>()),
-        sn = s.n(nodes[2].get<std::string>());
-    double sign = (typ == "nmos" || typ == "n") ? 1.0 : -1.0;
-    double vgs = sign * (xat(x, g) - xat(x, sn));
-    double vds = sign * (xat(x, dn) - xat(x, sn));
+    dn = s.n(nodes[0].get<std::string>());
+    g = s.n(nodes[1].get<std::string>());
+    sn = s.n(nodes[2].get<std::string>());
+    sign = (typ == "nmos" || typ == "n") ? 1.0 : -1.0;
+    vgs = sign * (xat(x, g) - xat(x, sn));
+    vds = sign * (xat(x, dn) - xat(x, sn));
     double vth = VTO;
-    double id_, gm, gds;
     if (vgs <= vth) {
         id_ = 0.0; gm = 0.0; gds = s.gmin;
     } else if (vds < (vgs - vth)) {  // triode
@@ -597,6 +603,25 @@ void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<
         gm = beta * (vgs - vth) * (1 + LAMBDA * vds);
         gds = 0.5 * beta * (vgs - vth) * (vgs - vth) * LAMBDA + s.gmin;
     }
+}
+
+// Constant Cgs/Cgd/Cds (farads) — devices.py::Mosfet._caps. Absolute CGx overrides CGSO*W.
+void mosfet_caps(const Setup& s, const json& d, double& cgs, double& cgd, double& cds) {
+    double W = mp(d, s.models, "W", 1e-4);
+    cgs = mp(d, s.models, "CGS", 0.0);
+    cgd = mp(d, s.models, "CGD", 0.0);
+    cds = mp(d, s.models, "CDS", 0.0);
+    if (cgs <= 0.0) cgs = mp(d, s.models, "CGSO", 0.0) * W;
+    if (cgd <= 0.0) cgd = mp(d, s.models, "CGDO", 0.0) * W;
+    if (cgs < 0.0) cgs = 0.0;
+    if (cgd < 0.0) cgd = 0.0;
+    if (cds < 0.0) cds = 0.0;
+}
+
+void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x) {
+    int dn, g, sn;
+    double sign, id_, gm, gds, vgs, vds;
+    mosfet_bias(s, d, x, dn, g, sn, sign, id_, gm, gds, vgs, vds);
     // gds across D-S + controlled drain current gm*Vgs (drain->source).
     mna.G(dn, dn, gds); mna.G(dn, sn, -gds);
     mna.G(sn, dn, -gds); mna.G(sn, sn, gds);
@@ -606,13 +631,70 @@ void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<
     mna.I(dn, -sign * ieq); mna.I(sn, sign * ieq);
 }
 
+// Voltage-controlled switch — devices.py::Switch (SPICE VSWITCH linear-R interpolation).
+// nodes = [n1, n2, ctrl+, ctrl-]; params ron/roff + vt/vh or von/voff.
+double switch_g_of(const Setup& s, const json& d, double vc) {
+    double ron = mp(d, s.models, "ron", mp(d, s.models, "RON", 1.0));
+    if (ron < 1e-12) ron = 1e-12;
+    double roff = mp(d, s.models, "roff", mp(d, s.models, "ROFF", 1e12));
+    if (roff < ron) roff = ron;
+    const json& dp = params_of(d);
+    std::string mname = d.value("model", std::string());
+    const json* model = nullptr;
+    if (!mname.empty() && s.models.contains(mname) && s.models[mname].is_object())
+        model = &s.models[mname];
+    auto has_key = [&](const char* k) -> bool {
+        if (dp.contains(k)) return true;
+        return model && model->contains(k);
+    };
+    double von, voff;
+    if (has_key("von") || has_key("VON") || has_key("voff") || has_key("VOFF")) {
+        von = mp(d, s.models, "von", mp(d, s.models, "VON", 1.0));
+        voff = mp(d, s.models, "voff", mp(d, s.models, "VOFF", 0.0));
+    } else {
+        double vt = mp(d, s.models, "vt", mp(d, s.models, "VT", 0.0));
+        double vh = std::abs(mp(d, s.models, "vh", mp(d, s.models, "VH", 0.0)));
+        if (vh <= 0.0) vh = 5e-4;  // 1 mV smooth edge
+        von = vt + vh;
+        voff = vt - vh;
+    }
+    double r;
+    if (von == voff) {
+        r = (vc >= von) ? ron : roff;
+    } else if (von > voff) {
+        if (vc >= von) r = ron;
+        else if (vc <= voff) r = roff;
+        else r = roff + (ron - roff) * (vc - voff) / (von - voff);
+    } else {
+        if (vc <= von) r = ron;
+        else if (vc >= voff) r = roff;
+        else r = roff + (ron - roff) * (voff - vc) / (voff - von);
+    }
+    if (r < 1e-12) r = 1e-12;
+    return 1.0 / r;
+}
+
+void stamp_switch_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x) {
+    const json& nodes = d["nodes"];
+    if (nodes.size() < 4) return;  // malformed — leave open
+    int a = s.n(nodes[0].get<std::string>());
+    int b = s.n(nodes[1].get<std::string>());
+    int cp = s.n(nodes[2].get<std::string>());
+    int cn = s.n(nodes[3].get<std::string>());
+    double vc = xat(x, cp) - xat(x, cn);
+    double g = switch_g_of(s, d, vc);
+    mna.G(a, a, g); mna.G(b, b, g); mna.G(a, b, -g); mna.G(b, a, -g);
+}
+
 void stamp_nonlinear_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x,
                         std::map<std::string, double>& last_vd) {
     const std::string kind = d.value("kind", std::string());
     if (kind == "D") stamp_diode_dc(s, mna, d, x, last_vd);
     else if (kind == "Q") stamp_bjt_dc(s, mna, d, x);
     else if (kind == "M") stamp_mosfet_dc(s, mna, d, x);
+    else if (kind == "S") stamp_switch_dc(s, mna, d, x);
 }
+
 
 // ---- behavioral source expression evaluator (B) — devices.py::_SafeExpr ----------------
 // A safe recursive-descent evaluator for the whitelisted grammar: numeric literals, parens,
@@ -1327,7 +1409,36 @@ json spice_simulate(const json& circuit, const json& study) {
                         }
                     }
                 }
+            } else if (kind == "M") {
+                // Level-1 small-signal gm/gds + constant Cgs/Cgd/Cds (devices.py::Mosfet.stamp_ac).
+                int dn, g, sn;
+                double sign, id_, gm, gds, vgs, vds;
+                mosfet_bias(s, d, x_op, dn, g, sn, sign, id_, gm, gds, vgs, vds);
+                G(dn, dn, cd(gds, 0.0)); G(dn, sn, cd(-gds, 0.0));
+                G(sn, dn, cd(-gds, 0.0)); G(sn, sn, cd(gds, 0.0));
+                G(dn, g, cd(gm, 0.0)); G(dn, sn, cd(-gm, 0.0));
+                G(sn, g, cd(-gm, 0.0)); G(sn, sn, cd(gm, 0.0));
+                double cgs = 0.0, cgd = 0.0, cds = 0.0;
+                mosfet_caps(s, d, cgs, cgd, cds);
+                auto stamp_c = [&](int a, int b, double c) {
+                    if (c <= 0.0) return;
+                    cd y(0.0, omega * c);
+                    G(a, a, y); G(b, b, y); G(a, b, -y); G(b, a, -y);
+                };
+                stamp_c(g, sn, cgs);
+                stamp_c(g, dn, cgd);
+                stamp_c(dn, sn, cds);
+            } else if (kind == "S") {
+                // Voltage-controlled switch linearized at DC op (devices.py::Switch.stamp_ac).
+                if (d["nodes"].size() >= 4) {
+                    int a = N(d, 0), b = N(d, 1), cp = N(d, 2), cn = N(d, 3);
+                    double vc = xat(x_op, cp) - xat(x_op, cn);
+                    double gsw = switch_g_of(s, d, vc);
+                    cd gg(gsw, 0.0);
+                    G(a, a, gg); G(b, b, gg); G(a, b, -gg); G(b, a, -gg);
+                }
             }
+
         }
     };
 
@@ -1837,7 +1948,30 @@ json spice_simulate(const json& circuit, const json& study) {
                                 mna.G(a0, b0, -geq); mna.G(b0, a0, -geq);
                                 mna.I(a0, ieq); mna.I(b0, -ieq);
                             }
+                        } else if (kind == "M") {
+                            // Constant Cgs/Cgd/Cds companions (devices.py::Mosfet.stamp_tran).
+                            double cgs = 0.0, cgd = 0.0, cds = 0.0;
+                            mosfet_caps(s, d, cgs, cgd, cds);
+                            if (cgs > 0.0 || cgd > 0.0 || cds > 0.0) {
+                                int dn = N_of(d, 0), g = N_of(d, 1), sn = N_of(d, 2);
+                                TranState& h = st[name];
+                                auto stamp_one = [&](const char* vk, const char* ik,
+                                                     int a, int b, double c) {
+                                    if (c <= 0.0) return;
+                                    double v_prev = h.mdidt.count(vk) ? h.mdidt[vk] : 0.0;
+                                    double i_prev = h.mdidt.count(ik) ? h.mdidt[ik] : 0.0;
+                                    double geq = trap ? 2.0 * c / dt : c / dt;
+                                    double ieq = trap ? geq * v_prev + i_prev : geq * v_prev;
+                                    mna.G(a, a, geq); mna.G(b, b, geq);
+                                    mna.G(a, b, -geq); mna.G(b, a, -geq);
+                                    mna.I(a, ieq); mna.I(b, -ieq);
+                                };
+                                stamp_one("cgs_v", "cgs_i", g, sn, cgs);
+                                stamp_one("cgd_v", "cgd_i", g, dn, cgd);
+                                stamp_one("cds_v", "cds_i", dn, sn, cds);
+                            }
                         }
+
                     } else if (kind == "B") {
                         auto it = b_expr.find(name);
                         if (it != b_expr.end())
@@ -1887,6 +2021,26 @@ json spice_simulate(const json& circuit, const json& study) {
                             double i_new = trap ? 2.0 * CJO / dt * (v - h.vcap) - h.icap
                                                 : CJO / dt * (v - h.vcap);
                             h.vcap = v; h.icap = i_new;
+                        }
+                    } else if (kind == "M") {
+                        double cgs = 0.0, cgd = 0.0, cds = 0.0;
+                        mosfet_caps(s, d, cgs, cgd, cds);
+                        if (cgs > 0.0 || cgd > 0.0 || cds > 0.0) {
+                            int dn = N_of(d, 0), g = N_of(d, 1), sn = N_of(d, 2);
+                            TranState& h = st[name];
+                            auto upd = [&](const char* vk, const char* ik, int a, int b, double c) {
+                                if (c <= 0.0) return;
+                                double v = xat(xn, a) - xat(xn, b);
+                                double v_prev = h.mdidt.count(vk) ? h.mdidt[vk] : 0.0;
+                                double i_prev = h.mdidt.count(ik) ? h.mdidt[ik] : 0.0;
+                                double i_new = trap ? 2.0 * c / dt * (v - v_prev) - i_prev
+                                                    : c / dt * (v - v_prev);
+                                h.mdidt[vk] = v;
+                                h.mdidt[ik] = i_new;
+                            };
+                            upd("cgs_v", "cgs_i", g, sn, cgs);
+                            upd("cgd_v", "cgd_i", g, dn, cgd);
+                            upd("cds_v", "cds_i", dn, sn, cds);
                         }
                     } else if (kind == "T") {
                         // Append the port (t,v,i) samples; overwrite the t=0 seed on first real

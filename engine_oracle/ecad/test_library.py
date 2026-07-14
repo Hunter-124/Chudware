@@ -395,6 +395,86 @@ def test_multiunit_symbol() -> None:
         assert not errs, f"unit {unit} validation failed: {errs}"
     _ok("OPAMP_dual unit 1 and 2 each validate")
 
+# ─── 9. pin numbers ⊆ default footprint pads ─────────────────────────────────
+
+def test_default_footprints_pin_subset_of_pads() -> None:
+    print("\n[9] _DEFAULT_FOOTPRINTS pin numbers ⊆ footprint pads")
+    from engine.ecad.library.starter import SYMBOLS, FOOTPRINTS
+    from engine.ecad.orchestrator import _DEFAULT_FOOTPRINTS
+
+    assert _DEFAULT_FOOTPRINTS, "_DEFAULT_FOOTPRINTS must be non-empty"
+    for libid, fpid in _DEFAULT_FOOTPRINTS.items():
+        assert libid in SYMBOLS, f"default map libid missing from SYMBOLS: {libid}"
+        assert fpid in FOOTPRINTS, f"default map fpid missing from FOOTPRINTS: {fpid}"
+        pin_nums = {str(p.get("number")) for p in SYMBOLS[libid].get("pins", [])}
+        pad_nums = {str(p.get("number")) for p in FOOTPRINTS[fpid].get("pads", [])}
+        missing = pin_nums - pad_nums
+        assert not missing, (
+            f"{libid} → {fpid}: pin numbers {sorted(missing)} not in pads {sorted(pad_nums)}"
+        )
+    _ok(f"{len(_DEFAULT_FOOTPRINTS)} default footprint mappings: pins ⊆ pads")
+
+
+# ─── 10. LM358 datasheet pinout golden ───────────────────────────────────────
+
+def test_lm358_datasheet_pinout() -> None:
+    print("\n[10] LM358 DIP-8/SOIC-8 datasheet pinout")
+    from engine.ecad.library.starter import SYMBOLS
+
+    # TI SLOS068 public pin map (clean-room).
+    golden = {
+        "1": "OUT1",
+        "2": "IN1-",
+        "3": "IN1+",
+        "4": "V-",
+        "5": "IN2+",
+        "6": "IN2-",
+        "7": "OUT2",
+        "8": "V+",
+    }
+    sdef = SYMBOLS["Amplifier_Operational:LM358"]
+    got = {str(p["number"]): str(p["name"]) for p in sdef["pins"]}
+    assert got == golden, f"LM358 pinout {got} != golden {golden}"
+    # OPAMP_dual remains abstract multi-unit (not a package claim).
+    dual = SYMBOLS["Amplifier_Operational:OPAMP_dual"]
+    assert dual["units_count"] == 3
+    assert "not a package pinout" in dual["description"].lower() or \
+           "abstract" in dual["description"].lower()
+    _ok("LM358 pinout golden; OPAMP_dual stays abstract multi-unit")
+
+
+# ─── 11. BJT/MOSFET SOT-23 numeric pin numbers ───────────────────────────────
+
+def test_bjt_mosfet_sot23_pin_numbers() -> None:
+    print("\n[11] BJT/MOSFET pin numbers map to SOT-23 pads 1/2/3")
+    from engine.ecad.library.starter import SYMBOLS, FOOTPRINTS
+
+    pads = {str(p["number"]) for p in FOOTPRINTS["Package_TO_SOT_SMD:SOT-23"]["pads"]}
+    assert pads == {"1", "2", "3"}
+    for libid in ("Device:Q_NPN", "Device:Q_PNP", "Device:NMOS", "Device:PMOS"):
+        pins = {str(p["number"]) for p in SYMBOLS[libid]["pins"]}
+        assert pins == {"1", "2", "3"}, f"{libid} pins {pins} not {{1,2,3}}"
+        assert pins <= pads
+    # Name map sanity (MMBT3904 / 2N7002 class).
+    npn = {str(p["number"]): p["name"] for p in SYMBOLS["Device:Q_NPN"]["pins"]}
+    assert npn == {"1": "B", "2": "E", "3": "C"}
+    nmos = {str(p["number"]): p["name"] for p in SYMBOLS["Device:NMOS"]["pins"]}
+    assert nmos == {"1": "G", "2": "S", "3": "D"}
+    _ok("BJT/MOSFET SOT-23 pin numbers + names")
+
+
+# ─── 12. real-board essentials search hits ───────────────────────────────────
+
+def test_board_essentials_search() -> None:
+    print("\n[12] search mcu/regulator/usb/inductor each ≥1 hit")
+    from engine.ecad import library
+
+    for q in ("mcu", "regulator", "usb", "inductor"):
+        hits = library.search(q)
+        assert len(hits) >= 1, f"search({q!r}) returned 0 hits: {hits}"
+        _ok(f"search({q!r}) → {len(hits)} hit(s)")
+
+
 
 # ─── main ─────────────────────────────────────────────────────────────────────
 
@@ -413,6 +493,10 @@ def main() -> None:
         test_sim_mappings,
         test_pin_types,
         test_multiunit_symbol,
+        test_default_footprints_pin_subset_of_pads,
+        test_lm358_datasheet_pinout,
+        test_bjt_mosfet_sot23_pin_numbers,
+        test_board_essentials_search,
     ]
 
     passed = 0

@@ -12,6 +12,9 @@ Gates:
   6. inverting op-amp               — gain = -Rf/Rin  (op + ac)
   7. common-emitter DC bias         — Vce in the active region
   8. RC low-pass AC                 — -3 dB at f = 1/(2*pi*RC), ~-20 dB/dec slope
+  9. voltage-controlled switch S    — on/off resistance within 1% of ron/roff
+ 10. MOSFET AC pole (Cgs)          — -3 dB within 5% of 1/(2*pi*R*Cgs)
+
 
 Run:  & ".../venv/Scripts/python.exe" -m engine.sim.test_circuit
 """
@@ -414,6 +417,124 @@ def test_dc_sweep() -> None:
 
 
 # =============================================================================
+# Gate 9 — voltage-controlled switch S (ron/roff across threshold)
+# =============================================================================
+
+def test_switch_ron_roff() -> None:
+    """S1 between OUT and 0, series R from Vsrc; control above/below vt → Ron/Roff."""
+    Vsrc = 1.0
+    Rseries = 1000.0
+    ron, roff = 10.0, 1.0e6
+    vt, vh = 0.5, 0.1
+
+    def _run(vctrl: float) -> float:
+        circuit = {
+            "nodes": ["0", "OUT", "CTRL", "SRC"],
+            "devices": [
+                {"kind": "V", "name": "VS", "nodes": ["SRC", "0"], "value": Vsrc, "params": {}},
+                {"kind": "R", "name": "RS", "nodes": ["SRC", "OUT"], "value": Rseries, "params": {}},
+                {"kind": "V", "name": "VC", "nodes": ["CTRL", "0"], "value": vctrl, "params": {}},
+                {"kind": "S", "name": "S1", "nodes": ["OUT", "0", "CTRL", "0"], "value": None,
+                 "params": {"vt": vt, "vh": vh, "ron": ron, "roff": roff}},
+            ],
+            "models": {},
+            "params": {"TEMP": 27},
+        }
+        res = simulate(circuit, {"analyses": [{"type": "op"}], "probes": ["V(OUT)"]})
+        assert res["convergence"]["op"], f"switch op failed at Vctrl={vctrl}: {res['log']}"
+        return float(res["op"]["V(OUT)"])
+
+    # ON: Vctrl = vt+vh+margin → switch ≈ ron; Vout = Vsrc * ron/(Rseries+ron)
+    v_on = _run(vt + vh + 0.5)
+    r_on_meas = Rseries * v_on / max(Vsrc - v_on, 1e-30)
+    err_on = _pct_err(r_on_meas, ron)
+    print(f"  S ON:  Vout={v_on:.6g}  Rsw={r_on_meas:.6g}  ron={ron}  err={err_on:.3f}%")
+    assert err_on < 1.0, f"switch on-resistance err {err_on:.3f}% (need <1%)"
+
+    # OFF: Vctrl = vt-vh-margin → switch ≈ roff
+    v_off = _run(vt - vh - 0.5)
+    r_off_meas = Rseries * v_off / max(Vsrc - v_off, 1e-30)
+    err_off = _pct_err(r_off_meas, roff)
+    print(f"  S OFF: Vout={v_off:.6g}  Rsw={r_off_meas:.6g}  roff={roff}  err={err_off:.3f}%")
+    assert err_off < 1.0, f"switch off-resistance err {err_off:.3f}% (need <1%)"
+    print("  [gate 9 voltage-controlled switch S] PASS")
+
+
+# =============================================================================
+# Gate 10 — MOSFET AC pole from constant Cgs
+# =============================================================================
+
+def test_mosfet_ac_cgs_pole() -> None:
+    """Gate driven through Rdrive with constant Cgs; |V(G)| -3 dB at 1/(2π R Cgs).
+
+    Drain is held at a fixed DC bias so the MOSFET is in saturation; the AC path of
+    interest is the passive R–Cgs low-pass at the gate (Cgd/Cds = 0 so the pole is pure).
+    """
+    Rdrive = 1000.0
+    Cgs = 1e-9  # 1 nF → fc = 1/(2π R C) ≈ 159.155 kHz
+    fc_exp = 1.0 / (2.0 * math.pi * Rdrive * Cgs)
+    VDD = 5.0
+    VGS_bias = 2.0
+    VTO = 1.0
+    KP = 2e-4
+    Wl = 10.0
+
+    circuit = {
+        "nodes": ["0", "VDD", "G", "D", "GIN"],
+        "devices": [
+            {"kind": "V", "name": "VDD", "nodes": ["VDD", "0"], "value": VDD, "params": {}},
+            # AC unit drive into the gate through Rdrive; DC bias also through the same path.
+            {"kind": "V", "name": "VG", "nodes": ["GIN", "0"], "value": VGS_bias,
+             "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+            {"kind": "R", "name": "RG", "nodes": ["GIN", "G"], "value": Rdrive, "params": {}},
+            {"kind": "R", "name": "RD", "nodes": ["VDD", "D"], "value": 2000.0, "params": {}},
+            {"kind": "M", "name": "M1", "nodes": ["D", "G", "0"], "value": None,
+             "model": "NM", "params": {}},
+        ],
+        "models": {"NM": {"type": "nmos", "VTO": VTO, "KP": KP, "W": Wl, "L": 1.0,
+                          "LAMBDA": 0.0, "CGS": Cgs, "CGD": 0.0, "CDS": 0.0}},
+        "params": {"TEMP": 27},
+    }
+    study = {
+        "analyses": [
+            {"type": "op"},
+            {"type": "ac", "sweep": "dec", "points": 20, "fstart": fc_exp / 100.0,
+             "fstop": fc_exp * 100.0},
+        ],
+        "probes": ["V(G)"],
+    }
+    res = simulate(circuit, study)
+    assert res["convergence"]["op"], f"MOSFET+Cgs op failed: {res['log']}"
+    assert res["convergence"]["ac"], f"MOSFET+Cgs ac failed: {res['log']}"
+
+    freqs = np.asarray(res["ac"]["x_f"], dtype=float)
+    mag = np.asarray(res["ac"]["mag"]["V(G)"], dtype=float)
+    # DC / low-freq gain of the R–Cgs divider is 1.0 (gate open at DC through C).
+    low = mag[0]
+    assert low > 0.5, f"low-freq |V(G)| unexpectedly small: {low}"
+    target = low / math.sqrt(2.0)
+    # First frequency where |V(G)| drops to -3 dB of the low-freq value.
+    below = np.where(mag <= target)[0]
+    assert len(below) > 0, "AC sweep never reached -3 dB — Cgs not stamped?"
+    i = int(below[0])
+    if i == 0:
+        fc_meas = float(freqs[0])
+    else:
+        # Log-linear interpolate between i-1 and i.
+        m0, m1 = mag[i - 1], mag[i]
+        f0, f1 = freqs[i - 1], freqs[i]
+        if m0 == m1:
+            fc_meas = float(f1)
+        else:
+            t = (target - m0) / (m1 - m0)
+            fc_meas = float(math.exp(math.log(f0) + t * (math.log(f1) - math.log(f0))))
+    err = _pct_err(fc_meas, fc_exp)
+    print(f"  MOSFET Cgs pole: fc_meas={fc_meas:.6g} Hz  fc_exp={fc_exp:.6g} Hz  err={err:.3f}%")
+    assert err < 5.0, f"MOSFET Cgs pole err {err:.3f}% (need <5%)"
+    print("  [gate 10 MOSFET AC Cgs pole] PASS")
+
+
+# =============================================================================
 # main
 # =============================================================================
 
@@ -432,6 +553,8 @@ def main() -> None:
         ("Gate 6: inverting op-amp", test_inverting_opamp),
         ("Gate 7: common-emitter bias", test_common_emitter_bias),
         ("Gate 8: RC low-pass AC", test_rc_lowpass_ac),
+        ("Gate 9: switch S ron/roff", test_switch_ron_roff),
+        ("Gate 10: MOSFET AC Cgs pole", test_mosfet_ac_cgs_pole),
         ("Bonus: DC sweep", test_dc_sweep),
     ]
     for title, fn in gates:

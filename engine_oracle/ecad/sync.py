@@ -52,12 +52,25 @@ _GRID_COLS = 8
 _DEFAULT_FOOTPRINTS = {
     "Device:R": "Resistor_SMD:R_0603",
     "Device:C": "Capacitor_SMD:C_0603",
+    "Device:C_pol": "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm",
+    "Device:L": "Inductor_SMD:L_0603",
+    "Device:Ferrite_Bead": "Inductor_SMD:FB_0603",
     "Device:D": "Diode_SMD:D_SMA",
     "Device:LED": "LED_SMD:LED_0805",
     "Device:Q_NPN": "Package_TO_SOT_SMD:SOT-23",
     "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
+    "Device:NMOS": "Package_TO_SOT_SMD:SOT-23",
+    "Device:PMOS": "Package_TO_SOT_SMD:SOT-23",
     "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
+    "Amplifier_Operational:LM358": "Package_SO:SOIC-8",
     "Timer:NE555": "Package_DIP:DIP-8",
+    "Regulator_Linear:AMS1117-3.3": "Package_TO_SOT_SMD:SOT-223",
+    "Regulator_Linear:7805": "Package_TO_SOT_THT:TO-220-3",
+    "MCU:Generic_QFP48": "Package_QFP:LQFP-48_7x7mm_P0.5mm",
+    "Connector:Header_2x03": "Connector_PinHeader_2.54mm:Header_2x03",
+    "Connector:Header_2x05": "Connector_PinHeader_2.54mm:Header_2x05",
+    "Connector:USB_C": "Connector_USB:USB_C",
+    "Connector:USB_B": "Connector_USB:USB_B",
 }
 
 

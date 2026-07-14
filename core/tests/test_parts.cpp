@@ -140,6 +140,45 @@ TEST_CASE("bearing 608 — outer ring 22, bore 8, width 7") {
     CHECK((*outer)["params"]["height"]["value"].get<double>() == doctest::Approx(7.0));
 }
 
+TEST_CASE("bearing 6205 — 25x52x15 ISO 15") {
+    PartBuild pb = build("bearing", "6205", 0.0, json::object());
+    const json *outer = nullptr, *bore = nullptr;
+    for (const json& op : pb.ops) {
+        const std::string nm = op["feature"].value("name", "");
+        if (nm == "outer") outer = &op["feature"];
+        if (nm == "bore") bore = &op["feature"];
+    }
+    REQUIRE(outer);
+    REQUIRE(bore);
+    CHECK(cyl_radius(*outer) == doctest::Approx(52.0 / 2.0));
+    CHECK(cyl_radius(*bore) == doctest::Approx(25.0 / 2.0));
+    CHECK((*outer)["params"]["height"]["value"].get<double>() == doctest::Approx(15.0));
+    CHECK(pb.meta["specs"]["bore"].get<double>() == doctest::Approx(25.0));
+    CHECK(pb.meta["specs"]["od"].get<double>() == doctest::Approx(52.0));
+    CHECK(pb.meta["specs"]["width"].get<double>() == doctest::Approx(15.0));
+}
+
+TEST_CASE("every ISO 15 bearing size in the table builds") {
+    // Must cover the bolts YAML advertised set (engine_oracle/data/bolts/bearings.blt.yaml).
+    static const char* kIso15[] = {
+        "623", "624", "625", "626", "608",
+        "6000", "6001", "6002", "6003", "6004", "6005", "6006", "6007", "6008",
+        "6200", "6201", "6202", "6203", "6204", "6205", "6206", "6207", "6208",
+        "6300", "6301", "6302", "6303", "6304", "6305",
+        "6800", "6801", "6802", "6900", "6901",
+    };
+    for (const char* size : kIso15) {
+        INFO("bearing size " << size);
+        const data::BearingRow* row = data::find_bearing(size);
+        REQUIRE(row);
+        PartBuild pb = build("bearing", size, 0.0, json::object());
+        CHECK(pb.ops.size() >= 2);
+        CHECK(pb.meta["specs"]["bore"].get<double>() == doctest::Approx(row->bore));
+        CHECK(pb.meta["specs"]["od"].get<double>() == doctest::Approx(row->od));
+        CHECK(pb.meta["specs"]["width"].get<double>() == doctest::Approx(row->width));
+    }
+}
+
 TEST_CASE("unknown family / size throws") {
     CHECK_THROWS_AS(build("nonesuch", "M3", 10.0, json::object()), std::invalid_argument);
     CHECK_THROWS_AS(build("shcs", "M99", 10.0, json::object()), std::invalid_argument);

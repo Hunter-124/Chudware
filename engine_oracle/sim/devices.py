@@ -1353,11 +1353,27 @@ class OpAmp(Device):
         mna.stamp_Gc(br, ip, -Aw); mna.stamp_Gc(br, inn, Aw)
 
 
-# --------------------------------------------------------------------------- M (stub)
+# --------------------------------------------------------------------------- M (MOSFET level-1)
 
 @device("M")
 class Mosfet(Device):
-    """MOSFET level-1 (square-law). nodes=[D, G, S, (B)]. DC + small-signal AC (no caps in v1)."""
+    """MOSFET level-1 (square-law). nodes=[D, G, S, (B)].
+
+    DC: square-law Id(Vgs, Vds) with channel-length modulation (LAMBDA). Small-signal
+    AC stamps gm + gds linearized at the DC operating point, plus optional constant
+    gate/drain capacitances so the AC response has a real frequency pole:
+
+      * CGS / CGD / CDS  — absolute farads (device params or .model card)
+      * CGSO / CGDO      — F/m overlap, scaled by W (defaults 0)
+
+    Cap model is constant-C (not full Meyer region-dependent Cgs/Cgd). That is enough for
+    first-order AC poles (fc ≈ 1/(2π R Cgs) on a gate drive) and stays Newton-stable.
+    Full Meyer / BSIM junction capacitance is intentionally out of scope.
+
+    Noise is still only the passive 4kTR floor (analysis_ext); MOSFET channel noise is
+    not modeled. Bulk (4th node) is accepted for pin order but body effect is not applied
+    (GAMMA/PHI are read-compatible no-ops for DC).
+    """
 
     def is_nonlinear(self) -> bool:
         return True
@@ -1370,7 +1386,19 @@ class Mosfet(Device):
         L = self._mp("L", 1e-4)
         typ = str(self.model.get("type", self.dparams.get("type", "nmos"))).lower()
         beta = KP * W / L
-        return VTO, beta, LAMBDA, typ
+        return VTO, beta, LAMBDA, typ, W
+
+    def _caps(self) -> tuple[float, float, float]:
+        """Constant Cgs, Cgd, Cds (farads). Absolute CGx overrides CGSO*W."""
+        _VTO, _beta, _lam, _typ, W = self._params()
+        cgs = self._mp("CGS", 0.0)
+        cgd = self._mp("CGD", 0.0)
+        cds = self._mp("CDS", 0.0)
+        if cgs <= 0.0:
+            cgs = self._mp("CGSO", 0.0) * W
+        if cgd <= 0.0:
+            cgd = self._mp("CGDO", 0.0) * W
+        return max(cgs, 0.0), max(cgd, 0.0), max(cds, 0.0)
 
     def _bias(self, x: np.ndarray, mna: MnaLike) -> tuple[float, float, float, float, float]:
         """Recompute the level-1 operating point from the (op-point) node voltages.
@@ -1381,7 +1409,7 @@ class Mosfet(Device):
         approach as the BJT / diode), so the small-signal parameters are evaluated exactly at the
         operating point with no stored state needed.
         """
-        VTO, beta, lam, typ = self._params()
+        VTO, beta, lam, typ, _W = self._params()
         d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
         sign = 1.0 if typ in ("nmos", "n") else -1.0
         vgs = sign * (_xat(x, g) - _xat(x, s))
@@ -1411,6 +1439,13 @@ class Mosfet(Device):
         mna.stamp_G(d, g, gm); mna.stamp_G(d, s, -gm)
         mna.stamp_G(s, g, -gm); mna.stamp_G(s, s, gm)
 
+    @staticmethod
+    def _stamp_cap_pair(mna: MnaLike, a: int, b: int, c: float) -> None:
+        if c <= 0.0:
+            return
+        mna.stamp_C(a, a, c); mna.stamp_C(b, b, c)
+        mna.stamp_C(a, b, -c); mna.stamp_C(b, a, -c)
+
     def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
         d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
         sign, id_, gm, gds, vgs = self._bias(x, mna)
@@ -1425,23 +1460,160 @@ class Mosfet(Device):
         """Level-1 small-signal AC stamp linearized at the DC operating point.
 
         Transconductance ``gm`` and output conductance ``gds`` are recomputed from the op-point
-        node voltages (the AC driver passes the converged DC solution as ``x_op``). Only the linear
-        conductances are stamped: the controlled source ``gm*Vgs`` (drain->source) plus ``gds``
-        across drain-source. Junction/overlap capacitances (Cgs, Cgd, Cds) are intentionally OMITTED
-        in v1 -- the AC response is frequency-flat, exact for the resistive small-signal model and a
-        valid low-frequency approximation. Works for both n- and p-channel."""
+        node voltages. Constant Cgs/Cgd/Cds (when present) are stamped as pure capacitors so the
+        AC response has a real frequency pole instead of flat resistive gain. Works for both n-
+        and p-channel.
+        """
+        d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
         _sign, _id, gm, gds, _vgs = self._bias(x_op, mna)
         self._stamp_conductances(mna, gm, gds)
+        cgs, cgd, cds = self._caps()
+        self._stamp_cap_pair(mna, g, s, cgs)
+        self._stamp_cap_pair(mna, g, d, cgd)
+        self._stamp_cap_pair(mna, d, s, cds)
+
+    def stamp_tran(self, mna: MnaLike, x: np.ndarray, dt: float, hist: dict) -> None:
+        """DC companion + constant-cap BE/trap companions (same pattern as Capacitor)."""
+        self.stamp_dc(mna, x)
+        cgs, cgd, cds = self._caps()
+        if cgs <= 0.0 and cgd <= 0.0 and cds <= 0.0:
+            return
+        d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
+        method = hist.get("_method", "trap")
+        st = hist.setdefault(self.name, {})
+        for key, a, b, c in (("cgs", g, s, cgs), ("cgd", g, d, cgd), ("cds", d, s, cds)):
+            if c <= 0.0:
+                continue
+            v_prev = st.get(f"{key}_v", 0.0)
+            i_prev = st.get(f"{key}_i", 0.0)
+            if method == "trap":
+                geq = 2.0 * c / dt
+                ieq = geq * v_prev + i_prev
+            else:
+                geq = c / dt
+                ieq = geq * v_prev
+            mna.stamp_G(a, a, geq); mna.stamp_G(b, b, geq)
+            mna.stamp_G(a, b, -geq); mna.stamp_G(b, a, -geq)
+            mna.stamp_I(a, ieq); mna.stamp_I(b, -ieq)
+
+    def update_state(self, x: np.ndarray, dt: float, hist: dict) -> None:
+        cgs, cgd, cds = self._caps()
+        if cgs <= 0.0 and cgd <= 0.0 and cds <= 0.0:
+            return
+        di = getattr(self, "_d", None)
+        gi = getattr(self, "_g", None)
+        si = getattr(self, "_s", None)
+        if di is None or gi is None or si is None:
+            return
+        method = hist.get("_method", "trap")
+        st = hist.setdefault(self.name, {})
+        for key, a, b, c in (("cgs", gi, si, cgs), ("cgd", gi, di, cgd), ("cds", di, si, cds)):
+            if c <= 0.0:
+                continue
+            v = _xat(x, a) - _xat(x, b)
+            v_prev = st.get(f"{key}_v", 0.0)
+            i_prev = st.get(f"{key}_i", 0.0)
+            if method == "trap":
+                i_new = 2.0 * c / dt * (v - v_prev) - i_prev
+            else:
+                i_new = c / dt * (v - v_prev)
+            st[f"{key}_v"] = v
+            st[f"{key}_i"] = i_new
+
+    def record_indices(self, mna: MnaLike) -> None:
+        self._d = mna.n(self.node_names[0])
+        self._g = mna.n(self.node_names[1])
+        self._s = mna.n(self.node_names[2])
 
 
-# --------------------------------------------------------------------------- S (stub)
+# --------------------------------------------------------------------------- S (voltage-controlled switch)
 
 @device("S")
 class Switch(Device):
-    """Voltage-controlled switch — NICE-TO-HAVE; registered stub."""
+    """Voltage-controlled switch. nodes=[n1, n2, ctrl+, ctrl-].
+
+    Params (device or .model; device wins):
+
+      * ron, roff — on/off resistance (ohm). Defaults 1 / 1e12.
+      * vt, vh    — threshold and half-hysteresis width (volts). Defaults 0 / 0.
+      * von, voff — SPICE-style absolute thresholds; if either is present they override
+                    vt/vh via ``vt=(von+voff)/2``, ``vh=|von-voff|/2``.
+
+    Conductance is continuous (Newton-friendly): R interpolates linearly between roff and
+    ron over the [voff, von] control window (classic SPICE VSWITCH model). With vh=0 the
+    window collapses to a 1 mV smooth edge around vt so the Jacobian stays finite.
+
+    The switch is mildly nonlinear in the control voltage (G = G(Vctrl)) and is stamped
+    every Newton iteration from the current solution. AC uses the same G linearized at the
+    DC operating point (no reactive switch model).
+    """
+
+    def is_nonlinear(self) -> bool:
+        # G depends on control voltage → re-linearize each Newton iteration.
+        return True
+
+    def _thresholds(self) -> tuple[float, float, float, float]:
+        ron = max(self._mp("ron", self._mp("RON", 1.0)), 1e-12)
+        roff = max(self._mp("roff", self._mp("ROFF", 1e12)), ron)
+        # Prefer explicit von/voff when either is supplied (SPICE deck grammar).
+        has_von = any(k in self.dparams or k in self.model for k in ("von", "VON", "voff", "VOFF"))
+        if has_von:
+            von = self._mp("von", self._mp("VON", 1.0))
+            voff = self._mp("voff", self._mp("VOFF", 0.0))
+        else:
+            vt = self._mp("vt", self._mp("VT", 0.0))
+            vh = abs(self._mp("vh", self._mp("VH", 0.0)))
+            if vh <= 0.0:
+                # Smooth 1 mV edge so pure-step switches still Newton-converge.
+                vh = 5e-4
+            von = vt + vh
+            voff = vt - vh
+        return ron, roff, von, voff
+
+    def _g_of(self, vc: float) -> float:
+        """Channel conductance at control voltage vc (SPICE linear-R interpolation)."""
+        ron, roff, von, voff = self._thresholds()
+        if von == voff:
+            r = ron if vc >= von else roff
+        elif von > voff:
+            # Normal: ON above von, OFF below voff.
+            if vc >= von:
+                r = ron
+            elif vc <= voff:
+                r = roff
+            else:
+                r = roff + (ron - roff) * (vc - voff) / (von - voff)
+        else:
+            # Inverted thresholds (von < voff): ON below von, OFF above voff.
+            if vc <= von:
+                r = ron
+            elif vc >= voff:
+                r = roff
+            else:
+                r = roff + (ron - roff) * (voff - vc) / (voff - von)
+        r = max(r, 1e-12)
+        return 1.0 / r
+
+    def _stamp_g(self, mna: MnaLike, g: float) -> None:
+        a = mna.n(self.node_names[0]); b = mna.n(self.node_names[1])
+        mna.stamp_G(a, a, g); mna.stamp_G(b, b, g)
+        mna.stamp_G(a, b, -g); mna.stamp_G(b, a, -g)
+
+    def _vc(self, x: np.ndarray, mna: MnaLike) -> float:
+        if len(self.node_names) < 4:
+            raise DeviceError(f"{self.name}: voltage-controlled switch needs 4 nodes "
+                              f"[n1 n2 ctrl+ ctrl-], got {self.node_names!r}")
+        cp = mna.n(self.node_names[2]); cn = mna.n(self.node_names[3])
+        return _xat(x, cp) - _xat(x, cn)
 
     def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
-        raise DeviceError("voltage-controlled switch (S) not yet modeled")
+        g = self._g_of(self._vc(x, mna))
+        self._stamp_g(mna, g)
+
+    def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:  # noqa: ARG002
+        g = self._g_of(self._vc(x_op, mna))
+        self._stamp_g(mna, g)
+
 
 
 # --------------------------------------------------------------------------- T (lossless line)

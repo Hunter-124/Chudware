@@ -320,6 +320,12 @@ register_photo_recon_tools(mcp)
 from mcp_server.firmware_tools import register_firmware_tools
 register_firmware_tools(mcp)
 
+# Full-wave EM (eigenmode / driven / timedomain) — builtin-fdfd + analytic adapters;
+# openEMS when installed. Compact summary-first envelopes (field arrays behind detail=).
+from mcp_server.em_tools import register_em_tools
+register_em_tools(_reg.view(mcp, "em"))
+
+
 from mcp_server.power_budget import register_power_budget_tools
 register_power_budget_tools(_reg.view(mcp, "ecad"))
 

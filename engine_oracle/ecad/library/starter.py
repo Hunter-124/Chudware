@@ -329,14 +329,17 @@ def _make_symbols() -> dict:
     )
 
     # ── NPN BJT ──────────────────────────────────────────────────────────────
+    # Pin numbers 1/2/3 match SOT-23 pad numbers (MMBT3904-class: 1=B, 2=E, 3=C)
+    # so sch->pcb pad binding attaches correctly. sim.pin_order still uses names
+    # (C/B/E) which resolve via the pin name map.
     syms["Device:Q_NPN"] = _sym(
         "Device:Q_NPN", "Q_NPN", "Q", "Q",
-        "NPN bipolar transistor",
+        "NPN bipolar transistor (SOT-23 pin numbers)",
         "npn bjt transistor",
         pins=[
-            _pin("B", "B", [-3.81, 0.0], 180.0, "input"),
-            _pin("C", "C", [0.0, 3.81], 90.0, "output"),
-            _pin("E", "E", [0.0, -3.81], 270.0, "output"),
+            _pin("1", "B", [-3.81, 0.0], 180.0, "input"),
+            _pin("3", "C", [0.0, 3.81], 90.0, "output"),
+            _pin("2", "E", [0.0, -3.81], 270.0, "output"),
         ],
         graphics=[
             # base line
@@ -353,18 +356,19 @@ def _make_symbols() -> dict:
             _circle(0.0, 0.0, 2.2),
         ],
         sim={"model": "NPN", "pin_order": ["C", "B", "E"]},  # solver order (devices.py BJT: nodes=[C,B,E])
-        footprint_filters=["TO-92*", "SOT-23*"],
+        footprint_filters=["SOT-23*", "TO-92*"],
     )
 
     # ── PNP BJT ──────────────────────────────────────────────────────────────
+    # SOT-23 pin numbers: 1=B, 2=E, 3=C (MMBT3906-class).
     syms["Device:Q_PNP"] = _sym(
         "Device:Q_PNP", "Q_PNP", "Q", "Q",
-        "PNP bipolar transistor",
+        "PNP bipolar transistor (SOT-23 pin numbers)",
         "pnp bjt transistor",
         pins=[
-            _pin("B", "B", [-3.81, 0.0], 180.0, "input"),
-            _pin("C", "C", [0.0, -3.81], 270.0, "output"),
-            _pin("E", "E", [0.0, 3.81], 90.0, "output"),
+            _pin("1", "B", [-3.81, 0.0], 180.0, "input"),
+            _pin("2", "E", [0.0, 3.81], 90.0, "output"),
+            _pin("3", "C", [0.0, -3.81], 270.0, "output"),
         ],
         graphics=[
             _line(-1.27, -2.54, -1.27, 2.54),
@@ -376,18 +380,19 @@ def _make_symbols() -> dict:
             _circle(0.0, 0.0, 2.2),
         ],
         sim={"model": "PNP", "pin_order": ["C", "B", "E"]},  # solver order (devices.py BJT: nodes=[C,B,E])
-        footprint_filters=["TO-92*", "SOT-23*"],
+        footprint_filters=["SOT-23*", "TO-92*"],
     )
 
     # ── N-channel MOSFET ────────────────────────────────────────────────────
+    # SOT-23 pin numbers match 2N7002-class: 1=G, 2=S, 3=D.
     syms["Device:NMOS"] = _sym(
         "Device:NMOS", "NMOS", "Q", "NMOS",
-        "N-channel enhancement MOSFET",
+        "N-channel enhancement MOSFET (SOT-23 pin numbers)",
         "nmos mosfet transistor",
         pins=[
-            _pin("G", "G", [-5.08, 0.0], 180.0, "input"),
-            _pin("D", "D", [0.0, 3.81], 90.0, "output"),
-            _pin("S", "S", [0.0, -3.81], 270.0, "output"),
+            _pin("1", "G", [-5.08, 0.0], 180.0, "input"),
+            _pin("3", "D", [0.0, 3.81], 90.0, "output"),
+            _pin("2", "S", [0.0, -3.81], 270.0, "output"),
         ],
         graphics=[
             # gate line
@@ -407,14 +412,15 @@ def _make_symbols() -> dict:
     )
 
     # ── P-channel MOSFET ────────────────────────────────────────────────────
+    # SOT-23 pin numbers match BSS84-class: 1=G, 2=S, 3=D.
     syms["Device:PMOS"] = _sym(
         "Device:PMOS", "PMOS", "Q", "PMOS",
-        "P-channel enhancement MOSFET",
+        "P-channel enhancement MOSFET (SOT-23 pin numbers)",
         "pmos mosfet transistor",
         pins=[
-            _pin("G", "G", [-5.08, 0.0], 180.0, "input"),
-            _pin("D", "D", [0.0, -3.81], 270.0, "output"),
-            _pin("S", "S", [0.0, 3.81], 90.0, "output"),
+            _pin("1", "G", [-5.08, 0.0], 180.0, "input"),
+            _pin("2", "S", [0.0, 3.81], 90.0, "output"),
+            _pin("3", "D", [0.0, -3.81], 270.0, "output"),
         ],
         graphics=[
             _line(-1.27, -2.0, -1.27, 2.0),
@@ -429,8 +435,10 @@ def _make_symbols() -> dict:
         footprint_filters=["SOT-23*", "TO-92*"],
     )
 
-    # ── Dual op-amp (e.g. LM358) ────────────────────────────────────────────
-    # 2 units; unit 3 = power
+    # ── Dual op-amp abstract multi-unit ──────────────────────────────────────
+    # Unit-based abstract dual op-amp for multi-unit schematic placement / SPICE
+    # OPAMP model. Pin numbers are NOT a physical package map — use
+    # Amplifier_Operational:LM358 for a datasheet-correct DIP-8/SOIC-8 pinout.
     opamp_pins = []
     # Unit 1: IN-, IN+, OUT
     opamp_pins += [
@@ -444,7 +452,7 @@ def _make_symbols() -> dict:
         _pin("6", "IN+", [-6.35, -1.27], 180.0, "input", unit=2),
         _pin("7", "OUT", [6.35, 0.0], 0.0, "output", unit=2),
     ]
-    # Power unit (unit 3, unit=0 means shared in KiCad, we use 3)
+    # Power unit (unit 3)
     opamp_pins += [
         _pin("8", "V+", [0.0, 6.35], 90.0, "power_in", unit=3),
         _pin("4", "V-", [0.0, -6.35], 270.0, "power_in", unit=3),
@@ -458,16 +466,40 @@ def _make_symbols() -> dict:
         _line(-4.445, -1.905, -4.445, -0.635),
         _line(-5.08, 1.27, -3.81, 1.27),
     ]
-    opamp_graphics_pwr = [_rect(-2.54, -2.54, 2.54, 2.54)]
 
     syms["Amplifier_Operational:OPAMP_dual"] = _sym(
         "Amplifier_Operational:OPAMP_dual", "OPAMP_dual", "U", "OPAMP_dual",
-        "Dual operational amplifier",
-        "opamp operational amplifier",
+        "Dual operational amplifier (abstract multi-unit; not a package pinout)",
+        "opamp operational amplifier dual abstract",
         pins=opamp_pins,
         graphics=opamp_graphics_u12,
         units_count=3,
         sim={"model": "OPAMP", "pin_order": ["IN+", "IN-", "V+", "V-", "OUT"]},
+        footprint_filters=["SOIC-8*", "DIP-8*"],
+    )
+
+    # ── LM358 dual op-amp (datasheet DIP-8 / SOIC-8 pinout) ─────────────────
+    # TI SLOS068 / public datasheet pin map (clean-room; not derived from KiCad):
+    #   1 OUT1, 2 IN1-, 3 IN1+, 4 V-, 5 IN2+, 6 IN2-, 7 OUT2, 8 V+
+    # Single-unit symbol so every pin is on unit 1 and matches SOIC-8/DIP-8 pads 1-8.
+    lm358_w, lm358_h = 10.16, 15.24
+    lm358_pins = [
+        _pin("1", "OUT1", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27], 180.0, "output"),
+        _pin("2", "IN1-", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27 - 2.54], 180.0, "input"),
+        _pin("3", "IN1+", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27 - 2.54 * 2], 180.0, "input"),
+        _pin("4", "V-", [-lm358_w / 2 - 2.54, -lm358_h / 2 + 1.27], 180.0, "power_in"),
+        _pin("5", "IN2+", [lm358_w / 2 + 2.54, -lm358_h / 2 + 1.27], 0.0, "input"),
+        _pin("6", "IN2-", [lm358_w / 2 + 2.54, -lm358_h / 2 + 1.27 + 2.54], 0.0, "input"),
+        _pin("7", "OUT2", [lm358_w / 2 + 2.54, lm358_h / 2 - 1.27 - 2.54], 0.0, "output"),
+        _pin("8", "V+", [lm358_w / 2 + 2.54, lm358_h / 2 - 1.27], 0.0, "power_in"),
+    ]
+    syms["Amplifier_Operational:LM358"] = _sym(
+        "Amplifier_Operational:LM358", "LM358", "U", "LM358",
+        "LM358 dual operational amplifier (DIP-8/SOIC-8 datasheet pinout)",
+        "opamp operational amplifier lm358 dual",
+        pins=lm358_pins,
+        graphics=[_rect(-lm358_w / 2, -lm358_h / 2, lm358_w / 2, lm358_h / 2)],
+        sim={"model": "OPAMP", "pin_order": ["IN1+", "IN1-", "V+", "V-", "OUT1"]},
         footprint_filters=["SOIC-8*", "DIP-8*"],
     )
 
@@ -701,6 +733,193 @@ def _make_symbols() -> dict:
             _line(1.27, 0.0, 3.81, 0.0),
         ],
         sim={"model": "S", "pin_order": ["1", "2"]},
+    )
+
+    # ── Ferrite bead ────────────────────────────────────────────────────────
+    syms["Device:Ferrite_Bead"] = _sym(
+        "Device:Ferrite_Bead", "Ferrite_Bead", "FB", "FB",
+        "Ferrite bead (series impedance)",
+        "ferrite bead choke emi filter inductor",
+        pins=[
+            _pin("1", "~", [0.0, 2.54], 90.0, "passive"),
+            _pin("2", "~", [0.0, -2.54], 270.0, "passive"),
+        ],
+        graphics=[
+            _rect(-1.0, -1.5, 1.0, 1.5),
+            _line(0.0, 2.54, 0.0, 1.5),
+            _line(0.0, -1.5, 0.0, -2.54),
+            _line(-0.7, 0.8, 0.7, 0.8),
+            _line(-0.7, 0.0, 0.7, 0.0),
+            _line(-0.7, -0.8, 0.7, -0.8),
+        ],
+        sim={"model": "L", "pin_order": ["1", "2"]},
+        footprint_filters=["L_*", "FB_*"],
+    )
+
+    # ── 2xN pin headers (2.54 mm) ───────────────────────────────────────────
+    def _header_2xn(cols: int) -> dict:
+        n = cols * 2
+        pins = []
+        for i in range(1, n + 1):
+            # odd pins left column top→bottom (1,3,5…), even right (2,4,6…)
+            col = 0 if (i % 2 == 1) else 1
+            row = (i - 1) // 2
+            x = -3.81 if col == 0 else 3.81
+            y = (cols - 1) * 1.27 - row * 2.54
+            pins.append(_pin(str(i), f"Pin_{i}", [x, y], 180.0 if col == 0 else 0.0, "passive"))
+        h = cols * 1.27 + 1.27
+        return _sym(
+            f"Connector:Header_2x{cols:02d}", f"Header_2x{cols:02d}", "J", f"Header_2x{cols:02d}",
+            f"2x{cols} pin header 2.54 mm",
+            f"connector header 2x{cols} pinheader 2.54",
+            pins=pins,
+            graphics=[_rect(-2.54, -h, 2.54, h)],
+            footprint_filters=["PinHeader_2x*", "Header_2x*"],
+        )
+
+    syms["Connector:Header_2x03"] = _header_2xn(3)
+    syms["Connector:Header_2x05"] = _header_2xn(5)
+
+    # ── USB-C receptacle (simplified 16-pin mid-mount class) ────────────────
+    # Clean-room simplified USB-C pin subset for host/device boards. Numbers are
+    # sequential 1..16 matching the footprint pads (not a full CC/SBU map).
+    usb_pins = []
+    usb_names = [
+        "GND", "TX1+", "TX1-", "VBUS", "CC1", "D+", "D-", "SBU1",
+        "VBUS", "RX2-", "RX2+", "GND", "SBU2", "VBUS", "CC2", "SHIELD",
+    ]
+    for i, nm in enumerate(usb_names, start=1):
+        y = (8 - i) * 1.27
+        ptype = "power_in" if nm in ("VBUS", "GND", "SHIELD") else "bidirectional"
+        if nm in ("VBUS",):
+            ptype = "power_in"
+        if nm == "GND" or nm == "SHIELD":
+            ptype = "power_in"
+        usb_pins.append(_pin(str(i), nm, [-7.62, y], 180.0, ptype))
+    syms["Connector:USB_C"] = _sym(
+        "Connector:USB_C", "USB_C", "J", "USB_C",
+        "USB Type-C receptacle (simplified 16-pin)",
+        "usb usb-c type-c connector receptacle",
+        pins=usb_pins,
+        graphics=[_rect(-5.08, -12.0, 5.08, 12.0), _circle(-3.0, 10.0, 0.4)],
+        footprint_filters=["USB_C*", "Connector_USB*"],
+    )
+
+    # ── USB-B receptacle (4-pin classic) ────────────────────────────────────
+    # Public pinout: 1=VBUS, 2=D-, 3=D+, 4=GND
+    syms["Connector:USB_B"] = _sym(
+        "Connector:USB_B", "USB_B", "J", "USB_B",
+        "USB Type-B receptacle (4-pin)",
+        "usb usb-b type-b connector receptacle",
+        pins=[
+            _pin("1", "VBUS", [-5.08, 3.81], 180.0, "power_in"),
+            _pin("2", "D-", [-5.08, 1.27], 180.0, "bidirectional"),
+            _pin("3", "D+", [-5.08, -1.27], 180.0, "bidirectional"),
+            _pin("4", "GND", [-5.08, -3.81], 180.0, "power_in"),
+        ],
+        graphics=[_rect(-2.54, -5.08, 2.54, 5.08)],
+        footprint_filters=["USB_B*", "Connector_USB*"],
+    )
+
+    # ── Linear regulator AMS1117-3.3 (SOT-223) ──────────────────────────────
+    # Public datasheet pinout SOT-223 (tab = VOUT): 1=GND, 2=VOUT, 3=VIN, 4=VOUT(tab)
+    syms["Regulator_Linear:AMS1117-3.3"] = _sym(
+        "Regulator_Linear:AMS1117-3.3", "AMS1117-3.3", "U", "AMS1117-3.3",
+        "AMS1117 3.3 V LDO (SOT-223 pinout)",
+        "regulator ldo linear ams1117 3.3v 3v3",
+        pins=[
+            _pin("1", "GND", [-7.62, -2.54], 180.0, "power_in"),
+            _pin("2", "VOUT", [7.62, 0.0], 0.0, "power_out"),
+            _pin("3", "VIN", [-7.62, 2.54], 180.0, "power_in"),
+            _pin("4", "VOUT", [0.0, 5.08], 90.0, "power_out"),
+        ],
+        graphics=[_rect(-5.08, -3.81, 5.08, 3.81)],
+        footprint_filters=["SOT-223*"],
+        eng={
+            "power_w": {"typ": 0.5, "max": 1.0},
+            "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VIN", 4.75, 5.0, 12.0, 0.01, None),
+                _rail("VOUT", 3.2, 3.3, 3.4, None, None),
+            ], "voltage_domains": ["VIN", "VOUT"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: AMS1117-3.3 class LDO — Vout 3.3 V,"
+                        " dropout ~1.1 V, Tj max 125 °C. Seed currents; load-dependent."],
+        },
+    )
+
+    # ── 7805 linear regulator (TO-220) ──────────────────────────────────────
+    # Public pinout TO-220 (facing front, pins down): 1=IN, 2=GND, 3=OUT
+    syms["Regulator_Linear:7805"] = _sym(
+        "Regulator_Linear:7805", "7805", "U", "7805",
+        "7805 5 V linear regulator (TO-220 pinout)",
+        "regulator linear 7805 5v lm7805",
+        pins=[
+            _pin("1", "VIN", [-7.62, 2.54], 180.0, "power_in"),
+            _pin("2", "GND", [-7.62, 0.0], 180.0, "power_in"),
+            _pin("3", "VOUT", [-7.62, -2.54], 180.0, "power_out"),
+        ],
+        graphics=[_rect(-5.08, -5.08, 5.08, 5.08)],
+        footprint_filters=["TO-220*"],
+        eng={
+            "power_w": {"typ": 1.0, "max": 15.0},
+            "limits_c": {"tj_max": 150.0, "ta_max": 70.0},
+            "supply": {"rails": [
+                _rail("VIN", 7.0, 9.0, 25.0, 0.005, None),
+                _rail("VOUT", 4.8, 5.0, 5.2, None, None),
+            ], "voltage_domains": ["VIN", "VOUT"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: LM7805/MC7805 class — Vout 5 V,"
+                        " Vin 7–25 V, Tj max 150 °C. Dissipation is (Vin-Vout)*Iload."],
+        },
+    )
+
+    # ── Generic MCU QFP-48 class (simplified STM32F0-like) ──────────────────
+    # Clean-room simplified 48-pin MCU symbol for host-board workflows. Pins are
+    # numbered 1..48 matching LQFP-48 pads. Named power/boot/reset/clock pins
+    # for hostboard_rules identification; remaining pins are GPIO.
+    mcu_named = {
+        1: ("VBAT", "power_in"), 7: ("NRST", "input"), 8: ("VSSA", "power_in"),
+        9: ("VDDA", "power_in"), 10: ("OSC_IN", "input"), 11: ("OSC_OUT", "output"),
+        12: ("VSS", "power_in"), 13: ("VDD", "power_in"), 23: ("VSS", "power_in"),
+        24: ("VDD", "power_in"), 28: ("BOOT0", "input"), 35: ("VSS", "power_in"),
+        36: ("VDD", "power_in"), 47: ("VSS", "power_in"), 48: ("VDD", "power_in"),
+    }
+    mcu_pins = []
+    # 12 pins per side, LQFP-48 style numbering counterclockwise from top-left.
+    # Side layout for symbol (not package geometry): L 1-12, B 13-24, R 25-36, T 37-48.
+    for i in range(1, 49):
+        if i <= 12:  # left
+            y = (6.5 - i) * 2.54
+            pos, ang = [-12.7, y], 180.0
+        elif i <= 24:  # bottom
+            x = (i - 18.5) * 2.54
+            pos, ang = [x, -12.7], 270.0
+        elif i <= 36:  # right
+            y = (i - 30.5) * 2.54
+            pos, ang = [12.7, y], 0.0
+        else:  # top
+            x = (42.5 - i) * 2.54
+            pos, ang = [x, 12.7], 90.0
+        if i in mcu_named:
+            nm, ptype = mcu_named[i]
+        else:
+            nm, ptype = f"P{i}", "bidirectional"
+        mcu_pins.append(_pin(str(i), nm, pos, ang, ptype))
+    syms["MCU:Generic_QFP48"] = _sym(
+        "MCU:Generic_QFP48", "Generic_QFP48", "U", "MCU",
+        "Generic 48-pin MCU (QFP-48 / STM32F0-class simplified)",
+        "mcu microcontroller stm32 arm cortex qfp48 host",
+        pins=mcu_pins,
+        graphics=[_rect(-10.16, -10.16, 10.16, 10.16)],
+        footprint_filters=["LQFP-48*", "QFP-48*"],
+        eng={
+            "limits_c": {"tj_max": 105.0, "ta_max": 85.0},
+            "supply": {"rails": [
+                _rail("VDD", 2.0, 3.3, 3.6, 0.02, 0.00001),
+                _rail("VDDA", 2.0, 3.3, 3.6, 0.001, None),
+            ], "voltage_domains": ["VDD", "VDDA"], "sequencing": []},
+            "sources": ["research_datasheet_fetch: STM32F0-class MCU envelope — VDD 2.0–3.6 V,"
+                        " Tj industrial. Pin names simplified for host-board checks; currents seed."],
+        },
     )
 
     return syms
@@ -1248,6 +1467,154 @@ def _make_footprints() -> dict:
         description="QFN-48 7x7 mm 0.5 mm pitch with exposed pad (pin 49)",
     )
 
+    # ── Inductor SMD L_0603 / L_0805 (same pad geometry as R of same size) ──
+    fps["Inductor_SMD:L_0603"] = _fp(
+        "Inductor_SMD:L_0603",
+        pads=[
+            _smd_pad("p1", "1", -0.8, 0.0, 0.9, 0.9, 0.25),
+            _smd_pad("p2", "2", 0.8, 0.0, 0.9, 0.9, 0.25),
+        ],
+        graphics=_silk_box(-1.0, -0.5, 1.0, 0.5) + _crtyd_box(-1.3, -0.7, 1.3, 0.7),
+        description="Inductor 0603",
+    )
+    fps["Inductor_SMD:L_0805"] = _fp(
+        "Inductor_SMD:L_0805",
+        pads=[
+            _smd_pad("p1", "1", -1.0, 0.0, 1.15, 1.45, 0.25),
+            _smd_pad("p2", "2", 1.0, 0.0, 1.15, 1.45, 0.25),
+        ],
+        graphics=_silk_box(-1.2, -0.7, 1.2, 0.7) + _crtyd_box(-1.7, -1.0, 1.7, 1.0),
+        description="Inductor 0805",
+    )
+    # Ferrite bead reuses 0603 geometry with FB-friendly fpid.
+    fps["Inductor_SMD:FB_0603"] = _fp(
+        "Inductor_SMD:FB_0603",
+        pads=[
+            _smd_pad("p1", "1", -0.8, 0.0, 0.9, 0.9, 0.25),
+            _smd_pad("p2", "2", 0.8, 0.0, 0.9, 0.9, 0.25),
+        ],
+        graphics=_silk_box(-1.0, -0.5, 1.0, 0.5) + _crtyd_box(-1.3, -0.7, 1.3, 0.7),
+        description="Ferrite bead 0603",
+    )
+
+    # ── Polarised electrolytic radial (THT, 2 pins) ────────────────────────
+    # Generic 5 mm can, 2.0 mm pitch: pad 1 = +, pad 2 = −.
+    fps["Capacitor_THT:CP_Radial_D5.0mm_P2.00mm"] = _fp(
+        "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm",
+        pads=[
+            _tht_pad("p1", "1", -1.0, 0.0, 0.7, 1.6, 1.6),
+            _tht_pad("p2", "2", 1.0, 0.0, 0.7, 1.6, 1.6),
+        ],
+        graphics=[
+            {"type": "circle", "center": [0.0, 0.0], "radius": 2.5,
+             "layer": "F.SilkS", "width": _SILK_W},
+            _line(-0.5, 1.5, 0.5, 1.5),
+            _line(0.0, 1.0, 0.0, 2.0),
+        ] + _crtyd_box(-3.0, -3.0, 3.0, 3.0),
+        attr="tht",
+        description="Radial electrolytic capacitor D5.0 mm pitch 2.0 mm",
+    )
+
+    # ── SOT-223 (4 pads: 3 leads + tab) ────────────────────────────────────
+    # JEDEC TO-261 nominal: pins 1/2/3 bottom, tab pin 4 top.
+    fps["Package_TO_SOT_SMD:SOT-223"] = _fp(
+        "Package_TO_SOT_SMD:SOT-223",
+        pads=[
+            _smd_pad("p1", "1", -2.3, -2.15, 1.2, 1.8, 0.2),
+            _smd_pad("p2", "2", 0.0, -2.15, 1.2, 1.8, 0.2),
+            _smd_pad("p3", "3", 2.3, -2.15, 1.2, 1.8, 0.2),
+            _smd_pad("p4", "4", 0.0, 2.35, 3.6, 2.15, 0.1),
+        ],
+        graphics=_silk_box(-3.3, -1.8, 3.3, 1.8) + _crtyd_box(-3.8, -3.5, 3.8, 3.8),
+        description="SOT-223 3-lead + tab",
+    )
+
+    # ── TO-220-3 (THT) ─────────────────────────────────────────────────────
+    fps["Package_TO_SOT_THT:TO-220-3"] = _fp(
+        "Package_TO_SOT_THT:TO-220-3",
+        pads=[
+            _tht_pad("p1", "1", -2.54, 0.0, 1.0, 2.0, 2.0),
+            _tht_pad("p2", "2", 0.0, 0.0, 1.0, 2.0, 2.0),
+            _tht_pad("p3", "3", 2.54, 0.0, 1.0, 2.0, 2.0),
+        ],
+        graphics=_silk_box(-5.0, -2.0, 5.0, 8.0) + _crtyd_box(-5.5, -2.5, 5.5, 8.5),
+        attr="tht",
+        description="TO-220 3-lead through-hole",
+    )
+
+    # ── 2xN pin headers 2.54 mm ────────────────────────────────────────────
+    def _header_2xn_fp(cols: int) -> dict:
+        pads = []
+        for row in range(cols):
+            y = (cols - 1) * 1.27 - row * 2.54
+            n_left = row * 2 + 1
+            n_right = row * 2 + 2
+            pads.append(_tht_pad(f"p{n_left}", str(n_left), -1.27, y, 1.0, 1.7, 1.7))
+            pads.append(_tht_pad(f"p{n_right}", str(n_right), 1.27, y, 1.0, 1.7, 1.7))
+        h = cols * 1.27 + 1.5
+        fpid = f"Connector_PinHeader_2.54mm:Header_2x{cols:02d}"
+        return _fp(
+            fpid, pads=pads,
+            graphics=_silk_box(-2.0, -h, 2.0, h) + _crtyd_box(-2.6, -h - 0.5, 2.6, h + 0.5),
+            attr="tht",
+            description=f"2x{cols} pin header 2.54 mm pitch",
+        )
+
+    fps["Connector_PinHeader_2.54mm:Header_2x03"] = _header_2xn_fp(3)
+    fps["Connector_PinHeader_2.54mm:Header_2x05"] = _header_2xn_fp(5)
+
+    # ── USB-B receptacle (4 pins, simplified THT) ──────────────────────────
+    fps["Connector_USB:USB_B"] = _fp(
+        "Connector_USB:USB_B",
+        pads=[
+            _tht_pad("p1", "1", -3.5, 2.5, 1.0, 1.8, 1.8),
+            _tht_pad("p2", "2", -1.2, 2.5, 1.0, 1.8, 1.8),
+            _tht_pad("p3", "3", 1.2, 2.5, 1.0, 1.8, 1.8),
+            _tht_pad("p4", "4", 3.5, 2.5, 1.0, 1.8, 1.8),
+        ],
+        graphics=_silk_box(-6.0, -4.0, 6.0, 6.0) + _crtyd_box(-6.5, -4.5, 6.5, 6.5),
+        attr="tht",
+        description="USB Type-B receptacle 4-pin",
+    )
+
+    # ── USB-C receptacle (simplified 16 SMD pads) ──────────────────────────
+    usbc_pads = []
+    for i in range(16):
+        # two rows of 8, pitch 0.5 mm
+        row = 0 if i < 8 else 1
+        col = i if i < 8 else i - 8
+        x = (col - 3.5) * 0.5
+        y = -1.6 if row == 0 else 1.6
+        usbc_pads.append(_smd_pad(f"p{i+1}", str(i + 1), x, y, 0.3, 1.0, 0.25))
+    fps["Connector_USB:USB_C"] = _fp(
+        "Connector_USB:USB_C",
+        pads=usbc_pads,
+        graphics=_silk_box(-4.5, -3.5, 4.5, 3.5) + _crtyd_box(-5.0, -4.0, 5.0, 4.0),
+        description="USB Type-C receptacle simplified 16-pad",
+    )
+
+    # ── LQFP-48 7x7 mm 0.5 mm pitch (generic MCU) ──────────────────────────
+    lqfp48_pads = []
+    for i in range(12):  # 1-12 left, top to bottom
+        y = (5.5 - i) * 0.5
+        lqfp48_pads.append(_smd_pad(f"p{i+1}", str(i + 1), -4.0, y, 1.0, 0.28, 0.25))
+    for i in range(12):  # 13-24 bottom, left to right
+        x = (i - 5.5) * 0.5
+        lqfp48_pads.append(_smd_pad(f"p{i+13}", str(i + 13), x, -4.0, 0.28, 1.0, 0.25))
+    for i in range(12):  # 25-36 right, bottom to top
+        y = (i - 5.5) * 0.5
+        lqfp48_pads.append(_smd_pad(f"p{i+25}", str(i + 25), 4.0, y, 1.0, 0.28, 0.25))
+    for i in range(12):  # 37-48 top, right to left
+        x = (5.5 - i) * 0.5
+        lqfp48_pads.append(_smd_pad(f"p{i+37}", str(i + 37), x, 4.0, 0.28, 1.0, 0.25))
+    fps["Package_QFP:LQFP-48_7x7mm_P0.5mm"] = _fp(
+        "Package_QFP:LQFP-48_7x7mm_P0.5mm",
+        pads=lqfp48_pads,
+        graphics=_silk_box(-3.6, -3.6, 3.6, 3.6) + _crtyd_box(-5.0, -5.0, 5.0, 5.0)
+        + [_circle(-4.5, 3.5, 0.15)],
+        description="LQFP-48 7x7 mm 0.5 mm pitch",
+    )
+
     # Final pass: clip every footprint's silk off its pads so no generated footprint
     # ships silk over copper (DFM silk_over_pad) — generic, covers all sizes + future parts.
     for fp in fps.values():
@@ -1300,6 +1667,20 @@ _FOOTPRINT_ENG: dict[str, dict] = {
     "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical":
         _box(10.16, 2.54, 8.5, source=_JEDEC_SRC + " Header height incl. pins (nominal)."),
     "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm": _box(7.0, 7.0, 0.85, theta_ja=28.0),
+    "Inductor_SMD:L_0603": _box(1.6, 0.8, 0.8),
+    "Inductor_SMD:L_0805": _box(2.0, 1.25, 1.25),
+    "Inductor_SMD:FB_0603": _box(1.6, 0.8, 0.8),
+    "Capacitor_THT:CP_Radial_D5.0mm_P2.00mm":
+        _pkg_eng("cylinder", d_mm=5.0, h_mm=11.0, source=_JEDEC_SRC),
+    "Package_TO_SOT_SMD:SOT-223": _box(6.5, 3.5, 1.8, theta_ja=60.0),
+    "Package_TO_SOT_THT:TO-220-3": _box(10.0, 4.5, 9.0, theta_ja=50.0),
+    "Connector_PinHeader_2.54mm:Header_2x03":
+        _box(7.62, 5.08, 8.5, source=_JEDEC_SRC + " Header height incl. pins (nominal)."),
+    "Connector_PinHeader_2.54mm:Header_2x05":
+        _box(12.7, 5.08, 8.5, source=_JEDEC_SRC + " Header height incl. pins (nominal)."),
+    "Connector_USB:USB_B": _box(12.0, 11.0, 10.0),
+    "Connector_USB:USB_C": _box(8.9, 7.3, 3.2),
+    "Package_QFP:LQFP-48_7x7mm_P0.5mm": _box(7.0, 7.0, 1.4, theta_ja=45.0),
 }
 _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
     _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"]

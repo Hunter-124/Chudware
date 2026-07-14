@@ -1253,3 +1253,42 @@ staged full-OCCT engine for a solver-backed simsuite integration run (numerics v
 abandoned timed-out provider/vendor daemon threads finish on their own but occupy a thread until their
 own client timeout. Pre-existing, unrelated: `scripts/check.py feature_surface_audit` flags Sketch3D/
 ReverseEng ribbon commands in `host/src/ui/ribbon_def.cpp` lacking handlers (untouched this pass).
+
+## 2026-07-14b — ECAD/electric/EM + emulators + parts libs + providers + compact MCP serving
+
+Follow-up push (FEA mesh/solver intentionally excluded — separate project). Plan:
+`services/dag/templates/ecad_electric_parts_serving_perfection.json` (validated aicad.dag/1, 15
+nodes). Five disjoint-write-set agents; recon by five scouts first. **Circuit sim** (`core/sim/spice.cpp`,
+`engine_oracle/sim/devices.py`): implemented the voltage-controlled Switch `S` (was a raising stub) and
+MOSFET level-1 small-signal caps (Cgs/Cgd/Cds) so AC has a real pole — Python+C++ parity within 1%
+(Switch on/off 0.000%, MOSFET pole 0.01%). **EM via MCP** (new `services/mcp/em_tools.py`,
+registered in `server.py`): `em_status/em_eigenmode/em_driven/em_timedomain` over the validated
+builtin-FDFD + analytic adapters (WR-90 TE10 0.006% through MCP), honest openEMS skip when the binary
+is absent, compact summaries (raw field arrays only behind `detail`). **Emulators** (`engine_oracle/firmware`):
+fixed the MCU family split so a board-linked STM32F4/F1 selects a peripheral-capable platform instead of
+the generic no-peripheral `cortex-m`; registered `fw_power_profile` in the worker RPC set; added an
+arm-none-eabi-gcc build preflight (`toolchain_not_found` instead of an opaque CMake wall); updated the
+stale test expectations that encoded the old `cortex-m4` mapping (235 firmware tests pass). **Parts libs**
+(`core/parts/catalog.cpp`, `engine_oracle/ecad/library/starter.py`): fixed the bearing federation bug —
+core now builds every ISO 15 size the bolts YAML advertises (6005-6008/6200-6208/6300-6305, incl 6205
+25x52x15), so `make_standard_part('bearing','6205')` no longer fails after search shows it; corrected
+BJT/MOSFET symbol pins to SOT-23 pads and added a datasheet-correct `Amplifier_Operational:LM358`;
+added a real-board essentials pack (generic QFP-48 MCU, AMS1117-3.3/7805 regulators, 2xN headers, USB-C/B,
+L_0603/0805 + ferrite-bead + electrolytic footprints) with `_DEFAULT_FOOTPRINTS` wired in BOTH
+`orchestrator.py` and `sync.py` (the actual board-build path — mirrored so `ecad_make_board` places the
+new parts). **Providers** (`engine_oracle/parts_providers.py`, browser adapters): wired the DigiKey
+Product v4 (OAuth2 client-credentials + keyword search → VendorPart) and Mouser SearchByPartNumber APIs
+(were stubs that raised even with creds), fail-closed without creds, never fabricating; added a digikey_web
+narrow-MPN product drill-down and fixed the dfrobot search route; vendors_health honesty confirmed.
+**Compact MCP serving** (new `services/mcp/result_serving.py`): summary/list/full detail + pagination +
+priority-drop that never drops ok/summary/counts/erc-drc/hint/next_actions, compact JSON by default
+(`AICAD_MCP_PRETTY=1` to pretty). Applied to `ecad_status` (33-comp board: **784 tokens** summary vs
+~5.6k before; `detail=full` retains full ref+net sets), `part_search` (row projection, 947 tok vs 4.4k;
+full record still via `part_get`), and `ecad_simulate` (default probe cap + always-summarized tran/ac,
+no per-timestep arrays). Gates: ECAD MCP suite 115 passed; parts/providers/library/EM 367 passed/7
+skipped; core ctest parts+spice+sim 8/8; firmware 235 passed; circuit gates + em MCP green. Landed in
+5 commits. Deferred/honest limits: openEMS full-wave needs the binary (analytic + FDFD cover the
+validated cases); MOSFET caps are constant-C (not region-dependent Meyer); noise still 4kTR resistor
+floor; DigiKey/Mouser live API unexercised without keys (offline-fixture verified); other domain tools'
+`_dumps` not yet migrated to result_serving. Pre-existing/unrelated: `check.py feature_surface_audit`
+ribbon-handler flags in `host/src/ui/ribbon_def.cpp`.

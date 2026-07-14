@@ -1,0 +1,492 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "mission-simulation-acceleration-ecad-parts-repair-2026-07",
+  "name": "Simulation Acceleration + ECAD MCP + Parts Repair",
+  "nodes": [
+    {
+      "id": "n_reconcile_wip",
+      "type": "plan",
+      "name": "Reconcile existing simulation work",
+      "inputs": {
+        "request": "Preserve and review the existing uncommitted assembly-FEA and host changes before any optimization. Establish which current behaviors are baseline, compile them, and never overwrite unrelated user edits.",
+        "write_set": [
+          "core/sim/fea_run.cpp",
+          "core/sim/fea_static.cpp",
+          "core/sim/fea_static.h",
+          "core/sim/mesher.cpp",
+          "host/src/core/app_state.h",
+          "host/src/ui/sketch_mode.cpp",
+          "host/src/ui/viewport_panel.cpp"
+        ]
+      },
+      "tools": null,
+      "end_condition": "Existing changes are preserved, their purpose is recorded, and the current core/host build state is known.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_baseline_sim",
+      "type": "simulate",
+      "name": "Capture simulation baseline",
+      "inputs": {
+        "request": "Run focused simsuite quick/domain baselines and phase profiling. Record cold/warm mesh, setup, assemble, analyze, factorize, solve, recovery, overlay, LBM loop, wall time, peak memory, thread count, and accuracy against the 2026-07-13T012422Z 91-case baseline.",
+        "commands": [
+          "AI_CAD_ENGINE_DAEMON=0 .venv-mcp/bin/python benchmarks/simsuite/run_all.py --quick --only fea_static,fea_modal_freq,fea_thermal,cfd,profiler",
+          "engine_profile(action=reset_phases)",
+          "engine_profile(action=phases)"
+        ]
+      },
+      "tools": ["engine_profile"],
+      "end_condition": "A machine-readable pre-change baseline exists with phase coverage and accuracy metrics for representative FEA and CFD cases.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_baseline_assets",
+      "type": "simulate",
+      "name": "Profile representative STEP corpus",
+      "inputs": {
+        "request": "Profile import, mesh, setup, solve, and repeat-run behavior on deterministic small, medium, and large STEP+ assets under the resource governor. Capture exact cache hit/miss behavior and skip the large case only with an explicit governor reason.",
+        "assets": {
+          "small": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-400_Steering/CD-403_Upright_R.step+",
+          "medium": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-103_Hinge/CD-103_Hinge_Leaf_A.step+",
+          "large": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-000_GA/CD-000_GA_Deployed_v6.step+"
+        }
+      },
+      "tools": ["engine_profile", "import_part"],
+      "end_condition": "Cold and warm timing plus memory figures exist for small and medium assets; the large asset either completes safely or records a resource-governor skip.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_repro_ecad",
+      "type": "ecad",
+      "name": "Reproduce ECAD MCP failures",
+      "inputs": {
+        "request": "Reproduce a fresh ecad_design voltage-divider call, immediate ecad_status follow-up, family-restricted tool registration, session recovery, and module-alias state sharing. Capture transport timing and whether a timed-out design blocks subsequent MCP requests.",
+        "observed_failure": "ecad_design('5V voltage divider with 2.5V output') exceeded the 30 second MCP timeout; the following ecad_status call also timed out."
+      },
+      "tools": ["ecad_design", "ecad_status", "ecad_run_erc"],
+      "end_condition": "Every ECAD failure has a deterministic reproduction and an owning layer: transport budget, planning/build isolation, session state, package identity, or registration family.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_repro_parts",
+      "type": "source",
+      "name": "Reproduce parts failures",
+      "inputs": {
+        "request": "Reproduce plain local search, category+facet search, live-vendor fan-out, host facet filtering, part_source routing, watched local-library federation, generated-model placement, and vendor-health behavior.",
+        "observed_failure": "part_search(query='tube', category_id='structural_stock.metal_tube', facets={od_mm:25.4, alloy:4130}) exceeded the 30 second MCP timeout while plain M8 search and 6205 part_source succeeded."
+      },
+      "tools": ["part_search", "part_source", "parts_taxonomy", "vendors_health"],
+      "end_condition": "Fast local, faceted, live, sourced, placed, local-library, and degraded vendor paths each have a deterministic expected envelope and latency bound.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_gate_baseline",
+      "type": "gate",
+      "name": "Freeze measured contracts",
+      "inputs": {
+        "request": "Freeze pre-change correctness, latency, cache, memory, and failure-reproduction contracts. Reject speculative optimization nodes whose target phase is not measurable."
+      },
+      "tools": null,
+      "end_condition": "All implementation nodes have a measured problem statement, exact write set, and regression gate.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_sim_component_mesh_cache",
+      "type": "structural",
+      "name": "Cache unchanged component meshes",
+      "inputs": {
+        "request": "Extend the existing content-addressed mesh cache into a governor-bounded component/solid mesh cache so small assembly geometry changes remesh only changed solids. Use full geometry content plus every MeshOptions field in the key; never key by path or bounding box. Preserve Netgen serialization and current assembly bond behavior.",
+        "write_set": ["core/sim/mesher.cpp", "core/sim/mesher.h", "core/tests/test_sim.cpp"],
+        "acceptance": [
+          "A repeat unchanged assembly solve performs zero Netgen generation work.",
+          "Changing one solid produces one component cache miss while unchanged solids hit.",
+          "Mesh quality, connectivity, node ordering, and tet4 parity do not regress.",
+          "Cache residency obeys a byte budget derived from the resource governor."
+        ]
+      },
+      "tools": null,
+      "end_condition": "Assembly mesh reuse is content-safe, memory-bounded, observable, and covered by focused tests.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_sim_factor_cache",
+      "type": "structural",
+      "name": "Reuse prepared static systems",
+      "inputs": {
+        "request": "Add a bounded prepared-system cache for static FEA load-case comparisons. Reuse reduced DOF maps, assembled K, symbolic ordering, and numeric factorization only when mesh, element order, material, fixtures, and bond springs are identical. Loads and yield strength must not invalidate stiffness; any structural input change must miss safely.",
+        "write_set": ["core/sim/fea_static.cpp", "core/sim/fea_static.h", "core/tests/test_sim.cpp"],
+        "acceptance": [
+          "A load-only repeat reports a factor-cache hit and skips assembly/analyze/factorize.",
+          "Material, fixture, mesh, element-order, or bond changes miss the cache.",
+          "Displacement, stress, reactions, energy, and FoS match uncached results within existing tolerances; tet4 remains byte-stable where required.",
+          "Cache is thread-safe and resource-governor bounded."
+        ]
+      },
+      "tools": null,
+      "end_condition": "Load-only design comparisons reuse a valid prepared system without changing numerical contracts.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_sim_faceset_index",
+      "type": "structural",
+      "name": "Accelerate boundary-condition setup",
+      "inputs": {
+        "request": "Replace repeated O(nodes × samples) faceset matching with a deterministic spatial index and per-mesh faceset cache. Parallelize independent face/load resolution where it preserves accumulation order. Keep analytic surface tests and empty-fixture hard failures.",
+        "write_set": ["core/sim/fea_run.cpp", "core/tests/test_sim.cpp", "services/mcp/test_fea_static_suite.py"],
+        "acceptance": [
+          "Dense faceset setup scales sub-quadratically and is faster than baseline on the medium asset.",
+          "Pressure/force resultants and cylinder surface coverage stay within existing error thresholds.",
+          "A fixture resolving to zero nodes still fails loudly."
+        ]
+      },
+      "tools": null,
+      "end_condition": "Boundary-condition setup is indexed, cached, deterministic, and regression-covered.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_sim_cuda_lbm",
+      "type": "simulate",
+      "name": "Add optional CUDA LBM backend",
+      "inputs": {
+        "request": "Implement an optional CUDA 13 backend for the D3Q19 LBM collision, streaming, bounce-back, inlet, and force-reduction payload. Runtime backend selection is auto|cpu|cuda with honest fallback; voxelization remains CPU. Keep the existing OpenMP backend as the portable reference.",
+        "write_set": ["core/sim/lbm.cpp", "core/sim/lbm.h", "core/sim/lbm_cuda.cu", "core/sim/lbm_cuda.h", "core/CMakeLists.txt", "benchmarks/simsuite/cfd_bench.py", "core/tests/test_sim.cpp"],
+        "acceptance": [
+          "CUDA build is optional and CPU-only builds remain green.",
+          "CPU and CUDA fields/forces agree within the existing float32 parity tolerance.",
+          "Backend and fallback reason are visible in results/profiling.",
+          "The 96-cell, 2000-step benchmark is at least 3x faster on the installed RTX 3080 Ti, or the measured limiting transfer is reported without weakening correctness."
+        ]
+      },
+      "tools": ["engine_profile"],
+      "end_condition": "A parity-gated CUDA LBM path accelerates sufficiently large lattices and falls back safely everywhere else.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_ecad_design_deadline",
+      "type": "ecad",
+      "name": "Make ECAD design transport-safe",
+      "inputs": {
+        "request": "Separate provider planning from session creation/build so a timed-out provider cannot continue a full design pipeline concurrently with recipe fallback. Apply an end-to-end deadline below the MCP transport limit, keep the server responsive, and return a structured background/degraded result instead of hanging.",
+        "write_set": ["services/mcp/ecad_tools.py", "engine_oracle/ecad/orchestrator.py", "services/mcp/test_ecad_hardening.py", "services/mcp/test_ecad_tools.py"],
+        "acceptance": [
+          "Slow provider path returns or degrades before the client timeout.",
+          "Immediate ecad_status remains responsive after a timed-out plan.",
+          "Only one schematic build occurs and recipe fallback remains verified.",
+          "A late provider result cannot replace current_sch/current."
+        ]
+      },
+      "tools": null,
+      "end_condition": "ecad_design cannot wedge the MCP process or race a fallback build.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_ecad_session_identity",
+      "type": "ecad",
+      "name": "Unify ECAD session identity",
+      "inputs": {
+        "request": "Guarantee mcp_server.ecad_tools and services.mcp.ecad_tools resolve to one module object/state store. Make warm autosave recovery monotonic: it fills empty defaults but never overwrites a newly-created or explicitly-selected document. Add explicit multi-document isolation tests.",
+        "write_set": ["services/mcp/__init__.py", "services/mcp/server.py", "services/mcp/ecad_tools.py", "services/mcp/ecad_thermal.py", "services/mcp/ecad_reliability.py", "services/mcp/heatsink.py", "services/mcp/test_ecad_hardening.py"],
+        "acceptance": [
+          "Both import paths observe the same _ECAD and _THERMAL objects.",
+          "Warm recovery never replaces non-empty current_sch/current_pcb/current.",
+          "Explicit doc_id calls stay isolated across multiple schematics and boards."
+        ]
+      },
+      "tools": null,
+      "end_condition": "All ECAD MCP tools share one race-safe session store.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_ecad_registration",
+      "type": "ecad",
+      "name": "Repair ECAD tool registration",
+      "inputs": {
+        "request": "Bring the live ECAD core, pack, handoff, heatsink, and power-budget catalog into one family-consistent registration set. Update stale expected-tool tests and ensure family:ecad allow-listing permits every ECAD tool without exposing unrelated families.",
+        "write_set": ["services/mcp/server.py", "services/mcp/tool_registry.py", "services/mcp/test_ecad_tools.py", "services/mcp/test_ecad_packs.py", "services/mcp/test_power_budget.py"],
+        "acceptance": [
+          "No registered ECAD tool is missing from catalog tests.",
+          "power_budget has the intended ECAD family/risk metadata.",
+          "family:ecad policy permits core, pack, 3D, reliability, heatsink, and power tools."
+        ]
+      },
+      "tools": null,
+      "end_condition": "ECAD MCP registration, catalog metadata, and allow-list behavior agree.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_live_deadline",
+      "type": "source",
+      "name": "Bound live parts search",
+      "inputs": {
+        "request": "Make explicit live-vendor fan-out concurrent and deadline-bounded, preserving instant local results and returning per-site timeout/login notices instead of blocking the MCP transport. Category routing must query only relevant sites and never serialize slow adapters.",
+        "write_set": ["engine_oracle/parts_hub/hub.py", "services/mcp/parts_tools.py", "engine_oracle/parts_hub/test_parts_hub_p3.py", "services/mcp/test_parts_tools_v2.py"],
+        "acceptance": [
+          "The observed structural-tube facet query returns within 5 seconds even when a routed vendor stalls.",
+          "Fast provider results are retained when another provider times out.",
+          "Local-only search performs no network access.",
+          "Timeout/login states appear as honest notices."
+        ]
+      },
+      "tools": null,
+      "end_condition": "Live parts lookup is partial-result tolerant and transport-safe.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_facet_alias",
+      "type": "source",
+      "name": "Unify parts facet filtering",
+      "inputs": {
+        "request": "Use the shared alias-aware facet parameter view in host/worker filtering so taxonomy keys such as bore_mm and od_mm match local records that store bore and outer_d. Keep range, enum, and text semantics identical to MCP search.",
+        "write_set": ["engine_oracle/parts_hub/gui_rpc.py", "engine_oracle/parts_hub/test_parts_worker_rpc.py"],
+        "acceptance": [
+          "A 12 mm bore filter returns the local 6001 bearing through host RPC.",
+          "Host RPC and MCP return the same local record ids for equivalent category/facet queries."
+        ]
+      },
+      "tools": null,
+      "end_condition": "Host and MCP use one facet vocabulary and produce matching local results.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_source_routing",
+      "type": "source",
+      "name": "Repair deterministic sourcing routes",
+      "inputs": {
+        "request": "Pass taxonomy route sites through part_source and include catalog providers only when routed. Preserve deterministic scoring and artifact plans while avoiding unrelated vendor fan-out.",
+        "write_set": ["engine_oracle/parts_hub/source.py", "engine_oracle/parts_hub/test_source.py"],
+        "acceptance": [
+          "Injected search tests receive the taxonomy sites list.",
+          "Structural tube sourcing cannot query electronics vendors.",
+          "Offline/login-required adapters never fabricate candidates."
+        ]
+      },
+      "tools": null,
+      "end_condition": "part_source executes the taxonomy route it reports.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_local_federation",
+      "type": "source",
+      "name": "Federate watched local parts",
+      "inputs": {
+        "request": "Expose watched local STEP/STEP+ vendor_parts through the PartsHub index using a real indexable provider and trigger safe index refresh after scan/register changes. Preserve editable import_file geometry and provenance.",
+        "write_set": ["engine_oracle/parts_library.py", "engine_oracle/vendor_parts.py", "engine_oracle/parts_hub/hub.py", "engine_oracle/parts_hub/adapters/local_library_adapter.py", "engine_oracle/test_parts_library.py", "engine_oracle/test_vendor_parts.py"],
+        "acceptance": [
+          "A dropped local STEP file becomes searchable by title and part number after scan.",
+          "Removing or replacing the file invalidates the index entry.",
+          "part_place imports the found file as an editable document."
+        ]
+      },
+      "tools": null,
+      "end_condition": "The built-in watched library and unified search index no longer diverge.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_place_health",
+      "type": "source",
+      "name": "Complete placement and health envelopes",
+      "inputs": {
+        "request": "Make generate_model placement import the produced geometry and return a real document id. Report optional browser-adapter bootstrap failures and login-wizard health as deferred/needs_human_login rather than empty success.",
+        "write_set": ["engine_oracle/parts_hub/place.py", "engine_oracle/parts_hub/hub.py", "services/browser/health.py", "engine_oracle/parts_hub/test_parts_hub_p3.py", "services/browser/adapters/test_parts_provider.py"],
+        "acceptance": [
+          "generate_model placement returns ok, editable=true, and a real doc id when core import is available.",
+          "Browser adapter import failure leaves local search working and emits a diagnostic.",
+          "Active login wizard produces deferred/needs_human_login status, never an empty all-clear."
+        ]
+      },
+      "tools": null,
+      "end_condition": "All placeable geometry kinds and vendor-health degradation states are truthful and actionable.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_sim",
+      "type": "verify",
+      "name": "Verify simulation acceleration",
+      "inputs": {
+        "request": "Build core and run focused mesh/static/modal/thermal/CFD/profiler/parity tests. Compare CPU cached/uncached and CUDA/CPU results, memory bounds, and phase timings against baseline.",
+        "acceptance": [
+          "No existing accuracy threshold regresses.",
+          "Cache hits and invalidation paths are explicitly tested.",
+          "CPU-only and CUDA-enabled builds both pass.",
+          "Warm load-only and small-assembly-edit comparisons are materially faster than cold baseline."
+        ]
+      },
+      "tools": ["engine_profile"],
+      "end_condition": "Simulation correctness, portability, resource use, and measured speedups all pass.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_ecad",
+      "type": "verify",
+      "name": "Verify ECAD MCP end to end",
+      "inputs": {
+        "request": "Run focused ECAD registration, hardening, schematic simulation, board pack, and power-budget tests plus a live fresh-design smoke. Verify subsequent MCP requests remain responsive.",
+        "acceptance": [
+          "Voltage-divider design returns before transport timeout and sim error is at most 0.1 percent.",
+          "Immediate status/ERC calls succeed.",
+          "All intended ECAD tools are registered under the correct family.",
+          "Recovery and dual-import state tests pass."
+        ]
+      },
+      "tools": ["ecad_design", "ecad_status", "ecad_run_erc"],
+      "end_condition": "ECAD MCP core, packs, session state, and timeout behavior work in one process.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_parts",
+      "type": "verify",
+      "name": "Verify parts workflows end to end",
+      "inputs": {
+        "request": "Run hub, worker RPC, MCP V2, local-library, placement, and browser-adapter tests. Repeat the observed tube query with a stalled fake provider and smoke actual local M8/bearing searches.",
+        "acceptance": [
+          "No parts MCP call exceeds its deadline.",
+          "Host and MCP faceted ids agree.",
+          "Local watched parts are searchable and placeable.",
+          "Source routing and degraded vendor notices are deterministic."
+        ]
+      },
+      "tools": ["part_search", "part_source", "vendors_health"],
+      "end_condition": "Search, source, library, place, and health paths all satisfy the unified contract.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_post_benchmark",
+      "type": "simulate",
+      "name": "Measure post-change performance",
+      "inputs": {
+        "request": "Repeat the exact pre-change simsuite, phase-profile, and small/medium/large asset scenarios on a quiet machine. Produce cold/warm deltas, cache hit ratios, CPU/CUDA speedups, memory, and accuracy tables."
+      },
+      "tools": ["engine_profile", "import_part"],
+      "end_condition": "Before/after performance and correctness data exists for every optimization claim.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_integration_gate",
+      "type": "gate",
+      "name": "Run integration gate",
+      "inputs": {
+        "request": "Run the repo gate after focused suites pass. Reject accuracy regressions, deadlocks, stale session state, unbounded network calls, CUDA-only portability, or cache invalidation defects."
+      },
+      "tools": null,
+      "end_condition": "scripts/gate.sh passes with only documented environment skips.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_full_simsuite",
+      "type": "simulate",
+      "name": "Run full simulation suite",
+      "inputs": {
+        "request": "Run the full serial simsuite and compare all 91 baseline cases plus any new cache/CUDA cases. Preserve existing known CFD accuracy caveats rather than masking them."
+      },
+      "tools": ["engine_profile"],
+      "end_condition": "Full simsuite exits cleanly with no new failures/skips or unexplained accuracy/timing regressions.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_report",
+      "type": "report",
+      "name": "Report verified outcomes",
+      "inputs": {
+        "request": "Record files changed, observed failures fixed, before/after timings, cache invalidation rules, CUDA fallback behavior, verification commands, remaining physics limitations, and benchmark artifact paths in the existing refactor log and performance result outputs."
+      },
+      "tools": null,
+      "end_condition": "Maintainers can reproduce every performance and correctness claim from recorded artifacts.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    }
+  ],
+  "edges": [
+    {"from": "n_reconcile_wip", "to": "n_baseline_sim"},
+    {"from": "n_reconcile_wip", "to": "n_baseline_assets"},
+    {"from": "n_reconcile_wip", "to": "n_repro_ecad"},
+    {"from": "n_reconcile_wip", "to": "n_repro_parts"},
+    {"from": "n_baseline_sim", "to": "n_gate_baseline"},
+    {"from": "n_baseline_assets", "to": "n_gate_baseline"},
+    {"from": "n_repro_ecad", "to": "n_gate_baseline"},
+    {"from": "n_repro_parts", "to": "n_gate_baseline"},
+
+    {"from": "n_gate_baseline", "to": "n_sim_component_mesh_cache"},
+    {"from": "n_gate_baseline", "to": "n_sim_factor_cache"},
+    {"from": "n_gate_baseline", "to": "n_sim_faceset_index"},
+    {"from": "n_gate_baseline", "to": "n_sim_cuda_lbm"},
+    {"from": "n_gate_baseline", "to": "n_ecad_design_deadline"},
+    {"from": "n_gate_baseline", "to": "n_ecad_session_identity"},
+    {"from": "n_gate_baseline", "to": "n_ecad_registration"},
+    {"from": "n_gate_baseline", "to": "n_parts_live_deadline"},
+    {"from": "n_gate_baseline", "to": "n_parts_facet_alias"},
+    {"from": "n_gate_baseline", "to": "n_parts_source_routing"},
+    {"from": "n_gate_baseline", "to": "n_parts_local_federation"},
+    {"from": "n_gate_baseline", "to": "n_parts_place_health"},
+
+    {"from": "n_sim_component_mesh_cache", "to": "n_verify_sim"},
+    {"from": "n_sim_factor_cache", "to": "n_verify_sim"},
+    {"from": "n_sim_faceset_index", "to": "n_verify_sim"},
+    {"from": "n_sim_cuda_lbm", "to": "n_verify_sim"},
+
+    {"from": "n_ecad_design_deadline", "to": "n_verify_ecad"},
+    {"from": "n_ecad_session_identity", "to": "n_verify_ecad"},
+    {"from": "n_ecad_registration", "to": "n_verify_ecad"},
+
+    {"from": "n_parts_live_deadline", "to": "n_verify_parts"},
+    {"from": "n_parts_facet_alias", "to": "n_verify_parts"},
+    {"from": "n_parts_source_routing", "to": "n_verify_parts"},
+    {"from": "n_parts_local_federation", "to": "n_verify_parts"},
+    {"from": "n_parts_place_health", "to": "n_verify_parts"},
+
+    {"from": "n_verify_sim", "to": "n_post_benchmark"},
+    {"from": "n_verify_ecad", "to": "n_post_benchmark"},
+    {"from": "n_verify_parts", "to": "n_post_benchmark"},
+    {"from": "n_post_benchmark", "to": "n_integration_gate"},
+    {"from": "n_integration_gate", "to": "n_full_simsuite"},
+    {"from": "n_full_simsuite", "to": "n_report"}
+  ]
+}

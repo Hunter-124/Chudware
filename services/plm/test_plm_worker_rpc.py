@@ -76,9 +76,19 @@ def _call(method: str, **params):
 # ---------------------------------------------------------------------------
 
 def test_all_methods_envelope_on_missing_path():
+    # AI-VC methods are doc_id-scoped (not project-path vault); empty params are
+    # valid for plm_timeline (empty list) and invalid for plm_rollback (needs `to`).
+    _AI_VC = {"plm_timeline", "plm_rollback"}
     for name, fn in worker_rpc.WORKER_METHODS.items():
         out = fn({}, _emit)
         assert isinstance(out, dict), name
+        if name == "plm_timeline":
+            assert out.get("ok") is True and "checkpoints" in out, name
+            continue
+        if name == "plm_rollback":
+            assert out.get("ok") is False and "reason" in out, name
+            _assert_no_git_vocab(str(out.get("hint", "")))
+            continue
         assert out.get("ok") is False, name
         assert "reason" in out, name
         _assert_no_git_vocab(str(out.get("hint", "")))

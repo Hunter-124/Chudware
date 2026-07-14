@@ -246,6 +246,10 @@ class MissionDispatch:
         Requires the mission's live delegation tree; without one this returns a
         structured refusal (and records the request) — do the work directly or
         escalate in your handoff.
+
+        WS4: spawn-depth policy (max_spawn_depth from capability / config) is
+        checked before the tree spawn; deeper spawns require decreasing
+        difficulty for auto model assignment.
         """
         if self.delegation_tree is None:
             if self.ledger is not None:
@@ -259,6 +263,40 @@ class MissionDispatch:
             return {"ok": False, "status": "unavailable",
                     "error": ("no delegation tree bound to this mission (org layer "
                               "off); do the work directly or escalate in your handoff")}
+
+        # WS4 spawn-depth policy: max depth from capability letter / config.
+        try:
+            from services.agent.role_models import (  # noqa: PLC0415
+                check_spawn_depth_policy,
+            )
+            parent = None
+            try:
+                pid = parent_id or getattr(self.delegation_tree, "root_id", None)
+                parent = (self.delegation_tree._nodes.get(pid)  # noqa: SLF001
+                          if pid is not None else None)
+            except Exception:  # noqa: BLE001
+                parent = None
+            depth = (int(getattr(parent, "depth", 0)) + 1) if parent is not None else 1
+            letter = None
+            if self.capability is not None:
+                letter = getattr(self.capability, "letter", None)
+            policy = check_spawn_depth_policy(
+                depth,
+                letter=letter,
+                task_class=self.task_class,
+            )
+            if not policy.get("ok"):
+                return {
+                    "ok": False,
+                    "status": "refused",
+                    "error": policy.get("reason") or "spawn depth policy refused",
+                    "spawn_depth_policy": policy,
+                }
+            # Stash for _run_subagent auto model pick (decreasing difficulty).
+            self._last_spawn_policy = policy
+        except Exception:  # noqa: BLE001 — policy is best-effort; never block spawn
+            self._last_spawn_policy = None
+
         try:
             from services.agent.delegation import delegate as _delegate
             node = _delegate(role, brief, budget_tokens, tree=self.delegation_tree,
@@ -370,8 +408,55 @@ class MissionDispatch:
                         max_calls = max(4, min(12, derived))
                 except Exception:  # noqa: BLE001
                     pass
+            # WS2: per-node model pick when ai_roles is set / auto.
+            provider = self.provider
+            try:
+                from services.agent.role_models import resolve_for_node  # noqa: PLC0415
+                from services.agent import config as agent_config  # noqa: PLC0415
+                depth = 0
+                try:
+                    depth = int((node.get("depth") if isinstance(node, dict)
+                                 else getattr(node, "depth", 0)) or 0)
+                except (TypeError, ValueError):
+                    depth = 0
+                policy = getattr(self, "_last_spawn_policy", None) or {}
+                ctx = {
+                    "task_class": self.task_class,
+                    "depth": depth,
+                    "risk": "low" if str(node.get("kind") or "") == "ponder" else None,
+                    "node_inputs": {"task_class": self.task_class, "depth": depth},
+                }
+                # Map harness roles: subagent worker → task; planner-ish → planning.
+                harness_role = "task"
+                if role in ("overseer", "orchestrator", "department_manager"):
+                    harness_role = "planning"
+                elif role in ("advisor", "reviewer"):
+                    harness_role = "advisor"
+                assignment = resolve_for_node(harness_role, ctx)
+                if assignment is not None and policy.get("min_rank") is not None:
+                    # Re-resolve with depth-aware min_rank (decreasing difficulty).
+                    from services.agent.role_models import resolve_role_model  # noqa: PLC0415
+                    assignment = resolve_role_model(
+                        harness_role,
+                        agent_config.load_config(),
+                        task_class=self.task_class,
+                        node_depth=depth,
+                        min_rank=int(policy["min_rank"]),
+                    )
+                if assignment is not None:
+                    cfg = dict(agent_config.load_config())
+                    cfg["model"] = assignment.model
+                    try:
+                        provider = agent_config.get_provider(
+                            name=assignment.provider, cfg=cfg)
+                        if isinstance(node, dict):
+                            node["role_model"] = assignment.to_dict()
+                    except Exception:  # noqa: BLE001 — keep mission provider
+                        provider = self.provider
+            except Exception:  # noqa: BLE001 — never block subagent on role_models
+                provider = self.provider
             result = _at.run_turn(
-                brief, self.provider, name=role, actor=role,
+                brief, provider, name=role, actor=role,
                 system_prompt=system_prompt,
                 allowed_tools=allowed,
                 tools_text=tools_text,

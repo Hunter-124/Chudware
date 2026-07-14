@@ -93,3 +93,10 @@ try:
     WORKER_METHODS.update(_BENCH_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
+
+# WS2: per-role model assignment + rankings (Settings ModelRolesAuto).
+try:
+    from engine_oracle.parts_hub.role_models_rpc import ROLE_MODELS_METHODS as _ROLE_METHODS
+    WORKER_METHODS.update(_ROLE_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass

@@ -4,13 +4,14 @@ Order of precedence: explicit arg → AI_CAD_PROVIDER env var → %APPDATA%/AI-C
 default. The env var outranks config.json on purpose: it is a per-process override (tests use
 AI_CAD_PROVIDER=mock to guarantee no live model is called), while config.json is ambient user
 state. config.json shape:
-
     {
       "provider": "anthropic",          // or "openai" / "llamacpp"
       "model": "claude-opus-4-8",
       "api_key": "sk-ant-...",          // optional; else read from env
       "openai": {"base_url": "http://localhost:1234/v1"},
-      "llamacpp": {"model_path": "%APPDATA%/AI-CAD/models/model.gguf"}
+      "llamacpp": {"model_path": "%APPDATA%/AI-CAD/models/model.gguf"},
+      "compliance_mode": "off",         // "off" | "redact" | "local_only" (WS3)
+      "offline_mode": false             // legacy hard local-only (still honored)
     }
 """
 from __future__ import annotations
@@ -65,6 +66,37 @@ OFFLINE_SETTING = "offline_mode"
 def offline_enabled(cfg: dict | None = None) -> bool:
     cfg = cfg if cfg is not None else load_config()
     return bool(cfg.get(OFFLINE_SETTING, False))
+
+# --------------------------------------------------------------------------- compliance mode (WS3)
+# ITAR-class outbound redaction. config.json "compliance_mode":
+#   "off"        — no wrapping (default)
+#   "redact"     — wrap cloud providers: deterministic + optional local-LLM scrub,
+#                  rehydrate inbound; images blocked outbound
+#   "local_only" — refuse ALL non-loopback providers (same enforcement as offline_mode)
+# offline_mode remains the legacy hard switch and still forces local-only refusal;
+# compliance_mode=local_only is the named WS3 equivalent. See docs/REDACTION_DESIGN.md.
+
+COMPLIANCE_SETTING = "compliance_mode"
+_VALID_COMPLIANCE_MODES = {"off", "redact", "local_only"}
+
+
+def compliance_mode(cfg: dict | None = None) -> str:
+    """Return normalized compliance_mode: ``off`` | ``redact`` | ``local_only``."""
+    cfg = cfg if cfg is not None else load_config()
+    raw = cfg.get(COMPLIANCE_SETTING, "off")
+    s = str(raw or "off").strip().lower().replace("-", "_")
+    if s in ("localonly", "local"):
+        return "local_only"
+    return s if s in _VALID_COMPLIANCE_MODES else "off"
+
+
+def local_only_enabled(cfg: dict | None = None) -> bool:
+    """True when non-loopback providers must be refused (offline_mode OR local_only)."""
+    cfg = cfg if cfg is not None else load_config()
+    if offline_enabled(cfg):
+        return True
+    return compliance_mode(cfg) == "local_only"
+
 
 
 _VALID_CONSENT_TIERS = {"off", "meta", "full"}
@@ -150,7 +182,7 @@ def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
 
 def get_provider(name: str | None = None, cfg: dict | None = None,
                  role: str | None = None) -> Provider:
-    """Resolve the configured provider, enforcing offline mode (C35) at two points: cloud
+    """Resolve the configured provider, enforcing offline/local-only at two points: cloud
     providers are refused by name BEFORE construction, and the resolved provider is re-checked
     against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases).
 
@@ -158,10 +190,31 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     node name) — see ``_resolve_via_routing``. When *name* / ``AI_CAD_PROVIDER`` is not given,
     routing.yaml's role->source assignment (contract §14) is consulted BEFORE falling back to
     config.json's flat ``provider`` field, so a source registered into routing.yaml (e.g. the
-    bundled llama.cpp runtime's ``register_routing_source``) actually gets picked up here."""
+    bundled llama.cpp runtime's ``register_routing_source``) actually gets picked up here.
+
+    When ``compliance_mode == "redact"``, the resolved provider is wrapped in
+    :class:`services.agent.redaction.RedactingProvider` so outbound text is scrubbed and
+    inbound replies rehydrated. ``local_only`` (and legacy ``offline_mode``) refuse every
+    non-loopback provider before the wrap.
+    """
     cfg = cfg if cfg is not None else load_config()
+    # local_only / offline: refuse non-loopback via the existing offline assert path.
+    # For local_only without offline_mode, temporarily treat as offline for the assert.
     provider = _resolve_provider(name, cfg, role=role)
-    assert_offline_safe(provider, cfg)
+    if local_only_enabled(cfg):
+        # Reuse offline assert machinery; synthesize a cfg that trips offline_enabled.
+        if offline_enabled(cfg):
+            assert_offline_safe(provider, cfg)
+        else:
+            assert_offline_safe(provider, {**cfg, OFFLINE_SETTING: True})
+    else:
+        assert_offline_safe(provider, cfg)
+
+    # WS3 redact wrap — applied AFTER offline/local-only gates so we never wrap a
+    # provider that should have been refused.
+    if compliance_mode(cfg) == "redact":
+        from .redaction import wrap_provider
+        provider = wrap_provider(provider, cfg=cfg)
     return provider
 
 
@@ -242,7 +295,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             cfg[sub_key].setdefault("base_url", routed_base_url)
 
     name = (name or os.environ.get("AI_CAD_PROVIDER") or cfg.get("provider") or "").lower()
-    offline = offline_enabled(cfg)
+    offline = offline_enabled(cfg) or compliance_mode(cfg) == "local_only"
 
     # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
     # lookup). A local OpenAI-compatible endpoint is checked against its base_url below.

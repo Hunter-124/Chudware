@@ -1,0 +1,131 @@
+# model_rankings.yaml — shipped capability ranks for auto role→model pick (WS2).
+# rank: 1 (utility/local) … 5 (frontier). source: shipped | user | measured.
+# Loader (role_models.load_rankings) merges:
+#   1. this file (source: shipped)
+#   2. benchmarks/leaderboard/leaderboard.json pass rates when cycles >= 1
+#      (source: measured — promote/demote automatically)
+#   3. config.json ai_roles_rankings / model_rankings user overrides
+#      (source: user — always wins)
+schema: aicad.model_rankings/1
+notes: public evals 2026-07, replace with measured
+
+models:
+  # Rank 5 — frontier band
+  - id: grok-4.5
+    provider: xai
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: grok-4-5
+    provider: xai
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07 alias, replace with measured"
+  - id: claude-4
+    provider: anthropic
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: claude-sonnet-4
+    provider: anthropic
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: claude-opus-4
+    provider: anthropic
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: gpt-5
+    provider: openai
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: gemini-2.5-pro
+    provider: gemini
+    rank: 5
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+
+  # Rank 4 — strong mid / free strong
+  - id: gemini-2.5-flash
+    provider: gemini
+    rank: 4
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: gemini-flash
+    provider: gemini
+    rank: 4
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: qwen3-vl-32b
+    provider: openrouter
+    rank: 4
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: nvidia/nemotron-ultra:free
+    provider: openrouter
+    rank: 4
+    source: shipped
+    notes: "public evals 2026-07 free tier, replace with measured"
+  - id: nemotron-ultra:free
+    provider: openrouter
+    rank: 4
+    source: shipped
+    notes: "public evals 2026-07 free tier alias, replace with measured"
+
+  # Rank 3 — mid free / small-strong
+  - id: mistral-small
+    provider: openrouter
+    rank: 3
+    source: shipped
+    notes: "public evals 2026-07, replace with measured"
+  - id: mistralai/mistral-small:free
+    provider: openrouter
+    rank: 3
+    source: shipped
+    notes: "public evals 2026-07 free, replace with measured"
+  - id: google/gemma-3-27b-it:free
+    provider: openrouter
+    rank: 3
+    source: shipped
+    notes: "public evals 2026-07 free, replace with measured"
+  - id: meta-llama/llama-3.3-70b-instruct:free
+    provider: openrouter
+    rank: 3
+    source: shipped
+    notes: "public evals 2026-07 free, replace with measured"
+
+  # Rank 2 — small free / large-local utility
+  - id: google/gemma-3-12b-it:free
+    provider: openrouter
+    rank: 2
+    source: shipped
+    notes: "public evals 2026-07 free, replace with measured"
+  - id: qwen/qwen3-14b:free
+    provider: openrouter
+    rank: 2
+    source: shipped
+    notes: "public evals 2026-07 free, replace with measured"
+  - id: gemma3-4b-qat
+    provider: llamacpp
+    rank: 2
+    source: shipped
+    notes: "public evals 2026-07 local utility, replace with measured"
+  - id: gemma-3-4b
+    provider: llamacpp
+    rank: 2
+    source: shipped
+    notes: "public evals 2026-07 local utility alias, replace with measured"
+
+  # Rank 1 — tiny locals
+  - id: qwen3-4b
+    provider: llamacpp
+    rank: 1
+    source: shipped
+    notes: "public evals 2026-07 local utility, replace with measured"
+  - id: gemma4-e4b
+    provider: llamacpp
+    rank: 1
+    source: shipped
+    notes: "public evals 2026-07 local utility, replace with measured"

@@ -894,6 +894,17 @@ def take_auto_checkpoint(doc_id: str | None,
         emit_hard_guardrail(ledger, "auto_checkpoint", "passed",
                             reason=f"checkpoint before {trigger_tool}",
                             actor=actor)
+        # Also record an AI-VC checkpoint when the doc is agent/mixed-authored
+        # (silent, never blocks — engine doc_checkpoint above is the HARD path).
+        try:
+            from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
+            if _ai_vc.is_ai_policy_doc(doc_id):
+                _ai_vc.on_ai_tool_success(
+                    trigger_tool, {"doc_id": doc_id}, {"ok": True},
+                    ledger=ledger, actor=actor,
+                )
+        except Exception:  # noqa: BLE001
+            pass
         return True, "ok"
     except Exception as exc:  # noqa: BLE001
         reason = str(exc)

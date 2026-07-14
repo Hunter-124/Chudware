@@ -217,6 +217,22 @@ def auto_checkpoint(client: Any, project_id: str, message: str, *,
     )
 
 
+# ---------------------------------------------------------------------------
+# AI-VC seam (agent/MCP silent checkpoints — separate from project vault)
+# ---------------------------------------------------------------------------
+
+def ai_vc_on_mutate(tool: str, args: dict | None, result: Any, **kwargs: Any) -> dict[str, Any] | None:
+    """Route a successful AI mutation into the AI-VC store (silent, idempotent).
+
+    Thin re-export so guardrails / agent_turn / MCP can share one import path
+    without depending on the vault assist tier (AI-VC is always-on for agent
+    docs; the managed-tier ``auto_checkpoint`` above remains for project vault).
+    """
+    from services.plm import ai_vc
+
+    return ai_vc.on_ai_tool_success(tool, args, result, **kwargs)
+
+
 def discard_entry(vault: Any, commit: str) -> dict[str, Any]:
     """One-click discard of a history entry (contract §8.4 reversibility).
 

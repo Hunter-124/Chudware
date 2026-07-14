@@ -1919,12 +1919,15 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     for phase_name, prefixes in _PHASE_NODE_PREFIXES:
         phase = Phase(phase_name)
         nodes = _phase_nodes(prefixes)
-        all_done = bool(nodes) and all(_node_status(n) == "done" for n in nodes)
-        # The gate node 'n_spec_done' (a DAG gate) belongs to the SPECIFY exit.
+        # SPECIFY: n_spec_done is the overseer AUDIT join (mission_template), not a
+        # hard gate. It also matches the n_spec_ prefix, so filter it out of the
+        # required set — otherwise every incomplete/failed overseer audit (budget
+        # burn, 429, missing role handoff) freezes the mission at specify_incomplete
+        # even when every n_spec_* worker already wrote dimensions. Spec exit is
+        # owned by PhaseMachine (_gate_specify); the overseer is advisory.
         if phase is Phase.SPECIFY:
-            join = "n_spec_done"
-            if join in node_states:
-                all_done = all_done and _node_status(join) == "done"
+            nodes = [n for n in nodes if n != "n_spec_done"]
+        all_done = bool(nodes) and all(_node_status(n) == "done" for n in nodes)
 
         machine.enter(phase)
         emit_phase(phase, f"Phase {phase.value}")

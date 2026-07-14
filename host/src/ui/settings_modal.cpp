@@ -1,5 +1,5 @@
-// AI-CAD Settings modal (Appearance / General / AI / Prompts / Agent / Experimental tabs) and
-// the About modal.
+// AI-CAD Settings modal (Appearance / General / AI / Benchmarks / Prompts / Agent /
+// Experimental tabs) and the About modal.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +19,7 @@
 #include "../renderer.h"
 #include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
-#include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > AI)
+#include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include <map>
 
 
@@ -401,7 +401,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
-// ---- Run benchmark (Settings → AI → Model Leaderboard) ---------------------
+// ---- Run benchmark + categories (Settings → Benchmarks) ---------------------
 struct BenchUi {
     int source = 1;   // 0=current copilot, 1=xAI grok-4.5, 2=local
     int mode = 0;     // 0=diag, 1=smoke
@@ -412,8 +412,71 @@ struct BenchUi {
     std::string lastError;
     std::string lastResultPath;
     bool wasRunning = false;
+    std::string activeCategory;  // non-empty when last launch was per-category
 };
 static BenchUi s_bench;
+
+struct BenchCategoryLast {
+    std::string when;
+    float passRate = -1.f;  // <0 = absent
+    std::string detailPath;
+};
+struct BenchCategory {
+    std::string id;
+    std::string label;
+    std::string description;
+    std::vector<std::string> toolsCovered;
+    bool runnable = true;
+    bool hasLast = false;
+    BenchCategoryLast last;
+};
+struct BenchCategoriesUi {
+    std::vector<BenchCategory> cats;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool pollInFlight = false;
+    double lastPoll = -1e9;
+    std::string lastError;
+};
+static BenchCategoriesUi s_cats;
+
+// ---- Model roles + rankings (Settings → AI) ---------------------------------
+// RPC: ai_roles_get/set, model_rankings_get/set (ModelRolesAuto). Degrade read-only
+// when the RPC is absent.
+struct RoleAssign {
+    bool isAuto = true;
+    std::string provider;
+    std::string model;
+};
+struct ModelRankingRow {
+    std::string modelId;
+    std::string provider;
+    int rank = 3;              // 1–5
+    std::string source;        // shipped | user | measured
+    std::string notes;
+};
+struct ModelRolesUi {
+    std::map<std::string, RoleAssign> roles;
+    std::vector<ModelRankingRow> rankings;
+    bool rolesLoaded = false;
+    bool rankingsLoaded = false;
+    bool rolesRpcMissing = false;
+    bool rankingsRpcMissing = false;
+    bool rolesPollInFlight = false;
+    bool rankingsPollInFlight = false;
+    double lastRolesPoll = -1e9;
+    double lastRankingsPoll = -1e9;
+    std::string lastError;
+    bool rolesSaveInFlight = false;
+    bool rankingsSaveInFlight = false;
+};
+static ModelRolesUi s_roles;
+
+static const char* kRoleKeys[] = {
+    "advisor", "task", "planning", "default", "plm", "redaction"};
+static const char* kRoleLabels[] = {
+    "Advisor", "Task", "Planning", "Default", "PLM", "Redaction"};
+static constexpr int kRoleCount = 6;
 
 static std::string benchTierForSource(const Settings& s, int source) {
     if (source == 1) return "xai:grok-4-5";
@@ -470,12 +533,518 @@ static void pollBenchStatus(AppState& st, bool force, ui::leaderboard::Board* lb
         s_bench.lastResultPath = r.result.value("last_result_path", std::string());
         if (r.result.contains("last_result_path") && r.result["last_result_path"].is_null())
             s_bench.lastResultPath.clear();
-        // Transition running → done: auto-refresh leaderboard table.
-        if (was && !s_bench.running && lbRefresh) {
-            *lbRefresh = ui::leaderboard::load();
+        // Transition running → done: auto-refresh leaderboard + categories.
+        if (was && !s_bench.running) {
+            if (lbRefresh) *lbRefresh = ui::leaderboard::load();
+            s_cats.lastPoll = -1e9;  // force category re-poll
+            s_cats.loaded = false;
         }
         s_bench.wasRunning = s_bench.running;
     });
+}
+
+static void pollBenchCategories(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && s_cats.loaded && (now - s_cats.lastPoll) < 4.0) return;
+    if (s_cats.pollInFlight) return;
+    s_cats.lastPoll = now;
+    s_cats.pollInFlight = true;
+    st.rpc.call("bench_categories", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_cats.pollInFlight = false;
+        if (!r.ok) {
+            s_cats.rpcMissing = true;
+            if (s_cats.lastError.empty())
+                s_cats.lastError = r.err.empty() ? "bench_categories unavailable" : r.err;
+            s_cats.loaded = true;
+            return;
+        }
+        if (!r.result.is_object()) {
+            s_cats.rpcMissing = true;
+            s_cats.loaded = true;
+            return;
+        }
+        if (r.result.value("ok", true) == false) {
+            s_cats.lastError = r.result.value("reason", std::string("bench_categories failed"));
+            s_cats.loaded = true;
+            return;
+        }
+        s_cats.rpcMissing = false;
+        s_cats.lastError.clear();
+        s_cats.cats.clear();
+        auto arr = r.result.value("categories", nlohmann::json::array());
+        if (!arr.is_array()) { s_cats.loaded = true; return; }
+        for (const auto& c : arr) {
+            if (!c.is_object()) continue;
+            BenchCategory row;
+            row.id = c.value("id", std::string());
+            row.label = c.value("label", row.id);
+            row.description = c.value("description", std::string());
+            row.runnable = c.value("runnable", true);
+            auto tools = c.value("tools_covered", nlohmann::json::array());
+            if (tools.is_array()) {
+                for (const auto& t : tools)
+                    if (t.is_string()) row.toolsCovered.push_back(t.get<std::string>());
+            }
+            if (c.contains("last") && c["last"].is_object() && !c["last"].is_null()) {
+                const auto& L = c["last"];
+                row.hasLast = true;
+                row.last.when = L.value("when", std::string());
+                if (L.contains("pass_rate") && L["pass_rate"].is_number())
+                    row.last.passRate = (float)L["pass_rate"].get<double>();
+                row.last.detailPath = L.value("detail_path", std::string());
+            }
+            s_cats.cats.push_back(std::move(row));
+        }
+        s_cats.loaded = true;
+    });
+}
+
+// Wire provider name used by role/ranking RPCs (matches routing / config conventions).
+static const char* roleProviderWire(int prov) {
+    switch (prov) {
+        case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_OPENAI:      return "openai";
+        case ui::PROV_LOCAL:       return "local";
+        case ui::PROV_LLAMACPP:    return "llamacpp";
+        case ui::PROV_GEMINI:      return "gemini";
+        case ui::PROV_CLOUDCOMPAT: return "openrouter";
+        case ui::PROV_XAI:         return "xai";
+        default: return "local";
+    }
+}
+
+static int roleProviderFromWire(const std::string& w) {
+    if (w == "anthropic") return ui::PROV_ANTHROPIC;
+    if (w == "openai") return ui::PROV_OPENAI;
+    if (w == "local") return ui::PROV_LOCAL;
+    if (w == "llamacpp") return ui::PROV_LLAMACPP;
+    if (w == "gemini") return ui::PROV_GEMINI;
+    if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
+    if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
+    return -1;
+}
+
+static bool providerIsLoopback(int prov) {
+    return prov == ui::PROV_LOCAL || prov == ui::PROV_LLAMACPP;
+}
+
+// Flat picker entry for role model dropdowns.
+struct RolePickEntry {
+    bool isAuto = false;
+    int provider = ui::PROV_LOCAL;
+    std::string model;
+    std::string label;  // display
+};
+
+static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly) {
+    std::vector<RolePickEntry> out;
+    out.push_back(RolePickEntry{true, 0, "", "Auto"});
+    auto add = [&](int prov, const std::string& model, const std::string& label) {
+        if (localOnly && !providerIsLoopback(prov)) return;
+        RolePickEntry e;
+        e.isAuto = false;
+        e.provider = prov;
+        e.model = model;
+        e.label = label;
+        out.push_back(std::move(e));
+    };
+    // Built-in cloud catalog.
+    for (const auto& m : ui::builtinModels()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
+                      ui::providerLabel(m.provider), m.label.c_str());
+        add(m.provider, m.id, buf);
+    }
+    // Cloud OpenRouter / DashScope / DeepSeek presets.
+    for (const auto& p : ui::cloudPresets()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "OpenRouter / Cloud \xc2\xb7 %s", p.label.c_str());
+        add(ui::PROV_CLOUDCOMPAT, p.id, buf);
+    }
+    // Local presets + live-probed local models.
+    for (const auto& p : ui::localPresets()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
+        add(ui::PROV_LOCAL, p.id, buf);
+    }
+    const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
+    if (lpm.ok) {
+        for (const auto& id : lpm.models) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", id.c_str());
+            add(ui::PROV_LOCAL, id, buf);
+        }
+    }
+    const ProviderModels& lcpp = st.providerModels[ui::PROV_LLAMACPP];
+    if (lcpp.ok) {
+        for (const auto& id : lcpp.models) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "llama.cpp \xc2\xb7 %s", id.c_str());
+            add(ui::PROV_LLAMACPP, id, buf);
+        }
+    }
+    return out;
+}
+
+static void ensureDefaultRoles() {
+    for (int i = 0; i < kRoleCount; ++i) {
+        if (s_roles.roles.find(kRoleKeys[i]) == s_roles.roles.end()) {
+            RoleAssign a;
+            a.isAuto = true;
+            s_roles.roles[kRoleKeys[i]] = a;
+        }
+    }
+}
+
+static void pollModelRoles(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && s_roles.rolesLoaded && (now - s_roles.lastRolesPoll) < 5.0) return;
+    if (s_roles.rolesPollInFlight || s_roles.rolesSaveInFlight) return;
+    s_roles.lastRolesPoll = now;
+    s_roles.rolesPollInFlight = true;
+    st.rpc.call("ai_roles_get", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_roles.rolesPollInFlight = false;
+        if (!r.ok) {
+            s_roles.rolesRpcMissing = true;
+            ensureDefaultRoles();
+            s_roles.rolesLoaded = true;
+            return;
+        }
+        if (!r.result.is_object()) {
+            s_roles.rolesRpcMissing = true;
+            ensureDefaultRoles();
+            s_roles.rolesLoaded = true;
+            return;
+        }
+        s_roles.rolesRpcMissing = false;
+        auto roles = r.result.value("roles", nlohmann::json::object());
+        if (!roles.is_object()) roles = nlohmann::json::object();
+        s_roles.roles.clear();
+        for (int i = 0; i < kRoleCount; ++i) {
+            RoleAssign a;
+            a.isAuto = true;
+            auto it = roles.find(kRoleKeys[i]);
+            if (it != roles.end()) {
+                if (it->is_string()) {
+                    std::string v = it->get<std::string>();
+                    a.isAuto = (v == "auto" || v.empty());
+                } else if (it->is_object()) {
+                    a.isAuto = false;
+                    a.provider = it->value("provider", std::string());
+                    a.model = it->value("model", std::string());
+                    if (a.provider.empty() && a.model.empty()) a.isAuto = true;
+                }
+            }
+            s_roles.roles[kRoleKeys[i]] = std::move(a);
+        }
+        s_roles.rolesLoaded = true;
+    });
+}
+
+static void pollModelRankings(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && s_roles.rankingsLoaded && (now - s_roles.lastRankingsPoll) < 5.0) return;
+    if (s_roles.rankingsPollInFlight || s_roles.rankingsSaveInFlight) return;
+    s_roles.lastRankingsPoll = now;
+    s_roles.rankingsPollInFlight = true;
+    st.rpc.call("model_rankings_get", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_roles.rankingsPollInFlight = false;
+        if (!r.ok || !r.result.is_object()) {
+            s_roles.rankingsRpcMissing = true;
+            // Seed a read-only fallback from the builtin catalog so the table isn't empty.
+            if (s_roles.rankings.empty()) {
+                for (const auto& m : ui::builtinModels()) {
+                    ModelRankingRow row;
+                    row.modelId = m.id;
+                    row.provider = roleProviderWire(m.provider);
+                    row.rank = 3;
+                    row.source = "shipped";
+                    s_roles.rankings.push_back(std::move(row));
+                }
+            }
+            s_roles.rankingsLoaded = true;
+            return;
+        }
+        s_roles.rankingsRpcMissing = false;
+        s_roles.rankings.clear();
+        auto ranks = r.result.value("rankings", nlohmann::json::object());
+        if (ranks.is_object()) {
+            for (auto it = ranks.begin(); it != ranks.end(); ++it) {
+                if (!it.value().is_object()) continue;
+                ModelRankingRow row;
+                row.modelId = it.key();
+                row.rank = it.value().value("rank", 3);
+                if (row.rank < 1) row.rank = 1;
+                if (row.rank > 5) row.rank = 5;
+                row.source = it.value().value("source", std::string("shipped"));
+                row.notes = it.value().value("notes", std::string());
+                row.provider = it.value().value("provider", std::string());
+                s_roles.rankings.push_back(std::move(row));
+            }
+        }
+        std::sort(s_roles.rankings.begin(), s_roles.rankings.end(),
+                  [](const ModelRankingRow& a, const ModelRankingRow& b) {
+                      if (a.rank != b.rank) return a.rank > b.rank;
+                      return a.modelId < b.modelId;
+                  });
+        s_roles.rankingsLoaded = true;
+    });
+}
+
+static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a) {
+    if (s_roles.rolesRpcMissing) return;
+    s_roles.roles[roleKey] = a;
+    nlohmann::json p;
+    nlohmann::json roles = nlohmann::json::object();
+    if (a.isAuto) {
+        roles[roleKey] = "auto";
+    } else {
+        roles[roleKey] = nlohmann::json{{"provider", a.provider}, {"model", a.model}};
+    }
+    p["roles"] = roles;
+    s_roles.rolesSaveInFlight = true;
+    st.rpc.call("ai_roles_set", p, [](const core::RpcResult& r) {
+        s_roles.rolesSaveInFlight = false;
+        if (!r.ok) {
+            s_roles.lastError = r.err.empty() ? "ai_roles_set failed" : r.err;
+            return;
+        }
+        // Prefer server echo when present.
+        if (r.result.is_object() && r.result.contains("roles") && r.result["roles"].is_object()) {
+            const auto& roles = r.result["roles"];
+            for (int i = 0; i < kRoleCount; ++i) {
+                auto it = roles.find(kRoleKeys[i]);
+                if (it == roles.end()) continue;
+                RoleAssign a;
+                if (it->is_string()) {
+                    a.isAuto = (it->get<std::string>() == "auto");
+                } else if (it->is_object()) {
+                    a.isAuto = false;
+                    a.provider = it->value("provider", std::string());
+                    a.model = it->value("model", std::string());
+                }
+                s_roles.roles[kRoleKeys[i]] = a;
+            }
+        }
+        s_roles.lastRolesPoll = ImGui::GetTime();
+    });
+}
+
+static void setModelRank(AppState& st, const std::string& modelId, int rank) {
+    if (s_roles.rankingsRpcMissing) return;
+    if (rank < 1) rank = 1;
+    if (rank > 5) rank = 5;
+    for (auto& row : s_roles.rankings) {
+        if (row.modelId == modelId) {
+            row.rank = rank;
+            row.source = "user";
+            break;
+        }
+    }
+    nlohmann::json p;
+    p["rankings"] = nlohmann::json::object();
+    p["rankings"][modelId] = nlohmann::json{{"rank", rank}};
+    s_roles.rankingsSaveInFlight = true;
+    st.rpc.call("model_rankings_set", p, [](const core::RpcResult& r) {
+        s_roles.rankingsSaveInFlight = false;
+        if (!r.ok) {
+            s_roles.lastError = r.err.empty() ? "model_rankings_set failed" : r.err;
+            return;
+        }
+        s_roles.lastRankingsPoll = -1e9;  // refresh
+        s_roles.rankingsLoaded = false;
+    });
+}
+
+static void drawPassRateBar(float rate, float width, float height) {
+    // Local copy of leaderboard bar so category rows don't need the full Board.
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = height > 0 ? height : 8.0f * sc;
+    const float w = width > 0 ? width : ImGui::GetContentRegionAvail().x;
+    const float r = std::max(0.f, std::min(1.f, rate));
+    ImU32 bg = ui::Palette::toU32(pal.accentSoft);
+    ImU32 fg = r >= 0.5f ? ui::Palette::toU32(pal.statusOk)
+             : r >= 0.2f ? ui::Palette::toU32(pal.statusWarn)
+                         : ui::Palette::toU32(pal.statusErr);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, 3.0f * sc);
+    if (r > 0.001f)
+        dl->AddRectFilled(p, ImVec2(p.x + w * r, p.y + h), fg, 3.0f * sc);
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+static void drawBenchStatusLine(AppState& st, float sc) {
+    if (s_bench.running) {
+        static const char* kSpin[] = {".  ", ".. ", "...", " ..", "  .", "   "};
+        int frame = (int)(ImGui::GetTime() * 6.0) % 6;
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
+        if (!s_bench.activeCategory.empty())
+            ImGui::Text("Running %s (%s) %s", s_bench.stage.c_str(),
+                        s_bench.activeCategory.c_str(), kSpin[frame]);
+        else
+            ImGui::Text("Running %s %s", s_bench.stage.c_str(), kSpin[frame]);
+        ImGui::PopStyleColor();
+    } else if (s_bench.stage == "done") {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+        ImGui::TextUnformatted("Done \xe2\x80\x94 leaderboard refreshed");
+        ImGui::PopStyleColor();
+        if (!s_bench.lastResultPath.empty()) {
+            ImGui::SameLine();
+            dimText(s_bench.lastResultPath.c_str());
+        }
+    } else if (s_bench.stage == "error" && !s_bench.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_bench.lastError.c_str());
+        ImGui::PopStyleColor();
+    } else {
+        dimText("Idle \xe2\x80\x94 pick a category or legacy smoke/diag run.");
+    }
+    (void)st; (void)sc;
+}
+
+static void drawBenchCategories(AppState& st, float sc) {
+    pollBenchCategories(st, /*force=*/false);
+    dimText("One row per tool family. Run queues the gym/suite for that category; status "
+            "polls via bench_status. History comes from the last cycle's detail_path.");
+
+    if (!s_cats.loaded && s_cats.pollInFlight) {
+        dimText("Loading categories\xe2\x80\xa6");
+        return;
+    }
+    if (s_cats.rpcMissing || (!s_cats.loaded && !st.workerStarted)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextWrapped("Categories unavailable (worker not ready or bench_categories RPC "
+                           "not registered yet). The legacy runner below still works.");
+        ImGui::PopStyleColor();
+        if (!s_cats.lastError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+            ImGui::TextWrapped("%s", s_cats.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+        return;
+    }
+    if (s_cats.cats.empty()) {
+        dimText("No categories reported.");
+        return;
+    }
+
+    if (ImGui::BeginTable("##bench_cats", 4,
+                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Tools", ImGuiTableColumnFlags_WidthStretch, 0.7f);
+        ImGui::TableSetupColumn("Last result", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("Run", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+        ImGui::TableHeadersRow();
+
+        for (const auto& cat : s_cats.cats) {
+            ImGui::TableNextRow();
+            ImGui::PushID(cat.id.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(cat.label.empty() ? cat.id.c_str() : cat.label.c_str());
+            if (!cat.description.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", cat.description.c_str());
+
+            ImGui::TableNextColumn();
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%d", (int)cat.toolsCovered.size());
+                ImGui::TextUnformatted(buf);
+                if (ImGui::IsItemHovered() && !cat.toolsCovered.empty()) {
+                    ImGui::BeginTooltip();
+                    ImGui::TextUnformatted("Tools covered:");
+                    for (const auto& t : cat.toolsCovered)
+                        ImGui::BulletText("%s", t.c_str());
+                    ImGui::EndTooltip();
+                }
+            }
+
+            ImGui::TableNextColumn();
+            if (!cat.hasLast) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                ImGui::TextUnformatted("\xe2\x80\x94 never run");
+                ImGui::PopStyleColor();
+            } else {
+                if (cat.last.passRate >= 0.f) {
+                    const float pctW = 40.0f * sc;
+                    const float barW = std::max(40.0f * sc,
+                        ImGui::GetContentRegionAvail().x - pctW - 8.0f * sc);
+                    drawPassRateBar(cat.last.passRate, barW, 8.0f * sc);
+                    ImGui::SameLine(0, 6.0f * sc);
+                    char pct[32];
+                    std::snprintf(pct, sizeof(pct), "%.0f%%", cat.last.passRate * 100.f);
+                    ImGui::TextUnformatted(pct);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
+                    ImGui::TextUnformatted("ran");
+                    ImGui::PopStyleColor();
+                }
+                if (!cat.last.when.empty()) {
+                    ImGui::SameLine(0, 8.0f * sc);
+                    dimText(cat.last.when.c_str());
+                }
+                if (!cat.last.detailPath.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("detail: %s", cat.last.detailPath.c_str());
+                // History: show detail_path as a collapsible one-liner.
+                if (!cat.last.detailPath.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                    ImGui::TextWrapped("%s", cat.last.detailPath.c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
+
+            ImGui::TableNextColumn();
+            {
+                const bool canRun = cat.runnable && !s_bench.running && st.workerStarted;
+                if (!canRun) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("Run")) {
+                    nlohmann::json p;
+                    p["category"] = cat.id;
+                    s_bench.running = true;
+                    s_bench.stage = "starting";
+                    s_bench.lastError.clear();
+                    s_bench.lastPoll = -1e9;
+                    s_bench.activeCategory = cat.id;
+                    st.rpc.call("bench_run", p, [](const core::RpcResult& r) {
+                        if (!r.ok) {
+                            s_bench.running = false;
+                            s_bench.stage = "error";
+                            s_bench.lastError = r.err.empty() ? "bench_run failed" : r.err;
+                        } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                            s_bench.running = false;
+                            s_bench.stage = "error";
+                            s_bench.lastError = r.result.value("reason",
+                                std::string("bench_run failed"));
+                        }
+                        s_bench.lastPoll = -1e9;
+                    });
+                }
+                if (!canRun) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (s_bench.running)
+                        ImGui::SetTooltip("A benchmark is already running.");
+                    else if (!st.workerStarted)
+                        ImGui::SetTooltip("Worker not ready yet.");
+                    else if (!cat.runnable)
+                        ImGui::SetTooltip("This category is not runnable.");
+                    else
+                        ImGui::SetTooltip("Run category '%s' via bench_run.", cat.id.c_str());
+                }
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    drawBenchStatusLine(st, sc);
 }
 
 static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
@@ -483,8 +1052,9 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
     ImGui::Dummy(ImVec2(0, 6.0f * sc));
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 4.0f * sc));
-    ImGui::TextUnformatted("Run benchmark");
-    dimText("Spawns the gym CLI detached on the worker. On finish rebuilds "
+    ImGui::TextUnformatted("Legacy quick run");
+    dimText("Spawns the gym CLI detached on the worker (diag / C1 smoke). Prefer the "
+            "category rows above for full tool-family coverage. On finish rebuilds "
             "benchmarks/leaderboard/leaderboard.json and refreshes the table.");
 
     static const char* kSources[] = {
@@ -520,6 +1090,7 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
         s_bench.stage = "starting";
         s_bench.lastError.clear();
         s_bench.lastPoll = -1e9;
+        s_bench.activeCategory.clear();
         st.rpc.call("bench_run", p, [](const core::RpcResult& r) {
             if (!r.ok) {
                 s_bench.running = false;
@@ -545,32 +1116,227 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
 
     // Status line + spinner while running / after finish.
     pollBenchStatus(st, s_bench.running, &lb);
-    if (s_bench.running) {
-        // Lightweight spinner via rotating dots (no GL dependency).
-        static const char* kSpin[] = {".  ", ".. ", "...", " ..", "  .", "   "};
-        int frame = (int)(ImGui::GetTime() * 6.0) % 6;
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
-        ImGui::Text("Running %s %s", s_bench.stage.c_str(), kSpin[frame]);
-        ImGui::PopStyleColor();
-        // Force table reload timestamp so the next idle poll reloads after done.
+    ImGui::SameLine();
+    drawBenchStatusLine(st, sc);
+    if (s_bench.running)
         lbLast = -1e9;
-    } else if (s_bench.stage == "done") {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
-        ImGui::TextUnformatted("Done \xe2\x80\x94 leaderboard refreshed");
+}
+
+static void drawModelRolesSection(AppState& st, float sc) {
+    pollModelRoles(st, /*force=*/false);
+    pollModelRankings(st, /*force=*/false);
+    ensureDefaultRoles();
+
+    dimText("Per-role model assignment. Auto picks from rankings within enabled providers. "
+            "Redaction is hard-locked to local (loopback) providers.");
+
+    if (s_roles.rolesRpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("ai_roles_* RPC not available \xe2\x80\x94 showing defaults (read-only).");
         ImGui::PopStyleColor();
-    } else if (s_bench.stage == "error" && !s_bench.lastError.empty()) {
+    }
+    if (!s_roles.lastError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
-        ImGui::TextWrapped("%s", s_bench.lastError.c_str());
+        ImGui::TextWrapped("%s", s_roles.lastError.c_str());
         ImGui::PopStyleColor();
+    }
+
+    // Build picker once per frame (cheap; catalogs are small).
+    const auto allPicks = buildRolePickList(st, /*localOnly=*/false);
+    const auto localPicks = buildRolePickList(st, /*localOnly=*/true);
+
+    if (ImGui::BeginTable("##model_roles", 2,
+                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < kRoleCount; ++i) {
+            const char* key = kRoleKeys[i];
+            const bool isRedaction = (std::strcmp(key, "redaction") == 0);
+            RoleAssign& a = s_roles.roles[key];
+            const auto& picks = isRedaction ? localPicks : allPicks;
+
+            ImGui::TableNextRow();
+            ImGui::PushID(key);
+
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(kRoleLabels[i]);
+            if (isRedaction) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+                ImGui::TextUnformatted("[local]");
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Redaction must use a loopback (local) provider. "
+                                      "Cloud providers are refused.");
+            }
+
+            ImGui::TableNextColumn();
+            // Resolve current selection index.
+            int sel = 0;  // Auto
+            if (!a.isAuto) {
+                const int wantProv = roleProviderFromWire(a.provider);
+                for (int pi = 1; pi < (int)picks.size(); ++pi) {
+                    if (picks[pi].model == a.model &&
+                        (wantProv < 0 || picks[pi].provider == wantProv ||
+                         roleProviderWire(picks[pi].provider) == a.provider)) {
+                        sel = pi;
+                        break;
+                    }
+                }
+                // Unknown model: inject a synthetic entry so the combo still shows it.
+                if (sel == 0 && !a.model.empty()) {
+                    // Keep Auto selected visually but show the current value dimly.
+                    // Better: force index 0 label via preview — fall through to custom.
+                }
+            }
+
+            // Preview label.
+            std::string preview;
+            if (a.isAuto) {
+                preview = "Auto";
+            } else if (sel > 0) {
+                preview = picks[sel].label;
+            } else {
+                preview = a.provider + " \xc2\xb7 " + a.model;
+                if (preview == " \xc2\xb7 ") preview = a.model.empty() ? "Auto" : a.model;
+            }
+
+            const bool ro = s_roles.rolesRpcMissing || s_roles.rolesSaveInFlight;
+            if (ro) ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##role_pick", preview.c_str())) {
+                for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                    const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
+                    if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
+                        RoleAssign next;
+                        if (picks[pi].isAuto) {
+                            next.isAuto = true;
+                        } else {
+                            next.isAuto = false;
+                            next.provider = roleProviderWire(picks[pi].provider);
+                            next.model = picks[pi].model;
+                        }
+                        // Hard-enforce redaction local-only client-side too.
+                        if (isRedaction && !next.isAuto &&
+                            !providerIsLoopback(picks[pi].provider)) {
+                            s_roles.lastError =
+                                "Redaction role refuses non-loopback providers.";
+                        } else {
+                            setRoleAssign(st, key, next);
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ro) ImGui::EndDisabled();
+
+            if (isRedaction) {
+                dimText("Local only \xe2\x80\x94 ITAR redaction stage must not leave the machine.");
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy(ImVec2(0, 8.0f * sc));
+    ImGui::TextUnformatted("Model rankings");
+    dimText("1-5 stars. User overrides persist via model_rankings_set; shipped / "
+            "measured badges come from the rankings file and live bench cycles.");
+
+    if (s_roles.rankingsRpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("model_rankings_* RPC not available \xe2\x80\x94 table is read-only.");
+        ImGui::PopStyleColor();
+    }
+
+    if (!s_roles.rankingsLoaded && s_roles.rankingsPollInFlight) {
+        dimText("Loading rankings\xe2\x80\xa6");
+        return;
+    }
+    if (s_roles.rankings.empty()) {
+        dimText("No rankings yet.");
+        return;
+    }
+
+    if (ImGui::BeginTable("##model_ranks", 4,
+                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_ScrollY,
+                          ImVec2(0, 220.0f * sc))) {
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+        ImGui::TableHeadersRow();
+
+        for (size_t i = 0; i < s_roles.rankings.size(); ++i) {
+            auto& row = s_roles.rankings[i];
+            ImGui::TableNextRow();
+            ImGui::PushID((int)i);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(row.modelId.c_str());
+            if (!row.notes.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", row.notes.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(row.provider.empty() ? "\xe2\x80\x94" : row.provider.c_str());
+
+            ImGui::TableNextColumn();
+            {
+                // Star buttons 1–5.
+                const bool ro = s_roles.rankingsRpcMissing || s_roles.rankingsSaveInFlight;
+                if (ro) ImGui::BeginDisabled();
+                for (int s = 1; s <= 5; ++s) {
+                    if (s > 1) ImGui::SameLine(0, 2.0f * sc);
+                    const bool on = s <= row.rank;
+                    if (on)
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ui::Palette::toU32(ui::palette.accent));
+                    else
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ui::Palette::toU32(ui::palette.textDim));
+                    char starId[32];
+                    std::snprintf(starId, sizeof(starId), "%s##s%d",
+                                  on ? "\xe2\x98\x85" : "\xe2\x98\x86", s);  // ★ / ☆
+                    if (ImGui::SmallButton(starId))
+                        setModelRank(st, row.modelId, s);
+                    ImGui::PopStyleColor();
+                }
+                if (ro) ImGui::EndDisabled();
+            }
+
+            ImGui::TableNextColumn();
+            {
+                const char* src = row.source.c_str();
+                ImU32 col = ui::Palette::toU32(ui::palette.textDim);
+                if (row.source == "user")
+                    col = ui::Palette::toU32(ui::palette.accent);
+                else if (row.source == "measured")
+                    col = ui::Palette::toU32(ui::palette.statusOk);
+                else if (row.source == "shipped")
+                    col = ui::Palette::toU32(ui::palette.textDim);
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                ImGui::TextUnformatted(src[0] ? src : "shipped");
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
 }
 
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Tab indices: 0=Appearance  1=General  2=AI  3=Prompts  4=Agent  5=Experimental
+// Tab indices: 0=Appearance 1=General 2=AI 3=Benchmarks 4=Prompts 5=Agent 6=Experimental
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
     // Appearance (tab 0)
@@ -612,29 +1378,35 @@ const SettingsEntry kSettingsEntries[] = {
     { "Accounts",                 "AI",           2 },
     { "Subscription accounts",    "AI",           2 },
     { "Sign in",                  "AI",           2 },
-    { "Model leaderboard",        "AI",           2 },
-    { "Run benchmark",            "AI",           2 },
-    { "Benchmark",                "AI",           2 },
+    { "Model roles",              "AI",           2 },
+    { "Model rankings",           "AI",           2 },
     { "Hidden models",            "AI",           2 },
-    // Prompts (tab 3) — role prompts + the system-prompt override (moved from Advanced)
-    { "Role prompts",             "Prompts",      3 },
-    { "Agent prompts",            "Prompts",      3 },
-    { "Prompt editor",            "Prompts",      3 },
-    { "System prompt",            "Prompts",      3 },
-    { "System prompt override",   "Prompts",      3 },
-    // Agent (tab 4) — run behavior (was the Advanced tab)
-    { "Plan before building",     "Agent",        4 },
-    { "Plan mode",                "Agent",        4 },
-    { "Refine-pass cap",          "Agent",        4 },
-    { "Max iters",                "Agent",        4 },
-    { "Iteration budget",         "Agent",        4 },
-    // Experimental (tab 5)
-    { "Vision review model",      "Experimental", 5 },
-    { "Model routing",            "Experimental", 5 },
-    { "Seek-CAD split",           "Experimental", 5 },
-    { "Parametric sequence mode", "Experimental", 5 },
-    { "CAD sequence mode",        "Experimental", 5 },
-    { "Feature sequence",         "Experimental", 5 },
+    // Benchmarks (tab 3)
+    { "Benchmarks",               "Benchmarks",   3 },
+    { "Model leaderboard",        "Benchmarks",   3 },
+    { "Run benchmark",            "Benchmarks",   3 },
+    { "Benchmark",                "Benchmarks",   3 },
+    { "Benchmark categories",     "Benchmarks",   3 },
+    { "Category run",             "Benchmarks",   3 },
+    // Prompts (tab 4)
+    { "Role prompts",             "Prompts",      4 },
+    { "Agent prompts",            "Prompts",      4 },
+    { "Prompt editor",            "Prompts",      4 },
+    { "System prompt",            "Prompts",      4 },
+    { "System prompt override",   "Prompts",      4 },
+    // Agent (tab 5)
+    { "Plan before building",     "Agent",        5 },
+    { "Plan mode",                "Agent",        5 },
+    { "Refine-pass cap",          "Agent",        5 },
+    { "Max iters",                "Agent",        5 },
+    { "Iteration budget",         "Agent",        5 },
+    // Experimental (tab 6)
+    { "Vision review model",      "Experimental", 6 },
+    { "Model routing",            "Experimental", 6 },
+    { "Seek-CAD split",           "Experimental", 6 },
+    { "Parametric sequence mode", "Experimental", 6 },
+    { "CAD sequence mode",        "Experimental", 6 },
+    { "Feature sequence",         "Experimental", 6 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -1037,27 +1809,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Privacy);
                 settingsGlassSectionEnd();
 
-                settingsGlassSectionBegin("##ai_leaderboard", "Model Leaderboard");
-                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
-                        "MOCK badge when task_suite ends in -MOCK.");
-                {
-                    static ui::leaderboard::Board s_lb;
-                    static bool s_lbLoaded = false;
-                    static double s_lbLast = -1e9;
-                    const double now = ImGui::GetTime();
-                    if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
-                        s_lb = ui::leaderboard::load();
-                        s_lbLoaded = true;
-                        s_lbLast = now;
-                    }
-                    if (ImGui::SmallButton("Refresh##settings_lb")) {
-                        s_lb = ui::leaderboard::load();
-                        s_lbLast = ImGui::GetTime();
-                    }
-                    ImGui::Dummy(ImVec2(0, 2 * sc));
-                    ui::leaderboard::drawCompactTable(s_lb, sc);
-                    drawBenchRunner(st, sc, s_lb, s_lbLast);
+                settingsGlassSectionBegin("##ai_benchmarks_link", "Benchmarks");
+                dimText("Leaderboard, category runs, and live status live on the Benchmarks tab.");
+                if (ImGui::SmallButton("Open Benchmarks tab")) {
+                    // Re-arm openSettingsTab so the next frame selects Benchmarks (index 3).
+                    st.openSettingsTab = 3;
                 }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Jump to Settings \xe2\x86\x92 Benchmarks");
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##ai_model_roles", "Model roles");
+                drawModelRolesSection(st, sc);
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
@@ -1084,9 +1847,47 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 ImGui::EndTabItem();
             }
+            // ---- Benchmarks tab: categories + leaderboard + legacy runner ----
+            if (ImGui::BeginTabItem("Benchmarks", nullptr,
+                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
+                // Shared leaderboard board (refreshed by runner / refresh button).
+                static ui::leaderboard::Board s_lb;
+                static bool s_lbLoaded = false;
+                static double s_lbLast = -1e9;
+                const double now = ImGui::GetTime();
+                if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
+                    s_lb = ui::leaderboard::load();
+                    s_lbLoaded = true;
+                    s_lbLast = now;
+                }
+
+                settingsGlassSectionBegin("##bench_categories", "Categories");
+                drawBenchCategories(st, sc);
+                // Keep status polling alive while this tab is open.
+                pollBenchStatus(st, s_bench.running, &s_lb);
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##bench_leaderboard", "Model Leaderboard");
+                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
+                        "MOCK badge when task_suite ends in -MOCK.");
+                if (ImGui::SmallButton("Refresh##settings_lb")) {
+                    s_lb = ui::leaderboard::load();
+                    s_lbLast = ImGui::GetTime();
+                    s_cats.lastPoll = -1e9;
+                    s_cats.loaded = false;
+                }
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ui::leaderboard::drawCompactTable(s_lb, sc);
+                drawBenchRunner(st, sc, s_lb, s_lbLast);
+                settingsGlassSectionEnd();
+
+                ImGui::EndTabItem();
+            }
+
             // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---
             if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    (jumpToPrompts || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToPrompts || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                                       : ImGuiTabItemFlags_None)) {
                 settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
@@ -1226,7 +2027,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
             if (wantSettingsSel) s_wantSettingsTabDone = true;
             if (ImGui::BeginTabItem("Agent", nullptr,
-                                    (wantSettingsSel || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
+                                    (wantSettingsSel || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                                         : ImGuiTabItemFlags_None)) {
                 settingsSectionHeader("Run behavior", /*first=*/true);
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
@@ -1249,7 +2050,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
             // ---- Experimental tab: research-backed opt-in AI features ----
             if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");

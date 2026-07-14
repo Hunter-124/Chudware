@@ -59,9 +59,12 @@ _SYSTEM_BASE = (
     "fenced json block:\n"
     "```json\n{\"tool\": \"<tool_name>\", \"args\": {<kwargs>}}\n```\n"
     "After you see the tool result, either call another tool or, when the node's "
-    "goal is met, reply with:\n"
+    "goal is met, finish with ONE of these fenced JSON forms (both accepted):\n"
     "```json\n{\"done\": true, \"handoff\": {<structured summary>}}\n```\n"
-    "Call only tools from the allowed list. Do not invent results — run the tool."
+    "or the role handoff envelope (preferred when your role card defines one):\n"
+    "```json\n{\"status\": \"done\", \"summary\": \"...\", \"outputs\": {…}}\n```\n"
+    "status may be done|blocked|escalated. Call only tools from the allowed list. "
+    "Do not invent results — run the tool."
 )
 
 
@@ -128,7 +131,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     _phase = phase or (
         getattr(mission_dispatch, "phase", None) if mission_dispatch is not None else None
     )
-    _budget_in = max_tool_calls if max_tool_calls is not None else 8
+    _budget_in = max_tool_calls if max_tool_calls is not None else 16
     _capped = False
     if _sc is not None and _cap is not None:
         _budget_in, _capped = _sc.apply_phase_cap(
@@ -136,7 +139,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             ledger=ledger, actor=actor or name,
         )
         if _budget_in is None:
-            _budget_in = 8
+            _budget_in = 16
     budget = int(_budget_in)
     completion_cap = int(max_tokens) if max_tokens else 2048
     if tool_dispatch is not None:
@@ -264,8 +267,30 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             last_reason = _NOCODE
             break
 
-        if parsed.get("done"):
-            handoff = parsed.get("handoff") or {}
+        # Finish forms accepted:
+        #   1. {"done": true, "handoff": {...}}  — agent_turn envelope
+        #   2. {"status": "done"|"blocked"|"escalated", "summary", "outputs"}
+        #      — role-card handoff_schema (spec_writer/overseer/…). Observed
+        #      live on grok-4.5: the role prompt + GBNF/schema training teach
+        #      form (2); only form (1) was previously treated as done, so a
+        #      perfect role handoff fell through to no_code and killed SPECIFY.
+        role_status = parsed.get("status")
+        is_role_handoff = (
+            role_status in ("done", "blocked", "escalated")
+            and "tool" not in parsed
+            and not parsed.get("done")
+        )
+        if parsed.get("done") or is_role_handoff:
+            if parsed.get("done"):
+                handoff = parsed.get("handoff") or {}
+            else:
+                # Role-schema envelope IS the handoff; wrap for downstream.
+                handoff = dict(parsed)
+                # blocked/escalated still end the turn (node_runner maps success
+                # + confirmed → done). Surface non-done status in the handoff so
+                # the ledger/overseer can see it; the node still completes so
+                # the phase machine can advance past a honest blocked report
+                # rather than looping as specify_incomplete forever.
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
@@ -337,6 +362,25 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
+        # AI-VC: silent deterministic checkpoint after every successful mutating
+        # AI tool call (agent/mixed docs only; user docs untouched).
+        if ok:
+            try:
+                from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
+                _ai_vc.set_session_context(
+                    session_id=run_id,
+                    turn_id=tool_calls_made,
+                )
+                _ai_vc.on_ai_tool_success(
+                    tool, args, result,
+                    turn_id=tool_calls_made,
+                    session_id=run_id,
+                    ledger=ledger,
+                    actor=actor or "agent_turn",
+                )
+            except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
+                pass
+
         # WI-2: auto-verify inject after successful mutating dispatch (A/B only).
         if ok and _sc is not None and _cap is not None:
             try:
@@ -353,9 +397,51 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             except Exception:  # noqa: BLE001 — inject never breaks the turn
                 pass
 
-    return TurnResult(tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"),
-                      last_reason, {"calls": calls,
-                                    "tool_calls": tool_calls_made})
+    # No clean finish. Historically this returned max_iters / no_code →
+    # escalate (DEFAULT_RETRY_BUDGET=1), which killed every SPECIFY node that
+    # researched thoroughly but never emitted a formal done envelope —
+    # observed on grok-4.5 and locals alike (tool syntax perfect, 7–8 calls,
+    # zero handoff). Two failure modes:
+    #   * budget exhaust (max_iters / phase_step_cap)
+    #   * post-write junk JSON / prose that is neither tool nor done (no_code)
+    #     — specify-fix-1 s2: 8 productive calls + ledger_note, then
+    #     unparseable finish → escalate → specify_incomplete.
+    # Strong signal: a successful ledger_note means the node did its job;
+    # synthesise a done handoff so the phase can exit. Empty turns stay no_code.
+    wrote = any(
+        c.get("ok") and c.get("tool") == "ledger_note" for c in calls
+    )
+    if (tool_calls_made > 0
+            and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
+            and wrote):
+        synth = {
+            "status": "done",
+            "summary": (
+                f"auto-completed after {tool_calls_made} tool calls "
+                f"(budget={budget}, reason={last_reason}); model did not "
+                f"emit a formal handoff envelope"
+            ),
+            "outputs": {
+                "auto_complete": True,
+                "tool_calls": tool_calls_made,
+                "wrote_ledger": True,
+                "reasoning_summary": (
+                    "Turn ended without a formal handoff after ledger writes; "
+                    "synthesised a done handoff so the phase can exit."
+                ),
+            },
+        }
+        _log(ledger, actor, {"event": "turn", "kind": "done",
+                             "handoff": synth, "auto": True})
+        return TurnResult(True, _DONE,
+                          {"handoff": synth, "calls": calls,
+                           "tool_calls": tool_calls_made,
+                           "auto_complete": True})
+    if tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"):
+        return TurnResult(True, last_reason, {"calls": calls,
+                                              "tool_calls": tool_calls_made})
+    return TurnResult(False, last_reason, {"calls": calls,
+                                           "tool_calls": tool_calls_made})
 
 
 # ---------------------------------------------------------------------------

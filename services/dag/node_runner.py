@@ -165,7 +165,9 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
          ``mission_start(tier=...)`` over MCP followed by ``dag_run``) or on the
          context pack directly. Resolved via the single shared
          ``services.agent.tiers.provider_for_tier`` seam (also used by the gym).
-      3. The ambient ``config.get_provider()`` default — UNCHANGED behaviour for
+      3. WS2 ``ai_roles`` / auto ranking pick via ``role_models.resolve_for_node``
+         when config.json has an ``ai_roles`` block (or role is redaction).
+      4. The ambient ``config.get_provider()`` default — UNCHANGED behaviour for
          any node whose graph/caller specifies neither a provider nor a tier.
     """
     if provider is not None:
@@ -175,6 +177,28 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
     if tier:
         from services.agent.tiers import provider_for_tier  # noqa: PLC0415
         return provider_for_tier(tier)
+    # WS2: per-role / auto model assignment when ai_roles is configured.
+    try:
+        from services.agent.role_models import resolve_for_node  # noqa: PLC0415
+        from services.agent import config as agent_config  # noqa: PLC0415
+        role = (
+            context_pack.get("role_id")
+            or node_inputs.get("role")
+            or context_pack.get("role")
+            or "default"
+        )
+        assignment = resolve_for_node(str(role), context_pack)
+        if assignment is not None:
+            cfg = dict(agent_config.load_config())
+            cfg["model"] = assignment.model
+            # Stash the pick for observability (ledger / HUD consumers).
+            try:
+                context_pack["role_model"] = assignment.to_dict()
+            except Exception:  # noqa: BLE001
+                pass
+            return agent_config.get_provider(name=assignment.provider, cfg=cfg)
+    except Exception:  # noqa: BLE001 — never block node on role_models
+        pass
     from services.agent import config  # noqa: PLC0415 — real import, no wrong name
     return config.get_provider()
 

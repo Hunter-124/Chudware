@@ -62,3 +62,15 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
 - 2026-07-14: waves 1–4 + harness batches 1–2 landed (see REFACTOR_LOG). xAI OAuth live;
   grok-4.5 smoke + diag + C1 real executed; multi-account subscriptions; claude/codex CLI
   providers; bench-from-GUI RPC. This roadmap committed.
+- 2026-07-14 WS0 SPECIFY fix: every model class died at specify_incomplete because
+  (1) agent_turn only accepted `{"done":true,"handoff":…}` while role cards teach
+  `{"status","summary","outputs"}` — perfect role handoffs became no_code;
+  (2) default tool budget 8 + DEFAULT_RETRY_BUDGET=1 escalated productive
+  ledger_note turns that never emitted a formal done; (3) n_spec_done overseer
+  join matched the n_spec_ prefix and was required status==done, so a failed
+  audit froze the phase even when workers finished. Fix: accept role-schema
+  handoffs; auto-complete on ledger_note after budget/no_code; soft-filter
+  n_spec_done from the required set; default budget 16. Live specify-fix-1
+  C1×grok-4-5: specify mortality 1/3=0.33 (was 1.0); s1+s3 reach plan
+  (plan_incomplete is next bottleneck). Regression: test_agent_turn
+  role/auto-complete/replay + test_specify_advances_when_overseer_join_failed.

@@ -1,0 +1,448 @@
+{
+  "schema": "aicad.diag/1",
+  "generated": "2026-07-14T16:46:13Z",
+  "seed": 1,
+  "axes": [
+    "tool_validity",
+    "vision_fix",
+    "feature_id",
+    "vc_hygiene"
+  ],
+  "tiers": [
+    "openrouter:google/gemma-4-31b-it:free",
+    "openrouter:qwen/qwen3-coder:free"
+  ],
+  "mock": false,
+  "results": [
+    {
+      "tier": "openrouter:google/gemma-4-31b-it:free",
+      "model": {
+        "id": "google/gemma-4-31b-it:free",
+        "label": "Gemma 4 31B It:Free",
+        "provider": "openrouter",
+        "kind": "paid",
+        "tier": "openrouter:google/gemma-4-31b-it:free"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "tv1_describe",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv2_measure",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv3_add_features",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv4_done_handoff",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv5_nested_args",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false,
+          "n_parseable": 0,
+          "n_schema_valid": 0
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "vf1_missing_boss",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf2_good_part",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf3_fillet_too_large",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf4_cut_vs_boss",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf5_mirror_missing",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "fi1_bore",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi2_fillet",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi3_bolt_circle",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi4_extrude_depth",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi5_cut",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "vc1_delete_feature",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc2_cut_through",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc3_edit_params",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc4_suppress",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc5_boolean_cut",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 1.836,
+      "supports_vision": true
+    },
+    {
+      "tier": "openrouter:qwen/qwen3-coder:free",
+      "model": {
+        "id": "qwen/qwen3-coder:free",
+        "label": "Qwen3 Coder:Free",
+        "provider": "openrouter",
+        "kind": "paid",
+        "tier": "openrouter:qwen/qwen3-coder:free"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "tv1_describe",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv2_measure",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv3_add_features",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv4_done_handoff",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "tv5_nested_args",
+              "passed": false,
+              "parseable": false,
+              "schema_valid": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false,
+          "n_parseable": 0,
+          "n_schema_valid": 0
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "vf1_missing_boss",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf2_good_part",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf3_fillet_too_large",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf4_cut_vs_boss",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vf5_mirror_missing",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "fi1_bore",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi2_fillet",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi3_bolt_circle",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi4_extrude_depth",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "fi5_cut",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 0.0,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "n_errors": 0,
+          "n_scored": 5,
+          "tasks": [
+            {
+              "id": "vc1_delete_feature",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc2_cut_through",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc3_edit_params",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc4_suppress",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            },
+            {
+              "id": "vc5_boolean_cut",
+              "passed": false,
+              "detail": "provider error: AuthenticationError: Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+              "sequence": [],
+              "reply": "",
+              "error": false
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 0.969,
+      "supports_vision": true
+    }
+  ]
+}

@@ -13,7 +13,8 @@ users as-is.
 
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
-plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4).
+plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4),
+plm_timeline + plm_rollback (AI-VC: silent agent checkpoints + chat rollback).
 Remote/lock tools (plm_add_remote, plm_sync, plm_lock, plm_unlock) are T-R7.
 
 plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
@@ -374,3 +375,46 @@ def register_plm_tools(mcp: FastMCP) -> None:
         except VaultError as e:
             return _err(e.reason, e.hint)
         return _ok(ai_mode=out)
+
+    # ------------------------------------------------------------------
+    # AI-VC: silent agent version control (copilot chat + MCP rollback)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def plm_timeline(doc_id: str = "") -> str:
+        """List AI-authored checkpoints for a document (newest first).
+
+        Each checkpoint: ``{id, turn, label, time, features_count}`` (aliases
+        ``when`` / ``features`` also present). Empty ``doc_id`` lists every
+        AI-VC chain. Returns ``{ok, checkpoints}``.
+        """
+        try:
+            from services.plm import ai_vc
+        except ImportError:
+            return _err("no_vault", "AI version history is not available on this machine")
+        try:
+            out = ai_vc.plm_timeline(doc_id or None)
+        except Exception as e:  # noqa: BLE001
+            return _err("internal", f"{type(e).__name__}: {e}")
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def plm_rollback(to: str, doc_id: str = "") -> str:
+        """Roll an AI-authored document back to an earlier checkpoint.
+
+        ``to`` is a checkpoint id, ``turn:<n>``, or ``-N`` (relative from the
+        newest: ``-1`` = latest, ``-2`` = one before, …). Silent — never asks
+        the user. Returns ``{ok, checkpoint_id, restored_turn, content_hash, via}``.
+        """
+        try:
+            from services.plm import ai_vc
+        except ImportError:
+            return _err("no_vault", "AI version history is not available on this machine")
+        try:
+            out = ai_vc.plm_rollback(doc_id or None, to)
+        except Exception as e:  # noqa: BLE001
+            return _err("internal", f"{type(e).__name__}: {e}")
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})

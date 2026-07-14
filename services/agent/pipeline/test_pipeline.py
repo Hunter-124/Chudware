@@ -790,3 +790,57 @@ def test_verify_gate_passes_only_when_reviewer_passes(monkeypatch):
 
     assert result.status == "done", (result.status, result.stop_reason)
     assert result.phase == "deliver"
+
+
+# ---------------------------------------------------------------------------
+# WS0 — SPECIFY soft-join (n_spec_done is advisory)
+# ---------------------------------------------------------------------------
+
+def test_specify_advances_when_overseer_join_failed(monkeypatch):
+    """n_spec_done is the overseer audit join, not a hard gate. When every
+    n_spec_* worker is done but the join failed (budget/429/no handoff — the
+    grok45-1 pattern), the mission must still exit SPECIFY. Pre-fix the join
+    was required status==done and matched the n_spec_ prefix, freezing every
+    model class at specify_incomplete."""
+    monkeypatch.setenv("AI_CAD_ADVISOR", "0")
+    from services.agent import loop
+    from services.agent.pipeline.phases import Phase, PhaseMachine, PipelineFlags
+    from services.dag.mission_template import build_mission_graph
+
+    manifest = _valid_manifest()
+    graph = build_mission_graph(manifest, graph_id="ws0_soft_join",
+                                org_layer=False)
+    # Fabricate a dag_result: every node done EXCEPT n_spec_done failed.
+    node_states = {}
+    for n in graph["nodes"]:
+        nid = n["id"]
+        if nid == "n_spec_done":
+            node_states[nid] = {"status": "failed",
+                                "output": {"status": "failed"}}
+        else:
+            node_states[nid] = {"status": "done",
+                                "output": {"status": "done"}}
+    dag_result = {"status": "failed", "nodes": node_states}
+
+    machine = PhaseMachine(flags=PipelineFlags(org_layer=False))
+    # INTAKE already completed by the real path before _drive_phases_from_dag.
+    machine.enter(Phase.INTAKE)
+    machine.exit(Phase.INTAKE, machine.run_gate(
+        Phase.INTAKE, {"manifest_findings": []}))
+    completed = ["intake"]
+    events = []
+
+    def _emit_phase(phase, text):
+        events.append((phase.value if hasattr(phase, "value") else phase, text))
+
+    reached, status, stop_reason = loop._drive_phases_from_dag(
+        machine, manifest, graph, dag_result, completed, _emit_phase, Phase,
+        ledger=None)
+
+    # SPECIFY must have been exited (not stuck at specify_incomplete).
+    assert "specify" in completed, (completed, reached, stop_reason)
+    assert stop_reason != "specify_incomplete", (reached, status, stop_reason)
+    # With only specify workers done and later nodes marked done in this
+    # fixture, the machine advances; the critical invariant is it did not
+    # die at specify because of the failed overseer join.
+    assert reached != "specify" or "specify" in completed

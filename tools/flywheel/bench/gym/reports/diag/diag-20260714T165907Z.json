@@ -1,0 +1,42 @@
+{
+  "schema": "aicad.diag/1",
+  "generated": "2026-07-14T16:59:07Z",
+  "seed": 1,
+  "axes": [
+    "tool_validity",
+    "vision_fix",
+    "feature_id",
+    "vc_hygiene"
+  ],
+  "tiers": [
+    "openrouter:google/gemma-4-31b-it:free",
+    "openrouter:qwen/qwen3-coder:free"
+  ],
+  "mock": false,
+  "results": [
+    {
+      "tier": "openrouter:google/gemma-4-31b-it:free",
+      "error": "OfflineModeError: offline mode is enabled (config 'offline_mode': true): the OpenRouter cloud provider is refused. Use a local (loopback) model server instead.",
+      "axes": {},
+      "model": {
+        "id": "openrouter:google/gemma-4-31b-it:free",
+        "label": "openrouter:google/gemma-4-31b-it:free",
+        "provider": "error",
+        "kind": "local",
+        "tier": "openrouter:google/gemma-4-31b-it:free"
+      }
+    },
+    {
+      "tier": "openrouter:qwen/qwen3-coder:free",
+      "error": "OfflineModeError: offline mode is enabled (config 'offline_mode': true): the OpenRouter cloud provider is refused. Use a local (loopback) model server instead.",
+      "axes": {},
+      "model": {
+        "id": "openrouter:qwen/qwen3-coder:free",
+        "label": "openrouter:qwen/qwen3-coder:free",
+        "provider": "error",
+        "kind": "local",
+        "tier": "openrouter:qwen/qwen3-coder:free"
+      }
+    }
+  ]
+}

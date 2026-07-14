@@ -300,6 +300,45 @@ def _plm_settings_set(params: dict, _emit: Callable) -> dict:
     return _with_vault(params, run)
 
 
+def _plm_timeline(params: dict, _emit: Callable) -> dict:
+    """AI-VC timeline: checkpoints for a doc (or all). Newest first.
+
+    Shape: ``{ok, checkpoints:[{id, turn, label, time, features_count}]}``.
+    """
+    try:
+        from services.plm import ai_vc
+    except ImportError:
+        return dict(_NO_VAULT)
+    doc_id = (params or {}).get("doc_id") or None
+    if doc_id is not None:
+        doc_id = str(doc_id) or None
+    try:
+        return ai_vc.plm_timeline(doc_id)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
+
+
+def _plm_rollback(params: dict, _emit: Callable) -> dict:
+    """AI-VC rollback: restore doc to checkpoint id | turn:N | -N.
+
+    Shape: ``{ok, checkpoint_id, restored_turn, content_hash, via}``.
+    """
+    try:
+        from services.plm import ai_vc
+    except ImportError:
+        return dict(_NO_VAULT)
+    doc_id = (params or {}).get("doc_id") or None
+    if doc_id is not None:
+        doc_id = str(doc_id) or None
+    to = str((params or {}).get("to", "") or "")
+    try:
+        return ai_vc.plm_rollback(doc_id, to)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
+
+
 def _plm_compare(params: dict, _emit: Callable) -> dict:
     """Semantic (+ optional visual) compare of one item between two entries.
 
@@ -579,6 +618,8 @@ WORKER_METHODS = {
     "plm_scheme_set": _plm_scheme_set,
     "plm_discard_draft": _plm_discard_draft,
     "plm_draft": _plm_draft,
+    "plm_timeline": _plm_timeline,
+    "plm_rollback": _plm_rollback,
     # Git tab — real git / GitHub client
     "git_status": _git_status,
     "git_log": _git_log,

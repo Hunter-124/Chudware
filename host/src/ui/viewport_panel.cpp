@@ -3958,11 +3958,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // ---- world-origin axis labels (+X/+Y/+Z, dim -X/-Y/-Z) ----
         // Screen-space companions to the color-coded origin axes drawRefDatums draws at the world
-        // origin (X=red, Y=green, Z=blue; solid arrow on +, dashed tail on -). Gated on the same
-        // datum set + FeatureManager eye toggle so labels never float without their arrows. The
-        // world lengths (0.22 / 0.80 of scene radius) must match the renderer's origin-axis case.
-        if (!inSketch && renderer.hasDatum("point.origin") &&
-            !st.hiddenFeatures.count("point.origin")) {
+        // origin (X=red, Y=green, Z=blue; solid arrow on +, dashed tail on -). Gated on originVisEff
+        // (same single source of truth as the renderer + FM eye + pick) so labels never float without
+        // their arrows and never lag auto-show/auto-hide. The world lengths (0.22 / 0.80 of scene
+        // radius) must match the renderer's origin-axis case.
+        if (!inSketch && renderer.hasDatum("point.origin") && st.originVisEff) {
             const float* m = renderer.camera().mvp.m;  // column-major model->clip
             auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
                 float x = m[0]*wx + m[4]*wy + m[8]*wz  + m[12];

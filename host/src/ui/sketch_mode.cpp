@@ -4787,12 +4787,13 @@ bool SketchMode::drawPointPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
 
     // Collect all point-kind datums that are not hidden (including the synthetic origin).
     // The renderer's refDatums_ is not directly accessible, so we rebuild from docMirror
-    // (user-created) plus the synthetic origin.
+    // (user-created) plus the synthetic origin. Origin gates on originVisEff — same "drawn
+    // iff pickable" contract as drawPointPicker's sketch-plane sibling and the FM eye.
     struct PointCandidate { float wx, wy, wz; std::string fid, name; };
     std::vector<PointCandidate> candidates;
 
-    // Synthetic world origin — always included (visibility handled by hidden check below).
-    if (!st.hiddenFeatures.count("point.origin"))
+    // Synthetic world origin — only when the triad is actually drawn this frame.
+    if (st.originVisEff)
         candidates.push_back({0.0f, 0.0f, 0.0f, "point.origin", "Origin"});
 
     // User-created point-datum features from docMirror.

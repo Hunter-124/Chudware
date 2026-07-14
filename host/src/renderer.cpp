@@ -1458,7 +1458,14 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);          // must occlude behind solid faces (CASE B bleed-through)
     glDepthMask(GL_FALSE);            // test against geometry but don't occlude it
+    // Match the solid-face glPolygonOffset(1,1) so we compare against the SAME depth values the
+    // shaded pass wrote. Without this, solid depths are pushed farther while planes sit at true
+    // depth and always win GL_LESS — planes (and the origin triad) bleed through the mesh.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glEnable(GL_POLYGON_OFFSET_LINE);
+    glPolygonOffset(1.0f, 1.0f);
     glDisable(GL_CULL_FACE);
     glBindVertexArray(planeVao_);
 
@@ -1497,15 +1504,19 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
     }
 
     glBindVertexArray(0);
+    glDisable(GL_POLYGON_OFFSET_LINE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 }
 
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
 // systems (3 axes). These build no body, so the engine ships their geometry out-of-band (setRefDatums
-// from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums read against the depth
-// buffer but don't occlude (depthMask off), the same as the origin planes, so they sit visibly over
-// the model without z-fighting it away. Amber/green keeps them distinct from the blue origin planes.
+// from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums depth-TEST against
+// the solid (depthMask off so they never occlude it) — same contract as the origin planes. Polygon
+// offset matches the shaded-pass offset so we don't always win GL_LESS against pushed solid depths
+// (origin triad bleed-through when force-shown over a body). Amber/green keeps them distinct from
+// the blue origin planes.
 void Renderer::drawRefDatums(const Mat4& mvp) {
     if (refDatums_.empty() || planeProg_ == 0) return;
     const float e = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
@@ -1516,7 +1527,11 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);          // occlude parts of the triad that sit behind solid faces
     glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glEnable(GL_POLYGON_OFFSET_LINE);
+    glPolygonOffset(1.0f, 1.0f);      // match solid-face offset (see drawReferencePlanes)
     glDisable(GL_CULL_FACE);
     glBindVertexArray(planeVao_);
 
@@ -1662,8 +1677,8 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                     }
                     // Issue #19/#29: a tiny 3D sphere (octahedron approximation) at absolute (0,0,0)
                     // as a grabbable reference point (selection routes via drawPointPicker for
-                    // "point.origin"). Drawn last, over the axes; depth-mask off. When the origin is
-                    // selected a translucent halo blooms around it for a glowing-border read.
+                    // "point.origin"). Drawn last over the axes; depth-mask stays off (same as the
+                    // rest of this pass) so the sphere still depth-tests against the solid.
                     {
                         const float rd = os * 0.16f;
                         static const Vec3 A[6] = {Vec3(1, 0, 0), Vec3(-1, 0, 0), Vec3(0, 1, 0),
@@ -1732,6 +1747,8 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
 
     glLineWidth(1.0f);
     glBindVertexArray(0);
+    glDisable(GL_POLYGON_OFFSET_LINE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 }

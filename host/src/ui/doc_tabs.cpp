@@ -56,7 +56,8 @@ static bool s_openChooser = false;
 
 // ---- horizontal scroll + overflow edge treatment (file-display strip) ----
 // The strip never wraps. When the open tabs overflow the visible width we scroll them horizontally
-// and cap each overflowing edge with a "+N" indicator instead of hard-clipping the boundary tab.
+// and reserve a dedicated "+N" glass chip after the last visible tab (and before the first when
+// scrolled) so the count never paints over a filename. Boundary tab titles get a clean alpha fade.
 static float s_scrollX  = 0.0f;   // px of content hidden past the LEFT edge (0 = flush left)
 
 // Forward decls (definitions below drawDocTabs, which calls them).
@@ -127,6 +128,12 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         ImGui::EndPopup();
     }
 
+    // Shared pill geometry for fill + outline (same radius, same flags, same rect). Mismatched
+    // inset/radius between glassPanel and a later AddRect was the source of the corner seam/step
+    // artifacts where the rounded corner begins.
+    const float kTabRdp = 4.0f;
+    const float kTabR   = kTabRdp * s;
+
     // Glass pill: active = Regular material, inactive = UltraThin, hover lifts an inactive tab to
     // Thin (per-rect UV-projected live backdrop; glassBackground fallback when no backdrop is live).
     ui::GlassLevel level = active ? ui::GlassLevel::Regular : ui::GlassLevel::UltraThin;
@@ -134,50 +141,46 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
 
     // AI-activity glow: an animated, pulsating halo around a tab a subagent is editing in the
     // background (never the active tab — viewing it clears the pulse). Drawn UNDER the glass pill so
-    // the pill floats on top of the glow. A layered set of rounded rects with a sine-driven alpha
-    // reads as a soft breathing halo without needing a shader.
+    // the pill floats on top of the glow. Rings share kTabR so they stay concentric with the fill.
     if (t.aiPulse && !active) {
         const float tsec = (float)ImGui::GetTime();
         const float phase = 0.5f + 0.5f * std::sin(tsec * 3.2f);   // 0..1 breath, ~2 Hz
         const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
-        const float r = 4.0f * s;
         for (int k = 3; k >= 1; --k) {                             // outer→inner rings
             const float grow = (float)k * 2.2f * s;
             const float a = (0.10f + 0.16f * phase) * (float)k / 3.0f;
             const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, a));
             dl->AddRect(ImVec2(p0.x - grow, p0.y - grow),
                         ImVec2(p1.x + grow, p1.y + grow),
-                        col, r + grow, 0, 2.0f * s);
+                        col, kTabR + grow, 0, 2.0f * s);
         }
-        // Warm fill tint so a background tab reads as "live" even against a busy backdrop.
+        // Warm fill tint — same rounded rect the glass pill will occupy (no square fill under curves).
         dl->AddRectFilled(p0, p1,
                           ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, 0.06f + 0.10f * phase)),
-                          r);
+                          kTabR);
     }
 
     // Only the ACTIVE tab (or a hovered / AI-pulsing one) paints its own glass-pill background.
     // Inactive middle tabs stay transparent against the shared band so no stray rounded background
-    // bar shows behind them — the effect belongs to the active tab + the "+N" overflow caps, not to
+    // bar shows behind them — the effect belongs to the active tab + the "+N" overflow chips, not to
     // every file title (Hunter P4: a background was displaying where it isn't supposed to be).
     if (active || hovered || t.aiPulse)
-        ui::glassPanel(dl, tabRect, level, 4.0f /*dp — glassPanel scales by uiScale*/, surf);
+        ui::glassPanel(dl, tabRect, level, kTabRdp /*dp — glassPanel scales by uiScale*/, surf);
     if (active) {
-        // polish(G3): bold bounding-box outline replaces the thin top-edge line indicator —
-        // matches the SolidWorks-refined active-state language (filled pill + visible border).
-        // Inset 1dp so the corner rounding of the glassPanel isn't hidden by a perfectly
-        // flush rect; stroke 1.5dp reads as "bold" without being heavy.
-        const float inset = 1.0f * s;
-        dl->AddRect(ImVec2(p0.x + inset, p0.y + inset),
-                    ImVec2(p1.x - inset, p1.y - inset),
+        // Accent outline on the EXACT same rounded rect as the glass fill (no inset / no radius
+        // mismatch). Stroke sits on the pill edge so corner AA of fill + outline share one geometry.
+        dl->AddRect(p0, p1,
                     ui::Palette::toU32(pal.accent),
-                    4.0f * s,   // corner radius matches the glass pill (4dp)
+                    kTabR,
                     0,
                     std::max(1.0f, 1.5f * s));
-    } else  // thin separator on the right edge of inactive tabs
-        dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + 4 * s), ImVec2(p1.x - 0.5f, p1.y - 4 * s),
+    } else  // thin separator on the right edge of inactive tabs (inset from pill corners)
+        dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + kTabR), ImVec2(p1.x - 0.5f, p1.y - kTabR),
                     ui::Palette::toU32(pal.border), 1.0f);
 
     // Title text + kind icon — max-contrast glass surface tones (theme-independent vibrancy ramp).
+    // Clip to the pill AABB so close-button / label never paint past the tab edge under overflow.
+    dl->PushClipRect(p0, p1, true);
     const ImU32 textCol = ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary : surf.textSecondary);
     const float iy = p0.y + (tabH - iconSz) * 0.5f;
     ui::drawIconGlass(dl, docIconName(t), ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
@@ -185,11 +188,6 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     dl->AddText(ImVec2(p0.x + padX + iconSz + iconGap,
                        p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
                 textCol, label.c_str());
-
-    if (hovered && !t.path.empty())
-        ImGui::SetTooltip("%s%s", t.path.c_str(), t.dirty ? "  (unsaved changes)" : "");
-    else if (hovered && t.dirty)
-        ImGui::SetTooltip("Unsaved changes");
 
     // × close button — submitted AFTER (on top of) the pill so ImGui routes clicks in this zone to
     // it, not to the switch button underneath.
@@ -204,6 +202,12 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     const ImU32 xCol = ImGui::ColorConvertFloat4ToU32(xHover ? surf.textPrimary : surf.textTertiary);
     dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, 1.6f * s);
     dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, 1.6f * s);
+    dl->PopClipRect();
+
+    if (hovered && !t.path.empty())
+        ImGui::SetTooltip("%s%s", t.path.c_str(), t.dirty ? "  (unsaved changes)" : "");
+    else if (hovered && t.dirty)
+        ImGui::SetTooltip("Unsaved changes");
 
     // Route interactions (deferred).
     if (xClicked || middleClose) {
@@ -227,68 +231,90 @@ static float measureTabW(const AppState::DocTab& t, float s) {
            padX * 0.5f;
 }
 
-// An ANIMATED iridescent flame glow capping an overflowing edge of the tab lane. Drawn OVER the
-// (clipped) tabs so it organically overtakes the trailing/leading filename under a moving light
-// effect rather than a hard cut or a dead box. Left and right are a matched pair — same look,
-// mirrored: `fromRight` bleeds in from the right edge; else from the left. The faded (inner) side is
-// transparent and the edge side is solid accent, with a travelling flame flicker + slow iridescent
-// hue drift (ImGui::GetTime, so it animates every frame). The "+N hidden" count floats legibly at
-// the glowing edge. Returns true when its paging hot-zone is clicked (caller pages toward that edge).
-static bool drawEdgeGlow(ImDrawList* dl, float edgeX, float y0, float y1, float glowW,
-                         bool fromRight, int count, const ui::AdaptiveSurface& surf, float s,
-                         const char* id) {
-    const auto& pal = ui::palette;
-    const float tsec = (float)ImGui::GetTime();
-    const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
-    const float dir = fromRight ? 1.0f : -1.0f;   // mirror the flame travel so both lick inward
-    // Reserve a fully-OPAQUE rounded cap of width R hugging the very edge: this both (a) matches the
-    // 8dp rounded corners of the glass band so the glow doesn't poke square past them, and (b) makes
-    // the strip fully opaque a little BEFORE the edge so a trailing filename fades out under the glow
-    // instead of sharply clipping at the band boundary. The gradient runs over the flat span up to it.
-    const float R = 8.0f * s;
-    const float gspan = std::max(1.0f, glowW - R);
-    const float innerX = fromRight ? (edgeX - glowW) : (edgeX + glowW);   // faded end of the gradient
-    const float capInnerX = fromRight ? (edgeX - R) : (edgeX + R);        // where the solid cap starts
-    const int N = 16;
-    for (int i = 0; i < N; ++i) {
-        const float e0 = (float)i / N, e1 = (float)(i + 1) / N, em = (e0 + e1) * 0.5f;  // 0 inner→1 cap
-        const float xa = innerX + dir * e0 * gspan;
-        const float xb = innerX + dir * e1 * gspan;
-        const float lo = std::min(xa, xb), hi = std::max(xa, xb);
-        const float flick = 0.5f + 0.5f * std::sin(tsec * 3.4f + dir * em * 7.0f);
-        const float ramp = std::pow(em, 1.25f);                       // faint inner → opaque by the cap
-        const float a = std::min(1.0f, (0.12f + 0.98f * ramp) * (0.74f + 0.26f * flick));
-        const float warm = 0.10f * ramp + 0.05f * flick;             // hue flicker warmer at the edge
-        const float g = ag * (0.90f + 0.06f * std::sin(tsec * 1.7f + em * 4.0f));  // iridescent drift
-        const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), g, ab, a));
-        dl->AddRectFilled(ImVec2(lo, y0), ImVec2(hi, y1), col);
-    }
-    // Solid, edge-rounded cap — fully opaque so nothing shows through, corners matched to the band.
+// Width of the "+N" overflow chip for a given hidden count (text + horizontal padding).
+static float measureOverflowChipW(int count, float s) {
+    char lbl[16];
+    std::snprintf(lbl, sizeof(lbl), "+%d", count < 0 ? 0 : count);
+    return ImGui::CalcTextSize(lbl).x + 16.0f * s;
+}
+
+// Clean alpha fade at a truncated tab edge — neutral surface tone ramping to transparent, NOT a
+// saturated accent gradient block. `fromRight` true: opaque at the right edge, transparent leftward.
+static void drawTabEdgeFade(ImDrawList* dl, float edgeX, float y0, float y1, float fadeW,
+                            bool fromRight, const ui::AdaptiveSurface& surf) {
+    if (fadeW < 1.0f) return;
+    const float lo = fromRight ? (edgeX - fadeW) : edgeX;
+    const float hi = fromRight ? edgeX : (edgeX + fadeW);
+    // Match the band's glass scrim so the fade reads as the title dissolving, not a blue smear.
+    const ImVec4 base = surf.tint;
+    const float aEdge = std::min(0.92f, 0.55f + surf.scrim);
+    const ImU32 solid = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, aEdge));
+    const ImU32 clear = ImGui::ColorConvertFloat4ToU32(ImVec4(base.x, base.y, base.z, 0.0f));
+    if (fromRight)
+        dl->AddRectFilledMultiColor(ImVec2(lo, y0), ImVec2(hi, y1), clear, solid, solid, clear);
+    else
+        dl->AddRectFilledMultiColor(ImVec2(lo, y0), ImVec2(hi, y1), solid, clear, clear, solid);
+}
+
+// Dedicated overflow "+N" glass chip in its own reserved slot (never painted over a tab title).
+// Click pages the lane toward the hidden side. Tooltip lists the hidden document titles when cheap.
+// Returns true when the chip is clicked.
+static bool drawOverflowChip(ImDrawList* dl, float x, float y0, float barH, float chipW,
+                             int count, const ui::AdaptiveSurface& surf, float s,
+                             const char* id, const std::vector<std::string>& hiddenTitles) {
+    const float padY = 2.0f * s;
+    const ImVec2 p0(x, y0 + padY);
+    const ImVec2 p1(x + chipW, y0 + barH - padY);
+    const ImRect chipRect(p0, p1);
+    const float kChipRdp = 4.0f;
+
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(p0);
+    const bool clicked = ImGui::InvisibleButton("##ovf", ImVec2(chipW, p1.y - p0.y));
+    const bool hovered = ImGui::IsItemHovered();
+
+    // Glass-style pill via the theme helpers (fill + border share one rounded geometry).
+    ui::glassPanel(dl, chipRect,
+                   hovered ? ui::GlassLevel::Thin : ui::GlassLevel::UltraThin,
+                   kChipRdp, surf);
+    // Soft accent wash so the chip reads as an overflow control without the old flame smear.
     {
-        const float flick = 0.5f + 0.5f * std::sin(tsec * 3.4f + dir * 7.0f);
-        const float warm = 0.10f + 0.05f * flick;
-        const ImU32 cap = ImGui::ColorConvertFloat4ToU32(ImVec4(std::min(1.0f, ar + warm), ag * 0.9f, ab, 1.0f));
-        const float lo = std::min(capInnerX, edgeX), hi = std::max(capInnerX, edgeX);
-        dl->AddRectFilled(ImVec2(lo, y0), ImVec2(hi, y1), cap, R,
-                          fromRight ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft);
+        const float ar = ui::palette.accent[0], ag = ui::palette.accent[1], ab = ui::palette.accent[2];
+        const float a = hovered ? 0.28f : 0.16f;
+        dl->AddRectFilled(p0, p1,
+                          ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, a)),
+                          kChipRdp * s);
+        dl->AddRect(p0, p1,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(ar, ag, ab, hovered ? 0.70f : 0.45f)),
+                    kChipRdp * s, 0, std::max(1.0f, 1.0f * s));
     }
 
     char lbl[16];
     std::snprintf(lbl, sizeof(lbl), "+%d", count < 0 ? 0 : count);
     const ImVec2 ts = ImGui::CalcTextSize(lbl);
-    const float ty = y0 + (y1 - y0 - ts.y) * 0.5f;
-    const float tx = fromRight ? (edgeX - ts.x - 8.0f * s) : (edgeX + 8.0f * s);
-    dl->AddText(ImVec2(tx + 1.0f, ty + 1.0f), IM_COL32(0, 0, 0, 150), lbl);   // shadow for legibility
+    const float tx = p0.x + (chipW - ts.x) * 0.5f;
+    const float ty = p0.y + (p1.y - p0.y - ts.y) * 0.5f;
     dl->AddText(ImVec2(tx, ty), ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lbl);
 
-    // Paging hot-zone over the count (tabs allow overlap, so this later item wins its clicks).
-    const float zoneW = ts.x + 16.0f * s;
-    const float zx = fromRight ? (edgeX - zoneW) : edgeX;
-    ImGui::PushID(id);
-    ImGui::SetCursorScreenPos(ImVec2(zx, y0));
-    const bool clicked = ImGui::InvisibleButton("##pg", ImVec2(zoneW, y1 - y0));
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%d more open document%s — click to reveal", count, count == 1 ? "" : "s");
+    if (hovered) {
+        // Cheap title list for the hidden docs (cap so a huge strip stays readable).
+        std::string tip;
+        tip.reserve(64 + hiddenTitles.size() * 24);
+        tip += std::to_string(count);
+        tip += count == 1 ? " more open document — click to reveal\n" : " more open documents — click to reveal\n";
+        const int show = std::min((int)hiddenTitles.size(), 12);
+        for (int i = 0; i < show; ++i) {
+            tip += "• ";
+            tip += hiddenTitles[(size_t)i];
+            if (i + 1 < show) tip += '\n';
+        }
+        if ((int)hiddenTitles.size() > show) {
+            tip += "\n… +";
+            tip += std::to_string((int)hiddenTitles.size() - show);
+            tip += " more";
+        }
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
     ImGui::PopID();
     return clicked;
 }
@@ -505,17 +531,18 @@ float drawDocTabs(AppState& st, float availW) {
         ui::adaptivePanel(ui::panelId("host_doctabs_glass"), bandRect);
     ui::glassPanel(dl, bandRect, ui::GlassLevel::Thin, 8.0f /*dp — glassPanel scales by uiScale*/, surf);
 
-    // ---- scrollable tab lane + mirrored overflow caps ----------------------------------------------
+    // ---- scrollable tab lane + reserved overflow chips ---------------------------------------------
     // The trailing "+" button is always pinned at the far right; the tabs scroll within the space to
-    // its left. When they overflow, whichever edge hides files gets a matched "+N" cap and a thin
-    // horizontal scrollbar overlays the top of the lane. When everything fits this collapses to the
-    // old flush-left, no-scrollbar behaviour.
+    // its left. When they overflow, each side that hides files gets a dedicated "+N" glass chip in
+    // its OWN slot (the tab clip region shrinks so chips never paint over a filename). Boundary tab
+    // titles fade out with a clean alpha ramp. When everything fits this collapses to the old
+    // flush-left, no-chip behaviour.
     const float y0 = origin.y;
     const float gap = 2.0f * s;
     const float btn = barH;                       // trailing "+" button, always visible
-    const float laneL = origin.x;
-    const float laneW = std::max(40.0f * s, availW - btn - gap * 2.0f);
-    const float laneR = laneL + laneW;
+    const float outerL = origin.x;
+    const float outerW = std::max(40.0f * s, availW - btn - gap * 2.0f);
+    const float outerR = outerL + outerW;
 
     // Measure every tab up front so we can lay the lane out without drawing it.
     const int nTabs = (int)st.docTabs.size();
@@ -528,10 +555,57 @@ float drawDocTabs(AppState& st, float availW) {
         fullContentW += tabWs[i] + (i + 1 < nTabs ? gap : 0.0f);
     }
 
-    const bool overflow = fullContentW > laneW + 0.5f;
-    const float maxScroll = std::max(0.0f, fullContentW - laneW);
-    if (!overflow) s_scrollX = 0.0f;
-    s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
+    const bool overflow = fullContentW > outerW + 0.5f;
+
+    // Two-pass layout: chip widths depend on hidden counts, and hidden counts depend on the
+    // (shrunk) tab clip width after chips are reserved. One refine pass is enough for digit-width
+    // stability (counts rarely change between passes).
+    float leftChipW = 0.0f, rightChipW = 0.0f;
+    float tabsL = outerL, tabsR = outerR, tabsW = outerW;
+    float maxScroll = 0.0f;
+    int nLeft = 0, nRight = 0;
+    std::vector<std::string> leftTitles, rightTitles;
+    leftTitles.reserve((size_t)nTabs);
+    rightTitles.reserve((size_t)nTabs);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        tabsL = outerL + (leftChipW > 0.5f ? leftChipW + gap : 0.0f);
+        tabsR = outerR - (rightChipW > 0.5f ? rightChipW + gap : 0.0f);
+        tabsW = std::max(24.0f * s, tabsR - tabsL);
+        tabsR = tabsL + tabsW;   // keep consistent if clamped
+
+        maxScroll = std::max(0.0f, fullContentW - tabsW);
+        if (!overflow) s_scrollX = 0.0f;
+        s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
+
+        nLeft = 0;
+        nRight = 0;
+        leftTitles.clear();
+        rightTitles.clear();
+        for (int i = 0; i < nTabs; ++i) {
+            const float x = tabsL + tabOff[i] - s_scrollX;
+            const float xr = x + tabWs[i];
+            if (xr <= tabsL + 0.5f) {
+                ++nLeft;
+                leftTitles.push_back(st.docTabs[i].displayTitle());
+                continue;
+            }
+            if (x >= tabsR - 0.5f) {
+                ++nRight;
+                rightTitles.push_back(st.docTabs[i].displayTitle());
+                continue;
+            }
+        }
+
+        // Show a chip only when at least one tab is fully hidden on that side (partial-only
+        // truncation gets the alpha fade alone — no "+0" chip).
+        const float nextLeft  = (overflow && nLeft  > 0) ? measureOverflowChipW(nLeft,  s) : 0.0f;
+        const float nextRight = (overflow && nRight > 0) ? measureOverflowChipW(nRight, s) : 0.0f;
+        if (std::fabs(nextLeft - leftChipW) < 0.5f && std::fabs(nextRight - rightChipW) < 0.5f)
+            break;
+        leftChipW = nextLeft;
+        rightChipW = nextRight;
+    }
 
     // Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a fallback
     // so a trackpad / mouse without an H-wheel still works).
@@ -542,53 +616,54 @@ float drawDocTabs(AppState& st, float availW) {
             s_scrollX = std::min(std::max(s_scrollX - wheel * 60.0f * s, 0.0f), maxScroll);
     }
 
-    const bool leftHidden  = overflow && s_scrollX > 0.5f;
-    const bool rightHidden = overflow && s_scrollX < maxScroll - 0.5f;
-
-    // Draw the tabs clipped to the WHOLE lane; a partially-scrolled boundary tab stays drawn (the
-    // edge glow below fades it out organically instead of a hard cut or a dead box). Fully-off-lane
-    // tabs are skipped and tallied per side for the "+N hidden" count.
-    int nLeft = 0, nRight = 0;
-    dl->PushClipRect(ImVec2(laneL, bandT), ImVec2(laneR, bandB), true);
+    // Draw the tabs clipped to the reserved tab region (chips live outside this clip).
+    // A partially-scrolled boundary tab stays drawn; the edge fade below softens its title.
+    dl->PushClipRect(ImVec2(tabsL, bandT), ImVec2(tabsR, bandB), true);
     for (int i = 0; i < nTabs; ++i) {
-        const float x = laneL + tabOff[i] - s_scrollX;   // screen x of this tab's left edge
+        const float x = tabsL + tabOff[i] - s_scrollX;
         const float xr = x + tabWs[i];
-        if (xr <= laneL + 0.5f) { ++nLeft;  continue; }   // fully hidden left of the lane
-        if (x  >= laneR - 0.5f) { ++nRight; continue; }   // fully hidden right of the lane
-        drawOneTab(st, i, x, y0, barH, surf);             // (partially) visible — clipped to the lane
+        if (xr <= tabsL + 0.5f) continue;
+        if (x  >= tabsR - 0.5f) continue;
+        drawOneTab(st, i, x, y0, barH, surf);
     }
+    // Clean alpha fade on truncated edges (drawn inside the tab clip so it only covers tab content).
+    const float fadeW = 28.0f * s;
+    if (overflow && s_scrollX > 0.5f)
+        drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf);
+    if (overflow && s_scrollX < maxScroll - 0.5f)
+        drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf);
     dl->PopClipRect();
 
-    // Animated iridescent flame glow over each overflowing edge — a matched, mirrored pair. It
-    // overtakes the trailing (right) / leading (left) filename under a moving light effect, with the
-    // "+N hidden" count floating at the glowing edge; clicking it pages the lane that way.
-    const float glowW = 56.0f * s;
-    if (leftHidden &&
-        drawEdgeGlow(dl, laneL, y0, y0 + barH, glowW, /*fromRight=*/false, nLeft, surf, s, "glowL"))
-        s_scrollX = std::max(0.0f, s_scrollX - laneW * 0.8f);
-    if (rightHidden &&
-        drawEdgeGlow(dl, laneR, y0, y0 + barH, glowW, /*fromRight=*/true, nRight, surf, s, "glowR"))
-        s_scrollX = std::min(maxScroll, s_scrollX + laneW * 0.8f);
+    // Reserved-slot overflow chips — never over a tab title.
+    if (leftChipW > 0.5f && nLeft > 0) {
+        if (drawOverflowChip(dl, outerL, y0, barH, leftChipW, nLeft, surf, s, "ovfL", leftTitles))
+            s_scrollX = std::max(0.0f, s_scrollX - tabsW * 0.8f);
+    }
+    if (rightChipW > 0.5f && nRight > 0) {
+        if (drawOverflowChip(dl, outerR - rightChipW, y0, barH, rightChipW, nRight, surf, s,
+                             "ovfR", rightTitles))
+            s_scrollX = std::min(maxScroll, s_scrollX + tabsW * 0.8f);
+    }
 
-    // Thin horizontal pill-on-track scrollbar overlaying the TOP edge of the lane — only when
+    // Thin horizontal pill-on-track scrollbar overlaying the TOP edge of the tab region — only when
     // overflowing. Shares ui::drawScrollPill with the FeatureManager body so the look matches.
     if (overflow && maxScroll > 0.5f) {
         const float bandH = 8.0f * s;   // hit strip height along the top edge
-        const float thumbW = std::max(24.0f * s, laneW * (laneW / fullContentW));
-        const float thumbX = laneL + (s_scrollX / maxScroll) * (laneW - thumbW);
-        ImGui::SetCursorScreenPos(ImVec2(laneL, bandT));
-        ImGui::InvisibleButton("##hscroll", ImVec2(laneW, bandH));
+        const float thumbW = std::max(24.0f * s, tabsW * (tabsW / fullContentW));
+        const float thumbX = tabsL + (s_scrollX / maxScroll) * (tabsW - thumbW);
+        ImGui::SetCursorScreenPos(ImVec2(tabsL, bandT));
+        ImGui::InvisibleButton("##hscroll", ImVec2(tabsW, bandH));
         const bool sbHov = ImGui::IsItemHovered() || ImGui::IsItemActive();
         if (ImGui::IsItemActive()) {
             const float mx = ImGui::GetIO().MousePos.x;
-            const float t = (mx - laneL - thumbW * 0.5f) / std::max(1.0f, laneW - thumbW);
+            const float t = (mx - tabsL - thumbW * 0.5f) / std::max(1.0f, tabsW - thumbW);
             s_scrollX = std::min(std::max(t, 0.0f), 1.0f) * maxScroll;
         }
         // Nudge the bar UP a few px so it rides the top edge of the strip (Hunter: fine if it grazes
         // the ribbon above). Drawn on the FOREGROUND list so it isn't clipped by this overlay window.
         const float sbY = bandT - 5.0f * s;
-        ui::drawScrollPill(ImGui::GetForegroundDrawList(), ImVec2(laneL, sbY),
-                           ImVec2(laneR, sbY + bandH), thumbX, thumbX + thumbW,
+        ui::drawScrollPill(ImGui::GetForegroundDrawList(), ImVec2(tabsL, sbY),
+                           ImVec2(tabsR, sbY + bandH), thumbX, thumbX + thumbW,
                            /*vertical=*/false, sbHov, surf);
     }
 
@@ -597,7 +672,7 @@ float drawDocTabs(AppState& st, float availW) {
     {
         // Pinned at the far right only when the lane overflows; otherwise it hugs the last tab so the
         // band (which hugs its content) doesn't leave the button stranded outside the glass.
-        const float btnX = overflow ? (laneR + gap) : (laneL + fullContentW + gap);
+        const float btnX = overflow ? (outerR + gap) : (outerL + fullContentW + gap);
         const ImVec2 p0(btnX, y0);
         ImGui::SetCursorScreenPos(p0);
         const bool clicked = ImGui::InvisibleButton("##newtab", ImVec2(btn, btn));

@@ -1175,6 +1175,7 @@ void AppState::clearViewportForNewDoc() {
     // A fresh part re-enters the auto-show "pick a plane to start" state until the user toggles.
     planesUserToggled = false;
     originUserToggled = false;
+    showPlane[0] = showPlane[1] = showPlane[2] = false;
 }
 
 // Multi-document: park the LEAVING tab's live per-doc value state into its DocSession (move out, so
@@ -1192,6 +1193,9 @@ void AppState::captureDocState(DocSession& s) {
     s.docBodyIds   = std::move(docBodyIds);
     s.hiddenFeatures = std::move(hiddenFeatures);
     s.autoHiddenPlanes = std::move(autoHiddenPlanes);
+    for (int i = 0; i < 3; ++i) s.showPlane[i] = showPlane[i];
+    s.planesUserToggled = planesUserToggled;
+    s.originUserToggled = originUserToggled;
     s.modelInfo    = std::move(modelInfo);
     s.asmParts     = std::move(asmParts);
     s.asmFit       = std::move(asmFit);
@@ -1212,6 +1216,9 @@ void AppState::restoreDocState(DocSession& s) {
     docBodyIds   = std::move(s.docBodyIds);
     hiddenFeatures = std::move(s.hiddenFeatures);
     autoHiddenPlanes = std::move(s.autoHiddenPlanes);
+    for (int i = 0; i < 3; ++i) showPlane[i] = s.showPlane[i];
+    planesUserToggled = s.planesUserToggled;
+    originUserToggled = s.originUserToggled;
     applyDatumVisibility();   // reflect this tab's datum hides in the renderer
     modelInfo    = std::move(s.modelInfo);
     asmParts     = std::move(s.asmParts);

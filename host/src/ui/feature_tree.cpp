@@ -3155,15 +3155,18 @@ void drawFeatureTreeBody(AppState& st,
                                        ImGuiTreeNodeFlags_OpenOnArrow |
                                        ImGuiTreeNodeFlags_FramePadding;   // pill-height node
                 bool originSelected = (st.selectedFeatureId == "point.origin");
-                bool originHidden   = st.hiddenFeatures.count("point.origin") > 0;
+                // Eye ICON + dim state follow originVisEff (what the renderer actually draws this
+                // frame: auto-show on empty / auto-hide once a body exists / user force-show).
+                // Click still writes originUserToggled + hiddenFeatures (the sticky override).
+                const bool originShown = st.originVisEff;
                 FmRowRect originRect = fmRowPill(originSelected);
                 treeIcon("origin", "[O]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
-                if (originHidden)
+                if (!originShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
-                if (originHidden) ImGui::PopStyleColor();
+                if (!originShown) ImGui::PopStyleColor();
                 // Eye toggle for the origin point glyph.
                 {
                     ImVec2 oNodeMin = ImGui::GetItemRectMin();
@@ -3175,15 +3178,17 @@ void drawFeatureTreeBody(AppState& st,
                     bool   oOverEye = ImGui::IsMouseHoveringRect(oEyeMin, oEyeMax);
                     {
                         ImDrawList* odl = ImGui::GetWindowDrawList();
-                        drawEyeGlyph(odl, oEyeMin, oEyeMax, !originHidden, oOverEye, fmSurf());
+                        drawEyeGlyph(odl, oEyeMin, oEyeMax, originShown, oOverEye, fmSurf());
                         if (oOverEye) {
-                            ImGui::SetTooltip(originHidden ? "Show Origin" : "Hide Origin");
+                            ImGui::SetTooltip(originShown ? "Hide Origin" : "Show Origin");
                             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                                if (originHidden)
-                                    st.hiddenFeatures.erase("point.origin");
-                                else {
+                                // Flip relative to EFFECTIVE visibility so auto-show empty parts
+                                // (drawn but still in hiddenFeatures) hide on the first click.
+                                if (originShown) {
                                     st.hiddenFeatures.insert("point.origin");
                                     if (originSelected) st.selectedFeatureId.clear();
+                                } else {
+                                    st.hiddenFeatures.erase("point.origin");
                                 }
                                 st.originUserToggled = true;   // issue #30: stick — stop auto-hide
                                 st.applyDatumVisibility();

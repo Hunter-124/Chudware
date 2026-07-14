@@ -259,6 +259,11 @@ struct DocSession {
     std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
     std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
     std::unordered_set<std::string> autoHiddenPlanes; // user datum planes auto-hidden once referenced
+    // Datum visibility control state — parked per-doc so force-show/auto-show decisions never
+    // leak across tabs (issue: origin force-shown in doc A stayed shown in doc B).
+    bool showPlane[3] = {false, false, false};
+    bool planesUserToggled = false;
+    bool originUserToggled = false;
     std::string                modelInfo;            // (DocSession parked copy — see AppState field)
     std::vector<PartInfo>      asmParts;
     FitReport                  asmFit;

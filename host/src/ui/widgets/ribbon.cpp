@@ -310,11 +310,37 @@ static float ribbon_columnsTotalW(const std::vector<SmColumn>& cols) {
     return w;
 }
 
-// How many small rows fit vertically in the body small-zone.
+// ---------------------------------------------------------------------------
+// Shared group geometry (screen px, snapped). Panel, big buttons, small stacks,
+// and the caption strip ALL read from these so a tile can never cross the group
+// pill at any uiScale. Layout (top → bottom):
+//   padY | content zone (big btn / small rows) | caption strip | padY
+// ---------------------------------------------------------------------------
+static float ribbon_groupPadY() {
+    // Even inset between the group pill's outer edge and the button/caption content.
+    return snap(2.0f * ui::uiScale);
+}
+static float ribbon_captionH() {
+    return snap(kCaptionH * ui::uiScale);
+}
+static float ribbon_bodyH() {
+    // Full body-cell height (matches the chrome band). Snapped so panel bottom and
+    // caption placement share one integer edge.
+    return snap(kBodyH * ui::uiScale);
+}
+static float ribbon_contentH() {
+    // Button zone height: body minus caption strip minus even top/bottom pad.
+    // Big buttons, small-row packing, and the group pill's inner rect all use this.
+    float h = ribbon_bodyH() - ribbon_captionH() - 2.0f * ribbon_groupPadY();
+    float minH = snap(kSmRowH * ui::uiScale);
+    return h < minH ? minH : snap(h);
+}
+
+// How many small rows fit vertically in the body content zone.
 static int ribbon_rowsPerCol() {
-    float s = ui::uiScale;
-    float smZoneH = snap((kBodyH - kCaptionH) * s);
-    int n = (int)std::floor(smZoneH / snap(kSmRowH * s));
+    float smZoneH = ribbon_contentH();
+    float rowH    = snap(kSmRowH * ui::uiScale);
+    int n = (int)std::floor(smZoneH / rowH);
     return n < 1 ? 1 : n;
 }
 
@@ -907,7 +933,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // ONE snapped geometry rect for hit / fill / content. Measure helpers already snap widths;
     // re-snap here so a fractional wOverride (or unsapped caller) cannot desync the three.
     float bw  = snap(wOverride >= 0.0f ? wOverride : ribbon_bigBtnW(cmd_id, label, hasDrop));
-    float bh  = snap((kBodyH - kCaptionH) * s);
+    float bh  = ribbon_contentH();
     float rnd = ui::metrics::ribbonBtnRound();
 
     // Pixel-snap origin so the tile lands on the grid even when the group cursor is fractional
@@ -1079,12 +1105,14 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     return clicked && enabled;
 }
 
-// §2.3: the height of a degraded "big-as-small" row (fit ~3 per body zone, floored at the small
-// row height). Layout MUST advance sy by this value, not kSmRowH*s, or these taller rows overlap.
+// §2.3: the height of a degraded "big-as-small" row (fit ~3 per content zone, floored at the
+// small row height). Layout MUST advance sy by this value, not kSmRowH*s, or these taller rows
+// overlap. Uses the same ribbon_contentH() the big button and group panel share; floor so
+// three stacked rows never exceed the content zone (snap-up would overflow by 1px).
 static float ribbon_bigBtnAsSmallRowH() {
-    float s = ui::uiScale;
-    // Snap both candidates so row advance, hit, and fill share one integer height.
-    return ImMax(snap((kBodyH - kCaptionH) * s / 3.0f), snap(kSmRowH * s));
+    float zone = ribbon_contentH();
+    float third = std::floor(zone / 3.0f);
+    return ImMax(third, snap(kSmRowH * ui::uiScale));
 }
 
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
@@ -1609,7 +1637,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
     float s      = ui::uiScale;
     float tabH   = kTabH  * s;
-    float bodyH2 = kBodyH * s;
+    // Shared snapped body height — panel, buttons, caption, and chrome all use this.
+    float bodyH2 = ribbon_bodyH();
     float totalH = tabH + bodyH2 + kBottomPad * s;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1832,12 +1861,18 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // hard border/step against the buttons' rounded tiles (worst at the bottom-left/right corners,
     // where the panel edge cut across the curve). Dropping the fill lets the same glass show through
     // the whole band, so the body matches the tabs and the buttons sit on one continuous surface.
+    //
+    // WindowPadding MUST be zero: theme default (~15×13 scaled) would offset SetCursorPos content
+    // relative to GetWindowPos-based panel rects, so tiles and the group pill no longer share an
+    // origin. Pad is applied explicitly via ribbon_groupPadY() so panel and buttons agree.
     ImGui::SetCursorScreenPos(ImVec2(wPos.x + 4.0f * s, wPos.y + tabH + 2.0f * s));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##RibbonBody",
                       ImVec2(vp->Size.x - 8.0f * s, bodyH2 + 2.0f * s),
                       false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
     float curX = 0.0f;
@@ -1849,6 +1884,11 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         bool isSmall = (grp.collapse != COL_BIG);
         float grpW = natW[gi];
         int rowsPerCol = ribbon_rowsPerCol();
+        // Shared vertical metrics for this group: padY + content zone + caption + padY.
+        // Buttons start at contentY so they sit fully inside the pill at any uiScale.
+        const float padY     = ribbon_groupPadY();
+        const float contentH = ribbon_contentH();
+        const float contentY = padY;
 
         // --- Liquid-glass group background (drawn into the ribbon window's draw list) ---
         // The button widgets render into the ##RibbonBody child window, which composites ON TOP of
@@ -1856,15 +1896,15 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // paint OVER this band), so this frosted+washed pill always sits behind the group's
         // icons/labels regardless of code order. Horizontal extent matches the caption bounds
         // (curX + half a group pad on each side) so adjacent groups don't abut and the divider bar
-        // has a gap to sit in; vertical extent is the body cell with a small inset. Wash is kept
-        // subtle (softer than the tab strip) so the larger body area doesn't overwhelm the icons.
+        // has a gap to sit in. Vertical extent = padY + contentH + captionH + padY so the pill
+        // encloses every button tile with even padding (same snapped metrics the buttons use).
         {
             ImVec2 cwp   = ImGui::GetWindowPos();
             float  gpad  = kGroupPadX * s * 0.5f;
-            float  gvin  = 2.0f * s;                       // top/bottom inset
             float  rnd   = 6.0f * s;                       // pinned spec corner radius
-            ImVec2 g0(snap(cwp.x + curX + gpad), snap(cwp.y + gvin));
-            ImVec2 g1(snap(cwp.x + curX + grpW - gpad), snap(cwp.y + bodyH2 - gvin));
+            // Pill top/bottom: even padY inset from the body cell (matches contentY / caption bottom).
+            ImVec2 g0(snap(cwp.x + curX + gpad), snap(cwp.y + padY));
+            ImVec2 g1(snap(cwp.x + curX + grpW - gpad), snap(cwp.y + bodyH2 - padY));
             float gtint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
             ui::glassRowBackground(dl, g0, g1, rnd, /*stripe*/false, /*selected*/false,
                                    /*washAlpha*/0.30f);
@@ -1900,7 +1940,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 // routed through the generic split-button last-used machinery (a plain click must
                 // always finish; only the flyout cancels). Rendered in the New-Sketch slot.
                 if (ribbon_isSketchFinish(cmd)) {
-                    ImGui::SetCursorPos(ImVec2(bx, 0.0f));
+                    ImGui::SetCursorPos(ImVec2(bx, contentY));
                     float wStable = ribbon_bigBtnW(cmd->cmd_id, cmd->label, /*hasDrop=*/true);
                     ribbon_bigBtn(cmd->cmd_id, cmd->icon, cmd->label, true, /*hasDrop=*/true,
                                   wStable, /*highlight=*/true, /*finishBadge=*/true);
@@ -1909,7 +1949,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     continue;
                 }
                 bool drop = ribbon_hasSubs(grp, cmd);
-                ImGui::SetCursorPos(ImVec2(bx, 0.0f));
+                ImGui::SetCursorPos(ImVec2(bx, contentY));
                 const char* showIcon; const char* showLabel;
                 resolveFace(cmd, drop, showIcon, showLabel);
                 // N1-N5: stable widest-variant width — draw and advance share it so the face label
@@ -1927,7 +1967,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 auto cols = ribbon_packColumns(widths, rowsPerCol);
                 float sx = bx;
                 for (const auto& col : cols) {
-                    float sy = 0.0f;
+                    // Top-align a partially-filled small column (e.g. Curves' lone Split) so it
+                    // shares the same top edge as full 3-row stacks in neighboring groups.
+                    float sy = contentY;
                     for (int r = 0; r < col.count; ++r) {
                         const auto* cmd = grp.smCmds[col.first + r];
                         ImGui::SetCursorPos(ImVec2(sx, sy));
@@ -1958,7 +2000,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             auto cols = ribbon_packColumns(widths, rowsPerCol);
             float sx = curX + kGroupPadX * s;
             for (const auto& col : cols) {
-                float sy = 0.0f;
+                // Top-align partial columns (same rule as the big-layout small zone).
+                float sy = contentY;
                 for (int r = 0; r < col.count; ++r) {
                     int idx = col.first + r;
                     const auto* cmd = rows[idx];
@@ -2020,7 +2063,11 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 float  capR = cwinPos.x + curX + grpW - kGroupPadX * s * 0.5f;
                 float  glx = snap(capL + ((capR - capL) - gts.x) * 0.5f);
                 if (glx < capL) glx = snap(capL);
-                float  gly = snap(cwinPos.y + bodyH2 - gts.y - 2.0f * s);
+                // Caption strip sits under the content zone: contentY + contentH … bodyH2 - padY.
+                // Vertically center the label in that strip so it never collides with button tiles.
+                float  capTop = contentY + contentH;
+                float  capBot = bodyH2 - padY;
+                float  gly = snap(capTop + ((capBot - capTop) - gts.y) * 0.5f);
                 bool clipped = gts.x > (capR - capL);
                 dl->PushClipRect(ImVec2(capL, gly), ImVec2(capR, gly + gts.y), true);
                 dl->AddText(nullptr, 0.0f, ImVec2(glx, gly),
@@ -2037,8 +2084,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
     // --- C25-W3G: overflow chevron ---
     if (anyHidden) {
-        float bh = (kBodyH - kCaptionH) * s;
-        if (ribbon_overflowChevron(curX + 2.0f * s, 0.0f, bh))
+        float bh = ribbon_contentH();
+        if (ribbon_overflowChevron(curX + 2.0f * s, ribbon_groupPadY(), bh))
             ImGui::OpenPopup("##ribbon_overflow");
 
         if (ImGui::BeginPopup("##ribbon_overflow", ImGuiWindowFlags_NoMove)) {

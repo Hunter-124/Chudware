@@ -29,6 +29,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <map>
+#include <vector>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
@@ -46,6 +48,7 @@
 #include "console_panel.h"   // drawConsoleBody (shared console helper)
 #include "file_dialog.h"     // openFileDialog — composer paperclip attachments (M23)
 #include "icons.h"           // getIcon / IconUV — composer settings glyph
+#include "widgets/interwebz.h"
 
 #include "../core/app_state.h"
 #include "../core/cpp_core.h"  // detect the in-process C++ core (libaicad) backend
@@ -3545,270 +3548,1040 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
     return drawAiSettingsSection(st, busy, AiSettingsSection::All);
 }
 
-// Compact AI-settings OVERLAY body — fills the Copilot chat area when the header gear is
-// toggled (same in-column swap as Sessions). Provider + model on one row each, reasoning,
-// collapsible Advanced (tokens/window), API key + status, privacy, and footer actions.
-static void drawAISettingsBody(AppState& st, bool busy) {
-    Settings& s = st.settings;
-    const float S = ui::uiScale;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    bool changed = false;
-    refreshModelAvailability(st, false);
+// AI-settings OVERLAY body — fills the Copilot chat area when the header gear is
+// toggled (same in-column swap as Sessions). Interwebz vertical category rail +
+// 2-column glass groups for Agents / Prompts / Skills / Permissions / Accounts.
+// Esc / gear / "< Chat" style back returns to the conversation.
+namespace {
+// Forward decl — definition lives with the subscription usage strip below.
+static void drawCopilotUsageBox(AppState& st);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * S, 5.0f * S));
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::TextUnformatted("AI Settings");
-    ImGui::PopStyleColor();
-    ImGui::PopFont();
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Provider, model, and privacy. Full form lives in Settings.");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 2.0f * S));
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 2.0f * S));
+// ---- Overlay roles (ai_roles_get/set + model_rankings_get for Auto badge) ----
+struct OvRoleAssign {
+    bool isAuto = true;
+    std::string provider;
+    std::string model;
+};
+struct OvRolePick {
+    bool isAuto = false;
+    int provider = ui::PROV_LOCAL;
+    std::string model;
+    std::string label;
+};
+struct OvRolesUi {
+    std::map<std::string, OvRoleAssign> roles;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool pollInFlight = false;
+    bool saveInFlight = false;
+    double lastPoll = -1e9;
+    std::string lastError;
+};
+static OvRolesUi s_ovRoles;
 
-    ImGui::TextUnformatted("Provider");
-    ImGui::SetNextItemWidth(-1);
-    const char* provs[ui::PROV_COUNT];
-    for (int i = 0; i < ui::PROV_COUNT; ++i) provs[i] = ui::providerLabel(i);
-    int prevProvider = s.provider;
-    if (ImGui::Combo("##cp_provider", &s.provider, provs, ui::PROV_COUNT) &&
-        s.provider != prevProvider) {
-        changed = true;
-        if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
-                                              std::strstr(s.model, "claude")))
-            std::strncpy(s.model, "gemini-2.5-pro", sizeof(s.model) - 1);
-        else if (s.provider == ui::PROV_ANTHROPIC)
-            std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
-        else if (s.provider == ui::PROV_OPENAI)
-            std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
-        else if (s.provider == ui::PROV_LOCAL) {
-            std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
-            if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
-                std::strstr(s.model, "claude"))
-                std::strncpy(s.model, "gemma-4-e4b", sizeof(s.model) - 1);
-            s.vision = true;
-        } else if (s.provider == ui::PROV_LLAMACPP) {
-            std::strncpy(s.baseUrl, "http://127.0.0.1:1234/v1", sizeof(s.baseUrl) - 1);
-            if (!std::strstr(s.model, ".gguf"))
-                std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf", sizeof(s.model) - 1);
-            s.vision = false;
-        } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
-            const auto& cp = ui::cloudPresets();
-            if (!cp.empty()) {
-                std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
-                std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
-                s.vision = cp[0].vision;
-            }
-        } else if (s.provider == ui::PROV_XAI) {
-            std::strncpy(s.model, "grok-4", sizeof(s.model) - 1);
-            s.vision = true;
+static const char* kOvRoleKeys[] = {
+    "advisor", "task", "planning", "default", "plm", "redaction"};
+static const char* kOvRoleLabels[] = {
+    "Advisor", "Task", "Planning", "Default", "PLM", "Redaction"};
+static constexpr int kOvRoleCount = 6;
+
+static const char* ovRoleProviderWire(int prov) {
+    switch (prov) {
+        case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_OPENAI:      return "openai";
+        case ui::PROV_LOCAL:       return "local";
+        case ui::PROV_LLAMACPP:    return "llamacpp";
+        case ui::PROV_GEMINI:      return "gemini";
+        case ui::PROV_CLOUDCOMPAT: return "openrouter";
+        case ui::PROV_XAI:         return "xai";
+        default: return "local";
+    }
+}
+static int ovRoleProviderFromWire(const std::string& w) {
+    if (w == "anthropic") return ui::PROV_ANTHROPIC;
+    if (w == "openai") return ui::PROV_OPENAI;
+    if (w == "local") return ui::PROV_LOCAL;
+    if (w == "llamacpp") return ui::PROV_LLAMACPP;
+    if (w == "gemini") return ui::PROV_GEMINI;
+    if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
+    if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
+    return -1;
+}
+static bool ovProviderIsLoopback(int prov) {
+    return prov == ui::PROV_LOCAL || prov == ui::PROV_LLAMACPP;
+}
+static void ovEnsureDefaultRoles() {
+    for (int i = 0; i < kOvRoleCount; ++i) {
+        if (s_ovRoles.roles.find(kOvRoleKeys[i]) == s_ovRoles.roles.end()) {
+            OvRoleAssign a;
+            a.isAuto = true;
+            s_ovRoles.roles[kOvRoleKeys[i]] = a;
         }
     }
-
-    const bool cloud = ui::providerIsCloud(s.provider);
-    if (s.provider == ui::PROV_CLOUDCOMPAT) {
-        ImGui::TextUnformatted("Model");
-        const auto& cps = ui::cloudPresets();
-        std::vector<const char*> plabels;
-        plabels.push_back("(choose a preset\xe2\x80\xa6)");
-        for (const auto& p : cps) plabels.push_back(p.label.c_str());
-        int psel = 0;
-        for (int i = 0; i < (int)cps.size(); ++i)
-            if (s.model[0] && cps[i].id == s.model) { psel = i + 1; break; }
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##cp_cloudpreset", &psel, plabels.data(), (int)plabels.size()) &&
-            psel > 0 && psel - 1 < (int)cps.size()) {
-            const auto& p = cps[psel - 1];
-            std::strncpy(s.model, p.id.c_str(), sizeof(s.model) - 1);
-            std::strncpy(s.baseUrl, p.baseUrl.c_str(), sizeof(s.baseUrl) - 1);
-            s.vision = p.vision;
-            changed = true;
+}
+static std::vector<OvRolePick> ovBuildRolePicks(AppState& st, bool localOnly) {
+    std::vector<OvRolePick> out;
+    out.push_back(OvRolePick{true, 0, "", "Auto"});
+    auto add = [&](int prov, const std::string& model, const std::string& label) {
+        if (localOnly && !ovProviderIsLoopback(prov)) return;
+        OvRolePick e;
+        e.isAuto = false;
+        e.provider = prov;
+        e.model = model;
+        e.label = label;
+        out.push_back(std::move(e));
+    };
+    for (const auto& m : ui::builtinModels()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
+                      ui::providerLabel(m.provider), m.label.c_str());
+        add(m.provider, m.id, buf);
+    }
+    for (const auto& p : ui::cloudPresets()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "OpenRouter / Cloud \xc2\xb7 %s", p.label.c_str());
+        add(ui::PROV_CLOUDCOMPAT, p.id, buf);
+    }
+    for (const auto& p : ui::localPresets()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
+        add(ui::PROV_LOCAL, p.id, buf);
+    }
+    const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
+    if (lpm.ok) {
+        for (const auto& id : lpm.models) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", id.c_str());
+            add(ui::PROV_LOCAL, id, buf);
         }
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputTextWithHint("##cp_cloudmodel", "model id", s.model, sizeof(s.model)))
-            changed = true;
-    } else if (cloud) {
-        std::vector<const char*> ids, labels;
-        for (const auto& m : ui::builtinModels())
-            if (m.provider == s.provider) {
-                ids.push_back(m.id.c_str());
-                labels.push_back(m.label.c_str());
+    }
+    const ProviderModels& lcpp = st.providerModels[ui::PROV_LLAMACPP];
+    if (lcpp.ok) {
+        for (const auto& id : lcpp.models) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "llama.cpp \xc2\xb7 %s", id.c_str());
+            add(ui::PROV_LLAMACPP, id, buf);
+        }
+    }
+    return out;
+}
+static void ovPollRoles(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && s_ovRoles.loaded && (now - s_ovRoles.lastPoll) < 5.0) return;
+    if (s_ovRoles.pollInFlight || s_ovRoles.saveInFlight) return;
+    s_ovRoles.lastPoll = now;
+    s_ovRoles.pollInFlight = true;
+    st.rpc.call("ai_roles_get", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovRoles.pollInFlight = false;
+        if (!r.ok || !r.result.is_object()) {
+            s_ovRoles.rpcMissing = true;
+            ovEnsureDefaultRoles();
+            s_ovRoles.loaded = true;
+            return;
+        }
+        s_ovRoles.rpcMissing = false;
+        auto roles = r.result.value("roles", nlohmann::json::object());
+        if (!roles.is_object()) roles = nlohmann::json::object();
+        s_ovRoles.roles.clear();
+        for (int i = 0; i < kOvRoleCount; ++i) {
+            OvRoleAssign a;
+            a.isAuto = true;
+            auto it = roles.find(kOvRoleKeys[i]);
+            if (it != roles.end()) {
+                if (it->is_string()) {
+                    std::string v = it->get<std::string>();
+                    a.isAuto = (v == "auto" || v.empty());
+                } else if (it->is_object()) {
+                    a.isAuto = false;
+                    a.provider = it->value("provider", std::string());
+                    a.model = it->value("model", std::string());
+                    if (a.provider.empty() && a.model.empty()) a.isAuto = true;
+                }
             }
-        int cur = -1;
-        for (size_t i = 0; i < ids.size(); ++i)
-            if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
-        std::string customLabel;
-        if (cur < 0) {
-            customLabel = std::string(s.model[0] ? s.model : "(choose a model)") + "  (custom)";
-            labels.push_back(customLabel.c_str());
-            cur = (int)labels.size() - 1;
+            s_ovRoles.roles[kOvRoleKeys[i]] = std::move(a);
         }
-        ImGui::TextUnformatted("Model");
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##cp_modelpick", &cur, labels.data(), (int)labels.size())) {
-            if (cur >= 0 && cur < (int)ids.size()) {
-                std::strncpy(s.model, ids[cur], sizeof(s.model) - 1);
+        s_ovRoles.loaded = true;
+    });
+}
+static void ovSetRole(AppState& st, const char* roleKey, const OvRoleAssign& a) {
+    if (s_ovRoles.rpcMissing) return;
+    s_ovRoles.roles[roleKey] = a;
+    nlohmann::json p;
+    nlohmann::json roles = nlohmann::json::object();
+    if (a.isAuto) {
+        roles[roleKey] = "auto";
+    } else {
+        roles[roleKey] = nlohmann::json{{"provider", a.provider}, {"model", a.model}};
+    }
+    p["roles"] = roles;
+    s_ovRoles.saveInFlight = true;
+    st.rpc.call("ai_roles_set", p, [](const core::RpcResult& r) {
+        s_ovRoles.saveInFlight = false;
+        if (!r.ok) {
+            s_ovRoles.lastError = r.err.empty() ? "ai_roles_set failed" : r.err;
+            return;
+        }
+        if (r.result.is_object() && r.result.contains("roles") && r.result["roles"].is_object()) {
+            const auto& roles = r.result["roles"];
+            for (int i = 0; i < kOvRoleCount; ++i) {
+                auto it = roles.find(kOvRoleKeys[i]);
+                if (it == roles.end()) continue;
+                OvRoleAssign a;
+                if (it->is_string()) {
+                    a.isAuto = (it->get<std::string>() == "auto");
+                } else if (it->is_object()) {
+                    a.isAuto = false;
+                    a.provider = it->value("provider", std::string());
+                    a.model = it->value("model", std::string());
+                }
+                s_ovRoles.roles[kOvRoleKeys[i]] = a;
+            }
+        }
+        s_ovRoles.lastPoll = ImGui::GetTime();
+    });
+}
+
+// ---- Skills (skills_list / skills_get / skills_save / skills_delete) ----
+struct OvSkillRow {
+    std::string name;
+    std::string description;
+    std::string source;  // builtin | user | project
+    std::string inject;
+};
+struct OvSkillsUi {
+    std::vector<OvSkillRow> skills;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool listInFlight = false;
+    bool bodyInFlight = false;
+    bool saveInFlight = false;
+    double lastList = -1e9;
+    std::string lastError;
+    std::string selected;
+    std::string bodyName;          // name the editor buffer belongs to
+    std::vector<char> body{std::vector<char>(65536, 0)};
+    bool bodyDirty = false;
+    bool creating = false;
+    char newName[96] = {};
+};
+static OvSkillsUi s_ovSkills;
+
+static const char* kSkillCreatorTemplate =
+    "---\n"
+    "name: my-skill\n"
+    "description: One line describing what this skill teaches.\n"
+    "inject: manual\n"
+    "triggers:\n"
+    "  keywords: []\n"
+    "  tools: []\n"
+    "  phases: []\n"
+    "---\n"
+    "\n"
+    "# My Skill\n"
+    "\n"
+    "Teach a tool sequence. Always verify-before-done.\n"
+    "\n"
+    "## Steps\n"
+    "\n"
+    "1. ...\n"
+    "2. ...\n"
+    "\n"
+    "## Checklist\n"
+    "\n"
+    "- [ ] name + description valid\n"
+    "- [ ] verify-before-done called out\n";
+
+static bool ovSkillsAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (r.result.is_object()) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+        if (!r.result.value("ok", true)) {
+            const std::string reason = r.result.value("reason", std::string());
+            if (reason == "unknown_method" || reason == "method_not_found")
+                return true;
+        }
+    }
+    return false;
+}
+static void ovPollSkills(AppState& st, bool force) {
+    if (s_ovSkills.rpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_ovSkills.loaded && (now - s_ovSkills.lastList) < 4.0) return;
+    if (s_ovSkills.listInFlight) return;
+    s_ovSkills.lastList = now;
+    s_ovSkills.listInFlight = true;
+    st.rpc.call("skills_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovSkills.listInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            s_ovSkills.loaded = true;
+            s_ovSkills.skills.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            s_ovSkills.lastError = r.err.empty() ? "skills_list failed" : r.err;
+            s_ovSkills.loaded = true;
+            return;
+        }
+        s_ovSkills.lastError.clear();
+        s_ovSkills.skills.clear();
+        auto arr = r.result.value("skills", nlohmann::json::array());
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                if (!e.is_object()) continue;
+                OvSkillRow row;
+                row.name = e.value("name", std::string());
+                row.description = e.value("description", std::string());
+                row.source = e.value("source", std::string("builtin"));
+                row.inject = e.value("inject", std::string("manual"));
+                if (!row.name.empty()) s_ovSkills.skills.push_back(std::move(row));
+            }
+        }
+        std::sort(s_ovSkills.skills.begin(), s_ovSkills.skills.end(),
+                  [](const OvSkillRow& a, const OvSkillRow& b) {
+                      return a.name < b.name;
+                  });
+        s_ovSkills.loaded = true;
+    });
+}
+static void ovLoadSkillBody(AppState& st, const std::string& name) {
+    if (name.empty() || s_ovSkills.bodyInFlight) return;
+    s_ovSkills.bodyInFlight = true;
+    s_ovSkills.bodyName = name;
+    s_ovSkills.bodyDirty = false;
+    std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+    st.rpc.call("skills_get", nlohmann::json{{"name", name}},
+                [name](const core::RpcResult& r) {
+        s_ovSkills.bodyInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_get failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovSkills.selected != name) return;  // selection moved on
+        std::string body = r.result.value("body", std::string());
+        std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+        if (body.size() >= s_ovSkills.body.size())
+            body.resize(s_ovSkills.body.size() - 1);
+        std::memcpy(s_ovSkills.body.data(), body.data(), body.size());
+        s_ovSkills.bodyName = name;
+        s_ovSkills.bodyDirty = false;
+        s_ovSkills.lastError.clear();
+    });
+}
+static void ovSaveSkill(AppState& st) {
+    if (s_ovSkills.selected.empty() || s_ovSkills.saveInFlight) return;
+    s_ovSkills.saveInFlight = true;
+    nlohmann::json p;
+    p["name"] = s_ovSkills.selected;
+    p["body"] = std::string(s_ovSkills.body.data());
+    st.rpc.call("skills_save", p, [](const core::RpcResult& r) {
+        s_ovSkills.saveInFlight = false;
+        if (ovSkillsAbsent(r)) {
+            s_ovSkills.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_save failed"))
+                : r.err;
+            return;
+        }
+        s_ovSkills.bodyDirty = false;
+        s_ovSkills.lastError.clear();
+        s_ovSkills.loaded = false;  // refresh list (source may flip to user)
+        s_ovSkills.lastList = -1e9;
+    });
+}
+static void ovDeleteSkill(AppState& st, const std::string& name) {
+    if (name.empty()) return;
+    st.rpc.call("skills_delete", nlohmann::json{{"name", name}},
+                [name](const core::RpcResult& r) {
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovSkills.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("skills_delete failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovSkills.selected == name) {
+            s_ovSkills.selected.clear();
+            s_ovSkills.bodyName.clear();
+            std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+            s_ovSkills.bodyDirty = false;
+        }
+        s_ovSkills.loaded = false;
+        s_ovSkills.lastList = -1e9;
+    });
+}
+
+// Apply provider switch defaults (shared with the old single-picker overlay).
+static void ovApplyProviderDefaults(Settings& s) {
+    if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
+                                          std::strstr(s.model, "claude")))
+        std::strncpy(s.model, "gemini-2.5-pro", sizeof(s.model) - 1);
+    else if (s.provider == ui::PROV_ANTHROPIC)
+        std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
+    else if (s.provider == ui::PROV_OPENAI)
+        std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
+    else if (s.provider == ui::PROV_LOCAL) {
+        std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
+        if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
+            std::strstr(s.model, "claude"))
+            std::strncpy(s.model, "gemma-4-e4b", sizeof(s.model) - 1);
+        s.vision = true;
+    } else if (s.provider == ui::PROV_LLAMACPP) {
+        std::strncpy(s.baseUrl, "http://127.0.0.1:1234/v1", sizeof(s.baseUrl) - 1);
+        if (!std::strstr(s.model, ".gguf"))
+            std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf", sizeof(s.model) - 1);
+        s.vision = false;
+    } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
+        const auto& cp = ui::cloudPresets();
+        if (!cp.empty()) {
+            std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
+            std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+            s.vision = cp[0].vision;
+        }
+    } else if (s.provider == ui::PROV_XAI) {
+        std::strncpy(s.model, "grok-4.5", sizeof(s.model) - 1);
+        s.vision = true;
+    }
+}
+
+static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
+    Settings& s = st.settings;
+    ovPollRoles(st, /*force=*/false);
+    ovEnsureDefaultRoles();
+    refreshModelAvailability(st, false);
+
+    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##ov_roles", "Role models", ImVec2(0, colH))) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Per-role assignment. Auto picks from rankings within enabled providers.");
+        ImGui::PopStyleColor();
+        if (s_ovRoles.rpcMissing) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+            ImGui::TextWrapped("ai_roles_* unavailable \xe2\x80\x94 defaults (read-only).");
+            ImGui::PopStyleColor();
+        }
+        if (!s_ovRoles.lastError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", s_ovRoles.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        const auto allPicks = ovBuildRolePicks(st, /*localOnly=*/false);
+        const auto localPicks = ovBuildRolePicks(st, /*localOnly=*/true);
+        // Stable C-string pointers for InterwebzCombo (labels live in picks vectors).
+        std::vector<const char*> allLabels, localLabels;
+        allLabels.reserve(allPicks.size());
+        localLabels.reserve(localPicks.size());
+        for (const auto& p : allPicks) allLabels.push_back(p.label.c_str());
+        for (const auto& p : localPicks) localLabels.push_back(p.label.c_str());
+
+        for (int i = 0; i < kOvRoleCount; ++i) {
+            const char* key = kOvRoleKeys[i];
+            const bool isRedaction = (std::strcmp(key, "redaction") == 0);
+            OvRoleAssign& a = s_ovRoles.roles[key];
+            const auto& picks = isRedaction ? localPicks : allPicks;
+            const auto& labels = isRedaction ? localLabels : allLabels;
+
+            ImGui::PushID(key);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(kOvRoleLabels[i]);
+            if (a.isAuto) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
+                ImGui::TextUnformatted("auto");
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Auto-picked from model rankings.");
+            }
+            if (isRedaction) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+                ImGui::TextUnformatted("[local]");
+                ImGui::PopStyleColor();
+            }
+
+            int sel = 0;
+            if (!a.isAuto) {
+                const int wantProv = ovRoleProviderFromWire(a.provider);
+                for (int pi = 1; pi < (int)picks.size(); ++pi) {
+                    if (picks[pi].model == a.model &&
+                        (wantProv < 0 || picks[pi].provider == wantProv ||
+                         ovRoleProviderWire(picks[pi].provider) == a.provider)) {
+                        sel = pi;
+                        break;
+                    }
+                }
+            }
+            const bool ro = s_ovRoles.rpcMissing || s_ovRoles.saveInFlight;
+            if (ro) ImGui::BeginDisabled();
+            int comboSel = sel;
+            if (ui::InterwebzCombo("##role_model", &comboSel, labels.data(), (int)labels.size()) &&
+                comboSel >= 0 && comboSel < (int)picks.size()) {
+                OvRoleAssign next;
+                if (picks[comboSel].isAuto) {
+                    next.isAuto = true;
+                } else {
+                    next.isAuto = false;
+                    next.provider = ovRoleProviderWire(picks[comboSel].provider);
+                    next.model = picks[comboSel].model;
+                }
+                if (isRedaction && !next.isAuto &&
+                    !ovProviderIsLoopback(picks[comboSel].provider)) {
+                    s_ovRoles.lastError = "Redaction role refuses non-loopback providers.";
+                } else {
+                    ovSetRole(st, key, next);
+                }
+            }
+            if (ro) ImGui::EndDisabled();
+            ImGui::PopID();
+            ImGui::Dummy(ImVec2(0, 2.0f * S));
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_default_prov", "Default provider", ImVec2(0, colH))) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Composer default. Role rows above override per sub-agent.");
+        ImGui::PopStyleColor();
+
+        const char* provs[ui::PROV_COUNT];
+        for (int i = 0; i < ui::PROV_COUNT; ++i) provs[i] = ui::providerLabel(i);
+        int prevProvider = s.provider;
+        if (ui::InterwebzCombo("Provider", &s.provider, provs, ui::PROV_COUNT) &&
+            s.provider != prevProvider) {
+            changed = true;
+            ovApplyProviderDefaults(s);
+        }
+
+        // Model picker for the default provider (kept reachable).
+        const bool cloud = ui::providerIsCloud(s.provider);
+        if (s.provider == ui::PROV_CLOUDCOMPAT) {
+            const auto& cps = ui::cloudPresets();
+            std::vector<const char*> plabels;
+            plabels.push_back("(choose a preset\xe2\x80\xa6)");
+            for (const auto& p : cps) plabels.push_back(p.label.c_str());
+            int psel = 0;
+            for (int i = 0; i < (int)cps.size(); ++i)
+                if (s.model[0] && cps[i].id == s.model) { psel = i + 1; break; }
+            if (ui::InterwebzCombo("Preset", &psel, plabels.data(), (int)plabels.size()) &&
+                psel > 0 && psel - 1 < (int)cps.size()) {
+                const auto& p = cps[psel - 1];
+                std::strncpy(s.model, p.id.c_str(), sizeof(s.model) - 1);
+                std::strncpy(s.baseUrl, p.baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+                s.vision = p.vision;
                 changed = true;
             }
-        }
-    } else {
-        ImGui::TextUnformatted(s.provider == ui::PROV_LLAMACPP ? "GGUF path" : "Model");
-        const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
-                                                          ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
-        if (s.provider != ui::PROV_LLAMACPP && pm.ok && !pm.models.empty()) {
-            std::vector<const char*> ids;
-            for (const auto& id : pm.models) ids.push_back(id.c_str());
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputTextWithHint("##ov_cloudmodel", "model id", s.model, sizeof(s.model)))
+                changed = true;
+        } else if (cloud) {
+            std::vector<const char*> ids, labels;
+            for (const auto& m : ui::builtinModels())
+                if (m.provider == s.provider) {
+                    ids.push_back(m.id.c_str());
+                    labels.push_back(m.label.c_str());
+                }
             int cur = -1;
             for (size_t i = 0; i < ids.size(); ++i)
                 if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
             std::string customLabel;
             if (cur < 0) {
-                customLabel = std::string(s.model[0] ? s.model : "(select)") + "  (custom)";
-                ids.push_back(customLabel.c_str());
-                cur = (int)ids.size() - 1;
+                customLabel = std::string(s.model[0] ? s.model : "(choose a model)") + "  (custom)";
+                labels.push_back(customLabel.c_str());
+                cur = (int)labels.size() - 1;
             }
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##cp_localmodel", &cur, ids.data(), (int)ids.size())) {
-                if (cur >= 0 && (size_t)cur < pm.models.size()) {
-                    std::strncpy(s.model, pm.models[cur].c_str(), sizeof(s.model) - 1);
+            if (ui::InterwebzCombo("Model", &cur, labels.data(), (int)labels.size())) {
+                if (cur >= 0 && cur < (int)ids.size()) {
+                    std::strncpy(s.model, ids[cur], sizeof(s.model) - 1);
                     changed = true;
                 }
             }
         } else {
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##cp_localmodeltext", s.model, sizeof(s.model))) changed = true;
+            const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
+                                                              ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
+            if (s.provider != ui::PROV_LLAMACPP && pm.ok && !pm.models.empty()) {
+                std::vector<const char*> ids;
+                for (const auto& id : pm.models) ids.push_back(id.c_str());
+                int cur = -1;
+                for (size_t i = 0; i < ids.size(); ++i)
+                    if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+                std::string customLabel;
+                if (cur < 0) {
+                    customLabel = std::string(s.model[0] ? s.model : "(select)") + "  (custom)";
+                    ids.push_back(customLabel.c_str());
+                    cur = (int)ids.size() - 1;
+                }
+                if (ui::InterwebzCombo("Model", &cur, ids.data(), (int)ids.size())) {
+                    if (cur >= 0 && (size_t)cur < pm.models.size()) {
+                        std::strncpy(s.model, pm.models[cur].c_str(), sizeof(s.model) - 1);
+                        changed = true;
+                    }
+                }
+            } else {
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_localmodel", s.model, sizeof(s.model))) changed = true;
+            }
         }
-    }
 
-    {
-        const char* effLabels[8] = {};
-        const char* effValues[8] = {};
-        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
-        if (nEff > 0) {
-            ImGui::TextUnformatted("Reasoning effort");
-            int effIdx = 0;
-            for (int i = 0; i < nEff; ++i)
-                if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##cp_effort", &effIdx, effLabels, nEff)) {
-                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
+        {
+            const char* effLabels[8] = {};
+            const char* effValues[8] = {};
+            int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+            if (nEff > 0) {
+                int effIdx = 0;
+                for (int i = 0; i < nEff; ++i)
+                    if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+                if (ui::InterwebzCombo("Reasoning", &effIdx, effLabels, nEff)) {
+                    std::strncpy(s.reasoningEffort, effValues[effIdx],
+                                 sizeof(s.reasoningEffort) - 1);
+                    changed = true;
+                }
+            }
+        }
+
+        // Advanced: token/window minutiae (auto) collapsed.
+        if (ImGui::CollapsingHeader("Advanced")) {
+            int mt = s.maxTokens;
+            if (ui::InterwebzSliderInt("Max tokens", &mt, 0, 128000, "%d")) {
+                if (mt < 0) mt = 0;
+                if (mt > 0 && mt < 512) mt = 512;
+                s.maxTokens = mt;
                 changed = true;
             }
-        }
-    }
-
-    if (ImGui::CollapsingHeader("Advanced")) {
-        ImGui::SetNextItemWidth(-1);
-        int mt = s.maxTokens;
-        if (ImGui::InputInt("Max tokens##cp_mt", &mt, 1024, 4096)) {
-            if (mt < 0) mt = 0;
-            if (mt > 0 && mt < 512) mt = 512;
-            if (mt > 200000) mt = 200000;
-            s.maxTokens = mt;
-            changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Output token cap per model call. 0 = automatic.");
-        ImGui::SetNextItemWidth(-1);
-        int cw = s.contextWindow;
-        if (ImGui::InputInt("Context window##cp_cw", &cw, 1024, 8192)) {
-            if (cw < 0) cw = 0;
-            if (cw > 0 && cw < 2048) cw = 2048;
-            if (cw > 2000000) cw = 2000000;
-            s.contextWindow = cw;
-            changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Model's total token window. 0 = automatic.");
-        if (s.provider == ui::PROV_CLOUDCOMPAT || s.provider == ui::PROV_LOCAL ||
-            s.provider == ui::PROV_LLAMACPP) {
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("Base URL##cp_base", s.baseUrl, sizeof(s.baseUrl))) {
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("0 = automatic output token cap.");
+            int cw = s.contextWindow;
+            if (ui::InterwebzSliderInt("Context window", &cw, 0, 1000000, "%d")) {
+                if (cw < 0) cw = 0;
+                if (cw > 0 && cw < 2048) cw = 2048;
+                s.contextWindow = cw;
                 changed = true;
-                if (s.provider != ui::PROV_CLOUDCOMPAT) refreshModelAvailability(st, true);
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("0 = automatic context window.");
+            if (s.provider == ui::PROV_CLOUDCOMPAT || s.provider == ui::PROV_LOCAL ||
+                s.provider == ui::PROV_LLAMACPP) {
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("Base URL##ov_base", s.baseUrl, sizeof(s.baseUrl))) {
+                    changed = true;
+                    if (s.provider != ui::PROV_CLOUDCOMPAT) refreshModelAvailability(st, true);
+                }
+            }
+            if (cloud || s.provider == ui::PROV_LOCAL) {
+                char* key = providerKeyBuf(s, s.provider);
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText(s.provider == ui::PROV_LOCAL ? "API key (optional)##ovk"
+                                                                 : "API key##ovk",
+                                     key, 256, ImGuiInputTextFlags_Password))
+                    changed = true;
+            }
+        }
+
+        if (ImGui::Button("All settings\xe2\x80\xa6", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 2;
+            st.showAISettingsOverlay = false;
+        }
+        if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
+            !st.setupRunning.load() && !st.job.running.load()) {
+            st.startSetup(true);
         }
     }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
 
-    if (cloud || s.provider == ui::PROV_LOCAL) {
-        ImGui::Dummy(ImVec2(0, 2.0f * S));
-        ImGui::TextUnformatted(s.provider == ui::PROV_LOCAL ? "API key (optional)" : "API key");
-        char* key = providerKeyBuf(s, s.provider);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##cp_provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
-        bool haveKey = key[0] != '\0';
-        const char* statusMsg = nullptr;
-        ImU32 statusCol = ui::Palette::toU32(ui::palette.textDim);
-        if (s.provider == ui::PROV_CLOUDCOMPAT) {
-            const char* svc = ui::cloudServiceKey(s.baseUrl);
-            if (std::strcmp(svc, "openrouter") == 0) {
-                statusMsg = haveKey ? "OpenRouter key set"
-                                    : "no OpenRouter key — add one at openrouter.ai/keys";
-            } else {
-                statusMsg = haveKey ? "key set — cloud API available"
-                                    : "no API key — add your OpenRouter / DashScope / DeepSeek key";
-            }
-            statusCol = haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                : ui::Palette::toU32(ui::palette.statusWarn);
-        } else if (cloud) {
-            statusMsg = haveKey ? "key set — model available"
-                                : "no API key — add one to use this provider";
-            statusCol = haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                : ui::Palette::toU32(ui::palette.statusWarn);
-        } else {
-            const ProviderModels& pm = st.providerModels[ui::PROV_LOCAL];
-            if (!pm.checked) { statusMsg = "checking endpoint\xe2\x80\xa6"; }
-            else if (pm.ok) {
-                statusMsg = "endpoint reachable";
-                statusCol = ui::Palette::toU32(ui::palette.statusOk);
-            } else {
-                statusMsg = "endpoint unreachable";
-                statusCol = ui::Palette::toU32(ui::palette.statusErr);
-            }
+static void drawOvPromptsTab(AppState& st, float S, bool& changed) {
+    Settings& s = st.settings;
+    // Keep spBuf in sync when empty buffer should reflect persisted prompt.
+    if (st.spBuf[0] == 0 && !s.systemPrompt.empty())
+        std::strncpy(st.spBuf.data(), s.systemPrompt.c_str(), st.spBuf.size() - 1);
+
+    const float colH = ImMax(200.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##ov_prompt_ed", "System prompt override", ImVec2(0, colH))) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Empty = built-in. Save writes to config and the next agent turn.");
+        ImGui::PopStyleColor();
+        const float edH = ImMax(120.0f * S, ImGui::GetContentRegionAvail().y - 48.0f * S);
+        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+        if (ImGui::InputTextMultiline("##ov_sysprompt", st.spBuf.data(), st.spBuf.size(),
+                                      ImVec2(-1, edH))) {
+            // live buffer; persisted on Save
         }
-        if (statusMsg) {
-            ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
-            ImGui::TextWrapped("%s", statusMsg);
-            ImGui::PopStyleColor();
+        if (st.fonts.mono) ImGui::PopFont();
+        if (ImGui::Button("Save override", ImVec2(-1, 0))) {
+            s.systemPrompt = st.spBuf.data();
+            changed = true;
         }
-    } else if (s.provider == ui::PROV_LLAMACPP) {
-        const ProviderModels& pm = st.providerModels[ui::PROV_LLAMACPP];
-        const char* msg; ImU32 col;
-        if (!pm.checked) { msg = "checking endpoint\xe2\x80\xa6"; col = ui::Palette::toU32(ui::palette.textDim); }
-        else if (pm.ok) { msg = "endpoint reachable"; col = ui::Palette::toU32(ui::palette.statusOk); }
-        else { msg = "endpoint unreachable"; col = ui::Palette::toU32(ui::palette.statusErr); }
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::TextUnformatted(msg);
+        if (ImGui::Button("Clear (use built-in)", ImVec2(-1, 0))) {
+            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+            s.systemPrompt.clear();
+            changed = true;
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_prompt_info", "About", ImVec2(0, colH))) {
+        ui::InterwebzKeyValueRow("Status",
+            st.spBuf[0] ? "custom override" : "built-in default");
+        ui::InterwebzKeyValueRow("Persisted",
+            s.systemPrompt.empty() ? "no" : "yes");
+        ImGui::Dummy(ImVec2(0, 6.0f * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Role-specific prompts live in Settings \xe2\x86\x92 Prompts. "
+                           "This overlay edits the global system override only.");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Open Prompts tab\xe2\x80\xa6", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 4;
+            st.showAISettingsOverlay = false;
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+static void drawOvSkillsTab(AppState& st, float S) {
+    ovPollSkills(st, /*force=*/false);
+
+    if (s_ovSkills.rpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("skills_* RPC not available \xe2\x80\x94 skill editor hidden.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_ovSkills.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_ovSkills.lastError.c_str());
         ImGui::PopStyleColor();
     }
 
-    ImGui::Dummy(ImVec2(0, 2.0f * S));
-    ImGui::SeparatorText("Privacy");
-    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Refuse cloud providers. Only a local loopback endpoint is allowed.");
-    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show the AI's reasoning steps inline.");
+    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##ov_skill_list", "Catalog", ImVec2(0, colH))) {
+        if (ImGui::Button("New skill", ImVec2(-1, 0))) {
+            s_ovSkills.creating = true;
+            s_ovSkills.selected.clear();
+            std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
+            std::strncpy(s_ovSkills.body.data(), kSkillCreatorTemplate,
+                         s_ovSkills.body.size() - 1);
+            s_ovSkills.bodyName.clear();
+            s_ovSkills.bodyDirty = true;
+            std::memset(s_ovSkills.newName, 0, sizeof(s_ovSkills.newName));
+            std::strncpy(s_ovSkills.newName, "my-skill", sizeof(s_ovSkills.newName) - 1);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Create a user skill from the skill-creator template.");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+        if (!s_ovSkills.loaded && s_ovSkills.listInFlight) {
+            ImGui::TextUnformatted("Loading skills\xe2\x80\xa6");
+        } else if (s_ovSkills.skills.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("No skills discovered.");
+            ImGui::PopStyleColor();
+        } else {
+            for (size_t i = 0; i < s_ovSkills.skills.size(); ++i) {
+                const auto& sk = s_ovSkills.skills[i];
+                ImGui::PushID((int)i);
+                const bool sel = (!s_ovSkills.creating && s_ovSkills.selected == sk.name);
+                if (ImGui::Selectable("##skrow", sel, 0, ImVec2(0, 0))) {
+                    s_ovSkills.creating = false;
+                    s_ovSkills.selected = sk.name;
+                    ovLoadSkillBody(st, sk.name);
+                }
+                // Paint name + source chip on the same row.
+                {
+                    ImVec2 rmin = ImGui::GetItemRectMin();
+                    ImVec2 rmax = ImGui::GetItemRectMax();
+                    // Expand row height for two lines: name + description.
+                    (void)rmin; (void)rmax;
+                }
+                ImGui::SameLine(0, 0);
+                ImGui::BeginGroup();
+                ImGui::TextUnformatted(sk.name.c_str());
+                ImGui::SameLine();
+                {
+                    const char* chip = sk.source.c_str();
+                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
+                    if (sk.source == "user")
+                        chipCol = ui::Palette::toU32(ui::palette.accent);
+                    else if (sk.source == "project")
+                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
+                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
+                    ImGui::Text("[%s]", chip);
+                    ImGui::PopStyleColor();
+                }
+                if (!sk.description.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("%s", sk.description.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndGroup();
+                // Make the group also selectable.
+                if (ImGui::IsItemClicked()) {
+                    s_ovSkills.creating = false;
+                    s_ovSkills.selected = sk.name;
+                    ovLoadSkillBody(st, sk.name);
+                }
+                ImGui::PopID();
+                ImGui::Dummy(ImVec2(0, 2.0f * S));
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_skill_ed", "Editor", ImVec2(0, colH))) {
+        if (s_ovSkills.creating) {
+            ImGui::TextUnformatted("Name");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##ov_newskill", s_ovSkills.newName, sizeof(s_ovSkills.newName));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Saved under the user skills dir via skills_save.");
+            ImGui::PopStyleColor();
+        } else if (s_ovSkills.selected.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Select a skill to edit, or New skill.");
+            ImGui::PopStyleColor();
+        } else {
+            ui::InterwebzKeyValueRow("Skill", s_ovSkills.selected.c_str());
+            // Source chip for selected.
+            const char* src = "builtin";
+            for (const auto& sk : s_ovSkills.skills)
+                if (sk.name == s_ovSkills.selected) { src = sk.source.c_str(); break; }
+            ui::InterwebzKeyValueRow("Source", src);
+        }
+
+        if (s_ovSkills.creating || !s_ovSkills.selected.empty()) {
+            if (s_ovSkills.bodyInFlight && !s_ovSkills.creating) {
+                ImGui::TextUnformatted("Loading body\xe2\x80\xa6");
+            } else {
+                const float edH = ImMax(100.0f * S,
+                    ImGui::GetContentRegionAvail().y - 56.0f * S);
+                if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                if (ImGui::InputTextMultiline("##ov_skillbody", s_ovSkills.body.data(),
+                                              s_ovSkills.body.size(), ImVec2(-1, edH)))
+                    s_ovSkills.bodyDirty = true;
+                if (st.fonts.mono) ImGui::PopFont();
+            }
+
+            const bool busySave = s_ovSkills.saveInFlight;
+            if (busySave) ImGui::BeginDisabled();
+            if (ImGui::Button(s_ovSkills.creating ? "Create##sksave" : "Save##sksave",
+                              ImVec2(-1, 0))) {
+                if (s_ovSkills.creating) {
+                    // Normalize name from field; rewrite frontmatter name if needed.
+                    std::string name = s_ovSkills.newName;
+                    // strip spaces
+                    name.erase(std::remove_if(name.begin(), name.end(),
+                        [](unsigned char c) { return std::isspace(c); }), name.end());
+                    if (name.empty()) name = "my-skill";
+                    s_ovSkills.selected = name;
+                    s_ovSkills.creating = false;
+                    ovSaveSkill(st);
+                } else {
+                    ovSaveSkill(st);
+                }
+            }
+            if (busySave) ImGui::EndDisabled();
+
+            // Delete only for user skills.
+            if (!s_ovSkills.creating && !s_ovSkills.selected.empty()) {
+                bool isUser = false;
+                for (const auto& sk : s_ovSkills.skills)
+                    if (sk.name == s_ovSkills.selected && sk.source == "user") {
+                        isUser = true; break;
+                    }
+                if (isUser) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
+                               ui::palette.statusErr[2], 0.55f));
+                    if (ImGui::Button("Delete user skill", ImVec2(-1, 0)))
+                        ovDeleteSkill(st, s_ovSkills.selected);
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
+    Settings& s = st.settings;
+    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##ov_privacy", "Privacy", ImVec2(0, colH))) {
+        if (ui::InterwebzCheckbox("Offline mode (local only)", &s.offlineMode))
+            changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Refuse cloud providers. Only a local loopback endpoint is allowed.");
+        ui::InterwebzCheckbox("Show assistant thoughts", &gShowThinking);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show the AI's reasoning steps inline.");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+        ImGui::PopStyleColor();
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_run", "Run permissions", ImVec2(0, colH))) {
+        if (ui::InterwebzCheckbox("Supervised (plan + clarify)", &s.planMode))
+            changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Draft a build plan and ask clarify questions before modeling.");
+        if (ui::InterwebzCheckbox("Vision (send screenshots)", &s.vision))
+            changed = true;
+        int iters = s.maxIters;
+        if (ui::InterwebzSliderInt("Refine-pass cap", &iters, 0, 32, "%d")) {
+            if (iters < 0) iters = 0;
+            s.maxIters = iters;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0 = automatic refine-pass budget.");
+        ui::InterwebzKeyValueRow("Mode", s.planMode ? "Supervised" : "Autopilot");
+        ui::InterwebzKeyValueRow("Offline", s.offlineMode ? "on" : "off");
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+static void drawOvAccountsTab(AppState& st, float S) {
+    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(12.0f);
+    if (ui::InterwebzGroupBegin("##ov_acct_usage", "Active subscription", ImVec2(0, colH))) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Usage for the active provider. Polls subscription_usage.");
+        ImGui::PopStyleColor();
+        // Reuse the compact usage strip (same cache as the composer toolbar).
+        drawCopilotUsageBox(st);
+        // If the box hid itself, show a quiet empty state.
+        if (ImGui::GetCursorPosY() < 8.0f * S) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("No subscription usage for this provider.");
+            ImGui::PopStyleColor();
+        }
+        ui::InterwebzKeyValueRow("Provider", ui::providerLabel(st.settings.provider));
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_acct_mgmt", "Accounts", ImVec2(0, colH))) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+        ImGui::TextWrapped("Manage sign-in, switch accounts, and full usage tables in Settings.");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Open AI settings\xe2\x80\xa6", ImVec2(-1, 0))) {
+            st.openSettings = true;
+            st.openSettingsTab = 2;
+            st.showAISettingsOverlay = false;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Full form + accounts + leaderboard.");
+        if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
+            !st.setupRunning.load() && !st.job.running.load()) {
+            st.startSetup(true);
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
+}  // namespace
+
+static void drawAISettingsBody(AppState& st, bool busy) {
+    Settings& s = st.settings;
+    const float S = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    bool changed = false;
+    (void)busy;
+
+    // Esc returns to chat (same as gear toggle / Sessions "< Chat").
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive()) {
+        st.showAISettingsOverlay = false;
+        return;
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * S, 5.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("AI Settings");
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextWrapped("Agents, prompts, skills, permissions, accounts.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+    static int s_aiSettingsRail = 0;
+    static const char* kRailLabels[] = {
+        "Agents", "Prompts", "Skills", "Permissions", "Accounts",
+    };
+    static const char* kRailIcons[] = {
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+    };
+    const float railW = 120.0f * S;
+    const float gap = 10.0f * S;
+
+    ui::InterwebzVTabRail("##ai_ov_rail", kRailLabels, kRailIcons, 5, &s_aiSettingsRail, railW);
+    ImGui::SameLine(0.0f, gap);
+
+    ImGui::BeginChild("##ai_ov_body", ImVec2(0, 0), ImGuiChildFlags_None);
+    switch (s_aiSettingsRail) {
+    case 0: drawOvAgentsTab(st, S, changed); break;
+    case 1: drawOvPromptsTab(st, S, changed); break;
+    case 2: drawOvSkillsTab(st, S); break;
+    case 3: drawOvPermissionsTab(st, S, changed); break;
+    case 4: drawOvAccountsTab(st, S); break;
+    default: break;
+    }
+    ImGui::EndChild();
 
     if (changed) saveSettings(s);
 
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
-    if (ImGui::Button("All settings\xe2\x80\xa6", ImVec2(-1, 0))) {
-        st.openSettings    = true;
-        st.openSettingsTab = 2;
-        st.showAISettingsOverlay = false;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Open the Settings modal AI tab (full form + leaderboard).");
-    if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
-        !st.setupRunning.load() && !st.job.running.load()) {
-        st.startSetup(true);
-    }
+    ImGui::PopStyleColor();  // surf.textPrimary
     ImGui::PopStyleVar();
-    (void)busy;
 }
 
 // ============================ searchable model dropdown ============================

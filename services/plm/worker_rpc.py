@@ -304,6 +304,8 @@ def _plm_timeline(params: dict, _emit: Callable) -> dict:
     """AI-VC timeline: checkpoints for a doc (or all). Newest first.
 
     Shape: ``{ok, checkpoints:[{id, turn, label, time, features_count}]}``.
+    When ``path`` is given, the store is bound to the project's active branch
+    so checkpoints stay per-branch.
     """
     try:
         from services.plm import ai_vc
@@ -312,8 +314,22 @@ def _plm_timeline(params: dict, _emit: Callable) -> dict:
     doc_id = (params or {}).get("doc_id") or None
     if doc_id is not None:
         doc_id = str(doc_id) or None
+    path = str((params or {}).get("path") or (params or {}).get("project_dir") or "").strip()
+    store = None
+    if path:
+        try:
+            from services.plm import branches
+            from services.plm.vault import Vault
+            v = Vault.open(path)
+            try:
+                root = branches.bind_ai_vc_to_branch(v)
+                store = ai_vc.get_store(root)
+            finally:
+                v.close()
+        except Exception:  # noqa: BLE001 — fall through to default store
+            store = None
     try:
-        return ai_vc.plm_timeline(doc_id)
+        return ai_vc.plm_timeline(doc_id, store=store)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}
@@ -644,3 +660,11 @@ WORKER_METHODS = {
     "git_gh_auth_status": _git_gh_auth_status,
     "git_gh_auth_login": _git_gh_auth_login,
 }
+
+# Lightweight PLM branching (wave-2) — also registered via parts_hub.worker_rpc;
+# re-exported here so a plm-only import path still exposes them.
+try:
+    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS
+    WORKER_METHODS.update(_PLM_BRANCH_METHODS)
+except Exception:  # noqa: BLE001 — optional; parts_hub registration is the primary path
+    pass

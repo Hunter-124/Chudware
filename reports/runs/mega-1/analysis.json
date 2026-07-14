@@ -1,0 +1,174 @@
+{
+  "mission": {
+    "status": "failed",
+    "phase": "plan",
+    "phases_completed": [
+      "intake"
+    ],
+    "stop_reason": "dag_error: At key '__root__': Can receive only one value per step. Use an Annotated key to handle multiple values.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE",
+    "findings": [],
+    "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-1-fc-rocket/ledger.json",
+    "run_id": "mega-1-fc-rocket",
+    "mode": "real",
+    "wall_s": 4.25,
+    "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-1-fc-rocket/ledger.json"
+  },
+  "meta": {
+    "run_id": "mega-1-fc-rocket",
+    "tier": "xai:grok-4-5",
+    "effort": "maximum",
+    "org_layer": true,
+    "max_spawn_depth": 8,
+    "request_preview": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avio",
+    "started_at": "2026-07-14T21:02:56Z"
+  },
+  "ledger_events": 17,
+  "ledger_kinds": {
+    "brief": 1,
+    "effort_profile": 1,
+    "stage": 2,
+    "artifact": 1,
+    "delegation": 1,
+    "agent_turn": 11
+  },
+  "agent_turn_events": {
+    "tools_slot": 6,
+    "provider_error": 5
+  },
+  "provider_errors": [
+    {
+      "actor": "INTAKE: build manifest",
+      "error": "Error code: 400 - {'code': 'invalid-argument', 'error': 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.'}"
+    },
+    {
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "error": "Error code: 400 - {'code': 'invalid-argument', 'error': 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.'}"
+    },
+    {
+      "actor": "SPECIFY DL5: mission_report_card",
+      "error": "Error code: 400 - {'code': 'invalid-argument', 'error': 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.'}"
+    },
+    {
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "error": "Error code: 400 - {'code': 'invalid-argument', 'error': 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.'}"
+    },
+    {
+      "actor": "SPECIFY DL2: avionics_integration",
+      "error": "Error code: 400 - {'code': 'invalid-argument', 'error': 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.'}"
+    }
+  ],
+  "dag_event_kinds": {
+    "mission_phase": 1,
+    "mission.eta": 1,
+    "dag.run.started": 1,
+    "dag.node.started": 6,
+    "dag.node.failed": 6
+  },
+  "delegation_roots": [
+    {
+      "schema": "aicad.delegation/1",
+      "node_id": "dg_2e3ea473a407",
+      "role": "orchestrator",
+      "status": "approved",
+      "depth": 0,
+      "kind": "worker",
+      "model": {
+        "provider": "",
+        "id": "",
+        "tier": ""
+      },
+      "budget": {
+        "tokens_granted": 50000,
+        "tokens_spent": 0,
+        "attempts": 0
+      },
+      "note": "root node auto-approved at init"
+    }
+  ],
+  "prior_cells": [
+    {
+      "cycle": "specify-fix-1",
+      "cell": "C1_open_xai:grok-4-5_s1",
+      "status": "failed",
+      "phase": "plan",
+      "stop": "plan_incomplete"
+    },
+    {
+      "cycle": "specify-fix-1",
+      "cell": "C1_open_xai:grok-4-5_s2",
+      "status": "failed",
+      "phase": "specify",
+      "stop": "specify_incomplete"
+    },
+    {
+      "cycle": "specify-fix-1",
+      "cell": "C1_open_xai:grok-4-5_s3",
+      "status": "failed",
+      "phase": "plan",
+      "stop": "plan_incomplete"
+    },
+    {
+      "cycle": "grok45-2",
+      "cell": "C1_open_xai:grok-4-5_s1",
+      "status": "failed",
+      "phase": "plan",
+      "stop": "plan_incomplete"
+    },
+    {
+      "cycle": "grok45-2",
+      "cell": "C1_open_xai:grok-4-5_s2",
+      "status": "failed",
+      "phase": "plan",
+      "stop": "plan_incomplete"
+    },
+    {
+      "cycle": "grok45-2",
+      "cell": "C1_open_xai:grok-4-5_s3",
+      "status": "failed",
+      "phase": "specify",
+      "stop": "specify_incomplete"
+    },
+    {
+      "cycle": "grok45-1",
+      "cell": "C1_open_xai:grok-4-5_s1",
+      "status": "failed",
+      "phase": "specify",
+      "stop": "specify_incomplete"
+    },
+    {
+      "cycle": "grok45-1",
+      "cell": "C1_open_xai:grok-4-5_s2",
+      "status": "failed",
+      "phase": "specify",
+      "stop": "specify_incomplete"
+    },
+    {
+      "cycle": "grok45-1",
+      "cell": "C1_open_xai:grok-4-5_s3",
+      "status": "failed",
+      "phase": "specify",
+      "stop": "specify_incomplete"
+    }
+  ],
+  "auth_probe": {
+    "offline_mode": true,
+    "subscription_auth_xai_sub": false,
+    "XAI_API_KEY": false,
+    "provider_for_tier_xai_grok_4_5": "XAIProvider (api-key path)",
+    "config_provider": "xai-sub"
+  },
+  "graph": {
+    "nodes": 19,
+    "edges": 22,
+    "spec_parallel": [
+      "n_spec_DL1",
+      "n_spec_DL2",
+      "n_spec_DL3",
+      "n_spec_DL4",
+      "n_spec_DL5"
+    ],
+    "fan_in": {
+      "n_spec_done": 5
+    }
+  }
+}

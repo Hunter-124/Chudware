@@ -115,4 +115,12 @@ try:
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
+# PLM lightweight branching (wave-2) — create / list / switch / merge.
+try:
+    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS
+    WORKER_METHODS.update(_PLM_BRANCH_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass
+
+
 

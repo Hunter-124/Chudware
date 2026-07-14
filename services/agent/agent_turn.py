@@ -36,12 +36,61 @@ _DONE = "confirmed"
 _RETRY = "max_iters"
 _NOCODE = "no_code"
 _FAILED = "failed"
+_PROVIDER_AUTH = "provider_auth"  # non-retryable auth/bad-request (mega-1 TOP-4)
 
 # T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
 # pattern truncated at the FIRST closing brace, so any tool call with nested args
 # (e.g. {"tool": "x", "args": {"a": {...}}}) failed to parse and the model's valid
 # directive was dropped as free text (observed live in the r4 PLAN node).
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
+    """Classify a provider exception → ``(stop_reason, retryable)``.
+
+    Auth + permanent bad-request (400/401/403, invalid_api_key, Incorrect API key)
+    are NON-RETRYABLE → ``provider_auth`` so the mission aborts instead of burning
+    escalate/budget as ``failed``/``budget exhausted`` (mega-1 TOP-4).
+
+    Rate limits (429) and 5xx remain retryable (map to ``failed`` so the node can
+    still escalate, but callers that inspect ``retryable`` may back off).
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    # Prefer structured status codes when the SDK attaches them.
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    try:
+        status_i = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_i = None
+
+    auth_markers = (
+        "incorrect api key",
+        "invalid api key",
+        "invalid_api_key",
+        "authentication",
+        "unauthorized",
+        "auth_missing",
+        "permission denied",
+        "forbidden",
+        "invalid-argument",  # xAI 400 envelope for bad key
+        "api key provided",
+    )
+    if status_i in (400, 401, 403) or any(m in text for m in auth_markers):
+        # 400 alone is ambiguous (bad request vs auth). Treat as non-retryable
+        # when auth-ish markers present OR status is 401/403; bare 400 with
+        # invalid-argument/key wording also non-retryable.
+        if status_i in (401, 403):
+            return _PROVIDER_AUTH, False
+        if status_i == 400 or any(m in text for m in auth_markers):
+            return _PROVIDER_AUTH, False
+    if status_i == 429 or "rate limit" in text or "too many requests" in text:
+        return _FAILED, True
+    if status_i is not None and status_i >= 500:
+        return _FAILED, True
+    # Default: treat as failed (node escalates); not marked non-retryable auth.
+    return _FAILED, True
 
 
 class TurnResult:
@@ -274,9 +323,24 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         try:
             reply = provider.complete(system, messages, max_tokens=completion_cap)
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
-            _log(ledger, actor, {"event": "provider_error", "error": str(exc)})
-            return TurnResult(False, _FAILED,
-                              {"error": f"provider error: {exc}", "calls": calls})
+            stop, retryable = classify_provider_error(exc)
+            _log(ledger, actor, {
+                "event": "provider_error",
+                "error": str(exc),
+                "stop_reason": stop,
+                "retryable": retryable,
+            })
+            if stop == _PROVIDER_AUTH:
+                _log(ledger, actor, {
+                    "event": "provider_fatal",
+                    "error": str(exc),
+                    "stop_reason": stop,
+                })
+            return TurnResult(False, stop,
+                              {"error": f"provider error: {exc}",
+                               "calls": calls,
+                               "retryable": retryable,
+                               "stop_reason": stop})
 
         messages.append({"role": "assistant", "content": _parts(reply)})
         # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer

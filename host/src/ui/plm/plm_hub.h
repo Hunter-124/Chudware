@@ -22,7 +22,7 @@ bool        plmOk(const core::RpcResult& r, std::string& hint);
 std::string plmReason(const core::RpcResult& r);   // the machine reason code ("" if none/ok)
 
 enum class PlmPage {
-    Overview, Files, History, Releases, Planning, Issues, Team, Git, Settings
+    Overview, Files, History, Releases, Planning, Issues, Team, Git, Graph, Settings
 };
 
 // ---- cached row shapes (parsed from the plm_* envelopes) ----------------------

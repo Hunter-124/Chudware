@@ -74,3 +74,15 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   C1×grok-4-5: specify mortality 1/3=0.33 (was 1.0); s1+s3 reach plan
   (plan_incomplete is next bottleneck). Regression: test_agent_turn
   role/auto-complete/replay + test_specify_advances_when_overseer_join_failed.
+- 2026-07-14 mega-1 (WS5): grok-4.5 multi-domain mission (flight computer + model
+  rocket plane, 5 deliverables, org layer + max spawn depth 8, maximum effort)
+  run under `reports/runs/mega-1/`. Early death at wall 4.25s: config had
+  `offline_mode=true` and empty `subscription_auth` so `xai:grok-4-5` fell through
+  to API-key `XAIProvider` → 400 Incorrect API key on every node; parallel SPECIFY
+  then crashed LangGraph with `INVALID_CONCURRENT_GRAPH_UPDATE` on `__root__`
+  (multi-DL fan-in lacks Annotated reducer). Findings:
+  `reports/runs/mega-1/findings.md` — top fixes: auth fail-closed for xai tiers,
+  concurrent fan-in reducer, on_event dual-signature normalize, non-retryable
+  provider taxonomy, ECAD/fw tools on analysis role slots. Infinitely-branching
+  DelegationTree root landed; no child spawns (pre-model-success). Re-run after
+  xai-sub login or API key restore.

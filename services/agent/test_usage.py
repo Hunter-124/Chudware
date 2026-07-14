@@ -253,7 +253,8 @@ def test_xai_jwt_inference_degrade(tmp_config, monkeypatch):
     assert row["display_name"] in ("g@x.ai", "g@x.ai")
 
 
-def test_xai_browser_scrape_stub_seam(tmp_config, monkeypatch):
+def test_xai_browser_scrape_uses_scrape_or_falls_back(tmp_config, monkeypatch):
+    """browser_scrape source: success maps bars; any scrape failure → jwt_inference."""
     sub_auth.save_credential("xai-sub", {
         "access_token": "t",
         "email": "g@x.ai",
@@ -262,13 +263,48 @@ def test_xai_browser_scrape_stub_seam(tmp_config, monkeypatch):
         "expires_at_ms": int(time.time() * 1000) + 10**9,
     }, account_id="u1")
     monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_BROWSER)
+
+    # Failure path: CEF unavailable → jwt_inference fallback (no invented bars).
+    def boom(*_a, **_k):
+        raise RuntimeError("cef down")
+
+    monkeypatch.setattr(usage, "fetch_xai_usage_browser_scrape", usage.fetch_xai_usage_browser_scrape)
+    # Patch the scrape module import target.
+    import services.browser.usage_scrape as scrape_mod
+    monkeypatch.setattr(scrape_mod, "fetch_grok_usage", boom)
+
     row = usage.fetch_account_usage("xai", "u1", force=True)
-    assert row["source"] == "browser_scrape"
+    assert row["source"] == "jwt_inference"
     assert row["dashboard_url"] == "https://grok.com/?_s=usage"
     assert row["plan"] == "Premium+"
-    assert len(row["usage"]) == 1
-    assert row["usage"][0]["status"] == "unknown"
-    assert row["usage"][0]["used_fraction"] is None
+    assert row["usage"] == []
+
+    # Success path: scrape returns weekly pool fractions.
+    usage.clear_cache()
+
+    def ok_scrape(account_id, cred, **_k):
+        return {
+            "ok": True,
+            "status": "ok",
+            "source": "browser_scrape",
+            "dashboard_url": "https://grok.com/?_s=usage",
+            "usage": [{
+                "window": "weekly",
+                "label": "Grok web",
+                "used_fraction": 0.4,
+                "resets_at": None,
+                "status": "ok",
+                "remaining": 60,
+                "limit": 100,
+            }],
+        }
+
+    monkeypatch.setattr(scrape_mod, "fetch_grok_usage", ok_scrape)
+    row2 = usage.fetch_account_usage("xai", "u1", force=True)
+    assert row2["source"] == "browser_scrape"
+    assert len(row2["usage"]) == 1
+    assert abs(row2["usage"][0]["used_fraction"] - 0.4) < 1e-9
+    assert row2["usage"][0]["status"] == "ok"
 
 
 # ── Cache TTL ────────────────────────────────────────────────────────────────

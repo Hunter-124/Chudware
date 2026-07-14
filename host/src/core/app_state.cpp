@@ -251,7 +251,28 @@ void loadSettings(Settings& s) {
 }
 
 void saveSettings(const Settings& s) {
-    nlohmann::json j;
+    // Merge-not-replace: config.json is SHARED with the Python side (subscription_auth OAuth
+    // tokens, plm.*, ai_roles, ...). Start from the on-disk JSON and only rewrite the keys the
+    // GUI owns — a fixed-allowlist full overwrite here silently wiped every signed-in account
+    // whenever any setting was saved (2026-07-14 wipe incident).
+    nlohmann::json j = nlohmann::json::object();
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json old;
+            in >> old;
+            if (old.is_object()) j = std::move(old);
+        }
+    } catch (...) {
+        j = nlohmann::json::object();  // corrupt/absent file: rebuild GUI-owned keys only
+    }
+    // Erase GUI-owned keys that are conditionally emitted below, so stale values never linger
+    // after the user clears them or switches provider. Unknown keys survive untouched.
+    for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "keys",
+                          "reasoning_effort", "max_iters", "max_output_tokens", "context_window",
+                          "system_prompt", "appearance", "workspace_dir", "hidden_models",
+                          "disabled_providers", "experimental"})
+        j.erase(k);
     if (s.provider == 4) {
         j["provider"] = "gemini";
         j["model"] = s.model[0] ? s.model : "gemini-2.5-flash";
@@ -368,7 +389,12 @@ void saveSettings(const Settings& s) {
     }
     try {
         std::filesystem::create_directories(appdataAppDir());
-        std::ofstream(configPath()) << j.dump(2);
+        // Atomic-ish write: tmp + rename, so a concurrent Python reader/writer never sees a
+        // half-written file (sub_auth writes are load-modify-write on this same path).
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::filesystem::rename(tmp, path);
     } catch (...) {
     }
 }

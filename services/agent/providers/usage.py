@@ -50,10 +50,10 @@ DASHBOARD_URLS = {
     "xai": "https://grok.com/?_s=usage",
 }
 
-# xAI usage source enum (wave-1: jwt_inference only; browser_scrape is a stub seam).
+# xAI usage source enum (wave-2: browser_scrape via CEF per-account profiles).
 XAI_SOURCE_JWT = "jwt_inference"
 XAI_SOURCE_BROWSER = "browser_scrape"
-XAI_USAGE_SOURCE = XAI_SOURCE_JWT  # flip to browser_scrape when CEF profiles land
+XAI_USAGE_SOURCE = XAI_SOURCE_BROWSER  # CEF rate-limits scrape; jwt_inference on failure
 
 # Anthropic OAuth product surfaces
 _ANTHROPIC_OAUTH_BASE = "https://api.anthropic.com/api/oauth"
@@ -675,17 +675,118 @@ def fetch_xai_usage_jwt_inference(cred: dict) -> dict:
 
 
 def fetch_xai_usage_browser_scrape(cred: dict) -> dict:
-    """Wave-2 seam: CEF per-account scrape of grok.com/?_s=usage.
+    """CEF per-account scrape of grok.com SuperGrok web pool remaining.
 
-    This wave returns an unknown status stub so the UI can link the dashboard
-    without inventing a progress bar. A later agent wires real scrape results.
+    Lazy-imports ``services.browser.usage_scrape`` so non-browser test paths stay
+    light. On ANY failure (daemon down, parse empty, timeout, import error) falls
+    back to :func:`fetch_xai_usage_jwt_inference` so Settings still shows plan +
+    dashboard link. Structured ``needs_login`` / ``blocked`` results keep
+    ``source=browser_scrape`` so the UI can CTA re-login without inventing bars.
     """
     base = fetch_xai_usage_jwt_inference(cred)
-    base["source"] = XAI_SOURCE_BROWSER
-    base["usage"] = [
-        _usage_row("weekly", "Weekly pool", None, None, "unknown"),
-    ]
-    return base
+    account_id = str(cred.get("account_id") or cred.get("sub") or cred.get("email") or "default")
+    try:
+        from services.browser import usage_scrape  # lazy: CEF only when scraping
+    except Exception as exc:  # noqa: BLE001
+        log.warning("xAI browser_scrape import failed; jwt_inference fallback: %s", exc)
+        return base
+
+    try:
+        scraped = usage_scrape.fetch_grok_usage(
+            account_id,
+            cred,
+            timeout_s=45.0,
+        )
+    except Exception as exc:  # noqa: BLE001 — transport / parse / busy
+        log.warning("xAI browser_scrape failed; jwt_inference fallback: %s", exc)
+        return base
+
+    if not isinstance(scraped, dict):
+        return base
+
+    status = scraped.get("status")
+    # Structured degrade paths: keep browser_scrape source + dashboard, map usage.
+    if status in ("needs_login", "blocked"):
+        out = dict(base)
+        out["source"] = XAI_SOURCE_BROWSER
+        out["dashboard_url"] = scraped.get("dashboard_url") or DASHBOARD_URLS["xai"]
+        usage_rows = scraped.get("usage") or []
+        if usage_rows:
+            out["usage"] = [
+                _usage_row(
+                    str(r.get("window") or "weekly"),
+                    str(r.get("label") or "Weekly pool"),
+                    r.get("used_fraction"),
+                    r.get("resets_at"),
+                    str(r.get("status") or status),
+                )
+                for r in usage_rows
+                if isinstance(r, dict)
+            ]
+        else:
+            out["usage"] = [
+                _usage_row("weekly", "Weekly pool", None, None, str(status)),
+            ]
+        if scraped.get("details"):
+            out["details"] = scraped["details"]
+        return out
+
+    if not scraped.get("ok"):
+        # error / empty — fall back so we don't ship unknown bars without a scrape win
+        log.info("xAI browser_scrape not ok (status=%s); jwt_inference fallback", status)
+        return base
+
+    usage_rows = scraped.get("usage") or []
+    if not usage_rows:
+        return base
+
+    out = dict(base)
+    out["source"] = XAI_SOURCE_BROWSER
+    out["dashboard_url"] = scraped.get("dashboard_url") or DASHBOARD_URLS["xai"]
+    # Prefer scrape identity when present; JWT plan/email remain the baseline.
+    if scraped.get("email"):
+        out["email"] = scraped["email"]
+    if scraped.get("display_name"):
+        out["display_name"] = scraped["display_name"]
+    if scraped.get("plan"):
+        out["plan"] = scraped["plan"]
+
+    normalized: list[dict] = []
+    for r in usage_rows:
+        if not isinstance(r, dict):
+            continue
+        frac = r.get("used_fraction")
+        # Prefer remaining/limit when fraction absent.
+        if frac is None:
+            rem = _to_number(r.get("remaining"))
+            lim = _to_number(r.get("limit"))
+            if rem is not None and lim and lim > 0:
+                frac = _clamp_fraction((lim - rem) / lim)
+        st = r.get("status")
+        # Map scrape vocabulary → contract status (ok|warn|blocked|unknown).
+        if st == "exhausted":
+            st = "blocked"
+        elif st == "warning":
+            st = "warn"
+        elif st in ("needs_login", "blocked"):
+            pass
+        elif st == "ok" or st is None:
+            st = None  # let _usage_row derive from fraction
+        normalized.append(
+            _usage_row(
+                str(r.get("window") or "weekly"),
+                str(r.get("label") or "Weekly pool"),
+                frac,
+                r.get("resets_at") if isinstance(r.get("resets_at"), str) else None,
+                st if isinstance(st, str) else None,
+            )
+        )
+    if not normalized:
+        return base
+    out["usage"] = normalized
+    if scraped.get("details"):
+        out["details"] = scraped["details"]
+    return out
 
 
 def fetch_xai_usage(cred: dict) -> dict:

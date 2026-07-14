@@ -548,8 +548,67 @@ _DONE_TRUE_RE = re.compile(r'"done"\s*:\s*true', re.IGNORECASE)
 _ANY_FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.DOTALL)
 _SCRIPTISH_RE = re.compile(r"^\s*(?:result|parts|assembly)\s*=", re.M)
 
-# Event callback: receives a dict describing live progress (see _emit_* below).
-EventFn = Callable[[dict], None]
+# Event callback: historically a single-arg dict sink (``on_event(data)``).
+# The DAG executor / EventJournal use ``emit(event_type: str, payload: dict)``.
+# Both arities are accepted; :func:`normalize_on_event` adapts at run_mission.
+EventFn = Callable[..., None]
+
+
+def normalize_on_event(on_event: "EventFn | None") -> "EventFn | None":
+    """Accept both ``(dict)`` and ``(str, dict)`` event sinks; never let emit raise.
+
+    mega-1 first attempt died with
+    ``on_event() takes 1 positional argument but 2 were given`` when a gym-style
+    single-arg sink was threaded into the DAG executor. Normalize at the
+    ``run_mission`` boundary so every downstream emit is dual-arity-safe.
+    """
+    if on_event is None:
+        return None
+
+    def _safe(*args, **kwargs) -> None:
+        try:
+            if not args and "event" in kwargs:
+                # interaction._emit style: on_event(event=kind, data=data)
+                kind = kwargs.get("event")
+                data = kwargs.get("data") or {}
+                try:
+                    on_event(kind, data if isinstance(data, dict) else {"data": data})
+                except TypeError:
+                    payload = dict(data) if isinstance(data, dict) else {"data": data}
+                    payload.setdefault("kind", kind)
+                    on_event(payload)
+                return
+            if len(args) == 0:
+                if kwargs:
+                    on_event(kwargs)
+                return
+            if len(args) == 1:
+                only = args[0]
+                if isinstance(only, dict):
+                    try:
+                        on_event(only)
+                    except TypeError:
+                        # Sink wants (str, dict) — promote kind from payload.
+                        kind = only.get("kind") or only.get("event") or "event"
+                        on_event(str(kind), only)
+                else:
+                    # Bare event type with kwargs payload
+                    on_event(str(only), dict(kwargs) if kwargs else {})
+                return
+            # (event_type, payload[, ...]) — DAG / journal shape
+            event_type, payload = args[0], args[1] if len(args) > 1 else {}
+            if not isinstance(payload, dict):
+                payload = {"data": payload}
+            try:
+                on_event(event_type, payload)
+            except TypeError:
+                merged = dict(payload)
+                merged.setdefault("kind", event_type)
+                on_event(merged)
+        except Exception:  # noqa: BLE001 — a flaky UI sink must never break the run
+            pass
+
+    return _safe
 
 
 def _extract_code(reply: str) -> str | None:
@@ -1745,7 +1804,8 @@ def run_mission(
 
     run_id = name or f"mission_{hashlib.sha256(request.encode()).hexdigest()[:10]}"
     flags = PipelineFlags.from_env()
-
+    # Dual-arity event sink: accept (dict) and (str, dict); never raise into dag_error.
+    on_event = normalize_on_event(on_event)
     # Ledger — the mission's durable state (best-effort creation).
     ledger = None
     if _LEDGER_ENABLED:
@@ -1823,6 +1883,45 @@ def run_mission(
             run_id, Phase.CLARIFY, request, ledger, completed,
             stop_reason="blocking_ambiguity", manifest=manifest,
             findings=[str(f) for f in findings])
+
+    # --- Auth fail-closed (mega-1 TOP-1) ------------------------------------
+    # When the active tier is xai:* and neither xai-sub nor XAI_API_KEY is
+    # available, refuse BEFORE the DAG launches so we never amplify one bad
+    # key into N parallel provider_error 400s + join crash.
+    try:
+        from services.agent.tiers import (
+            MissionAuthError as _MissionAuthError,
+            detect_tier_from_env as _detect_tier,
+            parse_xai_tier as _parse_xai,
+            provider_for_tier as _provider_for_tier,
+        )
+    except Exception:  # noqa: BLE001 — tiers layer optional at probe time
+        _MissionAuthError = None  # type: ignore[assignment,misc]
+        _detect_tier = None  # type: ignore[assignment]
+        _parse_xai = None  # type: ignore[assignment]
+        _provider_for_tier = None  # type: ignore[assignment]
+    if _provider_for_tier is not None and _detect_tier is not None and _parse_xai is not None:
+        try:
+            _tier_now = _detect_tier()
+        except Exception:  # noqa: BLE001
+            _tier_now = None
+        if _tier_now and _parse_xai(_tier_now) is not None:
+            try:
+                _provider_for_tier(_tier_now)
+            except _MissionAuthError as _auth_exc:  # type: ignore[misc]
+                if ledger is not None:
+                    try:
+                        ledger.append("pipeline", "provider_fatal", _auth_exc.to_dict())
+                    except Exception:  # noqa: BLE001
+                        pass
+                _emit(on_event, kind="provider_fatal", run_id=run_id,
+                      **_auth_exc.to_dict())
+                return MissionRun(
+                    request=request, run_id=run_id, phase=Phase.PLAN.value,
+                    status="failed", manifest=manifest, graph=None,
+                    ledger_path=str(ledger.path) if ledger else None,
+                    phases_completed=completed, stop_reason="provider_auth",
+                    findings=[str(f) for f in findings] + [str(_auth_exc)])
 
     # --- Compile the mission DAG (role-assigned) ---------------------------
     graph = build_mission_graph(

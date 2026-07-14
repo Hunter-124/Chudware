@@ -1,0 +1,15 @@
+{"kind": "mission_phase", "run_id": "mega-1-fc-rocket", "phase": "intake", "text": "INTAKE: building deliverable manifest", "_wall": 1784062978.0340462}
+{"kind": "mission.eta", "label": "ETA 3s \u2013 10s", "remaining_phases": ["specify", "plan", "build", "verify", "deliver"], "eta_s": 5.0, "low_s": 2.6, "high_s": 10.0, "nodes": {"specify": "~1s \u2013 2s", "plan": "~1s \u2013 2s", "build": "~1s \u2013 1s", "verify": "~1s \u2013 4s", "deliver": "~1s \u2013 1s"}, "_wall": 1784062978.0363932}
+{"arg0": "dag.run.started", "arg1": {"run_id": "mega-1-fc-rocket", "graph_id": "mega-1-fc-rocket", "node_count": 19, "graph_name": ""}, "_wall": 1784062978.1528409}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_intake", "node_type": "plan", "node_name": "INTAKE: build manifest"}, "_wall": 1784062978.314448}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_intake", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.3729575}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_spec_DL3", "node_type": "design", "node_name": "SPECIFY DL3: flight_computer_ecad"}, "_wall": 1784062980.5014062}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_spec_DL1", "node_type": "design", "node_name": "SPECIFY DL1: rocket_plane_airframe"}, "_wall": 1784062980.522805}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_spec_DL5", "node_type": "design", "node_name": "SPECIFY DL5: mission_report_card"}, "_wall": 1784062980.5356681}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_spec_DL4", "node_type": "design", "node_name": "SPECIFY DL4: firmware_sensor_loop"}, "_wall": 1784062980.5460422}
+{"arg0": "dag.node.started", "arg1": {"node_id": "n_spec_DL2", "node_type": "design", "node_name": "SPECIFY DL2: avionics_integration"}, "_wall": 1784062980.5551426}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_spec_DL3", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.7064705}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_spec_DL5", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.777189}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_spec_DL1", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.7885146}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_spec_DL2", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.8174107}
+{"arg0": "dag.node.failed", "arg1": {"node_id": "n_spec_DL4", "error": "escalated: failed (budget exhausted)"}, "_wall": 1784062980.8192363}

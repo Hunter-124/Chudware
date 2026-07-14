@@ -1,0 +1,14 @@
+{
+  "status": "failed",
+  "phase": "plan",
+  "phases_completed": [
+    "intake"
+  ],
+  "stop_reason": "dag_error: At key '__root__': Can receive only one value per step. Use an Annotated key to handle multiple values.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-1-fc-rocket/ledger.json",
+  "run_id": "mega-1-fc-rocket",
+  "mode": "real",
+  "wall_s": 4.25,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-1-fc-rocket/ledger.json"
+}

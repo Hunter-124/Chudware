@@ -24,6 +24,9 @@ from engine import paths
 
 from .providers.base import Provider
 
+from . import model_catalog
+
+
 
 def load_config() -> dict:
     if paths.CONFIG.exists():
@@ -160,6 +163,41 @@ def provider_offline_safe(provider: Provider) -> bool:
         return _host_is_loopback(base_url or "http://localhost:8000/v1")
     # Unknown provider with a loopback base_url is allowed; anything else is refused.
     return _host_is_loopback(base_url)
+
+
+def _catalog_caps(provider: str, model: str, cfg: dict) -> dict:
+    """Resolve context/vision/effort options from the model catalog.
+
+    User config overrides (context_window, max_output_tokens, nested *.vision,
+    reasoning_efforts) always win. Network is NOT used here — only the on-disk
+    models.dev cache (if present) + heuristics. Live discovery is owned by the
+    on-connect probe (agent_list_models / discover_models).
+    """
+    try:
+        return model_catalog.resolve_capabilities(provider, model or "", cfg)
+    except Exception:  # noqa: BLE001 — never break provider construction
+        return {
+            "context": 0,
+            "max_output": 0,
+            "vision": True,
+            "tools": True,
+            "reasoning_efforts": [],
+            "auto_source": "heuristic",
+            "label": model or "",
+        }
+
+
+def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
+    """Stamp resolved catalog fields onto the provider for downstream consumers."""
+    try:
+        provider.context_window = int(caps.get("context") or 0) or None  # type: ignore[attr-defined]
+        provider.max_output_tokens = int(caps.get("max_output") or 0) or None  # type: ignore[attr-defined]
+        provider.reasoning_efforts = list(caps.get("reasoning_efforts") or [])  # type: ignore[attr-defined]
+        provider.catalog_auto_source = str(caps.get("auto_source") or "")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+    return provider
+
 
 
 def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
@@ -353,14 +391,20 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         # running gemma-4-e4b, so the app is testable out of the box on this machine.
         from .providers.openai_provider import OpenAIProvider
 
-        oai = cfg.get("openai", {})
-        return OpenAIProvider(
+        oai = cfg.get("openai", {}) or {}
+        model = cfg.get("model") or DEFAULT_LOCAL_MODEL
+        caps = _catalog_caps("openai", model, cfg)
+        # Nested openai.vision wins when set; else catalog (local defaults conservative).
+        vision = oai["vision"] if "vision" in oai else caps.get("vision", True)
+        prov = OpenAIProvider(
             api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or "lm-studio",
-            model=cfg.get("model") or DEFAULT_LOCAL_MODEL,
+            model=model,
             base_url=oai.get("base_url") or DEFAULT_LOCAL_BASE_URL,
-            supports_vision=oai.get("vision", True),
+            supports_vision=bool(vision),
             timeout=float(oai.get("timeout", 120.0)),
         )
+        return _attach_catalog_meta(prov, caps)
+
 
     if name == "mock":
         # Deterministic mock provider for tests (no API key, no network). Scripted replies load
@@ -394,18 +438,26 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
         key = cfg.get("api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get(
             "GOOGLE_API_KEY")
-        return GeminiProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
+        model = cfg.get("model", DEFAULT_MODEL)
+        caps = _catalog_caps("gemini", model, cfg)
+        # Effort preference stays user-owned; option set is catalog-derived.
+        prov = GeminiProvider(api_key=key, model=model,
                               reasoning_effort=cfg.get("reasoning_effort"))
+        return _attach_catalog_meta(prov, caps)
 
     if name == "openai":
         from .providers.openai_provider import OpenAIProvider, DEFAULT_MODEL
 
         key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
-        oai = cfg.get("openai", {})
-        return OpenAIProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
+        oai = cfg.get("openai", {}) or {}
+        model = cfg.get("model", DEFAULT_MODEL)
+        caps = _catalog_caps("openai", model, cfg)
+        vision = oai["vision"] if "vision" in oai else caps.get("vision", True)
+        prov = OpenAIProvider(api_key=key, model=model,
                               base_url=oai.get("base_url"),
-                              supports_vision=oai.get("vision", True),
+                              supports_vision=bool(vision),
                               timeout=float(oai.get("timeout", 120.0)))
+        return _attach_catalog_meta(prov, caps)
 
     if name == "openrouter":
         # OpenAI-compatible endpoint pinned to OpenRouter. Key is BYO (OPENROUTER_API_KEY)
@@ -414,9 +466,13 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
         key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
         oc = cfg.get("openrouter", {}) or {}
-        return OpenRouterProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
-                                  supports_vision=oc.get("vision", True),
+        model = cfg.get("model", DEFAULT_MODEL)
+        caps = _catalog_caps("openrouter", model, cfg)
+        vision = oc["vision"] if "vision" in oc else caps.get("vision", True)
+        prov = OpenRouterProvider(api_key=key, model=model,
+                                  supports_vision=bool(vision),
                                   timeout=float(oc.get("timeout", 120.0)))
+        return _attach_catalog_meta(prov, caps)
 
     if name == "xai":
         # Classic API-key path (console.x.ai). OpenAI-compatible at https://api.x.ai/v1.
@@ -424,13 +480,18 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
         key = cfg.get("api_key") or os.environ.get("XAI_API_KEY")
         xc = cfg.get("xai", {}) or {}
-        return XAIProvider(
+        model = cfg.get("model", DEFAULT_MODEL)
+        caps = _catalog_caps("xai", model, cfg)
+        vision = xc["vision"] if "vision" in xc else caps.get("vision", True)
+        prov = XAIProvider(
             api_key=key,
-            model=cfg.get("model", DEFAULT_MODEL),
-            supports_vision=xc.get("vision", True),
+            model=model,
+            supports_vision=bool(vision),
             timeout=float(xc.get("timeout", 120.0)),
             base_url=xc.get("base_url") or BASE_URL,
         )
+        return _attach_catalog_meta(prov, caps)
+
 
     if name == "anthropic-sub":
         # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
@@ -493,13 +554,18 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                                               DEFAULT_MODEL as VLLM_DEFAULT_MODEL)
 
         vc = dict(cfg.get("vllm", {}) or {})
-        return VLLMProvider(
-            base_model=vc.get("model") or cfg.get("model") or VLLM_DEFAULT_MODEL,
+        model = vc.get("model") or cfg.get("model") or VLLM_DEFAULT_MODEL
+        caps = _catalog_caps("vllm", model, cfg)
+        vision = vc["vision"] if "vision" in vc else caps.get("vision", False)
+        prov = VLLMProvider(
+            base_model=model,
             adapter=vc.get("adapter"),
             api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
             base_url=vc.get("base_url") or DEFAULT_BASE_URL,
-            supports_vision=vc.get("vision", False),
+            supports_vision=bool(vision),
             timeout=float(vc.get("timeout", 120.0)),
         )
+        return _attach_catalog_meta(prov, caps)
+
 
     raise ValueError(f"Unknown provider: {name!r}")

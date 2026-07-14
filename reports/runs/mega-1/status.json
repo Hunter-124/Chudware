@@ -1,0 +1,15 @@
+{
+  "state": "finished",
+  "run_id": "mega-1-fc-rocket",
+  "tier": "xai:grok-4-5",
+  "pid": 970770,
+  "started_wall": 1784062976.5755591,
+  "finished_wall": 1784062980.8262732,
+  "wall_s": 4.25,
+  "result": {
+    "status": "failed",
+    "phase": "plan",
+    "stop_reason": "dag_error: At key '__root__': Can receive only one value per step. Use an Annotated key to handle multiple values.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE",
+    "error": null
+  }
+}

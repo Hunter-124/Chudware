@@ -320,6 +320,38 @@ def effort_tier_for(tier: str | None) -> str | None:
     return tier
 
 
+class MissionAuthError(RuntimeError):
+    """Provider credentials missing/invalid — fail closed BEFORE the DAG launches.
+
+    Raised by :func:`provider_for_tier` when an ``xai:*`` tier has neither a
+    stored SuperGrok subscription token nor an ``XAI_API_KEY`` / config api_key.
+    Callers (``run_mission``) must surface this as ``stop_reason=provider_auth``
+    rather than letting N parallel nodes burn budget on opaque 400s (mega-1).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "auth_missing",
+        tried: list[str] | None = None,
+        tier: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.tried = list(tried or [])
+        self.tier = tier
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": False,
+            "code": self.code,
+            "tried": list(self.tried),
+            "tier": self.tier,
+            "error": str(self),
+        }
+
+
 def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     """Resolve the :class:`Provider` a *tier* should run on.
 
@@ -412,7 +444,33 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
             or merged_cfg.get("api_key")
             or os.environ.get("XAI_API_KEY")
         )
-        merged_cfg["api_key"] = key
+        # Fail closed: never construct XAIProvider with a missing/empty key.
+        # Offline mode also refuses cloud xai — surface the same structured error
+        # rather than N parallel 400 "Incorrect API key" storms mid-DAG (mega-1).
+        key_s = (str(key).strip() if key is not None else "")
+        if not key_s:
+            tried = ["xai-sub", "xai"]
+            offline = False
+            try:
+                offline = bool(_config.offline_enabled(
+                    merged_cfg if merged_cfg else None))
+            except Exception:  # noqa: BLE001
+                offline = False
+            if offline:
+                msg = (
+                    f"xAI tier {tier!r} unavailable: offline_mode is on and no "
+                    f"xai-sub credential is stored (cloud API key path is refused)."
+                )
+            else:
+                msg = (
+                    f"xAI tier {tier!r} has no credentials: no xai-sub OAuth token "
+                    f"in subscription_auth and no XAI_API_KEY / config api_key. "
+                    f"Sign in with xAI (device code) or set XAI_API_KEY before "
+                    f"launching the mission."
+                )
+            raise MissionAuthError(
+                msg, code="auth_missing", tried=tried, tier=str(tier))
+        merged_cfg["api_key"] = key_s
         merged_cfg.setdefault("xai", xc)
         return _config.get_provider("xai", cfg=merged_cfg)
 

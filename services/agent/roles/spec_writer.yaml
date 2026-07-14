@@ -4,20 +4,22 @@ goal: Turn one deliverable into a complete engineering spec - envelope, interfac
 stage_scope: [spec]
 playbook_default: null
 tool_allowlist:
+  # Core ledger + research (mechanical specs still need these).
   - tool: ledger_get
   - tool: ledger_note
   - tool: research_material_lookup
-  - tool: research_thread_spec
-  - tool: research_standard_section
-  - tool: research_web_search
-  - tool: research_fetch_page
-  - tool: research_unit_convert
   - tool: research_eng_calc
   - tool: fit_calc
   - tool: recommend_fit
   - tool: resolve_process
   - tool: part_search
   - tool: describe_part
+  # mega-1 TOP-5: analysis/ECAD/firmware deliverables need domain tools on the
+  # SPECIFY tools_slot (family tokens expand via RoleCard.concrete_tools).
+  - family: ecad
+  - family: em
+  - family: fw
+  - tool: board_from_schematic
 context_recipe:
   ledger_tokens: 1000
   describers: [{tool: describe_part, budget: 800}]

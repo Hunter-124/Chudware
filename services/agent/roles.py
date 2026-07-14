@@ -62,6 +62,31 @@ STAGES = (
 )
 
 # Per-role tool-allowlist cap (contract §8 tier profile `max_tools_per_role`).
+
+# Seed tool names for family tokens when the MCP catalog is empty (unit tests,
+# pre-register). Kept short — real runs expand from tool_registry.catalog().
+# mega-1 TOP-5: analysis/specify roles need ecad/fw/em offered on the tools_slot.
+_FAMILY_SEED_TOOLS: dict[str, tuple[str, ...]] = {
+    "ecad": (
+        "ecad_new_schematic", "ecad_new_pcb", "ecad_find_part", "ecad_place_symbol",
+        "ecad_wire", "ecad_add_power", "ecad_label", "ecad_status", "ecad_run_erc",
+        "ecad_simulate", "ecad_run_drc", "ecad_make_board", "board_from_schematic",
+        "ecad_autoroute", "ecad_antenna_design", "ecad_antenna_analyze",
+        "ecad_export", "ecad_to_3d", "ecad_run_pdn",
+    ),
+    "em": (
+        "em_status", "em_eigenmode", "em_driven", "em_timedomain",
+        "ecad_antenna_design", "ecad_antenna_analyze",
+    ),
+    "fw": (
+        "fw_status", "fw_new_project", "fw_build", "fw_sources", "fw_sim_run",
+        "fw_verify_board", "fw_sensor_scenario", "fw_power_profile",
+    ),
+    "firmware": (
+        "fw_status", "fw_new_project", "fw_build", "fw_sources", "fw_sim_run",
+        "fw_verify_board", "fw_sensor_scenario", "fw_power_profile",
+    ),
+}
 MAX_TOOLS_PER_ROLE = 14
 
 # Allowlist tools that do not yet resolve to a registered MCP tool — they land with
@@ -178,8 +203,44 @@ class RoleCard:
 
     @property
     def concrete_tools(self) -> list[str]:
-        """Concrete tool names (not ``family:`` tokens) in the allowlist."""
-        return [t.tool for t in self.tool_allowlist if t.tool]
+        """Concrete tool names for the tools_slot prompt.
+
+        Expands ``family:<name>`` allowlist entries via the MCP tool catalog
+        when populated; falls back to a curated seed list for families the
+        catalog has not registered yet (e.g. firmware tools registered without
+        a family view). Order preserves allowlist order; de-duped.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(name: str) -> None:
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+
+        catalog: dict[str, dict] = {}
+        try:
+            from mcp_server import tool_registry as _reg  # noqa: PLC0415
+            catalog = dict(_reg.catalog() or {})
+        except Exception:  # noqa: BLE001
+            catalog = {}
+
+        for ref in self.tool_allowlist:
+            if ref.tool:
+                _add(ref.tool)
+                continue
+            if not ref.family:
+                continue
+            fam = ref.family
+            # Catalog expansion (preferred — real registered names).
+            for name, meta in catalog.items():
+                if (meta or {}).get("family") == fam:
+                    _add(name)
+            # Seed fallbacks when the catalog is empty (headless / pre-register).
+            if not any((meta or {}).get("family") == fam for meta in catalog.values()):
+                for name in _FAMILY_SEED_TOOLS.get(fam, ()):
+                    _add(name)
+        return out
 
     def apply_tool_policy(self, registry: Any) -> list[str]:
         """Bind this role's allowlist into the MCP tool_registry — the ONE dispatch
@@ -363,7 +424,10 @@ def validate_role(
             f"(> cap {MAX_TOOLS_PER_ROLE})"))
 
     if known_tools is not None:
-        for name in card.concrete_tools:
+        # Only explicit `tool:` allowlist entries must resolve. Family tokens
+        # expand at tools_slot time (catalog or seed) and are not required to
+        # appear in the static catalog during suite validation.
+        for name in (t.tool for t in card.tool_allowlist if t.tool):
             if name in known_tools:
                 continue
             if name in FEATURE_FLAGGED_TOOLS:

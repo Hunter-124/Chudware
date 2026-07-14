@@ -705,6 +705,30 @@ class Vault:
 
     # -- maintenance -------------------------------------------------------
 
+    # -- lightweight branching (wave-2) ------------------------------------
+
+    def branch_list(self) -> dict[str, Any]:
+        """List named design branches (refs into the content-addressed vault)."""
+        from services.plm import branches as branches_mod
+        return branches_mod.list_branches(self)
+
+    def branch_create(self, name: str, *, from_ref: str | None = None) -> dict[str, Any]:
+        from services.plm import branches as branches_mod
+        return branches_mod.create_branch(self, name, from_ref=from_ref)
+
+    def branch_switch(self, name: str) -> dict[str, Any]:
+        from services.plm import branches as branches_mod
+        return branches_mod.switch_branch(self, name)
+
+    def branch_merge(self, src: str, dst: str, *, message: str = "") -> dict[str, Any]:
+        from services.plm import branches as branches_mod
+        return branches_mod.merge_branches(self, src, dst, message=message)
+
+    def active_branch(self) -> str:
+        from services.plm import branches as branches_mod
+        return branches_mod.active_branch(self)
+
+
     def repack(self) -> str:
         return self._bind.repack()
 

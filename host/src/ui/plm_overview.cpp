@@ -1,9 +1,9 @@
 // Compact PLM overview — see plm_overview.h.
 //
 // Self-contained: does not mutate the full PLM hub workspace state (g_plmHub).
-// Feeds from existing plm_* RPCs (plm_item_list, plm_history, plm_timeline) and
-// degrades to a filesystem listing of the project folder when those methods are
-// missing or the vault is absent.
+// Feeds from existing plm_* RPCs (plm_item_list, plm_history, plm_timeline,
+// plm_branch_*) and degrades to a filesystem listing of the project folder when
+// those methods are missing or the vault is absent.
 #include "plm_overview.h"
 
 #include <algorithm>
@@ -64,10 +64,12 @@ struct PlmOverviewState {
     bool plmItemsAvail  = true;
     bool plmHistAvail   = true;
     bool aiTimelineAvail = true;
+    bool plmBranchAvail  = true;
 
     bool itemsLoading = false;
     bool histLoading  = false;
     bool aiLoading    = false;
+    bool branchLoading = false;
 
     std::string itemsErr;
     std::string histErr;
@@ -81,6 +83,12 @@ struct PlmOverviewState {
     std::vector<FeedRow>  history;    // plm_history
     std::vector<FeedRow>  aiFeed;     // plm_timeline
 
+    // lightweight design branches (plm_branch_list)
+    std::vector<std::string> branches;
+    std::string activeBranch;
+    char        newBranchName[64] = {};
+    bool        showCreateBranch  = false;
+
     // directory listing fallback (project folder CAD files)
     std::vector<std::string> dirFiles;  // basenames
     bool dirListed = false;
@@ -88,6 +96,7 @@ struct PlmOverviewState {
     double lastItemsFetch = 0.0;
     double lastHistFetch  = 0.0;
     double lastAiFetch    = 0.0;
+    double lastBranchFetch = 0.0;
     int    histGen        = 0;        // bumped when selection filter changes
 };
 static PlmOverviewState S;
@@ -371,6 +380,9 @@ static void fetchAiTimeline(AppState& st, bool force) {
 
     nlohmann::json p = nlohmann::json::object();
     if (!docId.empty()) p["doc_id"] = docId;
+    // Bind AI-VC store to the active design branch when a project is open.
+    const std::string proj = st.plmProjectPath();
+    if (!proj.empty()) p["path"] = proj;
     st.rpc.call("plm_timeline", p, [](const core::RpcResult& r) {
         S.aiLoading = false;
         std::string hint;
@@ -424,6 +436,121 @@ static void fetchAiTimeline(AppState& st, bool force) {
     });
 }
 
+static void fetchBranches(AppState& st, bool force) {
+    if (!S.plmBranchAvail || S.branchLoading) return;
+    const std::string path = st.plmProjectPath();
+    if (path.empty()) return;
+    const double now = ImGui::GetTime();
+    if (!force && (now - S.lastBranchFetch) < 2.0) return;
+    S.branchLoading = true;
+    S.lastBranchFetch = now;
+    nlohmann::json p;
+    p["path"] = path;
+    st.rpc.call("plm_branch_list", p, [](const core::RpcResult& r) {
+        S.branchLoading = false;
+        std::string hint;
+        if (!rpcOk(r, hint, &S.plmBranchAvail)) {
+            if (!S.plmBranchAvail) {
+                S.branches.clear();
+                S.activeBranch.clear();
+            }
+            return;
+        }
+        S.branches.clear();
+        S.activeBranch = jstr(r.result, "active");
+        auto it = r.result.find("branches");
+        if (it != r.result.end() && it->is_array()) {
+            for (const auto& b : *it) {
+                if (!b.is_object()) continue;
+                std::string name = jstr(b, "name");
+                if (name.empty()) continue;
+                S.branches.push_back(name);
+                if (b.value("current", false)) S.activeBranch = name;
+            }
+        }
+        if (S.activeBranch.empty() && !S.branches.empty())
+            S.activeBranch = S.branches.front();
+    });
+}
+
+static void switchBranch(AppState& st, const std::string& name) {
+    if (name.empty() || name == S.activeBranch) return;
+    const std::string path = st.plmProjectPath();
+    if (path.empty()) return;
+    nlohmann::json p;
+    p["path"] = path;
+    p["name"] = name;
+    st.rpc.call("plm_branch_switch", p, [name](const core::RpcResult& r) {
+        std::string hint;
+        if (!rpcOk(r, hint, &S.plmBranchAvail)) {
+            // soft fail — toast so the user sees why
+            return;
+        }
+        S.activeBranch = name;
+        S.lastBranchFetch = 0.0;
+        S.lastHistFetch = 0.0;
+        S.lastAiFetch = 0.0;
+        S.lastItemsFetch = 0.0;
+    });
+}
+
+static void createBranch(AppState& st, const std::string& name) {
+    if (name.empty()) return;
+    const std::string path = st.plmProjectPath();
+    if (path.empty()) return;
+    nlohmann::json p;
+    p["path"] = path;
+    p["name"] = name;
+    st.rpc.call("plm_branch_create", p, [name](const core::RpcResult& r) {
+        std::string hint;
+        if (!rpcOk(r, hint, &S.plmBranchAvail)) return;
+        S.branches.push_back(name);
+        S.lastBranchFetch = 0.0;
+        S.showCreateBranch = false;
+        S.newBranchName[0] = '\0';
+    });
+}
+
+static void mergeBranchIntoActive(AppState& st, const std::string& src) {
+    if (src.empty() || S.activeBranch.empty() || src == S.activeBranch) return;
+    const std::string path = st.plmProjectPath();
+    if (path.empty()) return;
+    const std::string dst = S.activeBranch;
+    nlohmann::json p;
+    p["path"] = path;
+    p["src"] = src;
+    p["dst"] = dst;
+    st.rpc.call("plm_branch_merge", p, [&st, src, dst](const core::RpcResult& r) {
+        std::string hint;
+        if (!rpcOk(r, hint, &S.plmBranchAvail)) {
+            st.toast(ui::ToastLevel::Warn,
+                     hint.empty() ? "Could not merge branches" : hint);
+            return;
+        }
+        int n = 0;
+        if (r.result.contains("conflict_count") && r.result["conflict_count"].is_number())
+            n = (int)r.result["conflict_count"].get<double>();
+        else if (r.result.contains("conflicts") && r.result["conflicts"].is_array())
+            n = (int)r.result["conflicts"].size();
+        char buf[160];
+        if (n > 0) {
+            std::snprintf(buf, sizeof(buf),
+                          "Merged %s into %s — %d conflict%s",
+                          src.c_str(), dst.c_str(), n, n == 1 ? "" : "s");
+            st.toast(ui::ToastLevel::Warn, buf);
+        } else {
+            std::snprintf(buf, sizeof(buf), "Merged %s into %s",
+                          src.c_str(), dst.c_str());
+            st.toast(ui::ToastLevel::Success, buf);
+        }
+        S.lastBranchFetch = 0.0;
+        S.lastHistFetch = 0.0;
+        S.lastItemsFetch = 0.0;
+        S.lastAiFetch = 0.0;
+    });
+}
+
+
 // ---- selection ----------------------------------------------------------------
 static void selectAsset(AppState& st, const std::string& path, const std::string& itemId) {
     if (S.selectedPath == path && S.selectedItemId == itemId) {
@@ -455,6 +582,68 @@ static void drawProjectHeader(AppState& st) {
     ui::fmRowPillEnd(rr, false);
     if (ImGui::IsItemHovered() && !path.empty())
         ImGui::SetTooltip("%s", path.c_str());
+
+    // Branch dropdown — hidden when plm_branch_* RPCs are unavailable.
+    if (S.plmBranchAvail && !path.empty()) {
+        ImGui::Dummy(ImVec2(0, 2.0f * Scl));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Branch");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 6.0f * Scl);
+
+        const std::string preview =
+            S.activeBranch.empty() ? std::string("main") : S.activeBranch;
+        ImGui::SetNextItemWidth(std::max(80.0f * Scl,
+                                         ImGui::GetContentRegionAvail().x * 0.55f));
+        if (ImGui::BeginCombo("##plm_ov_branch", preview.c_str())) {
+            for (const auto& b : S.branches) {
+                const bool sel = (b == S.activeBranch);
+                if (ImGui::Selectable(b.c_str(), sel)) {
+                    if (!sel) switchBranch(st, b);
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("Create branch\xe2\x80\xa6")) {
+                S.showCreateBranch = true;
+                S.newBranchName[0] = '\0';
+            }
+            // Merge another branch into the active one.
+            if (!S.activeBranch.empty() && S.branches.size() > 1) {
+                if (ImGui::BeginMenu("Merge into current\xe2\x80\xa6")) {
+                    for (const auto& b : S.branches) {
+                        if (b == S.activeBranch) continue;
+                        if (ImGui::MenuItem(b.c_str()))
+                            mergeBranchIntoActive(st, b);
+                    }
+                    ImGui::EndMenu();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        if (S.showCreateBranch) {
+            ImGui::SetNextItemWidth(-1.0f);
+            bool enter = ImGui::InputTextWithHint(
+                "##plm_ov_new_branch", "new-branch-name",
+                S.newBranchName, sizeof(S.newBranchName),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            if (enter || ImGui::Button("Create")) {
+                std::string n = S.newBranchName;
+                while (!n.empty() && (n.back() == ' ' || n.back() == '\t')) n.pop_back();
+                size_t i = 0;
+                while (i < n.size() && (n[i] == ' ' || n[i] == '\t')) ++i;
+                n = n.substr(i);
+                if (!n.empty()) createBranch(st, n);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                S.showCreateBranch = false;
+                S.newBranchName[0] = '\0';
+            }
+        }
+    }
 }
 
 static void drawStatusDot(ImDrawList* dl, ImVec2 center, ImU32 col, float r) {
@@ -696,6 +885,8 @@ void drawPlmOverviewBody(AppState& st) {
         S.assets.clear();
         S.history.clear();
         S.aiFeed.clear();
+        S.branches.clear();
+        S.activeBranch.clear();
         S.dirFiles.clear();
         S.dirListed = false;
         S.selectedPath.clear();
@@ -704,11 +895,15 @@ void drawPlmOverviewBody(AppState& st) {
         S.lastItemsFetch = 0.0;
         S.lastHistFetch  = 0.0;
         S.lastAiFetch    = 0.0;
+        S.lastBranchFetch = 0.0;
+        S.showCreateBranch = false;
+        S.newBranchName[0] = '\0';
     }
 
     fetchItems(st, /*force=*/false);
     if (S.plmHistAvail)  fetchHistory(st, /*force=*/false);
     if (S.aiTimelineAvail) fetchAiTimeline(st, /*force=*/false);
+    if (S.plmBranchAvail) fetchBranches(st, /*force=*/false);
 
     // If PLM items never arrived, ensure a directory listing exists.
     if (S.assets.empty() && !S.itemsLoading && !S.dirListed)

@@ -62,8 +62,8 @@ VERDICT_ESCALATE = "escalate"
 _DONE_REASONS = frozenset(["confirmed", "stabilized"])
 # stop_reason values that map to retry
 _RETRY_REASONS = frozenset(["max_iters"])
-# stop_reason values that map to escalate (failed build / no model output)
-_ESCALATE_REASONS = frozenset(["failed", "no_code"])
+# stop_reason values that map to escalate (failed build / no model output / auth)
+_ESCALATE_REASONS = frozenset(["failed", "no_code", "provider_auth"])
 
 # ---------------------------------------------------------------------------
 # Agent function type

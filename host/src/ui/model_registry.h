@@ -5,9 +5,11 @@
 // a model supports a reasoning-effort control, and whether it can see screenshots (vision).
 // Live availability (key present / endpoint reachable / which local models are loaded) is
 // resolved at runtime by AppState's model probe (agent_list_models RPC); this file is the
-// static knowledge the probe augments.
+// static knowledge the probe augments. Probe rows may carry context / reasoning_efforts /
+// vision / tools / auto_source — when present those win over the static heuristics below.
 #pragma once
 
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -33,7 +35,15 @@ struct ModelInfo {
     std::string label;     // human label for the picker
     bool vision = true;    // can receive screenshots
     bool reasoning = true; // exposes a reasoning-effort knob
+    // ---- auto-discovered capability metadata (0 / empty = unknown → fall back) ----
+    int context = 0;                     // total context window tokens
+    int max_output = 0;                  // max output tokens (0 = unspecified)
+    bool tools = true;                   // tool/function calling
+    std::vector<std::string> reasoning_efforts;  // empty = use static ladder
+    std::string auto_source;             // "live" | "models.dev" | "heuristic" | "user" | combo
+    bool has_probe_meta = false;         // true when filled from agent_list_models model_rows
 };
+
 
 inline const char* providerLabel(int provider) {
     switch (provider) {
@@ -200,7 +210,13 @@ inline const std::vector<LocalPreset>& cloudPresets() {
 
 // Does (provider, model id) expose a reasoning-effort knob? Falls back to the provider
 // default for unknown ids (local models route through gemma-style reasoning -> true).
-inline bool modelSupportsReasoning(int provider, const std::string& id) {
+// When *probe* carries has_probe_meta + reasoning_efforts, that is authoritative.
+inline bool modelSupportsReasoning(int provider, const std::string& id,
+                                   const ModelInfo* probe = nullptr) {
+    if (probe && probe->has_probe_meta) {
+        // Empty efforts with probe meta = model does not expose a dial.
+        return !probe->reasoning_efforts.empty();
+    }
     for (const auto& m : builtinModels())
         if (m.provider == provider && m.id == id) return m.reasoning;
     if (provider == PROV_LOCAL || provider == PROV_LLAMACPP) return true;  // gemma reasons
@@ -208,7 +224,11 @@ inline bool modelSupportsReasoning(int provider, const std::string& id) {
 }
 
 // Per-model default context window when settings.contextWindow == 0 (auto).
-inline int defaultContextWindowForModel(int provider, const std::string& id) {
+// Prefer probe metadata (agent_list_models model_rows) when present.
+inline int defaultContextWindowForModel(int provider, const std::string& id,
+                                        const ModelInfo* probe = nullptr) {
+    if (probe && probe->has_probe_meta && probe->context > 0)
+        return probe->context;
     std::string m = id;
     for (char& c : m) c = (char)std::tolower((unsigned char)c);
     auto has = [&](const char* sub) -> bool {
@@ -240,9 +260,39 @@ inline int defaultContextWindowForModel(int provider, const std::string& id) {
 }
 
 // Reasoning-effort levels for the active model. Returns count; writes labels/values arrays.
+// When *probe* has reasoning_efforts, those values win (labels title-cased from values).
 inline int reasoningEffortOptions(int provider, const std::string& id,
-                                  const char** outLabels, const char** outValues, int maxN) {
-    if (!modelSupportsReasoning(provider, id)) return 0;
+                                  const char** outLabels, const char** outValues, int maxN,
+                                  const ModelInfo* probe = nullptr) {
+    // Static storage for probe-derived C strings (valid until next call).
+    static thread_local std::vector<std::string> s_vals;
+    static thread_local std::vector<std::string> s_labs;
+    static thread_local std::vector<const char*> s_valp;
+    static thread_local std::vector<const char*> s_labp;
+
+    if (probe && probe->has_probe_meta) {
+        if (probe->reasoning_efforts.empty()) return 0;
+        s_vals = probe->reasoning_efforts;
+        s_labs.clear();
+        s_labs.reserve(s_vals.size());
+        for (const auto& v : s_vals) {
+            std::string lab = v;
+            if (!lab.empty()) lab[0] = (char)std::toupper((unsigned char)lab[0]);
+            s_labs.push_back(lab);
+        }
+        s_valp.resize(s_vals.size());
+        s_labp.resize(s_labs.size());
+        int out = (int)s_vals.size() < maxN ? (int)s_vals.size() : maxN;
+        for (int i = 0; i < out; ++i) {
+            s_valp[i] = s_vals[i].c_str();
+            s_labp[i] = s_labs[i].c_str();
+            outLabels[i] = s_labp[i];
+            outValues[i] = s_valp[i];
+        }
+        return out;
+    }
+
+    if (!modelSupportsReasoning(provider, id, probe)) return 0;
     struct Opt { const char* label; const char* value; };
     static const Opt kGemini[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
                                   {"High", "high"}, {"Max", "max"}};
@@ -265,5 +315,28 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
     }
     return out;
 }
+
+// Build a ModelInfo from an agent_list_models model_rows entry (JSON-ish fields already
+// extracted by the caller). Marks has_probe_meta so the helpers above prefer it.
+inline ModelInfo modelInfoFromProbe(int provider, const std::string& id,
+                                    const std::string& label, int context, int max_output,
+                                    bool vision, bool tools,
+                                    const std::vector<std::string>& efforts,
+                                    const std::string& auto_source) {
+    ModelInfo m;
+    m.provider = provider;
+    m.id = id;
+    m.label = label.empty() ? id : label;
+    m.vision = vision;
+    m.reasoning = !efforts.empty();
+    m.context = context;
+    m.max_output = max_output;
+    m.tools = tools;
+    m.reasoning_efforts = efforts;
+    m.auto_source = auto_source;
+    m.has_probe_meta = true;
+    return m;
+}
+
 
 }  // namespace ui

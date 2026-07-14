@@ -1,0 +1,9 @@
+{
+  "run_id": "mega-1-fc-rocket",
+  "tier": "xai:grok-4-5",
+  "effort": "maximum",
+  "org_layer": true,
+  "max_spawn_depth": 8,
+  "request_preview": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avio",
+  "started_at": "2026-07-14T21:02:56Z"
+}

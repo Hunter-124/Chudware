@@ -202,6 +202,7 @@ add_executable(Billet
   src/ui/plm/plm_pages.cpp   # plmDraw*Page implementations (split out of plm_workspace)
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
+  src/ui/plm/graph_tab.cpp     # PLM Graph tab (cad_graph_get/blast draw-list)
   src/ui/plm_overview.cpp        # compact PLM overview (left manager tab, left of Explorer)
   src/ui/ai/ai_workspace.cpp
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell

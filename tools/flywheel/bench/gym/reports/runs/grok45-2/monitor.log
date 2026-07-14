@@ -1,0 +1,5 @@
+monitor: following /home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/runs/grok45-2 (stall>120s, poll=5.0s)
+ERROR phase_stall            [C1_open_xai:grok-4-5_s1] no events for 120s (threshold 120s); last_seq=1 phase≈'' seqs=[1]
+ERROR phase_stall            [C1_open_xai:grok-4-5_s1] no events for 125s (threshold 120s); last_seq=1 phase≈'' seqs=[1]
+monitor: quiet for 120s after activity — done (1 cells, 0 findings)
+wrote /home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/runs/grok45-2/monitor.json

@@ -5,8 +5,9 @@ Scaffold: T-A1. Node handler dispatch wired in T-A2.
 """
 from __future__ import annotations
 
+import operator
 import warnings
-from typing import Any, Callable, Optional
+from typing import Annotated, Any, Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -31,13 +32,44 @@ VALID_ON_FAIL = frozenset(["pause", "abort", "skip", "retry"])
 
 
 # ---------------------------------------------------------------------------
-# Type aliases
+# Type aliases + concurrent-safe state (LangGraph Annotated reducers)
 # ---------------------------------------------------------------------------
 
 EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
 
-# DAG state is a plain dict; LangGraph merges updates returned by node handlers.
-DagState = dict[str, Any]
+
+def _merge_dicts(left: Any, right: Any) -> dict[str, Any]:
+    """Reducer for maps written by sibling nodes in one superstep (multi-DL fan-in).
+
+    LangGraph rejects concurrent writes to a bare key with
+    INVALID_CONCURRENT_GRAPH_UPDATE. Sibling SPECIFY/BUILD nodes each return a
+    partial ``node_states`` patch; this reducer merges them so fan-in to
+    ``n_spec_done`` (etc.) does not crash the mission graph.
+    """
+    if not left:
+        return dict(right or {})
+    if not right:
+        return dict(left or {})
+    out = dict(left)
+    out.update(right)
+    return out
+
+
+def _last_value(left: Any, right: Any) -> Any:
+    """Last-write-wins reducer for scalar status fields under parallel updates."""
+    return right if right is not None else left
+
+
+class DagState(TypedDict, total=False):
+    """Mission DAG state with reducers on every key that parallel nodes may write.
+
+    Without Annotated reducers, two parallel ``n_spec_DL*`` completions raise
+    ``INVALID_CONCURRENT_GRAPH_UPDATE`` on the shared channel (mega-1 stop_reason).
+    """
+    run_id: Annotated[str, _last_value]
+    run_status: Annotated[str, _last_value]
+    node_states: Annotated[dict[str, Any], _merge_dicts]
+    open_questions: Annotated[list[Any], operator.add]
 
 
 # ---------------------------------------------------------------------------

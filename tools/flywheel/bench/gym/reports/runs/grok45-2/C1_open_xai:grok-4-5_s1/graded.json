@@ -1,0 +1,30 @@
+{
+  "challenge": "C1",
+  "criteria": [
+    {
+      "id": "AC1",
+      "text": "bore d20 H7 (sliding-fit basis) recorded",
+      "result": "PASS",
+      "detail": "bore d20.0 H7"
+    },
+    {
+      "id": "AC2",
+      "text": "sliding-fit clearance for d20 h7 shaft in band",
+      "result": "FAIL",
+      "detail": "no fit_bore decision with a clearance value"
+    },
+    {
+      "id": "AC3",
+      "text": "4xM4 clearance bolt circle on PCD 34.0",
+      "result": "FAIL",
+      "detail": "bolt circle has None holes, expected 4"
+    },
+    {
+      "id": "AC4",
+      "text": "verify_battery PASS (coherent geometry)",
+      "result": "FAIL",
+      "detail": "no verify_battery artifact recorded"
+    }
+  ],
+  "passed": false
+}

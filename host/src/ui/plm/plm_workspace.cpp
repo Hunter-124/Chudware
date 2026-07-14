@@ -12,6 +12,7 @@
 // user-facing string (contract §8.1): Project / History / Checkpoint / Release.
 #include "plm_workspace.h"
 #include "plm_hub.h"
+#include "graph_tab.h"
 
 #include <algorithm>
 #include <cstring>
@@ -156,6 +157,7 @@ static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
     {PlmPage::Planning, "Planning", "plan_board"},
+    {PlmPage::Graph,    "Graph",    "mesh"},
     {PlmPage::Git,      "Git",      "git"},
     {PlmPage::Settings, "Settings", "settings"},
 };
@@ -295,6 +297,8 @@ static void drawTopNav(AppState& st) {
     const float fullW     = ImGui::GetContentRegionAvail().x;
     const float gap = 6 * S;
     for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
+        // Degrade: hide Graph when the worker lacks cad_graph_* RPCs.
+        if (kRail[i].page == PlmPage::Graph && !plmGraphAvailable()) continue;
         if (i) ImGui::SameLine(0, gap);
         int badge = 0;
         if (kRail[i].page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
@@ -346,8 +350,13 @@ void drawPlmWorkspace(AppState& st) {
     if (proj != g_plmHub.projectDir) {
         g_plmHub.projectDir = proj;
         plmInvalidate();
+        plmGraphOnProjectChanged();
     }
     if (proj.empty()) { drawOnboarding(st); return; }
+
+    // If Graph was selected but the RPC is gone, fall back to Overview.
+    if (g_plmHub.page == PlmPage::Graph && !plmGraphAvailable())
+        g_plmHub.page = PlmPage::Overview;
 
     // keep the dashboard aggregate fresh (drives rail badges + Overview)
     plmEnsureOverview(st);
@@ -384,6 +393,7 @@ void drawPlmWorkspace(AppState& st) {
         case PlmPage::Issues:   plmDrawIssuesPage(st);   break;
         case PlmPage::Team:     plmDrawTeamPage(st);     break;
         case PlmPage::Git:      plmDrawGitPage(st);      break;
+        case PlmPage::Graph:    plmDrawGraphPage(st);    break;
         case PlmPage::Settings: plmDrawSettingsPage(st); break;
     }
     ImGui::PopStyleVar();  // ItemSpacing

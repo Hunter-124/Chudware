@@ -1112,23 +1112,96 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             return emit(aicad::agent::resolve_provider(name, cfg, env), out_json, 0);
         }
         if (m == "agent_list_models") {
-            // {provider, base_url?, api_key?} -> {ok, models:[id...], error?}. Probes the
-            // backend so the host model picker can hide unreachable / unkeyed providers.
+            // {provider, base_url?, api_key?} -> {ok, models:[id...], model_rows?[{id,...}], error?}.
+            // Probes the backend so the host model picker can hide unreachable / unkeyed providers.
+            // model_rows is additive metadata (context/max_output/vision/tools/reasoning_efforts);
+            // legacy clients keep reading flat string ids from `models`.
             std::string provider = params.value("provider", std::string());
             std::string base_url = params.value("base_url", std::string());
             std::string api_key = params.value("api_key", std::string());
             json models = json::array();
-            if (provider == "openai" || provider == "llamacpp") {
+            json model_rows = json::array();
+            auto push_id = [&](const std::string& id) {
+                models.push_back(id);
+            };
+            auto push_row = [&](const std::string& id, json meta = json::object()) {
+                meta["id"] = id;
+                if (!meta.contains("label")) meta["label"] = id;
+                model_rows.push_back(std::move(meta));
+                push_id(id);
+            };
+            // Id-substring heuristics mirrored from model_registry / model_catalog so the
+            // probe can enrich OpenAI-compat endpoints that only return bare ids.
+            auto heuristic_meta = [&](const std::string& id) -> json {
+                std::string mlow = id;
+                for (char& c : mlow) c = (char)std::tolower((unsigned char)c);
+                auto has = [&](const char* sub) {
+                    return mlow.find(sub) != std::string::npos;
+                };
+                int context = 8192;
+                bool vision = false;
+                bool tools = true;
+                json efforts = json::array();
+                if (has("1.5-pro")) context = 2097152;
+                else if (has("1.5-flash") || has("2.0") || has("2.5") || has("flash") || has("gemini"))
+                    context = 1048576;
+                else if (has("claude") || has("opus") || has("sonnet") || has("haiku"))
+                    context = 200000;
+                else if (has("gpt-4.1")) context = 1047576;
+                else if (has("o1") || has("o3") || has("o4") || has("reasoner") || has("r1"))
+                    context = 200000;
+                else if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) context = 128000;
+                else if (has("gpt-3.5")) context = 16385;
+                else if (has("qwen") || has("deepseek")) context = 128000;
+                else if (has("grok-4.5") || has("grok-4-5")) context = 500000;
+                else if (has("grok")) context = 131072;
+                else if (provider == "gemini") context = 1048576;
+                else if (provider == "anthropic") context = 200000;
+                else if (provider == "openai" || provider == "xai") context = 128000;
+
+                if (has("vision") || has("-vl") || has("gpt-4o") || has("gemini") ||
+                    has("claude") || has("grok-4") || has("4o"))
+                    vision = true;
+                if (provider == "gemini" || provider == "anthropic" || provider == "xai")
+                    vision = true;
+
+                if (provider == "gemini" || has("gemini")) {
+                    if (!(has("2.0") && has("flash")))
+                        efforts = json::array({"off", "low", "medium", "high", "max"});
+                } else if (provider == "anthropic" || has("claude")) {
+                    efforts = json::array({"low", "medium", "high"});
+                } else if (provider == "xai" || has("grok")) {
+                    if (!has("build") && !has("non-reasoning"))
+                        efforts = json::array({"off", "low", "medium", "high"});
+                } else if (has("o1") || has("o3") || has("o4") || has("gpt-5") || has("reason") ||
+                           has("r1") || has("think") || has("qwen3")) {
+                    efforts = json::array({"off", "low", "medium", "high"});
+                    if (has("o1") || has("o3") || has("o4") || has("gpt-5"))
+                        efforts = json::array({"low", "medium", "high"});
+                }
+                return json{{"context", context},
+                            {"max_output", 0},
+                            {"vision", vision},
+                            {"tools", tools},
+                            {"reasoning_efforts", efforts},
+                            {"auto_source", "live+heuristic"}};
+            };
+
+            if (provider == "openai" || provider == "llamacpp" || provider == "xai") {
                 std::string root = aicad::agent::openai_normalize_base_url(base_url);
-                if (root.empty()) root = "https://api.openai.com/v1";
+                if (root.empty()) {
+                    if (provider == "xai") root = "https://api.x.ai/v1";
+                    else root = "https://api.openai.com/v1";
+                }
                 std::vector<std::pair<std::string, std::string>> hdrs;
                 if (!api_key.empty()) hdrs.push_back({"Authorization", "Bearer " + api_key});
                 aicad::agent::HttpResponse hr = aicad::agent::http_get(root + "/models", hdrs);
                 if (!hr.error.empty())
-                    return emit(json{{"ok", false}, {"models", models}, {"error", hr.error}},
+                    return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
+                                     {"error", hr.error}},
                                 out_json, 0);
                 if (hr.status < 200 || hr.status >= 300)
-                    return emit(json{{"ok", false}, {"models", models},
+                    return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                                      {"error", "HTTP " + std::to_string(hr.status)}}, out_json, 0);
                 json parsed = json::parse(hr.body, nullptr, false);
                 json free = json::array();  // ids priced at $0 prompt (OpenRouter ":free" tiers etc.)
@@ -1136,7 +1209,31 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     for (const auto& d : parsed["data"]) {
                         if (!d.contains("id") || !d["id"].is_string()) continue;
                         std::string id = d["id"].get<std::string>();
-                        models.push_back(id);
+                        json meta = heuristic_meta(id);
+                        // OpenRouter / rich OpenAI-compat rows may carry real limits.
+                        if (d.contains("context_length") && d["context_length"].is_number_integer()) {
+                            meta["context"] = d["context_length"].get<int>();
+                            meta["auto_source"] = "live";
+                        } else if (d.contains("context_length") && d["context_length"].is_number()) {
+                            meta["context"] = static_cast<int>(d["context_length"].get<double>());
+                            meta["auto_source"] = "live";
+                        }
+                        if (d.contains("architecture") && d["architecture"].is_object()) {
+                            const auto& a = d["architecture"];
+                            if (a.contains("input_modalities") && a["input_modalities"].is_array()) {
+                                for (const auto& im : a["input_modalities"])
+                                    if (im.is_string() && im.get<std::string>() == "image")
+                                        meta["vision"] = true;
+                            } else if (a.contains("modality") && a["modality"].is_string()) {
+                                std::string mod = a["modality"].get<std::string>();
+                                size_t arrow = mod.find("->");
+                                std::string inp = arrow == std::string::npos ? mod : mod.substr(0, arrow);
+                                if (inp.find("image") != std::string::npos) meta["vision"] = true;
+                            }
+                        }
+                        if (d.contains("name") && d["name"].is_string())
+                            meta["label"] = d["name"].get<std::string>();
+                        push_row(id, std::move(meta));
                         // OpenRouter (and some others) expose per-model pricing; prompt=="0" => free.
                         if (d.contains("pricing") && d["pricing"].is_object()) {
                             const auto& pr = d["pricing"];
@@ -1181,7 +1278,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 // when it's reachable we use it to report which ids are actually loaded. Other
                 // OpenAI-compatible servers (vLLM, llama.cpp) only serve loaded models, so the
                 // absence of this endpoint just means "treat all listed as available".
-                if (!base_url.empty()) {
+                // Skip LM Studio probe for cloud xAI / openai.com roots.
+                bool tryLmStudio = __omp_shell("base_url.empty() && provider != \"xai\" &&")
+                                   root.find("api.openai.com") == std::string::npos &&
+                                   root.find("api.x.ai") == std::string::npos;
+                if (tryLmStudio) {
                     std::string origin = root;
                     if (origin.size() >= 3 && origin.compare(origin.size() - 3, 3, "/v1") == 0)
                         origin.erase(origin.size() - 3);
@@ -1195,26 +1296,30 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 if (d.value("state", std::string()) == "loaded" &&
                                     d.contains("id") && d["id"].is_string())
                                     loaded.push_back(d["id"].get<std::string>());
-                            return emit(json{{"ok", true}, {"models", models}, {"free", free},
+                            return emit(json{{"ok", true}, {"models", models},
+                                             {"model_rows", model_rows}, {"free", free},
                                              {"loaded", loaded}, {"loaded_known", true}},
                                         out_json, 0);
                         }
                     }
                 }
-                return emit(json{{"ok", true}, {"models", models}, {"free", free}}, out_json, 0);
+                return emit(json{{"ok", true}, {"models", models}, {"model_rows", model_rows},
+                                 {"free", free}}, out_json, 0);
             }
             if (provider == "gemini") {
                 if (api_key.empty())
-                    return emit(json{{"ok", false}, {"models", models}, {"error", "no api key"}},
+                    return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
+                                     {"error", "no api key"}},
                                 out_json, 0);
                 std::vector<std::pair<std::string, std::string>> hdrs = {{"x-goog-api-key", api_key}};
                 aicad::agent::HttpResponse hr = aicad::agent::http_get(
                     "https://generativelanguage.googleapis.com/v1beta/models", hdrs);
                 if (!hr.error.empty())
-                    return emit(json{{"ok", false}, {"models", models}, {"error", hr.error}},
+                    return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
+                                     {"error", hr.error}},
                                 out_json, 0);
                 if (hr.status < 200 || hr.status >= 300)
-                    return emit(json{{"ok", false}, {"models", models},
+                    return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
                                      {"error", "HTTP " + std::to_string(hr.status)}}, out_json, 0);
                 json parsed = json::parse(hr.body, nullptr, false);
                 if (parsed.is_object() && parsed.contains("models") && parsed["models"].is_array())
@@ -1228,18 +1333,37 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         if (gen && md.contains("name") && md["name"].is_string()) {
                             std::string nm = md["name"].get<std::string>();
                             if (nm.rfind("models/", 0) == 0) nm = nm.substr(7);
-                            models.push_back(nm);
+                            json meta = heuristic_meta(nm);
+                            // Keep live Gemini token limits (previously discarded).
+                            if (md.contains("inputTokenLimit") && md["inputTokenLimit"].is_number())
+                                meta["context"] = md["inputTokenLimit"].get<int>();
+                            if (md.contains("outputTokenLimit") && md["outputTokenLimit"].is_number())
+                                meta["max_output"] = md["outputTokenLimit"].get<int>();
+                            meta["auto_source"] = "live";
+                            meta["vision"] = true;
+                            meta["tools"] = true;
+                            if (md.contains("displayName") && md["displayName"].is_string())
+                                meta["label"] = md["displayName"].get<std::string>();
+                            push_row(nm, std::move(meta));
                         }
                     }
-                return emit(json{{"ok", true}, {"models", models}}, out_json, 0);
+                return emit(json{{"ok", true}, {"models", models}, {"model_rows", model_rows}},
+                            out_json, 0);
             }
             if (provider == "anthropic") {
                 // No keyless list endpoint; report availability by key presence + a static set.
-                bool ok = !api_key.empty();
-                if (ok) models.push_back("claude-opus-4-8");
-                return emit(json{{"ok", ok}, {"models", models}}, out_json, 0);
+                bool ok = __omp_shell("api_key.empty();")
+                if (ok) {
+                    json meta = heuristic_meta("claude-opus-4-8");
+                    meta["label"] = "Claude Opus 4.8";
+                    meta["auto_source"] = "heuristic";
+                    push_row("claude-opus-4-8", std::move(meta));
+                }
+                return emit(json{{"ok", ok}, {"models", models}, {"model_rows", model_rows}},
+                            out_json, 0);
             }
-            return emit(json{{"ok", false}, {"models", models}, {"error", "unknown provider"}},
+            return emit(json{{"ok", false}, {"models", models}, {"model_rows", model_rows},
+                             {"error", "unknown provider"}},
                         out_json, 0);
         }
         if (m == "agent_cap_raw") {

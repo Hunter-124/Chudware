@@ -76,6 +76,8 @@ def test_register() -> dict:
         "ecad_run_hostcheck",
         # T-FIN11 FPGA support pack
         "ecad_fpga_check",
+        # pack tools that live in register_ecad_tools (pdn/si/stackup/netclass)
+        "ecad_run_pdn", "ecad_run_sicheck", "ecad_stackup_solve", "ecad_set_net_class",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -1346,6 +1348,38 @@ def _disable_live_provider():
         if _orig is not None:
             _cfg.get_provider = _orig  # type: ignore[attr-defined]
     return _restore
+
+# --------------------------------------------------------------------------- pytest collection
+# pytest treats bare `tools` parameters as fixtures. The main() harness passes the dict
+# returned by test_register() explicitly; under pytest we provide a module-scoped fixture
+# that registers the tools once with the live provider disabled (same as main()).
+
+_PYTEST_PROVIDER_RESTORE = None
+
+
+def pytest_configure(config):  # noqa: ANN001 — pytest hook
+    """Disable the live provider for the whole pytest session of this file."""
+    global _PYTEST_PROVIDER_RESTORE
+    _PYTEST_PROVIDER_RESTORE = _disable_live_provider()
+
+
+def pytest_unconfigure(config):  # noqa: ANN001 — pytest hook
+    restore = globals().get("_PYTEST_PROVIDER_RESTORE")
+    if callable(restore):
+        restore()
+
+
+try:
+    import pytest
+except ImportError:  # pragma: no cover — pytest absent when run via main()
+    pytest = None  # type: ignore
+
+
+if pytest is not None:
+    @pytest.fixture(scope="module")
+    def tools():
+        """Module-scoped registered ECAD tool dict (provider disabled like main())."""
+        return test_register()
 
 
 # --------------------------------------------------------------------------- T-FIN16 thermal handoff

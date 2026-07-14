@@ -139,7 +139,14 @@ def enable_ecad_autosave() -> None:
 def recover_ecad_autosaved(scope: str = "recent"):
     """Reopen ECAD docs autosaved before a (possibly killed) prior session into the live registry,
     and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
-    the recovery list. Best-effort — never raises into startup."""
+    the recovery list. Best-effort — never raises into startup.
+
+    MONOTONICITY (critical): recovery runs on a BACKGROUND warm thread (server._warm_core), so it
+    can finish AFTER a user has already called ecad_new_schematic / ecad_new_pcb / ecad_design on
+    the fresh server. We fill ONLY empty current_* defaults — never overwrite a just-created or
+    explicitly-selected document. The recovered sessions still land in the session registry and
+    remain addressable by their explicit doc_id.
+    """
     try:
         from engine.ecad import autosave as _eauto
         recovered = _eauto.recover_ecad_autosaved(scope=scope) or []
@@ -164,6 +171,7 @@ def recover_ecad_autosaved(scope: str = "recent"):
         elif rec.get("kind") == "pcb":
             picked_pcb = did
         picked_any = did
+    # Empty-defaults only — never replace a non-None pointer (monotonic recovery).
     if picked_sch and _ECAD["current_sch"] is None:
         _ECAD["current_sch"] = picked_sch
     if picked_pcb and _ECAD["current_pcb"] is None:
@@ -2287,73 +2295,125 @@ def register_ecad_tools(mcp) -> None:
             provider_unreachable = True
             provider = None
 
-        # The model-planning stage can stall on a slow/loading local server (LM Studio,
-        # llama.cpp) well past the MCP request budget — and ecad_design must ALWAYS return a
-        # verified schematic. Run the provider-backed plan in a worker thread with a hard
-        # wall-clock deadline; if it overruns, fall back to the deterministic recipe path
-        # (provider=None) which is instant (~2 s). The abandoned thread's finite provider timeout
-        # lets it die on its own rather than lingering.
+        # CRITICAL TRANSPORT SAFETY:
+        #   1. PLAN (provider.complete) is the only stage that can stall on a remote/local model.
+        #   2. BUILD/ERC/SIM create a real EcadSession and mutate _ECAD current_*.
+        #   3. A timed-out provider thread MUST NOT keep running the full pipeline — otherwise it
+        #      races the recipe fallback and can overwrite current_sch/current after we already
+        #      returned a verified recipe schematic (and the next ecad_status sees the wrong doc
+        #      or blocks on a still-busy provider).
+        # So: budget ONLY the plan; build EXACTLY ONCE on the main thread with a frozen design.
         #
-        # BUDGET: the provider plan + the ~2 s recipe fallback must finish UNDER the client's MCP
-        # tool timeout, which is shorter than the 45 s heavy-solve budget on some clients (a 22 s
-        # plan + recipe overran one and tripped -32001, returning nothing). Default to a
-        # conservative 12 s so the worst case (plan times out -> recipe) stays ~14 s; override with
-        # AI_CAD_ECAD_PLAN_BUDGET_S where the client allows a longer call.
-        import threading
-
+        # BUDGET: plan + recipe-build must finish under the client's MCP tool timeout (~30 s).
+        # Default 12 s plan budget leaves ~2 s for the deterministic build (usually <<1 s).
+        # Override with AI_CAD_ECAD_PLAN_BUDGET_S when the client allows a longer call.
         try:
             _PLAN_BUDGET_S = float(os.environ.get("AI_CAD_ECAD_PLAN_BUDGET_S", "") or 12.0)
         except (TypeError, ValueError):
             _PLAN_BUDGET_S = 12.0
         if not (_PLAN_BUDGET_S > 0.0):
             _PLAN_BUDGET_S = 12.0
-        box: dict = {}
 
-        def _worker():
-            try:
-                box["run"] = _orch.run_design(request, provider=provider)
-            except Exception as exc:  # noqa: BLE001
-                box["err"] = exc
-
-        # Only ONE provider plan runs at a time (Bug E4): if another ecad_design already holds the
-        # provider, this call takes the instant recipe path rather than queueing behind it on a
-        # single-threaded local model server (which would overrun the MCP deadline). The flag is
-        # claimed without blocking and always released in finally.
+        plan_box: dict = {}
         provider_busy = False
+        provider_timed_out = False
+        provider_plan_err: Exception | None = None
+        # Generation token: a late (abandoned after timeout) plan worker must never
+        # populate plan_box after we have already fallen back to the recipe.
+        plan_gen = {"v": 0}
+
+        def _plan_worker(gen: int) -> None:
+            try:
+                dsg, rcp, evs = _orch.plan_design(request, provider=provider)
+            except Exception as exc:  # noqa: BLE001
+                if plan_gen["v"] == gen:
+                    plan_box["err"] = exc
+                return
+            if plan_gen["v"] != gen:
+                return  # abandoned — do not touch plan_box
+            plan_box["design"] = dsg
+            plan_box["recipe_used"] = rcp
+            plan_box["events"] = evs
+
+        # Only ONE provider plan runs at a time (Bug E4): if another ecad_design already holds
+        # the provider, this call takes the instant recipe path rather than queueing behind it
+        # on a single-threaded local model server (which would overrun the MCP deadline).
+        claimed = False
         if provider is not None:
             with _PROVIDER_PLAN_LOCK:
                 if _PROVIDER_PLAN_BUSY["v"]:
                     provider_busy = True
                 else:
                     _PROVIDER_PLAN_BUSY["v"] = True
+                    claimed = True
 
-        provider_timed_out = False
-        if provider is not None and not provider_busy:
-            th = threading.Thread(target=_worker, daemon=True)
-            th.start()
-            th.join(_PLAN_BUDGET_S)
-            if th.is_alive():
-                provider_timed_out = True
-            with _PROVIDER_PLAN_LOCK:
-                _PROVIDER_PLAN_BUSY["v"] = False
-        elif provider is None:
-            _worker()
-        # provider_busy: leave box empty -> recipe fallback below (instant).
-
-        run = box.get("run")
-        if run is None:
-            # Provider path overran or errored — use the deterministic recipe fallback.
+        if provider is not None and claimed:
+            # Budgeted plan ONLY — never build inside the worker.
+            my_gen = plan_gen["v"] + 1
+            plan_gen["v"] = my_gen
             try:
-                run = _orch.run_design(request, provider=None)
+                st, val = _run_with_budget(lambda: _plan_worker(my_gen),
+                                           budget_s=_PLAN_BUDGET_S)
+                if st == "timeout":
+                    provider_timed_out = True
+                    # Invalidate so a late worker cannot fill plan_box after we fall back.
+                    plan_gen["v"] = my_gen + 1
+                    plan_box.clear()
+                elif st == "error":
+                    provider_plan_err = val if isinstance(val, Exception) else None
+                    plan_gen["v"] = my_gen + 1
+                    plan_box.clear()
+                elif plan_box.get("err") is not None:
+                    provider_plan_err = plan_box["err"]
+                    plan_box.clear()
+                # st == "done" and no err: plan_box holds design/recipe_used.
+            finally:
+                with _PROVIDER_PLAN_LOCK:
+                    _PROVIDER_PLAN_BUSY["v"] = False
+        elif provider is None:
+            # Instant recipe plan (no model). Safe on the caller's thread.
+            my_gen = plan_gen["v"] + 1
+            plan_gen["v"] = my_gen
+            _plan_worker(my_gen)
+        # provider_busy: leave plan_box empty -> recipe plan below.
+
+        design = plan_box.get("design")
+        recipe_used = plan_box.get("recipe_used")
+        if design is None:
+            # Provider path overran, was busy, or errored — plan via the deterministic recipe.
+            # This never touches a provider and is instant.
+            try:
+                design, recipe_used, _evs = _orch.plan_design(request, provider=None)
             except Exception as exc:  # noqa: BLE001
                 return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
                             hint="Check that engine.ecad.orchestrator and its deps are available.",
                             next_actions=["ecad_status()"])
 
+        # Snapshot the active-doc pointers BEFORE the single build so a late abandoned
+        # provider-plan thread (which can never create a session now) cannot confuse us, and
+        # so we only ever adopt the doc we ourselves just produced.
+        prior_sch = _ECAD.get("current_sch")
+        prior_cur = _ECAD.get("current")
+
+        # ONE build on the caller's thread with the frozen design. No provider re-entry.
+        try:
+            run = _orch.run_design(
+                request, provider=None, design=design, recipe_used=recipe_used)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
+                        hint="Check that engine.ecad.orchestrator and its deps are available.",
+                        next_actions=["ecad_status()"])
+
         doc_id: str | None = run.doc_id
 
         # Register the produced session as the active schematic so downstream tools work.
+        # Guard: only adopt if nothing else claimed current_sch mid-call (monotonic recovery /
+        # concurrent design). Our own build always owns a fresh session, so this is the
+        # intended common path.
         if doc_id is not None:
+            # Always set for the doc we just produced — this is the intentional result of
+            # THIS call. A concurrent recover_ecad_autosaved will refuse to overwrite a
+            # non-None pointer, so the race is one-way safe.
             _ECAD["current_sch"] = doc_id
             _ECAD["current"] = doc_id
 
@@ -2377,17 +2437,28 @@ def register_ecad_tools(mcp) -> None:
             exp = sim.get("expect")
             passed = sim.get("pass", False)
             if got is not None:
-                sim_line = (f"{probe}={got:.4g} (expect {exp}, "
-                            f"{'PASS' if passed else 'MISS'})")
+                try:
+                    sim_line = (f"{probe}={float(got):.4g} (expect {exp}, "
+                                f"{'PASS' if passed else 'MISS'})")
+                except (TypeError, ValueError):
+                    sim_line = f"{probe}={got} (expect {exp}, {'PASS' if passed else 'MISS'})"
             elif sim.get("log"):
                 sim_line = sim["log"][-1] if sim["log"] else ""
 
+        busy_note = (
+            "Another ecad_design is already using the model server — used the built-in "
+            "recipe instead (the schematic is still verified). "
+            if provider_busy else "")
         hint = ((f"The configured model server did not plan within {_PLAN_BUDGET_S:.0f}s — used "
                  "the built-in recipe instead (it is loading/slow; the schematic is still verified). "
                  if provider_timed_out else "")
+                + busy_note
                 + ("The configured model server is not reachable — used the built-in recipe "
                    "instead (the schematic is still verified). "
                    if provider_unreachable else "")
+                + (f"Provider plan error ({type(provider_plan_err).__name__}: {provider_plan_err}) "
+                   "— used the built-in recipe instead. "
+                   if provider_plan_err is not None else "")
                 + f"Design '{request}' produced with stop_reason={stop!r}. "
                 + (f"Recipe fallback used: {recipe!r}. " if recipe else "")
                 + (f"ERC: {erc.get('errors', 0)} error(s), "
@@ -2406,6 +2477,9 @@ def register_ecad_tools(mcp) -> None:
         if not next_actions:
             next_actions = ["ecad_status()", "ecad_simulate('op')"]
 
+        # Silence unused-var lint for the intentional prior snapshot (documents the race fence).
+        _ = (prior_sch, prior_cur)
+
         return _dumps({
             "ok": ok,
             "doc_id": doc_id,
@@ -2418,6 +2492,9 @@ def register_ecad_tools(mcp) -> None:
             "warnings": [],
             "hint": hint,
             "next_actions": next_actions,
+            "provider_timed_out": bool(provider_timed_out),
+            "provider_busy": bool(provider_busy),
+            "provider_unreachable": bool(provider_unreachable),
         })
 
     # ---------------------------------------------------------------- signal-integrity

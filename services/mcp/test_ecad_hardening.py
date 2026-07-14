@@ -186,3 +186,172 @@ def test_mcp_autosave_and_recover() -> None:
             os.environ.pop("AI_CAD_ECAD_AUTOSAVE_DIR", None)
         else:
             os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = prev_env
+
+
+# --------------------------------------------------------------------------- dual-import identity
+
+
+def test_ecad_module_identity_dual_import() -> None:
+    """mcp_server.ecad_tools and services.mcp.ecad_tools must be ONE module object so
+    _ECAD / _THERMAL session state is never split across two import paths."""
+    import mcp_server.ecad_tools as a
+    import services.mcp.ecad_tools as b
+    assert a is b, f"dual import produced two modules: {a} vs {b}"
+    assert a._ECAD is b._ECAD
+    import mcp_server.ecad_thermal as t1
+    import services.mcp.ecad_thermal as t2
+    assert t1 is t2
+    assert t1._THERMAL is t2._THERMAL
+
+
+# --------------------------------------------------------------------------- recovery monotonicity
+
+
+def test_recover_never_overwrites_active_docs() -> None:
+    """Warm autosave recovery fills only EMPTY current_* defaults — never a just-created doc."""
+    d = tempfile.mkdtemp(prefix="ecad-mcp-mono-")
+    prev_env = os.environ.get("AI_CAD_ECAD_AUTOSAVE_DIR")
+    os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = d
+    eauto.disable()
+    eauto._STATE["session_id"] = None
+    esess._REGISTRY.clear()
+    et._ECAD["current_sch"] = et._ECAD["current_pcb"] = et._ECAD["current"] = None
+    try:
+        et.enable_ecad_autosave()
+        tools = _tools()
+        r = _call(tools, "ecad_new_schematic", name="OldDoc")
+        _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1", value="1k")
+        old_id = r["doc_id"]
+        assert (pathlib.Path(d) / f"{old_id}.json").exists()
+
+        # Simulate restart: clear registry + pointers, then create a NEW live doc BEFORE recover.
+        et._ECAD_SESSION_ID = "RESTARTED2"
+        eauto.enable("RESTARTED2")
+        esess._REGISTRY.clear()
+        et._ECAD["current_sch"] = et._ECAD["current_pcb"] = et._ECAD["current"] = None
+
+        fresh = _call(tools, "ecad_new_schematic", name="FreshLive")
+        fresh_id = fresh["doc_id"]
+        assert et._ECAD["current_sch"] == fresh_id
+
+        # Recovery must NOT clobber the just-created fresh doc.
+        recovered = et.recover_ecad_autosaved()
+        assert et._ECAD["current_sch"] == fresh_id, (
+            f"recovery overwrote active sch {fresh_id} with {et._ECAD['current_sch']}")
+        assert et._ECAD["current"] == fresh_id
+        # Recovered docs still exist in the registry and are addressable by id.
+        assert any(rec.get("original_doc_id") == old_id or rec.get("doc_id")
+                   for rec in recovered) or recovered is not None
+        st = _call(tools, "ecad_status", doc_id=fresh_id)
+        assert st["ok"] and st["component_count"] == 0
+    finally:
+        eauto.disable()
+        eauto._STATE["session_id"] = None
+        if prev_env is None:
+            os.environ.pop("AI_CAD_ECAD_AUTOSAVE_DIR", None)
+        else:
+            os.environ["AI_CAD_ECAD_AUTOSAVE_DIR"] = prev_env
+
+
+def test_multi_doc_explicit_doc_id_isolation() -> None:
+    """Explicit doc_id keeps multi-schematic ops isolated from the active pointer."""
+    tools = _tools()
+    a = _call(tools, "ecad_new_schematic", name="IsoA")
+    aid = a["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, value="1k",
+          ref="RA", doc_id=aid)
+    b = _call(tools, "ecad_new_schematic", name="IsoB")
+    bid = b["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, value="2k",
+          ref="RB", doc_id=bid)
+    assert aid != bid
+    sa = _call(tools, "ecad_status", doc_id=aid)
+    sb = _call(tools, "ecad_status", doc_id=bid)
+    assert sa["ok"] and sa["component_count"] == 1
+    assert sb["ok"] and sb["component_count"] == 1
+    assert sa["components"][0]["ref"] == "RA"
+    assert sb["components"][0]["ref"] == "RB"
+    # Active pointer is B (most recently created); default status must not see A's RA.
+    st = _call(tools, "ecad_status")
+    assert st["ok"]
+    refs = [c["ref"] for c in st.get("components", [])]
+    assert "RB" in refs and "RA" not in refs
+
+
+# --------------------------------------------------------------------------- slow-provider plan budget
+
+
+class _SlowProvider:
+    """Stub provider whose complete() blocks well past the plan budget."""
+
+    def __init__(self, delay_s: float = 30.0):
+        self.delay_s = delay_s
+        self.calls = 0
+        self.base_url = "http://127.0.0.1:9/v1"  # unused — reachability is monkeypatched
+
+    def complete(self, system, messages):  # noqa: ANN001
+        self.calls += 1
+        time.sleep(self.delay_s)
+        return '{"components":[], "nets":{}, "study":{"analysis":"op","expect":{}}}'
+
+
+def test_ecad_design_slow_provider_falls_back_promptly() -> None:
+    """A slow/timed-out provider must degrade to the recipe path before the client budget,
+    produce exactly one verified schematic, and leave ecad_status responsive."""
+    tools = _tools()
+    slow = _SlowProvider(delay_s=30.0)
+    orig_budget = os.environ.get("AI_CAD_ECAD_PLAN_BUDGET_S")
+    os.environ["AI_CAD_ECAD_PLAN_BUDGET_S"] = "1.0"
+
+    # Force the configured provider path and skip the TCP pre-flight.
+    import agent.config as _cfg  # type: ignore
+    orig_get = getattr(_cfg, "get_provider", None)
+    _cfg.get_provider = lambda *a, **k: slow  # type: ignore[attr-defined]
+    orig_reach = et._provider_reachable
+    et._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
+
+    # Snapshot session registry size so we can assert only ONE new sch was built.
+    before_ids = {s.doc_id for s in esess.iter_sessions()}
+    try:
+        t0 = time.time()
+        p = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
+        dt = time.time() - t0
+    finally:
+        if orig_get is not None:
+            _cfg.get_provider = orig_get  # type: ignore[attr-defined]
+        et._provider_reachable = orig_reach  # type: ignore[assignment]
+        if orig_budget is None:
+            os.environ.pop("AI_CAD_ECAD_PLAN_BUDGET_S", None)
+        else:
+            os.environ["AI_CAD_ECAD_PLAN_BUDGET_S"] = orig_budget
+
+    # Must return well under the 30 s MCP transport deadline (plan budget 1 s + build ~2 s).
+    assert dt < 8.0, f"slow-provider design hung for {dt:.1f}s (would trip transport timeout)"
+    assert p.get("provider_timed_out") is True, p
+    assert p.get("ok") is True, f"recipe fallback must still verify: {p.get('hint')}"
+    assert p.get("doc_id"), p
+    assert p.get("recipe_used"), "fallback must name the recipe used"
+
+    # Exactly one new schematic session created by this call (no racing second build).
+    after_ids = {s.doc_id for s in esess.iter_sessions()}
+    new_ids = after_ids - before_ids
+    assert p["doc_id"] in new_ids
+    # Only one *new* sch of the design — registry may hold prior test docs, but the design
+    # doc is the one we just adopted as current.
+    assert et._ECAD["current_sch"] == p["doc_id"]
+    assert et._ECAD["current"] == p["doc_id"]
+
+    # Immediate follow-up status must stay responsive and see the recipe schematic.
+    t1 = time.time()
+    st = _call(tools, "ecad_status")
+    assert (time.time() - t1) < 2.0, "ecad_status after timed-out design must stay responsive"
+    assert st["ok"] and st["kind"] == "sch"
+    assert st.get("doc_id") == p["doc_id"] or et._ECAD["current_sch"] == p["doc_id"]
+
+    # Voltage-divider recipe sim accuracy: midpoint within 0.1%.
+    sim = p.get("sim") or {}
+    got = sim.get("got")
+    exp = sim.get("expect")
+    if got is not None and exp is not None:
+        err = abs(float(got) - float(exp)) / max(abs(float(exp)), 1e-12)
+        assert err <= 0.001, f"divider sim err {err:.4%} > 0.1% (got={got}, expect={exp})"

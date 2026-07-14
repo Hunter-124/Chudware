@@ -662,36 +662,84 @@ def _estimate_period(t: list, v: list) -> float | None:
 # --------------------------------------------------------------------------- the state machine
 
 
+def plan_design(request: str, *, provider=None, max_attempts: int = _PLAN_ATTEMPTS,
+                emit: EmitFn | None = None) -> tuple[dict | None, str | None, list]:
+    """PLAN only — never creates a session or builds a schematic.
+
+    Returns ``(design, recipe_used, events)``. When *provider* is None or planning
+    fails/errors, returns the closest built-in recipe so the caller can still BUILD
+    a verified schematic. Used by ``ecad_design`` to isolate the (possibly slow)
+    model call from session creation so a timed-out provider cannot race a recipe
+    fallback build.
+    """
+    stages: list[StageEvent] = []
+    if provider is not None:
+        design, recipe_used, plan_events = _plan_stage(request, provider, max_attempts)
+        stages.extend(plan_events)
+        if design is not None:
+            return design, recipe_used, stages
+    # No provider, or planning failed -> deterministic recipe (the safety net).
+    design = recipes_mod.closest_recipe(request)
+    recipe_used = design.get("name")
+    ev = StageEvent(stage="plan", ok=True, attempt=0,
+                    detail=f"used recipe fallback {recipe_used!r}",
+                    parsed=design, result={"recipe_used": recipe_used})
+    stages.append(ev)
+    _emit(emit, ev)
+    return design, recipe_used, stages
+
+
 def run_design(request: str, *, provider=None, doc_id: str | None = None,
                max_attempts: int = _PLAN_ATTEMPTS, emit: EmitFn | None = None,
-               session: ecad_session.EcadSession | None = None) -> DesignRun:
+               session: ecad_session.EcadSession | None = None,
+               design: dict | None = None,
+               recipe_used: str | None = None) -> DesignRun:
     """Run the full deterministic design pipeline for *request*; return a :class:`DesignRun`.
 
     ``provider`` is any agent.providers Provider (a MockProvider in tests). When None, the PLAN
     stage is skipped and the closest recipe is used directly -- the run still produces + verifies a
     real schematic. ``session`` lets a caller pass an existing EcadSession (else one is created).
+
+    ``design`` (optional): a pre-validated design intent from :func:`plan_design`. When supplied,
+    the PLAN stage is skipped entirely — this is how ``ecad_design`` separates a budgeted provider
+    plan from a single non-racy BUILD so a late/timed-out provider can never create a second
+    schematic that overwrites the recipe fallback.
+    ``recipe_used`` pairs with a pre-planned design to preserve stop_reason/report fidelity.
     """
     stages: list[StageEvent] = []
     if session is None:
         session = ecad_session.new_session("sch", name="orchestrator")
-    recipe_used: str | None = None
     stop_reason = "confirmed"
 
     # -- stage 1: INTAKE / PLAN --------------------------------------------
-    design: dict | None = None
-    if provider is not None:
-        design, recipe_used, plan_events = _plan_stage(request, provider, max_attempts)
-        stages.extend(plan_events)
-    if design is None:
-        # no provider, or planning failed -> deterministic recipe fallback (the safety net).
-        design = recipes_mod.closest_recipe(request)
-        recipe_used = design.get("name")
-        ev = StageEvent(stage="plan", ok=True, attempt=0,
-                        detail=f"used recipe fallback {recipe_used!r}",
-                        parsed=design, result={"recipe_used": recipe_used})
+    if design is not None:
+        # Pre-planned path: no provider call, no second opinion. Record transparency only.
+        if recipe_used:
+            stop_reason = "fallback"
+        ev = StageEvent(
+            stage="plan", ok=True, attempt=0,
+            detail=(f"pre-planned design (recipe={recipe_used!r})"
+                    if recipe_used else "pre-planned design"),
+            parsed=design, result={"recipe_used": recipe_used},
+        )
         stages.append(ev)
         _emit(emit, ev)
-        stop_reason = "fallback"
+    else:
+        recipe_used = None
+        design = None
+        if provider is not None:
+            design, recipe_used, plan_events = _plan_stage(request, provider, max_attempts)
+            stages.extend(plan_events)
+        if design is None:
+            # no provider, or planning failed -> deterministic recipe fallback (the safety net).
+            design = recipes_mod.closest_recipe(request)
+            recipe_used = design.get("name")
+            ev = StageEvent(stage="plan", ok=True, attempt=0,
+                            detail=f"used recipe fallback {recipe_used!r}",
+                            parsed=design, result={"recipe_used": recipe_used})
+            stages.append(ev)
+            _emit(emit, ev)
+            stop_reason = "fallback"
 
     # -- stage 2: BUILD ----------------------------------------------------
     try:
@@ -720,7 +768,8 @@ def run_design(request: str, *, provider=None, doc_id: str | None = None,
     _emit(emit, ev)
 
     if erc["errors"] > 0:
-        erc, fix_events = _fix_stage(session, erc, provider)
+        # FIX is deterministic (code-side); never re-enter the provider on the build path.
+        erc, fix_events = _fix_stage(session, erc, provider=None)
         stages.extend(fix_events)
 
     # -- stage 4: SIMULATE -------------------------------------------------

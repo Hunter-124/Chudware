@@ -17,7 +17,7 @@ right class on the right seed — honest, since the turns are LABELED, not grade
 from __future__ import annotations
 
 from . import (Challenge, AcceptanceCheck, ledger_dimension, ledger_artifact,
-               ledger_decision_value)
+               ledger_decision_value, coerce_number, dimension_fit_class)
 
 # H7 on d20: +0.021 / 0 ; h7 shaft on d20: 0 / -0.021 → clearance band [0, 0.042].
 BORE_NOM = 20.0
@@ -33,10 +33,12 @@ def _grade_bore(ledger: dict, ctx: dict) -> "tuple[str,str]":
     dim = ledger_dimension(ledger, "bore")
     if not dim:
         return "FAIL", "no bore dimension recorded in ledger"
-    if abs(float(dim.get("value", 0)) - BORE_NOM) > 1e-6:
+    val = coerce_number(dim.get("value", 0))
+    if val is None:
+        return "FAIL", f"bore value {dim.get('value')!r} is not numeric"
+    if abs(val - BORE_NOM) > 1e-6:
         return "FAIL", f"bore value {dim.get('value')} != {BORE_NOM}"
-    tol = dim.get("tolerance") or {}
-    fit = str(tol.get("fit_class") or tol.get("class") or "").upper()
+    fit = dimension_fit_class(dim)
     if "H7" not in fit:
         return "FAIL", f"bore tolerance is {fit or 'none'}, expected H7 (sliding-fit basis)"
     return "PASS", f"bore d{BORE_NOM} {fit}"
@@ -46,21 +48,27 @@ def _grade_fit(ledger: dict, ctx: dict) -> "tuple[str,str]":
     clr = ledger_decision_value(ledger, "fit_bore", "clearance")
     if clr is None:
         return "FAIL", "no fit_bore decision with a clearance value"
+    clr_n = coerce_number(clr)
+    if clr_n is None:
+        return "FAIL", f"clearance {clr!r} is not numeric"
     lo, hi = SLIDING_CLEARANCE_BAND
-    if not (lo <= float(clr) <= hi):
+    if not (lo <= clr_n <= hi):
         return "FAIL", f"clearance {clr} outside sliding band {SLIDING_CLEARANCE_BAND}"
-    return "PASS", f"sliding-fit clearance {clr} mm in band"
+    return "PASS", f"sliding-fit clearance {clr_n} mm in band"
 
 
 def _grade_bolt_circle(ledger: dict, ctx: dict) -> "tuple[str,str]":
     bc = ledger_decision_value(ledger, "bolt_circle", "holes")
     hole_d = ledger_decision_value(ledger, "bolt_circle", "hole_d")
     pcd = ledger_decision_value(ledger, "bolt_circle", "pcd")
-    if bc != BOLT_HOLES:
+    bc_n = coerce_number(bc)
+    if bc_n is None or int(bc_n) != BOLT_HOLES:
         return "FAIL", f"bolt circle has {bc} holes, expected {BOLT_HOLES}"
-    if hole_d is None or abs(float(hole_d) - M4_CLEARANCE_D) > 1e-6:
+    hole_n = coerce_number(hole_d)
+    if hole_n is None or abs(hole_n - M4_CLEARANCE_D) > 1e-6:
         return "FAIL", f"hole d {hole_d} != M4 clearance {M4_CLEARANCE_D}"
-    if pcd is None or abs(float(pcd) - PCD) > 1e-6:
+    pcd_n = coerce_number(pcd)
+    if pcd_n is None or abs(pcd_n - PCD) > 1e-6:
         return "FAIL", f"PCD {pcd} != {PCD}"
     return "PASS", f"{BOLT_HOLES}xM4 clearance on PCD {PCD}"
 

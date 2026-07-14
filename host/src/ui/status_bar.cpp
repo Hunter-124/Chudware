@@ -184,7 +184,8 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                          : st.settings.provider == 1 ? "OpenAI"
                          : st.settings.provider == 3 ? "llama.cpp"
                          : st.settings.provider == 4 ? "Gemini"
-                         : st.settings.provider == 5 ? "Cloud API" : "Local";
+                         : st.settings.provider == 5 ? "Cloud API"
+                         : st.settings.provider == 6 ? "xAI" : "Local";
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");

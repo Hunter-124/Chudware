@@ -204,12 +204,12 @@ def test_codex_build_input_drops_images(tmp_config):
 
 def test_dispatcher_lists_providers():
     ids = {p["id"] for p in sl.providers()}
-    assert ids == {"codex", "claude", "cursor"}
+    assert ids == {"codex", "claude", "cursor", "xai"}
 
 
 def test_dispatcher_status_all_disconnected(tmp_config):
     st = sl.status()
-    assert set(st) == {"codex", "claude", "cursor"}
+    assert set(st) == {"codex", "claude", "cursor", "xai"}
     assert all(not v["connected"] for v in st.values())
 
 
@@ -247,14 +247,14 @@ def test_dispatcher_login_failure_is_contract_shaped(tmp_config, monkeypatch):
 
 # ── Offline mode refuses subscription providers ─────────────────────────────
 
-@pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub"])
+@pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"])
 def test_subscription_providers_refused_offline(name):
     from agent import config
     with pytest.raises(config.OfflineModeError):
         config.get_provider(name, {"offline_mode": True})
 
 
-@pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub"])
+@pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"])
 def test_subscription_providers_never_offline_safe(name):
     from agent import config
 
@@ -264,3 +264,107 @@ def test_subscription_providers_never_offline_safe(name):
     stub = _Stub()
     stub.name = name
     assert config.provider_offline_safe(stub) is False
+
+
+# ── xAI registration ────────────────────────────────────────────────────────
+
+def test_xai_credential_roundtrip_and_status(tmp_config):
+    """Token cache + status shape for the xai friendly id (no network)."""
+    assert sub_auth.load_credential("xai-sub") is None
+    cred = {
+        "access_token": "xai-access",
+        "refresh_token": "xai-refresh",
+        "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        "account_id": "acct-xai",
+        "email": "user@x.ai",
+    }
+    sub_auth.save_credential("xai-sub", cred)
+    assert sub_auth.load_credential("xai-sub") == cred
+
+    st = sl.status()
+    assert st["xai"]["connected"] is True
+    assert st["xai"]["email"] == "user@x.ai"
+    assert st["xai"]["account_id"] == "acct-xai"
+    assert st["xai"]["label"]
+    assert st["xai"]["expires_at_ms"] == cred["expires_at_ms"]
+
+    assert sl.logout("xai") == {"ok": True}
+    assert sub_auth.load_credential("xai-sub") is None
+    assert sl.status()["xai"]["connected"] is False
+
+
+def test_xai_sub_provider_loads_cached_token(tmp_config):
+    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+
+    sub_auth.save_credential(PROVIDER_ID, {
+        "access_token": "tok",
+        "refresh_token": "ref",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+        "email": "a@b.com",
+    })
+    p = XAISubProvider()
+    assert p.name == "xai-sub"
+    assert p.supports_vision is True
+    assert p._cred["access_token"] == "tok"
+
+
+def test_xai_api_key_provider_resolves(tmp_config):
+    from agent import config
+    from agent.providers.xai_provider import XAIProvider, BASE_URL
+
+    p = config.get_provider("xai", {"api_key": "xai-test-key", "model": "grok-4"})
+    assert isinstance(p, XAIProvider)
+    assert p.name == "xai"
+    assert p.model == "grok-4"
+    assert p.base_url == BASE_URL
+
+
+def test_xai_offline_refuses_api_key_path():
+    from agent import config
+    with pytest.raises(config.OfflineModeError):
+        config.get_provider("xai", {"offline_mode": True, "api_key": "k"})
+
+
+def test_xai_tier_denied_error_is_contract_shaped():
+    from agent.providers.xai_sub_provider import (
+        XaiTierDeniedError, TIER_DENIED_REASON, TIER_DENIED_HINT,
+    )
+    err = XaiTierDeniedError("permission denied")
+    assert err.reason == TIER_DENIED_REASON
+    assert "console.x.ai" in err.hint or "console.x.ai" in TIER_DENIED_HINT
+    assert "Heavy" in str(err)
+    assert "traceback" not in str(err).lower()
+
+
+def test_xai_login_403_is_contract_shaped(tmp_config, monkeypatch):
+    """Device-code HTTP 403 surfaces the Heavy-gating reason, never a traceback."""
+    from agent.providers import xai_sub_provider as xsp
+
+    def boom(self, open_browser=True):
+        raise xsp.XaiTierDeniedError("caller does not have permission")
+
+    monkeypatch.setattr(xsp.XAISubProvider, "login_device", boom)
+    monkeypatch.setattr(xsp.XAISubProvider, "login", boom)
+    out = sl.login("xai")
+    assert out["ok"] is False
+    assert "Heavy-only" in out["reason"] or "not API-enabled" in out["reason"]
+    assert "console.x.ai" in (out.get("hint") or "")
+
+
+def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
+    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+
+    p = XAISubProvider()
+    # Fake JWT with email claim.
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"email": "Grok@X.AI", "sub": "user-1"}).encode()
+    ).decode().rstrip("=")
+    token = f"hdr.{payload}.sig"
+    cred = p._store_tokens({
+        "access_token": token,
+        "refresh_token": "rt",
+        "expires_in": 3600,
+    }, token_endpoint="https://auth.x.ai/oauth2/token")
+    assert cred["email"] == "grok@x.ai"
+    assert cred["account_id"] == "user-1"
+    assert sub_auth.load_credential(PROVIDER_ID)["refresh_token"] == "rt"

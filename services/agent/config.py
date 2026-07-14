@@ -112,8 +112,8 @@ def provider_offline_safe(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True
-    if name in ("anthropic", "gemini", "openrouter",
-                "anthropic-sub", "codex-sub", "cursor-sub"):
+    if name in ("anthropic", "gemini", "openrouter", "xai",
+                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"):
         return False  # always cloud (incl. subscription-auth providers, §4.4)
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
@@ -173,6 +173,7 @@ _ROUTING_KIND_TO_PROVIDER_NAME = {
     "openai": "openai",
     "openrouter": "openrouter",
     "gemini": "gemini",
+    "xai": "xai",
     "llamacpp": "llamacpp",
     "vllm": "vllm",
     "mock": "mock",
@@ -250,6 +251,10 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenRouter "
             f"cloud provider is refused. Use a local (loopback) model server instead.")
+    if offline and name == "xai":
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the xAI "
+            f"cloud provider is refused. Use a local (loopback) model server instead.")
     if offline and name in ("anthropic", "openai") and name != "":
         if name == "anthropic":
             raise OfflineModeError(
@@ -278,7 +283,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
                 f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
-    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub"):
+    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"):
         # Subscription-auth providers (§4.4) always talk to a vendor cloud endpoint.
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the subscription "
@@ -355,6 +360,20 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
                                   supports_vision=oc.get("vision", True),
                                   timeout=float(oc.get("timeout", 120.0)))
 
+    if name == "xai":
+        # Classic API-key path (console.x.ai). OpenAI-compatible at https://api.x.ai/v1.
+        from .providers.xai_provider import XAIProvider, DEFAULT_MODEL, BASE_URL
+
+        key = cfg.get("api_key") or os.environ.get("XAI_API_KEY")
+        xc = cfg.get("xai", {}) or {}
+        return XAIProvider(
+            api_key=key,
+            model=cfg.get("model", DEFAULT_MODEL),
+            supports_vision=xc.get("vision", True),
+            timeout=float(xc.get("timeout", 120.0)),
+            base_url=xc.get("base_url") or BASE_URL,
+        )
+
     if name == "anthropic-sub":
         # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
         from .providers.anthropic_sub_provider import AnthropicSubProvider, DEFAULT_MODEL
@@ -373,6 +392,11 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
         return CursorSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
+    if name == "xai-sub":
+        # Subscription auth (§4.4): SuperGrok / X Premium+ device-code OAuth.
+        from .providers.xai_sub_provider import XAISubProvider, DEFAULT_MODEL
+
+        return XAISubProvider(model=cfg.get("model", DEFAULT_MODEL))
     if name in ("llamacpp", "llama.cpp", "llama-cpp"):
         from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL
 

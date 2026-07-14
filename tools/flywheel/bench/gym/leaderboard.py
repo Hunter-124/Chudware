@@ -281,6 +281,23 @@ def aggregate(
     if diag is None:
         diag = load_diag(diag_path)
 
+    # Real builds keep only evaluated models. Scripted/mock paid cells (e.g. the
+    # historical frontier-200k fixture matrix) must not pollute the committed
+    # leaderboard — GUI empty-state covers missing paid providers. Local models
+    # always stay; paid models require a non-mock diag row or an openrouter:* tier
+    # cell from a cycle whose execution_mode is "real".
+    real_cycle_names: set[str] = set()
+    for rep in cycle_reports:
+        if rep.get("execution_mode") == "real":
+            real_cycle_names.add(str(rep.get("cycle") or Path(str(rep.get("_source") or "")).stem))
+    diag_is_mock = bool(diag and diag.get("mock"))
+    diag_model_ids: set[str] = set()
+    if diag and not diag_is_mock:
+        for row in diag.get("results") or []:
+            mid = (row.get("model") or {}).get("id")
+            if mid and not row.get("error"):
+                diag_model_ids.add(mid)
+
     # Group cells by model id (derived from tier).
     by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
     tier_for_model: dict[str, str] = {}
@@ -313,6 +330,16 @@ def aggregate(
                                        if k in ("id", "label", "provider", "kind")}}
                     break
 
+        # Drop mock paid models from a real store.
+        if not force_mock and meta.get("kind") == "paid":
+            has_real_openrouter_cell = any(
+                c.get("tier", "").startswith("openrouter:")
+                and str(c.get("cycle") or "") in real_cycle_names
+                for c in mcells
+            )
+            has_real_diag = mid in diag_model_ids
+            if not (has_real_openrouter_cell or has_real_diag):
+                continue
         n_total = len(mcells)
         n_passed = sum(1 for c in mcells if c.get("passed"))
         pass_rate = round(n_passed / n_total, 4) if n_total else 0.0

@@ -138,6 +138,7 @@ void loadSettings(Settings& s) {
         if (prov == "gemini") s.provider = 4;
         else if (prov == "anthropic") s.provider = 0;
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
+        else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
         else if (hasBase) s.provider = baseLoopback ? 2 : 5;  // 2=Local, 5=Cloud OpenAI-compatible
         else s.provider = 1;                                   // 1=OpenAI cloud (api.openai.com)
         std::string model = j.value("model", "");
@@ -153,12 +154,14 @@ void loadSettings(Settings& s) {
         copyStr(s.anthropicKey, sizeof(s.anthropicKey), keys.value("anthropic", std::string()));
         copyStr(s.openaiKey, sizeof(s.openaiKey), keys.value("openai", std::string()));
         copyStr(s.cloudKey, sizeof(s.cloudKey), keys.value("cloud_compat", std::string()));
+        copyStr(s.xaiKey, sizeof(s.xaiKey), keys.value("xai", std::string()));
         // Back-compat: fold the active provider's top-level api_key into its per-provider slot.
         if (!activeKey.empty()) {
             if (prov == "gemini" && !s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), activeKey);
             else if (prov == "anthropic" && !s.anthropicKey[0]) copyStr(s.anthropicKey, sizeof(s.anthropicKey), activeKey);
             else if (prov == "openai" && !hasBase && !s.openaiKey[0]) copyStr(s.openaiKey, sizeof(s.openaiKey), activeKey);
             else if (prov == "openai" && hasBase && !baseLoopback && !s.cloudKey[0]) copyStr(s.cloudKey, sizeof(s.cloudKey), activeKey);
+            else if ((prov == "xai" || prov == "xai-sub") && !s.xaiKey[0]) copyStr(s.xaiKey, sizeof(s.xaiKey), activeKey);
         }
         // Seed the shipped Gemini key on first run so the copilot works out of the box.
         if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
@@ -276,6 +279,16 @@ void saveSettings(const Settings& s) {
         j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
                                                  : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
                        {"vision", s.vision}};
+    } else if (s.provider == 6) {
+        // xAI Grok. Prefer API-key path when xaiKey is set; otherwise wire as xai-sub so the
+        // agent uses the SuperGrok / X Premium+ OAuth credential from subscription_auth.
+        if (s.xaiKey[0]) {
+            j["provider"] = "xai";
+            j["api_key"] = s.xaiKey;
+        } else {
+            j["provider"] = "xai-sub";
+        }
+        j["model"] = s.model[0] ? s.model : "grok-4";
     } else {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";
@@ -290,7 +303,7 @@ void saveSettings(const Settings& s) {
     // can tell which providers are usable. The active provider's key is also the top-level
     // api_key above (what resolve_provider reads).
     j["keys"] = {{"gemini", s.geminiKey}, {"anthropic", s.anthropicKey}, {"openai", s.openaiKey},
-                 {"cloud_compat", s.cloudKey}};
+                 {"cloud_compat", s.cloudKey}, {"xai", s.xaiKey}};
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;

@@ -1,75 +1,40 @@
 {
   "schema": "aicad.leaderboard/1",
-  "generated": "2026-07-14T13:58:04Z",
-  "task_suite": "gym-C1..C8 + diag-v1-MOCK",
+  "generated": "2026-07-14T14:19:47Z",
+  "task_suite": "gym-C1..C8 + diag-v1",
   "models": [
     {
-      "id": "frontier-200k",
-      "label": "frontier-200k",
-      "provider": "openrouter",
-      "kind": "paid",
-      "evaluated": "2026-07-14T13:58:04Z",
+      "id": "gemma3-4b-qat",
+      "label": "gemma3-4b-qat",
+      "provider": "llamacpp",
+      "kind": "local",
+      "evaluated": "2026-07-14T14:19:47Z",
       "cycles": 1,
       "primary": {
-        "pass_rate": 0.8889,
-        "cells_total": 18,
-        "cells_passed": 16
+        "pass_rate": 0.0,
+        "cells_total": 3,
+        "cells_passed": 0
       },
       "axes": {
-        "tool_validity": null,
+        "tool_validity": 1.0,
         "vision_fix": null,
-        "feature_id": null,
-        "vc_hygiene": null
+        "feature_id": 1.0,
+        "vc_hygiene": 0.6
       },
       "failure_taxonomy": {
-        "tool_misuse": 3,
-        "context_loss": 2,
-        "advisory_ignored": 1,
-        "abstraction_skip": 1,
-        "incoherent_geometry": 2,
-        "grind": 2,
-        "wrong_question": 2
+        "incoherent_geometry": 3,
+        "grind": 1
       },
       "cost": {
         "usd_per_task_med": null,
         "latency_s_med": null,
-        "tokens_per_task_med": null
+        "tokens_per_task_med": 475.5
       },
       "per_challenge": [
         {
           "challenge": "C1",
-          "tier": "frontier-200k",
-          "pass_rate": 1.0,
-          "seeds": 3
-        },
-        {
-          "challenge": "C2",
-          "tier": "frontier-200k",
-          "pass_rate": 1.0,
-          "seeds": 3
-        },
-        {
-          "challenge": "C3",
-          "tier": "frontier-200k",
-          "pass_rate": 0.6667,
-          "seeds": 3
-        },
-        {
-          "challenge": "C4",
-          "tier": "frontier-200k",
-          "pass_rate": 1.0,
-          "seeds": 3
-        },
-        {
-          "challenge": "C5",
-          "tier": "frontier-200k",
-          "pass_rate": 0.6667,
-          "seeds": 3
-        },
-        {
-          "challenge": "C6",
-          "tier": "frontier-200k",
-          "pass_rate": 1.0,
+          "tier": "local-24k-gemma3-qat",
+          "pass_rate": 0.0,
           "seeds": 3
         }
       ]
@@ -79,7 +44,7 @@
       "label": "qwen3-4b",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-14T13:58:04Z",
+      "evaluated": "2026-07-14T14:19:47Z",
       "cycles": 10,
       "primary": {
         "pass_rate": 0.3256,
@@ -90,7 +55,7 @@
         "tool_validity": 1.0,
         "vision_fix": null,
         "feature_id": 1.0,
-        "vc_hygiene": 1.0
+        "vc_hygiene": 0.8
       },
       "failure_taxonomy": {
         "incoherent_geometry": 29,

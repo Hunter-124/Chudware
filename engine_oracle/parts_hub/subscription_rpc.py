@@ -47,7 +47,7 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
     provider = str((params or {}).get("provider", "")).strip().lower()
     device = bool((params or {}).get("device", False))
     if not provider:
-        return {"ok": False, "reason": "provider required (codex|claude|cursor)"}
+        return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
     valid = {p["id"] for p in _sl().providers()}
     if provider not in valid:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
@@ -79,7 +79,7 @@ def _subscription_logout(params: dict, _emit: Callable) -> dict:
     """Clear the stored credential for a provider."""
     provider = str((params or {}).get("provider", "")).strip().lower()
     if not provider:
-        return {"ok": False, "reason": "provider required (codex|claude|cursor)"}
+        return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
     try:
         out = _sl().logout(provider)
         with _login_lock:

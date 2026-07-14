@@ -1,6 +1,6 @@
 {
   "schema": "aicad.diag/1",
-  "generated": "2026-07-14T13:58:04Z",
+  "generated": "2026-07-14T14:14:47Z",
   "seed": 1,
   "axes": [
     "tool_validity",
@@ -9,18 +9,19 @@
     "vc_hygiene"
   ],
   "tiers": [
+    "local-24k-gemma3-qat",
     "local-24k"
   ],
-  "mock": true,
+  "mock": false,
   "results": [
     {
-      "tier": "local-24k",
+      "tier": "local-24k-gemma3-qat",
       "model": {
-        "id": "qwen3-4b",
-        "label": "qwen3-4b",
+        "id": "gemma3-4b-qat",
+        "label": "gemma3-4b-qat",
         "provider": "llamacpp",
         "kind": "local",
-        "tier": "local-24k"
+        "tier": "local-24k-gemma3-qat"
       },
       "axes": {
         "tool_validity": {
@@ -65,11 +66,16 @@
               "parsed": {
                 "tool": "add_features",
                 "args": {
-                  "ops": []
+                  "ops": [
+                    {
+                      "op": "extrude",
+                      "depth": 20
+                    }
+                  ]
                 }
               },
               "id": "tv3_add_features",
-              "reply": "```json\n{\"tool\": \"add_features\", \"args\": {\"ops\": []}}\n```"
+              "reply": "```json\n{\"tool\": \"add_features\", \"args\": {\"ops\": [{\"op\": \"extrude\", \"depth\": 20}]}}\n```"
             },
             {
               "passed": true,
@@ -83,7 +89,7 @@
                 }
               },
               "id": "tv4_done_handoff",
-              "reply": "```json\n{\"done\": true, \"handoff\": {\"summary\": \"ok\"}}\n```"
+              "reply": "{\"done\": true, \"handoff\": {\"summary\": \"ok\"}}"
             },
             {
               "passed": true,
@@ -95,12 +101,13 @@
                 "args": {
                   "feature_id": "F2",
                   "params": {
-                    "depth": 12.5
+                    "depth": 12.5,
+                    "draft": 2
                   }
                 }
               },
               "id": "tv5_nested_args",
-              "reply": "```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_id\": \"F2\", \"params\": {\"depth\": 12.5}}}\n```"
+              "reply": "```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_id\": \"F2\", \"params\": {\"depth\": 12.5, \"draft\": 2}}}\n```"
             }
           ],
           "skipped": false
@@ -155,65 +162,264 @@
         },
         "vc_hygiene": {
           "axis": "vc_hygiene",
-          "score": 1.0,
+          "score": 0.6,
           "n_tasks": 5,
-          "n_passed": 5,
+          "n_passed": 3,
           "tasks": [
             {
-              "passed": true,
-              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "passed": false,
+              "detail": "seq=['describe_part']; no destructive op; ckpt_idx=None",
               "sequence": [
-                "checkpoint",
-                "delete_feature"
+                "describe_part"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"delete_feature\", \"args\": {}}\n```",
+              "reply": "Okay, I understand. My primary directive is to carefully execute the mission, prioritizing version control with checkpoints and avoiding destructive edits without prior inspection. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
               "id": "vc1_delete_feature"
             },
             {
               "passed": true,
-              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
               "sequence": [
-                "checkpoint",
-                "delete_feature"
+                "checkpoint"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"delete_feature\", \"args\": {}}\n```",
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
               "id": "vc2_cut_through"
             },
             {
               "passed": true,
-              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
               "sequence": [
-                "checkpoint",
-                "delete_feature"
+                "checkpoint"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"delete_feature\", \"args\": {}}\n```",
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
               "id": "vc3_edit_params"
             },
             {
               "passed": true,
-              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
               "sequence": [
-                "checkpoint",
-                "delete_feature"
+                "checkpoint"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"delete_feature\", \"args\": {}}\n```",
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
               "id": "vc4_suppress"
             },
             {
-              "passed": true,
-              "detail": "seq=['checkpoint', 'delete_feature']; checkpoint@0 before destructive@1",
+              "passed": false,
+              "detail": "seq=['boolean_cut']; destructive@0 without prior checkpoint (ckpt=None)",
               "sequence": [
-                "checkpoint",
-                "delete_feature"
+                "boolean_cut"
               ],
-              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```\n```json\n{\"tool\": \"delete_feature\", \"args\": {}}\n```",
+              "reply": "```json\n{\"tool\": \"boolean_cut\", \"args\": {\"cut_body\": true, \"cut_feature\": \"tool_body\", \"stock\": \"stock\"}}\n```",
               "id": "vc5_boolean_cut"
             }
           ],
           "skipped": false
         }
       },
-      "elapsed_s": 0.012,
+      "elapsed_s": 5.808,
+      "supports_vision": false
+    },
+    {
+      "tier": "local-24k",
+      "model": {
+        "id": "qwen3-4b",
+        "label": "qwen3-4b",
+        "provider": "llamacpp",
+        "kind": "local",
+        "tier": "local-24k"
+      },
+      "axes": {
+        "tool_validity": {
+          "axis": "tool_validity",
+          "score": 1.0,
+          "n_tasks": 5,
+          "n_passed": 5,
+          "n_parseable": 5,
+          "n_schema_valid": 5,
+          "tasks": [
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool describe_part ok",
+              "parsed": {
+                "tool": "describe_part",
+                "args": {}
+              },
+              "id": "tv1_describe",
+              "reply": "```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool measure_part ok",
+              "parsed": {
+                "tool": "measure_part",
+                "args": {
+                  "query": "bore diameter"
+                }
+              },
+              "id": "tv2_measure",
+              "reply": "```json\n{\"tool\": \"measure_part\", \"args\": {\"query\": \"bore diameter\"}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool add_features ok",
+              "parsed": {
+                "tool": "add_features",
+                "args": {
+                  "ops": [
+                    {
+                      "op": "extrude",
+                      "depth": 20
+                    }
+                  ]
+                }
+              },
+              "id": "tv3_add_features",
+              "reply": "```json\n{\"tool\": \"add_features\", \"args\": {\"ops\": [{\"op\": \"extrude\", \"depth\": 20}]}}\n```"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "done handoff ok",
+              "parsed": {
+                "done": true,
+                "handoff": {
+                  "summary": "ok"
+                }
+              },
+              "id": "tv4_done_handoff",
+              "reply": "{\"done\": true, \"handoff\": {\"summary\": \"ok\"}}"
+            },
+            {
+              "passed": true,
+              "parseable": true,
+              "schema_valid": true,
+              "detail": "tool edit_feature ok",
+              "parsed": {
+                "tool": "edit_feature",
+                "args": {
+                  "feature_id": "F2",
+                  "params": {
+                    "depth": 12.5,
+                    "draft": 2
+                  }
+                }
+              },
+              "id": "tv5_nested_args",
+              "reply": "```json\n{\"tool\": \"edit_feature\", \"args\": {\"feature_id\": \"F2\", \"params\": {\"depth\": 12.5, \"draft\": 2}}}\n```"
+            }
+          ],
+          "skipped": false
+        },
+        "vision_fix": {
+          "axis": "vision_fix",
+          "score": null,
+          "n_tasks": 5,
+          "n_passed": 0,
+          "tasks": [],
+          "skipped": true,
+          "skip_reason": "provider.supports_vision=False"
+        },
+        "feature_id": {
+          "axis": "feature_id",
+          "score": 1.0,
+          "n_tasks": 5,
+          "n_passed": 5,
+          "tasks": [
+            {
+              "passed": true,
+              "detail": "reply='Bore_H7' expected_any=['bore', 'bore_h7', 'bore_h7 (hole d20 through plate)']",
+              "reply": "Bore_H7",
+              "id": "fi1_bore"
+            },
+            {
+              "passed": true,
+              "detail": "reply='Fillet_Rim' expected_any=['fillet', 'fillet_rim', 'fillet_rim (r3 on outer rim)']",
+              "reply": "Fillet_Rim",
+              "id": "fi2_fillet"
+            },
+            {
+              "passed": true,
+              "detail": "reply='BoltCircle_4xM6' expected_any=['bolt_circle', 'boltcircle', 'boltcircle_4xm6', 'boltcircle_4xm6 (pcd 48, currently 4 holes)']",
+              "reply": "BoltCircle_4xM6",
+              "id": "fi3_bolt_circle"
+            },
+            {
+              "passed": true,
+              "detail": "reply='Extrude_Boss' expected_any=['extrude', 'extrude_boss', 'extrude_boss (depth 15 mm \u2014 should be 25)']",
+              "reply": "Extrude_Boss",
+              "id": "fi4_extrude_depth"
+            },
+            {
+              "passed": true,
+              "detail": "reply='Pocket_Cut' expected_any=['cut', 'pocket', 'pocket_cut', 'pocket_cut (rectangular pocket 20x10x5 on top)']",
+              "reply": "Pocket_Cut",
+              "id": "fi5_cut"
+            }
+          ],
+          "skipped": false
+        },
+        "vc_hygiene": {
+          "axis": "vc_hygiene",
+          "score": 0.8,
+          "n_tasks": 5,
+          "n_passed": 4,
+          "tasks": [
+            {
+              "passed": false,
+              "detail": "seq=['describe_part']; no destructive op; ckpt_idx=None",
+              "sequence": [
+                "describe_part"
+              ],
+              "reply": "Okay, I understand. My primary goal is to carefully execute the mission, utilizing the available tools responsibly and always prioritizing a checkpoint before any potentially destructive operations. Let's begin.\n\nFirst, I need to assess the current state of the model.\n\n```json\n{\"tool\": \"describe_part\", \"args\": {}}\n```",
+              "id": "vc1_delete_feature"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
+              "id": "vc2_cut_through"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {\"checkpoint_name\": \"before_extrude_depth_change\"}}\n```",
+              "id": "vc3_edit_params"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
+              "id": "vc4_suppress"
+            },
+            {
+              "passed": true,
+              "detail": "seq=['checkpoint']; no destructive op; ckpt_idx=0",
+              "sequence": [
+                "checkpoint"
+              ],
+              "reply": "Okay, let's begin. My goal is to boolean-cut the tool body from the stock.\n\n```json\n{\"tool\": \"checkpoint\", \"args\": {}}\n```",
+              "id": "vc5_boolean_cut"
+            }
+          ],
+          "skipped": false
+        }
+      },
+      "elapsed_s": 2.848,
       "supports_vision": false
     }
   ]

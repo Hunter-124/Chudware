@@ -24,6 +24,8 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import re
+
 
 # A grader: (ledger_dict, run_context) -> (result: "PASS"|"FAIL", detail: str)
 ACGrader = Callable[[dict, dict], "tuple[str, str]"]
@@ -124,3 +126,48 @@ def ledger_decision_value(ledger: dict, decision_id: str, key: str) -> Any:
         if e.get("kind") == "decision" and (e.get("payload") or {}).get("id") == decision_id:
             return (e.get("payload") or {}).get(key)
     return None
+
+
+def coerce_number(value: Any) -> float | None:
+    """Parse a free-text or numeric dimension/decision value into a float.
+
+    Real local models often write ISO-style strings like ``"Ø20 H7 (+0.021/0)"``
+    or ``"20 mm"`` into ledger dimension payloads. Graders must not crash on those
+    — extract the first numeric token, or return None when nothing parses.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    # Prefer the first number that looks like a dimension (before unit/fit noise).
+    m = re.search(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", text.replace(",", ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except (TypeError, ValueError):
+        return None
+
+
+def dimension_fit_class(dim: dict | None) -> str:
+    """Best-effort fit class from a dimension payload (structured or free-text)."""
+    if not isinstance(dim, dict):
+        return ""
+    tol = dim.get("tolerance") or {}
+    if isinstance(tol, dict):
+        fit = str(tol.get("fit_class") or tol.get("class") or "").upper()
+        if fit:
+            return fit
+    # Free-text value may embed the class, e.g. "Ø20 H7 (+0.021/0)".
+    blob = " ".join(str(dim.get(k, "")) for k in ("value", "name", "driver", "text"))
+    m = re.search(r"\b([HhGgNnKkPpFfMm]\d+)\b", blob)
+    return m.group(1).upper() if m else ""

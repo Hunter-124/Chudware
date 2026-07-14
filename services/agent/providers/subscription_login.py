@@ -7,8 +7,8 @@ never imports individual provider modules:
     logout(provider)  -> {"ok": True}
     status()          -> {provider: {"connected": bool, "email": ..., "expires_at_ms": ...}}
 
-`provider` is one of the friendly ids: "codex" | "claude" | "cursor" (aliases for the
-provider names "codex-sub" / "anthropic-sub" / "cursor-sub"). `login()` opens the user's
+`provider` is one of the friendly ids: "codex" | "claude" | "cursor" | "xai" (aliases for the
+provider names "codex-sub" / "anthropic-sub" / "cursor-sub" / "xai-sub"). `login()` opens the user's
 browser and blocks until the OAuth flow completes, so callers should run it off the UI
 thread. Every path returns a contract-shaped dict — never a traceback.
 """
@@ -21,6 +21,7 @@ _PROVIDERS = {
     "codex": ("codex-sub", "openai-codex", "OpenAI Codex (ChatGPT Plus/Pro)"),
     "claude": ("anthropic-sub", "anthropic-sub", "Anthropic Claude (Pro/Max)"),
     "cursor": ("cursor-sub", "cursor", "Cursor (Pro)"),
+    "xai": ("xai-sub", "xai-sub", "xAI Grok (SuperGrok / X Premium+)"),
 }
 
 
@@ -43,6 +44,9 @@ def _instantiate(provider_name: str):
     if provider_name == "cursor-sub":
         from .cursor_sub_provider import CursorSubProvider
         return CursorSubProvider()
+    if provider_name == "xai-sub":
+        from .xai_sub_provider import XAISubProvider
+        return XAISubProvider()
     raise ValueError(f"unknown subscription provider {provider_name!r}")
 
 
@@ -55,21 +59,28 @@ def providers() -> list[dict]:
 def login(provider: str, device: bool = False) -> dict:
     """Run the OAuth login for *provider*. Blocks on the browser flow. Contract-shaped.
 
-    ``device=True`` uses the headless device-code flow (Codex only) instead of the local
-    callback server — useful when port 1455 is busy or there's no local browser.
+    ``device=True`` uses the headless device-code flow (Codex / xAI) instead of a local
+    callback server — useful when the loopback port is busy or there's no local browser.
+    xAI is device-code-only; ``device`` is accepted for API symmetry.
     """
     resolved = _resolve(provider)
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": "Use one of: codex, claude, cursor."}
+                "hint": "Use one of: codex, claude, cursor, xai."}
     _friendly, name, _cred_id, label = resolved
     try:
         prov = _instantiate(name)
         if device and name == "codex-sub":
             cred = prov.login_device()
+        elif name == "xai-sub":
+            # xAI is device-code-only (accounts.x.ai); login() already opens the browser.
+            cred = prov.login_device(open_browser=not device) if device else prov.login()
         else:
             cred = prov.login()
     except Exception as e:  # noqa: BLE001 — surface every failure as a clean dict for the GUI
+        from .xai_sub_provider import XaiTierDeniedError, TIER_DENIED_HINT, TIER_DENIED_REASON
+        if isinstance(e, XaiTierDeniedError):
+            return {"ok": False, "reason": e.reason or TIER_DENIED_REASON, "hint": e.hint or TIER_DENIED_HINT}
         return {"ok": False, "reason": f"{label} login failed: {e}",
                 "hint": "Complete the login in the browser tab, or check your network and "
                         "subscription, then try again."}
@@ -82,7 +93,7 @@ def logout(provider: str) -> dict:
     resolved = _resolve(provider)
     if resolved is None:
         return {"ok": False, "reason": f"unknown subscription provider {provider!r}",
-                "hint": "Use one of: codex, claude, cursor."}
+                "hint": "Use one of: codex, claude, cursor, xai."}
     _friendly, _name, cred_id, _label = resolved
     sub_auth.clear_credential(cred_id)
     return {"ok": True}

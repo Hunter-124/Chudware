@@ -814,6 +814,7 @@ static const char* providerWireName(int provider) {
         case ui::PROV_CLOUDCOMPAT: return "openai";
         case ui::PROV_LLAMACPP:    return "llamacpp";
         case ui::PROV_GEMINI:      return "gemini";
+        case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
     }
     return "";
 }
@@ -2181,6 +2182,7 @@ static char* providerKeyBuf(Settings& s, int provider) {
         case ui::PROV_ANTHROPIC: return s.anthropicKey;
         case ui::PROV_OPENAI: return s.openaiKey;
         case ui::PROV_CLOUDCOMPAT: return s.cloudKey;  // DashScope / DeepSeek / OpenAI-compatible
+        case ui::PROV_XAI: return s.xaiKey;
         default: return s.apiKey;  // local OpenAI-compatible optional key
     }
 }
@@ -2235,6 +2237,9 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
                 std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
                 s.vision = cp[0].vision;
             }
+        } else if (s.provider == ui::PROV_XAI) {
+            std::strncpy(s.model, "grok-4", sizeof(s.model) - 1);
+            s.vision = true;
         }
     }
 
@@ -2436,6 +2441,104 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
             ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
                                            : "no API key — add your OpenRouter / DashScope / DeepSeek key");
         ImGui::PopStyleColor();
+    } else if (s.provider == ui::PROV_XAI) {
+        // xAI: SuperGrok / X Premium+ device-code OAuth AND/OR classic API key (console.x.ai).
+        // Sign-in uses subscription_login{provider:"xai",device:true}; GUI polls subscription_status.
+        static bool s_xaiLoginBusy = false;
+        static bool s_xaiConnected = false;
+        static std::string s_xaiEmail;
+        static std::string s_xaiError;
+        static double s_xaiLastPoll = -1e9;
+
+        auto pollXaiStatus = [&](bool force) {
+            double now = ImGui::GetTime();
+            if (!force && (now - s_xaiLastPoll) < 1.5) return;
+            s_xaiLastPoll = now;
+            st.rpc.call("subscription_status", nlohmann::json::object(),
+                        [](const core::RpcResult& r) {
+                if (!r.ok || !r.result.is_object()) return;
+                auto providers = r.result.value("providers", nlohmann::json::object());
+                auto x = providers.value("xai", nlohmann::json::object());
+                s_xaiConnected = x.value("connected", false);
+                s_xaiEmail = x.value("email", std::string());
+                s_xaiLoginBusy = x.value("login_in_progress", false);
+                if (auto err = x.value("last_error", std::string()); !err.empty())
+                    s_xaiError = err;
+                else if (s_xaiConnected)
+                    s_xaiError.clear();
+            });
+        };
+        pollXaiStatus(false);
+
+        dimText("SuperGrok / X Premium+ subscription (device-code OAuth) or API key from console.x.ai.");
+        if (s_xaiLoginBusy) {
+            ImGui::TextUnformatted("Waiting for browser approval\xe2\x80\xa6");
+            pollXaiStatus(true);
+        } else if (s_xaiConnected) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+            if (!s_xaiEmail.empty())
+                ImGui::Text("Connected as %s", s_xaiEmail.c_str());
+            else
+                ImGui::TextUnformatted("Connected via SuperGrok / X Premium+");
+            ImGui::PopStyleColor();
+            if (ImGui::SmallButton("Sign out##xai")) {
+                st.rpc.call("subscription_logout", nlohmann::json{{"provider", "xai"}},
+                            [](const core::RpcResult&) {});
+                s_xaiConnected = false;
+                s_xaiEmail.clear();
+                s_xaiError.clear();
+                s_xaiLastPoll = -1e9;
+            }
+        } else {
+            if (ImGui::Button("Sign in with xAI", ImVec2(-1, 0))) {
+                s_xaiLoginBusy = true;
+                s_xaiError.clear();
+                st.rpc.call("subscription_login",
+                            nlohmann::json{{"provider", "xai"}, {"device", true}},
+                            [](const core::RpcResult& r) {
+                    if (!r.ok) {
+                        s_xaiLoginBusy = false;
+                        s_xaiError = r.err.empty() ? "login failed" : r.err;
+                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                        s_xaiLoginBusy = false;
+                        auto reason = r.result.value("reason", std::string());
+                        auto hint = r.result.value("hint", std::string());
+                        s_xaiError = reason.empty() ? "login failed" : reason;
+                        if (!hint.empty()) s_xaiError += " — " + hint;
+                    }
+                    s_xaiLastPoll = -1e9;
+                });
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Opens the accounts.x.ai device-code flow in your browser.\n"
+                    "Approve on phone/browser; status flips to Connected when done.");
+        }
+        if (!s_xaiError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", s_xaiError.c_str());
+            ImGui::PopStyleColor();
+            // Honest Heavy-gating surface: if the reason mentions API-enabled / Heavy, keep the
+            // console.x.ai hint visible (subscription_login already includes it).
+        }
+
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::TextUnformatted("API key (console.x.ai — optional if signed in)");
+        char* key = providerKeyBuf(s, s.provider);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##xaikey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
+        bool haveKey = key[0] != '\0';
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            (haveKey || s_xaiConnected) ? ui::Palette::toU32(ui::palette.statusOk)
+                                        : ui::Palette::toU32(ui::palette.statusWarn));
+        if (haveKey)
+            ImGui::TextUnformatted("API key set — uses provider 'xai' (blocked in Offline mode)");
+        else if (s_xaiConnected)
+            ImGui::TextUnformatted("OAuth connected — uses provider 'xai-sub' (blocked in Offline mode)");
+        else
+            ImGui::TextUnformatted("Sign in with SuperGrok or paste an API key from console.x.ai");
+        ImGui::PopStyleColor();
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
         ImGui::TextUnformatted("API key");
         char* key = providerKeyBuf(s, s.provider);
@@ -2535,8 +2638,8 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
             return st.settings.disabledProviders.count(key) == 0;
         };
 
-        // Built-in cloud providers (Gemini / Anthropic / OpenAI).
-        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI}) {
+        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI).
+        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI}) {
             std::string key = ui::providerCatKey(pv);
             int n = 0;
             for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
@@ -2672,6 +2775,9 @@ static void drawAISettingsBody(AppState& st, bool busy) {
                 std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
                 s.vision = cp[0].vision;
             }
+        } else if (s.provider == ui::PROV_XAI) {
+            std::strncpy(s.model, "grok-4", sizeof(s.model) - 1);
+            s.vision = true;
         }
     }
 
@@ -2889,6 +2995,8 @@ static const char* providerShort(int provider) {
         case ui::PROV_LOCAL:     return "Local";
         case ui::PROV_LLAMACPP:  return "llama.cpp";
         case ui::PROV_GEMINI:    return "Gemini";
+        case ui::PROV_XAI:       return "xAI";
+        case ui::PROV_CLOUDCOMPAT: return "Cloud";
     }
     return "";
 }
@@ -2913,6 +3021,8 @@ static bool providerUsable(AppState& st, int provider) {
         case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0;
         case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0;
         case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0;
+        case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0;  // OAuth also OK; key is the
+                                                                    // cheap check for picker enable
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
     }
@@ -3461,7 +3571,7 @@ static void drawRuntimeBanner(AppState& st) {
 
 // Build a compact "Provider · model" label for the composer's model chip.
 static void composerModelLabel(const Settings& s, char* out, size_t n) {
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API"};
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI"};
     const char* prov = provNames[(s.provider >= 0 && s.provider < ui::PROV_COUNT)
                                      ? s.provider : ui::PROV_GEMINI];
     std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");

@@ -23,7 +23,8 @@ enum ProviderIndex {
     PROV_CLOUDCOMPAT = 5, // Cloud OpenAI-compatible API w/ custom base_url (Alibaba DashScope /
                           // DeepSeek API / etc.). Resolves as provider "openai" + a cloud base_url,
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
-    PROV_COUNT = 6,
+    PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
+    PROV_COUNT = 7,
 };
 
 struct ModelInfo {
@@ -42,13 +43,14 @@ inline const char* providerLabel(int provider) {
         case PROV_LLAMACPP: return "llama.cpp (managed local)";
         case PROV_GEMINI: return "Google Gemini";
         case PROV_CLOUDCOMPAT: return "OpenRouter / Cloud API";
+        case PROV_XAI: return "xAI (Grok)";
         default: return "?";
     }
 }
 
 inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
-           provider == PROV_CLOUDCOMPAT;
+           provider == PROV_CLOUDCOMPAT || provider == PROV_XAI;
 }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
@@ -63,6 +65,7 @@ inline const char* providerCatKey(int provider) {
         case PROV_LOCAL:
         case PROV_LLAMACPP: return "local";
         case PROV_CLOUDCOMPAT: return "cloud";  // refine with cloudServiceKey(base_url)
+        case PROV_XAI: return "xai";
         default: return "other";
     }
 }
@@ -75,7 +78,6 @@ inline const char* cloudServiceKey(const std::string& base_url) {
     return "cloud";
 }
 
-// Human label for a category key (covers both builtin providers and cloud services).
 inline const char* categoryLabel(const std::string& key) {
     if (key == "gemini") return "Google Gemini";
     if (key == "anthropic") return "Anthropic (Claude)";
@@ -84,6 +86,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "openrouter") return "OpenRouter";
     if (key == "alibaba") return "Alibaba Cloud (Qwen)";
     if (key == "deepseek") return "DeepSeek";
+    if (key == "xai") return "xAI (Grok)";
     return "Cloud API";
 }
 
@@ -100,6 +103,12 @@ inline const std::vector<ModelInfo>& builtinModels() {
         // OpenAI cloud.
         {PROV_OPENAI, "gpt-4o", "GPT-4o", true, false},
         {PROV_OPENAI, "o3", "OpenAI o3", false, true},
+        // xAI Grok — multimodal on 4.x; reasoning variants expose effort.
+        // Model ids from hermes-agent catalog / console.x.ai (2026).
+        {PROV_XAI, "grok-4", "Grok 4", true, true},
+        {PROV_XAI, "grok-4-1", "Grok 4.1", true, true},
+        {PROV_XAI, "grok-4.20-0309-reasoning", "Grok 4.20 Reasoning", true, true},
+        {PROV_XAI, "grok-build-0.1", "Grok Build 0.1", true, false},
     };
     return kModels;
 }
@@ -214,13 +223,14 @@ inline int defaultContextWindowForModel(int provider, const std::string& id) {
     if (has("o1") || has("o3") || has("o4") || has("reasoner") || has("r1")) return 200000;
     if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
     if (has("gpt-3.5")) return 16385;
-    if (has("qwen3-max") || has("qwen3-vl")) return 131072;
     if (has("qwen") || has("deepseek")) return 128000;
+    if (has("grok")) return 131072;
     switch (provider) {
         case PROV_GEMINI: return 1048576;
         case PROV_ANTHROPIC: return 200000;
         case PROV_OPENAI:
-        case PROV_CLOUDCOMPAT: return 128000;
+        case PROV_CLOUDCOMPAT:
+        case PROV_XAI: return 128000;
         default: return 8192;
     }
 }

@@ -16,7 +16,7 @@ schema: aicad.routing/1
 # onto it and the delegation tree still functions.
 #
 # Source kinds (NO consumer-OAuth kinds — Pillar 12):
-#   anthropic | openai | openrouter | lmstudio | llamacpp | ollama
+#   anthropic | openai | openrouter | gemini | xai | lmstudio | llamacpp | ollama | vllm
 
 sources: []  # populated by the user via the settings GUI (T-W17)
   # Example entries (uncomment and fill in):

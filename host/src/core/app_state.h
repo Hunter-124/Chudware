@@ -83,6 +83,7 @@ struct Settings {
     char anthropicKey[256] = "";
     char openaiKey[256] = "";
     char cloudKey[256] = "";       // cloud OpenAI-compatible API key (DashScope / DeepSeek / etc.)
+    char xaiKey[256] = "";         // xAI (Grok) API key — console.x.ai; empty when using xai-sub OAuth
     char reasoningEffort[16] = "high";  // off|low|medium|high — only used by reasoning models
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
@@ -1044,7 +1045,7 @@ struct AppState {
     int selectedPart = -1;            // -1 = whole assembly; >=0 = index into asmParts
 
     // ---- model picker availability (filled by the agent_list_models probe) ----
-    ProviderModels providerModels[6];        // indexed by ui::ProviderIndex (PROV_COUNT)
+    ProviderModels providerModels[7];        // indexed by ui::ProviderIndex (PROV_COUNT; PROV_XAI=6)
     std::atomic<bool> modelProbeInFlight{false};
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};

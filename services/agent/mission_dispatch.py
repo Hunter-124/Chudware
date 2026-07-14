@@ -37,7 +37,27 @@ from typing import Any, Callable, Optional
 # T-DP1 additive: the four design-pipeline stage kinds (contract design_pipeline.md §4).
 _LEDGER_NOTE_KINDS = {"brief", "decision", "dimension", "question",
                       "requirement", "stage", "artifact", "note",
-                      "feature", "geometry_spec", "linkage", "build_node"}
+                      "feature", "geometry_spec", "linkage", "build_node",
+                      # mega-2 / grok45-2: criterion_result is a real ledger kind
+                      # (T-W30); accept it on the note path too.
+                      "criterion_result"}
+
+# Model-facing aliases → canonical kinds (mega-2 live: kind=verdict from DELIVER;
+# grok45-2: review_verdict / audit / deliverables_manifest).
+_LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
+    "verdict": "decision",
+    "review_verdict": "decision",
+    "audit": "decision",
+    "ruling": "decision",
+    "spec": "decision",
+    "deliverables_manifest": "artifact",
+    "manifest": "artifact",
+    "report": "artifact",
+    "battery": "artifact",
+    "criterion": "criterion_result",
+    "ac_result": "criterion_result",
+    "acceptance": "criterion_result",
+}
 
 # T-DP1: kinds that require a `provenance` field on write (the "never recall a
 # number" rule) — dimension (contract §2) + geometry_spec (contract §3.2/§4).
@@ -125,19 +145,44 @@ class MissionDispatch:
         """Return the design ledger for this run, rendered within *budget_tokens*.
 
         section filters to one of brief | requirements | decisions | dimensions |
-        questions | stage_log | artifacts; omit for the full rendered ledger.
+        questions | stage_log | artifacts | features | geometry_specs | linkages |
+        build_nodes | manifest; omit (or section="all"/"*") for the full rendered
+        ledger. mega-2: models commonly pass section="all" meaning full render.
         """
         led = self._ledger(run_id)
         if led is None:
             return {"ok": False, "error": "no ledger bound to this mission run"}
+        # Alias full-ledger section names → rendered ledger (omit section).
+        if section in ("all", "*", "full", "entire", "everything"):
+            section = None
+        # mega-2: models ask for section="events" (raw event log).
+        if section in ("events", "event_log", "history"):
+            return {
+                "ok": True, "run_id": led.run_id, "section": "events",
+                "data": list(led.events),
+                "event_count": len(led.events),
+            }
         if section:
             allowed = {"brief", "requirements", "decisions", "dimensions",
                        "questions", "stage_log", "artifacts",
                        # T-DP1 design-pipeline sections (contract §4/§9)
-                       "features", "geometry_specs", "linkages", "build_nodes"}
+                       "features", "geometry_specs", "linkages", "build_nodes",
+                       # mega-2: intake manifest surface (also under artifacts)
+                       "manifest", "events"}
             if section not in allowed:
                 return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed)}
+                        "allowed": sorted(allowed) + ["all"]}
+            if section == "manifest":
+                arts = led.state.get("artifacts") or []
+                manifests = [a for a in arts
+                             if (a.get("kind") == "manifest"
+                                 or a.get("id") == "manifest")]
+                data = manifests[0] if manifests else None
+                # Prefer embedded payload when intake wrote it.
+                if isinstance(data, dict) and data.get("manifest"):
+                    data = data["manifest"]
+                return {"ok": True, "run_id": led.run_id, "section": "manifest",
+                        "data": data}
             return {"ok": True, "run_id": led.run_id, "section": section,
                     "data": led.state.get(section)}
         from services.agent.ledger import ledger_render
@@ -151,17 +196,65 @@ class MissionDispatch:
         """Append a structured event to this run's design ledger.
 
         kind: brief | decision | dimension | question | requirement | stage |
-        artifact | note.  Dimension events MUST carry a provenance field
-        (tool result / calc / table / user answer) — contract rule.
+        artifact | note | criterion_result (+ aliases: verdict→decision, …).
+        Dimension events MUST carry a provenance field (tool result / calc /
+        table / user answer) — contract rule.
+
+        mega-2: models often omit ``id`` and only send ``name``/``value`` for
+        decision/dimension. Synthesize a stable id from name so the write does
+        not leave id-less rows that later KeyError on upsert. Also alias
+        kind=verdict/review_verdict/audit → decision (DELIVER thrash).
         """
         led = self._ledger(run_id)
         if led is None:
             return {"ok": False, "error": "no ledger bound to this mission run"}
+        # Normalize model aliases before allow-list (mega-2 kind=verdict, etc.).
+        raw_kind = (kind or "note").strip().lower() if isinstance(kind, str) else "note"
+        kind = _LEDGER_NOTE_KIND_ALIASES.get(raw_kind, raw_kind)
         if kind not in _LEDGER_NOTE_KINDS:
-            return {"ok": False, "error": f"unknown kind {kind!r}",
-                    "valid_kinds": sorted(_LEDGER_NOTE_KINDS)}
+            return {
+                "ok": False,
+                "error": f"unknown kind {raw_kind!r}",
+                "valid_kinds": sorted(
+                    _LEDGER_NOTE_KINDS | set(_LEDGER_NOTE_KIND_ALIASES)
+                ),
+                "aliased_to": dict(_LEDGER_NOTE_KIND_ALIASES),
+            }
         body = dict(payload or {})
         body.update({k: v for k, v in extra.items() if not k.startswith("_")})
+        # Stash original alias for audit when we remapped.
+        if raw_kind != kind:
+            body.setdefault("aliased_kind", raw_kind)
+        # Promote common aliases so kind=decision/dimension always has id.
+        if kind in ("decision", "dimension", "question", "artifact",
+                    "feature", "geometry_spec", "linkage", "build_node",
+                    "criterion_result"):
+            if not body.get("id"):
+                for alt in ("name", "decision_id", "dim_id", "req_id",
+                            "artifact_id", "feature_id", "spec_id", "node_id",
+                            "deliverable", "criterion_id"):
+                    if body.get(alt):
+                        body["id"] = str(body[alt])
+                        break
+            if not body.get("id") and body.get("text"):
+                slug = "".join(
+                    c if c.isalnum() else "_"
+                    for c in str(body["text"])[:48].lower()
+                ).strip("_")
+                body["id"] = slug or f"{kind}_{len(getattr(led, 'events', []) or [])}"
+            if not body.get("id"):
+                body["id"] = f"{kind}_{len(getattr(led, 'events', []) or [])}"
+        # decision alias from verdict often lacks stage/text/rationale
+        if kind == "decision":
+            body.setdefault("stage", body.get("phase") or "verify")
+            if not body.get("text"):
+                body["text"] = (
+                    body.get("summary")
+                    or body.get("measured")
+                    or body.get("value")
+                    or str(body.get("id") or "decision")
+                )
+            body.setdefault("rationale", body.get("evidence") or body.get("driver") or "")
         if kind in _PROVENANCE_REQUIRED_KINDS and not body.get("provenance"):
             return {"ok": False,
                     "error": (f"{kind} events require a 'provenance' field "
@@ -169,7 +262,8 @@ class MissionDispatch:
         try:
             event = led.append(actor, kind, body)
             return {"ok": True, "seq": event["seq"], "run_id": led.run_id,
-                    "kind": kind, "ts": event["ts"]}
+                    "kind": kind, "ts": event["ts"],
+                    **({"aliased_from": raw_kind} if raw_kind != kind else {})}
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "error": f"ledger write failed: {exc}"}
 

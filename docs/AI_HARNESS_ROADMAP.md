@@ -86,3 +86,18 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   provider taxonomy, ECAD/fw tools on analysis role slots. Infinitely-branching
   DelegationTree root landed; no child spawns (pre-model-success). Re-run after
   xai-sub login or API key restore.
+
+- 2026-07-14 mega-2 (WS5): same 5-DL flight-computer + rocket-plane mission
+  under `reports/runs/mega-2/` with SuperGrok OAuth live (`XAISubProvider`
+  grok-4.5). Wall **879s**, mission `blocked`/`specify_incomplete` (phases_completed
+  only intake) but **DAG progressed past plan** through BUILD/VERIFY/DELIVER and
+  `dag.run.done` — no `INVALID_CONCURRENT_GRAPH_UPDATE` (mega-1 fan-in fix held).
+  Live fingerprints: fw/em tools unresolved-but-callable, ledger_get section
+  all/events/plan/acceptance, ledger_note decision `id` KeyError + kind=verdict,
+  provider read-timeout storm under parallel fan-out, BUILD without `new_part`
+  (hollow geometry), buildgraph_plan empty nodes. Child spawns still 0. Fixer2
+  (FollowingTakin) landed enablement fixes 1–7 mid-run (`fixes.md`, 49 tests) —
+  live pid pre-import; relaunch for verification. Findings + TOP5:
+  `reports/runs/mega-2/findings.md` (relaunch Fixer2 wave; xAI concurrency
+  timeout policy; new_part bootstrap; buildgraph_plan shape; mission phase gate
+  vs DAG progress).

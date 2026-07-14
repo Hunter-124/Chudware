@@ -105,7 +105,7 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
     # builds.  Same one-FastMCP-per-module pattern; still ONE process-wide registry.
     for module_key in ("gsl", "parts", "ledger", "preflight", "regen", "buildgraph",
                        "intake", "designreview", "req", "cost", "structural",
-                       "dimscheme", "workspace"):
+                       "dimscheme", "workspace", "firmware", "em", "antenna"):
         fn = _resolve_extra(module_key, tool)
         if fn is not None:
             return fn
@@ -192,6 +192,19 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # T-W32: workspace_status/workspace_doc_events — orchestrator/overseer.
                 from mcp_server.workspace_tools import register_workspace_tools
                 register_workspace_tools(mcp)
+            elif module_key == "firmware":
+                # mega-2: fw_* tools offered on SPECIFY tools_slot (family:fw seed)
+                # must resolve at dispatch — not only appear as unresolved labels.
+                from mcp_server.firmware_tools import register_firmware_tools
+                register_firmware_tools(mcp)
+            elif module_key == "em":
+                # mega-2: em_status / em_eigenmode / em_driven / em_timedomain.
+                from mcp_server.em_tools import register_em_tools
+                register_em_tools(mcp)
+            elif module_key == "antenna":
+                # mega-2: ecad_antenna_design / ecad_antenna_analyze (family:em/ecad).
+                from mcp_server.antenna_tools import register_antenna_tools
+                register_antenna_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

@@ -1863,9 +1863,36 @@ def run_mission(
 
     if ledger is not None:
         try:
-            ledger.add_artifact("intake_analyst", "manifest", "manifest",
-                                path="", stage=Phase.INTAKE.value,
-                                note=f"{len(manifest.get('deliverables', []))} deliverables")
+            # Embed the full manifest so ledger_get(section="manifest") and
+            # section="artifacts" surface deliverables/ACs (mega-2: models were
+            # thrashing ledger_get looking for empty requirements/build_nodes).
+            ledger.add_artifact(
+                "intake_analyst", "manifest", "manifest",
+                path="", stage=Phase.INTAKE.value,
+                note=f"{len(manifest.get('deliverables', []))} deliverables",
+                manifest=manifest,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # Mirror each AC as a requirement so section="requirements" is non-empty
+        # after fixture intake (same class as empty requirements thrash).
+        try:
+            for d in (manifest.get("deliverables") or []):
+                if not isinstance(d, dict):
+                    continue
+                did = d.get("id") or "?"
+                for ac in (d.get("acceptance_criteria") or []):
+                    if not isinstance(ac, dict):
+                        continue
+                    ac_id = ac.get("id") or "?"
+                    text = ac.get("text") or ""
+                    ledger.add_requirement(
+                        "intake_analyst",
+                        f"{did}/{ac_id}",
+                        text or f"{did} {ac_id}",
+                        source="manifest",
+                        status="open",
+                    )
         except Exception:  # noqa: BLE001
             pass
 

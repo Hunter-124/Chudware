@@ -104,8 +104,24 @@ def _apply(state: dict, event: dict) -> dict:
             state["requirements"].append(dict(payload))
 
     elif kind == "decision":
-        dec_id = payload.get("id")
-        existing = next((d for d in state["decisions"] if d["id"] == dec_id), None)
+        # Models often omit id and only send name=…; tolerate missing ids and
+        # never KeyError on an earlier id-less decision (mega-2: ledger write
+        # failed: 'id' after first decision without id polluted state).
+        dec_id = payload.get("id") or payload.get("name") or payload.get("decision_id")
+        if dec_id and not payload.get("id"):
+            payload = {**payload, "id": dec_id}
+        existing = None
+        if dec_id is not None:
+            existing = next(
+                (d for d in state["decisions"]
+                 if d.get("id") == dec_id or d.get("name") == dec_id),
+                None,
+            )
+        if existing is None and payload.get("name"):
+            existing = next(
+                (d for d in state["decisions"] if d.get("name") == payload.get("name")),
+                None,
+            )
         if existing:
             existing.update(payload)
         else:
@@ -113,14 +129,27 @@ def _apply(state: dict, event: dict) -> dict:
 
     elif kind == "dimension":
         # provenance stays in the event; only the frozen state fields go into state
-        dim_id = payload.get("id")
+        dim_id = payload.get("id") or payload.get("name") or payload.get("dim_id")
+        if dim_id and not payload.get("id"):
+            payload = {**payload, "id": dim_id}
         state_entry = {k: v for k, v in payload.items()
                        if k in ("id", "name", "value", "unit", "driver",
                                 "tolerance", "status", "confirmed_by", "refs",
                                 # §21 additive fields — derivation DAG + linking
                                 "derived_from", "derivation", "linked",
                                 "cited_by_departments")}
-        existing = next((d for d in state["dimensions"] if d["id"] == dim_id), None)
+        existing = None
+        if dim_id is not None:
+            existing = next(
+                (d for d in state["dimensions"]
+                 if d.get("id") == dim_id or d.get("name") == dim_id),
+                None,
+            )
+        if existing is None and payload.get("name"):
+            existing = next(
+                (d for d in state["dimensions"] if d.get("name") == payload.get("name")),
+                None,
+            )
         if existing:
             existing.update(state_entry)
         else:
@@ -359,11 +388,19 @@ class Ledger:
         })
 
     def add_artifact(self, actor: str, kind: str, artifact_id: str,
-                     path: str, stage: str, note: str = "") -> dict:
-        return self.append(actor, "artifact", {
+                     path: str, stage: str, note: str = "",
+                     **extra: Any) -> dict:
+        """Append an artifact event. Extra kwargs (e.g. ``manifest=…``) are
+        stored on the payload so ``ledger_get(section="manifest")`` can return
+        the full intake deliverables document, not just a note string."""
+        body: dict[str, Any] = {
             "kind": kind, "id": artifact_id, "path": path,
             "stage": stage, "note": note,
-        })
+        }
+        for k, v in extra.items():
+            if not str(k).startswith("_") and v is not None:
+                body[k] = v
+        return self.append(actor, "artifact", body)
 
     def add_criterion_result(self, actor: str, ac_id: str, result: str,
                              *, check_tool: str = "", pass_rule: str = "",

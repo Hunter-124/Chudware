@@ -68,6 +68,72 @@ class TestLedgerTools:
         got = md.ledger_get(section="nonsense")
         assert got["ok"] is False and "allowed" in got
 
+    def test_section_all_aliases_full_render(self, md):
+        """mega-2: models pass section='all' meaning full ledger render."""
+        md.ledger_note(kind="decision",
+                       payload={"id": "D1", "stage": "s",
+                                "text": "t", "rationale": "r"})
+        got = md.ledger_get(section="all")
+        assert got["ok"] is True and "rendered" in got
+        got2 = md.ledger_get(section="*")
+        assert got2["ok"] is True and "rendered" in got2
+
+    def test_section_events_returns_event_log(self, md):
+        """mega-2: section='events' must not be unknown."""
+        md.ledger_note(kind="note", payload={"text": "hi"})
+        got = md.ledger_get(section="events")
+        assert got["ok"] is True
+        assert isinstance(got["data"], list) and len(got["data"]) >= 1
+
+    def test_section_manifest_returns_embedded(self, md, ledger):
+        """mega-2: intake embeds full manifest under artifacts."""
+        ledger.add_artifact(
+            "intake", "manifest", "manifest", "", "intake",
+            note="1 deliverable",
+            manifest={"deliverables": [{"id": "DL1"}]},
+        )
+        got = md.ledger_get(section="manifest")
+        assert got["ok"] is True
+        assert got["data"]["deliverables"][0]["id"] == "DL1"
+
+    def test_decision_without_id_synthesizes_from_name(self, md):
+        """mega-2 defect 5: name-only decision must not KeyError on next write."""
+        r1 = md.ledger_note(
+            kind="decision",
+            payload={"name": "fc_process", "value": "pcb",
+                     "driver": "x", "provenance": "y"},
+        )
+        assert r1["ok"] is True, r1
+        r2 = md.ledger_note(
+            kind="decision",
+            payload={"name": "fc_material", "value": "FR4",
+                     "driver": "x", "provenance": "y"},
+        )
+        assert r2["ok"] is True, r2
+        r3 = md.ledger_note(
+            kind="decision",
+            payload={"id": "fc_3v3", "name": "fc_3v3", "value": "buck",
+                     "driver": "x", "provenance": "y"},
+        )
+        assert r3["ok"] is True, r3
+        got = md.ledger_get(section="decisions")
+        assert got["ok"] and len(got["data"]) >= 3
+
+    def test_dimension_without_id_after_named_write(self, md):
+        """mega-2: second dimension after name-only first must not KeyError."""
+        r1 = md.ledger_note(
+            kind="dimension",
+            payload={"name": "bore", "value": 20, "unit": "mm",
+                     "driver": "x", "provenance": "fit"},
+        )
+        assert r1["ok"] is True, r1
+        r2 = md.ledger_note(
+            kind="dimension",
+            payload={"name": "od", "value": 60, "unit": "mm",
+                     "driver": "x", "provenance": "calc"},
+        )
+        assert r2["ok"] is True, r2
+
     def test_dimension_requires_provenance(self, md):
         out = md.ledger_note(kind="dimension",
                              payload={"id": "DIM1", "name": "bore", "value": 10})

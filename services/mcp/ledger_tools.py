@@ -24,8 +24,9 @@ def register_ledger_tools(mcp) -> None:
         """Return the design ledger for *run_id*, rendered within *budget_tokens*.
 
         ``section`` filters to a single section (brief | requirements | decisions |
-        dimensions | questions | stage_log | artifacts); omit for the full ledger.
-        ``budget_tokens`` controls the rendering budget (default 800 for local-24k tier).
+        dimensions | questions | stage_log | artifacts | features | geometry_specs |
+        linkages | build_nodes | manifest); omit or pass ``all``/``*`` for the full
+        ledger render. ``budget_tokens`` controls the rendering budget (default 800).
         """
         try:
             from services.agent.ledger import Ledger, ledger_render
@@ -33,14 +34,35 @@ def register_ledger_tools(mcp) -> None:
             from agent.ledger import Ledger, ledger_render  # type: ignore
 
         ledger = Ledger.load(run_id)
+        # mega-2: models pass section="all" meaning full render, not a named key.
+        if section in ("all", "*", "full", "entire", "everything"):
+            section = None
+        if section in ("events", "event_log", "history"):
+            return {
+                "ok": True, "run_id": run_id, "section": "events",
+                "data": list(ledger.events),
+                "event_count": len(ledger.events),
+            }
         if section:
             # Return raw state section as JSON (no token budget needed)
             state = ledger.state
             allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts"}
+                       "questions", "stage_log", "artifacts",
+                       "features", "geometry_specs", "linkages", "build_nodes",
+                       "manifest", "events"}
             if section not in allowed:
                 return {"ok": False, "error": f"unknown section {section!r}",
-                        "allowed": sorted(allowed)}
+                        "allowed": sorted(allowed) + ["all"]}
+            if section == "manifest":
+                arts = state.get("artifacts") or []
+                manifests = [a for a in arts
+                             if (a.get("kind") == "manifest"
+                                 or a.get("id") == "manifest")]
+                data = manifests[0] if manifests else None
+                if isinstance(data, dict) and data.get("manifest"):
+                    data = data["manifest"]
+                return {"ok": True, "run_id": run_id, "section": "manifest",
+                        "data": data}
             return {"ok": True, "run_id": run_id, "section": section,
                     "data": state.get(section)}
         rendered = ledger_render(ledger, budget_tokens)
@@ -130,10 +152,23 @@ def register_ledger_tools(mcp) -> None:
             from agent.ledger import Ledger  # type: ignore
 
         VALID_KINDS = {"brief", "decision", "dimension", "question",
-                       "requirement", "stage", "artifact"}
+                       "requirement", "stage", "artifact", "note",
+                       "feature", "geometry_spec", "linkage", "build_node",
+                       "criterion_result"}
+        KIND_ALIASES = {
+            "verdict": "decision", "review_verdict": "decision",
+            "audit": "decision", "ruling": "decision", "spec": "decision",
+            "deliverables_manifest": "artifact", "manifest": "artifact",
+            "report": "artifact", "battery": "artifact",
+            "criterion": "criterion_result", "ac_result": "criterion_result",
+            "acceptance": "criterion_result",
+        }
+        raw_kind = (kind or "").strip().lower() if isinstance(kind, str) else ""
+        kind = KIND_ALIASES.get(raw_kind, raw_kind)
         if kind not in VALID_KINDS:
-            return {"ok": False, "error": f"unknown kind {kind!r}",
-                    "valid_kinds": sorted(VALID_KINDS)}
+            return {"ok": False, "error": f"unknown kind {raw_kind!r}",
+                    "valid_kinds": sorted(VALID_KINDS | set(KIND_ALIASES)),
+                    "aliased_to": KIND_ALIASES}
 
         if kind == "dimension" and not payload.get("provenance"):
             return {

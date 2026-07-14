@@ -1115,10 +1115,8 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                 float dt = io.DeltaTime < 0.1f ? io.DeltaTime : 0.1f;
                 float gx = -ox * kMaxPx * dt, gy = -oy * kMaxPx * dt;
                 const float deg = 3.14159265f / 180.0f;
-                const float fov = Renderer::kFovDeg * deg;
-                float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-                float dist = st.renderer->effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-                float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+                // Route through the renderer's camera seam so ortho/persp both pan correctly.
+                float worldPerPx = st.renderer->worldPerPixel(vh);
                 float yr = st.yaw * deg, pr = st.pitch * deg;
                 Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
                 Vec3 wUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),

@@ -1342,3 +1342,28 @@ edits were preserved throughout.
 **Deferred (honest):** opportunistic CUDA FEA-assembly path (spice_sweep CPU-parallel landed);
 a simsuite `run_all.py` adapter that maps benchmark legs to case rows (benchmarks run via gate.sh +
 standalone today); C++ `core/ecad` parity port of the new Python ECAD capabilities (MCP serves Python).
+
+## 2026-07-14 — Copilot-harness overhaul wave 1 (fable-5 session, 9 parallel agents)
+
+**Landed:** orthographic-default viewport (Camera seam on Renderer: CameraXform proj/view/basis +
+worldPerPixel; all hardcoded kFovDeg helpers routed through it; Ortho/Persp toggle in view selector,
+persisted as config.json `orthographic`); extrude/dim drag arrows now project cursor motion onto the
+DRAWN arrow's screen dir (tip−tail) — single sign source, fixes inverted drag; ribbon button geometry
+unified to one snapped rect (bg/hit/content); Feature Manager file+Reference sections auto-collapse
+when the doc gains its first body (per-doc sticky user override); PM OK/Cancel hover = status-tinted
+glow border, not solid fill; docked Copilot: AI-settings as in-column overlay (AppState::
+showAISettingsOverlay, same swap pattern as Sessions), sessions restyle, OpenRouter first-class;
+model leaderboard (contracts/leaderboard.md `aicad.leaderboard/1`, store benchmarks/leaderboard/
+leaderboard.json, shared parser host/src/ui/leaderboard_ui.h, compact table in Settings>AI + full
+pane in AI workspace); gym: `openrouter:<model-id>` tiers, diag suites (tool_validity/vision_fix/
+feature_id/vc_hygiene) under tools/flywheel/bench/gym/diag/, leaderboard.py aggregator; RevEng:
+RE-14 hints restored (was deleted by bb4665b1), _make_pipeline_agent_fn now calls real backends
+(colmap→ffwd→dense→cleanup→segment_fit→reverse_engineer), single_photo/fit_primitives unstubbed,
+live V4L2 webcam capture, phone-QR capture in Sources, session splat/mesh in Reconstruct stage;
+CAD-Recode v1.5 ML backend (engine_oracle/vision/cad_recode.py, strategy="ml", subprocess-sandboxed
+CadQuery exec; owner-authorized NC integration — license_debt row 19, cleanroom-before-ship).
+
+**Deferred (honest):** real OpenRouter eval run needs OPENROUTER_API_KEY (CLI recipe in gym
+tests/return packets); cost/latency medians null until real ledger usage events; MF (Windows)
+camera still stub; continuous phone-photo polling; splat overlay in app.cpp keeps its own fixed
+perspective preview camera (deliberate).

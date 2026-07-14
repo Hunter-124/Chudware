@@ -640,7 +640,7 @@ class RenodeEmulator:
         cmd = [self.BINARY, "--disable-xwt", "--console", resc_path]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
+                cmd, capture_output=True, text=True, errors="replace", timeout=timeout_s, check=False,
             )
             raw = proc.stdout or ""
             if proc.returncode not in (0, 1):
@@ -724,7 +724,7 @@ class QEMUEmulator:
         ]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
+                cmd, capture_output=True, text=True, errors="replace", timeout=timeout_s, check=False,
             )
             raw = proc.stdout or ""
         except FileNotFoundError:

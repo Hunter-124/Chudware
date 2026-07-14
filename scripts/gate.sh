@@ -777,6 +777,64 @@ stage_fin_content() {
     fi
 }
 
+# ---- Stage 4.8: master-mission E2E benchmarks (opt-in) ----------------------
+# The flight-computer + battery-charger end-to-end protocols exercise the WHOLE
+# ECAD+sim+firmware stack (parts -> schematic -> SPICE -> place/route/trace-opt ->
+# antenna/openEMS -> board checks -> firmware+Renode sensor-in-the-loop). Heavy
+# (~90-120s each, real openEMS/Renode), so OPT-IN like the other benches:
+#   AICAD_RUN_BENCH_FC=1   flight computer     AICAD_RUN_BENCH_CHG=1  battery charger
+# Legs that need an absent backend SKIP honestly; a real defect FAILs the gate.
+_run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-env-prefix
+    local label="$1" script="$2" pfx="$3" flag="$4" envpfx="$5"
+    if [ "${!flag:-}" != "1" ]; then
+        record "$label   SKIP    set ${flag}=1 to run the E2E benchmark"
+        echo "  SKIP: ${flag} not set"
+        return 0
+    fi
+    if [ ! -f "$REPO/$script" ]; then
+        record "$label   SKIP    $script missing"; echo "  SKIP: $script missing"; return 0
+    fi
+    local mcp_venv="$HOME/.local/share/AI-CAD/mcp-venv/bin/python" venv_py=""
+    if [ -x "$mcp_venv" ]; then venv_py="$mcp_venv"
+    elif command -v python3 >/dev/null 2>&1; then venv_py="python3"
+    else record "$label   SKIP    no python3"; echo "  SKIP: no python3"; return 0; fi
+    if [ -z "${AI_CAD_LIBAICAD:-}" ]; then
+        for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" \
+                    "$REPO/core/build-linux/bin/libaicad.so"; do
+            [ -f "$cand" ] && export AI_CAD_LIBAICAD="$cand" && break
+        done
+    fi
+    local out="${GATE_TMP}/${pfx}"; mkdir -p "$out/markers"
+    export "${envpfx}_OUT=$out" "${envpfx}_MARKERS=$out/markers"
+    export AI_CAD_ECAD_HEAVY_BUDGET_S="${AI_CAD_ECAD_HEAVY_BUDGET_S:-300}"
+    local rc=0
+    if ! PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" "$REPO/$script" \
+            > "${GATE_TMP}/${pfx}.out" 2>&1; then rc=$?; fi
+    local n_pass=0 n_fail=0 n_skip=0
+    if [ -d "$out/markers" ]; then
+        n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+        n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/${pfx}.out)"
+    if [ "$rc" -eq 0 ] && [ "$n_fail" = "0" ]; then
+        record "$label   PASS    $detail"; echo "  PASS ($detail)"
+    else
+        record "$label   FAIL    exit=$rc $detail"
+        echo "  FAIL: $label (see ${GATE_TMP}/${pfx}.out):"
+        tail -n 20 "${GATE_TMP}/${pfx}.out" | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+stage_bench_flight_computer() {
+    echo "=== [4.8/6] E2E benchmark: central flight computer ==="
+    _run_e2e_bench "bench flight-comp" "scripts/bench_flight_computer.py" "bench_fc" "AICAD_RUN_BENCH_FC" "AICAD_FC"
+}
+stage_bench_battery_charger() {
+    echo "=== [4.9/6] E2E benchmark: battery charger/controller ==="
+    _run_e2e_bench "bench charger    " "scripts/bench_battery_charger.py" "bench_chg" "AICAD_RUN_BENCH_CHG" "AICAD_BC"
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 HOST_BUILD_OK=0
@@ -792,6 +850,8 @@ stage_pytest
 stage_vv
 stage_modeling
 stage_fin_content
+stage_bench_flight_computer
+stage_bench_battery_charger
 stage_ui_imgui
 stage_bench
 stage_perf

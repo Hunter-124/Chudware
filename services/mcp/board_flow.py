@@ -151,6 +151,54 @@ def _routing_snapshot(board: dict) -> list[tuple]:
     return rows
 
 
+def _ensure_outline(pcb, report: dict, warnings: list) -> None:
+    """Add a closed rectangular Edge.Cuts outline enclosing placed parts if absent.
+
+    ecad_to_3d and zone fill both need a closed Edge.Cuts loop; ecad_make_board sets one
+    but the one-call board_from_schematic did not (found by the flight-computer benchmark).
+    """
+    doc = pcb.doc
+    if (doc.get("outline") or {}).get("shapes"):
+        report["steps"].append({"step": "set_outline", "ok": True, "kept": True})
+        return
+    xs: list[float] = []
+    ys: list[float] = []
+    for fp in doc.get("footprints", []) or []:
+        pos = fp.get("pos")
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
+            continue
+        fx, fy = float(pos[0]), float(pos[1])
+        added = False
+        for pad in fp.get("pads", []) or []:
+            off = pad.get("pos") or pad.get("at") or pad.get("offset")
+            if isinstance(off, (list, tuple)) and len(off) >= 2:
+                xs.append(fx + float(off[0])); ys.append(fy + float(off[1])); added = True
+        if not added:
+            xs.append(fx); ys.append(fy)
+    margin, min_side = 5.0, 20.0
+    if not xs or not ys:
+        x0, y0, x1, y1 = 0.0, 0.0, min_side, min_side
+    else:
+        x0, y0, x1, y1 = min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin
+        if x1 - x0 < min_side:
+            cx = (x0 + x1) / 2.0; x0, x1 = cx - min_side / 2.0, cx + min_side / 2.0
+        if y1 - y0 < min_side:
+            cy = (y0 + y1) / 2.0; y0, y1 = cy - min_side / 2.0, cy + min_side / 2.0
+    corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    shapes = [{"type": "line", "p1": corners[i], "p2": corners[(i + 1) % 4],
+               "layer": "Edge.Cuts"} for i in range(4)]
+    try:
+        ecad_session.apply_ops(
+            pcb, pcb.revision,
+            [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
+        report["steps"].append({"step": "set_outline", "ok": True,
+                                "size_mm": [round(x1 - x0, 1), round(y1 - y0, 1)]})
+    except Exception as e:  # noqa: BLE001
+        report["steps"].append({"step": "set_outline", "ok": False,
+                                "error": f"{type(e).__name__}: {e}"})
+        warnings.append(f"set_outline failed: {type(e).__name__}: {e}")
+
+
 # --------------------------------------------------------------------------- public
 
 
@@ -302,6 +350,9 @@ def board_from_schematic(
         warnings.append(f"place_board failed: {type(e).__name__}: {e}")
 
     n_placed = len(pcb.doc.get("footprints") or [])
+
+    # ---- 2b. ensure a closed Edge.Cuts outline (ecad_to_3d / fill need it) --
+    _ensure_outline(pcb, report, warnings)
 
     # Count airwires after placement (ratsnest_before for the route step).
     try:

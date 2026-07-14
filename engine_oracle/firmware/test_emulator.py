@@ -807,7 +807,8 @@ def test_live_stm32f4_hello_uart(tmp_path):
         "typedef unsigned int u32;\n"
         "static void send(const char *s){volatile u32 *dr=(u32*)0x40011004;"
         "while(*s){*dr=(u32)*s++;}}\n"
-        "void _start(void){send(\"HELLO_UART\\n\");for(;;){}}\n"
+        "void _start(void){*(volatile u32*)0x4001100C=(1u<<13)|(1u<<3);"  # USART1 CR1: UE|TE (Renode 1.16.1 enforces TE)
+        "send(\"HELLO_UART\\n\");for(;;){}}\n"
         "__attribute__((section(\".vtab\"),used)) static void(*v[2])(void)="
         "{(void(*)(void))0x20004000,_start};\n",
         encoding="utf-8")

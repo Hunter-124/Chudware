@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "ai-cad": {
+      "command": "/home/hunter/Repositories/CAD/.venv-mcp/bin/python",
+      "args": [
+        "-m",
+        "mcp_server.server"
+      ],
+      "cwd": "/home/hunter/Repositories/CAD",
+      "env": {
+        "PYTHONPATH": "/home/hunter/Repositories/CAD"
+      }
+    },
+    "aicad-team": {
+      "command": "python3",
+      "args": [
+        "/home/hunter/Repositories/CAD/work/tools/team_mcp.py"
+      ]
+    }
+  }
+}

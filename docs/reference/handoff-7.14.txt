@@ -1,0 +1,196 @@
+ # CloudCastle handoff — July 14, 2026
+
+  ## Current state
+
+  - Repository: /home/hunter/Desktop/cloudcastle/Light-RMM
+  - Branch: master
+  - HEAD: 797bc8d76
+  - origin/master matches local; worktree is clean.
+  - Production: root@2.25.83.186, application tree /opt/light-rmm
+  - Production control API, Postgres, signaling, relay, and mail containers are healthy.
+  - Database migrations 0015_phishing_soc2 and 0016_soc2_readiness are applied successfully.
+  - Production secrets file remains mode 0600; the obsolete shared platform-admin credential was removed.
+  - Several verified database backups exist under /var/backups/light-rmm/.
+
+  ## Completed and live
+
+  ### Linux remote recovery
+
+  The “Peer ID known but vault empty” failure is fixed and verified on this Linux machine.
+
+  Root cause:
+
+  - Password provisioning failed, but the agent treated the peer ID alone as success.
+  - A stale remote.cred.uploaded marker remained while remote.cred was absent.
+  - The server vault could therefore remain empty indefinitely.
+
+  Implemented:
+
+  - Success now requires both the peer ID and an uploadable credential.
+  - Passwords use OS-backed cryptographic randomness.
+  - remote.cred is written atomically with mode 0600.
+  - Forced recovery preserves an unacknowledged credential.
+  - The agent retains plaintext until the API explicitly returns password_stored: true.
+  - Error output cannot leak password-bearing command data.
+  - Remote maintenance remains off the heartbeat-critical path.
+
+  Live test result:
+
+  - Peer ID: 24304563
+  - Host/service: running
+  - Wayland capture: ready
+  - Input/uinput: ready
+  - Rendezvous configuration: valid
+  - Credential upload: explicitly acknowledged
+  - Plaintext remote.cred: removed after upload
+  - Both local services are active.
+
+  Relevant code: Light-RMM/rmm/agent/src/host_bootstrap.rs, Light-RMM/rmm/agent/src/main.rs.
+
+  ### Admin display fixes
+
+  The shared table primitive now fixes Patches, Escalations, and other action-column tables:
+
+  - Header/body/action geometry matches.
+  - Selected row backgrounds continue through actions.
+  - Horizontal scrolling preserves alignment.
+  - Mobile cards discard desktop widths correctly.
+  - Tested at 360, 768, and 1440 pixels across 13 representative surfaces.
+
+  Relevant code: Light-RMM/rmm/control-api/static/admin.html, Light-RMM/scripts/admin-table-ui-smoke.py.
+
+  ### Security/SOC 2 and phishing foundation
+
+  Live foundation includes:
+
+  - Nine phishing-related database tables and initial safe templates.
+  - Six SOC 2 readiness/evidence tables.
+  - Immutable evidence provenance enforcement.
+  - Tenant-scoped readiness framework/control storage.
+  - No false claim that the software makes a customer “SOC 2 compliant.”
+  - Legacy platform-test user removed from production.
+
+  Plan: Light-RMM/docs/SECURITY-SOC2-EXECUTION-DAG.md.
+
+  ### Remote-session security foundation
+
+  Added separate endpoints for:
+
+  - Grant issuance
+  - Device-bound redemption
+  - Heartbeats
+  - Session termination
+
+  Grants are 256-bit random, hash-only server-side, single-use, expiring, concurrency-limited, scoped, and audited.
+
+  The existing remote password response remains active for compatibility until the browser and host adopt the new
+  handshake. Implementation: Light-RMM/rmm/control-api/src/remote_sessions.rs.
+
+  ### Deployment improvements
+
+  - Automatic verified Postgres backup before rebuilding.
+  - Failed readiness now fails deployment.
+  - File baseline advances only after a healthy rebuild.
+  - Remote broker image pinned to its verified immutable digest.
+  - Legacy upstream-named packages excluded from customer artifact deployment.
+  - Open-source provenance notice added.
+  - Deployment script portability and Docker fixture packaging fixed.
+
+  Deployment driver: Light-RMM/deploy/push-updates.sh.
+
+  ## Pushed but not yet deployed
+
+  Commit 797bc8d76 removes remaining upstream product names from operator-facing package errors, automation copy,
+  escalation text, and installer output.
+
+  Deploy it with:
+
+  cd /home/hunter/Desktop/cloudcastle/Light-RMM
+  ./deploy/push-updates.sh --verify-remote --rebuild
+  git add deploy/file-hashes.md5
+  git commit -m "DEPLOY: record production file baseline"
+  git push origin master
+
+  The deployment will create another database backup automatically. Expect the control image rebuild to take roughly
+  three minutes.
+
+  ## Priority blocker: browser P2P viewer
+
+  The native host, vault, rendezvous, and relay path are now healthy, but browser video is not complete:
+
+  - /web/session responds successfully.
+  - Native signaling ports 21115 and 21117 are reachable.
+  - /web/rd/_manifest returns 503.
+  - Production has CLOUDCASTLE_WEB_ENGINE_MODE=disabled.
+  - No approved browser JS/WASM engine bundle is installed.
+
+  The open RustDesk source tree in this repository does not contain the distributable browser engine expected by
+  web-session.html. The next owner needs one of:
+
+  1. A licensed browser-engine bundle.
+  2. A self-built bundle with source, license review, and reproducible build provenance.
+  3. A dedicated clean-room/AGPL browser protocol implementation.
+
+  After acquiring/building it:
+
+  - Install it read-only under /var/lib/cloudcastle/web-engine.
+  - Generate the SHA-256 manifest described in Light-RMM/docs/WEB-ENGINE-BUNDLE.md.
+  - Enable CLOUDCASTLE_WEB_ENGINE_MODE=self-built-approved.
+  - Connect the browser and endpoint to the new one-time grant endpoints.
+  - Add heartbeat/end calls.
+  - Move the grant registry to Postgres or Redis before HA.
+  - Remove the permanent password from the legacy browser response.
+  - Perform real video, keyboard, pointer, reconnect, direct-P2P, and relay-fallback tests.
+
+  A licensed bundle must not have its license checks bypassed. Product-facing branding can be replaced, but upstream
+  copyright, AGPL notices, source availability, and internal compatibility identifiers must remain.
+
+  ## Remaining product work
+
+  ### Phishing simulation
+
+  - Campaign builder and scheduling
+  - Approval workflow and tenant authorization
+  - Domain/sender verification and strict recipient allowlists
+  - Safe landing/training pages
+  - Click/report/training telemetry
+  - CSV/PDF evidence export
+  - SOC 2 evidence linking
+  - Anti-abuse controls and customer consent records
+
+  ### SOC 2 readiness
+
+  - Admin interface for scopes, controls, owners, cadence, and review
+  - Automated evidence collectors
+  - Access-review and incident-exercise workflows
+  - Backup/restore evidence
+  - Evidence export and auditor portal
+  - Retention/deletion jobs
+  - Control mapping review with compliance counsel
+
+  ### Windows
+
+  - Build and sign current agent/host installers.
+  - Validate password side-channel and explicit vault acknowledgement.
+  - Verify service isolation and upgrade behavior.
+  - Run the same browser/native P2P matrix after Linux browser control works.
+
+  ### Branding/legal
+
+  - Finish desktop Flutter/platform metadata, icons, About screens, and installers.
+  - Add the complete AGPL license text and formal third-party notice inventory.
+  - Replace the MSI’s inherited privacy-policy document with reviewed CloudCastle privacy terms.
+  - Preserve compatibility names internally through aliases rather than global replacement.
+
+  ## Verification performed
+
+  - Agent suite: 125 passed
+  - Remote-session registry: 3 passed
+  - Artifact/package suite: 14 passed
+  - Admin responsive matrix: passed at 360/768/1440
+  - Production /ready: healthy
+  - Production control container: healthy
+  - Migrations 15 and 16: successful
+  - Local Linux forced remote recovery: successful
+  - Local and production agent artifact checksums: matched
+  - Repository and origin/master: synchronized at 797bc8d76

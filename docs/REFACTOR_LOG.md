@@ -1292,3 +1292,53 @@ validated cases); MOSFET caps are constant-C (not region-dependent Meyer); noise
 floor; DigiKey/Mouser live API unexercised without keys (offline-fixture verified); other domain tools'
 `_dumps` not yet migrated to result_serving. Pre-existing/unrelated: `check.py feature_surface_audit`
 ribbon-handler flags in `host/src/ui/ribbon_def.cpp`.
+
+## Master mission — ECAD board-design + simulation-suite expansion (2026-07-14)
+
+Planned as a monolithic `aicad.dag/1` (`dag/templates/flight_computer_charger_ecad_sim_master.json`,
+20 nodes, schema-valid) with the advisor (MCP `cad_guide`/`em_status`/`fw_status`/`check_metadata`)
+and the user (decisions D1–D4). Executed off master in subagent waves, commit+push per verified unit.
+
+**Landed (each with deterministic tests + recorded wall-times):**
+- **Provisioning:** openEMS 0.37.0 (full-wave FDTD, built from source) + Renode 1.16.1 installed and
+  wired into `services/installer/provision.py` + `install.ps1` (all OSes); `tools/provision_em.py` +
+  `tools/provision_renode.py`. `em_status` now `openems=installed` (driven/timedomain default → openEMS).
+- **Foundation (`core/`):** durable sim solve-state cache (`core/sim/sim_cache.*` + `.step+`
+  `studies/*/results.npz` seam in `stepplus.cpp` + SPICE/EM/CFD result cache; >5× reload, never stale);
+  nested-tree profiler (`core/prof/tree.*` + `engine_profile_tree` MCP, path/depth drill-down);
+  dynamic resource governor + shared thread pool (`core/util/thread_pool.*`, `resource_governor.cpp`
+  graded workers, no OOM / no self-throttle). Fixed pre-existing `mesher.h` missing `<cstdint>`.
+- **Parts pack:** flight-computer + charger electronics in the clean-room ECAD starter library
+  (IMU/baro/mag/GPS/buck/MCP73831/MOSFETs/current-sense/LVD/thermistor), pin-correct + eng metadata.
+- **ECAD (`engine_oracle/ecad/`, Python — the MCP path):** connectivity-aware deterministic
+  auto-placement (`place.py`, ratsnest −62% vs grid); arc/teardrop/impedance-driven trace optimization
+  (`trace_opt.py`, DRC-safe + idempotent); PCB antenna helpers (`antenna.py` patch/monopole/IFA/PIFA
+  matching Balanis/Pozar <1%) + EM bridge (`sim/em/antenna_bridge.py`, analytic always + openEMS S11)
+  + MCP `ecad_antenna_design/analyze`; deterministic `board_from_schematic` (`services/mcp/board_flow.py`)
+  + `ecad_autoplace`/`ecad_optimize_traces`.
+- **Sim/firmware:** CFD/aero/kinematic → sensor → emulation bridge (`firmware/sensor_models.py` IMU/baro/
+  mag/GNSS/pitot + time-varying `i2c_register_stream` + `build_sensor_scenario` + `fw_sensor_scenario`);
+  batched parallel SPICE sweep over the governed pool (`core/sim/spice_sweep.cpp`, 5.2× on N=48, exact
+  parity). GPU FEA path deferred (needs deeper F3-owned coupling — honest skip).
+- **Benchmarks (the new testing protocol):** `scripts/bench_flight_computer.py` (11/11 PASS, sensor-in-
+  the-loop LIVE via Renode) and `scripts/bench_battery_charger.py` (10/10 PASS: real MNA CC→CV + LVD
+  disconnect + OVP/OCP/OTP trips, safety-in-the-loop over-temp FAULT injection LIVE). Both governed +
+  solve-state-cached + per-stage PASS/WARN/FAIL/SKIP cards with wall-times; opt-in gate.sh stages
+  (`AICAD_RUN_BENCH_FC` / `AICAD_RUN_BENCH_CHG`).
+- **Renode 1.16.1 port:** curated flat platforms (`stm32f4_discovery.repl`, `stm32f103.repl`) ported to
+  1.16.1 types (`STM32_GPIOPort`, `STM32F4_I2C`); ADC PythonPeripheral stub ported to inline `script:` +
+  `request.IsInit/IsRead/Value`; live hello-uart test firmware now enables USART TE.
+
+**Verification:** core builds green (linux-core + NETGEN build); ctest sim_cache/prof_tree/thread_pool/
+governor/spice_sweep pass; `engine_oracle/firmware` 257 passed; ecad/antenna/board-flow/provisioner
+suites green; both E2E benchmarks PASS with 0 SKIP.
+
+**Pre-existing (NOT introduced here; red at session-start `dde9ff42`):** `check.py`
+`feature_surface_audit` (ribbon→handlers, GUI); `test_dfm::test_library_footprints_no_silk_over_pad`
+(MountingHole_3.2mm_M3, from commit `0f7790fd`); `test_rpc::test_worker_registry_regression`
+(`ecad_thermal_handoff` not in `_STRUCTURED_ERROR_METHODS`). The user's uncommitted `host/src/ui/*`
+edits were preserved throughout.
+
+**Deferred (honest):** opportunistic CUDA FEA-assembly path (spice_sweep CPU-parallel landed);
+a simsuite `run_all.py` adapter that maps benchmark legs to case rows (benchmarks run via gate.sh +
+standalone today); C++ `core/ecad` parity port of the new Python ECAD capabilities (MCP serves Python).

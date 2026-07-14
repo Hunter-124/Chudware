@@ -152,6 +152,55 @@ class TestSearchPartsV2:
         out = pt.search_parts_v2("bearing")
         assert out["ok"] is False and "hint" in out
 
+    def test_default_row_projection_is_compact(self, hub_search):
+        """Default detail=summary projects rows; full records stay behind detail=full."""
+        from mcp_server import result_serving as rs
+
+        out = pt.search_parts_v2("bearing")
+        assert out["ok"] is True and out["results"]
+        for r in out["results"]:
+            assert "part_id" in r and "title" in r
+            # Compact projection — no full PartRecord bloat.
+            assert "params" not in r
+            assert "geometry_ref" not in r
+            assert "sourcing" not in r
+            assert "provenance" not in r
+            assert "license" not in r
+            for k in ("part_id", "title", "domain", "vendor", "price",
+                      "designation", "score"):
+                assert k in r, f"missing projected key {k} in {r}"
+
+        # Token bound on a 20-row synthetic fan-out of fat PartRecords.
+        fat = []
+        for i in range(20):
+            fat.append({
+                "part_id": f"bearing:ISO 15:6{i:03d}",
+                "domain": "bearing",
+                "title": f"Deep-Groove Ball Bearing 6{i:03d} with a long descriptive title",
+                "designation": f"6{i:03d}",
+                "params": {"bore": 25.0, "outer_d": 52.0, "width": 15.0,
+                           "extra": "x" * 200},
+                "geometry_ref": {"kind": "core_family", "family": "ball"},
+                "sourcing": [{"price": 6.5, "currency": "USD", "stock": 3,
+                              "vendor": "local", "url": "https://example/" + "u" * 80}],
+                "provenance": {"src": "index", "blob": "y" * 200},
+                "license": "CC-BY-4.0",
+            })
+        payload = {
+            "ok": True, "count": 20, "has_live": False,
+            "results": fat, "notices": [], "facet_summary": {"bore": []},
+            "applied": {},
+        }
+        compact = rs.project_part_search(payload, rs.ServeOpts(detail="summary"))
+        tokens = rs.count_tokens(compact)
+        assert tokens <= 1500, f"part_search default rows too large: {tokens} tokens"
+        for r in compact["results"]:
+            assert r["part_id"] and r["title"]
+
+        full = rs.project_part_search(payload, rs.ServeOpts(detail="full"))
+        assert "params" in full["results"][0]
+        assert "geometry_ref" in full["results"][0]
+
 
 # ---------------------------------------------------------------------------
 # part_source_impl

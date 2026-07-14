@@ -1788,6 +1788,137 @@ def test_fin17_heatsink_select() -> None:
     print("  [fin17_heatsink_select] PASS")
 
 
+
+# --------------------------------------------------------------------------- result-serving size gates
+
+
+def _build_large_schematic(tools: dict, n_pairs: int = 16) -> str:
+    """Place >=30 components (n_pairs*2 resistors + 1 voltage source) on a fresh sch."""
+    s = _call(tools, "ecad_new_schematic", name=f"size_{n_pairs}")
+    doc_id = s["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=0,
+          value="5", doc_id=doc_id)
+    for i in range(n_pairs):
+        x = 20 + (i % 8) * 15
+        y = 20 + (i // 8) * 20
+        _call(tools, "ecad_place_symbol", libid="Device:R", x=x, y=y,
+              value="1k", doc_id=doc_id)
+        _call(tools, "ecad_place_symbol", libid="Device:R", x=x + 10, y=y,
+              value="2k", doc_id=doc_id)
+    return doc_id
+
+
+def test_status_summary_token_budget(tools: dict) -> None:
+    """Default ecad_status(detail=summary) stays <=800 tokens on a >=30-comp board
+    while retaining ok/summary/counts/erc counts/unconnected/next_actions."""
+    from mcp_server import result_serving as rs
+
+    doc_id = _build_large_schematic(tools, n_pairs=16)  # 1 V + 32 R = 33 comps
+    raw = tools["ecad_status"](doc_id=doc_id)  # default summary
+    st = json.loads(raw)
+    _assert_context(st, "ecad_status(summary)")
+    assert st["ok"] and st["kind"] == "sch"
+    assert st["component_count"] >= 30, st["component_count"]
+    assert "summary" in st and st["summary"]
+    assert "component_count" in st and "net_count" in st
+    assert "erc" in st and "errors" in st["erc"] and "warnings" in st["erc"]
+    assert "unconnected_count" in st or "unconnected_pins" in st
+    assert st.get("next_actions")
+    # Summary must NOT dump pin arrays / net members.
+    for c in st.get("components") or []:
+        assert "pins" not in c, f"summary leaked pins on {c.get('ref')}"
+    for n in st.get("nets") or []:
+        if isinstance(n, dict):
+            assert "members" not in n, f"summary leaked members on {n.get('name')}"
+    tokens = rs.count_tokens(raw)
+    print(f"  status summary tokens={tokens} (budget 800) comps={st['component_count']}")
+    assert tokens <= 800, f"ecad_status summary too large: {tokens} tokens"
+    # meta is attached by serve()
+    assert "meta" in st and st["meta"].get("detail") == "summary"
+    print("  [status_summary_token_budget] PASS")
+
+
+def test_status_full_ref_set_equality(tools: dict) -> None:
+    """detail=full retains the full component-ref + net-name sets (pre-change parity).
+
+    Summary keeps the same counts and a sample; full is the escape hatch with
+    pins + members and complete ref/name sets.
+    """
+    doc_id = _build_large_schematic(tools, n_pairs=16)  # 33 comps
+    full = _call(tools, "ecad_status", doc_id=doc_id, detail="full")
+    summary = _call(tools, "ecad_status", doc_id=doc_id, detail="summary")
+    assert full["ok"] and summary["ok"]
+    full_refs = {c["ref"] for c in full["components"]}
+    assert len(full_refs) == full["component_count"] >= 30
+    # Full must include pins; summary must not.
+    assert any("pins" in c for c in full["components"]), "detail=full should keep pins"
+    assert all("pins" not in c for c in (summary.get("components") or []))
+
+    def _net_names(st):
+        names = set()
+        for n in st.get("nets") or []:
+            if isinstance(n, dict):
+                names.add(n.get("name"))
+            else:
+                names.add(n)
+        return names
+
+    full_nets = _net_names(full)
+    assert len(full_nets) == full["net_count"]
+    # Counts agree between detail levels even when summary samples the lists.
+    assert summary["component_count"] == full["component_count"]
+    assert summary["net_count"] == full["net_count"]
+    # Full nets carry members when present.
+    assert any(isinstance(n, dict) and "members" in n for n in full["nets"]), \
+        "detail=full should keep net members"
+    # Summary may truncate list length under budget, but every remaining ref is
+    # drawn from the full set (no fabricated ids).
+    sum_refs = {c["ref"] for c in (summary.get("components") or [])}
+    assert sum_refs <= full_refs
+    sum_nets = _net_names(summary)
+    assert sum_nets <= full_nets
+    print(f"  full refs={len(full_refs)} nets={len(full_nets)}; "
+          f"summary sample refs={len(sum_refs)} nets={len(sum_nets)}")
+    print("  [status_full_ref_set_equality] PASS")
+
+
+def test_simulate_tran_ac_no_series(tools: dict) -> None:
+    """ecad_simulate tran/ac must never return per-timestep arrays (always summarized)."""
+    _call(tools, "ecad_new_schematic", name="sim_series")
+    _build_divider(tools)
+    # Label the midpoint so default probes pick a named net when present.
+    _call(tools, "ecad_label", text="OUT", x=20, y=30)
+
+    tran = _call(tools, "ecad_simulate", analysis="tran",
+                 params={"tstep": 1e-5, "tstop": 1e-3})
+    _assert_context(tran, "ecad_simulate(tran)")
+    assert tran["ok"], tran.get("error")
+    t = tran.get("tran") or {}
+    assert "traces" in t, t
+    for name, tr in (t.get("traces") or {}).items():
+        assert isinstance(tr, dict), f"trace {name} should be summary dict, got {type(tr)}"
+        assert "final" in tr or "min" in tr or "max" in tr
+        assert not isinstance(tr, list)
+    # No raw series keys.
+    assert "x_t" not in t
+    blob = json.dumps(tran)
+    assert "x_t" not in blob
+
+    ac = _call(tools, "ecad_simulate", analysis="ac",
+               params={"sweep": "dec", "points": 10, "fstart": 10, "fstop": 1e5})
+    _assert_context(ac, "ecad_simulate(ac)")
+    assert ac["ok"], ac.get("error")
+    a = ac.get("ac") or {}
+    assert "x_f" not in a
+    for name, tr in (a.get("traces") or {}).items():
+        assert isinstance(tr, dict)
+        assert "peak_mag" in tr or "f_-3dB" in tr
+    assert "x_f" not in json.dumps(ac)
+    print(f"  tran reading={tran.get('reading')!r}")
+    print(f"  ac reading={ac.get('reading')!r}")
+    print("  [simulate_tran_ac_no_series] PASS")
+
+
 def main() -> None:
     print("AI-ECAD MCP tool tests")
     _restore_provider = _disable_live_provider()
@@ -1846,6 +1977,10 @@ def _run_all() -> None:
     test_fin13_run_pdn(tools)
     # T-FIN11 FPGA support pack
     test_fin11_fpga_check_and_constraints(tools)
+    # result-serving size gates
+    test_status_summary_token_budget(tools)
+    test_status_full_ref_set_equality(tools)
+    test_simulate_tran_ac_no_series(tools)
     # T-FIN16 ECAD -> thermal FEA handoff
     test_fin16_dry_run_handoff()
     test_fin16_trace_heating_toggle()

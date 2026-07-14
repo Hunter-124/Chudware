@@ -41,6 +41,8 @@ import math
 import os
 from typing import Any, Optional, Union
 
+from mcp_server import result_serving as _rs
+
 from engine.ecad import netlist as netlist_mod
 from engine.ecad import schema
 from engine.ecad import session as ecad_session
@@ -290,17 +292,14 @@ def _budget_timeout_err(what: str, *, simplify: str,
 
 
 def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
+    """Compact JSON by default (AICAD_MCP_PRETTY=1 for indent=2)."""
+    return _rs.dumps(payload)
 
 
 def _err(message: str, *, hint: str = "", next_actions: list[str] | None = None,
          **extra) -> str:
     """A structured error payload that still TEACHES — every error carries a hint + next steps."""
-    out = {"ok": False, "error": message, "warnings": [],
-           "hint": hint or message,
-           "next_actions": next_actions or []}
-    out.update(extra)
-    return _dumps(out)
+    return _rs.dumps(_rs.err_envelope(message, hint=hint, next_actions=next_actions, **extra))
 
 
 def _active_sch_id(doc_id: str | None) -> str | None:
@@ -888,16 +887,27 @@ def register_ecad_tools(mcp) -> None:
     # ---------------------------------------------------------------- status (THE context tool)
 
     @mcp.tool()
-    def ecad_status(doc_id: str = "") -> str:
-        """THE situational-awareness call. Returns a COMPACT design summary sized for a small
-        context window: component count + list (each with its ``power_w`` typ/max from the
-        engineering-metadata layer — honest nulls when unknown), a board ``power`` total
-        (contracts/ecad/boardphys.md), every net with its size and members, the ERC
-        violation summary grouped by rule, and a PRIORITIZED ``next_actions`` list naming the
-        exact pins to fix.
+    def ecad_status(doc_id: str = "", detail: str = "summary",
+                    page: int = 0, page_size: int = 50,
+                    include: str = "") -> str:
+        """THE situational-awareness call — summary-first, token-bounded.
 
-        Call this whenever you are unsure what to do next — it tells you what exists, what is
-        wrong, and the single best next op.
+        Default ``detail='summary'`` returns a COMPACT design summary sized for a
+        small context window:
+          - counts (components/nets, ERC error+warning counts, unconnected count)
+          - board ``power`` totals (contracts/ecad/boardphys.md)
+          - components as ``{ref, value, libid}`` (+ power_w; NO pins)
+          - nets as ``{name, size}`` (NO members)
+          - unconnected sample (≤6) + prioritized ``next_actions``
+
+        Drill-down:
+          - ``detail='list'|'full'`` + ``page``/``page_size`` for components/nets
+          - ``include='pins,members'`` (CSV) opts into pin lists / net members
+          - ``detail='full'`` retains the SAME component refs + net names as the
+            full internal payload (set equality with pre-projection data)
+
+        Call this whenever you are unsure what to do next — it tells you what
+        exists, what is wrong, and the single best next op.
         """
         did = doc_id or _ECAD["current"] or _ECAD["current_sch"] or _ECAD["current_pcb"]
         if did is None:
@@ -911,9 +921,17 @@ def register_ecad_tools(mcp) -> None:
             return _err(e.message, hint="That doc id is not open.",
                         next_actions=["ecad_new_schematic('mydesign')"])
         doc = session.doc
+        inc_list = [p.strip() for p in str(include or "").split(",") if p.strip()]
+        opts = _rs.ServeOpts(
+            detail=detail or "summary",
+            page=int(page or 0),
+            page_size=int(page_size or 50),
+            include=inc_list or None,
+            budget_tokens=800 if (detail or "summary").strip().lower() == "summary" else None,
+        )
         if session.kind == "pcb":
-            return _pcb_status(session)
-        # ---- schematic status ----
+            return _pcb_status(session, opts)
+        # ---- schematic status (full internal payload, then project) ----
         nl = netlist_mod.build_netlist(doc)
         components = []
         comp_engs = []
@@ -967,7 +985,7 @@ def register_ecad_tools(mcp) -> None:
                 f"{len(unconnected)} unconnected pin(s).")
         if power and power.get("power_w_typ") is not None:
             head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
-        return _dumps({
+        full = {
             "ok": True, "doc_id": session.doc_id, "kind": "sch",
             "name": doc.get("name"), "revision": session.revision,
             "summary": head,
@@ -975,13 +993,15 @@ def register_ecad_tools(mcp) -> None:
             "power": power,
             "net_count": len(nets), "nets": nets,
             "erc": erc,
+            "unconnected_count": len(unconnected),
             "unconnected_pins": [_pretty_pin(p) for p in unconnected],
             "warnings": nl.get("warnings", []),
             "hint": head + " Fix ERC errors first, then connect floating pins, then simulate.",
             "next_actions": next_actions or ["ecad_simulate('op')"],
-        })
+        }
+        return _rs.serve(full, opts, projector=_rs.project_ecad_status)
 
-    def _pcb_status(session) -> str:
+    def _pcb_status(session, opts: "_rs.ServeOpts | None" = None) -> str:
         doc = session.doc
         fps = doc.get("footprints", [])
         nets = doc.get("nets", [])
@@ -1012,7 +1032,7 @@ def register_ecad_tools(mcp) -> None:
                 f"{len(vias)} via(s), {erc['errors']} DRC error(s), {erc['warnings']} warning(s).")
         if power and power.get("power_w_typ") is not None:
             head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
-        return _dumps({
+        full = {
             "ok": True, "doc_id": session.doc_id, "kind": "pcb",
             "name": doc.get("name"), "revision": session.revision,
             "summary": head,
@@ -1022,13 +1042,18 @@ def register_ecad_tools(mcp) -> None:
                             "power_w": (e or {}).get("power_w", {"typ": None, "max": None})}
                            for f, e in zip(fps, fp_engs)],
             "power": power,
-            "nets": [n.get("name") for n in nets],
+            "net_count": len(nets),
+            "nets": [{"name": n.get("name"), "size": len(n.get("pads") or n.get("nodes") or [])}
+                     if isinstance(n, dict) else {"name": n}
+                     for n in nets],
             "track_count": len(tracks), "via_count": len(vias),
             "drc": erc,
             "warnings": [],
             "hint": head + " Fix DRC errors first.",
             "next_actions": next_actions or ["ecad_run_drc()", "ecad_export('gerber')"],
-        })
+        }
+        o = opts or _rs.ServeOpts(detail="summary", budget_tokens=800)
+        return _rs.serve(full, o, projector=_rs.project_ecad_status)
 
     # ---------------------------------------------------------------- ERC
 
@@ -1108,9 +1133,12 @@ def register_ecad_tools(mcp) -> None:
                      -> returns output trend vs temperature
           'noise' -- output noise density {"output":"V(OUT)","fstart":10,"fstop":1e6}
                      -> returns total RMS noise + per-resistor contributions
-        If ``probes`` is omitted, DEFAULTS TO ALL NODE VOLTAGES (you won't always know the node
-        names — this surfaces them all). Returns op node voltages, or for tran/ac a compact
-        summary (final value / -3 dB point) plus a sentence like 'V(OUT) settles to 2.49 V'.
+        If ``probes`` is omitted, defaults to a BOUNDED set: named/OUT nets first
+        (and other human net names), then a hard cap of ~12 node voltages, plus
+        I(V*) for every voltage source. Pass an explicit probes list for full
+        coverage. Returns op node voltages, or for tran/ac a compact summary
+        (final value / -3 dB point — NEVER per-timestep arrays) plus a sentence
+        like 'V(OUT) settles to 2.49 V'.
         """
         try:
             session = _get_sch(doc_id or None)
@@ -1138,14 +1166,13 @@ def register_ecad_tools(mcp) -> None:
                                       "ecad_status()"],
                         warnings=warns)
 
-        # default probes = every non-ground node voltage (the weak model rarely names probes).
+        # default probes = named/OUT nets first, then a bounded count (never dump
+        # every anonymous N$ node on a large netlist).
         nodes = [n for n in circuit.get("nodes", []) if str(n) not in ("0", "gnd", "GND")]
         if probes:
             probe_list = list(probes)
         else:
-            probe_list = [f"V({n})" for n in nodes]
-            # also add the current through every voltage source — usually the interesting datum.
-            probe_list += [f"I({d['name']})" for d in circuit["devices"] if d.get("kind") == "V"]
+            probe_list = _rs.select_default_probes(nodes, circuit.get("devices") or [])
 
         an = _build_analysis(analysis, params or {}, circuit)
         if an is None:

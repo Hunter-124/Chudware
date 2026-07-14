@@ -56,6 +56,8 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 
+from mcp_server import result_serving as _rs
+
 def _ok(payload) -> str:
     return json.dumps({"ok": True, **payload} if isinstance(payload, dict) else {"ok": True, "result": payload},
                       ensure_ascii=False)
@@ -148,9 +150,15 @@ def taxonomy_browse(node_id: str = "", depth: int = 2,
 
 def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                     category_id: str = "", facets=None, price_max: float = 0.0,
-                    vendors: str = "", in_stock: bool = False) -> dict:
+                    vendors: str = "", in_stock: bool = False,
+                    detail: str = "summary") -> dict:
     """V2 faceted, taxonomy-routed part search. Backward-compatible envelope
-    (ok/count/has_live/results) plus facet_summary + applied."""
+    (ok/count/has_live/results) plus facet_summary + applied.
+
+    Default ``detail='summary'`` projects each hit to
+    ``{part_id,title,domain,vendor,price,designation,score}``; full PartRecords
+    stay behind ``part_get`` / ``detail='full'``.
+    """
     facets_q, err = _parse_json_dict(facets, "facets")
     if err:
         return {"ok": False, "reason": err,
@@ -266,7 +274,7 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                 top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
                 facet_summary[key] = [{"value": v, "count": c} for v, c in top]
 
-        return {
+        payload = {
             "ok": True,
             "count": len(records),
             "has_live": any(r.get("source") == "live" for r in records),
@@ -278,6 +286,12 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                         "vendors": wanted_vendors, "in_stock": bool(in_stock),
                         "sites": route_sites},
         }
+        opts = _rs.ServeOpts(
+            detail=detail or "summary",
+            budget_tokens=1500 if (detail or "summary").strip().lower() != "full" else None,
+        )
+        # Project in-place via projector; return dict (MCP tool serializes).
+        return _rs.project_part_search(payload, opts)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"part_search failed: {exc}",
                 "hint": "Check that engine_oracle/parts_hub is importable."}
@@ -544,12 +558,15 @@ def register_parts_tools(mcp: FastMCP) -> None:
     def part_search(query: str, domain: str = "", limit: int = 20,
                     category_id: str = "", facets: str = "",
                     price_max: float = 0.0, vendors: str = "",
-                    in_stock: bool = False) -> str:
+                    in_stock: bool = False, detail: str = "summary") -> str:
         """Search the unified standard-parts library (all domains federated), with
         V2 taxonomy routing + faceted filtering.
 
-        Returns a ranked list of PartRecord dicts (aicad.parts/1) plus a
-        facet_summary (top param values over THIS result set) and applied filters.
+        Default returns COMPACT rows
+        ``{part_id, title, domain, vendor, price, designation, score}`` plus
+        ``facet_summary`` / ``applied``. Full PartRecords stay behind
+        ``part_get(part_id)`` or ``detail='full'``.
+
         Ranking: exact designation match first (e.g. "M3"), then standard prefix,
         then FTS score. Cross-domain: "M3" surfaces fasteners AND ecad footprints.
 
@@ -566,6 +583,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         price_max   : keep only records with a known unit price <= this (0 = off)
         vendors     : CSV vendor filter, e.g. "mcmaster,grainger"
         in_stock    : drop records with KNOWN zero stock (unknown stock passes)
+        detail      : 'summary' (default, compact rows) | 'full' (full PartRecords)
 
         Examples:
           part_search("M8 socket head")
@@ -574,12 +592,18 @@ def register_parts_tools(mcp: FastMCP) -> None:
           part_search("bearing", category_id="bearings_motion.ball_bearings.deep_groove",
                       facets='{"bore_mm": 12}')
         """
-        return json.dumps(
-            search_parts_v2(query, domain=domain, limit=limit,
-                            category_id=category_id, facets=facets,
-                            price_max=price_max, vendors=vendors,
-                            in_stock=in_stock),
-            ensure_ascii=False)
+        out = search_parts_v2(query, domain=domain, limit=limit,
+                              category_id=category_id, facets=facets,
+                              price_max=price_max, vendors=vendors,
+                              in_stock=in_stock, detail=detail)
+        # Token-budget wrap for the MCP string path (dict path stays projected).
+        if out.get("ok"):
+            opts = _rs.ServeOpts(
+                detail=detail or "summary",
+                budget_tokens=1500 if (detail or "summary").strip().lower() != "full" else None,
+            )
+            return _rs.serve(out, opts)
+        return _rs.dumps(out)
 
     @mcp.tool()
     def parts_taxonomy(node_id: str = "", depth: int = 2,

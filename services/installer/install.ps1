@@ -67,6 +67,26 @@ try {
         Write-Host "==> Registering AI-CAD file associations ..."
         & $venvPy -m installer.setup_file_assoc --exe (Join-Path $InstallDir "AI-CAD.exe")
     }
+
+    # Optional sim/firmware backends (Renode portable zip, openEMS MSVC note).
+    # Non-fatal: a failure here must never abort the install.
+    try {
+        Write-Host "==> Optional: provisioning Renode + openEMS (best-effort) ..."
+        $env:AICAD_PROVISION_OPTIONAL_SIM = "1"
+        & $venvPy -c @"
+import sys
+try:
+    from installer.provision import ensure_optional_sim_tools
+    st = ensure_optional_sim_tools(install=True)
+    for k, v in st.items():
+        print(f'  {k}: installed={v.get(\"installed\")} path={v.get(\"path\") or v.get(\"python\")}')
+except Exception as e:
+    print(f'  optional sim tools skipped: {e}')
+    sys.exit(0)
+"@
+    } catch {
+        Write-Warning "optional Renode/openEMS provisioning skipped: $_"
+    }
 } finally {
     Pop-Location
 }

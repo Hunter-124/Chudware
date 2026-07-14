@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -142,6 +143,89 @@ def ngspice_provisioning_status() -> dict:
     return ngspice_status()
 
 
+def renode_provisioning_status() -> dict:
+    """Availability of the OPTIONAL Renode firmware emulator — never raises.
+
+    Renode is MIT, subprocess-only (PATH / known install roots). Absence is not
+    an error — firmware emulation degrades honestly. Delegates to
+    ``tools.provision_renode.status()`` when importable.
+    """
+    try:
+        # tools/ is a namespace package at the repo root; ensure REPO is on path.
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from tools.provision_renode import status as _renode_status
+        return _renode_status()
+    except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
+        which = shutil.which("renode") or shutil.which("renode.exe")
+        return {
+            "tool": "renode",
+            "installed": bool(which),
+            "path": which,
+            "version": None,
+            "hint": None if which else f"provision_renode unavailable: {exc}",
+        }
+
+
+def openems_provisioning_status() -> dict:
+    """Availability of the OPTIONAL openEMS FDTD backend — never raises.
+
+    openEMS is GPLv3, python-module only (``import openEMS`` / ``CSXCAD``).
+    Absence is not an error — em_* adapters degrade to builtin-FDFD/analytic.
+    Delegates to ``tools.provision_em.status()`` when importable.
+    """
+    try:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from tools.provision_em import status as _openems_status
+        return _openems_status()
+    except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
+        return {
+            "tool": "openems",
+            "installed": False,
+            "python": None,
+            "version": None,
+            "detail": f"provision_em unavailable: {exc}",
+            "hint": "python -m tools.provision_em --install",
+        }
+
+
+def ensure_optional_sim_tools(*, install: bool = False) -> dict:
+    """Optionally provision Renode + openEMS. Always non-fatal / best-effort.
+
+    Returns a dict of per-tool status snapshots. When *install* is False this is
+    detection-only (used by ``--check``). When True, each provisioner's
+    ``--install`` path is invoked if the tool is absent; failures are recorded
+    but never raised so a normal install still succeeds.
+    """
+    out: dict = {"renode": renode_provisioning_status(), "openems": openems_provisioning_status()}
+    if not install:
+        return out
+
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+
+    if not out["renode"].get("installed"):
+        try:
+            from tools import provision_renode as _pr
+            print("[provision] optional: installing Renode ...")
+            _pr.install()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[provision] optional Renode install skipped: {exc}")
+        out["renode"] = renode_provisioning_status()
+
+    if not out["openems"].get("installed"):
+        try:
+            from tools import provision_em as _pe
+            print("[provision] optional: installing openEMS ...")
+            _pe.install()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[provision] optional openEMS install skipped: {exc}")
+        out["openems"] = openems_provisioning_status()
+
+    return out
+
+
 def is_ready() -> bool:
     if not STAMP.exists():
         return False
@@ -249,6 +333,17 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
         llamacpp.install_from_bundle()
     except Exception:  # noqa: BLE001 - runtime provisioning must not fail because optional AI is absent
         pass
+
+    # Optional sim/firmware backends (Renode, openEMS). Best-effort, non-fatal,
+    # idempotent. Controlled by AICAD_PROVISION_OPTIONAL_SIM (default: "1" = try).
+    # Set to "0"/"false" to skip network/source builds during a minimal install.
+    opt_flag = os.environ.get("AICAD_PROVISION_OPTIONAL_SIM", "1").strip().lower()
+    if opt_flag not in ("0", "false", "no", "off"):
+        try:
+            ensure_optional_sim_tools(install=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[provision] optional sim tools skipped: {exc}")
+
     _write_stamp()
     return {"status": "ready", "reused": False, "python": str(py)}
 
@@ -282,7 +377,9 @@ def main(argv: list[str]) -> int:
                           "imports_ok": _imports_ok(_venv_python()),
                           "converters": converters_status(),
                           "ngspice": ngspice_provisioning_status(),
-                          "reveng": reveng_provisioning_status()}, indent=2))
+                          "reveng": reveng_provisioning_status(),
+                          "renode": renode_provisioning_status(),
+                          "openems": openems_provisioning_status()}, indent=2))
         return 0
 
     res = ensure_runtime(args.base_python, args.wheelhouse, args.force)

@@ -255,6 +255,36 @@ class TestCategoryRoutedPartsSearch:
         assert keep.get("ok") and len(keep["results"]) == 1
         assert drop.get("ok") and len(drop["results"]) == 0
 
+    def test_facet_alias_bore_mm_keeps_local_bearing(self, monkeypatch):
+        """Host facet filter must alias bore→bore_mm so a 12 mm-bore local bearing
+        is kept when the GUI queries facets={bore_mm: 12} (parity with MCP)."""
+        import engine_oracle.parts_hub as hub_mod
+
+        def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
+            return [
+                {"part_id": "bearing:ISO 15:6001", "domain": "bearing",
+                 "title": "Deep-Groove Ball Bearing 6001",
+                 "params": {"bore": 12.0, "outer_d": 28.0, "width": 8.0},
+                 "geometry_ref": {"kind": "core_family"}, "sourcing": [],
+                 "provenance": "test", "license": "clean-room"},
+                {"part_id": "bearing:ISO 15:6205", "domain": "bearing",
+                 "title": "Deep-Groove Ball Bearing 6205",
+                 "params": {"bore": 25.0, "outer_d": 52.0, "width": 15.0},
+                 "geometry_ref": {"kind": "core_family"}, "sourcing": [],
+                 "provenance": "test", "license": "clean-room"},
+            ]
+
+        monkeypatch.setattr(hub_mod, "search", _fake_search)
+        r = self._gui_search(
+            query="bearing",
+            category_id="bearings_motion.ball_bearings.deep_groove",
+            facets={"bore_mm": 12},
+        )
+        assert r.get("ok") is True, f"facet search failed: {r}"
+        ids = [item["id"] for item in r["results"]]
+        assert ids == ["bearing:ISO 15:6001"], \
+            f"12mm-bore local bearing dropped by alias-blind filter: {ids}"
+
 
 class TestVendorsHealthRpc:
     """Parts Library V2: vendors_health_check / vendors_health_status envelopes."""

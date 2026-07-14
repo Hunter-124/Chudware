@@ -452,8 +452,24 @@ def source(need: str, constraints: str | None = None, limit: int = 5, *,
     for cid in categories or [""]:
         routing = _tax.route(cid) if cid else {"domains": [], "sites": [], "query_terms": []}
         domains = routing["domains"] or None
+        # Taxonomy route sites drive the LIVE fan-out only. Catalog domain is
+        # included when the route names at least one site so a structural-tube
+        # need never queries electronics vendors (and offline adapters never
+        # fabricate candidates — they simply contribute nothing / notices).
+        route_sites = list(routing.get("sites") or [])
+        search_domains = list(domains) if domains else None
+        if route_sites:
+            if search_domains is None:
+                search_domains = ["catalog"]
+            elif "catalog" not in search_domains:
+                search_domains = list(search_domains) + ["catalog"]
         try:
-            recs = search_fn(need, domain=domains, limit=limit * 4)
+            recs = search_fn(
+                need,
+                domain=search_domains,
+                limit=limit * 4,
+                sites=route_sites or None,
+            )
         except Exception:  # noqa: BLE001 — one bad route contributes nothing
             recs = []
         per_cat_hits += len(recs)
@@ -461,9 +477,8 @@ def source(need: str, constraints: str | None = None, limit: int = 5, *,
             pid = str(r.get("part_id", ""))
             if pid and pid not in seen:
                 r = dict(r)
-                r["_route_sites"] = routing["sites"]
+                r["_route_sites"] = route_sites
                 seen[pid] = r
-
     candidates: list[dict] = []
     for rec in seen.values():
         sc, rationale = score_candidate(rec, facets=facets, defs=defs,

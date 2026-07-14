@@ -136,6 +136,15 @@ def scan_library_folder(folder: str | None = None) -> dict:
         else:
             updated += 1
 
+    # Federate into PartsHub FTS so part_search finds the newly scanned files.
+    # Best-effort: hub may be unavailable in pure-metadata tests / core-less CI.
+    if added or updated:
+        try:
+            from engine_oracle.parts_hub import rebuild_index as _rebuild  # noqa: PLC0415
+            _rebuild()
+        except Exception:  # noqa: BLE001
+            pass
+
     return {"scanned": scanned, "added": added, "updated": updated, "parts": touched}
 
 

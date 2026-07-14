@@ -226,3 +226,22 @@ def test_count_and_iter_records_raise_not_implemented(provider_mods):
         provider.count()
     with pytest.raises(NotImplementedError):
         next(iter(provider.iter_records()))
+
+
+def test_health_wizard_active_is_deferred_not_all_clear(monkeypatch):
+    """Active login wizard must yield deferred/needs_human_login rows — never []."""
+    from services.browser import health as h
+
+    class _Mgr:
+        def wizard_active(self):
+            return True
+
+    monkeypatch.setattr("services.browser.embed.get_manager", lambda: _Mgr())
+    rows = h.run_health_check(["mcmaster", "grabcad"])
+    assert rows, "wizard-active health returned empty all-clear"
+    assert len(rows) == 2
+    for r in rows:
+        assert r["ok"] is False
+        assert r.get("deferred") is True
+        assert r["error"] == "needs_human_login"
+        assert r.get("expected") is True

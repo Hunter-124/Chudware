@@ -177,7 +177,8 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                 query_terms = routing["query_terms"]
                 facet_defs = _tax.effective_facets(category_id)
 
-        records = list(_search(query, domain=dom, limit=limit))
+        records = list(_search(query, domain=dom, limit=limit,
+                               sites=route_sites or None))
 
         if category_id and route_sites:
             # Category-routed live catalog merge, restricted to the node's sites.
@@ -186,7 +187,7 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                 # Restrict the live fan-out to the category's fitting vendors so a
                 # query never fetches from a vendor that can't stock it (no
                 # McMaster for microcontrollers). The prefix filter below stays as
-                # a belt-and-braces guard.
+                # a belt-and-braces guard. Inherits the hub's live wall budget.
                 cat_records = _search(vendor_query, domain="catalog", limit=limit,
                                       sites=route_sites)
             except Exception:  # noqa: BLE001 — live layer optional
@@ -198,7 +199,6 @@ def search_parts_v2(query: str, domain: str = "", limit: int = 20,
                 if pid.startswith(prefixes) and pid not in seen_ids:
                     seen_ids.add(pid)
                     records.append(rec)
-
         # Drop non-record stubs (login_required pass-throughs) into notices.
         notices: list[dict] = []
         clean: list[dict] = []
@@ -298,7 +298,8 @@ def vendors_health_impl(sites: str = "") -> dict:
             r = dict(row)
             r["needs_human_login"] = bool(
                 not r.get("ok") and (
-                    r.get("error") == "login_required" or
+                    r.get("error") in ("login_required", "needs_human_login") or
+                    r.get("deferred") or
                     (r.get("expected") and not r.get("logged_in"))))
             out.append(r)
         return {"ok": True, "count": len(out), "sites": out,

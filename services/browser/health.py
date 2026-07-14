@@ -164,21 +164,45 @@ def run_health_check(sites: list[str] | None = None) -> list[dict[str, Any]]:
 
     Returns one ``{site, ok, latency_ms, logged_in, hit_count, error[, expected]}``
     dict per site, in input/registry order. Never raises.
+
+    When the interactive login wizard is active the canary fan-out is deferred
+    (it would race the headed session). Callers receive an honest
+    ``needs_human_login``/``deferred`` row set — NEVER an empty all-clear.
     """
-    try:
-        from .embed import get_manager
-        if get_manager().wizard_active():
-            return []
-    except Exception:  # noqa: BLE001 — health must never raise
-        pass
     if sites is None:
         # Only the vendors that gate CAD/datasheet/footprint downloads behind a
         # login (login_wizard_sites) — commerce/link-out sites (Ace, Amazon, Home
         # Depot, …) are not part of the "Test vendors" surface. Fall back to the
         # full registry if the wizard-site list is unavailable/empty.
-        registered = login_wizard_sites() or [a.key for a in all_adapters()]
+        try:
+            registered = login_wizard_sites() or [a.key for a in all_adapters()]
+        except Exception:  # noqa: BLE001
+            registered = list(CANARY_QUERIES.keys())
         # Registry order first, then any canary-only leftovers (defensive).
         sites = registered + [s for s in CANARY_QUERIES if s not in registered]
+
+    # Active login wizard → do not thrash the same profiles with canaries.
+    # Return deferred/needs_human_login rows so the status board is truthful.
+    try:
+        from .embed import get_manager
+        if get_manager().wizard_active():
+            return [
+                {
+                    "site": site,
+                    "ok": False,
+                    "latency_ms": None,
+                    "logged_in": False,
+                    "hit_count": 0,
+                    "error": "needs_human_login",
+                    "expected": True,
+                    "deferred": True,
+                    "reason": "login_wizard_active",
+                }
+                for site in (sites or [])
+            ]
+    except Exception:  # noqa: BLE001 — health must never raise
+        pass
+
     def _safe_check(site: str) -> dict[str, Any]:
         try:
             return _check_site(site)

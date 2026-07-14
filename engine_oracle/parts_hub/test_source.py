@@ -201,3 +201,27 @@ class TestSource:
         assert cov["records_considered"] == len(_ALL)
         assert cov["facets_queried"] == 1
         assert cov["local_candidates"] + cov["live_candidates"] == len(r["candidates"])
+
+    def test_injects_taxonomy_route_sites(self):
+        """part_source must pass taxonomy route sites into the search fan-out so a
+        structural-tube need never queries electronics vendors."""
+        seen: list[dict] = []
+
+        def _capturing(query, domain=None, limit=20, **kw):
+            seen.append({"query": query, "domain": domain, "limit": limit,
+                         "sites": kw.get("sites")})
+            return list(_ALL)[:limit]
+
+        r = src.source("4130 chromoly tube OD 25.4 wall 1.25",
+                       search_fn=_capturing)
+        assert r["ok"] is True
+        assert seen, "search_fn was never called"
+        # Primary category is structural_stock.metal_tube → metals sites.
+        sites = seen[0]["sites"] or []
+        assert "onlinemetals" in sites or "metalsdepot" in sites, \
+            f"expected metals route sites, got {sites}"
+        assert "digikey" not in sites and "lcsc" not in sites, \
+            f"electronics vendors leaked into tube route: {sites}"
+        # Catalog domain is included when route sites are present.
+        dom = seen[0]["domain"] or []
+        assert "catalog" in dom or dom is None or "section" in (dom if isinstance(dom, list) else [dom])

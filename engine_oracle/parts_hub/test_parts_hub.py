@@ -309,13 +309,147 @@ class TestPartsHub:
         assert count1 > 0
 
     def test_search_fts_no_crash_on_fts_special_chars(self):
-        """FTS5 operator injection must not raise."""
+        """FTS5 operator injection must not raise.
+
+        Local-only: this test guards the FTS sanitiser, not the live fan-out.
+        (Live fan-out is deadline-bounded separately — see
+        test_live_fanout_deadline_bounds_slow_provider.)
+        """
         for q in ('M8 "socket"', "AND OR NOT", "*", "", "(M8)", "M8 AND bearing"):
             try:
-                results = self.hub.search(q)
+                results = self.hub.search(q, include_live=False)
                 assert isinstance(results, list)
             except Exception as exc:
                 pytest.fail(f"Search raised on query {q!r}: {exc}")
+
+    def test_include_live_false_does_zero_network(self, monkeypatch):
+        """include_live=False must never call a live provider.search."""
+        calls: list[str] = []
+
+        class _SlowLive:
+            domain = "catalog"
+            provider_id = "slow_live"
+            site = "slowsite"
+
+            def search(self, query, **kw):
+                calls.append(query)
+                return [{"part_id": "catalog:slowsite::x", "title": "X",
+                         "domain": "catalog", "source": "live"}]
+
+            def count(self):
+                raise NotImplementedError
+
+            def iter_records(self):
+                raise NotImplementedError
+
+        self.hub.register(_SlowLive())
+        # Force the live path by searching for a string that cannot hit FTS.
+        out = self.hub.search("zzz_no_fts_hit_xyzzy_9999", include_live=False)
+        assert out == []
+        assert calls == [], f"live provider was called despite include_live=False: {calls}"
+
+    def test_live_fanout_deadline_bounds_slow_provider(self, monkeypatch):
+        """A stalled live provider must not hang; fast providers still land and
+        the slow site surfaces as a timeout notice."""
+        import time as _time
+
+        monkeypatch.setenv("AI_CAD_PARTS_LIVE_BUDGET_S", "0.4")
+        monkeypatch.setenv("AI_CAD_PARTS_LIVE_SITE_BUDGET_S", "0.4")
+
+        class _FastLive:
+            domain = "catalog"
+            provider_id = "fast_live"
+            site = "fastsite"
+
+            def search(self, query, **kw):
+                return [{
+                    "part_id": "catalog:fastsite::widget",
+                    "domain": "catalog",
+                    "title": "Fast Widget",
+                    "source": "live",
+                    "params": {},
+                    "geometry_ref": {},
+                    "sourcing": [],
+                    "provenance": "test",
+                    "license": "test",
+                }]
+
+            def count(self):
+                raise NotImplementedError
+
+            def iter_records(self):
+                raise NotImplementedError
+
+        class _SlowLive:
+            domain = "catalog"
+            provider_id = "slow_live"
+            site = "slowsite"
+
+            def search(self, query, **kw):
+                _time.sleep(30.0)  # would hang forever pre-fix
+                return [{
+                    "part_id": "catalog:slowsite::late",
+                    "domain": "catalog",
+                    "title": "Late",
+                    "source": "live",
+                }]
+
+            def count(self):
+                raise NotImplementedError
+
+            def iter_records(self):
+                raise NotImplementedError
+
+        # Fresh hub without the real browser catalog (so we only hit stubs).
+        from engine_oracle.parts_hub.hub import PartsHub
+        hub = PartsHub()
+        hub.register(_FastLive())
+        hub.register(_SlowLive())
+        # Empty index → forces live fan-out.
+        hub._index_built = True  # skip rebuild; index stays empty
+
+        t0 = _time.monotonic()
+        out = hub.search("zzz_no_fts_hit_xyzzy_9999", domain="catalog", limit=10)
+        elapsed = _time.monotonic() - t0
+
+        assert elapsed < 2.0, f"live fan-out hung for {elapsed:.2f}s (budget 0.4s)"
+        real = [r for r in out if r.get("part_id") and r.get("title")]
+        notices = [r for r in out if not (r.get("part_id") and r.get("title"))]
+        assert any(r.get("part_id") == "catalog:fastsite::widget" for r in real), \
+            f"fast provider result missing: {out}"
+        assert any(n.get("site") == "slowsite" and n.get("reason") == "timeout"
+                   for n in notices), f"timeout notice missing: {notices}"
+
+    def test_browser_bootstrap_error_is_diagnostic(self, monkeypatch):
+        """Browser adapter import failure must leave local search working and
+        surface browser_bootstrap_error (not silent)."""
+        from engine_oracle.parts_hub.hub import PartsHub
+
+        hub = PartsHub()
+
+        def _boom():
+            raise RuntimeError("playwright missing in test")
+
+        monkeypatch.setattr(hub, "_register_browser_catalog_adapters",
+                            lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        # Call the real method body by forcing the import path to fail.
+        def _failing_register():
+            try:
+                raise ImportError("no services.browser")
+            except Exception as exc:
+                hub.browser_bootstrap_error = f"{type(exc).__name__}: {exc}"
+
+        monkeypatch.setattr(hub, "_register_browser_catalog_adapters", _failing_register)
+        # Minimal bootstrap: bolts only + failing browser register.
+        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
+        hub.register(BoltsAdapter())
+        hub._register_browser_catalog_adapters()
+        hub._ensure_index()
+
+        assert hub.browser_bootstrap_error
+        assert "ImportError" in hub.browser_bootstrap_error
+        hits = hub.search("bearing 6205", include_live=False)
+        assert any(r["part_id"] == "bearing:ISO 15:6205" for r in hits)
 
 
 # ---------------------------------------------------------------------------

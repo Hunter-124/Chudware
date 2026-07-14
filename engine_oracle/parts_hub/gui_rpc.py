@@ -319,9 +319,11 @@ def _filter_items(records: list[dict], p: dict, facet_defs: list[dict]) -> list[
     source    = str(p.get("source", "")).strip().lower()  # "", "local", "live"
 
     if facets_q:
+        from engine_oracle.parts_hub.source import facet_params_view as _fpv
         from engine_oracle.parts_hub.taxonomy import match_facets as _match_facets
         items = [i for i, r in zip(items, records)
-                 if _match_facets(r.get("params") or {}, facets_q, facet_defs)]
+                 if _match_facets(_fpv(r.get("params") or {}, facets_q.keys()),
+                                  facets_q, facet_defs)]
     if price_min > 0:
         items = [i for i in items if i["price_usd"] >= price_min]
     if price_max > 0:

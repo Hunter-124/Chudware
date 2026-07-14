@@ -22,11 +22,19 @@ Provider-overlap deduplication (T-P3, contract-additive):
 """
 from __future__ import annotations
 
+import os
+import queue
 import threading
+import time
 from typing import Iterator
 
 from engine_oracle.parts_hub.registry import ProviderRegistry
 from engine_oracle.parts_hub.index import PartsIndex
+
+# Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
+# Override with AI_CAD_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
+# value (AI_CAD_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
+_DEFAULT_LIVE_BUDGET_S = 4.0
 
 
 class PartsHub:
@@ -37,6 +45,9 @@ class PartsHub:
         self._index = PartsIndex()
         self._lock = threading.Lock()
         self._index_built = False
+        # Optional peer package diagnostic (browser adapters). Local FTS still
+        # works when this is set; never silent-swallow on the public status API.
+        self.browser_bootstrap_error: str | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -49,7 +60,7 @@ class PartsHub:
             self._index_built = False
 
     def bootstrap(self) -> None:
-        """Auto-register all built-in adapters (T-P1 + T-P2)."""
+        """Auto-register all built-in adapters (T-P1 + T-P2 + local library)."""
         # T-P1 adapters
         from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
         from engine_oracle.parts_hub.adapters.core_families_adapter import CoreFamiliesAdapter
@@ -60,6 +71,8 @@ class PartsHub:
         from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         # T-FIN17 curated heatsink catalog (thermal metadata for heatsink_select)
         from engine_oracle.parts_hub.adapters.heatsinks_adapter import HeatsinksAdapter
+        # Watched local library (vendor_parts index) — indexable STEP/STEP+ files
+        from engine_oracle.parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
         # T-P2 live-vendor adapter (non-indexed, search-only)
         from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
 
@@ -70,6 +83,7 @@ class PartsHub:
         self.register(HydraulicComponentsAdapter())
         self.register(EcadKicadAdapter())
         self.register(HeatsinksAdapter())
+        self.register(LocalLibraryAdapter())
         self.register(EcadVendorAdapter())
         self._register_browser_catalog_adapters()
         # Build the index immediately so first search is fast.
@@ -81,16 +95,19 @@ class PartsHub:
         providers" (TraceParts/Werk24), populated here by the browser-session mechanism
         instead. Best-effort: services/browser is an optional peer package (Playwright is
         a lazy runtime dependency of its own session module) — any import/registration
-        failure here must never break hub bootstrap, so this degrades to a no-op, same
-        posture as EcadVendorAdapter's ProviderChain-unavailable degradation above."""
+        failure here must never break hub bootstrap. Failure is retained as
+        ``browser_bootstrap_error`` so callers can surface a diagnostic while local
+        search keeps working.
+        """
         try:
             from services.browser.adapters import all_adapters
             from services.browser.adapters.parts_provider import BrowserCatalogAdapter
 
             for adapter in all_adapters():
                 self.register(BrowserCatalogAdapter(adapter))
-        except Exception:  # noqa: BLE001 — optional integration, never fatal at bootstrap
-            pass
+            self.browser_bootstrap_error = None
+        except Exception as exc:  # noqa: BLE001 — optional integration, never fatal at bootstrap
+            self.browser_bootstrap_error = f"{type(exc).__name__}: {exc}"
 
     # ------------------------------------------------------------------
     # Index management
@@ -149,8 +166,11 @@ class PartsHub:
         Primary: FTS5 index over all indexable providers.
         Fallback: when the index returns no results AND domain matches a live
         provider (e.g. ecad_vendor for domain=ecad or unfiltered), query each
-        live-only provider directly. Live results carry source:"live" and are
-        returned after index results (or alone when index is empty).
+        live-only provider concurrently under a wall-clock budget
+        (``AI_CAD_PARTS_LIVE_BUDGET_S``, default a few seconds). Live results
+        carry source:"live" and are NEVER indexed. Timed-out sites surface as
+        notice stubs (no part_id/title) so callers can render honest per-site
+        timeout notices. ``include_live=False`` does ZERO network.
         """
         self._ensure_index()
         results = self._index.search(query, domain=domain, limit=limit)
@@ -161,30 +181,140 @@ class PartsHub:
         # the synchronous browser fan-out so the local call returns immediately.
         if not include_live:
             return []
+        return self._search_live(query, domain=domain, filters=filters,
+                                 limit=limit, sites=sites)
+
+    def _search_live(self, query: str, *,
+                     domain: str | list[str] | None,
+                     filters: dict | None,
+                     limit: int,
+                     sites: list[str] | None) -> list[dict]:
+        """Concurrent, deadline-bounded live-vendor fan-out.
+
+        Returns partial hits plus timeout/login notice stubs. Never blocks past
+        the overall wall budget even if a provider stalls. Workers are daemon
+        threads so a stall cannot keep the process (or pytest) alive after
+        return.
+        """
         domains = [domain] if isinstance(domain, str) else list(domain or [])
         site_allow = set(sites) if sites else None
-        # Fallback to live providers when the index has no hits.
-        live_results: list[dict] = []
+        providers: list[object] = []
         for provider in self._registry.providers():
-            # Live-only: iter_records raises NotImplementedError.
             if not _is_live_only(provider):
                 continue
             pdomain = getattr(provider, "domain", None)
             if domains and pdomain and pdomain not in domains:
                 continue
-            # Category routing: skip vendors that don't serve this category, so
-            # we never make the request in the first place (not fetch-then-drop).
             if site_allow is not None:
                 psite = getattr(provider, "site", None)
                 if psite is not None and psite not in site_allow:
                     continue
             if callable(getattr(provider, "search", None)):
-                try:
-                    hits = provider.search(query, domain=domain, filters=filters)
-                    live_results.extend(hits)
-                except Exception:  # noqa: BLE001
-                    pass
-        return live_results[:limit]
+                providers.append(provider)
+        if not providers:
+            return []
+
+        budget = _live_budget_s()
+        if budget <= 0:
+            return []
+
+        out_q: queue.Queue = queue.Queue()
+
+        def _worker(provider: object) -> None:
+            site = str(getattr(provider, "site", None)
+                       or getattr(provider, "provider_id", "unknown")
+                       or "unknown")
+            try:
+                hits = provider.search(  # type: ignore[attr-defined]
+                    query, domain=domain, filters=filters)
+                if not isinstance(hits, list):
+                    out_q.put((site, [], f"search returned {type(hits).__name__}"))
+                else:
+                    out_q.put((site, hits, None))
+            except Exception as exc:  # noqa: BLE001
+                out_q.put((site, [], str(exc) or type(exc).__name__))
+
+        threads: list[threading.Thread] = []
+        for p in providers:
+            site = str(getattr(p, "site", None)
+                       or getattr(p, "provider_id", "x") or "x")
+            t = threading.Thread(
+                target=_worker, args=(p,),
+                name=f"parts-live-{site}",
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        deadline = time.monotonic() + budget
+        live_results: list[dict] = []
+        finished_sites: set[str] = set()
+        n = len(threads)
+        finished = 0
+        while finished < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                site, hits, err = out_q.get(timeout=remaining)
+            except queue.Empty:
+                break
+            finished += 1
+            finished_sites.add(site)
+            if err:
+                reason = err if err in (
+                    "login_required", "no_profile", "unavailable",
+                    "timeout", "challenge_page",
+                ) else "error"
+                live_results.append({
+                    "site": site,
+                    "reason": reason,
+                    "hint": err if reason == "error" else "",
+                })
+            else:
+                live_results.extend(hits)
+            if len([r for r in live_results
+                    if r.get("part_id") and r.get("title")]) >= limit:
+                break
+
+        # Non-blocking drain: anything that finished in the last moment of the
+        # budget still contributes (avoids false timeouts on race-at-deadline).
+        while True:
+            try:
+                site, hits, err = out_q.get_nowait()
+            except queue.Empty:
+                break
+            finished_sites.add(site)
+            if err:
+                reason = err if err in (
+                    "login_required", "no_profile", "unavailable",
+                    "timeout", "challenge_page",
+                ) else "error"
+                live_results.append({
+                    "site": site,
+                    "reason": reason,
+                    "hint": err if reason == "error" else "",
+                })
+            else:
+                live_results.extend(hits)
+
+        # Still-running (or never-drained) providers → honest timeout notices.
+        for p in providers:
+            site = str(getattr(p, "site", None)
+                       or getattr(p, "provider_id", "unknown")
+                       or "unknown")
+            if site in finished_sites:
+                continue
+            live_results.append({
+                "site": site,
+                "reason": "timeout",
+                "hint": (f"live vendor '{site}' exceeded "
+                         f"{budget:g}s budget (AI_CAD_PARTS_LIVE_BUDGET_S)"),
+            })
+        real = [r for r in live_results
+                if r.get("part_id") and str(r.get("title") or "").strip()]
+        notices = [r for r in live_results if r not in real]
+        return real[:limit] + notices
 
     def get(self, part_id: str) -> dict | None:
         """Retrieve a PartRecord by part_id. Returns None if not found."""
@@ -204,6 +334,27 @@ class PartsHub:
                     pass
         return None
 
+
+# ── Live fan-out budgets ─────────────────────────────────────────────────────
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return max(0.05, float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _live_budget_s() -> float:
+    """Overall wall budget for one live fan-out call."""
+    return _env_float("AI_CAD_PARTS_LIVE_BUDGET_S", _DEFAULT_LIVE_BUDGET_S)
+
+
+def _live_site_budget_s(overall: float) -> float:
+    """Per-site wait slice (capped by the overall budget)."""
+    return min(overall, _env_float("AI_CAD_PARTS_LIVE_SITE_BUDGET_S", overall))
 
 # ── Provider-overlap deduplication (T-P3 — contract-additive) ────────────────
 

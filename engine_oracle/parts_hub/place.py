@@ -118,7 +118,11 @@ def _place_core_family(gref: dict, doc_context: dict | None,
 
 def _place_generate_model(gref: dict, doc_context: dict | None,
                           params: dict | None) -> dict:
-    """spec_sheet_matcher.generate_model → new mech part doc."""
+    """spec_sheet_matcher.generate_model → import produced STEP as editable doc.
+
+    Mirrors ``_place_import_file``: once geometry lands on disk, the same
+    ``import_file`` core RPC creates a real ``doc_id`` (not a path-as-id stub).
+    """
     domain = "generate_model"
     match = gref.get("match")
     if not match:
@@ -130,8 +134,34 @@ def _place_generate_model(gref: dict, doc_context: dict | None,
         if path is None:
             return _err(domain, "generate_model returned None (no geometry available)",
                         "Core may be absent or the match source is 'kicad' (no mech model).")
-        # The STEP file is an editable import target; doc_id = the STEP path as a stable ref.
-        return _ok(domain, str(path), str(path), {"step_path": str(path)})
+        # Import the produced STEP as a genuine editable doc — same seam as
+        # browser-acquired import_file placements.
+        import_result = _place_import_file(
+            {"kind": "import_file", "path": str(path)},
+            doc_context,
+            params,
+        )
+        if not import_result.get("ok"):
+            # Preserve generate_model domain in the error envelope while keeping
+            # the underlying import failure reason/hint.
+            return _err(domain,
+                        import_result.get("reason", "import of generated model failed"),
+                        import_result.get("hint", ""),
+                        detail={
+                            "step_path": str(path),
+                            **(import_result.get("detail") or {}),
+                        })
+        detail = dict(import_result.get("detail") or {})
+        detail["step_path"] = str(path)
+        detail.setdefault(
+            "hint",
+            "call reverse_engineer(source=doc_id) for parametric feature "
+            "recovery where the geometry supports it",
+        )
+        return _ok(domain,
+                   import_result.get("doc_id"),
+                   import_result.get("entity_id") or import_result.get("doc_id"),
+                   detail)
     except Exception as exc:  # noqa: BLE001
         return _err(domain, f"generate_model failed: {exc}",
                     "Ensure engine_oracle.spec_sheet_matcher is importable.")

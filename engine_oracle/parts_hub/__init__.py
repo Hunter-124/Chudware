@@ -57,11 +57,21 @@ def rebuild_index() -> int:
     return _get_hub().rebuild_index()
 
 
+def browser_bootstrap_error() -> str | None:
+    """Diagnostic string when browser catalog adapters failed to register, else None.
+
+    Local FTS search keeps working either way — this is an honest status signal,
+    never a silent swallow of optional-peer import failures.
+    """
+    return _get_hub().browser_bootstrap_error
+
+
 __all__ = [
     "register_provider",
     "search",
     "get",
     "rebuild_index",
+    "browser_bootstrap_error",
     "PartsHub",
     "ProviderRegistry",
     "PartsIndex",

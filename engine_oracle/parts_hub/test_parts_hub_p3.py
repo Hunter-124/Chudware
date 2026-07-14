@@ -106,6 +106,46 @@ class TestPlaceCoreFamily:
         assert r["editable"] is True
 
 
+
+class TestPlaceGenerateModel:
+    """generate_model must import produced geometry and return a real doc id."""
+
+    def test_generate_model_imports_via_import_file(self, tmp_path, monkeypatch):
+        step = tmp_path / "generated.step"
+        step.write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
+
+        import engine_oracle.spec_sheet_matcher as ssm
+        monkeypatch.setattr(ssm, "generate_model", lambda match: str(step))
+
+        from services.mcp import core_bridge as cb
+        monkeypatch.setattr(
+            cb, "call",
+            lambda verb, params: {"doc_id": "doc-gen-1", "body_count": 1}
+            if verb == "import_file" else {},
+        )
+
+        from engine_oracle.parts_hub.place import _place_generate_model
+        r = _place_generate_model(
+            {"kind": "generate_model", "match": {"source": "test", "id": "x"}},
+            None, None,
+        )
+        assert r["ok"] is True, f"generate_model place failed: {r}"
+        assert r["editable"] is True
+        assert r["doc_id"] == "doc-gen-1"
+        assert r["domain"] == "generate_model"
+        assert r["detail"]["step_path"] == str(step)
+
+    def test_generate_model_none_is_error(self, monkeypatch):
+        import engine_oracle.spec_sheet_matcher as ssm
+        monkeypatch.setattr(ssm, "generate_model", lambda match: None)
+        from engine_oracle.parts_hub.place import _place_generate_model
+        r = _place_generate_model(
+            {"kind": "generate_model", "match": {"source": "kicad"}},
+            None, None,
+        )
+        assert r["ok"] is False
+        assert "None" in r["reason"]
+
 class TestPlaceSymbolFootprint:
     """ECAD symbol placement: sch_add_symbol into a live schematic doc."""
 

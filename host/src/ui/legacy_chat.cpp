@@ -1433,7 +1433,387 @@ static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW
     ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
-static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
+// ============================ AI-VC (agent version control) ============================
+// Silent, deterministic checkpoints of AI-authored work. Worker RPCs (AiVcCore):
+//   plm_timeline {doc_id?} -> {ok, checkpoints:[{id, turn, when|time, label, features|features_count}]}
+//   plm_rollback {doc_id?, to: checkpoint_id|"turn:N"|"-N"} -> {ok, ...}
+// Degrade: when the worker reports unknown_method the affordances hide permanently this session.
+
+namespace {
+
+struct AiVcCheckpoint {
+    std::string id;
+    int         turn = -1;     // agent turn index, or -1 if unset
+    std::string when;          // ISO timestamp
+    std::string label;         // tool/op-batch summary
+    int         features = 0;  // feature count at checkpoint
+};
+
+struct AiVcUi {
+    bool available = true;     // false after unknown-method (hide all AI-VC chrome)
+    bool loading   = false;
+    bool busy      = false;
+    std::string err;
+    std::vector<AiVcCheckpoint> checkpoints;
+    double      lastFetch = 0.0;
+    std::string lastDocId;
+    // Inline confirm (click again) for per-turn restore — never a modal questionnaire.
+    int    confirmMsgIdx = -1;  // chat index pending confirm, -1 = none
+    int    confirmKind   = 0;   // 1 = before this step, 2 = after this step
+    double confirmUntil  = 0.0; // auto-clear after a few seconds
+};
+static AiVcUi s_aiVc;
+
+static std::string aiVcActiveDocId(AppState& st) {
+    if (st.docMirror.hasDoc()) return st.docMirror.docId();
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+        return st.docTabs[st.activeTab].docId;
+    return {};
+}
+
+// Did this finished assistant turn mutate geometry? Used to gate the restore affordance.
+static bool chatMsgMutatedDoc(const ChatMsg& m) {
+    if (m.fromUser || m.running) return false;
+    for (const auto& a : m.activity) {
+        if (a.rowKind == 3) return true;   // tool call row
+        if (a.opsCount > 0) return true;
+    }
+    for (const auto& s : m.steps)
+        if (s.ok || s.done) return true;
+    return false;
+}
+
+// Protocol-2 / contract envelopes that mean "this RPC isn't registered yet".
+static bool aiVcIsAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (!r.result.is_object()) return false;
+    if (r.result.contains("code")) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented" ||
+            c == "unknown" || c.find("unknown") != std::string::npos)
+            return true;
+    }
+    if (!r.result.value("ok", true)) {
+        const std::string reason = r.result.value("reason", std::string());
+        if (reason == "unknown_method" || reason == "method_not_found" ||
+            reason == "not_implemented" || reason == "no_vault")
+            return true;
+    }
+    return false;
+}
+
+static bool aiVcOk(const core::RpcResult& r, std::string& hint) {
+    if (aiVcIsAbsent(r)) {
+        s_aiVc.available = false;
+        hint = "AI checkpoints unavailable";
+        return false;
+    }
+    if (!r.ok) {
+        hint = r.err.empty() ? "the service did not respond" : r.err;
+        return false;
+    }
+    if (r.result.is_object() && !r.result.value("ok", true)) {
+        const std::string reason = r.result.value("reason", std::string());
+        hint = r.result.value("hint", reason.empty() ? std::string("that could not be done")
+                                                     : reason);
+        return false;
+    }
+    return true;
+}
+
+static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
+    // Prefer an ops-shaped envelope (revision/tree/tess); otherwise resync + rebuild mesh.
+    if (res.is_object() && (res.contains("revision") || res.contains("tree") ||
+                            res.contains("ops"))) {
+        st.docMirror.ingestOpsResponse(res.contains("ops") && res["ops"].is_object()
+                                           ? res["ops"] : res);
+        std::string aicm;
+        if (res.contains("aicm_path") && res["aicm_path"].is_string())
+            aicm = res["aicm_path"].get<std::string>();
+        if (aicm.empty() && res.contains("tess") && res["tess"].is_object())
+            aicm = res["tess"].value("aicm_path", std::string());
+        if (aicm.empty() && res.contains("ops") && res["ops"].is_object())
+            aicm = res["ops"].value("aicm_path", std::string());
+        if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+        return;
+    }
+    if (!st.docMirror.hasDoc()) return;
+    const std::string docId = st.docMirror.docId();
+    st.docMirror.resync(st.worker);
+    nlohmann::json p;
+    p["doc_id"] = docId;
+    st.rpc.call("doc_rebuild", p, [&st](const core::RpcResult& r) {
+        if (!r.ok || !r.result.is_object()) return;
+        std::string aicm = r.result.value("aicm_path", std::string());
+        if (aicm.empty() && r.result.contains("tess") && r.result["tess"].is_object())
+            aicm = r.result["tess"].value("aicm_path", std::string());
+        if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+        st.docMirror.resync(st.worker);
+    });
+}
+
+static void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast) {
+    if (!s_aiVc.available || s_aiVc.busy || to.empty()) return;
+    s_aiVc.busy = true;
+    s_aiVc.confirmMsgIdx = -1;
+    nlohmann::json p = nlohmann::json::object();
+    const std::string docId = aiVcActiveDocId(st);
+    if (!docId.empty()) p["doc_id"] = docId;
+    p["to"] = to;
+    st.rpc.call("plm_rollback", p, [&st, okToast](const core::RpcResult& r) {
+        s_aiVc.busy = false;
+        std::string hint;
+        if (!aiVcOk(r, hint)) {
+            if (s_aiVc.available) st.toast(ui::ToastLevel::Error, hint);
+            return;
+        }
+        aiVcRefreshMirror(st, r.result);
+        st.toast(ui::ToastLevel::Success,
+                 okToast.empty() ? std::string("Restored checkpoint") : okToast);
+        s_aiVc.lastFetch = 0.0;  // force timeline refresh next open
+    });
+}
+
+static void aiVcFetchTimeline(AppState& st, bool force = false) {
+    if (!s_aiVc.available || s_aiVc.loading) return;
+    const std::string docId = aiVcActiveDocId(st);
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_aiVc.lastFetch) < 1.5 && s_aiVc.lastDocId == docId &&
+        !s_aiVc.checkpoints.empty())
+        return;
+    s_aiVc.loading = true;
+    s_aiVc.lastFetch = now;
+    s_aiVc.lastDocId = docId;
+    nlohmann::json p = nlohmann::json::object();
+    if (!docId.empty()) p["doc_id"] = docId;
+    st.rpc.call("plm_timeline", p, [](const core::RpcResult& r) {
+        s_aiVc.loading = false;
+        std::string hint;
+        if (!aiVcOk(r, hint)) {
+            s_aiVc.err = s_aiVc.available ? hint : std::string();
+            if (!s_aiVc.available) s_aiVc.checkpoints.clear();
+            return;
+        }
+        s_aiVc.err.clear();
+        s_aiVc.checkpoints.clear();
+        auto it = r.result.find("checkpoints");
+        if (it == r.result.end() || !it->is_array()) return;
+        for (const auto& c : *it) {
+            if (!c.is_object()) continue;
+            AiVcCheckpoint cp;
+            cp.id = c.value("id", std::string());
+            if (c.contains("turn") && !c["turn"].is_null()) {
+                if (c["turn"].is_number_integer()) cp.turn = c["turn"].get<int>();
+                else if (c["turn"].is_number()) cp.turn = (int)c["turn"].get<double>();
+                else if (c["turn"].is_string()) {
+                    try { cp.turn = std::stoi(c["turn"].get<std::string>()); }
+                    catch (...) { cp.turn = -1; }
+                }
+            }
+            // Accept both field names from Main vs WorkingPheasant payloads.
+            cp.when = c.value("when", c.value("time", std::string()));
+            cp.label = c.value("label", std::string());
+            if (c.contains("features") && c["features"].is_number())
+                cp.features = c["features"].get<int>();
+            else if (c.contains("features_count") && c["features_count"].is_number())
+                cp.features = c["features_count"].get<int>();
+            s_aiVc.checkpoints.push_back(std::move(cp));
+        }
+    });
+}
+
+// Compact "14:32" or short date from ISO-ish `when`.
+static std::string aiVcNiceTime(const std::string& when) {
+    if (when.size() >= 16 && when[10] == 'T')  // 2026-07-14T14:32:…
+        return when.substr(11, 5);
+    if (when.size() >= 16) return when.substr(0, 16);
+    return when;
+}
+
+// Draw the compact AI checkpoints popover body (glass rows + Restore).
+static void drawAiVcTimelinePopover(AppState& st) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted("AI checkpoints");
+    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted("Restore the part to a prior AI step.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+
+    if (s_aiVc.loading && s_aiVc.checkpoints.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Loading\xe2\x80\xa6");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_aiVc.err.empty() && s_aiVc.checkpoints.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", s_aiVc.err.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Retry")) aiVcFetchTimeline(st, /*force=*/true);
+        return;
+    }
+    if (s_aiVc.checkpoints.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("No AI checkpoints yet \xe2\x80\x94 they appear after the copilot "
+                           "edits this part.");
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float padX = 8.0f * sc;
+    const float padY = 6.0f * sc;
+    const float rowH = ImGui::GetTextLineHeight() * 2.0f + padY * 2.0f + 2.0f * sc;
+    const float restW = ImGui::CalcTextSize("Restore").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+
+    ImGui::BeginChild("##ai_vc_list", ImVec2(ui::metrics::px(320), ui::metrics::px(280)),
+                      ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (int i = 0; i < (int)s_aiVc.checkpoints.size(); ++i) {
+        const AiVcCheckpoint& cp = s_aiVc.checkpoints[(size_t)i];
+        ImGui::PushID(i);
+        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+        const float  rowW   = ImGui::GetContentRegionAvail().x;
+        const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+
+        ImGui::InvisibleButton("##cprow", ImVec2(std::max(1.0f, rowW), rowH));
+        const bool hov = ImGui::IsItemHovered();
+        ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, false,
+                               hov ? 0.42f : 0.28f);
+
+        char title[160];
+        if (cp.turn >= 0 && !cp.label.empty())
+            std::snprintf(title, sizeof(title), "Turn %d \xc2\xb7 %s", cp.turn, cp.label.c_str());
+        else if (cp.turn >= 0)
+            std::snprintf(title, sizeof(title), "Turn %d", cp.turn);
+        else if (!cp.label.empty())
+            std::snprintf(title, sizeof(title), "%s", cp.label.c_str());
+        else
+            std::snprintf(title, sizeof(title), "Checkpoint");
+
+        char sub[96];
+        {
+            std::string t = aiVcNiceTime(cp.when);
+            if (cp.features > 0 && !t.empty())
+                std::snprintf(sub, sizeof(sub), "%s  \xc2\xb7  %d feature%s",
+                              t.c_str(), cp.features, cp.features == 1 ? "" : "s");
+            else if (cp.features > 0)
+                std::snprintf(sub, sizeof(sub), "%d feature%s",
+                              cp.features, cp.features == 1 ? "" : "s");
+            else if (!t.empty())
+                std::snprintf(sub, sizeof(sub), "%s", t.c_str());
+            else {
+                const std::string shortId =
+                    cp.id.size() > 10 ? cp.id.substr(0, 10) + "\xe2\x80\xa6" : cp.id;
+                std::snprintf(sub, sizeof(sub), "%s", shortId.c_str());
+            }
+        }
+
+        dl->AddText(ImVec2(rowMin.x + padX, rowMin.y + padY),
+                    ImGui::ColorConvertFloat4ToU32(surf.textPrimary), title);
+        dl->AddText(ImVec2(rowMin.x + padX,
+                           rowMin.y + padY + ImGui::GetTextLineHeight() + 2.0f * sc),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+
+        if (!cp.id.empty()) {
+            ImGui::SetCursorScreenPos(
+                ImVec2(rowMax.x - restW - 6.0f * sc,
+                       rowMin.y + (rowH - ImGui::GetFrameHeight()) * 0.5f));
+            if (s_aiVc.busy) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Restore")) {
+                aiVcRollback(st, cp.id, std::string("Restored: ") + title);
+                ImGui::CloseCurrentPopup();
+            }
+            if (s_aiVc.busy) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Restore the part to this checkpoint.");
+        }
+
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 3.0f * sc));
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+// Hover actions on a mutating assistant turn: restore before / after this step.
+// Inline confirm = click again within a few seconds (no modal).
+static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
+    if (!s_aiVc.available || turnNum <= 0 || s_aiVc.busy) return;
+    const float sc = ui::uiScale;
+    const double now = ImGui::GetTime();
+    if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
+        s_aiVc.confirmMsgIdx = -1;
+        s_aiVc.confirmKind = 0;
+    }
+    const bool pending = (s_aiVc.confirmMsgIdx == msgIdx);
+
+    // Latch hover for a short window so the user can move from the "Assistant"
+    // label onto the Before/After buttons without them vanishing mid-flight.
+    static int    s_hovMsg = -1;
+    static double s_hovUntil = 0.0;
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlapped)) {
+        s_hovMsg = msgIdx;
+        s_hovUntil = now + 0.6;
+    }
+    const bool latched = (s_hovMsg == msgIdx && now <= s_hovUntil);
+    const bool show = pending || latched;
+    if (!show) return;
+
+    auto clickAction = [&](int kind, const char* idle, const char* confirm, const char* tip) {
+        ImGui::SameLine(0, 6.0f * sc);
+        const bool isPend = pending && s_aiVc.confirmKind == kind;
+        const char* lab = isPend ? confirm : idle;
+        if (isPend) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+        }
+        if (ImGui::SmallButton(lab)) {
+            if (!isPend) {
+                s_aiVc.confirmMsgIdx = msgIdx;
+                s_aiVc.confirmKind = kind;
+                s_aiVc.confirmUntil = now + 4.0;
+            } else {
+                // kind 1 = before this step → turn:(N-1); kind 2 = after = turn:N
+                std::string to;
+                if (kind == 1) {
+                    if (turnNum <= 1) to = "turn:0";
+                    else to = "turn:" + std::to_string(turnNum - 1);
+                } else {
+                    to = "turn:" + std::to_string(turnNum);
+                }
+                aiVcRollback(st, to,
+                             kind == 1 ? "Restored to before this step"
+                                       : "Restored to after this step");
+            }
+        }
+        if (isPend) ImGui::PopStyleColor(2);
+        if (ImGui::IsItemHovered()) {
+            s_hovMsg = msgIdx;
+            s_hovUntil = now + 0.6;
+            ImGui::SetTooltip("%s", isPend ? "Click again to confirm." : tip);
+        }
+    };
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
+    clickAction(1, "Before", "Confirm?", "Restore the part to the state before this step.");
+    clickAction(2, "After",  "Confirm?", "Restore the part to the state after this step.");
+    ImGui::PopStyleVar();
+}
+
+}  // namespace
+
+
+static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
+                              int msgIdx = -1, int turnNum = 0) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, turnSurf);
@@ -1443,6 +1823,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(turnSurf.textSecondary, "Assistant");
     ImGui::PopFont();
+    // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
+    if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m))
+        drawAiVcTurnRestore(st, msgIdx, turnNum);
 
     // (1) Plan / todo block — a live checklist that ticks off as stages complete (DESIGN §5).
     if (m.plan.present) drawPlanCard(m.plan, m.activity, fonts);
@@ -1598,18 +1981,23 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    // Right-side control cluster: [Sessions|< Chat] [settings gear] [status], hard-anchored to
-    // the column's right edge so every control is always on-screen (T-G17). Sessions and Settings
-    // are mutually exclusive in-column overlays over the chat log.
+    // Right-side control cluster: [Sessions|< Chat] [history clock] [settings gear] [status],
+    // hard-anchored to the column's right edge so every control is always on-screen (T-G17).
+    // Sessions and Settings are mutually exclusive in-column overlays over the chat log.
+    // The history clock opens the AI checkpoints popover (hidden when AI-VC RPCs are absent).
     const float gearW = lh;
     const bool sessionsOpen = st.showSessionsPicker;
     const bool settingsOpen = st.showAISettingsOverlay;
+    const bool showAiVc = s_aiVc.available;
     const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
     const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
                                  ImGui::CalcTextSize("< Chat").x) + style.FramePadding.x * 2.0f;
+    const float histW = showAiVc ? gearW : 0.0f;
+    const float histGap = showAiVc ? style.ItemSpacing.x : 0.0f;
     const float dotW  = lh;
     const float rightInset = ui::metrics::U(1);
-    const float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + dotW;
+    const float cluster = sessW + style.ItemSpacing.x + histW + histGap + gearW +
+                          style.ItemSpacing.x + dotW;
     const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
 
     // Wordmark: "Billet" in the heading font, "Copilot" as a baseline-aligned secondary-ink
@@ -1653,6 +2041,36 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
                                        : "Sessions — switch between chats.");
+
+    // AI checkpoints clock — between Sessions and the settings gear. Hidden when the
+    // plm_timeline / plm_rollback worker RPCs are absent (AiVcCore still landing).
+    if (showAiVc) {
+        ImGui::SameLine();
+        centerY(gearW);
+        IconUV hist = ui::getIcon("history", 20);
+        if (!hist.valid) hist = ui::getIcon("undo", 20);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * sc, 2 * sc));
+        bool histClicked = false;
+        if (hist.valid)
+            histClicked = ImGui::ImageButton("##aiheaderhist", hist.texId,
+                                            ImVec2(gearW - 4 * sc, gearW - 4 * sc),
+                                            hist.uv0, hist.uv1);
+        else
+            histClicked = ImGui::SmallButton("ck");
+        ImGui::PopStyleVar();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("AI checkpoints — restore the part to a prior step.");
+        if (histClicked) {
+            aiVcFetchTimeline(st, /*force=*/true);
+            ImGui::OpenPopup("##ai_vc_timeline");
+        }
+        if (ImGui::BeginPopup("##ai_vc_timeline")) {
+            // Keep the list fresh while open (throttled inside aiVcFetchTimeline).
+            aiVcFetchTimeline(st, /*force=*/false);
+            drawAiVcTimelinePopover(st);
+            ImGui::EndPopup();
+        }
+    }
 
     ImGui::SameLine();
     centerY(gearW);
@@ -4264,12 +4682,21 @@ static void drawChatLogWindowed(AppState& st) {
     const float viewTop = ImGui::GetScrollY();
     const float viewBot = viewTop + ImGui::GetWindowSize().y;
     const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
+    // 1-based index of finished assistant turns that mutated the doc — matches AI-VC turn labels.
+    int mutTurn = 0;
     for (size_t mi = 0; mi < st.chat.size(); ++mi) {
         ChatMsg& m = st.chat[mi];
         ImGui::PushID((int)mi);
         const float y = ImGui::GetCursorPosY();
         const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
-        const bool interactive = m.running || m.clarify.active || m.clarify.awaiting;
+        const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
+                                 (s_aiVc.confirmMsgIdx == (int)mi);
+        // Pre-count mutating assistant turns even when the row is off-screen (stable turn nums).
+        int thisTurn = 0;
+        if (!m.fromUser && chatMsgMutatedDoc(m)) {
+            ++mutTurn;
+            thisTurn = mutTurn;
+        }
         if (cacheValid && !interactive &&
             (y + m.uiCachedH < viewTop - slack || y > viewBot + slack)) {
             ImGui::Dummy(ImVec2(logW, m.uiCachedH));   // same-height spacer, zero draw cost
@@ -4280,7 +4707,7 @@ static void drawChatLogWindowed(AppState& st) {
         if (m.fromUser) {
             drawUserBlock(m, fonts, logW);
         } else {
-            drawAssistantTurn(st, m, fonts, logW);
+            drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn);
             ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
         }
         ImGui::EndGroup();

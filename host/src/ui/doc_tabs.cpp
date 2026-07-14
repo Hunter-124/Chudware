@@ -120,7 +120,8 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     if (ImGui::BeginPopupContextItem("##tabctx")) {
         const int n = (int)st.docTabs.size();
         if (ImGui::MenuItem("Close")) {
-            if (t.dirty) s_confirmCloseIdx = idx; else s_closeIdx = idx;
+            const bool aiSilent = t.aiHandoff && !t.userAdopted;
+            if (t.dirty && !aiSilent) s_confirmCloseIdx = idx; else s_closeIdx = idx;
         }
         if (ImGui::MenuItem("Close Others", nullptr, false, n > 1)) s_closeOthersIdx = idx;
         ImGui::Separator();
@@ -211,8 +212,11 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
 
     // Route interactions (deferred).
     if (xClicked || middleClose) {
-        if (t.dirty) s_confirmCloseIdx = idx;   // ask first
-        else         s_closeIdx = idx;
+        // Pure AI-authored docs (un-adopted handoff mirrors) never raise a save prompt —
+        // AI-VC auto-checkpoints handle their history; close silently even if dirty.
+        const bool aiSilent = t.aiHandoff && !t.userAdopted;
+        if (t.dirty && !aiSilent) s_confirmCloseIdx = idx;   // ask first
+        else                      s_closeIdx = idx;
     } else if (switchClicked && !active) {
         s_switchTo = idx;
     }

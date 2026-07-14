@@ -1,0 +1,350 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "mission-flight-computer-charger-ecad-sim-master-2026-07",
+  "name": "Master: ECAD board-design + simulation-suite expansion, proven by flight-computer + battery-charger E2E benchmarks",
+  "meta": {
+    "status": "APPROVED 2026-07-14 — executing off master in subagent waves, commit+push per verified unit",
+    "decisions": {
+      "D1_execution_model": "subagent waves off master; driver commits+pushes per green unit; test-fixture authoring outsourced to subagents; tests DETERMINISTIC (identical build/sim inputs each run, compared to expected results); record+display ACTUAL wall-times (no expected-time gating until optimization phase)",
+      "D2_external_binaries": "install openEMS + Renode NOW on this box AND wire both into installer provisioning for all supported OSes",
+      "D3_gpu_depth": "opportunistic + safe (validated CPU fallback, governed, no hard GPU dep)",
+      "D4_bench_sequencing": "both benchmarks, foundation-first (foundation -> ECAD -> flight computer -> charger)"
+    },
+    "authored_with": "advisor MCP (cad_guide sim/dag/firmware/verify, em_status, fw_status, check_metadata) + 5 read-only scouts (sim/ecad/prof/parts+fw/dag)",
+    "vehicles": ["central flight computer/controller", "battery charger/controller (LVD + charge optimization + safety heuristics)"],
+    "ground_truth": {
+      "sim_exists": "SPICE(MNA op/dc/tran/ac/tf/noise/four/step/temp/mc, R/L/C/V/I/D/Q/M/E/F/G/H/S/OPAMP/T/K/B), FEA(static+factor-cache tet10/hex8, modal, thermal steady+transient, fatigue, buckling, contact, freq-response/random-vibe), CFD(LBM CPU+CUDA, OpenFOAM RANS/CHT), EM(builtin-FDFD eigenmode, analytic driven/timedomain; openEMS absent->skip), handoffs(motion->FEA, ecad->thermal/airflow/vibe, power_budget)",
+      "ecad_exists": "sch->netlist(union-find)->sync(grid place)->autoroute(Lee/A* orthogonal SEGMENTS only)->zonefill->DRC/ERC/DFM->fab(gerber/excellon/bom/cpl)->3d/boardphys; impedance IPC-2141(microstrip/stripline/CPWG); stackup inverse; si_rules; pdn DC IR-drop; schema supports track_kind={segment,arc}",
+      "cache_exists": ".step+ cache.json/cache.aicm(+brep) keyed engine+FNV doc_hash(+asm fingerprints); in-proc mesh cache + static factor cache; studies/*/results.npz RESERVED in contract but UNIMPLEMENTED",
+      "prof_exists": "sampler flat folded/speedscope; phases flat study/phase (TLS nesting only); governor memory-admit+solver_threads (NO dynamic throttle); no central thread pool; CUDA gated AICAD_WITH_CUDA (LBM only)",
+      "fw_exists": "cortex-m build+emulate (QEMU present, Renode absent); fwscenario/1 sensor stimulus (i2c_sensor tmp103/i2c_registers/spi_stub/adc_waveform/gpio/uart); fw_verify_board; power_profile; NO CFD/aero/kinematic->sensor bridge, NO multi-axis IMU/baro/mag/GPS models",
+      "parts_exists": "core/parts mechanical only; ECAD starter generic MCU QFP48+AMS1117/7805+conn/USB; ZERO flight sensors, ZERO charger ICs; providers Nexar/DigiKey/Mouser priced when credentialed",
+      "gaps": ["connectivity-aware auto-placement", "arc/curved+teardrop+impedance-driven trace optimization", "PCB antenna design helpers", "deterministic schematic->preliminary-PCB + AI board-design workflow tools", "durable sim solve-state cache", "nested-tree profiler", "dynamic resource governance + central thread pool", "opportunistic GPU/parallel beyond LBM", "CFD/aero/kinematic->sensor->firmware bridge + real sensor models", "flight-computer + charger parts pack", "flight-computer E2E benchmark", "battery-charger E2E benchmark", "governed+cached+profiled testing-protocol harness"]
+    }
+  },
+  "nodes": [
+    {
+      "id": "n_gate_scope",
+      "type": "gate",
+      "name": "Freeze scope, disjoint write-sets, and user decisions D1..D4",
+      "inputs": {
+        "request": "Confirm the four user decisions before execution: D1 execution model (subagent waves committing to master vs in-app dag_run), D2 external heavy binaries (install openEMS/Renode vs stay builtin-FDFD/analytic+QEMU honest-skip with REAL-when-present design), D3 GPU/parallel depth (opportunistic vs deep vs defer), D4 benchmark sequencing (foundation->ECAD->flight-computer->charger). Freeze disjoint write-sets so waves run in parallel. Preserve uncommitted host GUI edits (app_state.h, sketch_mode.cpp, viewport_panel.cpp). contracts/* and core/api/libaicad.h are APPEND-ONLY and integrator-owned.",
+        "decisions": ["D1_execution_model", "D2_external_binaries", "D3_gpu_depth", "D4_bench_sequencing"]
+      },
+      "tools": null,
+      "end_condition": "All four decisions recorded and every implementation node has a write-set that does not overlap another node in the same wave.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "approve"
+    },
+
+    {
+      "id": "n_sim_cache",
+      "type": "simulate",
+      "name": "F1: Durable sim solve-state cache (.step+ studies + SPICE/EM/CFD result cache)",
+      "inputs": {
+        "request": "Implement the RESERVED contracts/stepplus.md studies/*/results.npz seam in the C++ stepplus path so FEA static/modal/thermal solve state (assembled/factored system + result field) persists and reloads, mirroring the geometry cache (engine-key + content-hash keyed, erase-first on save, validate-on-open, honest miss). Add a keyed result cache for SPICE (deck+analysis hash), EM (geometry+freq-sweep hash), and CFD (mesh+BC hash) so re-runs of unchanged studies are O(load). Never serve a stale result: any input-hash mismatch is a miss. Respect the resource_governor 20MB/studies cap.",
+        "write_set": ["core/doc/stepplus.cpp", "core/doc/stepplus.h", "core/sim/fea_run.cpp", "core/sim/spice.cpp", "core/sim/flow_run.cpp", "core/sim/sim_cache.cpp", "core/sim/sim_cache.h", "core/tests/test_sim_cache.cpp", "contracts/stepplus.md"],
+        "acceptance": ["unchanged FEA study reload is a cache HIT with byte-identical result and >5x wall-clock speedup", "any mesh/BC/material/deck/freq input change is a MISS (no stale results ever)", "SPICE + EM + CFD result caches round-trip and invalidate on input-hash change", "studies stay under the contract 20MB cap; governor low-memory disables the cache honestly", "existing sim accuracy gates unchanged"]
+      },
+      "tools": null,
+      "end_condition": "Repeated identical sim studies load from cache with cited speedup; every input change invalidates correctly.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_profiler_tree",
+      "type": "plan",
+      "name": "F2: Nested-tree (file-tree) profiler + scoped drill-down",
+      "inputs": {
+        "request": "Add a nested call-tree report to core/prof: aggregate the existing folded stacks into a hierarchical tree (parent->children with self/total samples + %), and give phases.cpp a nested phase-tree report (study->phase->subphase) instead of flat lists. Emit as compact nested JSON so an agent reads the ROOT + hot children first and drills down by path (context-frugal, like a file tree) rather than ingesting the whole flat profile. Expose via the MCP engine_profile surface with a `path` selector for scoped subtree reads and a depth cap. Keep the existing folded/speedscope exports intact.",
+        "write_set": ["core/prof/sampler.cpp", "core/prof/sampler.h", "core/prof/phases.cpp", "core/prof/phases.h", "core/prof/tree.cpp", "core/prof/tree.h", "core/api/libaicad.cpp", "services/mcp/profile_tools.py", "core/tests/test_prof_tree.cpp"],
+        "acceptance": ["build_tree produces a correct parent/child self+total sample tree from a known folded-stack fixture", "phases report is nested study->phase->subphase with wall-clock rollups", "MCP profile read returns ROOT + top-N children within a token budget and supports path-scoped drill-down + depth cap", "folded + speedscope exports still byte-match the pre-change format"]
+      },
+      "tools": null,
+      "end_condition": "Profiler emits a nested tree an agent can drill down by path without ingesting the whole trace.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_governor",
+      "type": "plan",
+      "name": "F3: Dynamic resource governance (no OOM, no self-throttle) + shared thread pool",
+      "inputs": {
+        "request": "Upgrade core/util/resource_governor from binary admit to a dynamic governor: track live RSS + available memory and grade heavy ops (mesh/FEA/CFD/EM/ECAD-route) with an adaptive concurrency + thread budget that fills available CPU/RAM WITHOUT crossing the OOM headroom (avoid throttling when resources are free, avoid OOM when they are not). Add a small shared work-queue/thread-pool primitive (bounded by the governor) so solvers stop each spawning ad-hoc OMP regions that oversubscribe. Wire the pool + governor into the LBM, FEA assembly, and ECAD autoroute hot paths. Every limit decision must be observable (report) and env-overridable.",
+        "write_set": ["core/util/resource_governor.cpp", "core/util/resource_governor.h", "core/util/thread_pool.cpp", "core/util/thread_pool.h", "core/sim/solver_threads.h", "core/tests/test_governor.cpp", "core/tests/test_thread_pool.cpp"],
+        "acceptance": ["under a synthetic low-memory cap the governor reduces concurrency and NEVER exceeds the headroom (no OOM)", "with ample memory the governor uses ~all allotted cores (no artificial throttle)", "thread pool caps total worker threads to the governed budget (no oversubscription across nested solves)", "every admission/thread decision is in the governor report; env overrides honored", "existing governor tests still pass"]
+      },
+      "tools": null,
+      "end_condition": "Heavy ops scale to available resources without OOM and without self-throttling; threads are pooled under one budget.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parts_pack",
+      "type": "source",
+      "name": "F4: Flight-computer + battery-charger parts pack (symbols/footprints/eng/sim params)",
+      "inputs": {
+        "request": "Add real electronics parts to the clean-room ECAD starter library so both benchmark boards build end-to-end from the Parts Library. Flight computer: an MCU (STM32F4-class QFP), 6-axis IMU (accel+gyro, I2C/SPI), barometer (I2C), magnetometer (I2C), a GNSS/GPS module (UART), a buck or LDO 3V3 rail, decoupling/passives, crystal, SWD header, USB. Battery charger: a Li-ion charger controller topology (linear + switching option), power MOSFETs, current-sense resistor, low-voltage-disconnect comparator/load-switch, protection (reverse, OVP/UVP), thermistor, inductor, bulk caps. Each part: pin-correct symbol + footprint (pins subset of pads), eng metadata (supply rails/currents for boardphys + power_budget), and SPICE model refs/params where a device is simulated. Keep clean-room (no vendor netlists copied); make each resolvable via ecad_find_part/part_search.",
+        "write_set": ["engine_oracle/ecad/library/starter.py", "engine_oracle/ecad/library/eng_metadata.py", "engine_oracle/ecad/test_library.py", "engine_oracle/ecad/test_parts_pack.py"],
+        "acceptance": ["ecad_find_part returns >=1 pin-correct hit for imu, barometer, magnetometer, gps, charger_controller, power_mosfet, current_sense, load_switch", "every new symbol's pin numbers are a subset of its footprint pads", "each powered part carries eng supply-rail metadata consumed by power_budget", "a minimal flight-computer AND a minimal charger schematic place + ERC-clean using only starter/pack parts"]
+      },
+      "tools": null,
+      "end_condition": "Both benchmark boards can be built from the Parts Library with pin-correct, sim-ready parts.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+
+    {
+      "id": "n_place",
+      "type": "ecad",
+      "name": "E1: Connectivity-aware deterministic auto-placement",
+      "inputs": {
+        "request": "Upgrade op_pcb_autoplace beyond the fixed grid into a deterministic connectivity-aware placer: cluster components by net degree, seat decoupling caps adjacent to their IC power pins, keep connectors on the board edge, respect courtyards (no overlap), and honor placement hints/locks. Deterministic (seeded) so the same netlist yields the same layout. This is the placement half of 'preliminary board from schematic'.",
+        "write_set": ["core/ecad/place.cpp", "core/ecad/place.h", "core/ecad/ops.cpp", "core/ecad/sync.cpp", "core/tests/test_ecad_place.cpp"],
+        "acceptance": ["decoupling caps land within a small radius of their IC power pin", "no courtyard overlaps after placement (DRC courtyard clean)", "connectors placed on a board edge", "placement is deterministic for a fixed netlist+seed", "total ratsnest length strictly shorter than the old grid placement on a >=15-component board"]
+      },
+      "tools": null,
+      "end_condition": "Placement is connectivity-aware, overlap-free, deterministic, and shortens ratsnest vs grid.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_trace_opt",
+      "type": "ecad",
+      "name": "E2: Curved/arc + teardrop + impedance-driven trace optimization",
+      "inputs": {
+        "request": "Add a post-route trace-optimization pass over the existing Lee/A* segment output: (a) corner rounding — replace 90-degree corners with arc tracks (schema kind=arc already supported; fab tessellates ~5deg) to reduce discontinuity/impedance; (b) teardrops at pad/via junctions; (c) impedance-driven width adjustment — using IPC-2141 impedance.cpp + stackup inverse, widen/narrow nets tagged with a target Z0 to hit it within tolerance; (d) DRC-safe: every transformation re-checks clearance and reverts locally on violation. Deterministic and idempotent.",
+        "write_set": ["core/ecad/trace_opt.cpp", "core/ecad/trace_opt.h", "core/ecad/ops.cpp", "core/ecad/impedance.cpp", "core/tests/test_trace_opt.cpp"],
+        "acceptance": ["90-degree corners become arcs; routed board stays DRC-clean", "teardrops added at pad/via transitions without clearance violations", "a net tagged target Z0=50ohm is width-adjusted to within tolerance per ecad_check_impedance", "pass is deterministic + idempotent (second run is a no-op)", "fab export (gerber) round-trips the arc tracks"]
+      },
+      "tools": null,
+      "end_condition": "Rigid segment routes become smooth arc/teardrop/impedance-tuned traces, DRC-clean and deterministic.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_antenna",
+      "type": "ecad",
+      "name": "E3: PCB antenna design helpers + EM solver bridge",
+      "inputs": {
+        "request": "Add parametric PCB antenna design helpers: rectangular patch, quarter-wave monopole, meandered inverted-F (PIFA/IFA for 2.4GHz), and CPW/microstrip feed calculators (dimensions from target frequency + substrate epsilon_r/height using standard closed-form design equations, cross-checked against the existing IPC-2141/CPWG impedance code for the feed). Generate the antenna as real PCB copper geometry (traces/zones) on the board, and bridge to the EM suite: build the analytic/FDFD model and, when openEMS is present, the full-wave model, returning resonant frequency + return-loss/S11 estimate. Honest skip (design geometry + analytic estimate only) when openEMS is absent — never fabricate a full-wave result.",
+        "write_set": ["core/ecad/antenna.cpp", "core/ecad/antenna.h", "engine_oracle/ecad/antenna.py", "services/mcp/antenna_tools.py", "engine_oracle/sim/em/antenna_bridge.py", "core/tests/test_antenna.cpp", "services/mcp/test_antenna_tools.py"],
+        "acceptance": ["patch/monopole/IFA dimension calc matches textbook design equations within a few %", "generated antenna is real DRC-checkable board copper", "feed impedance cross-checks the IPC-2141/CPWG code", "EM bridge returns an analytic resonance estimate always, and a full-wave S11 when openEMS present (honest skip otherwise)"]
+      },
+      "tools": null,
+      "end_condition": "Agents can design a PCB antenna parametrically, place it as real copper, and evaluate it via the EM suite (honest under missing openEMS).",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_board_flow",
+      "type": "plan",
+      "name": "E4: Deterministic schematic->preliminary-PCB + AI board-design workflow tools",
+      "inputs": {
+        "request": "Wire the full board-design workflow the agent follows: (1) schematic-first — capture/generate schematic from a request; (2) simulate — SPICE the schematic until it exhibits target behavior (gate); (3) preliminary board — ONE deterministic tool that takes the simulated schematic and emits a placed + pre-routed board (uses E1 placement + existing autoroute + E2 trace-opt) to save layout time; (4) board-level checks — impedance/DRC/DFM/PDN/thermal/vibe/EM; (5) firmware. Add/repair the MCP tool surface so an agent has a correct, discoverable tool for each step (a board_from_schematic one-call, plus the guidance in cad_guide). Keep every stage honest and re-runnable.",
+        "write_set": ["services/mcp/ecad_tools.py", "services/mcp/board_flow.py", "engine_oracle/ecad/orchestrator.py", "services/mcp/test_board_flow.py"],
+        "acceptance": ["board_from_schematic turns a simulated schematic into a placed+pre-routed board in one call, DRC-clean or with named residual violations", "the schematic->simulate->layout->check->firmware tool path is complete and discoverable (each step has a tool)", "the preliminary board reuses E1/E2 (no duplicate placer/router)", "re-running board_from_schematic on an unchanged schematic is deterministic"]
+      },
+      "tools": null,
+      "end_condition": "An agent can go schematic->simulate->preliminary PCB->checks->firmware with a correct tool at each step.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+
+    {
+      "id": "n_sensor_bridge",
+      "type": "firmware",
+      "name": "S1: CFD/aero/kinematic -> sensor-model -> firmware-emulation bridge + real sensor models",
+      "inputs": {
+        "request": "Build the bridge that feeds SIMULATED REALITY into the emulated MCU. Add physics-accurate sensor models that convert sim time-series into aicad.fwscenario/1 tracks: 6-axis IMU (accel+gyro from a kinematic/rigid-body trajectory incl. gravity + body rates), barometer (pressure/altitude from an atmosphere model driven by a flight-profile or CFD field), magnetometer (heading), GNSS (position/velocity fix), pitot/airspeed (from CFD or flight profile). Extend scenario.py to support TIME-VARYING i2c_register streams (register bytes as a function of t) so a moving sensor value plays back over emulation; encode each model to its part's real register map (ties to F4 parts). Provide a bridge tool: given a motion/CFD/aero sim result (or an analytic flight profile) + a board's sensors, generate the fwscenario that plays that reality into fw_sim_run. Honest skip when Renode absent (fwscenario needs Renode) with a clear reason; keep QEMU semihosting path working for UART-only checks.",
+        "write_set": ["engine_oracle/firmware/sensor_models.py", "engine_oracle/firmware/scenario.py", "engine_oracle/firmware/sim_sensor_bridge.py", "services/mcp/fw_tools.py", "engine_oracle/firmware/test_sensor_models.py", "engine_oracle/firmware/test_sim_sensor_bridge.py"],
+        "acceptance": ["IMU model reproduces known accel/gyro for a canned trajectory (free-fall ~0g, static ~1g down, spin -> gyro rate) within tolerance", "barometer model maps a known altitude profile to correct pressures", "scenario.py plays a time-varying i2c_register stream that changes the value the firmware reads over time (verified via a trace assertion)", "the bridge turns a motion/flight-profile sim into a valid fwscenario consumed by fw_sim_run (Renode present) or honest-skips (absent) with reason"]
+      },
+      "tools": null,
+      "end_condition": "A CFD/kinematic/flight-profile sim can drive realistic IMU/baro/mag/GPS readings into the emulated firmware.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_gpu_parallel",
+      "type": "simulate",
+      "name": "S2: Opportunistic GPU/CUDA + parallelization expansion (scoped by D3)",
+      "inputs": {
+        "request": "Per decision D3, extend GPU/parallel acceleration where it is a clear, safe win beyond the existing CUDA LBM: candidate targets = FEA global assembly + sparse SpMV/solve (batched), EM FDFD eigensolve, and batched SPICE parameter sweeps (Monte-Carlo / .step) which are embarrassingly parallel across the shared thread pool (F3). Every GPU path MUST have a validated CPU fallback and be gated (AICAD_WITH_CUDA / runtime device probe) — never a hard dependency. Cross-check GPU results against the CPU path within accuracy tolerance. Use the F3 governor/thread-pool so parallel sweeps do not oversubscribe or OOM.",
+        "write_set": ["core/sim/fea_gpu.cu", "core/sim/fea_gpu.h", "core/sim/spice_sweep.cpp", "core/sim/spice_sweep.h", "core/sim/CMakeLists-notes.txt", "core/tests/test_gpu_parity.cpp"],
+        "acceptance": ["each new GPU path matches its CPU reference within accuracy tolerance", "each GPU path falls back cleanly with no CUDA device / AICAD_WITH_CUDA off", "batched SPICE sweep parallelizes across the F3 pool with a cited speedup and no oversubscription", "no new hard GPU dependency in the default build"]
+      },
+      "tools": null,
+      "end_condition": "Selected solvers gain governed GPU/parallel speedups with validated CPU fallbacks (scope per D3).",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+
+    {
+      "id": "n_verify_foundation",
+      "type": "verify",
+      "name": "V-F: Verify foundation (cache, profiler, governor, parts pack)",
+      "inputs": {"request": "Run sim-cache round-trip/invalidation tests, profiler-tree tests, governor + thread-pool tests, and parts-pack place+ERC tests. Confirm cache never serves stale results, profiler tree is correct + scoped, governor avoids OOM and self-throttle, and both boards build from the Parts Library.", "check_type": "requirement"},
+      "tools": null,
+      "end_condition": "All foundation suites pass with cited numbers; no stale cache; no OOM.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_ecad",
+      "type": "verify",
+      "name": "V-E: Verify ECAD caps (place, trace-opt, antenna, board-flow)",
+      "inputs": {"request": "Run placement, trace-optimization, antenna, and board_from_schematic tests; DRC/ERC/impedance checks on optimized boards; antenna EM bridge honest-skip check. Confirm smooth arc/teardrop/impedance-tuned traces stay DRC-clean and board_from_schematic is deterministic.", "check_type": "requirement"},
+      "tools": null,
+      "end_condition": "ECAD capability suites pass; optimized boards DRC-clean; antenna evaluated honestly.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_sim",
+      "type": "verify",
+      "name": "V-S: Verify sim bridge + GPU parity",
+      "inputs": {"request": "Run sensor-model + sim-sensor-bridge tests and GPU/CPU parity tests. Confirm sensor models reproduce known physics, time-varying register streams play back, and every GPU path matches CPU within tolerance with a clean fallback.", "check_type": "requirement"},
+      "tools": null,
+      "end_condition": "Sensor bridge and GPU parity suites pass; honest skips where backends absent.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+
+    {
+      "id": "n_integration_gate",
+      "type": "gate",
+      "name": "Integration build + focused gates",
+      "inputs": {"request": "./build.sh core (or all) green; run the union of focused suites touched this mission; reject accuracy regressions, stale-cache hits, fabricated results, OOM/oversubscription, dishonest skips, or contract/registration breakage. Pre-existing unrelated failures noted, not blocking."},
+      "tools": null,
+      "end_condition": "Core builds green and every focused suite passes or documents an environment skip.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "approve"
+    },
+
+    {
+      "id": "n_bench_flight",
+      "type": "verify",
+      "name": "B1: Flight-computer E2E benchmark",
+      "inputs": {
+        "request": "Author scripts/bench_flight_computer.py exercising the WHOLE suite: pull MCU/IMU/baro/mag/GPS/regulator from the Parts Library (providers priced when credentialed, honest-skip otherwise) -> generate + SPICE-simulate the power/sensor front-end schematic -> board_from_schematic deterministic preliminary PCB -> E2 trace-opt + antenna (GNSS/2.4GHz) -> render -> board-level checks (impedance, DRC/DFM, PDN, ECAD->thermal, ECAD->vibe) -> firmware project + build -> fw_sim_run driven by S1 sensor bridge feeding IMU/baro readings derived from a kinematic/aero flight-profile sim -> fw_verify_board -> power_budget -> report. Governed (resource_governor), solve-state-cached (F1), and profiled (F2 nested tree). Every stage asserts a concrete pass/fail; backends absent => honest SKIP markers, never fabricated success.",
+        "write_set": ["scripts/bench_flight_computer.py", "benchmarks/flight_computer/", "docs/FLIGHT_COMPUTER_BENCHMARK.md"],
+        "acceptance": ["end-to-end run completes with a PASS/FAIL/SKIP card per stage", "board is DRC-clean (or residuals named), impedance/PDN/thermal/vibe checks return numeric verdicts", "firmware builds and fw_sim_run consumes sensor-bridge readings from a flight-profile sim (Renode present) or honest-skips", "the run is cached (2nd run faster) and emits a nested profile tree", "wired into scripts/gate.sh as an env-gated stage"]
+      },
+      "tools": null,
+      "end_condition": "The flight computer is designed, laid out, simulated, and firmware-emulated end to end with per-stage verdicts.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_bench_charger",
+      "type": "verify",
+      "name": "B2: Battery charger/controller E2E benchmark (LVD + charge optimization + safety)",
+      "inputs": {
+        "request": "Author scripts/bench_battery_charger.py: design a Li-ion battery charger/controller with a low-voltage disconnect, charge-profile optimization (CC/CV stages, taper termination), and safety heuristics (over-voltage/under-voltage/over-current/over-temperature cutoffs, reverse-polarity protection, thermal foldback). Pull charger controller/MOSFET/current-sense/load-switch/thermistor from the Parts Library -> SPICE-simulate the analog charge/discharge behavior across load and battery-state, verifying CC->CV transition, taper-off termination, and that each safety cutoff actually trips at its threshold; LVD disconnects the load at the set voltage -> board_from_schematic PCB with adequate power-trace widths (impedance/ampacity) + ECAD->thermal on the pass device -> firmware charge state-machine (states: precharge/CC/CV/done/fault) with the safety cutoffs, emulated and asserted (fault entry on injected over-temp/over-voltage) -> power_budget/report. Governed, cached, profiled. Honest SKIP where backends absent.",
+        "write_set": ["scripts/bench_battery_charger.py", "benchmarks/battery_charger/", "docs/BATTERY_CHARGER_BENCHMARK.md"],
+        "acceptance": ["SPICE shows a correct CC->CV charge curve with taper termination and an LVD that disconnects at the set threshold", "each safety cutoff (OVP/UVP/OCP/OTP) trips at its threshold in simulation", "PCB power traces meet width/ampacity + thermal on the pass device", "firmware charge state-machine reaches DONE on a full charge and enters FAULT on injected over-temp/over-voltage via the sensor bridge", "wired into scripts/gate.sh as an env-gated stage; honest skips where backends absent"]
+      },
+      "tools": null,
+      "end_condition": "The charger is designed, simulated (charge profile + safety trips + LVD), laid out, and firmware-emulated with asserted safety behavior.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_bench_harness",
+      "type": "plan",
+      "name": "B3: Governed + cached + profiled testing-protocol harness",
+      "inputs": {
+        "request": "Generalize the two benchmarks into a reusable testing-protocol harness (extend benchmarks/simsuite/run_all.py + resguard) that runs the full ECAD+sim range under the F3 governor, reuses the F1 solve-state cache, emits F2 nested profile trees per run, and produces a single PASS/WARN/FAIL/SKIP report with per-stage numbers. This is the 'new testing protocols' deliverable — it must cover the entire ECAD suite and its integrations with the simulation suite and the 3D/physical-modeling section (housing integration via ecad->3d/boardphys).",
+        "write_set": ["benchmarks/simsuite/run_all.py", "benchmarks/simsuite/resguard.py", "benchmarks/simsuite/ecad_e2e_bench.py", "scripts/gate.sh"],
+        "acceptance": ["harness runs both benchmarks + the ECAD/sim/3D integration checks under one governed, cached, profiled protocol", "single consolidated report with per-stage verdicts + nested profile", "gate.sh wires it env-gated (skip-clean on unprovisioned boxes)"]
+      },
+      "tools": null,
+      "end_condition": "One governed/cached/profiled protocol covers the whole ECAD+sim+3D range with a consolidated verdict.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_benchmarks",
+      "type": "verify",
+      "name": "V-B: Verify both benchmarks + harness",
+      "inputs": {"request": "Run both E2E benchmarks + the harness under the governor; confirm per-stage verdicts, cache reuse on second run, nested profile emission, and honest skips. No fabricated success anywhere.", "check_type": "requirement"},
+      "tools": null,
+      "end_condition": "Both benchmarks + harness pass or document environment skips; caching + profiling observed.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_report",
+      "type": "report",
+      "name": "Report + land + graph update",
+      "inputs": {"request": "Log files changed, new capabilities (sim cache, nested profiler, dynamic governor, ECAD placement/trace-opt/antenna/board-flow, sensor bridge, GPU paths, both benchmarks + harness), verification commands + results, and honest limitations in docs/REFACTOR_LOG.md. Commit per verified domain and push to master as each unit goes green; graphify update."},
+      "tools": null,
+      "end_condition": "Every claim reproducible; verified units landed on master; graph refreshed.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    }
+  ],
+  "edges": [
+    {"from": "n_gate_scope", "to": "n_sim_cache"},
+    {"from": "n_gate_scope", "to": "n_profiler_tree"},
+    {"from": "n_gate_scope", "to": "n_governor"},
+    {"from": "n_gate_scope", "to": "n_parts_pack"},
+
+    {"from": "n_governor", "to": "n_place"},
+    {"from": "n_governor", "to": "n_trace_opt"},
+    {"from": "n_parts_pack", "to": "n_place"},
+    {"from": "n_place", "to": "n_trace_opt"},
+    {"from": "n_trace_opt", "to": "n_antenna"},
+    {"from": "n_place", "to": "n_board_flow"},
+    {"from": "n_trace_opt", "to": "n_board_flow"},
+
+    {"from": "n_parts_pack", "to": "n_sensor_bridge"},
+    {"from": "n_governor", "to": "n_gpu_parallel"},
+    {"from": "n_sim_cache", "to": "n_gpu_parallel"},
+
+    {"from": "n_sim_cache", "to": "n_verify_foundation"},
+    {"from": "n_profiler_tree", "to": "n_verify_foundation"},
+    {"from": "n_governor", "to": "n_verify_foundation"},
+    {"from": "n_parts_pack", "to": "n_verify_foundation"},
+
+    {"from": "n_place", "to": "n_verify_ecad"},
+    {"from": "n_trace_opt", "to": "n_verify_ecad"},
+    {"from": "n_antenna", "to": "n_verify_ecad"},
+    {"from": "n_board_flow", "to": "n_verify_ecad"},
+
+    {"from": "n_sensor_bridge", "to": "n_verify_sim"},
+    {"from": "n_gpu_parallel", "to": "n_verify_sim"},
+
+    {"from": "n_verify_foundation", "to": "n_integration_gate"},
+    {"from": "n_verify_ecad", "to": "n_integration_gate"},
+    {"from": "n_verify_sim", "to": "n_integration_gate"},
+
+    {"from": "n_integration_gate", "to": "n_bench_flight"},
+    {"from": "n_integration_gate", "to": "n_bench_charger"},
+    {"from": "n_bench_flight", "to": "n_bench_harness"},
+    {"from": "n_bench_charger", "to": "n_bench_harness"},
+    {"from": "n_bench_harness", "to": "n_verify_benchmarks"},
+    {"from": "n_verify_benchmarks", "to": "n_report"}
+  ]
+}

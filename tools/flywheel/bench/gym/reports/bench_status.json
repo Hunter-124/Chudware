@@ -1,0 +1,12 @@
+{
+  "running": false,
+  "stage": "running",
+  "started": null,
+  "finished": null,
+  "last_error": null,
+  "last_result_path": null,
+  "mode": null,
+  "tiers": [],
+  "pid": 2673074,
+  "exit_code": null
+}

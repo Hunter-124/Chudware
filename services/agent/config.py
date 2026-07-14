@@ -113,8 +113,9 @@ def provider_offline_safe(provider: Provider) -> bool:
     if name in ("mock", "mock-roles", "base"):
         return True
     if name in ("anthropic", "gemini", "openrouter", "xai",
-                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"):
-        return False  # always cloud (incl. subscription-auth providers, §4.4)
+                "anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
+                "claude-cli", "codex-cli"):
+        return False  # always cloud (incl. subscription-auth + CLI-subscription providers)
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
         # No base_url means the real OpenAI cloud endpoint; otherwise check the host.
@@ -179,6 +180,8 @@ _ROUTING_KIND_TO_PROVIDER_NAME = {
     "mock": "mock",
     "lmstudio": "openai",
     "ollama": "openai",
+    "claude-cli": "claude-cli",
+    "codex-cli": "codex-cli",
 }
 
 # cfg sub-key each provider name reads its base_url from (see _resolve_provider below).
@@ -283,8 +286,10 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
                 f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
-    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"):
-        # Subscription-auth providers (§4.4) always talk to a vendor cloud endpoint.
+    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub", "xai-sub",
+                            "claude-cli", "codex-cli"):
+        # Subscription-auth providers (§4.4) and CLI-subscription drivers always talk to
+        # a vendor cloud endpoint (the CLI is just a local front-end).
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the subscription "
             f"provider {name!r} uses a vendor cloud endpoint and is refused. Use a local "
@@ -397,6 +402,28 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         from .providers.xai_sub_provider import XAISubProvider, DEFAULT_MODEL
 
         return XAISubProvider(model=cfg.get("model", DEFAULT_MODEL))
+
+    if name == "claude-cli":
+        # Headless Claude Code CLI — subscription-backed, never offline-safe.
+        from .providers.claude_cli_provider import ClaudeCliProvider, DEFAULT_MODEL
+
+        cc = dict(cfg.get("claude_cli", {}) or {})
+        return ClaudeCliProvider(
+            model=cfg.get("model") or cc.get("model") or DEFAULT_MODEL,
+            binary=cc.get("binary") or "claude",
+            timeout=float(cc.get("timeout", 300.0)),
+        )
+
+    if name == "codex-cli":
+        # Headless Codex CLI — subscription-backed, never offline-safe.
+        from .providers.codex_cli_provider import CodexCliProvider, DEFAULT_MODEL
+
+        cc = dict(cfg.get("codex_cli", {}) or {})
+        return CodexCliProvider(
+            model=cfg.get("model") or cc.get("model") or DEFAULT_MODEL,
+            binary=cc.get("binary") or "codex",
+            timeout=float(cc.get("timeout", 300.0)),
+        )
     if name in ("llamacpp", "llama.cpp", "llama-cpp"):
         from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL
 

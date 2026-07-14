@@ -20,6 +20,8 @@
 #include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > AI)
+#include <map>
+
 
 // ---- C22b prompt editor state ----
 // Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
@@ -159,6 +161,412 @@ static void applyThemeNow(AppState& st, bool light) {
             ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
             ui::palette.viewportBottom[2]);
 }
+// ---- Subscription accounts (Settings → AI → Accounts) ----------------------
+// Consumes subscription_accounts / subscription_switch / subscription_login /
+// subscription_logout. Polls subscription_status for device-code UX fields.
+struct SubAccountRow {
+    std::string provider;
+    std::string accountId;
+    std::string label;
+    bool active = false;
+    bool connected = false;
+};
+struct SubLoginProgress {
+    bool inProgress = false;
+    bool browserOpened = false;
+    std::string userCode;
+    std::string verifyUrl;
+    std::string stage;
+    std::string lastError;
+};
+struct SubAccountsUi {
+    std::vector<SubAccountRow> rows;
+    std::map<std::string, SubLoginProgress> login;  // by provider friendly id
+    double lastPoll = -1e9;
+    bool pollInFlight = false;
+    std::string lastError;
+};
+static SubAccountsUi s_subAccts;
+
+static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor"};
+static const char* kSubProviderLabels[] = {
+    "xAI Grok", "Claude", "ChatGPT / Codex", "Cursor"};
+
+static void pollSubscriptionAccounts(AppState& st, bool force) {
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_subAccts.lastPoll) < 1.5) return;
+    if (s_subAccts.pollInFlight) return;
+    s_subAccts.lastPoll = now;
+    s_subAccts.pollInFlight = true;
+    st.rpc.call("subscription_accounts", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_subAccts.pollInFlight = false;
+        if (!r.ok || !r.result.is_object()) {
+            // RPC missing / worker down — keep last list; surface once.
+            if (!r.ok && s_subAccts.lastError.empty())
+                s_subAccts.lastError = r.err.empty() ? "subscription_accounts unavailable"
+                                                     : r.err;
+            return;
+        }
+        if (r.result.value("ok", true) == false) {
+            s_subAccts.lastError = r.result.value("reason", std::string("accounts failed"));
+            return;
+        }
+        s_subAccts.lastError.clear();
+        s_subAccts.rows.clear();
+        auto arr = r.result.value("accounts", nlohmann::json::array());
+        if (!arr.is_array()) return;
+        for (const auto& a : arr) {
+            if (!a.is_object()) continue;
+            SubAccountRow row;
+            row.provider  = a.value("provider", std::string());
+            row.accountId = a.value("account_id", std::string());
+            row.label     = a.value("label", std::string());
+            if (row.label.empty()) row.label = a.value("email", std::string());
+            if (row.label.empty()) row.label = row.accountId.empty() ? "(account)" : row.accountId;
+            row.active    = a.value("active", false);
+            row.connected = a.value("connected", true);
+            s_subAccts.rows.push_back(std::move(row));
+        }
+    });
+    // Also poll status for live login progress (device code etc.).
+    st.rpc.call("subscription_status", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        if (!r.ok || !r.result.is_object()) return;
+        auto providers = r.result.value("providers", nlohmann::json::object());
+        if (!providers.is_object()) return;
+        for (auto it = providers.begin(); it != providers.end(); ++it) {
+            if (!it.value().is_object()) continue;
+            SubLoginProgress& p = s_subAccts.login[it.key()];
+            const auto& x = it.value();
+            p.inProgress = x.value("login_in_progress", false);
+            p.browserOpened = x.value("browser_opened", false);
+            p.userCode = x.value("user_code", std::string());
+            p.verifyUrl = x.value("verification_url", std::string());
+            if (p.verifyUrl.empty())
+                p.verifyUrl = x.value("verification_uri", std::string());
+            p.stage = x.value("login_stage", std::string());
+            p.lastError = x.value("last_error", std::string());
+        }
+    });
+}
+
+static void drawSubscriptionAccounts(AppState& st, float sc) {
+    dimText("Named subscription accounts per provider. Sign in adds another account; "
+            "Set active selects which credential the harness uses.");
+    pollSubscriptionAccounts(st, false);
+
+    if (!s_subAccts.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("%s", s_subAccts.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    for (int pi = 0; pi < 4; ++pi) {
+        const char* prov = kSubProviders[pi];
+        const char* plabel = kSubProviderLabels[pi];
+        ImGui::PushID(prov);
+        ImGui::Dummy(ImVec2(0, 4.0f * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
+        ImGui::TextUnformatted(plabel);
+        ImGui::PopStyleColor();
+
+        // Rows for this provider.
+        bool any = false;
+        for (size_t i = 0; i < s_subAccts.rows.size(); ++i) {
+            const SubAccountRow& row = s_subAccts.rows[i];
+            if (row.provider != prov) continue;
+            any = true;
+            ImGui::PushID((int)i);
+            // Radio for active account.
+            bool active = row.active;
+            char radioLbl[256];
+            std::snprintf(radioLbl, sizeof(radioLbl), "%s%s",
+                          row.label.c_str(),
+                          row.connected ? "" : " (disconnected)");
+            if (ImGui::RadioButton(radioLbl, active)) {
+                if (!active) {
+                    nlohmann::json p;
+                    p["provider"] = prov;
+                    p["account_id"] = row.accountId;
+                    st.rpc.call("subscription_switch", p, [](const core::RpcResult&) {
+                        s_subAccts.lastPoll = -1e9;  // force refresh
+                    });
+                    // Optimistic local flip.
+                    for (auto& r2 : s_subAccts.rows)
+                        if (r2.provider == prov) r2.active = false;
+                    s_subAccts.rows[i].active = true;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Sign out")) {
+                nlohmann::json p;
+                p["provider"] = prov;
+                p["account_id"] = row.accountId;
+                st.rpc.call("subscription_logout", p, [](const core::RpcResult&) {
+                    s_subAccts.lastPoll = -1e9;
+                });
+                // Optimistic remove.
+                s_subAccts.rows.erase(s_subAccts.rows.begin() + (long)i);
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        if (!any) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("No accounts signed in");
+            ImGui::PopStyleColor();
+        }
+
+        // Live login progress for this provider (device-code UX).
+        SubLoginProgress& prog = s_subAccts.login[prov];
+        if (prog.inProgress) {
+            if (prog.userCode.empty() && prog.verifyUrl.empty()) {
+                ImGui::TextUnformatted("Opening browser\xe2\x80\xa6");
+            } else {
+                if (prog.browserOpened)
+                    ImGui::TextUnformatted("Browser opened \xe2\x80\x94 approve access, then wait\xe2\x80\xa6");
+                else
+                    ImGui::TextUnformatted("Could not auto-open browser \xe2\x80\x94 open the link below:");
+                if (!prog.userCode.empty()) {
+                    ImGui::Text("Code: %s", prog.userCode.c_str());
+                    ImGui::SameLine();
+                    char copyId[64];
+                    std::snprintf(copyId, sizeof(copyId), "Copy code##%s", prov);
+                    if (ImGui::SmallButton(copyId))
+                        ImGui::SetClipboardText(prog.userCode.c_str());
+                }
+                const std::string fallbackUrl =
+                    prog.verifyUrl.empty()
+                        ? (std::string(prov) == "xai" ? "https://accounts.x.ai/activate"
+                                                      : prog.verifyUrl)
+                        : prog.verifyUrl;
+                if (!fallbackUrl.empty()) {
+                    ImGui::TextWrapped("%s", fallbackUrl.c_str());
+                    char openId[64];
+                    std::snprintf(openId, sizeof(openId), "Open in browser##%s", prov);
+                    if (ImGui::SmallButton(openId)) {
+#if defined(_WIN32)
+                        std::system(("start \"\" \"" + fallbackUrl + "\"").c_str());
+#elif defined(__APPLE__)
+                        std::system(("open '" + fallbackUrl + "'").c_str());
+#else
+                        std::system(("xdg-open '" + fallbackUrl + "' >/dev/null 2>&1 &").c_str());
+#endif
+                    }
+                }
+            }
+            pollSubscriptionAccounts(st, true);
+        } else {
+            char signId[64];
+            std::snprintf(signId, sizeof(signId), "Sign in##%s", prov);
+            if (ImGui::SmallButton(signId)) {
+                prog.inProgress = true;
+                prog.lastError.clear();
+                prog.userCode.clear();
+                prog.verifyUrl.clear();
+                prog.browserOpened = false;
+                prog.stage = "start";
+                nlohmann::json p;
+                p["provider"] = prov;
+                // xAI is device-code only; others use browser OAuth.
+                if (std::string(prov) == "xai" || std::string(prov) == "codex")
+                    p["device"] = true;
+                st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
+                    SubLoginProgress& pr = s_subAccts.login[prov];
+                    if (!r.ok) {
+                        pr.inProgress = false;
+                        pr.lastError = r.err.empty() ? "login failed" : r.err;
+                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                        pr.inProgress = false;
+                        auto reason = r.result.value("reason", std::string());
+                        auto hint = r.result.value("hint", std::string());
+                        pr.lastError = reason.empty() ? "login failed" : reason;
+                        if (!hint.empty()) pr.lastError += " — " + hint;
+                    }
+                    s_subAccts.lastPoll = -1e9;
+                });
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Add another %s subscription account (browser OAuth).", plabel);
+        }
+        if (!prog.lastError.empty() && !prog.inProgress) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", prog.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopID();
+    }
+}
+
+// ---- Run benchmark (Settings → AI → Model Leaderboard) ---------------------
+struct BenchUi {
+    int source = 1;   // 0=current copilot, 1=xAI grok-4.5, 2=local
+    int mode = 0;     // 0=diag, 1=smoke
+    bool running = false;
+    bool pollInFlight = false;
+    double lastPoll = -1e9;
+    std::string stage = "idle";
+    std::string lastError;
+    std::string lastResultPath;
+    bool wasRunning = false;
+};
+static BenchUi s_bench;
+
+static std::string benchTierForSource(const Settings& s, int source) {
+    if (source == 1) return "xai:grok-4-5";
+    if (source == 2) return "local-24k";
+    // Current copilot model → gym tier string.
+    const int p = s.provider;
+    const char* model = s.model[0] ? s.model : "";
+    if (p == ui::PROV_XAI) {
+        std::string m = model[0] ? model : "grok-4-5";
+        // Gym tiers use hyphens (grok-4-5); UI may show grok-4.5.
+        for (char& c : m) if (c == '.') c = '-';
+        return std::string("xai:") + m;
+    }
+    if (p == ui::PROV_LOCAL || p == ui::PROV_LLAMACPP) return "local-24k";
+    if (p == ui::PROV_CLOUDCOMPAT && model[0]) {
+        // OpenRouter path when base looks like openrouter.
+        if (std::strstr(s.baseUrl, "openrouter") || std::strstr(model, "/"))
+            return std::string("openrouter:") + model;
+    }
+    if (p == ui::PROV_ANTHROPIC && model[0])
+        return std::string("openrouter:anthropic/") + model;
+    if (p == ui::PROV_OPENAI && model[0])
+        return std::string("openrouter:openai/") + model;
+    if (p == ui::PROV_GEMINI && model[0])
+        return std::string("openrouter:google/") + model;
+    return "local-24k";
+}
+
+static bool benchSourceIsPaid(const Settings& s, int source) {
+    if (source == 1) return true;   // xAI grok
+    if (source == 2) return false;  // local
+    // Current copilot: paid if cloud.
+    return ui::providerIsCloud(s.provider);
+}
+
+static void pollBenchStatus(AppState& st, bool force, ui::leaderboard::Board* lbRefresh) {
+    const double now = ImGui::GetTime();
+    if (!force && (now - s_bench.lastPoll) < 1.0) return;
+    if (s_bench.pollInFlight) return;
+    s_bench.lastPoll = now;
+    s_bench.pollInFlight = true;
+    st.rpc.call("bench_status", nlohmann::json::object(),
+                [lbRefresh](const core::RpcResult& r) {
+        s_bench.pollInFlight = false;
+        if (!r.ok || !r.result.is_object()) return;
+        const bool was = s_bench.running;
+        s_bench.running = r.result.value("running", false);
+        s_bench.stage = r.result.value("stage", std::string("idle"));
+        s_bench.lastError = r.result.value("last_error", std::string());
+        if (s_bench.lastError == "null") s_bench.lastError.clear();
+        // nlohmann may return empty for null; also accept null type.
+        if (r.result.contains("last_error") && r.result["last_error"].is_null())
+            s_bench.lastError.clear();
+        s_bench.lastResultPath = r.result.value("last_result_path", std::string());
+        if (r.result.contains("last_result_path") && r.result["last_result_path"].is_null())
+            s_bench.lastResultPath.clear();
+        // Transition running → done: auto-refresh leaderboard table.
+        if (was && !s_bench.running && lbRefresh) {
+            *lbRefresh = ui::leaderboard::load();
+        }
+        s_bench.wasRunning = s_bench.running;
+    });
+}
+
+static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
+                            double& lbLast) {
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    ImGui::TextUnformatted("Run benchmark");
+    dimText("Spawns the gym CLI detached on the worker. On finish rebuilds "
+            "benchmarks/leaderboard/leaderboard.json and refreshes the table.");
+
+    static const char* kSources[] = {
+        "Current copilot model",
+        "xAI grok-4.5",
+        "Local models (local-24k)",
+    };
+    static const char* kModes[] = {
+        "Quick diag",
+        "C1 smoke",
+    };
+    ImGui::SetNextItemWidth(220.0f * sc);
+    ImGui::Combo("##bench_src", &s_bench.source, kSources, 3);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f * sc);
+    ImGui::Combo("##bench_mode", &s_bench.mode, kModes, 2);
+
+    if (benchSourceIsPaid(st.settings, s_bench.source)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("Uses your API credits / subscription for the selected model.");
+        ImGui::PopStyleColor();
+    }
+
+    const bool canRun = !s_bench.running && st.workerStarted;
+    if (!canRun) ImGui::BeginDisabled();
+    if (ImGui::Button("Run benchmark", ImVec2(160.0f * sc, 0))) {
+        const std::string tier = benchTierForSource(st.settings, s_bench.source);
+        const char* mode = (s_bench.mode == 0) ? "diag" : "smoke";
+        nlohmann::json p;
+        p["mode"] = mode;
+        p["tiers"] = nlohmann::json::array({tier});
+        s_bench.running = true;
+        s_bench.stage = "starting";
+        s_bench.lastError.clear();
+        s_bench.lastPoll = -1e9;
+        st.rpc.call("bench_run", p, [](const core::RpcResult& r) {
+            if (!r.ok) {
+                s_bench.running = false;
+                s_bench.stage = "error";
+                s_bench.lastError = r.err.empty() ? "bench_run failed" : r.err;
+            } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                s_bench.running = false;
+                s_bench.stage = "error";
+                s_bench.lastError = r.result.value("reason", std::string("bench_run failed"));
+            }
+            s_bench.lastPoll = -1e9;
+        });
+    }
+    if (!canRun) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (s_bench.running)
+            ImGui::SetTooltip("A benchmark is already running.");
+        else if (!st.workerStarted)
+            ImGui::SetTooltip("Worker not ready yet.");
+        else
+            ImGui::SetTooltip("Start a detached gym CLI run for the selected model.");
+    }
+
+    // Status line + spinner while running / after finish.
+    pollBenchStatus(st, s_bench.running, &lb);
+    if (s_bench.running) {
+        // Lightweight spinner via rotating dots (no GL dependency).
+        static const char* kSpin[] = {".  ", ".. ", "...", " ..", "  .", "   "};
+        int frame = (int)(ImGui::GetTime() * 6.0) % 6;
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
+        ImGui::Text("Running %s %s", s_bench.stage.c_str(), kSpin[frame]);
+        ImGui::PopStyleColor();
+        // Force table reload timestamp so the next idle poll reloads after done.
+        lbLast = -1e9;
+    } else if (s_bench.stage == "done") {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+        ImGui::TextUnformatted("Done \xe2\x80\x94 leaderboard refreshed");
+        ImGui::PopStyleColor();
+    } else if (s_bench.stage == "error" && !s_bench.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_bench.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
@@ -201,6 +609,12 @@ const SettingsEntry kSettingsEntries[] = {
     { "Model context window",     "AI",           2 },
     { "Local endpoint",           "AI",           2 },
     { "Manage models",            "AI",           2 },
+    { "Accounts",                 "AI",           2 },
+    { "Subscription accounts",    "AI",           2 },
+    { "Sign in",                  "AI",           2 },
+    { "Model leaderboard",        "AI",           2 },
+    { "Run benchmark",            "AI",           2 },
+    { "Benchmark",                "AI",           2 },
     { "Hidden models",            "AI",           2 },
     // Prompts (tab 3) — role prompts + the system-prompt override (moved from Advanced)
     { "Role prompts",             "Prompts",      3 },
@@ -611,6 +1025,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ProviderModel);
                 settingsGlassSectionEnd();
 
+                settingsGlassSectionBegin("##ai_accounts", "Accounts");
+                drawSubscriptionAccounts(st, sc);
+                settingsGlassSectionEnd();
+
                 settingsGlassSectionBegin("##ai_generation", "Generation");
                 ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation);
                 settingsGlassSectionEnd();
@@ -638,6 +1056,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     }
                     ImGui::Dummy(ImVec2(0, 2 * sc));
                     ui::leaderboard::drawCompactTable(s_lb, sc);
+                    drawBenchRunner(st, sc, s_lb, s_lbLast);
                 }
                 settingsGlassSectionEnd();
 

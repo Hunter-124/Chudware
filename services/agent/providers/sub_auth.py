@@ -1,7 +1,9 @@
 """Shared subscription-auth plumbing: PKCE, local callback server, credential store.
 
-Used by the codex/anthropic/cursor subscription providers. Credentials are stored in
-config.json under the "subscription_auth" key, keyed by provider_id.
+Used by the codex/anthropic/cursor/xai subscription providers. Credentials are stored in
+config.json under the "subscription_auth" key, keyed by provider_id. Each provider holds
+named accounts: token cache is keyed (provider_id, account_id) with one active account per
+provider. Legacy single-account entries migrate transparently to account_id ``"default"``.
 """
 from __future__ import annotations
 
@@ -144,49 +146,229 @@ class CallbackServer:
 # ── Credential store (config.json) ──────────────────────────────────────────
 
 _AUTH_KEY = "subscription_auth"
+DEFAULT_ACCOUNT_ID = "default"
 
 
-def _load_all() -> dict:
+def _load_cfg() -> dict:
     if paths.CONFIG.exists():
         try:
-            cfg = json.loads(paths.CONFIG.read_text(encoding="utf-8"))
-            return cfg.get(_AUTH_KEY, {})
+            return json.loads(paths.CONFIG.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
 
-def load_credential(provider_id: str) -> dict | None:
-    creds = _load_all()
-    return creds.get(provider_id)
-
-
-def save_credential(provider_id: str, cred: dict) -> None:
-    if paths.CONFIG.exists():
-        try:
-            cfg = json.loads(paths.CONFIG.read_text(encoding="utf-8"))
-        except Exception:
-            cfg = {}
-    else:
-        cfg = {}
-    auth = cfg.setdefault(_AUTH_KEY, {})
-    auth[provider_id] = cred
+def _write_cfg(cfg: dict) -> None:
     paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
     paths.CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
-def clear_credential(provider_id: str) -> None:
-    if not paths.CONFIG.exists():
-        return
-    try:
-        cfg = json.loads(paths.CONFIG.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    auth = cfg.get(_AUTH_KEY, {})
-    if provider_id in auth:
-        del auth[provider_id]
-        paths.CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+def _load_all() -> dict:
+    return _load_cfg().get(_AUTH_KEY, {}) or {}
 
+
+def _is_multi_entry(entry) -> bool:
+    return isinstance(entry, dict) and isinstance(entry.get("accounts"), dict)
+
+
+def _normalize_entry(entry) -> dict:
+    """Return multi-account shape ``{active, accounts}`` from legacy or multi storage.
+
+    Does not persist. Legacy flat credential dicts become a single account under
+    ``DEFAULT_ACCOUNT_ID`` (or the cred's own ``account_id`` when present).
+    """
+    if not entry or not isinstance(entry, dict):
+        return {"active": DEFAULT_ACCOUNT_ID, "accounts": {}}
+    if _is_multi_entry(entry):
+        accounts = {str(k): dict(v) for k, v in entry["accounts"].items() if isinstance(v, dict)}
+        active = entry.get("active")
+        if active is None or str(active) not in accounts:
+            active = next(iter(accounts), DEFAULT_ACCOUNT_ID)
+        else:
+            active = str(active)
+        return {"active": active, "accounts": accounts}
+    # Legacy single-account credential (flat token dict).
+    raw_aid = entry.get("account_id")
+    if raw_aid is not None and str(raw_aid).strip():
+        aid = str(raw_aid).strip()
+    else:
+        aid = DEFAULT_ACCOUNT_ID
+    return {"active": aid, "accounts": {aid: dict(entry)}}
+
+
+def _persist_entry(provider_id: str, entry: dict) -> None:
+    """Write a multi-account entry; drop the provider key when no accounts remain."""
+    cfg = _load_cfg()
+    auth = cfg.setdefault(_AUTH_KEY, {})
+    accounts = entry.get("accounts") or {}
+    if not accounts:
+        auth.pop(provider_id, None)
+    else:
+        active = entry.get("active")
+        if active is None or str(active) not in accounts:
+            active = next(iter(accounts))
+        auth[provider_id] = {
+            "active": str(active),
+            "accounts": {str(k): dict(v) for k, v in accounts.items()},
+        }
+    _write_cfg(cfg)
+
+
+def _slug_account_id(value: str) -> str:
+    """Filesystem/json-safe account id from an identity string."""
+    s = "".join(ch if ch.isalnum() or ch in "._@+-" else "-" for ch in value.strip())
+    s = s.strip("-._")
+    return (s[:96] if s else DEFAULT_ACCOUNT_ID) or DEFAULT_ACCOUNT_ID
+
+
+def derive_account_id(cred: dict | None) -> str:
+    """Pick a stable account_id from token metadata, else a timestamp slug."""
+    if not cred:
+        return f"acct-{int(time.time())}"
+    for key in ("account_id", "email", "sub", "user_id"):
+        val = cred.get(key)
+        if val is not None and str(val).strip():
+            return _slug_account_id(str(val))
+    return f"acct-{int(time.time())}"
+
+
+def load_credential(provider_id: str, account_id: str | None = None) -> dict | None:
+    """Load a credential for *provider_id*.
+
+    When *account_id* is None, returns the ACTIVE account's token — this is the seam
+    every ``*_sub_provider`` already uses, so multi-account is transparent to them.
+    Migrates legacy flat cache entries on first read (in-memory only until next write).
+    """
+    entry = _normalize_entry(_load_all().get(provider_id))
+    accounts = entry["accounts"]
+    if not accounts:
+        return None
+    if account_id is not None:
+        cred = accounts.get(str(account_id))
+        return dict(cred) if cred else None
+    active = entry["active"]
+    cred = accounts.get(active)
+    if cred is None:
+        cred = accounts.get(DEFAULT_ACCOUNT_ID) or next(iter(accounts.values()), None)
+    return dict(cred) if cred else None
+
+
+def save_credential(
+    provider_id: str,
+    cred: dict,
+    account_id: str | None = None,
+    *,
+    set_active: bool = True,
+) -> str:
+    """Save *cred* under (provider_id, account_id). Returns the account_id used.
+
+    *account_id* defaults to ``cred['account_id']`` then ``DEFAULT_ACCOUNT_ID``.
+    When *set_active* is True (default), that account becomes the provider's active one.
+    Transparent migration: a legacy flat entry is rewritten as multi-account on save.
+    """
+    entry = _normalize_entry(_load_all().get(provider_id))
+    if account_id is not None and str(account_id).strip():
+        aid = str(account_id).strip()
+    else:
+        raw = cred.get("account_id") if isinstance(cred, dict) else None
+        if raw is not None and str(raw).strip():
+            aid = str(raw).strip()
+        elif entry["accounts"] and entry.get("active") in entry["accounts"]:
+            # Refresh path: providers often omit identity; update the active slot
+            # instead of spawning a new "default" account.
+            aid = entry["active"]
+        else:
+            aid = DEFAULT_ACCOUNT_ID
+    stored = dict(cred)
+    # Keep the identity field in sync with the cache key when missing and non-default.
+    if not stored.get("account_id") and aid != DEFAULT_ACCOUNT_ID:
+        stored["account_id"] = aid
+    entry["accounts"][aid] = stored
+    if set_active:
+        entry["active"] = aid
+    elif entry.get("active") not in entry["accounts"]:
+        entry["active"] = aid
+    _persist_entry(provider_id, entry)
+    return aid
+
+
+def clear_credential(provider_id: str, account_id: str | None = None) -> None:
+    """Remove one account (active when *account_id* is None). Drops the provider when empty."""
+    raw = _load_all().get(provider_id)
+    if raw is None:
+        return
+    entry = _normalize_entry(raw)
+    accounts = entry["accounts"]
+    if not accounts:
+        _persist_entry(provider_id, {"active": DEFAULT_ACCOUNT_ID, "accounts": {}})
+        return
+    if account_id is None:
+        target = entry.get("active") or DEFAULT_ACCOUNT_ID
+        if target not in accounts:
+            target = next(iter(accounts))
+    else:
+        target = str(account_id)
+    if target not in accounts:
+        return
+    del accounts[target]
+    if entry.get("active") == target:
+        entry["active"] = next(iter(accounts), DEFAULT_ACCOUNT_ID)
+    entry["accounts"] = accounts
+    _persist_entry(provider_id, entry)
+
+
+def list_accounts(provider_id: str) -> list[dict]:
+    """List stored accounts for *provider_id* (no tokens). Empty when disconnected."""
+    entry = _normalize_entry(_load_all().get(provider_id))
+    active = entry["active"]
+    out: list[dict] = []
+    for aid, cred in entry["accounts"].items():
+        email = cred.get("email")
+        out.append({
+            "account_id": aid,
+            "email": email,
+            "label": email or aid,
+            "active": aid == active,
+            "connected": True,
+            "expires_at_ms": cred.get("expires_at_ms"),
+        })
+    # Stable order: active first, then account_id.
+    out.sort(key=lambda a: (not a["active"], a["account_id"] or ""))
+    return out
+
+
+def get_active_account_id(provider_id: str) -> str | None:
+    """Return the active account_id, or None when the provider has no credentials."""
+    entry = _normalize_entry(_load_all().get(provider_id))
+    if not entry["accounts"]:
+        return None
+    return entry["active"]
+
+
+def set_active_account(provider_id: str, account_id: str) -> bool:
+    """Point the active account pointer at *account_id*. Returns False if unknown."""
+    entry = _normalize_entry(_load_all().get(provider_id))
+    aid = str(account_id)
+    if aid not in entry["accounts"]:
+        return False
+    entry["active"] = aid
+    _persist_entry(provider_id, entry)
+    return True
+
+
+def migrate_legacy_provider(provider_id: str) -> bool:
+    """Persist multi-account shape for a legacy flat entry. Returns True if rewritten."""
+    raw = _load_all().get(provider_id)
+    if raw is None or _is_multi_entry(raw):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    # Only migrate credential-looking dicts.
+    if "access_token" not in raw and "refresh_token" not in raw:
+        return False
+    entry = _normalize_entry(raw)
+    _persist_entry(provider_id, entry)
+    return True
 
 # ── Token lifecycle helpers ─────────────────────────────────────────────────
 

@@ -86,3 +86,10 @@ try:
     WORKER_METHODS.update(_SUB_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
+
+# GUI-launched gym benchmarks (Settings → AI Model Leaderboard).
+try:
+    from engine_oracle.parts_hub.bench_rpc import BENCH_METHODS as _BENCH_METHODS
+    WORKER_METHODS.update(_BENCH_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass

@@ -1,0 +1,1108 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-14T16:15:25Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C1",
+        "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-14T16:15:25Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": "frontier",
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": null,
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-14T16:15:26Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-14T16:15:26Z",
+        "exited": "2026-07-14T16:15:26Z",
+        "exit_gate": "manifest_valid"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "orchestrator",
+      "kind": "delegation",
+      "payload": {
+        "schema": "aicad.delegation/1",
+        "node_id": "dg_abe638166309",
+        "role": "orchestrator",
+        "status": "approved",
+        "depth": 0,
+        "kind": "worker",
+        "model": {
+          "provider": "",
+          "id": "",
+          "tier": ""
+        },
+        "budget": {
+          "tokens_granted": 50000,
+          "tokens_spent": 0,
+          "attempts": 0
+        },
+        "note": "root node auto-approved at init"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 322,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "describe_project",
+          "describe_part",
+          "list_parts",
+          "part_search",
+          "req_create",
+          "research_web_search"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "describe_project",
+        "args": {},
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"text\": \"No DAG run data supplied \\u2014 pass run=<dag_run_dict> from dag_status() once services/dag is available, or from your WS-A dag driver directly. See contracts/dag_schema.md for the expected shape.\"\n}"
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "list_parts",
+        "args": {},
+        "ok": true,
+        "result": "{\n  \"docs\": []\n}"
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "text",
+        "text": "Empty project — greenfield. Decomposing the request into a deliverable manifest and recording it.```json\n{\"tool\": \"ledger_note\", \"args\": {\"kind\": \"deliverables_manifest\", \"actor\": \"intake_analyst\", \"payload\": {\"schema\": \"aicad.deliverables/1\", \"request_verbatim\": \"Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\", \"deliverables\": [{\"id\":"
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 584,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_thread_spec",
+          "research_standard_section",
+          "research_web_search",
+          "research_fetch_page",
+          "research_unit_convert",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "describe_part"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {},
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s1]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s1\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:15:26Z exited=2026-07-14T16:15:26Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 14}"
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "recommend_fit",
+        "args": {
+          "function": "sliding fit rotating or linear"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"recommend_fit\",\n  \"answer\": [\n    {\n      \"id\": \"sliding\",\n      \"recommended_classes\": [\n        \"H7/g6\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Small controlled clearance for sliding without rotation. Parts can be assembled/disassembled by hand.\",\n      \"applications\": [\n        \"lathe spindles\",\n        \"milling arbors\",\n        \"precision machine slides\",\n        \"gearbox shafts not rotating\"\n      ],\n      \"notes\": \"Classic precision sliding fit. 20H7/g6 gives 0.007-0.041mm clearance on 20mm nominal.\",\n      \"typical_clearance_range_um\": [\n        2,\n        25\n      ]\n    },\n    {\n      \"id\": \"press_fit\",\n      \"recommended_classes\": [\n        \"H7/r6\",\n        \"H7/s6\"\n      ],\n      \"character\": \"press\",\n      \"rationale\": \"Substantial interference requiring hydraulic press or thermal expansion. Reliable torque and axial load without fasteners.\",\n      \"applications\": [\n        \"wheel hubs\",\n        \"heav…"
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H7/h6"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.013,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.034\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.987,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H7/h6\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H7/h6\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H8/h7"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.033\n    ],\n    \"shaft\": [\n      -0.021,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.054\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.033\n    ],\n    \"shaft_absolute\": [\n      19.979,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H8/h7\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H8/h7\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H7/h7"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.021,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.042\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.979,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H7/h7\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H7/h7\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_thread_spec",
+        "args": {
+          "designation": "M4"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": \"M4: pitch dia 3.5454 mm, minor dia 3.1412 mm, tensile stress area 8.7788 mm^2 (ISO 724)\",\n  \"units\": \"mm\",\n  \"source_url\": null,\n  \"quote\": \"ISO 724 basic M-profile dimensions\",\n  \"fetched_ts\": \"2026-07-14T16:16:18Z\",\n  \"confidence\": \"bundled\",\n  \"cached\": false,\n  \"designation\": \"M4\",\n  \"series\": \"metric\",\n  \"spec\": {\n    \"major_mm\": 4.0,\n    \"pitch_mm\": 0.7,\n    \"pitch_diameter_mm\": 3.5454,\n    \"minor_diameter_mm\": 3.1412,\n    \"minor_diameter_internal_mm\": 3.2422,\n    \"tensile_stress_area_mm2\": 8.7788,\n    \"thread_height_mm\": 0.6062,\n    \"thread_angle_deg\": 60\n  }\n}"
+      }
+    },
+    {
+      "seq": 21,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "CNC machined flanged bushing with H7 precision bore",
+          "material": "aluminum 6061",
+          "quantity": 1
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"cnc_mill\",\n  \"confidence\": 0.95,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [],\n  \"why\": \"explicit 'cnc_mill' process cue in the request\"\n}"
+      }
+    },
+    {
+      "seq": 22,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "agent",
+      "kind": "decision",
+      "payload": {
+        "name": "manufacturing_process",
+        "value": "cnc_mill",
+        "driver": "H7 precision bore requires machining; resolve_process selected cnc_mill for precision sliding bore",
+        "provenance": "resolve_process",
+        "needs_confirm": false
+      }
+    },
+    {
+      "seq": 23,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "decision",
+          "payload": {
+            "name": "manufacturing_process",
+            "value": "cnc_mill",
+            "driver": "H7 precision bore requires machining; resolve_process selected cnc_mill for precision sliding bore",
+            "provenance": "resolve_process",
+            "needs_confirm": false
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 21, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"kind\": \"decision\", \"ts\": \"2026-07-14T16:16:44Z\"}"
+      }
+    },
+    {
+      "seq": 24,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 263,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "buildgraph_status",
+          "workspace_status",
+          "describe_project",
+          "describe_part",
+          "ask_user"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "dag_status"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 25,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s1]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s1\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Decisions\\n  ? [?]:  \\u2014 \\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:15:26Z exited=2026-07-14T16:15:26Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 24}"
+      }
+    },
+    {
+      "seq": 26,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "manifest",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": false, \"error\": \"unknown section 'manifest'\", \"allowed\": [\"artifacts\", \"brief\", \"build_nodes\", \"decisions\", \"dimensions\", \"features\", \"geometry_specs\", \"linkages\", \"questions\", \"requirements\", \"stage_log\"]}"
+      }
+    },
+    {
+      "seq": 27,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "requirements",
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"section\": \"requirements\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 28,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "requirements",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"section\": \"requirements\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 29,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 4000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s1]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s1\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Decisions\\n  ? [?]:  \\u2014 \\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:15:26Z exited=2026-07-14T16:15:26Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 28}"
+      }
+    },
+    {
+      "seq": 30,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "dimensions",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"section\": \"dimensions\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 31,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "features",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"section\": \"features\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 32,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "geometry_specs",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"section\": \"geometry_specs\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 33,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 273,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "buildgraph_status",
+          "delegate",
+          "describe_part",
+          "workspace_status"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "channel_send",
+          "request_resolve",
+          "council_convene"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 34,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {},
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s1]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s1\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Decisions\\n  ? [?]:  \\u2014 \\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:15:26Z exited=2026-07-14T16:15:26Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 33}"
+      }
+    },
+    {
+      "seq": 35,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "workspace_status",
+        "args": {
+          "run_id": "gym_C1_open_xai:grok-4-5_s1"
+        },
+        "ok": true,
+        "result": "{\"ok\": false, \"error\": \"no active workspace session for run_id='gym_C1_open_xai:grok-4-5_s1'\", \"hint\": \"Session is created when WorkspaceSession is registered via register_session().\"}"
+      }
+    },
+    {
+      "seq": 36,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": null,
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s1\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s1]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s1\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Decisions\\n  ? [?]:  \\u2014 \\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:15:26Z exited=2026-07-14T16:15:26Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 35}"
+      }
+    },
+    {
+      "seq": 37,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "org_structure",
+          "actor": "department_manager",
+          "payload": {
+            "mission": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+            "rationale": "Single primary part with drawing/CAM satellites; no multi-body assembly or neighboring product departments required. One department owns the full deliverable cluster.",
+            "departments": [
+              {
+                "id": "dept_flanged_bushing",
+                "name": "Flanged Bushing",
+                "owner_role": "department_manager",
+                "deliverables": [
+                  "part: flanged_bushing (geometry body with sliding-fit bore for 20 mm shaft, flange with 4-hole M4 bolt circle)",
+                  "drawing: flanged_bushing_2d (dims, fits, bolt circle, notes)",
+                  "cam: flanged_bushing_cam (optional manufacturing satellites if in scope)"
+                ],
+                "interfaces": [
+                  "bore: sliding fit to 20 mm shaft (H7/g6 or equivalent ISO fit — to be ratified in build strategy)",
+                  "flange bolt circle: 4x M4 clearance holes (pitch circle diameter and thickness TBD in strategy; interfaces to mating structure if any)"
+                ],
+                "neighbors": []
+              }
+            ],
+            "confirmation": "Each department has an explicit owner_role. Single-department mission; department_manager owns dept_flanged_bushing end-to-end."
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": false, \"error\": \"unknown kind 'org_structure'\", \"valid_kinds\": [\"artifact\", \"brief\", \"build_node\", \"decision\", \"dimension\", \"feature\", \"geometry_spec\", \"linkage\", \"note\", \"question\", \"requirement\", \"stage\"]}"
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C1_open_xai:grok-4-5_s1",
+    "brief": {
+      "title": "Gym C1",
+      "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+      "success_criteria": []
+    },
+    "requirements": [],
+    "decisions": [
+      {
+        "name": "manufacturing_process",
+        "value": "cnc_mill",
+        "driver": "H7 precision bore requires machining; resolve_process selected cnc_mill for precision sliding bore",
+        "provenance": "resolve_process",
+        "needs_confirm": false
+      }
+    ],
+    "dimensions": [],
+    "questions": [],
+    "stage_log": [
+      {
+        "stage": "intake",
+        "entered": "2026-07-14T16:15:26Z",
+        "exited": "2026-07-14T16:15:26Z",
+        "exit_gate": "manifest_valid"
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables"
+      }
+    ],
+    "criterion_results": [],
+    "features": [],
+    "geometry_specs": [],
+    "linkages": [],
+    "build_nodes": []
+  }
+}

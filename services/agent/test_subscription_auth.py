@@ -101,7 +101,9 @@ def test_save_credential_preserves_other_keys(tmp_config):
     # Non-auth keys survive the merge-write.
     assert on_disk["provider"] == "anthropic"
     assert on_disk["api_key"] == "keep-me"
-    assert on_disk["subscription_auth"]["cursor"]["access_token"] == "t"
+    entry = on_disk["subscription_auth"]["cursor"]
+    assert entry["active"] == sub_auth.DEFAULT_ACCOUNT_ID
+    assert entry["accounts"][sub_auth.DEFAULT_ACCOUNT_ID]["access_token"] == "t"
 
 
 def test_is_expired_with_skew():
@@ -487,3 +489,235 @@ def test_parse_xai_tier_and_provider_resolution(tmp_config, monkeypatch):
     assert calls[-1][0] == "xai-sub"
     assert calls[-1][1] == "grok-4.5"
     assert prov.name == "xai-sub"
+
+
+
+# ── Multi-account credential store ──────────────────────────────────────────
+
+def test_legacy_flat_cache_migrates_transparently(tmp_config):
+    """Existing single-account cache files still resolve; migrate writes multi shape."""
+    # Write a legacy flat credential directly (pre-multi-account format).
+    tmp_config.write_text(json.dumps({
+        "subscription_auth": {
+            "xai-sub": {
+                "access_token": "legacy-tok",
+                "refresh_token": "legacy-rt",
+                "expires_at_ms": 999,
+                "email": "old@x.ai",
+                "account_id": "acct-legacy",
+            }
+        }
+    }))
+    # Transparent read without rewrite.
+    cred = sub_auth.load_credential("xai-sub")
+    assert cred is not None
+    assert cred["access_token"] == "legacy-tok"
+    assert cred["email"] == "old@x.ai"
+    # Active pointer resolves to the legacy account_id when present.
+    assert sub_auth.get_active_account_id("xai-sub") == "acct-legacy"
+
+    # Explicit migrate rewrites on disk.
+    assert sub_auth.migrate_legacy_provider("xai-sub") is True
+    on_disk = json.loads(tmp_config.read_text())
+    entry = on_disk["subscription_auth"]["xai-sub"]
+    assert "accounts" in entry and entry["active"] == "acct-legacy"
+    assert entry["accounts"]["acct-legacy"]["access_token"] == "legacy-tok"
+    # Second migrate is a no-op.
+    assert sub_auth.migrate_legacy_provider("xai-sub") is False
+
+    # Legacy without account_id becomes "default".
+    tmp_config.write_text(json.dumps({
+        "subscription_auth": {
+            "cursor": {"access_token": "c-tok", "refresh_token": "c-rt"}
+        }
+    }))
+    assert sub_auth.load_credential("cursor")["access_token"] == "c-tok"
+    assert sub_auth.get_active_account_id("cursor") == sub_auth.DEFAULT_ACCOUNT_ID
+    sub_auth.migrate_legacy_provider("cursor")
+    entry = json.loads(tmp_config.read_text())["subscription_auth"]["cursor"]
+    assert entry["active"] == "default"
+    assert "default" in entry["accounts"]
+
+
+def test_two_accounts_same_provider_and_switch(tmp_config):
+    """Two accounts under one provider; switch flips active token resolution."""
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "tok-a", "refresh_token": "rt-a",
+        "email": "a@x.ai", "account_id": "acct-a",
+        "expires_at_ms": 111,
+    }, account_id="acct-a")
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "tok-b", "refresh_token": "rt-b",
+        "email": "b@x.ai", "account_id": "acct-b",
+        "expires_at_ms": 222,
+    }, account_id="acct-b")
+
+    accts = sub_auth.list_accounts("xai-sub")
+    assert {a["account_id"] for a in accts} == {"acct-a", "acct-b"}
+    # Last save is active.
+    assert sub_auth.get_active_account_id("xai-sub") == "acct-b"
+    assert sub_auth.load_credential("xai-sub")["access_token"] == "tok-b"
+
+    assert sub_auth.set_active_account("xai-sub", "acct-a") is True
+    assert sub_auth.get_active_account_id("xai-sub") == "acct-a"
+    assert sub_auth.load_credential("xai-sub")["access_token"] == "tok-a"
+    assert sub_auth.load_credential("xai-sub", account_id="acct-b")["access_token"] == "tok-b"
+
+    # Logout active only — other account remains.
+    sub_auth.clear_credential("xai-sub")  # active = acct-a
+    assert sub_auth.load_credential("xai-sub")["access_token"] == "tok-b"
+    assert sub_auth.get_active_account_id("xai-sub") == "acct-b"
+
+    # Logout remaining → disconnected.
+    sub_auth.clear_credential("xai-sub")
+    assert sub_auth.load_credential("xai-sub") is None
+    assert sub_auth.list_accounts("xai-sub") == []
+
+
+def test_active_token_resolution_via_sub_providers(tmp_config):
+    """*_sub_provider constructors resolve the ACTIVE account through load_credential."""
+    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+
+    sub_auth.save_credential(PROVIDER_ID, {
+        "access_token": "first", "refresh_token": "r1",
+        "email": "one@x.ai", "account_id": "one",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+    }, account_id="one")
+    sub_auth.save_credential(PROVIDER_ID, {
+        "access_token": "second", "refresh_token": "r2",
+        "email": "two@x.ai", "account_id": "two",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+    }, account_id="two")
+
+    p = XAISubProvider()
+    assert p._cred["access_token"] == "second"
+
+    assert sl.switch("xai", "one")["ok"] is True
+    p2 = XAISubProvider()
+    assert p2._cred["access_token"] == "first"
+
+    st = sl.status()["xai"]
+    assert st["connected"] is True
+    assert st["email"] == "one@x.ai"
+    assert st["account_id"] in ("one", "one")  # active pointer
+    assert len(st["accounts"]) == 2
+    assert sum(1 for a in st["accounts"] if a["active"]) == 1
+
+
+def test_login_derives_account_id_and_sets_active(tmp_config, monkeypatch):
+    """login() derives account_id from cred metadata and marks it active."""
+    from agent.providers import xai_sub_provider as xsp
+
+    def fake_login_device(self, open_browser=True, progress=None):
+        cred = {
+            "access_token": "new-tok",
+            "refresh_token": "new-rt",
+            "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+            "account_id": "user-xyz",
+            "email": "user@x.ai",
+        }
+        # Mimic provider save (legacy path may write under default first).
+        sub_auth.save_credential(xsp.PROVIDER_ID, cred)
+        self._cred = cred
+        return cred
+
+    monkeypatch.setattr(xsp.XAISubProvider, "login_device", fake_login_device)
+    out = sl.login("xai", open_browser=False)
+    assert out["ok"] is True
+    assert out["account_id"] == "user-xyz"
+    assert sub_auth.get_active_account_id("xai-sub") == "user-xyz"
+    assert sub_auth.load_credential("xai-sub")["access_token"] == "new-tok"
+
+
+def test_dispatcher_accounts_and_switch(tmp_config):
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "t1", "email": "a@c.com", "account_id": "a1",
+    }, account_id="a1")
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "t2", "email": "b@c.com", "account_id": "a2",
+    }, account_id="a2")
+
+    all_accts = sl.accounts()
+    claude = [a for a in all_accts if a["provider"] == "claude"]
+    assert len(claude) == 2
+    assert all(a["connected"] for a in claude)
+    assert sum(1 for a in claude if a["active"]) == 1
+
+    filtered = sl.accounts("claude")
+    assert len(filtered) == 2
+    assert sl.accounts("nope") == []
+
+    bad = sl.switch("claude", "missing")
+    assert bad["ok"] is False
+
+    ok = sl.switch("claude", "a1")
+    assert ok["ok"] is True and ok["account_id"] == "a1"
+    assert sub_auth.load_credential("anthropic-sub")["access_token"] == "t1"
+
+    # logout(None) clears active only.
+    assert sl.logout("claude") == {"ok": True}
+    assert sub_auth.load_credential("anthropic-sub")["access_token"] == "t2"
+    assert sl.logout("claude", account_id="a2") == {"ok": True}
+    assert sl.status()["claude"]["connected"] is False
+
+
+def test_subscription_rpc_multi_account_shapes(tmp_config):
+    """RPC shapes for accounts/switch + backward-compat status/logout."""
+    from engine_oracle.parts_hub import subscription_rpc as rpc
+
+    emit = lambda *_a, **_k: None  # noqa: E731
+
+    # Empty accounts list.
+    out = rpc.SUBSCRIPTION_METHODS["subscription_accounts"]({}, emit)
+    assert out["ok"] is True and out["accounts"] == []
+
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "tok1", "email": "one@x.ai", "account_id": "one",
+        "expires_at_ms": 1,
+    }, account_id="one")
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "tok2", "email": "two@x.ai", "account_id": "two",
+        "expires_at_ms": 2,
+    }, account_id="two")
+
+    out = rpc.SUBSCRIPTION_METHODS["subscription_accounts"]({"provider": "xai"}, emit)
+    assert out["ok"] is True
+    assert len(out["accounts"]) == 2
+    for a in out["accounts"]:
+        assert set(a) >= {"provider", "account_id", "label", "email", "active", "connected"}
+        assert a["provider"] == "xai"
+        assert "access_token" not in a
+
+    # status still works (GUI in the wild).
+    st = rpc.SUBSCRIPTION_METHODS["subscription_status"]({}, emit)
+    assert st["ok"] is True
+    assert st["providers"]["xai"]["connected"] is True
+    assert "accounts" in st["providers"]["xai"]
+
+    sw = rpc.SUBSCRIPTION_METHODS["subscription_switch"](
+        {"provider": "xai", "account_id": "one"}, emit
+    )
+    assert sw["ok"] is True and sw["account_id"] == "one"
+    assert sub_auth.load_credential("xai-sub")["access_token"] == "tok1"
+
+    # logout without account_id = active.
+    lo = rpc.SUBSCRIPTION_METHODS["subscription_logout"]({"provider": "xai"}, emit)
+    assert lo["ok"] is True
+    assert sub_auth.get_active_account_id("xai-sub") == "two"
+
+    # logout with explicit account_id.
+    lo2 = rpc.SUBSCRIPTION_METHODS["subscription_logout"](
+        {"provider": "xai", "account_id": "two"}, emit
+    )
+    assert lo2["ok"] is True
+    assert sub_auth.load_credential("xai-sub") is None
+
+    # Unknown provider / missing account_id contract shapes.
+    bad = rpc.SUBSCRIPTION_METHODS["subscription_switch"]({"provider": "xai"}, emit)
+    assert bad["ok"] is False and "account_id" in bad["reason"]
+    bad2 = rpc.SUBSCRIPTION_METHODS["subscription_accounts"]({"provider": "nope"}, emit)
+    assert bad2["ok"] is False
+
+    # Methods registry includes new RPCs.
+    assert "subscription_accounts" in rpc.SUBSCRIPTION_METHODS
+    assert "subscription_switch" in rpc.SUBSCRIPTION_METHODS

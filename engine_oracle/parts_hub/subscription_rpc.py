@@ -1,8 +1,9 @@
 """Worker-RPC bridge for subscription-auth logins (§4.4) — the GUI Settings seam.
 
-Exposes ``subscription_status`` / ``subscription_login`` / ``subscription_logout`` as
-engine-worker methods so the C++/ImGui Settings panel reaches them over the same
-newline-delimited-JSON worker seam (``WorkerClient``) it uses for everything else.
+Exposes ``subscription_status`` / ``subscription_login`` / ``subscription_logout`` /
+``subscription_accounts`` / ``subscription_switch`` as engine-worker methods so the
+C++/ImGui Settings panel reaches them over the same newline-delimited-JSON worker seam
+(``WorkerClient``) it uses for everything else.
 
 ``subscription_login`` runs the browser OAuth flow on a daemon thread and returns
 IMMEDIATELY — the flow blocks up to ~120 s waiting on the local callback, and blocking the
@@ -14,6 +15,10 @@ For xAI's device-code flow the status payload also carries ``user_code``,
 ``verification_url``, and ``browser_opened`` while login is in progress so the GUI can
 show the code + a fallback "open accounts.x.ai/activate" link when the worker process
 could not launch a browser.
+
+Multi-account: ``subscription_accounts`` lists named accounts per provider;
+``subscription_switch`` flips the active account; login/logout accept optional
+``account_id``. Old call shapes remain valid (GUI still polls ``subscription_status``).
 
 Thin wrappers over :mod:`agent.providers.subscription_login`; all failures come back as a
 contract-shaped ``{"ok": false, "reason", "hint"}`` — never a traceback.
@@ -63,6 +68,8 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
     """Start the browser OAuth flow on a daemon thread; return immediately."""
     provider = str((params or {}).get("provider", "")).strip().lower()
     device = bool((params or {}).get("device", False))
+    raw_aid = (params or {}).get("account_id")
+    account_id = str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
     # Explicit open_browser override (default True). Headless workers can pass false;
     # the GUI still gets user_code + verification_url via status polling.
     if "open_browser" in (params or {}):
@@ -109,6 +116,7 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
                 device=device,
                 progress=_progress,
                 open_browser=open_browser,
+                account_id=account_id,
             )
             with _login_lock:
                 prev = dict(_login_state.get(provider) or {})
@@ -144,21 +152,65 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
 
 
 def _subscription_logout(params: dict, _emit: Callable) -> dict:
-    """Clear the stored credential for a provider."""
+    """Clear the stored credential for a provider (optional account_id; None = active)."""
     provider = str((params or {}).get("provider", "")).strip().lower()
     if not provider:
         return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
+    raw_aid = (params or {}).get("account_id")
+    account_id = str(raw_aid).strip() if raw_aid is not None and str(raw_aid).strip() else None
     try:
-        out = _sl().logout(provider)
+        out = _sl().logout(provider, account_id=account_id)
         with _login_lock:
-            _login_state.pop(provider, None)
+            # Only clear live login progress when the active (or last) account is gone.
+            if account_id is None or not _sl().status().get(provider, {}).get("connected"):
+                _login_state.pop(provider, None)
         return out
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subscription_logout failed: {exc}", "hint": ""}
+
+
+def _subscription_accounts(params: dict, _emit: Callable) -> dict:
+    """List named accounts: ``[{provider, account_id, label/email, active, connected}]``."""
+    try:
+        raw = (params or {}).get("provider")
+        provider = str(raw).strip().lower() if raw else None
+        if provider == "":
+            provider = None
+        if provider is not None:
+            valid = {p["id"] for p in _sl().providers()}
+            # Also accept provider names via status keys / resolve.
+            if provider not in valid and _sl()._resolve(provider) is None:
+                return {
+                    "ok": False,
+                    "reason": f"unknown subscription provider {provider!r}",
+                    "hint": f"Use one of: {', '.join(sorted(valid))}.",
+                }
+        accts = _sl().accounts(provider)
+        return {"ok": True, "accounts": accts}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"subscription_accounts failed: {exc}", "hint": ""}
+
+
+def _subscription_switch(params: dict, _emit: Callable) -> dict:
+    """Make account_id the active account for provider."""
+    provider = str((params or {}).get("provider", "")).strip().lower()
+    raw_aid = (params or {}).get("account_id")
+    account_id = str(raw_aid).strip() if raw_aid is not None else ""
+    if not provider:
+        return {"ok": False, "reason": "provider required (codex|claude|cursor|xai)"}
+    if not account_id:
+        return {"ok": False, "reason": "account_id required", "hint": ""}
+    try:
+        return _sl().switch(provider, account_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"subscription_switch failed: {exc}", "hint": ""}
 
 
 SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_status": _subscription_status,
     "subscription_login": _subscription_login,
     "subscription_logout": _subscription_logout,
+    "subscription_accounts": _subscription_accounts,
+    "subscription_switch": _subscription_switch,
 }
+

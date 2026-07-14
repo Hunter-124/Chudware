@@ -1,0 +1,1269 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C1",
+        "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-14T16:22:43Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": "frontier",
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": null,
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-14T16:22:43Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-14T16:22:43Z",
+        "exited": "2026-07-14T16:22:43Z",
+        "exit_gate": "manifest_valid"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "orchestrator",
+      "kind": "delegation",
+      "payload": {
+        "schema": "aicad.delegation/1",
+        "node_id": "dg_e6f8c12d787a",
+        "role": "orchestrator",
+        "status": "approved",
+        "depth": 0,
+        "kind": "worker",
+        "model": {
+          "provider": "",
+          "id": "",
+          "tier": ""
+        },
+        "budget": {
+          "tokens_granted": 50000,
+          "tokens_spent": 0,
+          "attempts": 0
+        },
+        "note": "root node auto-approved at init"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 322,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "describe_project",
+          "describe_part",
+          "list_parts",
+          "part_search",
+          "req_create",
+          "research_web_search"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "describe_project",
+        "args": {},
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"text\": \"No DAG run data supplied \\u2014 pass run=<dag_run_dict> from dag_status() once services/dag is available, or from your WS-A dag driver directly. See contracts/dag_schema.md for the expected shape.\"\n}"
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "flanged bushing 20mm",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [{\"site\": \"\", \"reason\": \"profile_busy\", \"hint\": \"site profile 'amazon' is open in the embedded browser \\u2014 close that session (or finish the login wizard) and retry\"}, {\"site\": \"jlcpcb\", \"reason\": \"timeout\", \"hint\": \"live vendor 'jlcpcb' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"lcsc\", \"reason\": \"timeout\", \"hint\": \"live vendor 'lcsc' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"mcmaster\", \"reason\": \"timeout\", \"hint\": \"live vendor 'mcmaster' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"pcbway\", \"reason\": \"timeout\", \"hint\": \"live vendor 'pcbway' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"snapeda\", \"reason\": \"timeout\", \"hint\": \"live vendor 'snapeda' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"harborfreight\", \"reason\": \"timeout\", \"hint\": \"live vendor 'harborfreight' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"homedep…"
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "deliverables_manifest",
+          "actor": "intake_analyst",
+          "payload": {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+            "deliverables": [
+              {
+                "id": "DL1",
+                "kind": "part",
+                "name": "flanged_bushing",
+                "title": "Flanged bushing for 20 mm shaft",
+                "description": "Single flanged bushing part: cylindrical sleeve with integral flange; sliding-fit bore for a 20 mm shaft; flange carries a 4-hole M4 bolt circle.",
+                "depends_on": [],
+                "target_refs": [],
+                "acceptance_criteria": [
+                  {
+                    "text": "Bore is sized for a sliding (clearance) fit on a nominal 20 mm shaft",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "bore_diameter"
+                      },
+                      "pass_rule": "bore diameter > 20.000 mm and within selected sliding-fit class limits for 20 mm nominal"
+                    }
+                  },
+                  {
+                    "text": "Flange has exactly four mounting holes arranged on a common bolt circle",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "flange_bolt_holes"
+                      },
+                      "pass_rule": "hole_count == 4 and holes share one pitch-circle diameter about the bore axis"
+                    }
+                  },
+                  {
+                    "text": "Mounting holes clear M4 bolts (clearance, not tapped, unless otherwise confirmed)",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "mounting_hole_diameter"
+                      },
+                      "pass_rule": "each mounting hole diameter in typical M4 clearance range (approx 4.3–4.8 mm) or as confirmed"
+                    }
+                  },
+                  {
+                    "text": "Part geometry is a flanged bushing: cylindrical body plus integral flange, coaxial with the bore",
+                    "check": {
+                      "tool": "describe_part",
+                      "params_hint": {},
+                      "pass_rule": "outline shows sleeve body + flange, bore through, coaxial"
+                    }
+                  }
+                ],
+                "outputs": [
+                  "part_doc"
+                ]
+              }
+            ],
+            "assumptions": [
+              {
+                "id": "A1",
+                "text": "Deliverable is a single CAD part only (no drawing, CAM, or assembly) unless the user later asks for more.",
+                "basis": "Request says 'design a flanged bushing'; no drawing/G-code/report mentioned.",
+                "needs_confirm": false
+              },
+              {
+                "id": "A2",
+                "text": "Mounting holes are clearance holes for M4 bolts, not M4 tapped threads.",
+                "basis": "Phrase 'M4 bolt circle' conventionally means bolts through the flange into a mating part.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A3",
+                "text": "Hole-basis sliding fit class will be chosen by spec (typical ISO H7 or H8 on the bore for a 20 mm shaft); exact class and shaft-side fit not fixed here.",
+                "basis": "User said 'sliding-fit' without naming ISO/ANSI class.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A4",
+                "text": "Unstated envelope dimensions (bore length, body OD, flange OD/thickness, bolt-circle diameter, wall thickness, material) will be set to engineering-sensible defaults or project standards by the spec writer.",
+                "basis": "Only functional constraints given: 20 mm shaft, 4× M4 bolt circle, flanged bushing form.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A5",
+                "text": "Material not specified; default to project/material standard (e.g. bearing bronze, brass, or 6061 if machining stock) as chosen downstream.",
+                "basis": "No material in request; no open project material default found.",
+                "needs_confirm": true
+              }
+            ],
+            "ambiguities": [
+              {
+                "id": "Q1",
+                "text": "Bolt circle diameter (PCD) and flange outer diameter are not specified.",
+                "readings": [
+                  "Use a typical proportioned PCD for a ~20 mm bore flanged bushing",
+                  "User will supply PCD and flange OD"
+                ],
+                "blocking": false,
+                "impact": "Changes flange size and hole layout; does not change deliverable count."
+              },
+              {
+                "id": "Q2",
+                "text": "Overall bushing length / engagement length not specified.",
+                "readings": [
+                  "Short pilot flange bushing",
+                  "Long sleeve with flange"
+                ],
+                "blocking": false,
+                "impact": "Affects body length only."
+              },
+              {
+                "id": "Q3",
+                "text": "Whether M4 holes are clearance or tapped.",
+                "readings": [
+                  "Clearance for M4 bolts (default)",
+                  "Tapped M4"
+                ],
+                "blocking": false,
+                "impact": "Hole diameter and callout."
+              },
+              {
+                "id": "Q4",
+                "text": "Exact sliding-fit tolerance class.",
+                "readings": [
+                  "ISO H7 bore",
+                  "ISO H8 bore",
+                  "Other clearance class"
+                ],
+                "blocking": false,
+                "impact": "Bore tolerance band only."
+              }
+            ],
+            "open_questions": [],
+            "notes": "Greenfield session: list_parts empty, no prior DAG/ledger design content. No standard-part hit for a 20 mm flanged bushing (vendor search timed out). Manifest is one part deliverable; drawings/CAM omitted per no-pad rule."
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": false, \"error\": \"unknown kind 'deliverables_manifest'\", \"valid_kinds\": [\"artifact\", \"brief\", \"build_node\", \"decision\", \"dimension\", \"feature\", \"geometry_spec\", \"linkage\", \"note\", \"question\", \"requirement\", \"stage\"]}"
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "brief",
+          "actor": "intake_analyst",
+          "payload": {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+            "deliverables": [
+              {
+                "id": "DL1",
+                "kind": "part",
+                "name": "flanged_bushing",
+                "title": "Flanged bushing for 20 mm shaft",
+                "description": "Single flanged bushing part: cylindrical sleeve with integral flange; sliding-fit bore for a 20 mm shaft; flange carries a 4-hole M4 bolt circle.",
+                "depends_on": [],
+                "target_refs": [],
+                "acceptance_criteria": [
+                  {
+                    "text": "Bore is sized for a sliding (clearance) fit on a nominal 20 mm shaft",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "bore_diameter"
+                      },
+                      "pass_rule": "bore diameter > 20.000 mm and within selected sliding-fit class limits for 20 mm nominal"
+                    }
+                  },
+                  {
+                    "text": "Flange has exactly four mounting holes arranged on a common bolt circle",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "flange_bolt_holes"
+                      },
+                      "pass_rule": "hole_count == 4 and holes share one pitch-circle diameter about the bore axis"
+                    }
+                  },
+                  {
+                    "text": "Mounting holes clear M4 bolts (clearance, not tapped, unless otherwise confirmed)",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "mounting_hole_diameter"
+                      },
+                      "pass_rule": "each mounting hole diameter in typical M4 clearance range (approx 4.3–4.8 mm) or as confirmed"
+                    }
+                  },
+                  {
+                    "text": "Part geometry is a flanged bushing: cylindrical body plus integral flange, coaxial with the bore",
+                    "check": {
+                      "tool": "describe_part",
+                      "params_hint": {},
+                      "pass_rule": "outline shows sleeve body + flange, bore through, coaxial"
+                    }
+                  }
+                ],
+                "outputs": [
+                  "part_doc"
+                ]
+              }
+            ],
+            "assumptions": [
+              {
+                "id": "A1",
+                "text": "Deliverable is a single CAD part only (no drawing, CAM, or assembly) unless the user later asks for more.",
+                "basis": "Request says 'design a flanged bushing'; no drawing/G-code/report mentioned.",
+                "needs_confirm": false
+              },
+              {
+                "id": "A2",
+                "text": "Mounting holes are clearance holes for M4 bolts, not M4 tapped threads.",
+                "basis": "Phrase 'M4 bolt circle' conventionally means bolts through the flange into a mating part.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A3",
+                "text": "Hole-basis sliding fit class will be chosen by spec (typical ISO H7 or H8 on the bore for a 20 mm shaft); exact class and shaft-side fit not fixed here.",
+                "basis": "User said 'sliding-fit' without naming ISO/ANSI class.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A4",
+                "text": "Unstated envelope dimensions (bore length, body OD, flange OD/thickness, bolt-circle diameter, wall thickness, material) will be set to engineering-sensible defaults or project standards by the spec writer.",
+                "basis": "Only functional constraints given: 20 mm shaft, 4× M4 bolt circle, flanged bushing form.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A5",
+                "text": "Material not specified; default to project/material standard (e.g. bearing bronze, brass, or 6061 if machining stock) as chosen downstream.",
+                "basis": "No material in request; no open project material default found.",
+                "needs_confirm": true
+              }
+            ],
+            "ambiguities": [
+              {
+                "id": "Q1",
+                "text": "Bolt circle diameter (PCD) and flange outer diameter are not specified.",
+                "readings": [
+                  "Use a typical proportioned PCD for a ~20 mm bore flanged bushing",
+                  "User will supply PCD and flange OD"
+                ],
+                "blocking": false,
+                "impact": "Changes flange size and hole layout; does not change deliverable count."
+              },
+              {
+                "id": "Q2",
+                "text": "Overall bushing length / engagement length not specified.",
+                "readings": [
+                  "Short pilot flange bushing",
+                  "Long sleeve with flange"
+                ],
+                "blocking": false,
+                "impact": "Affects body length only."
+              },
+              {
+                "id": "Q3",
+                "text": "Whether M4 holes are clearance or tapped.",
+                "readings": [
+                  "Clearance for M4 bolts (default)",
+                  "Tapped M4"
+                ],
+                "blocking": false,
+                "impact": "Hole diameter and callout."
+              },
+              {
+                "id": "Q4",
+                "text": "Exact sliding-fit tolerance class.",
+                "readings": [
+                  "ISO H7 bore",
+                  "ISO H8 bore",
+                  "Other clearance class"
+                ],
+                "blocking": false,
+                "impact": "Bore tolerance band only."
+              }
+            ],
+            "open_questions": [],
+            "notes": "Greenfield session: list_parts empty, no prior DAG/ledger design content. No standard-part hit for a 20 mm flanged bushing (vendor search timed out). Manifest is one part deliverable; drawings/CAM omitted per no-pad rule."
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 10, \"run_id\": \"gym_C1_open_xai:grok-4-5_s2\", \"kind\": \"brief\", \"ts\": \"2026-07-14T16:23:19Z\"}"
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "done",
+        "handoff": {
+          "role": "intake_analyst",
+          "status": "ok",
+          "reasoning_summary": "Greenfield request for one flanged bushing. Decomposed to a single part deliverable (DL1): sliding-fit bore for 20 mm shaft + 4-hole M4 bolt circle on flange. No drawing/CAM/assembly requested, so not padded. Unstated envelope dims, fit class, clearance-vs-tap, and material are non-blocking assumptions/ambiguities with needs_confirm for the spec writer. Manifest written to ledger as brief (schema aicad.deliverables/1).",
+          "manifest": {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+            "deliverables": [
+              {
+                "id": "DL1",
+                "kind": "part",
+                "name": "flanged_bushing",
+                "title": "Flanged bushing for 20 mm shaft",
+                "description": "Single flanged bushing part: cylindrical sleeve with integral flange; sliding-fit bore for a 20 mm shaft; flange carries a 4-hole M4 bolt circle.",
+                "depends_on": [],
+                "target_refs": [],
+                "acceptance_criteria": [
+                  {
+                    "text": "Bore is sized for a sliding (clearance) fit on a nominal 20 mm shaft",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "bore_diameter"
+                      },
+                      "pass_rule": "bore diameter > 20.000 mm and within selected sliding-fit class limits for 20 mm nominal"
+                    }
+                  },
+                  {
+                    "text": "Flange has exactly four mounting holes arranged on a common bolt circle",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "flange_bolt_holes"
+                      },
+                      "pass_rule": "hole_count == 4 and holes share one pitch-circle diameter about the bore axis"
+                    }
+                  },
+                  {
+                    "text": "Mounting holes clear M4 bolts (clearance, not tapped, unless otherwise confirmed)",
+                    "check": {
+                      "tool": "measure_part",
+                      "params_hint": {
+                        "feature": "mounting_hole_diameter"
+                      },
+                      "pass_rule": "each mounting hole diameter in typical M4 clearance range (approx 4.3–4.8 mm) or as confirmed"
+                    }
+                  },
+                  {
+                    "text": "Part geometry is a flanged bushing: cylindrical body plus integral flange, coaxial with the bore",
+                    "check": {
+                      "tool": "describe_part",
+                      "params_hint": {},
+                      "pass_rule": "outline shows sleeve body + flange, bore through, coaxial"
+                    }
+                  }
+                ],
+                "outputs": [
+                  "part_doc"
+                ]
+              }
+            ],
+            "assumptions": [
+              {
+                "id": "A1",
+                "text": "Deliverable is a single CAD part only (no drawing, CAM, or assembly) unless the user later asks for more.",
+                "basis": "Request says 'design a flanged bushing'; no drawing/G-code/report mentioned.",
+                "needs_confirm": false
+              },
+              {
+                "id": "A2",
+                "text": "Mounting holes are clearance holes for M4 bolts, not M4 tapped threads.",
+                "basis": "Phrase 'M4 bolt circle' conventionally means bolts through the flange into a mating part.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A3",
+                "text": "Hole-basis sliding fit class will be chosen by spec (typical ISO H7 or H8 on the bore for a 20 mm shaft); exact class and shaft-side fit not fixed here.",
+                "basis": "User said 'sliding-fit' without naming ISO/ANSI class.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A4",
+                "text": "Unstated envelope dimensions (bore length, body OD, flange OD/thickness, bolt-circle diameter, wall thickness, material) will be set to engineering-sensible defaults or project standards by the spec writer.",
+                "basis": "Only functional constraints given: 20 mm shaft, 4× M4 bolt circle, flanged bushing form.",
+                "needs_confirm": true
+              },
+              {
+                "id": "A5",
+                "text": "Material not specified; default to project/material standard (e.g. bearing bronze, brass, or 6061 if machining stock) as chosen downstream.",
+                "basis": "No material in request; no open project material default found.",
+                "needs_confirm": true
+              }
+            ],
+            "ambiguities": [
+              {
+                "id": "Q1",
+                "text": "Bolt circle diameter (PCD) and flange outer diameter are not specified.",
+                "readings": [
+                  "Use a typical proportioned PCD for a ~20 mm bore flanged bushing",
+                  "User will supply PCD and flange OD"
+                ],
+                "blocking": false,
+                "impact": "Changes flange size and hole layout; does not change deliverable count."
+              },
+              {
+                "id": "Q2",
+                "text": "Overall bushing length / engagement length not specified.",
+                "readings": [
+                  "Short pilot flange bushing",
+                  "Long sleeve with flange"
+                ],
+                "blocking": false,
+                "impact": "Affects body length only."
+              },
+              {
+                "id": "Q3",
+                "text": "Whether M4 holes are clearance or tapped.",
+                "readings": [
+                  "Clearance for M4 bolts (default)",
+                  "Tapped M4"
+                ],
+                "blocking": false,
+                "impact": "Hole diameter and callout."
+              },
+              {
+                "id": "Q4",
+                "text": "Exact sliding-fit tolerance class.",
+                "readings": [
+                  "ISO H7 bore",
+                  "ISO H8 bore",
+                  "Other clearance class"
+                ],
+                "blocking": false,
+                "impact": "Bore tolerance band only."
+              }
+            ],
+            "open_questions": [],
+            "notes": "Greenfield session: list_parts empty, no prior DAG/ledger design content. No standard-part hit for a 20 mm flanged bushing (vendor search timed out). Manifest is one part deliverable; drawings/CAM omitted per no-pad rule."
+          },
+          "ledger_seq": 10
+        }
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 584,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_thread_spec",
+          "research_standard_section",
+          "research_web_search",
+          "research_fetch_page",
+          "research_unit_convert",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "describe_part"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {},
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s2\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s2]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s2\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:22:43Z exited=2026-07-14T16:22:43Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 17}"
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "recommend_fit",
+        "args": {
+          "function": "sliding fit"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"recommend_fit\",\n  \"answer\": [\n    {\n      \"id\": \"sliding\",\n      \"recommended_classes\": [\n        \"H7/g6\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Small controlled clearance for sliding without rotation. Parts can be assembled/disassembled by hand.\",\n      \"applications\": [\n        \"lathe spindles\",\n        \"milling arbors\",\n        \"precision machine slides\",\n        \"gearbox shafts not rotating\"\n      ],\n      \"notes\": \"Classic precision sliding fit. 20H7/g6 gives 0.007-0.041mm clearance on 20mm nominal.\",\n      \"typical_clearance_range_um\": [\n        2,\n        25\n      ]\n    },\n    {\n      \"id\": \"press_fit\",\n      \"recommended_classes\": [\n        \"H7/r6\",\n        \"H7/s6\"\n      ],\n      \"character\": \"press\",\n      \"rationale\": \"Substantial interference requiring hydraulic press or thermal expansion. Reliable torque and axial load without fasteners.\",\n      \"applications\": [\n        \"wheel hubs\",\n        \"heav…"
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20.0,
+          "fit": "H7/h7"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.021,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.042\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.979,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20.0mm, H7/h7\",\n  \"inputs\": {\n    \"nominal\": 20.0,\n    \"fit\": \"H7/h7\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "bore_diameter",
+        "value": "Ø20 H7 (+0.021/0)",
+        "driver": "mates d20 h7 shaft, clearance 0–0.042 mm for sliding fit per AC1/AC2",
+        "provenance": "fit_calc H7/h7"
+      }
+    },
+    {
+      "seq": 21,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "bore_diameter",
+            "value": "Ø20 H7 (+0.021/0)",
+            "driver": "mates d20 h7 shaft, clearance 0–0.042 mm for sliding fit per AC1/AC2",
+            "provenance": "fit_calc H7/h7"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 20, \"run_id\": \"gym_C1_open_xai:grok-4-5_s2\", \"kind\": \"dimension\", \"ts\": \"2026-07-14T16:24:44Z\"}"
+      }
+    },
+    {
+      "seq": 22,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 2500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s2\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s2]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s2\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  ? bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft, clearance 0\\u20130.042 mm for sliding fit per AC1/AC2\\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:22:43Z exited=2026-07-14T16:22:43Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 22}"
+      }
+    },
+    {
+      "seq": 23,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_thread_spec",
+        "args": {
+          "designation": "M4"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": \"M4: pitch dia 3.5454 mm, minor dia 3.1412 mm, tensile stress area 8.7788 mm^2 (ISO 724)\",\n  \"units\": \"mm\",\n  \"source_url\": null,\n  \"quote\": \"ISO 724 basic M-profile dimensions\",\n  \"fetched_ts\": \"2026-07-14T16:25:16Z\",\n  \"confidence\": \"bundled\",\n  \"cached\": false,\n  \"designation\": \"M4\",\n  \"series\": \"metric\",\n  \"spec\": {\n    \"major_mm\": 4.0,\n    \"pitch_mm\": 0.7,\n    \"pitch_diameter_mm\": 3.5454,\n    \"minor_diameter_mm\": 3.1412,\n    \"minor_diameter_internal_mm\": 3.2422,\n    \"tensile_stress_area_mm2\": 8.7788,\n    \"thread_height_mm\": 0.6062,\n    \"thread_angle_deg\": 60\n  }\n}"
+      }
+    },
+    {
+      "seq": 24,
+      "ts": "2026-07-14T16:30:04Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 3000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s2\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s2]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s2\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  ? bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft, clearance 0\\u20130.042 mm for sliding fit per AC1/AC2\\n\\n## Stage Log\\n  intake: entered=2026-07-14T16:22:43Z exited=2026-07-14T16:22:43Z gate=manifest_valid\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 24}"
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C1_open_xai:grok-4-5_s2",
+    "brief": {
+      "title": "Gym C1",
+      "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+      "success_criteria": []
+    },
+    "requirements": [],
+    "decisions": [],
+    "dimensions": [
+      {
+        "name": "bore_diameter",
+        "value": "Ø20 H7 (+0.021/0)",
+        "driver": "mates d20 h7 shaft, clearance 0–0.042 mm for sliding fit per AC1/AC2"
+      }
+    ],
+    "questions": [],
+    "stage_log": [
+      {
+        "stage": "intake",
+        "entered": "2026-07-14T16:22:43Z",
+        "exited": "2026-07-14T16:22:43Z",
+        "exit_gate": "manifest_valid"
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables"
+      }
+    ],
+    "criterion_results": [],
+    "features": [],
+    "geometry_specs": [],
+    "linkages": [],
+    "build_nodes": []
+  }
+}

@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <set>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -31,41 +33,6 @@ using nlohmann::json;
 namespace aicad::sim {
 
 namespace {
-
-// ── Mesh cache (memoize mesh_step) ───────────────────────────────────────────────
-// FNV-1a over a byte range, chainable so we can fold file bytes + each opts field.
-uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const auto* b = static_cast<const unsigned char*>(p);
-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
-}
-
-// Fold EVERY MeshOptions field into the key. The static_assert makes adding a field a
-// compile error here, so a new option can never be silently omitted (which would let the
-// cache return a stale mesh for changed settings). Fields hashed individually rather than
-// as raw struct bytes because struct padding is indeterminate (would defeat every hit).
-uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
-    static_assert(sizeof(MeshOptions) == 80,
-                  "MeshOptions size changed — a field was added/removed. Update mesh_opts_key "
-                  "to hash the new field(s), then update this expected size. The mesh cache "
-                  "MUST fold in every field or it can return a stale mesh for changed settings.");
-    h = fnv1a(&o.fineness, sizeof o.fineness, h);
-    h = fnv1a(&o.density, sizeof o.density, h);
-    h = fnv1a(&o.order, sizeof o.order, h);
-    h = fnv1a(&o.curvature, sizeof o.curvature, h);
-    h = fnv1a(&o.curv_elems_per_circle, sizeof o.curv_elems_per_circle, h);
-    h = fnv1a(&o.target_size_mm, sizeof o.target_size_mm, h);
-    h = fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
-    h = fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
-    h = fnv1a(&o.optimize, sizeof o.optimize, h);
-    h = fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
-    h = fnv1a(&o.structured, sizeof o.structured, h);
-    h = fnv1a(&o.auto_type, sizeof o.auto_type, h);
-    h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
-    h = fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
-    h = fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
-    return h;
-}
 
 // Round half-away-from-zero to `nd` decimals, matching Python's round() closely
 // enough for the summary fields (values are positive magnitudes here). Python's
@@ -124,22 +91,6 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
     face_normal = {nj[0].get<double>(), nj[1].get<double>(), nj[2].get<double>()};
     perp_tol = fs.value("perp_tol_mm", 1.5);
     return true;
-}
-
-// Resolve a faceset object to mesh node indices with the best available geometry test,
-// in priority order: analytic surface (curved faces, C2) > face plane normal (planar,
-// Z1/Z2) > legacy pure-Euclidean proximity. Single entry point for every load/fixture/BC
-// resolution in this file so the three paths can never drift apart.
-std::vector<int> faceset_membership(const json& fs, const std::vector<double>& points) {
-    const std::vector<double> sample = faceset_sample(fs.value("points", json::array()));
-    const double tol = fs.value("tol_mm", 1.0);
-    FacesetSurface surf;
-    if (faceset_surface(fs, surf))
-        return nodes_in_faceset_surface(points, sample, tol, surf, fs.value("perp_tol_mm", 1.5));
-    std::array<double, 3> fn{};
-    double perp_tol = 0.0;
-    const bool has_fn = faceset_normal(fs, fn, perp_tol);
-    return nodes_in_faceset(points, sample, tol, has_fn ? fn.data() : nullptr, perp_tol);
 }
 
 // Resolve the mesh: inline points/tets if present, else mesh the STEP file.
@@ -411,6 +362,10 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
     // This is the Z1/Z2 fix: a 100×100mm fixture face on a 5mm plate uses tol=70mm (full
     // face coverage) + perp_tol=1.5mm (only nodes exactly on the face), so the fixture
     // correctly grabs all 100×100 bottom-face nodes but NOT the 5mm-away top-face nodes.
+    //
+    // Spatial-hash acceleration: samples are binned into a deterministic 3D grid of cell
+    // size = tol_mm. Each node only probes its 27-neighbour sample cells. Membership
+    // decisions are identical to the O(n*k) scan (same distance tests, same node order).
     std::vector<int> out;
     const size_t n = points.size() / 3;
     const size_t k = sample.size() / 3;
@@ -422,11 +377,29 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
     const double nz = use_normal ? face_normal[2] : 0.0;
     // P5 fast reject (planar mode): every sample lies ON the face plane, so a node's
     // perpendicular distance is the same against ANY sample up to coplanarity roundoff.
-    // One O(1) plane test per node culls off-plane nodes before the O(k) sample scan —
+    // One O(1) plane test per node culls off-plane nodes before the sample scan —
     // the surviving on-plane nodes still run the ORIGINAL per-sample loop, so membership
     // decisions are unchanged (the 1e-9 mm slack dwarfs fp noise but admits nothing new).
     const double plane_d0 =
         use_normal ? (sample[0] * nx + sample[1] * ny + sample[2] * nz) : 0.0;
+
+    // Build sample spatial hash. Cell size = tol so any sample within tol of a node is in
+    // the node's cell or a neighbour. Deterministic: samples inserted in order 0..k-1;
+    // each cell's vector preserves insertion order.
+    const double cell = std::max(tol, 1e-9);
+    const double inv_cell = 1.0 / cell;
+    auto cell_key = [inv_cell](double x, double y, double z) -> int64_t {
+        const int64_t ix = static_cast<int64_t>(std::floor(x * inv_cell));
+        const int64_t iy = static_cast<int64_t>(std::floor(y * inv_cell));
+        const int64_t iz = static_cast<int64_t>(std::floor(z * inv_cell));
+        return (ix * 73856093LL) ^ (iy * 19349663LL) ^ (iz * 83492791LL);
+    };
+    std::unordered_map<int64_t, std::vector<size_t>> grid;
+    grid.reserve(k * 2);
+    for (size_t s = 0; s < k; ++s) {
+        grid[cell_key(sample[s * 3 + 0], sample[s * 3 + 1], sample[s * 3 + 2])].push_back(s);
+    }
+
     for (size_t i = 0; i < n; ++i) {
         const double px = points[i * 3 + 0];
         const double py = points[i * 3 + 1];
@@ -435,23 +408,33 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
             std::fabs(px * nx + py * ny + pz * nz - plane_d0) > perp_tol_mm + 1e-9)
             continue;
         bool hit = false;
-        for (size_t s = 0; s < k; ++s) {
-            const double dx = px - sample[s * 3 + 0];
-            const double dy = py - sample[s * 3 + 1];
-            const double dz = pz - sample[s * 3 + 2];
-            if (use_normal) {
-                // Signed perpendicular component: how far the node is from the face plane
-                // (at this sample point). Tight threshold excludes off-face nodes.
-                const double d_perp = std::fabs(dx * nx + dy * ny + dz * nz);
-                if (d_perp > perp_tol_mm) continue;  // not on this face plane
-                // In-plane distance: sqrt(3D_dist² - d_perp²). Covers the entire face.
-                const double d3sq = dx*dx + dy*dy + dz*dz;
-                const double d_plane = std::sqrt(std::max(0.0, d3sq - d_perp * d_perp));
-                if (d_plane <= tol) { hit = true; break; }
-            } else {
-                // Legacy mode: pure 3D Euclidean distance (no face normal available).
-                const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (dist <= tol) { hit = true; break; }
+        const int64_t ix0 = static_cast<int64_t>(std::floor(px * inv_cell));
+        const int64_t iy0 = static_cast<int64_t>(std::floor(py * inv_cell));
+        const int64_t iz0 = static_cast<int64_t>(std::floor(pz * inv_cell));
+        for (int dx = -1; dx <= 1 && !hit; ++dx) {
+            for (int dy = -1; dy <= 1 && !hit; ++dy) {
+                for (int dz = -1; dz <= 1 && !hit; ++dz) {
+                    const int64_t key = ((ix0 + dx) * 73856093LL) ^
+                                        ((iy0 + dy) * 19349663LL) ^
+                                        ((iz0 + dz) * 83492791LL);
+                    auto it = grid.find(key);
+                    if (it == grid.end()) continue;
+                    for (size_t s : it->second) {
+                        const double ddx = px - sample[s * 3 + 0];
+                        const double ddy = py - sample[s * 3 + 1];
+                        const double ddz = pz - sample[s * 3 + 2];
+                        if (use_normal) {
+                            const double d_perp = std::fabs(ddx * nx + ddy * ny + ddz * nz);
+                            if (d_perp > perp_tol_mm) continue;
+                            const double d3sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                            const double d_plane = std::sqrt(std::max(0.0, d3sq - d_perp * d_perp));
+                            if (d_plane <= tol) { hit = true; break; }
+                        } else {
+                            const double dist = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                            if (dist <= tol) { hit = true; break; }
+                        }
+                    }
+                }
             }
         }
         if (hit) out.push_back(static_cast<int>(i));
@@ -514,16 +497,12 @@ double faceset_surface_distance(const FacesetSurface& s, const double* p) {
             return std::fabs(std::sqrt(rx * rx + ry * ry + rz * rz) - s.r1);
         }
         case FacesetSurface::kCone: {
-            // Distance from (h, r) in the meridian half-plane to the generator line
-            // r = h·tan(α) through the apex: |r·cosα − h·sinα|.
             const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
             const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1], rz = vz - h * s.axis[2];
             const double r = std::sqrt(rx * rx + ry * ry + rz * rz);
             return std::fabs(r * std::cos(s.semi_angle) - h * std::sin(s.semi_angle));
         }
         case FacesetSurface::kTorus: {
-            // Meridian plane: the tube center circle is at (r = major, h = 0); the surface
-            // is minor_r from it: | dist((r,h),(major,0)) − minor |.
             const double h = vx * s.axis[0] + vy * s.axis[1] + vz * s.axis[2];
             const double rx = vx - h * s.axis[0], ry = vy - h * s.axis[1], rz = vz - h * s.axis[2];
             const double r = std::sqrt(rx * rx + ry * ry + rz * rz);
@@ -538,29 +517,159 @@ double faceset_surface_distance(const FacesetSurface& s, const double* p) {
 std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
                                           const std::vector<double>& sample, double tol_mm,
                                           const FacesetSurface& surface, double perp_tol_mm) {
-    // Curved analogue of the planar split-tolerance mode below: the analytic
-    // distance-to-surface is the tight ON-face test (replaces the plane-normal dot), and
-    // plain 3D proximity to the sample cloud (large tol) delimits the trimmed extent.
+    // Curved analogue of the planar split-tolerance mode: analytic distance-to-surface
+    // is the tight ON-face test; 3D proximity to the sample cloud delimits the trimmed
+    // extent. Spatial hash over samples — same membership as the O(n*k) scan.
     std::vector<int> out;
     const size_t n = points.size() / 3;
     const size_t k = sample.size() / 3;
     if (k == 0 || n == 0 || surface.kind == FacesetSurface::kNone) return out;
+    const double cell = std::max(tol_mm, 1e-9);
+    const double inv_cell = 1.0 / cell;
+    auto cell_key = [inv_cell](double x, double y, double z) -> int64_t {
+        const int64_t ix = static_cast<int64_t>(std::floor(x * inv_cell));
+        const int64_t iy = static_cast<int64_t>(std::floor(y * inv_cell));
+        const int64_t iz = static_cast<int64_t>(std::floor(z * inv_cell));
+        return (ix * 73856093LL) ^ (iy * 19349663LL) ^ (iz * 83492791LL);
+    };
+    std::unordered_map<int64_t, std::vector<size_t>> grid;
+    grid.reserve(k * 2);
+    for (size_t s = 0; s < k; ++s)
+        grid[cell_key(sample[s * 3 + 0], sample[s * 3 + 1], sample[s * 3 + 2])].push_back(s);
+    const double tol2 = tol_mm * tol_mm;
     for (size_t i = 0; i < n; ++i) {
         const double* p = &points[i * 3];
-        if (faceset_surface_distance(surface, p) > perp_tol_mm) continue;  // off the surface
-        for (size_t s = 0; s < k; ++s) {
-            const double dx = p[0] - sample[s * 3 + 0];
-            const double dy = p[1] - sample[s * 3 + 1];
-            const double dz = p[2] - sample[s * 3 + 2];
-            if (dx * dx + dy * dy + dz * dz <= tol_mm * tol_mm) {
-                out.push_back(static_cast<int>(i));
-                break;
+        if (faceset_surface_distance(surface, p) > perp_tol_mm) continue;
+        bool hit = false;
+        const int64_t ix0 = static_cast<int64_t>(std::floor(p[0] * inv_cell));
+        const int64_t iy0 = static_cast<int64_t>(std::floor(p[1] * inv_cell));
+        const int64_t iz0 = static_cast<int64_t>(std::floor(p[2] * inv_cell));
+        for (int dx = -1; dx <= 1 && !hit; ++dx) {
+            for (int dy = -1; dy <= 1 && !hit; ++dy) {
+                for (int dz = -1; dz <= 1 && !hit; ++dz) {
+                    const int64_t key = ((ix0 + dx) * 73856093LL) ^
+                                        ((iy0 + dy) * 19349663LL) ^
+                                        ((iz0 + dz) * 83492791LL);
+                    auto it = grid.find(key);
+                    if (it == grid.end()) continue;
+                    for (size_t s : it->second) {
+                        const double ddx = p[0] - sample[s * 3 + 0];
+                        const double ddy = p[1] - sample[s * 3 + 1];
+                        const double ddz = p[2] - sample[s * 3 + 2];
+                        if (ddx * ddx + ddy * ddy + ddz * ddz <= tol2) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
+        if (hit) out.push_back(static_cast<int>(i));
     }
     return out;
 }
 
+
+// Resolve a faceset object to mesh node indices with the best available geometry test,
+// in priority order: analytic surface (curved faces, C2) > face plane normal (planar,
+// Z1/Z2) > legacy pure-Euclidean proximity. Single entry point for every load/fixture/BC
+// resolution in this file so the three paths can never drift apart.
+//
+// Per-mesh faceset cache: multi-load studies re-resolve the same faceset against the
+// same points vector many times. Key = FNV of faceset dump + points data pointer +
+// points size. Empty-fixture HARD FAILURE is preserved by callers.
+namespace {
+uint64_t faceset_fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+std::vector<double> faceset_sample_local(const nlohmann::json& points_node) {
+    std::vector<double> sample;
+    if (!points_node.is_array()) return sample;
+    for (const auto& p : points_node) {
+        if (p.is_array() && p.size() >= 3) {
+            sample.push_back(p[0].get<double>());
+            sample.push_back(p[1].get<double>());
+            sample.push_back(p[2].get<double>());
+        } else if (p.is_number()) {
+            sample.push_back(p.get<double>());
+        }
+    }
+    return sample;
+}
+bool faceset_normal_local(const nlohmann::json& fs, std::array<double, 3>& face_normal,
+                          double& perp_tol) {
+    if (!fs.contains("face_normal") || !fs["face_normal"].is_array() ||
+        fs["face_normal"].size() < 3)
+        return false;
+    const auto& nj = fs["face_normal"];
+    face_normal = {nj[0].get<double>(), nj[1].get<double>(), nj[2].get<double>()};
+    perp_tol = fs.value("perp_tol_mm", 1.5);
+    return true;
+}
+}  // namespace
+
+std::vector<int> faceset_membership(const nlohmann::json& fs,
+                                    const std::vector<double>& points) {
+    uint64_t key = faceset_fnv1a(points.data(),
+                                 std::min(points.size(), size_t(24)) * sizeof(double));
+    const void* ptr = points.data();
+    key = faceset_fnv1a(&ptr, sizeof(ptr), key);
+    const size_t npts = points.size();
+    key = faceset_fnv1a(&npts, sizeof npts, key);
+    const std::string fsdump = fs.dump();
+    key = faceset_fnv1a(fsdump.data(), fsdump.size(), key);
+
+    static std::mutex cache_mtx;
+    static std::unordered_map<uint64_t, std::vector<int>> cache;
+    static std::list<uint64_t> lru;
+    constexpr size_t kCap = 64;
+    {
+        std::lock_guard<std::mutex> lk(cache_mtx);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            lru.remove(key);
+            lru.push_front(key);
+            return it->second;
+        }
+    }
+
+    const std::vector<double> sample = faceset_sample_local(fs.value("points", nlohmann::json::array()));
+    const double tol = fs.value("tol_mm", 1.0);
+    std::vector<int> ids;
+    FacesetSurface surf;
+    if (faceset_surface(fs, surf)) {
+        const double perp0 = fs.value("perp_tol_mm", 1.5);
+        for (double scale = 1.0; scale <= 8.0; scale *= 2.0) {
+            ids = nodes_in_faceset_surface(points, sample, tol, surf, perp0 * scale);
+            if (!ids.empty()) break;
+        }
+    } else {
+        std::array<double, 3> fn{};
+        double perp_tol = 0.0;
+        const bool has_fn = faceset_normal_local(fs, fn, perp_tol);
+        if (has_fn) {
+            for (double scale = 1.0; scale <= 8.0; scale *= 2.0) {
+                ids = nodes_in_faceset(points, sample, tol, fn.data(), perp_tol * scale);
+                if (!ids.empty()) break;
+            }
+        } else {
+            ids = nodes_in_faceset(points, sample, tol, nullptr, perp_tol);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(cache_mtx);
+        cache[key] = ids;
+        lru.remove(key);
+        lru.push_front(key);
+        while (lru.size() > kCap) {
+            cache.erase(lru.back());
+            lru.pop_back();
+        }
+    }
+    return ids;
+}
 
 nlohmann::json fea_run_static(const nlohmann::json& study) {
     // Per-study structured phase record (prof/phases.h): "mesh" / "setup" / "solve" here,
@@ -738,12 +847,261 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
         }
     }
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
+    if (fixed_nodes.empty() && study.contains("fixtures") && study["fixtures"].is_array() &&
+        !study["fixtures"].empty()) {
+        // Fixtures were REQUESTED but none matched a mesh node — solving would be
+        // unconstrained garbage (or singular). Say exactly what happened.
+        return json{{"ok", false},
+                    {"error", "fea_static: the fixture faces resolved to 0 mesh nodes — "
+                              "the mesh does not sample those faces (tessellated assembly "
+                              "mesh vs analytic face test). This is a solver-side matching "
+                              "bug; report the model."},
+                    {"notes", notes}};
+    }
+
+    // ── Bonded gap ties (asm-fea) ────────────────────────────────────────────
+    // An imported assembly meshes into DISCONNECTED components wherever parts have real
+    // design clearances (bolted joints without bolt geometry, pin fits): the fuse only
+    // welds actual overlap/contact. A loaded component not reached by any fixture makes
+    // the reduced system singular. Detect components (union-find over element nodes) and
+    // tie each cross-component node pair closer than the gap tolerance with stiff penalty
+    // springs (k = E * char_len — element-stiffness scale), the standard bonded-contact
+    // idealization. Single-component meshes skip all of this (empty springs, no behaviour
+    // change). Gap default 1 mm, override AI_CAD_FEA_BOND_GAP_MM.
+    std::vector<BondSpring> bond_springs;
+    {
+        const int n_nodes_i = static_cast<int>(points.size() / 3);
+        std::vector<int> comp(static_cast<size_t>(n_nodes_i));
+        for (int i = 0; i < n_nodes_i; ++i) comp[static_cast<size_t>(i)] = i;
+        std::function<int(int)> find = [&](int x) {
+            while (comp[static_cast<size_t>(x)] != x) {
+                comp[static_cast<size_t>(x)] =
+                    comp[static_cast<size_t>(comp[static_cast<size_t>(x)])];
+                x = comp[static_cast<size_t>(x)];
+            }
+            return x;
+        };
+        auto unite = [&](int a, int b) {
+            a = find(a); b = find(b);
+            if (a != b) comp[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+        };
+        const int npe_i = nodes_per_elem;
+        const int n_el = static_cast<int>(tets.size()) / npe_i;
+        for (int e = 0; e < n_el; ++e)
+            for (int k = 1; k < npe_i; ++k)
+                unite(tets[static_cast<size_t>(e) * npe_i],
+                      tets[static_cast<size_t>(e) * npe_i + k]);
+        std::unordered_set<int> roots;
+        for (int i = 0; i < n_nodes_i; ++i) roots.insert(find(i));
+        if (roots.size() > 1) {
+            // Characteristic element length for the tie stiffness scale: mean first-edge
+            // length over a sample of elements (corner 0 -> corner 1).
+            double h_sum = 0.0;
+            int h_n = 0;
+            const int h_step = std::max(1, n_el / 1000);
+            for (int e = 0; e < n_el; e += h_step) {
+                const int a = tets[static_cast<size_t>(e) * npe_i];
+                const int b = tets[static_cast<size_t>(e) * npe_i + 1];
+                const double ddx = points[a * 3] - points[b * 3];
+                const double ddy = points[a * 3 + 1] - points[b * 3 + 1];
+                const double ddz = points[a * 3 + 2] - points[b * 3 + 2];
+                h_sum += std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                ++h_n;
+            }
+            const double char_len = (h_n > 0 && h_sum > 0.0) ? (h_sum / h_n) : 1.0;
+            double gap_mm = 1.0;
+            if (const char* env = std::getenv("AI_CAD_FEA_BOND_GAP_MM")) {
+                const double g = std::atof(env);
+                if (g > 0.0) gap_mm = g;
+            }
+            // Spatial hash (cell = gap): each node ties to its NEAREST other-component
+            // node within the gap; pairs dedupe via (min,max) keys.
+            const double cell = gap_mm;
+            auto cell_key = [&](double x, double y, double z) {
+                const long long ix = static_cast<long long>(std::floor(x / cell));
+                const long long iy = static_cast<long long>(std::floor(y / cell));
+                const long long iz = static_cast<long long>(std::floor(z / cell));
+                return (ix * 73856093LL) ^ (iy * 19349663LL) ^ (iz * 83492791LL);
+            };
+            std::unordered_map<long long, std::vector<int>> grid;
+            grid.reserve(static_cast<size_t>(n_nodes_i));
+            for (int i = 0; i < n_nodes_i; ++i)
+                grid[cell_key(points[i * 3], points[i * 3 + 1], points[i * 3 + 2])]
+                    .push_back(i);
+            std::set<std::pair<int, int>> tied;
+            for (int i = 0; i < n_nodes_i; ++i) {
+                const int ci = find(i);
+                const double xi = points[i * 3], yi = points[i * 3 + 1], zi = points[i * 3 + 2];
+                // Nearest node of EVERY distinct foreign component within the gap — a
+                // single nearest-only tie can spend a cluster's one link on another
+                // floating cluster and never reach the anchored one, leaving the super-
+                // graph disconnected even though an in-gap pair exists.
+                std::unordered_map<int, std::pair<double, int>> best_per_root;
+                for (int ox = -1; ox <= 1; ++ox)
+                    for (int oy = -1; oy <= 1; ++oy)
+                        for (int oz = -1; oz <= 1; ++oz) {
+                            const auto it = grid.find(
+                                cell_key(xi + ox * cell, yi + oy * cell, zi + oz * cell));
+                            if (it == grid.end()) continue;
+                            for (int j : it->second) {
+                                const int cj = find(j);
+                                if (cj == ci) continue;
+                                const double dx2 = points[j * 3] - xi;
+                                const double dy2 = points[j * 3 + 1] - yi;
+                                const double dz2 = points[j * 3 + 2] - zi;
+                                const double d2 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+                                if (d2 > gap_mm * gap_mm) continue;
+                                auto bit = best_per_root.find(cj);
+                                if (bit == best_per_root.end() || d2 < bit->second.first)
+                                    best_per_root[cj] = {d2, j};
+                            }
+                        }
+                for (const auto& kv : best_per_root) {
+                    const int best = kv.second.second;
+                    if (tied.emplace(std::min(i, best), std::max(i, best)).second)
+                        bond_springs.push_back(BondSpring{i, best, E_mpa * char_len});
+                }
+            }
+            notes.push_back("assembly mesh has " + std::to_string(roots.size()) +
+                            " disconnected component(s): " +
+                            std::to_string(bond_springs.size()) +
+                            " bonded gap tie(s) added (gap <= " + std::to_string(gap_mm) +
+                            " mm; AI_CAD_FEA_BOND_GAP_MM overrides)");
+
+            // ── Reachability: EVERY cluster must have a stiffness path to a fixture ──
+            // A free-floating cluster — even an UNLOADED one — contributes unconstrained
+            // DOFs and makes the whole reduced system singular. Union the tie edges into
+            // super-clusters, then:
+            //   * a LOADED unreachable cluster is AUTO-BRIDGED to its nearest neighbouring
+            //     cluster (nearest sampled node pair, tied regardless of the gap knob) with
+            //     a loud note — an answer with a stated idealization beats refusing, and
+            //     the pass loops so chained joints (seat -> bracket -> frame) resolve;
+            //   * unloaded unreachable clusters are rigidly GROUNDED (all nodes fixed —
+            //     they carry no load, so the rest of the model is exact).
+            for (int pass = 0; ; ++pass) {
+                std::vector<int> super(comp);  // component forest + tie edges
+                std::function<int(int)> sfind = [&](int x) {
+                    while (super[static_cast<size_t>(x)] != x) {
+                        super[static_cast<size_t>(x)] =
+                            super[static_cast<size_t>(super[static_cast<size_t>(x)])];
+                        x = super[static_cast<size_t>(x)];
+                    }
+                    return x;
+                };
+                for (const BondSpring& s : bond_springs) {
+                    const int a = sfind(s.a), b = sfind(s.b);
+                    if (a != b) super[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+                }
+                std::unordered_set<int> anchored;   // super-roots containing a fixed node
+                for (int nid : fixed_nodes) anchored.insert(sfind(nid));
+                std::unordered_set<int> loaded_roots;
+                for (int i = 0; i < n_nodes_i; ++i)
+                    if (nodal_forces[i * 3] != 0.0 || nodal_forces[i * 3 + 1] != 0.0 ||
+                        nodal_forces[i * 3 + 2] != 0.0)
+                        loaded_roots.insert(sfind(i));
+
+                std::vector<int> grounded_nodes;
+                std::vector<int> stranded;  // nodes of ONE unreachable LOADED cluster
+                int stranded_root = -1;
+                for (int i = 0; i < n_nodes_i; ++i) {
+                    const int r0 = sfind(i);
+                    if (anchored.count(r0)) continue;
+                    if (loaded_roots.count(r0)) {
+                        if (stranded_root < 0) stranded_root = r0;
+                        if (r0 == stranded_root) stranded.push_back(i);
+                    } else {
+                        grounded_nodes.push_back(i);
+                    }
+                }
+                if (stranded.empty()) {
+                    // All loaded clusters anchored; ground the unloaded stragglers.
+                    if (!grounded_nodes.empty()) {
+                        std::unordered_set<int> groots;
+                        for (int nid : grounded_nodes) groots.insert(sfind(nid));
+                        std::unordered_set<int> fixed_set(fixed_nodes.begin(),
+                                                          fixed_nodes.end());
+                        for (int nid : grounded_nodes)
+                            if (fixed_set.insert(nid).second) fixed_nodes.push_back(nid);
+                        std::sort(fixed_nodes.begin(), fixed_nodes.end());
+                        notes.push_back(std::to_string(groots.size()) +
+                                        " unloaded part cluster(s) had no contact path to "
+                                        "any fixture and were rigidly grounded (they carry "
+                                        "no load; raise AI_CAD_FEA_BOND_GAP_MM to bond "
+                                        "them instead)");
+                    }
+                    break;
+                }
+                // Each pass anchors at least one cluster (a tie either reaches an anchored
+                // super or merges two floating ones, strictly reducing the count), so the
+                // pass budget scales with the initial cluster count.
+                const int max_passes = 8 + 2 * static_cast<int>(roots.size());
+                if (pass >= max_passes) {
+                    return json{{"ok", false},
+                                {"error", "fea_static: could not connect every loaded part "
+                                          "cluster to a fixture after " +
+                                          std::to_string(max_passes) +
+                                          " bridge passes — check the assembly for "
+                                          "floating parts"}};
+                }
+                // Nearest cross-cluster node pair for the stranded cluster (sampled).
+                double best = std::numeric_limits<double>::infinity();
+                int best_a = -1, best_b = -1;
+                const std::size_t stepA = std::max<std::size_t>(1, stranded.size() / 400);
+                const int stepB = std::max(1, n_nodes_i / 8000);
+                for (std::size_t ia = 0; ia < stranded.size(); ia += stepA) {
+                    const int a = stranded[ia];
+                    for (int b = 0; b < n_nodes_i; b += stepB) {
+                        if (sfind(b) == stranded_root) continue;
+                        const double dxg = points[a * 3] - points[b * 3];
+                        const double dyg = points[a * 3 + 1] - points[b * 3 + 1];
+                        const double dzg = points[a * 3 + 2] - points[b * 3 + 2];
+                        const double d2 = dxg * dxg + dyg * dyg + dzg * dzg;
+                        if (d2 < best) { best = d2; best_a = a; best_b = b; }
+                    }
+                }
+                if (best_a < 0) {
+                    return json{{"ok", false},
+                                {"error", "fea_static: a loaded part cluster has no "
+                                          "neighbouring geometry to bond to"}};
+                }
+                // Tie the best pair plus every sampled stranded node within (d + char_len)
+                // of ITS nearest foreign node — a small bonded patch instead of a single
+                // hinge point.
+                const double reach = std::sqrt(best) + char_len;
+                int n_ties = 0;
+                for (std::size_t ia = 0; ia < stranded.size() && n_ties < 24; ia += stepA) {
+                    const int a = stranded[ia];
+                    double bd = std::numeric_limits<double>::infinity();
+                    int bb = -1;
+                    for (int b = 0; b < n_nodes_i; b += stepB) {
+                        if (sfind(b) == stranded_root) continue;
+                        const double dxg = points[a * 3] - points[b * 3];
+                        const double dyg = points[a * 3 + 1] - points[b * 3 + 1];
+                        const double dzg = points[a * 3 + 2] - points[b * 3 + 2];
+                        const double d2 = dxg * dxg + dyg * dyg + dzg * dzg;
+                        if (d2 < bd) { bd = d2; bb = b; }
+                    }
+                    if (bb >= 0 && std::sqrt(bd) <= reach) {
+                        bond_springs.push_back(BondSpring{a, bb, E_mpa * char_len});
+                        ++n_ties;
+                    }
+                }
+                char buf[240];
+                std::snprintf(buf, sizeof(buf),
+                              "auto-bridged a loaded part cluster across a ~%.2f mm gap "
+                              "(%d tie(s); beyond the %.2f mm bonded-gap tolerance — "
+                              "verify this joint is physically bonded)",
+                              std::sqrt(best), n_ties, gap_mm);
+                notes.push_back(buf);
+            }
+        }
+    }
 
     const auto t_solve0 = std::chrono::steady_clock::now();
     aicad::prof::phases::add("setup", std::chrono::duration<double, std::milli>(
                                           t_solve0 - t_setup0).count());
     FeaStaticResult r = fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
-                                         nodal_forces, nodes_per_elem);
+                                         nodal_forces, nodes_per_elem, bond_springs);
     aicad::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
     if (fprof) {
@@ -755,7 +1113,16 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                      std::chrono::duration<double, std::milli>(now - t_start).count());
         std::fflush(stderr);
     }
-    if (!r.ok) return json{{"ok", false}, {"error", r.error}};
+    if (!r.ok) {
+        std::string msg = r.error;
+        if (!bond_springs.empty() && msg.find("singular") != std::string::npos)
+            msg += " — the assembly mesh has disconnected part clusters and " +
+                   std::to_string(bond_springs.size()) +
+                   " bonded gap ties were added, but a loaded part may still not reach any "
+                   "fixtured part. Raise AI_CAD_FEA_BOND_GAP_MM (default 1.0) or check the "
+                   "assembly's contact/clearances.";
+        return json{{"ok", false}, {"error", msg}, {"notes", notes}};
+    }
     if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
     // Post-processing (failure criteria + result packaging) — dtor fires at function exit,
     // BEFORE _study's (declared earlier), so the phase lands inside this study.
@@ -1148,6 +1515,108 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
 // without deep-copying megabytes of points/tets (the old map<key, MeshOut> copied the whole
 // mesh on every hit). LRU eviction just drops the cache's reference — an outstanding caller
 // keeps its mesh alive via its own shared_ptr.
+// Residency is also bounded by a byte budget derived from the resource governor (not only
+// entry count): fine assembly meshes are MBs each and a fixed kCap of 8 can still OOM a
+// low-end box.
+namespace {
+size_t mesh_out_bytes(const MeshOut& m) {
+    return m.points.size() * sizeof(double) + m.tets.size() * sizeof(int) +
+           m.aspect_hist.size() * sizeof(int) + m.mesh_type_used.size() + m.note.size() +
+           m.error.size() + 256;
+}
+uint64_t mesh_cache_budget_bytes() {
+    const uint64_t host = aicad::governor::budget_bytes();
+    if (host == UINT64_MAX) return 512ull * 1024ull * 1024ull;  // 512 MiB when governor off
+    // Cap mesh-cache residency at 12.5% of the study budget, floored at 64 MiB so a
+    // small machine still keeps a couple of warm meshes.
+    const uint64_t frac = host / 8;
+    return std::max<uint64_t>(64ull * 1024ull * 1024ull, frac);
+}
+}  // namespace
+
+// Process-wide mesh-cache counters (whole-STEP + per-solid). Shared with mesher.cpp
+// via mesh_cache_note_generation / mesh_cache_stats. File-scope (not anonymous) so the
+// public mesh_cache_* API can touch them.
+namespace mesh_cache_detail {
+
+inline uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+inline uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
+    static_assert(sizeof(MeshOptions) == 80,
+                  "MeshOptions size changed — a field was added/removed. Update mesh_opts_key "
+                  "to hash the new field(s), then update this expected size. The mesh cache "
+                  "MUST fold in every field or it can return a stale mesh for changed settings.");
+    h = fnv1a(&o.fineness, sizeof o.fineness, h);
+    h = fnv1a(&o.density, sizeof o.density, h);
+    h = fnv1a(&o.order, sizeof o.order, h);
+    h = fnv1a(&o.curvature, sizeof o.curvature, h);
+    h = fnv1a(&o.curv_elems_per_circle, sizeof o.curv_elems_per_circle, h);
+    h = fnv1a(&o.target_size_mm, sizeof o.target_size_mm, h);
+    h = fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
+    h = fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
+    h = fnv1a(&o.optimize, sizeof o.optimize, h);
+    h = fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
+    h = fnv1a(&o.structured, sizeof o.structured, h);
+    h = fnv1a(&o.auto_type, sizeof o.auto_type, h);
+    h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
+    h = fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
+    h = fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
+    return h;
+}
+struct MeshCacheCounters {
+    std::mutex mtx;
+    MeshCacheStats s;
+};
+inline MeshCacheCounters& mesh_cache_counters() {
+    static MeshCacheCounters c;
+    return c;
+}
+}  // namespace mesh_cache_detail
+using mesh_cache_detail::mesh_cache_counters;
+using mesh_cache_detail::fnv1a;
+using mesh_cache_detail::mesh_opts_key;
+
+MeshCacheStats mesh_cache_stats() {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    return c.s;
+}
+
+void mesh_cache_reset_stats() {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    c.s = MeshCacheStats{};
+}
+
+void mesh_cache_note_generation() {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    ++c.s.generations;
+}
+
+// Internal hooks used by the per-solid component cache in mesher.cpp (same counters).
+void mesh_cache_note_component_hit() {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    ++c.s.hits;
+    ++c.s.component_hits;
+}
+void mesh_cache_note_component_miss() {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    ++c.s.misses;
+    ++c.s.component_misses;
+}
+void mesh_cache_set_resident(uint64_t bytes, uint64_t budget) {
+    auto& c = mesh_cache_counters();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    c.s.resident_bytes = bytes;
+    c.s.budget_bytes = budget;
+}
+
 std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path,
                                                     const MeshOptions& options) {
     // Hash the STEP bytes (one block read — not the old istreambuf char-at-a-time slurp).
@@ -1172,27 +1641,56 @@ std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path
     static std::mutex mtx;
     static std::unordered_map<uint64_t, std::shared_ptr<const MeshOut>> cache;
     static std::list<uint64_t> lru;   // most-recent at front
-    constexpr size_t kCap = 8;        // bound memory (fine meshes are MBs)
+    static uint64_t resident = 0;
+    constexpr size_t kCap = 16;       // soft entry cap; byte budget is the hard bound
     {
         std::lock_guard<std::mutex> lk(mtx);
         auto it = cache.find(key);
         if (it != cache.end()) {      // HIT: identical geometry + options — no copy
             lru.remove(key);
             lru.push_front(key);
+            {
+                auto& c = mesh_cache_counters();
+                std::lock_guard<std::mutex> ck(c.mtx);
+                ++c.s.hits;
+                c.s.resident_bytes = resident;
+                c.s.budget_bytes = mesh_cache_budget_bytes();
+            }
             return it->second;
         }
     }
     // MISS: mesh OUTSIDE the lock (mesh_step self-serializes), then store.
+    {
+        auto& c = mesh_cache_counters();
+        std::lock_guard<std::mutex> ck(c.mtx);
+        ++c.s.misses;
+    }
     auto m = std::make_shared<const MeshOut>(mesh_step(step_path, options));
     if (m->ok) {
+        const uint64_t need = static_cast<uint64_t>(mesh_out_bytes(*m));
+        const uint64_t budget = mesh_cache_budget_bytes();
         std::lock_guard<std::mutex> lk(mtx);
-        cache[key] = m;
-        lru.remove(key);
-        lru.push_front(key);
-        while (lru.size() > kCap) {
-            cache.erase(lru.back());
+        // Evict LRU until the new mesh fits (or the cache is empty).
+        while ((!lru.empty()) &&
+               (lru.size() >= kCap || resident + need > budget)) {
+            auto bit = cache.find(lru.back());
+            if (bit != cache.end()) {
+                resident -= static_cast<uint64_t>(mesh_out_bytes(*bit->second));
+                cache.erase(bit);
+            }
             lru.pop_back();
         }
+        // Insert even if need > budget (keep the single most-recent mesh).
+        if (cache.find(key) == cache.end()) {
+            cache[key] = m;
+            lru.push_front(key);
+            resident += need;
+        } else {
+            // Concurrent store of the same key: prefer the existing entry.
+            lru.remove(key);
+            lru.push_front(key);
+        }
+        mesh_cache_set_resident(resident, budget);
     }
     return m;
 }

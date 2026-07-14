@@ -12,6 +12,10 @@
 
 #include "sim/lbm.h"
 
+#ifdef AICAD_WITH_CUDA
+#include "sim/lbm_cuda.h"
+#endif
+
 #include "util/resource_governor.h"
 #include "prof/phases.h"  // per-phase timers (StudyScope "lbm")
 
@@ -153,6 +157,47 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         R.error = "lbm_run: solid mask size mismatch";
         return R;
     }
+
+    // Backend select: params.backend, else AI_CAD_LBM_BACKEND, else "auto".
+    // "cuda" / "auto" may pick CUDA when built+available; always fall back to CPU.
+    std::string want = p.backend;
+    if (want.empty()) {
+        if (const char* e = std::getenv("AI_CAD_LBM_BACKEND")) want = e;
+        else want = "auto";
+    }
+    for (char& c : want) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    R.backend = "cpu";
+#ifdef AICAD_WITH_CUDA
+    const bool try_cuda = (want == "cuda" || want == "auto");
+    if (try_cuda) {
+        if (!lbm_cuda_device_available()) {
+            R.backend_fallback = (want == "cuda")
+                ? "CUDA requested but no device available"
+                : "auto: no CUDA device, using CPU";
+        } else {
+            std::string why;
+            LbmResult cr = lbm_run_cuda(solid, nx, ny, nz, p, n_steps, on_progress, why);
+            if (cr.ok) {
+                cr.backend = "cuda";
+                if (!why.empty()) cr.backend_fallback = why;
+                return cr;
+            }
+            R.backend_fallback = why.empty()
+                ? (cr.error.empty() ? "CUDA path failed; using CPU" : cr.error)
+                : why;
+            // fall through to CPU reference
+        }
+    } else if (want == "cpu") {
+        // explicit CPU
+    } else {
+        R.backend_fallback = "unknown backend '" + want + "', using CPU";
+    }
+#else
+    if (want == "cuda") {
+        R.backend_fallback = "CUDA not built into this libaicad (AICAD_WITH_CUDA=OFF)";
+    }
+#endif
+
     // Per-phase record (prof/phases.h): init / loop (+ accumulated convergence sampling)
     // / output. Opened after arg validation so trivially-rejected calls don't pollute it.
     aicad::prof::phases::StudyScope _study("lbm");
@@ -650,6 +695,14 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     R.ok = true;
     return R;
+}
+
+bool lbm_cuda_available() {
+#ifdef AICAD_WITH_CUDA
+    return lbm_cuda_device_available();
+#else
+    return false;
+#endif
 }
 
 }  // namespace aicad::sim

@@ -45,7 +45,24 @@ struct FeaStaticResult {
     int n_elems = 0;
     bool ok = false;
     std::string error;  // non-empty when ok==false
+
+    // Prepared-system (factor) cache observability. factor_cache_hit means this solve
+    // reused the reduced DOF map + assembled K + numeric factorization and only
+    // re-solved the RHS (load-only repeat). Always false on the tet4 parity path.
+    bool factor_cache_hit = false;
 };
+
+// Factor-cache counters (tet10/hex8 prepared-system reuse). Thread-safe.
+struct FeaFactorCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t stores = 0;
+    uint64_t evictions = 0;
+    uint64_t resident_bytes = 0;
+};
+FeaFactorCacheStats fea_factor_cache_stats();
+void fea_factor_cache_reset_stats();
+void fea_factor_cache_clear();
 
 // Solve a linear-static problem on a tet OR hex mesh (4-, 10-, or 8-node elements).
 //   points         : n*3 flat node coordinates (mm)
@@ -56,16 +73,30 @@ struct FeaStaticResult {
 //   nodal_forces   : n*3 flat applied nodal force vector (N); same length as points
 //   nodes_per_elem : 4 (tet4, parity path), 10 (tet10), or 8 (hex8, structured grid)
 //
+// Penalty tie between two mesh nodes (asm-fea bonded contact across a small assembly
+// gap): couples all 3 DOFs of node a to node b with stiffness k (N/mm per DOF). Springs
+// to a FIXED node ground the free side (correct penalty behaviour). Used by fea_run to
+// bond disconnected mesh components (an imported assembly whose parts have design
+// clearances) so the load path crosses the joints instead of the system going singular.
+struct BondSpring {
+    int a = 0;
+    int b = 0;
+    double k = 0.0;
+};
+
 // nodes_per_elem==4 uses the analytical tet4 strain-displacement operator UNCHANGED
 // (byte-for-byte parity with the prior solver / the Python oracle). ==10 uses an
 // isoparametric quadratic tet (4-point Gauss); ==8 uses an isoparametric trilinear
 // hexahedron (2x2x2 Gauss) for structured/symmetric meshes of prismatic parts. Each is a
 // SEPARATE code path; default 4 keeps every existing caller on the parity path.
+// bond_springs (default empty = every existing caller unchanged, parity preserved)
+// appends penalty-tie stiffness AFTER element assembly.
 // Never throws: a degenerate/unsolvable model returns ok=false with an error string.
 FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  const std::vector<int>& tets, double E_mpa, double nu,
                                  double yield_mpa, const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces,
-                                 int nodes_per_elem = 4);
+                                 int nodes_per_elem = 4,
+                                 const std::vector<BondSpring>& bond_springs = {});
 
 }  // namespace aicad::sim

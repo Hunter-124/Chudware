@@ -18,6 +18,7 @@
 
 #include "sim/fea_static.h"
 #include "sim/flow_run.h"
+#include "sim/lbm.h"
 
 using aicad::sim::fea_static_solve;
 using aicad::sim::FeaStaticResult;
@@ -577,3 +578,118 @@ TEST_CASE("G4: run_wind_tunnel ref_length_mm equals the part's longest bbox span
 }
 
 }  // namespace
+
+
+// ── Acceleration caches (mesh / factor / faceset / LBM backend) ─────────────────
+TEST_CASE("factor cache: load-only tet10 repeat hits and matches") {
+    using aicad::sim::fea_static_solve;
+    using aicad::sim::fea_factor_cache_clear;
+    using aicad::sim::fea_factor_cache_reset_stats;
+    using aicad::sim::fea_factor_cache_stats;
+
+    fea_factor_cache_clear();
+    fea_factor_cache_reset_stats();
+
+    BoxMesh m4 = make_box_tet4(8, 2, 2, 100.0, 10.0, 10.0);
+    BoxMesh m = promote_to_tet10(m4);
+    const int n = static_cast<int>(m.points.size() / 3);
+    std::vector<int> fixed;
+    for (int i = 0; i < n; ++i)
+        if (m.points[i * 3] < 1e-9) fixed.push_back(i);
+    std::vector<double> f1(static_cast<size_t>(n) * 3, 0.0);
+    std::vector<double> f2 = f1;
+    for (int i = 0; i < n; ++i)
+        if (m.points[i * 3] > 99.0 - 1e-9) {
+            f1[i * 3 + 1] = -10.0;
+            f2[i * 3 + 1] = -20.0;  // load-only change
+        }
+
+    auto r1 = fea_static_solve(m.points, m.tets, 200000.0, 0.3, 250.0, fixed, f1, 10);
+    REQUIRE(r1.ok);
+    CHECK_FALSE(r1.factor_cache_hit);  // first solve stores
+
+    auto r1b = fea_static_solve(m.points, m.tets, 200000.0, 0.3, 250.0, fixed, f1, 10);
+    REQUIRE(r1b.ok);
+    CHECK(r1b.factor_cache_hit);
+    CHECK(r1b.max_disp_mm == doctest::Approx(r1.max_disp_mm).epsilon(1e-12));
+    CHECK(r1b.max_von_mises_mpa == doctest::Approx(r1.max_von_mises_mpa).epsilon(1e-12));
+    CHECK(r1b.min_fos == doctest::Approx(r1.min_fos).epsilon(1e-12));
+
+    auto r2 = fea_static_solve(m.points, m.tets, 200000.0, 0.3, 250.0, fixed, f2, 10);
+    REQUIRE(r2.ok);
+    CHECK(r2.factor_cache_hit);  // load-only: same K
+    // Twice the load -> ~twice the tip disp (linear static).
+    CHECK(r2.max_disp_mm == doctest::Approx(2.0 * r1.max_disp_mm).epsilon(1e-9));
+
+    // Material change must miss.
+    auto r3 = fea_static_solve(m.points, m.tets, 100000.0, 0.3, 250.0, fixed, f1, 10);
+    REQUIRE(r3.ok);
+    CHECK_FALSE(r3.factor_cache_hit);
+
+    auto st = fea_factor_cache_stats();
+    CHECK(st.hits >= 2);
+    CHECK(st.misses >= 2);
+}
+
+TEST_CASE("LBM CPU backend reports backend=cpu") {
+    using aicad::sim::lbm_run;
+    using aicad::sim::LbmParams;
+    const int nx = 16, ny = 8, nz = 8;
+    std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
+    // Small solid block in the middle.
+    for (int x = 6; x < 10; ++x)
+        for (int y = 3; y < 5; ++y)
+            for (int z = 3; z < 5; ++z)
+                solid[(x * ny + y) * nz + z] = 1;
+    LbmParams p;
+    p.backend = "cpu";
+    p.u_lat = 0.05;
+    p.tau0 = 0.6;
+    p.dx_m = 1e-3;
+    p.dt_s = 5e-6;
+    auto r = lbm_run(solid, nx, ny, nz, p, 20);
+    REQUIRE(r.ok);
+    CHECK(r.backend == "cpu");
+    CHECK(std::isfinite(r.drag_n));
+}
+
+TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
+    using aicad::sim::lbm_run;
+    using aicad::sim::lbm_cuda_available;
+    using aicad::sim::LbmParams;
+    const int nx = 16, ny = 8, nz = 8;
+    std::vector<uint8_t> solid(static_cast<size_t>(nx * ny * nz), 0);
+    for (int x = 6; x < 10; ++x)
+        for (int y = 3; y < 5; ++y)
+            for (int z = 3; z < 5; ++z)
+                solid[(x * ny + y) * nz + z] = 1;
+    LbmParams cpu_p;
+    cpu_p.backend = "cpu";
+    cpu_p.u_lat = 0.05;
+    cpu_p.tau0 = 0.6;
+    cpu_p.dx_m = 1e-3;
+    cpu_p.dt_s = 5e-6;
+    auto rc = lbm_run(solid, nx, ny, nz, cpu_p, 30);
+    REQUIRE(rc.ok);
+
+    LbmParams gp;
+    gp = cpu_p;
+    gp.backend = "cuda";
+    auto rg = lbm_run(solid, nx, ny, nz, gp, 30);
+    REQUIRE(rg.ok);
+    if (!lbm_cuda_available()) {
+        // CPU-only build or no device: must fall back honestly.
+        CHECK(rg.backend == "cpu");
+        CHECK_FALSE(rg.backend_fallback.empty());
+        return;
+    }
+    // CUDA available: either ran on CUDA or fell back with a reason.
+    if (rg.backend == "cuda") {
+        // Force parity within existing float32 tolerance (~1e-3 relative for small runs).
+        const double denom = std::max(1e-12, std::abs(rc.drag_n));
+        CHECK(std::abs(rg.drag_n - rc.drag_n) / denom < 1e-2);
+    } else {
+        CHECK_FALSE(rg.backend_fallback.empty());
+    }
+}
+

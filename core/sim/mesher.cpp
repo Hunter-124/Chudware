@@ -34,13 +34,23 @@
 #include "util/resource_governor.h"  // host-memory element ceiling (graceful degrade)
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <map>
+#include <set>
+#include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <list>
 #include <mutex>
 #include <limits>
-
+#include <sstream>
+#include <string>
+#include <unordered_map>
 // OCCT data-exchange + healing for the mesh-time defeaturing fallback (Issue 6): a STEP
 // read/write round-trip plus ShapeFix + same-domain face merge, used only when the volume
 // mesher rejects fused-primitive geometry (coincident coplanar faces / sliver edges). The
@@ -51,12 +61,27 @@
 #include <STEPControl_Writer.hxx>
 #include <STEPControl_StepModelType.hxx>
 #include <ShapeFix_Shape.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <TopoDS_Shape.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
+#include <TopTools_ListOfShape.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
+#include <BRep_Tool.hxx>
+#include <Poly_Triangulation.hxx>
+#include <TopLoc_Location.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
+#include <gp_Trsf.hxx>
 #include <GProp_GProps.hxx>
+#include <BRepTools.hxx>
 #include <BRepGProp.hxx>
 
 // nglib's C interface. The header declares plain function names but the implementation lives
@@ -66,6 +91,12 @@
 namespace nglib {
 #include <nglib.h>
 }
+// From netgen's nginterface (exported unmangled from libnglib.so, not in nglib.h): the
+// meshers poll the PROCESS-GLOBAL multithread.terminate flag, and a failed session can
+// leave it SET — after which every later mesh in the process aborts with "Meshing
+// stopped" (measured: one corrupt part poisoned all 35 parts behind it, though each
+// meshed fine in a fresh process). Cleared at every session start below.
+extern "C" void Ng_UnSetTerminate(void);
 
 namespace aicad::sim {
 
@@ -81,10 +112,118 @@ std::mutex& mesh_mutex() {
     return m;
 }
 
-// Ng_Init() only wires up Netgen's message streams; run it once for the process.
+// Netgen keeps PROCESS-GLOBAL meshing state that a prior session can leave dirty: after
+// a few dozen sequential meshes (a per-part assembly mesh) later parts start failing
+// ("Meshing stopped" / "OCC-Triangulation could not be built") even though the same part
+// meshes instantly in a fresh process — measured on a real 40-part vehicle at part 18.
+// Re-initialize per meshing session (callers hold mesh_mutex, so this never races).
 void ensure_ng_init() {
     static std::once_flag once;
     std::call_once(once, [] { nglib::Ng_Init(); });
+    // Clear the sticky global terminate flag a previously FAILED session leaves behind
+    // (see the extern above). Callers hold mesh_mutex, so this never races a live mesh.
+    ::Ng_UnSetTerminate();
+}
+
+// ── Per-solid component mesh cache ──────────────────────────────────────────────
+// Multi-solid assemblies re-mesh every body on every study. Key each solid by its
+// own BRep geometry content (BRepTools::Write bytes) + every MeshOptions field —
+// never path or bbox — so an unchanged component is a hit and only the edited
+// solid regenerates. Netgen still serializes under mesh_mutex inside mesh_stl /
+// mesh_step_netgen. Residency is bounded by the same governor-derived byte budget
+// as the whole-STEP cache.
+uint64_t component_fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+uint64_t component_opts_key(const MeshOptions& o, uint64_t h) {
+    static_assert(sizeof(MeshOptions) == 80,
+                  "MeshOptions size changed — update component_opts_key");
+    h = component_fnv1a(&o.fineness, sizeof o.fineness, h);
+    h = component_fnv1a(&o.density, sizeof o.density, h);
+    h = component_fnv1a(&o.order, sizeof o.order, h);
+    h = component_fnv1a(&o.curvature, sizeof o.curvature, h);
+    h = component_fnv1a(&o.curv_elems_per_circle, sizeof o.curv_elems_per_circle, h);
+    h = component_fnv1a(&o.target_size_mm, sizeof o.target_size_mm, h);
+    h = component_fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
+    h = component_fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
+    h = component_fnv1a(&o.optimize, sizeof o.optimize, h);
+    h = component_fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
+    h = component_fnv1a(&o.structured, sizeof o.structured, h);
+    h = component_fnv1a(&o.auto_type, sizeof o.auto_type, h);
+    h = component_fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
+    h = component_fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
+    h = component_fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
+    return h;
+}
+// Content hash of a solid: BRepTools ASCII dump (geometry content, not path/bbox).
+uint64_t solid_content_key(const TopoDS_Shape& sol) {
+    std::ostringstream oss;
+    BRepTools::Write(sol, oss);
+    const std::string s = oss.str();
+    return component_fnv1a(s.data(), s.size());
+}
+size_t component_mesh_bytes(const MeshOut& m) {
+    return m.points.size() * sizeof(double) + m.tets.size() * sizeof(int) +
+           m.aspect_hist.size() * sizeof(int) + m.mesh_type_used.size() + m.note.size() +
+           m.error.size() + 256;
+}
+uint64_t component_cache_budget() {
+    const uint64_t host = aicad::governor::budget_bytes();
+    if (host == UINT64_MAX) return 512ull * 1024ull * 1024ull;
+    return std::max<uint64_t>(64ull * 1024ull * 1024ull, host / 8);
+}
+struct ComponentMeshCache {
+    std::mutex mtx;
+    std::unordered_map<uint64_t, std::shared_ptr<const MeshOut>> map;
+    std::list<uint64_t> lru;
+    uint64_t resident = 0;
+};
+ComponentMeshCache& component_mesh_cache() {
+    static ComponentMeshCache c;
+    return c;
+}
+// Lookup or generate a single solid's mesh. On HIT, returns the cached MeshOut
+// without calling Netgen. On MISS, runs generate (Netgen serializes itself).
+template <typename GenFn>
+MeshOut mesh_solid_cached(const TopoDS_Shape& sol, const MeshOptions& options, GenFn&& generate) {
+    const uint64_t key = component_opts_key(options, solid_content_key(sol));
+    {
+        auto& c = component_mesh_cache();
+        std::lock_guard<std::mutex> lk(c.mtx);
+        auto it = c.map.find(key);
+        if (it != c.map.end()) {
+            c.lru.remove(key);
+            c.lru.push_front(key);
+            mesh_cache_note_component_hit();
+            return *it->second;
+        }
+    }
+    mesh_cache_note_component_miss();
+    MeshOut mo = generate();
+    if (mo.ok) {
+        auto sp = std::make_shared<const MeshOut>(mo);
+        const uint64_t need = static_cast<uint64_t>(component_mesh_bytes(mo));
+        const uint64_t budget = component_cache_budget();
+        auto& c = component_mesh_cache();
+        std::lock_guard<std::mutex> lk(c.mtx);
+        while ((!c.lru.empty()) &&
+               (c.lru.size() >= 64 || c.resident + need > budget)) {
+            auto bit = c.map.find(c.lru.back());
+            if (bit != c.map.end()) {
+                c.resident -= static_cast<uint64_t>(component_mesh_bytes(*bit->second));
+                c.map.erase(bit);
+            }
+            c.lru.pop_back();
+        }
+        if (c.map.find(key) == c.map.end()) {
+            c.map[key] = sp;
+            c.lru.push_front(key);
+            c.resident += need;
+        }
+    }
+    return mo;
 }
 
 // Netgen tet10 local index -> gmsh MSH_TET_10 local index. out.tets[e*10 + k] takes the
@@ -276,6 +415,29 @@ std::string heal_step_for_mesh(const std::string& step_path) {
 // API is path-based). nullptr = parse here (old behaviour).
 MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options,
                          const TopoDS_Shape* pre_shape = nullptr);
+// STL-route fallback (defined below): OCCT tessellation -> Netgen STL pipeline. Used for
+// bonded assemblies whose fused B-rep defeats Netgen's OCC surface mesher. `size_ref`
+// (optional) supplies the geometry the ELEMENT SIZING is derived from — pass the whole
+// assembly when meshing one solid of it, so every part meshes at the assembly-consistent
+// size instead of its own bbox-relative one.
+MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
+                        const TopoDS_Shape* size_ref = nullptr, double defl_scale = 1.0,
+                        bool force_direct = false);
+
+// Sizing resolution shared by every meshing route (defined below, next to
+// mesh_step_netgen): fineness -> base element size off the bbox diagonal, volume-aware
+// interactivity budget + host-memory governor coarsening, tight 2:1 min/max band.
+struct SizeBand {
+    bool ok = false;
+    std::string error;
+    std::string note;
+    double fineness = 0.5;
+    double base = 0.0;
+    double min_len = 0.0;
+    double max_len = 0.0;
+    double diag = 0.0;
+};
+SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options);
 
 namespace {
 
@@ -479,51 +641,267 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
     // path-based, so the bonded shape goes through a temp STEP beside the original. Fuse
     // failure falls through to the raw compound — single-solid behavior and its error
     // surfaces are unchanged.
+    // Stage tracing for long assembly meshes (AI_CAD_MESH_TRACE=1): every bonded-path
+    // stage stamps wall time to stderr, so a stuck stage is identifiable without waiting
+    // for the study-scope report that only prints on completion.
+    const bool trace = [] {
+        const char* e = std::getenv("AI_CAD_MESH_TRACE");
+        return e && *e && *e != '0';
+    }();
+    const auto t_start = std::chrono::steady_clock::now();
+    auto trace_stage = [&](const char* stage) {
+        if (!trace) return;
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t_start).count();
+        std::fprintf(stderr, "[mesh_step +%.1fs] %s\n", s, stage);
+        std::fflush(stderr);
+    };
+
     std::string mesh_path = step_path;
-    std::string bonded_tmp;
     std::string bonded_note;
     int n_solids = 0;
     if (!shape.IsNull())
         for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next()) ++n_solids;
+
+    MeshOut out;
     if (n_solids > 1) {
-        try {
-            std::vector<TopoDS_Shape> solids;
-            solids.reserve(static_cast<std::size_t>(n_solids));
-            for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next())
-                solids.push_back(e.Current());
-            const std::vector<TopoDS_Shape> tools(solids.begin() + 1, solids.end());
-            TopoDS_Shape fused = ::geom::fuse_many(solids.front(), tools);
-            if (!fused.IsNull()) {
-                TopoDS_Shape unified = ::geom::unify_same_domain(fused);
-                if (!unified.IsNull()) fused = unified;
+        // (asm-mesh) Multi-solid STEP = an exported assembly / multi-body document. Mesh
+        // every ORIGINAL solid SEPARATELY through the production OCC pipeline and
+        // concatenate — each part is pristine geometry that has meshed reliably for the
+        // product's whole life. The earlier design fused the bodies first (bonded-contact
+        // geometry), but the fuse of really-interfering assemblies produces boolean
+        // pathology no mesher route survived (Netgen: unterminated OCC surface meshing on
+        // the monolith, silently dropped domains and segfaults on the direct STL fill,
+        // deterministic per-cluster failures after seam welding). Bonding is the SOLVER's
+        // job instead: fea_run's gap ties join every cross-part node pair within the bond
+        // gap — touching faces AND interference overlaps give abundant tie pairs. Element
+        // sizing is pinned from the WHOLE assembly so parts mesh at a consistent size.
+        std::vector<TopoDS_Shape> fsolids;
+        for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next())
+            fsolids.push_back(e.Current());
+        MeshOptions bopt = options;
+        // Assemblies default to FIRST-ORDER tets: tet10's second-order surface elevation
+        // is the step that keeps failing on thin/curved assembly parts (a fender shell
+        // meshes fine as tet4 and refuses as tet10), and for a bonded load-path study the
+        // discretization error is dominated by the gap-tie idealization anyway.
+        // resolve_mesh takes the stride from the RESULT, so the solver follows.
+        // AICAD_ASM_TET10=1 opts back in.
+        std::string order_note;
+        if (bopt.order == 2) {
+            const char* o2 = std::getenv("AICAD_ASM_TET10");
+            if (!(o2 && *o2 && *o2 != '0')) {
+                bopt.order = 1;
+                order_note = "assembly meshed first-order (tet4) — tet10 elevation is "
+                             "unreliable on assembly parts (AICAD_ASM_TET10=1 forces it)";
             }
-            int n_after = 0;
-            if (!fused.IsNull())
-                for (TopExp_Explorer e(fused, TopAbs_SOLID); e.More(); e.Next()) ++n_after;
-            if (n_after >= 1) {
-                std::filesystem::path tmp(step_path);
-                tmp.replace_extension(".bonded.step");
-                STEPControl_Writer wr;
-                if (wr.Transfer(fused, STEPControl_AsIs) == IFSelect_RetDone &&
-                    wr.Write(tmp.string().c_str()) == IFSelect_RetDone) {
-                    bonded_tmp = tmp.string();
-                    mesh_path = bonded_tmp;
-                    shape = fused;
-                    bonded_note = "assembly bonded for meshing: " + std::to_string(n_solids) +
-                                  " solid bodies fused into " + std::to_string(n_after);
+        }
+        // Sizing is deliberately PER PART (auto): pinning the assembly-wide size as an
+        // explicit target bypassed the auto-mode "never exceed the part's smallest real
+        // dimension" clamp, which handed a thin-walled body tub 180 mm elements and
+        // stopped Netgen cold. Auto mode re-derives a sane size per part (thin parts get
+        // thin-wall sizing; the governor caps totals), at the cost of some size variation
+        // across parts — correct beats uniform.
+        // Per-part volumes: an UNMESHABLE part is skipped (with a loud note) when it is
+        // a negligible fraction of the assembly — a corrupt cosmetic sliver in a WIP doc
+        // must not kill a vehicle-level study — and a hard failure otherwise.
+        std::vector<double> vols(fsolids.size(), 0.0);
+        double vol_total = 0.0;
+        for (std::size_t i = 0; i < fsolids.size(); ++i) {
+            try {
+                GProp_GProps vp;
+                BRepGProp::VolumeProperties(fsolids[i], vp);
+                vols[i] = std::fabs(vp.Mass());
+            } catch (...) {
+                vols[i] = 0.0;
+            }
+            vol_total += vols[i];
+        }
+        std::vector<int> skipped;
+        MeshOut merged;
+        merged.nodes_per_elem = (bopt.order == 2) ? 10 : 4;
+        bool all_ok = true;
+        int solid_no = 0;
+        for (const TopoDS_Shape& sol : fsolids) {
+            ++solid_no;
+            // Per-solid content-addressed cache: identical solid geometry + MeshOptions
+            // reuses the component mesh (zero Netgen work). An edited solid is one miss
+            // while siblings hit. Key is BRep content + options — never path/bbox.
+            MeshOut mo = mesh_solid_cached(sol, bopt, [&]() -> MeshOut {
+                MeshOut gen;
+                gen.ok = false;
+                // BRepCheck verdict (used to decide whether the CAD-exact OCC route is safe
+                // as a fallback — its error paths heap-corrupt on invalid shells).
+                bool brep_valid = false;
+                try {
+                    BRepCheck_Analyzer an(sol);
+                    brep_valid = an.IsValid() == Standard_True;
+                } catch (...) {
+                    brep_valid = false;
+                }
+                // Tessellation routes FIRST: they carry the manifold + enclosed-volume trust
+                // gates, so garbage geometry fails CLEANLY before any netgen code runs.
+                for (double ds : {1.0, 0.55, 1.8}) {
+                    gen = mesh_stl_netgen(sol, bopt, &shape, ds);
+                    if (gen.ok) break;
+                }
+                if (!gen.ok) {
+                    for (double ds : {1.0, 0.55}) {
+                        gen = mesh_stl_netgen(sol, bopt, &shape, ds, /*force_direct=*/true);
+                        if (gen.ok) break;
+                    }
+                }
+                std::string occ_err = gen.ok ? std::string() : gen.error;
+                const bool untrusted =
+                    occ_err.find("2-manifold") != std::string::npos ||
+                    occ_err.find("self-intersecting") != std::string::npos;
+                if (!gen.ok && brep_valid && !untrusted) {
+                    try {
+                        std::filesystem::path tmp(step_path);
+                        tmp.replace_extension(".part" + std::to_string(solid_no) + ".step");
+                        STEPControl_Writer wr;
+                        if (wr.Transfer(sol, STEPControl_AsIs) == IFSelect_RetDone &&
+                            wr.Write(tmp.string().c_str()) == IFSelect_RetDone) {
+                            gen = mesh_step_single(tmp.string(), bopt, sol);
+                            if (!gen.ok) occ_err += " [OCC route: " + gen.error + "]";
+                            std::error_code ec;
+                            std::filesystem::remove(tmp, ec);
+                        }
+                    } catch (...) {
+                        occ_err += " [OCC route raised]";
+                    }
+                }
+                if (!gen.ok) {
+                    // Last-resort per-part heal: WIP documents carry OPEN-SHELL bodies.
+                    try {
+                        BRepBuilderAPI_Sewing sew(0.1);
+                        sew.Add(sol);
+                        sew.Perform();
+                        TopoDS_Shape sewn = sew.SewedShape();
+                        if (!sewn.IsNull()) {
+                            BRepBuilderAPI_MakeSolid mk;
+                            int n_shells = 0;
+                            for (TopExp_Explorer se(sewn, TopAbs_SHELL); se.More();
+                                 se.Next(), ++n_shells)
+                                mk.Add(TopoDS::Shell(se.Current()));
+                            TopoDS_Shape resolid;
+                            if (n_shells > 0 && mk.IsDone()) {
+                                const TopoDS_Solid sol_out = mk.Solid();
+                                resolid = sol_out;
+                            }
+                            if (!resolid.IsNull()) {
+                                for (double ds : {1.0, 0.55}) {
+                                    gen = mesh_stl_netgen(resolid, bopt, &shape, ds);
+                                    if (gen.ok) break;
+                                }
+                                if (gen.ok && trace)
+                                    trace_stage(("part " + std::to_string(solid_no) +
+                                                 ": recovered by sew+solidify").c_str());
+                            }
+                        }
+                    } catch (...) {
+                    }
+                }
+                if (!gen.ok && !occ_err.empty() && gen.error.empty()) gen.error = occ_err;
+                else if (!gen.ok && !occ_err.empty() && gen.error.find(occ_err) == std::string::npos)
+                    gen.error = occ_err;
+                return gen;
+            });
+            if (!mo.ok) {
+                std::string occ_err = mo.error;
+                const double vfrac =
+                    vol_total > 1e-9
+                        ? vols[static_cast<std::size_t>(solid_no - 1)] / vol_total
+                        : 1.0;
+                // Skip threshold for unmeshable parts (% of assembly volume).
+                // Default 0.5%; AI_CAD_FEA_SKIP_UNMESHABLE_PCT overrides.
+                double skip_pct = 0.5;
+                if (const char* sp = std::getenv("AI_CAD_FEA_SKIP_UNMESHABLE_PCT")) {
+                    const double v = std::atof(sp);
+                    if (v >= 0.0) skip_pct = v;
+                }
+                if (trace) {
+                    Bnd_Box pb;
+                    try { BRepBndLib::Add(sol, pb); } catch (...) {}
+                    double x0=0,y0=0,z0=0,x1=0,y1=0,z1=0;
+                    if (!pb.IsVoid()) pb.Get(x0,y0,z0,x1,y1,z1);
+                    std::fprintf(stderr,
+                        "[mesh_step] part %d FAILED: vol=%.1f mm3 (%.3f%% of assembly) "
+                        "bbox=[%.0f,%.0f,%.0f]..[%.0f,%.0f,%.0f]\n",
+                        solid_no, vols[static_cast<std::size_t>(solid_no - 1)],
+                        vfrac * 100.0, x0, y0, z0, x1, y1, z1);
+                    std::fflush(stderr);
+                }
+                if (vfrac * 100.0 < skip_pct) {
+                    skipped.push_back(solid_no);
+                    continue;  // negligible unmeshable part: skip, note below
+                }
+                {
+                    Bnd_Box pb;
+                    try { BRepBndLib::Add(sol, pb); } catch (...) {}
+                    double x0=0,y0=0,z0=0,x1=0,y1=0,z1=0;
+                    if (!pb.IsVoid()) pb.Get(x0,y0,z0,x1,y1,z1);
+                    char bb[128];
+                    std::snprintf(bb, sizeof(bb),
+                                  " (part bbox [%.0f,%.0f,%.0f]..[%.0f,%.0f,%.0f] mm, "
+                                  "%.2f%% of assembly volume)",
+                                  x0, y0, z0, x1, y1, z1, vfrac * 100.0);
+                    occ_err += bb;
+                }
+                out = mo;
+                out.error = "assembly part " + std::to_string(solid_no) + "/" +
+                            std::to_string(fsolids.size()) + " failed to mesh: " + occ_err;
+                all_ok = false;
+                break;
+            }
+            {
+                if (mo.nodes_per_elem != merged.nodes_per_elem) {
+                    out = mo;
+                    out.ok = false;
+                    out.error = "assembly part " + std::to_string(solid_no) +
+                                " meshed with a different element type (" +
+                                mo.mesh_type_used + ") — cannot merge";
+                    all_ok = false;
+                    break;
                 }
             }
-        } catch (...) {
-            // best-effort — the raw compound still goes to the mesher, which reports
-            // its own (now-annotated) failure below
+            const int offset = static_cast<int>(merged.points.size() / 3);
+            merged.points.insert(merged.points.end(), mo.points.begin(), mo.points.end());
+            merged.tets.reserve(merged.tets.size() + mo.tets.size());
+            for (int idx : mo.tets) merged.tets.push_back(idx + offset);
+            if (merged.char_len_mm <= 0.0) merged.char_len_mm = mo.char_len_mm;
+            if (merged.mesh_type_used.empty()) merged.mesh_type_used = mo.mesh_type_used;
+            if (trace)
+                trace_stage(("part " + std::to_string(solid_no) + "/" +
+                             std::to_string(fsolids.size()) + ": " +
+                             std::to_string(mo.n_elems) + " elems").c_str());
         }
-    }
-
-    MeshOut out = mesh_step_single(mesh_path, options, shape);
-
-    if (!bonded_tmp.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(bonded_tmp, ec);
+        if (all_ok) {
+            merged.n_nodes = static_cast<int>(merged.points.size() / 3);
+            merged.n_elems =
+                static_cast<int>(merged.tets.size() / merged.nodes_per_elem);
+            if (merged.n_elems > 0) {
+                fill_quality(merged);
+                merged.ok = true;
+                bonded_note = "assembly meshed per part: " + std::to_string(n_solids) +
+                              " solid bodies (bonded by solver gap ties)";
+                if (!order_note.empty()) bonded_note += "; " + order_note;
+                if (!skipped.empty()) {
+                    std::string sk;
+                    for (int i : skipped) sk += (sk.empty() ? "" : ",") + std::to_string(i);
+                    bonded_note += "; WARNING: " + std::to_string(skipped.size()) +
+                                   " unmeshable negligible-volume part(s) skipped (#" + sk +
+                                   " — below the unmeshable-part skip threshold; "
+                                   "check their geometry)";
+                }
+                out = std::move(merged);
+                trace_stage("per-solid assembly mesh: ok");
+            } else {
+                out.ok = false;
+                out.error = "assembly produced no volume elements";
+            }
+        }
+    } else {
+        out = mesh_step_single(mesh_path, options, shape);
     }
     if (n_solids > 1) {
         if (out.ok && !bonded_note.empty())
@@ -554,54 +932,26 @@ struct NetgenSession {
     }
 };
 
-MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options,
-                         const TopoDS_Shape* pre_shape) {
-    std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
-    // Per-phase record (prof/phases.h): load_step / generate / second_order / extract.
-    // Opened AFTER the meshing mutex so lock-wait is not misattributed to meshing time.
-    aicad::prof::phases::StudyScope _study("mesh_tet");
-    MeshOut out;
-
-    // Second-order (tet10) selection. order==1 produces 4-node tets (NG_TET); order==2
-    // elevates to 10-node tets (NG_TET10) with mid-side nodes projected to the CAD surface.
-    // Any other value is treated as order 1 (defensive).
-    const bool order2 = (options.order == 2);
-    const int npe = order2 ? 10 : 4;
-    out.nodes_per_elem = npe;
-
-    auto fail = [&](const std::string& msg) -> MeshOut {
-        out.ok = false;
-        out.error = "netgen: " + msg;
-        return out;
-    };
-
+// Sizing resolution shared by the OCC and STL meshing routes (extracted verbatim from
+// mesh_step_netgen): fineness -> base element size off the bbox DIAGONAL, the volume-aware
+// interactivity budget + host-memory governor coarsening, and the tight 2:1 min/max band
+// (Bug F7). `error` set (ok=false) on degenerate geometry; `note` carries any governor
+// coarsening message for MeshOut::note.
+SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options) {
+    SizeBand sb;
     // Resolve the primary sizing control. A legacy `density` (>= 0) wins and maps
     // directly onto fineness (both use "higher = finer"); otherwise use `fineness`.
-    const double fineness = std::min(
+    sb.fineness = std::min(
         1.0, std::max(0.0, options.density >= 0.0 ? options.density : options.fineness));
+    const double fineness = sb.fineness;
 
-    // Bounding box -> base element size, derived from the DIAGONAL (not the smallest side).
-    // The nglib OCC path takes a STEP file path rather than an in-memory shape, so we read
-    // the same STEP with OCCT to get the bbox. Keying off the diagonal gives a sane element
-    // count across very different proportions: a thin plate, a long bracket and a cube all
-    // mesh reasonably instead of the smallest-dimension heuristic exploding thin parts.
     double dx = 0.0, dy = 0.0, dz = 0.0;
     double solid_vol = 0.0;  // real occupied volume (mm^3) — drives the element-count budget
     try {
-        TopoDS_Shape shape;  // P4: reuse the caller's parse; only read the file ourselves
-        if (pre_shape && !pre_shape->IsNull()) {
-            shape = *pre_shape;
-        } else {
-            STEPControl_Reader rd;
-            if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone)
-                return fail("could not read the STEP (is the path valid?)");
-            rd.TransferRoots();
-            shape = rd.OneShape();
-        }
-        if (shape.IsNull()) return fail("STEP contained no shape");
+        if (shape.IsNull()) { sb.error = "STEP contained no shape"; return sb; }
         Bnd_Box bb;
         BRepBndLib::Add(shape, bb);
-        if (bb.IsVoid()) return fail("degenerate bounding box (void)");
+        if (bb.IsVoid()) { sb.error = "degenerate bounding box (void)"; return sb; }
         double xmin, ymin, zmin, xmax, ymax, zmax;
         bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
         dx = std::fabs(xmax - xmin);
@@ -615,12 +965,14 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
             solid_vol = std::fabs(vp.Mass());
         } catch (...) { solid_vol = 0.0; }
     } catch (...) {
-        return fail("failed to read STEP bounding box");
+        sb.error = "failed to read STEP bounding box";
+        return sb;
     }
     const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
     const double min_side =
         std::min({dx > 1e-9 ? dx : 1e30, dy > 1e-9 ? dy : 1e30, dz > 1e-9 ? dz : 1e30});
-    if (!(diag > 1e-6)) return fail("degenerate bounding box (diagonal <= 1e-6)");
+    if (!(diag > 1e-6)) { sb.error = "degenerate bounding box (diagonal <= 1e-6)"; return sb; }
+    sb.diag = diag;
 
     // base = diag / lerp(8, 60, fineness): coarse ~= diag/8, fine ~= diag/60. Explicit
     // target_size_mm overrides it outright (and is respected as-is).
@@ -628,6 +980,9 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         std::isfinite(options.target_size_mm) && options.target_size_mm > 0.0;
     const double divisor = 8.0 + 52.0 * fineness;
     double base = explicit_size ? options.target_size_mm : diag / divisor;
+    auto append_note = [&sb](const char* buf) {
+        sb.note = sb.note.empty() ? std::string(buf) : (sb.note + "; " + buf);
+    };
     // For auto sizing, never let the base exceed the part's smallest real dimension, or a
     // chunky/thin part gets only a single element through its thickness. (An explicit
     // target is honored verbatim.)
@@ -677,7 +1032,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
                     "auto-coarsened for interactivity: est ~%.0fk tets exceeds %ldk budget -> "
                     "element size %.2f->%.2f mm (raise Fine or set a target size for more detail)",
                     est / 1000.0, budget / 1000, base, base_new);
-                out.note = out.note.empty() ? std::string(buf) : (out.note + "; " + buf);
+                append_note(buf);
                 base = base_new;
             }
         }
@@ -694,7 +1049,7 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
                 "machine's memory budget (~%ldk) -> element size raised to %.2f mm "
                 "(raise AICAD_MEM_FRAC or use a smaller model for more detail)",
                 base, est / 1000.0, mem_max_elems / 1000, base_new);
-            out.note = out.note.empty() ? std::string(buf) : (out.note + "; " + buf);
+            append_note(buf);
             base = base_new;
         }
     }
@@ -722,6 +1077,59 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     const double abs_floor = diag * 1e-3;
     if (min_len < abs_floor) min_len = abs_floor;
     if (max_len < min_len) max_len = min_len;
+
+    sb.base = base;
+    sb.min_len = min_len;
+    sb.max_len = max_len;
+    sb.ok = true;
+    return sb;
+}
+
+MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options,
+                         const TopoDS_Shape* pre_shape) {
+    std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
+    // Per-phase record (prof/phases.h): load_step / generate / second_order / extract.
+    // Opened AFTER the meshing mutex so lock-wait is not misattributed to meshing time.
+    aicad::prof::phases::StudyScope _study("mesh_tet");
+    MeshOut out;
+
+    // Second-order (tet10) selection. order==1 produces 4-node tets (NG_TET); order==2
+    // elevates to 10-node tets (NG_TET10) with mid-side nodes projected to the CAD surface.
+    // Any other value is treated as order 1 (defensive).
+    const bool order2 = (options.order == 2);
+    const int npe = order2 ? 10 : 4;
+    out.nodes_per_elem = npe;
+
+    auto fail = [&](const std::string& msg) -> MeshOut {
+        out.ok = false;
+        out.error = "netgen: " + msg;
+        return out;
+    };
+
+    // Sizing (shared with the STL route). The nglib OCC path takes a STEP file path rather
+    // than an in-memory shape, so read the same STEP with OCCT when the caller has no
+    // pre-parsed shape (P4: reuse the caller's parse otherwise).
+    TopoDS_Shape shape;
+    if (pre_shape && !pre_shape->IsNull()) {
+        shape = *pre_shape;
+    } else {
+        try {
+            STEPControl_Reader rd;
+            if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone)
+                return fail("could not read the STEP (is the path valid?)");
+            rd.TransferRoots();
+            shape = rd.OneShape();
+        } catch (...) {
+            return fail("failed to read STEP bounding box");
+        }
+    }
+    SizeBand sb = resolve_size_band(shape, options);
+    if (!sb.ok) return fail(sb.error);
+    if (!sb.note.empty()) out.note = out.note.empty() ? sb.note : (out.note + "; " + sb.note);
+    const double fineness = sb.fineness;
+    double base = sb.base;
+    const double min_len = sb.min_len;
+    const double max_len = sb.max_len;
 
     ensure_ng_init();
     NetgenSession sess;
@@ -900,6 +1308,433 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
                                 : (options.quad_surface ? "tet4-quad-surface" : "tet4");
     fill_quality(out);
     out.ok = true;
+    mesh_cache_note_generation();
+    return out;
+}
+
+// STL-route volume meshing (asm-mesh fallback): tessellate the shape with OCCT's per-face
+// BRepMesh (robust on geometry Netgen's OCC surface mesher rejects — fused assembly seams
+// produced "meshed area > face area / GIVING UP" retry loops that burned 30+ minutes and
+// never terminated on a real 40-body vehicle), then hand the closed triangulation to
+// Netgen's STL pipeline (chart building + surface REMESH + Delaunay volume fill). Surfaces
+// are faceted at the tessellation deflection instead of CAD-exact — for a bonded-assembly
+// load-path study that error is far below the bonded-contact idealization itself. tet10
+// mid-nodes come from Ng_STL_Generate_SecondOrder (STL-surface projection).
+MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
+                        const TopoDS_Shape* size_ref, double defl_scale,
+                        bool force_direct) {
+    std::lock_guard<std::mutex> mesh_lock(mesh_mutex());  // serialize: Netgen is not thread-safe
+    aicad::prof::phases::StudyScope _study("mesh_stl");
+    MeshOut out;
+
+    const bool order2 = (options.order == 2);
+    const int npe = order2 ? 10 : 4;
+    out.nodes_per_elem = npe;
+
+    auto fail = [&](const std::string& msg) -> MeshOut {
+        out.ok = false;
+        out.error = "netgen-stl: " + msg;
+        return out;
+    };
+
+    SizeBand sb = resolve_size_band(
+        (size_ref && !size_ref->IsNull()) ? *size_ref : shape, options);
+    if (!sb.ok) return fail(sb.error);
+    if (!sb.note.empty()) out.note = sb.note;
+
+    const bool trace = [] {
+        const char* e = std::getenv("AI_CAD_MESH_TRACE");
+        return e && *e && *e != '0';
+    }();
+    const auto t_start = std::chrono::steady_clock::now();
+    auto trace_stage = [&](const char* stage, std::size_t n = 0) {
+        if (!trace) return;
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t_start).count();
+        if (n) std::fprintf(stderr, "[mesh_stl +%.1fs] %s (%zu)\n", s, stage, n);
+        else std::fprintf(stderr, "[mesh_stl +%.1fs] %s\n", s, stage);
+        std::fflush(stderr);
+    };
+
+    // Tessellate finer than the element size so faceting error stays below mesh error, but
+    // floored so a huge assembly doesn't produce a gigantic triangulation.
+    const double defl =
+        std::max(sb.diag * 1e-4, std::min(sb.base * 0.25, sb.diag * 2e-3)) *
+        std::max(0.05, defl_scale);
+
+    ensure_ng_init();
+    nglib::Ng_STL_Geometry* geo = nullptr;
+    nglib::Ng_Mesh* mesh = nullptr;
+    // NOTE: nglib exposes no Ng_STL_DeleteGeometry — the geometry object is leaked by API
+    // design. Meshes are content+options cached upstream (P4), so this is once per geometry.
+    auto cleanup_mesh = [&]() {
+        if (mesh) {
+            try { nglib::Ng_DeleteMesh(mesh); } catch (...) {}
+            mesh = nullptr;
+        }
+    };
+
+    // Welded triangle soup from the OCCT tessellation. OCCT discretizes each EDGE once and
+    // shares that polygon between the two adjacent faces' triangulations, so coincident
+    // vertices match bitwise; a quantized weld map (1e-6 mm) turns the per-face soups into
+    // one conforming closed surface mesh.
+    std::vector<double> vpts;                 // welded vertices, flat xyz
+    std::vector<std::array<int, 3>> vtris;    // welded triangles, 0-based
+    std::map<std::array<long long, 3>, int> weld;
+    auto weld_point = [&](const gp_Pnt& p) -> int {
+        const std::array<long long, 3> key = {
+            static_cast<long long>(std::llround(p.X() * 1e6)),
+            static_cast<long long>(std::llround(p.Y() * 1e6)),
+            static_cast<long long>(std::llround(p.Z() * 1e6))};
+        auto it = weld.find(key);
+        if (it != weld.end()) return it->second;
+        const int id = static_cast<int>(vpts.size() / 3);
+        vpts.push_back(p.X());
+        vpts.push_back(p.Y());
+        vpts.push_back(p.Z());
+        weld.emplace(key, id);
+        return id;
+    };
+
+    try {
+        aicad::prof::phases::PhaseScope _p("tessellate");
+        trace_stage("tessellate: start");
+        BRepMesh_IncrementalMesh mesher(shape, defl, Standard_False, 0.5, Standard_True);
+        mesher.Perform();
+        trace_stage("tessellate: done");
+        for (TopExp_Explorer fexp(shape, TopAbs_FACE); fexp.More(); fexp.Next()) {
+            const TopoDS_Face face = TopoDS::Face(fexp.Current());
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+            if (tri.IsNull()) continue;
+            const gp_Trsf trsf = loc.Transformation();
+            const bool ident = loc.IsIdentity();
+            // REVERSED faces wind their triangles inward — swap two nodes so every
+            // triangle is positively (outward) oriented; both Netgen input routes need a
+            // consistent orientation to tell inside from outside.
+            const bool flip = (face.Orientation() == TopAbs_REVERSED);
+            for (int t = 1; t <= tri->NbTriangles(); ++t) {
+                int n1, n2, n3;
+                tri->Triangle(t).Get(n1, n2, n3);
+                if (flip) std::swap(n2, n3);
+                gp_Pnt a = tri->Node(n1), b = tri->Node(n2), c = tri->Node(n3);
+                if (!ident) { a.Transform(trsf); b.Transform(trsf); c.Transform(trsf); }
+                // Degenerate slivers (zero area) confuse both routes — drop them; the
+                // neighbouring triangles still close the surface within tolerance.
+                const double ux = b.X()-a.X(), uy = b.Y()-a.Y(), uz = b.Z()-a.Z();
+                const double vx = c.X()-a.X(), vy = c.Y()-a.Y(), vz = c.Z()-a.Z();
+                const double cxs = uy*vz-uz*vy, cys = uz*vx-ux*vz, czs = ux*vy-uy*vx;
+                if (cxs*cxs + cys*cys + czs*czs <= 1e-24) continue;
+                const int ia = weld_point(a), ib = weld_point(b), ic = weld_point(c);
+                if (ia == ib || ib == ic || ia == ic) continue;  // welded to a sliver
+                vtris.push_back({ia, ib, ic});
+            }
+        }
+    } catch (const std::exception& e) {
+        return fail(std::string("tessellation raised: ") + e.what());
+    } catch (...) {
+        return fail("tessellation raised an unknown exception");
+    }
+    if (vtris.size() < 4) return fail("tessellation produced no usable triangles");
+    trace_stage("triangles welded", vtris.size());
+
+    // Conforming edge-cap refinement: OCCT's tessellator emits triangles as LARGE as the
+    // face allows on flat panels (chord deviation on a plane is zero), so a vehicle-sized
+    // sheet arrives as a handful of extremely long, skinny triangles next to millimetre
+    // ones — pathological input for Netgen's Delaunay volume fill (measured: "Illegal
+    // position in Geomsearch" + segfault). Split every edge longer than the element size
+    // and re-triangulate each triangle by which of ITS edges were flagged; the split set
+    // is global and midpoints weld by node-pair key, so neighbours stay conforming (no
+    // T-junctions, surface stays closed).
+    {
+        const double cap_len = std::max(sb.max_len, 4.0 * defl);
+        const double cap2 = cap_len * cap_len;
+        auto edge_key = [](int a, int b) {
+            return (static_cast<long long>(std::min(a, b)) << 32) |
+                   static_cast<unsigned int>(std::max(a, b));
+        };
+        auto len2 = [&](int a, int b) {
+            const double dx = vpts[3ull*a] - vpts[3ull*b];
+            const double dy = vpts[3ull*a+1] - vpts[3ull*b+1];
+            const double dz = vpts[3ull*a+2] - vpts[3ull*b+2];
+            return dx*dx + dy*dy + dz*dz;
+        };
+        for (int round = 0; round < 24; ++round) {
+            std::map<long long, int> midpoint;  // flagged edge -> welded midpoint node
+            auto flag_mid = [&](int a, int b) -> int {
+                const long long k = edge_key(a, b);
+                auto it = midpoint.find(k);
+                if (it != midpoint.end()) return it->second;
+                const gp_Pnt m((vpts[3ull*a] + vpts[3ull*b]) * 0.5,
+                               (vpts[3ull*a+1] + vpts[3ull*b+1]) * 0.5,
+                               (vpts[3ull*a+2] + vpts[3ull*b+2]) * 0.5);
+                const int id = weld_point(m);
+                midpoint.emplace(k, id);
+                return id;
+            };
+            // Pass 1: flag every over-length edge (global, so both sides split alike).
+            std::set<long long> flagged;
+            for (const auto& t : vtris)
+                for (int e = 0; e < 3; ++e) {
+                    const int a = t[e], b = t[(e + 1) % 3];
+                    if (len2(a, b) > cap2) flagged.insert(edge_key(a, b));
+                }
+            if (flagged.empty()) break;
+            // Pass 2: subdivide by per-triangle flagged-edge pattern (1 -> 2/3/4 tris).
+            std::vector<std::array<int, 3>> next;
+            next.reserve(vtris.size() * 2);
+            for (const auto& t : vtris) {
+                const int a = t[0], b = t[1], c = t[2];
+                const bool fab = flagged.count(edge_key(a, b)) != 0;
+                const bool fbc = flagged.count(edge_key(b, c)) != 0;
+                const bool fca = flagged.count(edge_key(c, a)) != 0;
+                const int n_f = (fab ? 1 : 0) + (fbc ? 1 : 0) + (fca ? 1 : 0);
+                if (n_f == 0) {
+                    next.push_back(t);
+                } else if (n_f == 3) {
+                    const int mab = flag_mid(a, b), mbc = flag_mid(b, c), mca = flag_mid(c, a);
+                    next.push_back({a, mab, mca});
+                    next.push_back({mab, b, mbc});
+                    next.push_back({mca, mbc, c});
+                    next.push_back({mab, mbc, mca});
+                } else if (n_f == 1) {
+                    // Rotate so the flagged edge is (a,b); apex c stays.
+                    int ra = a, rb = b, rc = c;
+                    if (fbc) { ra = b; rb = c; rc = a; }
+                    else if (fca) { ra = c; rb = a; rc = b; }
+                    const int m = flag_mid(ra, rb);
+                    next.push_back({ra, m, rc});
+                    next.push_back({m, rb, rc});
+                } else {  // n_f == 2: rotate so the UNflagged edge is (a,b)
+                    int ra = a, rb = b, rc = c;
+                    if (!fbc) { ra = b; rb = c; rc = a; }
+                    else if (!fca) { ra = c; rb = a; rc = b; }
+                    const int mbc = flag_mid(rb, rc), mca = flag_mid(rc, ra);
+                    next.push_back({ra, rb, mbc});
+                    next.push_back({ra, mbc, mca});
+                    next.push_back({mca, mbc, rc});
+                }
+            }
+            vtris.swap(next);
+        }
+        trace_stage("edge-cap refined", vtris.size());
+    }
+
+    nglib::Ng_Meshing_Parameters mp;
+    mp.uselocalh = 1;
+    mp.maxh = sb.max_len;
+    mp.minh = sb.min_len;
+    mp.fineness = sb.fineness;
+    mp.grading = 0.2;                      // same smooth gradation as the OCC route
+    mp.elementsperedge = 2.0;
+    mp.second_order = 0;                   // elevate explicitly below
+    mp.optsurfmeshenable = options.optimize ? 1 : 0;
+    mp.optvolmeshenable = options.optimize ? 1 : 0;
+    mp.optsteps_2d = options.optimize ? 5 : 0;
+    mp.optsteps_3d = options.optimize ? 5 : 0;
+
+    // Extraction shared by both routes below.
+    auto extract = [&](const char* type_tag) -> bool {
+        aicad::prof::phases::PhaseScope _p_extract("extract");
+        const int np = nglib::Ng_GetNP(mesh);
+        if (np <= 0) return false;
+        out.points.assign(static_cast<size_t>(np) * 3, 0.0);
+        for (int i = 1; i <= np; ++i) {
+            double x[3];
+            nglib::Ng_GetPoint(mesh, i, x);
+            const size_t b = static_cast<size_t>(i - 1) * 3;
+            out.points[b + 0] = x[0];
+            out.points[b + 1] = x[1];
+            out.points[b + 2] = x[2];
+        }
+        const auto want = order2 ? nglib::NG_TET10 : nglib::NG_TET;
+        const int ne = nglib::Ng_GetNE(mesh);
+        out.tets.clear();
+        out.tets.reserve(static_cast<size_t>(ne) * npe);
+        int pi[NG_VOLUME_ELEMENT_MAXPOINTS];
+        for (int e = 1; e <= ne; ++e) {
+            if (nglib::Ng_GetVolumeElement(mesh, e, pi) != want) continue;
+            for (int k = 0; k < npe; ++k) {
+                const int src = order2 ? kNg2Gmsh[k] : k;
+                out.tets.push_back(pi[src] - 1);  // 1-based -> 0-based
+            }
+        }
+        if (out.tets.empty()) return false;
+        out.char_len_mm = sb.base;
+        out.n_nodes = static_cast<int>(out.points.size() / 3);
+        out.n_elems = static_cast<int>(out.tets.size() / npe);
+        out.mesh_type_used = type_tag;
+        fill_quality(out);
+        out.ok = true;
+        mesh_cache_note_generation();
+        return true;
+    };
+
+    // ── Route A: DIRECT surface-mesh input ──────────────────────────────────────────
+    // Feed the welded, conforming, outward-oriented tessellation straight in as Netgen's
+    // surface mesh and go directly to the Delaunay volume fill — no chart building, no
+    // surface remesh. On the 40-body vehicle Netgen's STL surface remesher ground for
+    // 10+ minutes; the volume fill from a given closed surface is seconds. Boundary
+    // triangle size == tessellation deflection (finer than maxh — conservative).
+    //
+    // GATE: the volume fill assumes a closed, 2-manifold, consistently-oriented surface;
+    // handed anything else, Netgen's geometry search doesn't fail — it SEGFAULTS
+    // ("Illegal position in Geomsearch", observed on a sliver part whose weld collapsed
+    // nearly-degenerate triangles into a non-manifold edge). Require every undirected
+    // edge to be shared by exactly two triangles, else skip straight to Route B (whose
+    // STL chart builder is designed for dirty soup and fails cleanly).
+    std::string direct_err;
+    bool manifold = true;
+    {
+        std::map<long long, int> edge_uses;
+        auto ekey = [](int a, int b) {
+            return (static_cast<long long>(std::min(a, b)) << 32) |
+                   static_cast<unsigned int>(std::max(a, b));
+        };
+        for (const auto& t : vtris)
+            for (int e = 0; e < 3; ++e)
+                ++edge_uses[ekey(t[e], t[(e + 1) % 3])];
+        for (const auto& kv : edge_uses)
+            if (kv.second != 2) { manifold = false; break; }
+        if (!manifold) {
+            direct_err = "welded surface is not a closed 2-manifold";
+            trace_stage("direct: skipped (non-manifold surface)");
+        }
+    }
+    // Tessellation trustworthiness gate (applies to BOTH netgen routes): the surface
+    // must be a closed 2-manifold AND enclose the same volume as the B-rep (divergence
+    // theorem over the triangles vs GProp). A self-intersecting or inside-out shell
+    // passes face-level checks but heap-corrupts netgen's meshers (glibc aborts measured
+    // on a corrupt body tub: "boundary mesh is overlapping" -> corrupted size). Such
+    // geometry gets a CLEAN failure here instead of reaching netgen at all.
+    if (manifold) {
+        double vol6 = 0.0;
+        for (const auto& t : vtris) {
+            const double* a = &vpts[3ull * t[0]];
+            const double* b = &vpts[3ull * t[1]];
+            const double* c = &vpts[3ull * t[2]];
+            vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) -
+                    a[1] * (b[0] * c[2] - b[2] * c[0]) +
+                    a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        const double tess_vol = vol6 / 6.0;
+        double brep_vol = 0.0;
+        try {
+            GProp_GProps vp;
+            BRepGProp::VolumeProperties(shape, vp);
+            brep_vol = std::fabs(vp.Mass());
+        } catch (...) {}
+        if (brep_vol > 1e-9 &&
+            (tess_vol < 0.0 ||
+             std::fabs(tess_vol - brep_vol) > 0.25 * brep_vol)) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "tessellated surface encloses %.0f mm3 but the B-rep claims "
+                          "%.0f mm3 — self-intersecting or inside-out shell",
+                          tess_vol, brep_vol);
+            return fail(buf);
+        }
+    }
+
+    // SMALL parts skip the direct route entirely: Netgen's raw volume fill has segfaulted
+    // on a topologically-closed but degenerate sliver part (204 triangles), and at this
+    // size Route B's surface remesh costs ~0.1s while being far better conditioned. The
+    // direct route's payoff — skipping a minutes-long remesh — only exists on LARGE
+    // surfaces.
+    if (manifold && !force_direct && vtris.size() < 5000) {
+        manifold = false;
+        direct_err = "small part routed to the STL remesh (better conditioned)";
+        trace_stage("direct: skipped (small part -> remesh route)");
+    }
+    if (manifold) try {
+        aicad::prof::phases::PhaseScope _p("generate");
+        mesh = nglib::Ng_NewMesh();
+        double xyz[3];
+        for (size_t i = 0; i + 2 < vpts.size(); i += 3) {
+            xyz[0] = vpts[i]; xyz[1] = vpts[i + 1]; xyz[2] = vpts[i + 2];
+            nglib::Ng_AddPoint(mesh, xyz);
+        }
+        int tp[3];
+        for (const auto& t : vtris) {
+            tp[0] = t[0] + 1; tp[1] = t[1] + 1; tp[2] = t[2] + 1;  // 1-based
+            nglib::Ng_AddSurfaceElement(mesh, nglib::NG_TRIG, tp);
+        }
+        trace_stage("direct: surface fed");
+        if (nglib::Ng_GenerateVolumeMesh(mesh, &mp) != nglib::NG_OK) {
+            direct_err = "volume fill from the tessellated surface failed";
+        } else {
+            trace_stage("direct: volume mesh done");
+            if (order2) {
+                aicad::prof::phases::PhaseScope _p2("second_order");
+                nglib::Ng_Generate_SecondOrder(mesh);  // straight mid-edge nodes
+            }
+            if (extract(order2 ? "tet10-stl-direct" : "tet4-stl-direct")) {
+                cleanup_mesh();
+                return out;
+            }
+            direct_err = "volume fill produced no tet elements";
+        }
+    } catch (const std::exception& e) {
+        direct_err = std::string("direct route raised: ") + e.what();
+    } catch (...) {
+        direct_err = "direct route raised an unknown exception";
+    }
+    cleanup_mesh();
+    trace_stage("direct: failed, falling back to STL remesh");
+
+    // ── Route B: Netgen STL pipeline (chart build + surface remesh + volume) ────────
+    try {
+        {
+            aicad::prof::phases::PhaseScope _p("stl_init");
+            geo = nglib::Ng_STL_NewGeometry();
+            if (!geo) return fail("could not create the STL geometry [" + direct_err + "]");
+            for (const auto& t : vtris) {
+                double p1[3] = {vpts[3ull*t[0]], vpts[3ull*t[0]+1], vpts[3ull*t[0]+2]};
+                double p2[3] = {vpts[3ull*t[1]], vpts[3ull*t[1]+1], vpts[3ull*t[1]+2]};
+                double p3[3] = {vpts[3ull*t[2]], vpts[3ull*t[2]+1], vpts[3ull*t[2]+2]};
+                nglib::Ng_STL_AddTriangle(geo, p1, p2, p3);
+            }
+            if (nglib::Ng_STL_InitSTLGeometry(geo) != nglib::NG_OK)
+                return fail("STL geometry initialization failed (open or inconsistent "
+                            "surface) [" + direct_err + "]");
+            trace_stage("stl init: done");
+        }
+        mesh = nglib::Ng_NewMesh();
+        {
+            aicad::prof::phases::PhaseScope _p("generate");
+            if (nglib::Ng_STL_MakeEdges(geo, mesh, &mp) != nglib::NG_OK) {
+                cleanup_mesh();
+                return fail("STL edge detection failed [" + direct_err + "]");
+            }
+            trace_stage("make edges: done");
+            if (nglib::Ng_STL_GenerateSurfaceMesh(geo, mesh, &mp) != nglib::NG_OK) {
+                cleanup_mesh();
+                return fail("STL surface remeshing failed [" + direct_err + "]");
+            }
+            trace_stage("surface remesh: done");
+            if (nglib::Ng_GenerateVolumeMesh(mesh, &mp) != nglib::NG_OK) {
+                cleanup_mesh();
+                return fail("volume meshing failed [" + direct_err + "]");
+            }
+            trace_stage("volume mesh: done");
+        }
+        if (order2) {
+            aicad::prof::phases::PhaseScope _p("second_order");
+            nglib::Ng_STL_Generate_SecondOrder(geo, mesh);
+        }
+        if (!extract(order2 ? "tet10-stl" : "tet4-stl")) {
+            cleanup_mesh();
+            return fail(std::string("STL route produced no ") + (order2 ? "tet10" : "tet4") +
+                        " elements [" + direct_err + "]");
+        }
+        cleanup_mesh();
+    } catch (const std::exception& e) {
+        cleanup_mesh();
+        return fail(std::string("STL meshing raised: ") + e.what());
+    } catch (...) {
+        cleanup_mesh();
+        return fail("STL meshing raised an unknown exception");
+    }
     return out;
 }
 

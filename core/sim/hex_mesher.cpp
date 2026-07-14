@@ -254,6 +254,7 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
     fill_hex_quality(out, dx, dy, dz);
     out.mesh_type_used = "hex8";
     out.ok = true;
+    mesh_cache_note_generation();
     return out;
 }
 

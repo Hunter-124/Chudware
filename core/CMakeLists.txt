@@ -234,6 +234,32 @@ if(OpenMP_CXX_FOUND)
   target_compile_definitions(aicad_sim PRIVATE AICAD_HAVE_OPENMP)
 endif()
 
+
+# --- Optional CUDA LBM backend (D3Q19 collide/stream/BC) -------------------------
+# Default OFF so CPU-only builds stay unchanged. When ON, finds CUDAToolkit at the
+# CUDA 13.3 toolkit path if present and compiles sim/lbm_cuda.cu into aicad_sim.
+option(AICAD_WITH_CUDA "Build optional CUDA LBM backend (requires CUDAToolkit 13+)" OFF)
+if(AICAD_WITH_CUDA)
+  if(NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS "/usr/local/cuda-13.3/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.3/bin/nvcc" CACHE FILEPATH "nvcc" FORCE)
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "aicad_sim: CUDA LBM backend ENABLED (${CUDAToolkit_VERSION})")
+  target_sources(aicad_sim PRIVATE sim/lbm_cuda.cu)
+  target_compile_definitions(aicad_sim PUBLIC AICAD_WITH_CUDA)
+  target_link_libraries(aicad_sim PUBLIC CUDA::cudart)
+  set_target_properties(aicad_sim PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "75;86"
+    CUDA_STANDARD 17)
+  # sm_75 (Turing) + sm_86 (Ampere, RTX 3080 Ti). allow-unsupported-compiler is
+  # needed when the host GCC is newer than nvcc's official support ceiling.
+  target_compile_options(aicad_sim PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>)
+endif()
+
+
 # --- libaicad cam (computer-aided machining: toolpaths + post + sim) ----------
 # The CAM suite: stock/tool/machine/op model, Clipper2-backed 2D geometry, the
 # 2.5D/3D/turning/cutting toolpath generators, feeds & speeds, the data-driven

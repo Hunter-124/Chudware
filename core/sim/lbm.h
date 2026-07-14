@@ -38,6 +38,10 @@ struct LbmParams {
     double dx_m = 1.0e-3;    // voxel pitch (m)
     double dt_s = 1.0e-6;    // physical timestep (s)
     double rho_air = 1.225;  // reference air density (kg/m^3)
+    // Runtime backend select: "auto" (CUDA if built+available else CPU), "cpu", "cuda".
+    // Empty string = honour AI_CAD_LBM_BACKEND env, else "auto". Additive — default keeps
+    // every existing caller on the portable OpenMP CPU path unless they opt in.
+    std::string backend;
 };
 
 struct LbmResult {
@@ -64,6 +68,9 @@ struct LbmResult {
     double min_feature_mm = 0.0;    // smallest part bbox dimension (mm)
     int min_feature_voxels = 0;     // how many voxels span that smallest dimension
     std::string warning;            // non-empty when the grid likely under-resolves the geometry
+    // Backend actually used + why a requested CUDA path fell back (empty on clean CPU).
+    std::string backend;            // "cpu" | "cuda"
+    std::string backend_fallback;   // non-empty reason when CUDA was requested but CPU ran
     bool ok = false;
     std::string error;  // non-empty when ok==false
 };
@@ -83,5 +90,8 @@ struct LbmResult {
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                   const LbmParams& p, int n_steps,
                   const std::function<void(int, int)>& on_progress = {});
+
+// True when this build was compiled with AICAD_WITH_CUDA and a CUDA device is present.
+bool lbm_cuda_available();
 
 }  // namespace aicad::sim

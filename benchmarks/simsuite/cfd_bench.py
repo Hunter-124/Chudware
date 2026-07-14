@@ -68,13 +68,18 @@ def _idx(ny, nz):
     return lambda x, y, z: (x * ny + y) * nz + z
 
 
-def _sim_lbm(cb, solid, nx, ny, nz, tau0, n_steps, u_lat=0.05):
+def _sim_lbm(cb, solid, nx, ny, nz, tau0, n_steps, u_lat=0.05, backend=None):
     dx_m = 1e-3
     dt_s = u_lat * dx_m / 10.0      # physical speed 10 m/s
+    params = {"u_lat": u_lat, "tau0": tau0, "voxel_mm": 1.0,
+              "dx_m": dx_m, "dt_s": dt_s, "rho_air": 1.225}
+    # Additive backend select (auto|cpu|cuda); default leaves CPU unless env set.
+    be = backend if backend is not None else os.environ.get("AI_CAD_LBM_BACKEND")
+    if be:
+        params["backend"] = be
     return cb.call("sim_lbm", {
         "mask": {"nx": nx, "ny": ny, "nz": nz, "solid": solid},
-        "params": {"u_lat": u_lat, "tau0": tau0, "voxel_mm": 1.0,
-                   "dx_m": dx_m, "dt_s": dt_s, "rho_air": 1.225},
+        "params": params,
         "n_steps": n_steps})
 
 

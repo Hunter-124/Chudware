@@ -16,8 +16,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <list>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <thread>
 
@@ -32,6 +37,8 @@
 #ifdef AICAD_HAVE_OPENMP
 #include <omp.h>
 #endif
+
+#include "util/resource_governor.h"
 
 namespace aicad::sim {
 
@@ -367,11 +374,161 @@ bool hex8_B_at(const std::array<Eigen::Vector3d, 8>& ep, double xi, double eta, 
 
 }  // namespace
 
+// ── Prepared-system (factor) cache for load-only repeats ─────────────────────────
+// tet10/hex8 only: reuses reduced DOF map + assembled K + numeric factorization when
+// mesh / element order / material (E,nu) / fixtures / bond springs match. Loads and
+// yield strength do NOT enter the key. tet4 stays on the uncached SparseLU path so
+// the Python oracle parity harness remains byte-identical.
+namespace fea_factor_cache_detail {
+
+inline uint64_t factor_fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+inline uint64_t factor_system_key(const std::vector<double>& points, const std::vector<int>& tets,
+                           double E_mpa, double nu, const std::vector<int>& fixed_nodes,
+                           int nodes_per_elem, const std::vector<BondSpring>& bond_springs) {
+    uint64_t h = factor_fnv1a(points.data(), points.size() * sizeof(double));
+    h = factor_fnv1a(tets.data(), tets.size() * sizeof(int), h);
+    h = factor_fnv1a(&E_mpa, sizeof E_mpa, h);
+    h = factor_fnv1a(&nu, sizeof nu, h);
+    h = factor_fnv1a(&nodes_per_elem, sizeof nodes_per_elem, h);
+    std::vector<int> fx = fixed_nodes;
+    std::sort(fx.begin(), fx.end());
+    fx.erase(std::unique(fx.begin(), fx.end()), fx.end());
+    h = factor_fnv1a(fx.data(), fx.size() * sizeof(int), h);
+    std::vector<BondSpring> bs = bond_springs;
+    std::sort(bs.begin(), bs.end(), [](const BondSpring& x, const BondSpring& y) {
+        if (x.a != y.a) return x.a < y.a;
+        if (x.b != y.b) return x.b < y.b;
+        return x.k < y.k;
+    });
+    for (const BondSpring& s : bs) {
+        h = factor_fnv1a(&s.a, sizeof s.a, h);
+        h = factor_fnv1a(&s.b, sizeof s.b, h);
+        h = factor_fnv1a(&s.k, sizeof s.k, h);
+    }
+    return h;
+}
+struct FactorSolver {
+    virtual ~FactorSolver() = default;
+    virtual Eigen::VectorXd solve(const Eigen::VectorXd& ff) = 0;
+    virtual bool ok() const = 0;
+};
+#ifdef AICAD_WITH_CHOLMOD
+struct CholmodFactorSolver : FactorSolver {
+    Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
+    explicit CholmodFactorSolver(const Eigen::SparseMatrix<double>& K) {
+        const char* ord = std::getenv("AI_CAD_FEA_ORDER");
+        const int n_free = static_cast<int>(K.rows());
+        const std::string o = ord ? ord : (n_free >= 50000 ? "metis" : "default");
+        cholmod_common& cc = chol.cholmod();
+        if      (o == "metis")  { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_METIS;  cc.postorder = 1; }
+        else if (o == "nesdis") { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_NESDIS; cc.postorder = 1; }
+        else if (o == "amd")    { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_AMD;    cc.postorder = 1; }
+        chol.analyzePattern(K);
+        chol.factorize(K);
+    }
+    bool ok() const override { return chol.info() == Eigen::Success; }
+    Eigen::VectorXd solve(const Eigen::VectorXd& ff) override {
+        Eigen::VectorXd u = chol.solve(ff);
+        if (chol.info() != Eigen::Success) return {};
+        return u;
+    }
+};
+#endif
+struct LdltFactorSolver : FactorSolver {
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+    explicit LdltFactorSolver(const Eigen::SparseMatrix<double>& K) { ldlt.compute(K); }
+    bool ok() const override { return ldlt.info() == Eigen::Success; }
+    Eigen::VectorXd solve(const Eigen::VectorXd& ff) override {
+        Eigen::VectorXd u = ldlt.solve(ff);
+        if (ldlt.info() != Eigen::Success) return {};
+        return u;
+    }
+};
+struct SparseLuFactorSolver : FactorSolver {
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
+    explicit SparseLuFactorSolver(const Eigen::SparseMatrix<double>& K) {
+        lu.analyzePattern(K);
+        lu.factorize(K);
+    }
+    bool ok() const override { return lu.info() == Eigen::Success; }
+    Eigen::VectorXd solve(const Eigen::VectorXd& ff) override {
+        Eigen::VectorXd u = lu.solve(ff);
+        if (lu.info() != Eigen::Success) return {};
+        return u;
+    }
+};
+struct PreparedSystem {
+    std::vector<int> reduced;
+    int n_free = 0;
+    int n_dof = 0;
+    std::unique_ptr<FactorSolver> solver;
+    std::size_t nnz = 0;
+    size_t bytes() const {
+        return reduced.size() * sizeof(int) + nnz * (sizeof(double) + sizeof(int)) * 4 + 4096;
+    }
+};
+struct FactorCacheState {
+    std::mutex mtx;
+    std::unordered_map<uint64_t, std::shared_ptr<const PreparedSystem>> map;
+    std::list<uint64_t> lru;
+    uint64_t resident = 0;
+    FeaFactorCacheStats stats;
+};
+inline FactorCacheState& factor_cache_state() {
+    static FactorCacheState s;
+    return s;
+}
+inline uint64_t factor_cache_budget() {
+    const uint64_t host = aicad::governor::budget_bytes();
+    if (host == UINT64_MAX) return 1024ull * 1024ull * 1024ull;
+    return std::max<uint64_t>(128ull * 1024ull * 1024ull, host / 6);
+}
+
+}  // namespace fea_factor_cache_detail
+
+using fea_factor_cache_detail::factor_system_key;
+using fea_factor_cache_detail::FactorSolver;
+using fea_factor_cache_detail::PreparedSystem;
+using fea_factor_cache_detail::factor_cache_state;
+using fea_factor_cache_detail::factor_cache_budget;
+#ifdef AICAD_WITH_CHOLMOD
+using fea_factor_cache_detail::CholmodFactorSolver;
+#endif
+using fea_factor_cache_detail::LdltFactorSolver;
+using fea_factor_cache_detail::SparseLuFactorSolver;
+
+FeaFactorCacheStats fea_factor_cache_stats() {
+    auto& s = factor_cache_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    auto out = s.stats;
+    out.resident_bytes = s.resident;
+    return out;
+}
+void fea_factor_cache_reset_stats() {
+    auto& s = factor_cache_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.stats = FeaFactorCacheStats{};
+    s.stats.resident_bytes = s.resident;
+}
+void fea_factor_cache_clear() {
+    auto& s = factor_cache_state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.map.clear();
+    s.lru.clear();
+    s.resident = 0;
+    s.stats.resident_bytes = 0;
+}
+
 FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                  double E_mpa, double nu, double yield_mpa,
                                  const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces,
-                                 int nodes_per_elem) {
+                                 int nodes_per_elem,
+                                 const std::vector<BondSpring>& bond_springs) {
     FeaProf prof;
     FeaStaticResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
@@ -435,181 +592,302 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     const TetGauss4 gauss;
 
     // Fixed-DOF mask + reduced (free) DOF numbering: dof -> reduced index, or -1 if fixed.
-    std::vector<char> fixed(n_dof, 0);
-    for (int nid : fixed_nodes)
-        if (nid >= 0 && nid < n_nodes)
-            for (int k = 0; k < 3; ++k) fixed[nid * 3 + k] = 1;
-    std::vector<int> reduced(n_dof, -1);
+    // tet10/hex8: try prepared-system cache first (load-only repeats skip assembly+factorize).
+    // tet4 NEVER uses the cache — SparseLU path stays byte-identical to the Python oracle.
+    std::shared_ptr<const PreparedSystem> prepared;
+    const bool use_factor_cache = (tet10 || hex8);
+    uint64_t sys_key = 0;
+    if (use_factor_cache) {
+        sys_key = factor_system_key(points, tets, E_mpa, nu, fixed_nodes, nodes_per_elem,
+                                    bond_springs);
+        auto& cs = factor_cache_state();
+        std::lock_guard<std::mutex> lk(cs.mtx);
+        auto it = cs.map.find(sys_key);
+        if (it != cs.map.end()) {
+            prepared = it->second;
+            cs.lru.remove(sys_key);
+            cs.lru.push_front(sys_key);
+            ++cs.stats.hits;
+            res.factor_cache_hit = true;
+            prof.note("factor-cache HIT (skip assemble/analyze/factorize)");
+        } else {
+            ++cs.stats.misses;
+            prof.note("factor-cache MISS");
+        }
+    }
+
+    std::vector<int> reduced;
     int n_free = 0;
-    for (int d = 0; d < n_dof; ++d)
-        if (!fixed[d]) reduced[d] = n_free++;
-    if (n_free == 0) {
-        res.error = "fea_static: all DOFs constrained";
-        return res;
-    }
-
-    prof.mark("setup+dof-map");
-    // Assemble the reduced free-free stiffness directly (skip rows/cols of fixed DOFs).
-    std::vector<Eigen::Triplet<double>> trips;
-    const int edof = stride * 3;  // element DOFs (12 for tet4, 30 for tet10)
-    const std::size_t n_trips =
-        static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(edof) * edof;
-    // Size + memory census BEFORE the big reserve. On a too-fine mesh this reserve (or the
-    // factorization below) is where std::bad_alloc throws -> SIGABRT; this flushed line is
-    // the last thing printed, so it pins the ceiling DOF/element count that the box can take.
-    prof.note("nodes=%d  n_dof=%d  n_elems=%d  nodes/elem=%d  free_dof=%d", n_nodes, n_dof,
-              n_tets, nodes_per_elem, n_free);
-    prof.note("triplets=%zu  triplet_reserve=%.1f MB (%zu B/elem)", n_trips,
-              static_cast<double>(n_trips * sizeof(Eigen::Triplet<double>)) / 1.048576e6,
-              static_cast<std::size_t>(edof) * edof * sizeof(Eigen::Triplet<double>));
-    // Element loops run through assemble_elements_par (P1): deterministic parallel
-    // assembly with the IDENTICAL triplet sequence the old serial loops emitted (each
-    // element writes a pre-assigned slot), so tet4 parity stays byte-for-byte.
-    if (hex8) {
-        // ── hex8 path (8-node trilinear, 2x2x2 Gauss) ────────────────────────
-        const HexGauss8 hg;
-        assemble_elements_par<8>(n_tets, tets, reduced, trips,
-                                 [&](int e, Eigen::Matrix<double, 24, 24>& Ke) {
-            std::array<Eigen::Vector3d, 8> ep;
-            for (int j = 0; j < 8; ++j) ep[j] = node_pt(tets[e * 8 + j]);
-            Ke.setZero();
-            for (int g = 0; g < 8; ++g) {
-                Eigen::Matrix<double, 6, 24> B;
-                double detJ;
-                if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ))
-                    return false;
-                Ke += B.transpose() * C * B * (std::abs(detJ) * hg.w[g]);
-            }
-            return true;
-        });
-    } else if (!tet10) {
-        // ── tet4 path (parity-critical: element math UNCHANGED) ──────────────
-        assemble_elements_par<4>(n_tets, tets, reduced, trips,
-                                 [&](int e, Eigen::Matrix<double, 12, 12>& Ke) {
-            std::array<Eigen::Vector3d, 4> ep;
-            for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
-            Eigen::Matrix<double, 6, 12> B;
-            double vol;
-            if (!tet4_B(ep, B, vol)) return false;
-            Ke = B.transpose() * C * B * vol;
-            return true;
-        });
-    } else {
-        // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
-        assemble_elements_par<10>(n_tets, tets, reduced, trips,
-                                  [&](int e, Eigen::Matrix<double, 30, 30>& Ke) {
-            std::array<Eigen::Vector3d, 10> ep;
-            for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
-            Ke.setZero();
-            for (int g = 0; g < 4; ++g) {
-                Eigen::Matrix<double, 6, 30> B;
-                double detJ;
-                Eigen::Matrix<double, 10, 3> dNxyz;
-                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
-                                dNxyz))
-                    return false;
-                Ke += B.transpose() * C * B * (std::abs(detJ) * gauss.w[g]);
-            }
-            return true;
-        });
-    }
-
-    prof.mark("assemble-elements");
-    Eigen::SparseMatrix<double> Kff(n_free, n_free);
-    Kff.setFromTriplets(trips.begin(), trips.end());
-    Kff.makeCompressed();
-    if (Kff.nonZeros() == 0) {
-        res.error = "fea_static: no valid elements contributed stiffness";
-        return res;
-    }
-    prof.note("Kff %dx%d  nnz=%lld  (~%.1f MB compressed)", n_free, n_free,
-              static_cast<long long>(Kff.nonZeros()),
-              static_cast<double>(Kff.nonZeros()) * (sizeof(double) + sizeof(int)) / 1.048576e6);
-    prof.mark("build-sparse-matrix");
-
-    Eigen::VectorXd ff(n_free);
-    for (int d = 0; d < n_dof; ++d)
-        if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
-
-    // The reduced stiffness is symmetric positive-definite. For tet10 (large systems, no Python
-    // parity oracle) use a Cholesky factorization (SimplicialLDLT) — markedly faster + lower memory
-    // than SparseLU on SPD systems — and fall back to SparseLU only if it reports failure. tet4 keeps
-    // SparseLU verbatim so its results stay byte-identical to the Python oracle (parity harness).
     Eigen::VectorXd uf;
     bool solved = false;
-    if (tet10 || hex8) {
-        // SPD systems with no Python-parity constraint. Solver preference (fastest first),
-        // each falling through to the next if it reports failure:
-        //   1. CHOLMOD supernodal LLT — BLAS3 dense-supernode kernels on the threaded system
-        //      BLAS. 10-50x faster than SimplicialLDLT on 3D solids AND multithreaded; this is
-        //      the fix for the 300s single-core factorize on bulky parts.
-        //   2. Eigen SimplicialLDLT — scalar Cholesky (used when SuiteSparse is absent, or if
-        //      CHOLMOD's strict-SPD LLT rejects a near-singular reduced system).
-        //   3. SparseLU (below) — final fallback.
+
+    if (prepared) {
+        // ── Cache hit: only rebuild RHS and back-substitute ──────────────────
+        reduced = prepared->reduced;
+        n_free = prepared->n_free;
+        prof.mark("setup+dof-map");
+        Eigen::VectorXd ff(n_free);
+        for (int d = 0; d < n_dof; ++d)
+            if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
+        prof.mark("build-rhs-only");
         const int nthreads = fea_solver_threads(n_free);
         apply_solver_thread_cap(nthreads);
-#ifdef AICAD_WITH_CHOLMOD
-        prof.note("solver=CholmodSupernodalLLT (SuiteSparse, %d threads)", nthreads);
-        {
-            Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
-            // Fill-reducing ordering. For 3D solids CHOLMOD's default (AMD-biased) leaves far more
-            // fill than METIS nested-dissection: measured 106k-DOF factorize 4.3 s default vs 2.7 s
-            // METIS (AMD alone is worst at 7.3 s). METIS's analyze carries a fixed ~25 ms overhead
-            // that isn't repaid on tiny systems, so switch it on only for large ones. AI_CAD_FEA_ORDER
-            // (metis|nesdis|amd|default) forces a specific ordering for benchmarking.
-            const char* ord = std::getenv("AI_CAD_FEA_ORDER");
-            const std::string o = ord ? ord : (n_free >= 50000 ? "metis" : "default");
-            cholmod_common& cc = chol.cholmod();
-            if      (o == "metis")  { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_METIS;  cc.postorder = 1; }
-            else if (o == "nesdis") { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_NESDIS; cc.postorder = 1; }
-            else if (o == "amd")    { cc.nmethods = 1; cc.method[0].ordering = CHOLMOD_AMD;    cc.postorder = 1; }
-            prof.note("CHOLMOD ordering = %s", o.c_str());
-            chol.analyzePattern(Kff);
-            prof.mark("CHOLMOD analyze");
-            chol.factorize(Kff);
-            prof.mark("CHOLMOD factorize");
-            if (chol.info() == Eigen::Success) {
-                uf = chol.solve(ff);
-                prof.mark("CHOLMOD back-substitute");
-                if (chol.info() == Eigen::Success) solved = true;
-            }
-        }
-#endif
-        if (!solved) {
-            prof.note("solver=SimplicialLDLT (Cholesky, SPD)%s",
-#ifdef AICAD_WITH_CHOLMOD
-                      " (CHOLMOD unavailable/failed)"
-#else
-                      ""
-#endif
-            );
-            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
-            ldlt.compute(Kff);
-            prof.mark("factorize (LDLT)");
-            if (ldlt.info() == Eigen::Success) {
-                uf = ldlt.solve(ff);
-                prof.mark("back-substitute");
-                if (ldlt.info() == Eigen::Success) solved = true;
-            }
+        uf = prepared->solver->solve(ff);
+        if (uf.size() == n_free) {
+            solved = true;
+            prof.mark("factor-cache back-substitute");
+        } else {
+            // Stale/failed factor — fall through to full path.
+            prepared.reset();
+            res.factor_cache_hit = false;
+            prof.note("factor-cache solve failed; rebuilding");
         }
     }
+
+    if (!prepared) {
+        std::vector<char> fixed(n_dof, 0);
+        for (int nid : fixed_nodes)
+            if (nid >= 0 && nid < n_nodes)
+                for (int k = 0; k < 3; ++k) fixed[nid * 3 + k] = 1;
+        reduced.assign(n_dof, -1);
+        n_free = 0;
+        for (int d = 0; d < n_dof; ++d)
+            if (!fixed[d]) reduced[d] = n_free++;
+        if (n_free == 0) {
+            res.error = "fea_static: all DOFs constrained";
+            return res;
+        }
+
+        prof.mark("setup+dof-map");
+        // Assemble the reduced free-free stiffness directly (skip rows/cols of fixed DOFs).
+        std::vector<Eigen::Triplet<double>> trips;
+        const int edof = stride * 3;  // element DOFs (12 for tet4, 30 for tet10)
+        const std::size_t n_trips =
+            static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(edof) * edof;
+        // Size + memory census BEFORE the big reserve. On a too-fine mesh this reserve (or the
+        // factorization below) is where std::bad_alloc throws -> SIGABRT; this flushed line is
+        // the last thing printed, so it pins the ceiling DOF/element count that the box can take.
+        prof.note("nodes=%d  n_dof=%d  n_elems=%d  nodes/elem=%d  free_dof=%d", n_nodes, n_dof,
+                  n_tets, nodes_per_elem, n_free);
+        prof.note("triplets=%zu  triplet_reserve=%.1f MB (%zu B/elem)", n_trips,
+                  static_cast<double>(n_trips * sizeof(Eigen::Triplet<double>)) / 1.048576e6,
+                  static_cast<std::size_t>(edof) * edof * sizeof(Eigen::Triplet<double>));
+        // Element loops run through assemble_elements_par (P1): deterministic parallel
+        // assembly with the IDENTICAL triplet sequence the old serial loops emitted (each
+        // element writes a pre-assigned slot), so tet4 parity stays byte-for-byte.
+        if (hex8) {
+            // ── hex8 path (8-node trilinear, 2x2x2 Gauss) ────────────────────────
+            const HexGauss8 hg;
+            assemble_elements_par<8>(n_tets, tets, reduced, trips,
+                                     [&](int e, Eigen::Matrix<double, 24, 24>& Ke) {
+                std::array<Eigen::Vector3d, 8> ep;
+                for (int j = 0; j < 8; ++j) ep[j] = node_pt(tets[e * 8 + j]);
+                Ke.setZero();
+                for (int g = 0; g < 8; ++g) {
+                    Eigen::Matrix<double, 6, 24> B;
+                    double detJ;
+                    if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1], hg.pt[g][2], B, detJ))
+                        return false;
+                    Ke += B.transpose() * C * B * (std::abs(detJ) * hg.w[g]);
+                }
+                return true;
+            });
+        } else if (!tet10) {
+            // ── tet4 path (parity-critical: element math UNCHANGED) ──────────────
+            assemble_elements_par<4>(n_tets, tets, reduced, trips,
+                                     [&](int e, Eigen::Matrix<double, 12, 12>& Ke) {
+                std::array<Eigen::Vector3d, 4> ep;
+                for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
+                Eigen::Matrix<double, 6, 12> B;
+                double vol;
+                if (!tet4_B(ep, B, vol)) return false;
+                Ke = B.transpose() * C * B * vol;
+                return true;
+            });
+        } else {
+            // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
+            assemble_elements_par<10>(n_tets, tets, reduced, trips,
+                                      [&](int e, Eigen::Matrix<double, 30, 30>& Ke) {
+                std::array<Eigen::Vector3d, 10> ep;
+                for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
+                Ke.setZero();
+                for (int g = 0; g < 4; ++g) {
+                    Eigen::Matrix<double, 6, 30> B;
+                    double detJ;
+                    Eigen::Matrix<double, 10, 3> dNxyz;
+                    if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
+                                    dNxyz))
+                        return false;
+                    Ke += B.transpose() * C * B * (std::abs(detJ) * gauss.w[g]);
+                }
+                return true;
+            });
+        }
+
+        prof.mark("assemble-elements");
+        // Bonded gap ties (asm-fea): append penalty-spring stiffness AFTER element assembly —
+        // 3 diagonal DOF springs per pair, off-diagonal coupling only when both sides are
+        // free. A tie into a fixed node grounds the free side, which is the correct penalty
+        // behaviour. Default-empty, so single-part solves (and the tet4 parity oracle) emit
+        // the identical triplet sequence as before.
+        if (!bond_springs.empty()) {
+            std::size_t n_applied = 0;
+            for (const BondSpring& s : bond_springs) {
+                if (s.a < 0 || s.a >= n_nodes || s.b < 0 || s.b >= n_nodes || s.a == s.b) continue;
+                if (!(std::isfinite(s.k) && s.k > 0.0)) continue;
+                for (int d = 0; d < 3; ++d) {
+                    const int ra = reduced[s.a * 3 + d];
+                    const int rb = reduced[s.b * 3 + d];
+                    if (ra >= 0) trips.emplace_back(ra, ra, s.k);
+                    if (rb >= 0) trips.emplace_back(rb, rb, s.k);
+                    if (ra >= 0 && rb >= 0) {
+                        trips.emplace_back(ra, rb, -s.k);
+                        trips.emplace_back(rb, ra, -s.k);
+                    }
+                }
+                ++n_applied;
+            }
+            prof.note("bond springs: %zu applied (of %zu requested)", n_applied,
+                      bond_springs.size());
+        }
+        Eigen::SparseMatrix<double> Kff(n_free, n_free);
+        Kff.setFromTriplets(trips.begin(), trips.end());
+        Kff.makeCompressed();
+        if (Kff.nonZeros() == 0) {
+            res.error = "fea_static: no valid elements contributed stiffness";
+            return res;
+        }
+        prof.note("Kff %dx%d  nnz=%lld  (~%.1f MB compressed)", n_free, n_free,
+                  static_cast<long long>(Kff.nonZeros()),
+                  static_cast<double>(Kff.nonZeros()) * (sizeof(double) + sizeof(int)) / 1.048576e6);
+        prof.mark("build-sparse-matrix");
+
+        Eigen::VectorXd ff(n_free);
+        for (int d = 0; d < n_dof; ++d)
+            if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
+
+        // The reduced stiffness is symmetric positive-definite. For tet10 (large systems, no Python
+        // parity oracle) use a Cholesky factorization (SimplicialLDLT) — markedly faster + lower memory
+        // than SparseLU on SPD systems — and fall back to SparseLU only if it reports failure. tet4 keeps
+        // SparseLU verbatim so its results stay byte-identical to the Python oracle (parity harness).
+        if (tet10 || hex8) {
+            // SPD systems with no Python-parity constraint. Solver preference (fastest first),
+            // each falling through to the next if it reports failure:
+            //   1. CHOLMOD supernodal LLT — BLAS3 dense-supernode kernels on the threaded system
+            //      BLAS. 10-50x faster than SimplicialLDLT on 3D solids AND multithreaded; this is
+            //      the fix for the 300s single-core factorize on bulky parts.
+            //   2. Eigen SimplicialLDLT — scalar Cholesky (used when SuiteSparse is absent, or if
+            //      CHOLMOD's strict-SPD LLT rejects a near-singular reduced system).
+            //   3. SparseLU (below) — final fallback.
+            const int nthreads = fea_solver_threads(n_free);
+            apply_solver_thread_cap(nthreads);
+            std::unique_ptr<FactorSolver> built;
+#ifdef AICAD_WITH_CHOLMOD
+            prof.note("solver=CholmodSupernodalLLT (SuiteSparse, %d threads)", nthreads);
+            {
+                auto chol = std::make_unique<CholmodFactorSolver>(Kff);
+                prof.mark("CHOLMOD analyze+factorize");
+                if (chol->ok()) {
+                    uf = chol->solve(ff);
+                    prof.mark("CHOLMOD back-substitute");
+                    if (uf.size() == n_free) {
+                        solved = true;
+                        built = std::move(chol);
+                    }
+                }
+            }
+#endif
+            if (!solved) {
+                prof.note("solver=SimplicialLDLT (Cholesky, SPD)%s",
+#ifdef AICAD_WITH_CHOLMOD
+                          " (CHOLMOD unavailable/failed)"
+#else
+                          ""
+#endif
+                );
+                auto ldlt = std::make_unique<LdltFactorSolver>(Kff);
+                prof.mark("factorize (LDLT)");
+                if (ldlt->ok()) {
+                    uf = ldlt->solve(ff);
+                    prof.mark("back-substitute");
+                    if (uf.size() == n_free) {
+                        solved = true;
+                        built = std::move(ldlt);
+                    }
+                }
+            }
+            if (!solved) {
+                prof.note("solver=SparseLU (LDLT fell back)");
+                auto lu = std::make_unique<SparseLuFactorSolver>(Kff);
+                prof.mark("LU analyzePattern+factorize");
+                if (!lu->ok()) {
+                    res.error = "fea_static: sparse factorization failed (singular system)";
+                    return res;
+                }
+                uf = lu->solve(ff);
+                prof.mark("LU back-substitute");
+                if (uf.size() != n_free) {
+                    res.error = "fea_static: sparse solve failed";
+                    return res;
+                }
+                solved = true;
+                built = std::move(lu);
+            }
+            // Store prepared system for load-only reuse (governor-bounded).
+            if (solved && built && use_factor_cache) {
+                auto ps = std::make_shared<PreparedSystem>();
+                ps->reduced = reduced;
+                ps->n_free = n_free;
+                ps->n_dof = n_dof;
+                ps->nnz = static_cast<std::size_t>(Kff.nonZeros());
+                ps->solver = std::move(built);
+                const uint64_t need = static_cast<uint64_t>(ps->bytes());
+                const uint64_t budget = factor_cache_budget();
+                auto& cs = factor_cache_state();
+                std::lock_guard<std::mutex> lk(cs.mtx);
+                while ((!cs.lru.empty()) &&
+                       (cs.lru.size() >= 8 || cs.resident + need > budget)) {
+                    auto bit = cs.map.find(cs.lru.back());
+                    if (bit != cs.map.end()) {
+                        cs.resident -= static_cast<uint64_t>(bit->second->bytes());
+                        cs.map.erase(bit);
+                        ++cs.stats.evictions;
+                    }
+                    cs.lru.pop_back();
+                }
+                if (cs.map.find(sys_key) == cs.map.end()) {
+                    cs.map[sys_key] = ps;
+                    cs.lru.push_front(sys_key);
+                    cs.resident += need;
+                    ++cs.stats.stores;
+                    cs.stats.resident_bytes = cs.resident;
+                }
+            }
+        } else {
+            // tet4 parity path — SparseLU verbatim, never cached.
+            prof.note("solver=SparseLU (tet4 parity)");
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
+            lu.analyzePattern(Kff);
+            prof.mark("LU analyzePattern");
+            lu.factorize(Kff);
+            prof.mark("LU factorize");
+            if (lu.info() != Eigen::Success) {
+                res.error = "fea_static: sparse factorization failed (singular system)";
+                return res;
+            }
+            uf = lu.solve(ff);
+            prof.mark("LU back-substitute");
+            if (lu.info() != Eigen::Success) {
+                res.error = "fea_static: sparse solve failed";
+                return res;
+            }
+            solved = true;
+        }
+    }
+
     if (!solved) {
-        prof.note("solver=SparseLU%s", (tet10 || hex8) ? " (LDLT fell back)" : " (tet4 parity)");
-        Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
-        lu.analyzePattern(Kff);
-        prof.mark("LU analyzePattern");
-        lu.factorize(Kff);
-        prof.mark("LU factorize");
-        if (lu.info() != Eigen::Success) {
-            res.error = "fea_static: sparse factorization failed (singular system)";
-            return res;
-        }
-        uf = lu.solve(ff);
-        prof.mark("LU back-substitute");
-        if (lu.info() != Eigen::Success) {
-            res.error = "fea_static: sparse solve failed";
-            return res;
-        }
+        res.error = "fea_static: sparse factorization failed (singular system)";
+        return res;
     }
 
     // Scatter back to the full DOF vector (fixed DOFs stay zero).

@@ -152,4 +152,25 @@ MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& option
 std::shared_ptr<const MeshOut> mesh_step_cached_ptr(const std::string& step_path,
                                                     const MeshOptions& options);
 
+// Observable mesh-cache counters (whole-STEP + per-solid component cache).
+// generations increments only when Netgen/hex actually produces a new MeshOut;
+// hits/misses cover both the whole-file LRU and the per-solid component store.
+// Used by tests and AI_CAD_FEA_PROFILE / prof phases. Thread-safe.
+struct MeshCacheStats {
+    uint64_t hits = 0;          // content-key lookup found a resident mesh
+    uint64_t misses = 0;        // content-key lookup had to generate
+    uint64_t generations = 0;   // Netgen/hex actually ran (component or whole)
+    uint64_t component_hits = 0;
+    uint64_t component_misses = 0;
+    uint64_t resident_bytes = 0;  // current cache residency estimate
+    uint64_t budget_bytes = 0;    // governor-derived byte budget at last store
+};
+MeshCacheStats mesh_cache_stats();
+void mesh_cache_reset_stats();
+// Mark one Netgen/hex generation (called from mesh_step_netgen / mesh_stl / hex).
+void mesh_cache_note_generation();
+// Per-solid component cache observability (mesher multi-solid path).
+void mesh_cache_note_component_hit();
+void mesh_cache_note_component_miss();
+
 }  // namespace aicad::sim

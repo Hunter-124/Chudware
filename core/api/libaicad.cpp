@@ -2105,6 +2105,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             lp.dx_m = pp.value("dx_m", 1.0e-3);
             lp.dt_s = pp.value("dt_s", 1.0e-6);
             lp.rho_air = pp.value("rho_air", 1.225);
+            // Additive: optional backend select (auto|cpu|cuda). Empty keeps env/default.
+            if (pp.contains("backend") && pp["backend"].is_string())
+                lp.backend = pp["backend"].get<std::string>();
+            else if (params.contains("backend") && params["backend"].is_string())
+                lp.backend = params["backend"].get<std::string>();
             int n_steps = params.value("n_steps", 0);
             aicad::sim::LbmResult r = aicad::sim::lbm_run(solid, nx, ny, nz, lp, n_steps);
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
@@ -2121,7 +2126,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"lift_n", r.lift_n},
                              {"frontal_area_mm2", r.frontal_area_mm2},
                              {"steps_run", r.steps_run},
-                             {"diverged", r.diverged}},
+                             {"diverged", r.diverged},
+                             {"backend", r.backend},
+                             {"backend_fallback", r.backend_fallback}},
                         out_json, 0);
         }
 #ifdef AICAD_WITH_NETGEN  // Netgen/nglib FEA-mesh RPCs (mesh + meshing FEA runs)

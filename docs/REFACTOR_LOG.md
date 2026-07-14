@@ -1215,3 +1215,41 @@ in `load_component`; kill switch `AICAD_ASM_PARALLEL_LOAD=0`). Contract §4 appe
 (contracts/stepplus.md). Measured (rocket-plane, 29 parts): cold 14.3s→8.3s, warm 2.7s→18ms,
 component-changed reopen →3.1s, unchanged reopen →51ms. Deferred: seed the assembly tess cache
 from a part's `cache.aicm` (needs a core-side AICM reader); LRU caps on the component/tess caches.
+
+## 2026-07-14 — sim acceleration + incremental caches + CUDA LBM; ECAD MCP & parts repair
+
+Three disjoint workstreams landed from one monolithic plan
+(`services/dag/templates/simulation_acceleration_ecad_parts_repair.json`, validated aicad.dag/1,
+25 nodes). **Simulation** (`core/sim/*`): (1) per-solid content-addressed component mesh cache in
+the multi-solid `mesh_step` path so an assembly remeshes only changed solids — key = geometry
+bytes XOR every `MeshOptions` field (never path/bbox), LRU + byte budget `max(64MiB, gov/8)`,
+`mesh_cache_stats()` counters. (2) Prepared-static-system cache in `fea_static` (tet10/hex8 only;
+tet4 stays uncached SparseLU for byte parity): a load-only repeat reuses the reduced DOF map +
+assembled K + factorization and re-solves just the RHS — key excludes loads/yield, so a design
+load-sweep is a factor-cache HIT (`FeaStaticResult.factor_cache_hit`, `fea_factor_cache_stats()`).
+(3) `fea_run` faceset membership now uses a deterministic spatial hash + per-mesh faceset→nodes
+cache (analytic-surface path and empty-fixture hard-fail preserved). (4) Optional CUDA D3Q19 LBM
+(`lbm_cuda.cu`, `-DAICAD_WITH_CUDA=ON`, default OFF; CUDA 13.3): runtime backend `auto|cpu|cuda`
+via `LbmParams.backend` / `AI_CAD_LBM_BACKEND`, CPU OpenMP path is the guaranteed fallback,
+float32 reduction parity kept, backend+fallback surfaced in `LbmResult`. CPU-only `./build.sh core`
+green; ctest `sim|tet10|modal|thermal|studies|prof_phases|governor|overlay` 9/9; CUDA build
+`test_sim` 13/13. **ECAD MCP** (`services/mcp/*ecad*`, `engine_oracle/ecad/orchestrator.py`):
+split provider PLAN from BUILD (`orchestrator.plan_design`) so a slow/timed-out provider is budgeted
+and can never race the recipe fallback or overwrite `current_sch` (generation-token guard); unified
+`mcp_server.*` vs `services.mcp.*` to one module object via a `services/mcp/__init__.py` meta-path
+finder (shared `_ECAD`/`_THERMAL`); monotonic warm recovery; `power_budget` under `family:ecad`;
+added a pytest `tools` fixture that fixed 40 collection errors (→0). ECAD suite 91 passed; main
+harness ALL PASS. **Parts** (`engine_oracle/parts_hub/*`, `services/mcp/parts_tools.py`,
+`services/browser/health.py`): bounded the deadline-less synchronous live-vendor fan-out in
+`PartsHub.search` (concurrent + `AI_CAD_PARTS_LIVE_BUDGET_S`, default 4s; partial results + honest
+timeout notices; `include_live=False` does zero network) — this was the root cause of the
+`part_search` 30s hangs; facet alias parity in `gui_rpc._filter_items` (bore↔bore_mm); `part_source`
+now passes taxonomy route sites; new `LocalLibraryAdapter` federates the watched vendor_parts library
+into the FTS index (rebuild after scan/register); `_place_generate_model` imports for a real doc_id;
+login-wizard health returns deferred/needs_human_login. Parts suite 302 passed / 6 skipped in ~7s
+(was HUNG >15min); live `search_parts_v2` tube+facet query 3.33s (was 30s timeout). Deferred: pure-
+device CUDA LBM force reduction (currently D2H gather for parity — transfer-bound on large lattices);
+staged full-OCCT engine for a solver-backed simsuite integration run (numerics verified via ctest);
+abandoned timed-out provider/vendor daemon threads finish on their own but occupy a thread until their
+own client timeout. Pre-existing, unrelated: `scripts/check.py feature_surface_audit` flags Sketch3D/
+ReverseEng ribbon commands in `host/src/ui/ribbon_def.cpp` lacking handlers (untouched this pass).

@@ -200,7 +200,8 @@ add_library(aicad_sim STATIC
   sim/netlist.cpp
   sim/lbm.cpp
   sim/flow_run.cpp
-  sim/sim_cache.cpp)
+  sim/sim_cache.cpp
+  sim/spice_sweep.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 # aicad_util: host resource_governor (memory admission/degrade). aicad_prof: the per-phase
@@ -377,6 +378,15 @@ target_link_libraries(test_spice_netlist PRIVATE aicad_sim)
 set_target_properties(test_spice_netlist PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME spice_netlist COMMAND test_spice_netlist)
+
+# --- batched parallel SPICE sweep (governed thread pool, OCCT-free) ----------
+add_executable(test_spice_sweep
+  tests/test_spice_sweep.cpp)
+target_include_directories(test_spice_sweep PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_spice_sweep PRIVATE aicad_sim)
+set_target_properties(test_spice_sweep PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME spice_sweep COMMAND test_spice_sweep)
 
 # CAM suite tests: model serialization round-trips, Clipper2 geometry (offset /
 # boolean / pocket clearing / raster), feeds & speeds, the toolpath generators,

@@ -2000,6 +2000,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (st.hasDocMesh) effDatums.insert("point.origin");
             else               effDatums.erase("point.origin");
             renderer.setHiddenDatums(effDatums);
+            // Auto mode: drawn iff there's no body (auto-show empty, auto-hide once a solid exists).
+            st.originVisEff = !st.hasDocMesh;
+        } else {
+            // User took control: the renderer draws from hiddenFeatures (pushed by applyDatumVisibility
+            // on the eye toggle), so effective visibility is just the hidden-set membership.
+            st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)

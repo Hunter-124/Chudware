@@ -5011,10 +5011,16 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     {
         const auto& cam = st.renderer->camera();
         const ImVec2 mouse = io.MousePos;
-        const float grabRadius = 10.0f * ui::uiScale;
+        // The origin octahedron renders only a few px wide but sits amid full-screen origin planes,
+        // so a tight target loses every click to the coincident plane. Use a generous radius (like a
+        // SolidWorks origin pick) so a deliberate click near the glyph reliably takes the point.
+        const float grabRadius = 20.0f * ui::uiScale;
         struct PointCandidate { float wx, wy, wz; std::string fid, name; };
         std::vector<PointCandidate> pts;
-        if (!st.hiddenFeatures.count("point.origin"))
+        // Gate on originVisEff (what the renderer actually DRAWS), not hiddenFeatures: the origin is
+        // clickable exactly when it is visible — never through a body that auto-hid it, never in the
+        // default-hidden empty state. Mirrors how plane hit-tests gate on planeVisEff.
+        if (st.originVisEff)
             pts.push_back({0.0f, 0.0f, 0.0f, "point.origin", "Origin"});
         const nlohmann::json& datums = st.docMirror.refDatums();
         if (datums.is_array()) {
@@ -5032,6 +5038,16 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
         for (const auto& c : pts) {
             ImVec2 s;
             if (!worldToScreen(cam, imgMin, vw, vh, c.wx, c.wy, c.wz, s)) continue;
+            // DIAG (AICAD_ORIGIN_PICK_DEBUG): mark exactly where the code thinks each datum point is,
+            // plus the grab ring, so we can see alignment vs. the click. Remove once verified.
+            static const bool kDbg = std::getenv("AICAD_ORIGIN_PICK_DEBUG") != nullptr;
+            if (kDbg) {
+                wdl->PushClipRect(imgMin, imgMax, true);
+                wdl->AddCircle(s, grabRadius, IM_COL32(255, 0, 255, 200), 24, 1.5f * ui::uiScale);
+                wdl->AddLine(ImVec2(s.x - 6, s.y), ImVec2(s.x + 6, s.y), IM_COL32(255, 0, 255, 255), 1.5f);
+                wdl->AddLine(ImVec2(s.x, s.y - 6), ImVec2(s.x, s.y + 6), IM_COL32(255, 0, 255, 255), 1.5f);
+                wdl->PopClipRect();
+            }
             float dx = mouse.x - s.x, dy = mouse.y - s.y;
             float d = std::sqrt(dx * dx + dy * dy);
             if (d < best) { best = d; fid = c.fid; name = c.name; bestScreen = s; }

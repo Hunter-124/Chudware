@@ -1079,6 +1079,11 @@ struct AppState {
     // renderer draws. Plane hit-tests gate on THIS, not showPlane — otherwise a force-shown plane
     // (new-sketch pick, body-less auto-show, ref-plane well) is drawn but not clickable.
     bool planeVisEff[3] = {false, false, false};
+    // Same "what the renderer actually draws" flag for the world-origin gizmo — written by the
+    // viewport each frame right after it decides origin visibility (auto-hide / hiddenFeatures /
+    // PM force-show). The origin PICK gates on THIS, not hiddenFeatures, so it is clickable exactly
+    // when it is drawn (never through a body that auto-hid it, never in the default-hidden state).
+    bool originVisEff = false;
     // True once the user has explicitly toggled origin-plane visibility (eye / FeatureManager row).
     // Until then, an empty part (no solid body) auto-shows all three planes (SolidWorks "pick a plane
     // to start"); after the user takes control, showPlane is authoritative so a hide actually sticks

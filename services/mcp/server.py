@@ -330,6 +330,12 @@ register_firmware_tools(mcp)
 from mcp_server.em_tools import register_em_tools
 register_em_tools(_reg.view(mcp, "em"))
 
+# PCB antenna design + EM bridge (mission master): ecad_antenna_design (patch/monopole/IFA/PIFA
+# calculators + board copper geometry) + ecad_antenna_analyze (analytic resonance always, openEMS
+# full-wave S11 when installed). Cross-checks the IPC-2141 feed impedance.
+from mcp_server.antenna_tools import register_antenna_tools
+register_antenna_tools(_reg.view(mcp, "em"))
+
 
 from mcp_server.power_budget import register_power_budget_tools
 register_power_budget_tools(_reg.view(mcp, "ecad"))

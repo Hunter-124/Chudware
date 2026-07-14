@@ -35,6 +35,14 @@ local_models:
   fanout: qwen3-4b
   parallel_slots: 8
 
+# Parameterized paid tiers (gym multi-provider benchmark / leaderboard):
+#   openrouter:<model-id>  e.g. openrouter:anthropic/claude-opus-4
+#   openrouter:openai/gpt-4o
+# Resolved by services.agent.tiers.provider_for_tier → OpenRouterProvider with
+# that model id and OPENROUTER_API_KEY / config openrouter.api_key. Effort
+# budgets reuse the frontier profile (see tiers.effort_tier_for). These are
+# NOT listed as static profiles below — the model id is the tier parameter.
+
 profiles:
   local-24k:
     # Context: 24576 tokens. Layout per docs/ADVISOR_ARCHITECTURE.md §3 (local-24k reference).

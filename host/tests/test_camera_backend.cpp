@@ -10,11 +10,12 @@
 
 using namespace aicad::platform;
 
-// Deterministic stub check: regardless of platform or env, force the stub path so
-// CI has no hardware dependency. On Linux, CameraBackend::create() returns the stub
-// unless AICAD_TEST_CAMERA=1, so we unset it here before constructing.
+// Deterministic stub check: force the synthetic backend so CI has no hardware
+// dependency. On Linux, CameraBackend::create() returns V4L2 by default; the
+// stub is selected with AICAD_FORCE_STUB_CAMERA=1.
 static int test_stub() {
 #if defined(__linux__) && !defined(_WIN32)
+    ::setenv("AICAD_FORCE_STUB_CAMERA", "1", 1);
     ::unsetenv("AICAD_TEST_CAMERA");
 #endif
     auto cam = CameraBackend::create();
@@ -55,7 +56,8 @@ static int test_live_optional(bool live_requested) {
         return 0;
     }
 #if defined(__linux__) && !defined(_WIN32)
-    ::setenv("AICAD_TEST_CAMERA", "1", 1);  // re-arm the V4L2 selector in create()
+    ::unsetenv("AICAD_FORCE_STUB_CAMERA");  // real V4L2 path
+    ::setenv("AICAD_TEST_CAMERA", "1", 1);
 #endif
     auto cam = CameraBackend::create();
     auto devices = cam->listDevices();

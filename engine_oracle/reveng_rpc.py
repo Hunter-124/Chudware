@@ -70,15 +70,34 @@ def _reveng_list_sessions(params: dict, _emit: Callable) -> dict:
 
 
 def _reveng_get_session(params: dict, _emit: Callable) -> dict:
+    """Return full session manifest including artifacts.mesh_path / splat_path.
+
+    Paths are absolute under AICAD_REVENG_DIR/<sid>/ when present. GUI resolves
+    relative paths under the same root if ever relative.
+    """
     try:
         t = _tools()
         sid = str((params or {}).get("session_id", ""))
         s = t._load_session(sid)
         if s is None:
             return _fail("no_such_session", f"session {sid!r} not found")
+        # Ensure artifacts keys the GUI reads always exist (None when absent).
+        arts = s.setdefault("artifacts", {})
+        for key in ("mesh_path", "splat_path", "sparse_dir", "doc_id", "images",
+                    "fits_path"):
+            arts.setdefault(key, None if key != "images" else arts.get("images", 0))
+        # Prefer absolute paths for mesh/splat so the GUI can load without join.
+        root = t._session_path(sid)
+        for key in ("mesh_path", "splat_path", "sparse_dir", "fits_path"):
+            p = arts.get(key)
+            if isinstance(p, str) and p and not Path(p).is_absolute():
+                cand = root / p
+                if cand.exists() or key.endswith("_dir"):
+                    arts[key] = str(cand)
         return {"ok": True, "session": s}
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
+
 
 
 # ── §8.2 WRITE (the delivery seam) ───────────────────────────────────────────
@@ -328,6 +347,148 @@ def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
         return _wrap_exc(exc)
 
 
+# ── phone capture (mirrors recon_tools.register_photo_recon_tools) ───────────
+
+# port -> CaptureSession; process-local (same lifetime as the worker).
+_CAPTURE_SESSIONS: dict = {}
+
+
+def _start_capture_session(params: dict, _emit: Callable) -> dict:
+    """Start local phone-upload capture server.
+
+    Returns {ok, port, upload_url, qr, shot_names, photo_count?, instructions?}.
+    ``qr`` is a PNG data-URL when the qrcode package is available, else the raw URL.
+    """
+    try:
+        p = params or {}
+        port = int(p.get("port", 8742) or 8742)
+        scale_marker_mm = p.get("scale_marker_mm")
+        if scale_marker_mm is not None:
+            try:
+                scale_marker_mm = float(scale_marker_mm)
+            except (TypeError, ValueError):
+                scale_marker_mm = None
+
+        # Prefer engine_oracle path; fall back to engine symlink.
+        try:
+            from engine_oracle.vision.capture_server import start_session
+        except ImportError:
+            from engine.vision.capture_server import start_session  # type: ignore
+
+        if port in _CAPTURE_SESSIONS:
+            existing = _CAPTURE_SESSIONS[port]
+            return {
+                "ok": False,
+                "reason": f"a capture session is already running on port {port}",
+                "hint": "call stop_capture_session first, or use a different port",
+                "port": port,
+                "upload_url": existing.upload_url,
+                "qr": existing.qr,
+                "shot_names": list(existing.shot_names),
+                "photo_count": len(existing.received),
+            }
+
+        session = start_session(port=port)
+        port = int(session.port)  # resolved (port=0 -> ephemeral)
+        session._scale_marker_mm = scale_marker_mm  # type: ignore[attr-defined]
+        _CAPTURE_SESSIONS[port] = session
+        return {
+            "ok": True,
+            "port": port,
+            "upload_url": session.upload_url,
+            "qr": session.qr,
+            "shot_names": list(session.shot_names),
+            "photo_count": len(session.received),
+            "scale_marker_mm": scale_marker_mm,
+            "instructions": (
+                "Scan the QR code with your phone (or open the upload_url in a mobile "
+                f"browser). Upload one photo per guided angle ({len(session.shot_names)} "
+                "angles). When done, call stop_capture_session(port="
+                f"{port}) to collect photos."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _wrap_exc(exc)
+
+
+def _stop_capture_session(params: dict, _emit: Callable) -> dict:
+    """Stop capture server; return photos. Optional photogrammetry when requested.
+
+    Returns {ok, photo_count, photos:[paths], mesh_path?}.
+    Default run_reconstruction=false (GUI adds photos to a reveng session itself).
+    """
+    try:
+        p = params or {}
+        port = int(p.get("port", 8742) or 8742)
+        run_reconstruction = bool(p.get("run_reconstruction", False))
+
+        try:
+            from engine_oracle.vision.capture_server import stop_session
+        except ImportError:
+            from engine.vision.capture_server import stop_session  # type: ignore
+
+        session = _CAPTURE_SESSIONS.pop(port, None)
+        if session is None:
+            return _fail(
+                f"no capture session is running on port {port}",
+                "call start_capture_session first",
+            )
+
+        photos = list(session.received)
+        photo_count = len(photos)
+        work_dir = getattr(session, "work_dir", None)
+        scale_mm = getattr(session, "_scale_marker_mm", None)
+        stop_session(session)
+
+        result: dict = {
+            "ok": True,
+            "photo_count": photo_count,
+            "photos": photos,
+            "mesh_path": None,
+        }
+
+        if not run_reconstruction or photo_count == 0:
+            return result
+
+        # Optional photogrammetry (legacy MCP default was True; GUI uses False).
+        try:
+            try:
+                from engine_oracle.vision import photogrammetry as _pg
+                from engine_oracle.vision import mesh_cleanup as _mc
+            except ImportError:
+                from engine.vision import photogrammetry as _pg  # type: ignore
+                from engine.vision import mesh_cleanup as _mc  # type: ignore
+            import os as _os
+            import tempfile
+
+            recon_dir = tempfile.mkdtemp(prefix="aicad_recon_")
+            recon = _pg.reconstruct(
+                image_dir=str(work_dir) if work_dir else "",
+                out_dir=recon_dir,
+                scale_mm=scale_mm,
+            )
+            result["reconstruction"] = recon
+            if recon.get("ok") and recon.get("mesh_path"):
+                raw_mesh = recon["mesh_path"]
+                cleaned_path = _os.path.join(recon_dir, "cleaned_mesh.obj")
+                cleanup = _mc.cleanup_mesh(raw_mesh, cleaned_path, scale_mm=scale_mm)
+                if cleanup.get("ok"):
+                    result["mesh_path"] = cleanup.get("mesh_path")
+                else:
+                    result["mesh_path"] = raw_mesh
+                    result["cleanup_skipped"] = cleanup.get("reason")
+            else:
+                result["mesh_path"] = None
+        except Exception as exc:  # noqa: BLE001
+            result["reconstruction"] = {
+                "ok": False,
+                "reason": f"reconstruction failed: {exc}",
+            }
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return _wrap_exc(exc)
+
+
 REVENG_WORKER_METHODS: dict[str, Callable] = {
     "list_reveng_sessions": _reveng_list_sessions,
     "get_reveng_session": _reveng_get_session,
@@ -335,4 +496,6 @@ REVENG_WORKER_METHODS: dict[str, Callable] = {
     "reveng_add_images": _reveng_add_images,
     "reveng_ingest_datasheet": _reveng_ingest_datasheet,
     "reveng_start_from_product": _reveng_start_from_product,
+    "start_capture_session": _start_capture_session,
+    "stop_capture_session": _stop_capture_session,
 }

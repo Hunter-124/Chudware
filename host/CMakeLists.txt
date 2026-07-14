@@ -208,6 +208,8 @@ add_executable(Billet
   src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
   src/ui/reveng/sources_panel.cpp    # RE-30 source-mode entry panel (Scan/Datasheet/Web/Library)
+  # RE-07/RE-19: CameraBackend (V4L2 / MF / stub) for live webcam capture
+  src/platform/camera_stub.cpp
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp
@@ -223,6 +225,12 @@ add_executable(Billet
 if(WIN32)
   target_sources(Billet PRIVATE app.rc)
 endif()
+if(NOT WIN32)
+  target_sources(Billet PRIVATE src/platform/camera_v4l2.cpp)
+else()
+  target_sources(Billet PRIVATE src/platform/camera_mf.cpp)
+endif()
+
 
 target_include_directories(Billet PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src

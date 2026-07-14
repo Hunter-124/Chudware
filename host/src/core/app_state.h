@@ -101,6 +101,8 @@ struct Settings {
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
+    bool orthographic = true;    // viewport projection: true=orthographic (CAD default), false=perspective
+                                 // — persisted to config.json as "orthographic"
     bool partsGridView = false;  // Parts Library results as grid cards vs list — "parts_grid_view"
     // Parts Library GUI V2: expanded taxonomy categories + result sort mode
     // (0=Relevance 1=Price low→high 2=Price high→low 3=Name). Serialized as
@@ -1096,6 +1098,7 @@ struct AppState {
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire
+    bool orthographic = true;        // live projection mode; mirrors Settings::orthographic (viewport/renderer apply each frame)
     // Appearance ribbon "Appearance..." button -> one-shot request the viewport's color/material
     // picker for the whole model (body "b1"). Consumed (and cleared) by viewport_panel each frame.
     bool requestAppearanceEditor = false;
@@ -1115,6 +1118,7 @@ struct AppState {
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
     bool showSessionsPicker = false;  // Copilot: hide chat log, show the Sessions list/dropdown
+    bool showAISettingsOverlay = false;  // Copilot: hide chat log, show compact AI settings (gear toggle; mutually exclusive with showSessionsPicker)
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
     // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
     // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.

@@ -41,7 +41,7 @@ inline const char* providerLabel(int provider) {
         case PROV_LOCAL: return "Local (OpenAI-compatible)";
         case PROV_LLAMACPP: return "llama.cpp (managed local)";
         case PROV_GEMINI: return "Google Gemini";
-        case PROV_CLOUDCOMPAT: return "Cloud API (Qwen / DeepSeek / OpenAI-compatible)";
+        case PROV_CLOUDCOMPAT: return "OpenRouter / Cloud API";
         default: return "?";
     }
 }

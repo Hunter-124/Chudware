@@ -330,9 +330,10 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     # T-W28: the gym reads the SAME effort resolution path as the mission
     # pipeline and the settings GUI (tiers.resolve_effort → presets + user
     # overrides), and snapshots it into the cell ledger like a real mission.
-    from services.agent.tiers import resolve_effort
+    from services.agent.tiers import resolve_effort, effort_tier_for
     from services.agent.effort import record_effort_snapshot
-    effort_profile = resolve_effort(tier)
+    # openrouter:<model-id> reuses the frontier budget profile for effort.
+    effort_profile = resolve_effort(effort_tier_for(tier) or tier)
     record_effort_snapshot(ledger, active_tier=effort_profile.tier)
 
     if real_mode:
@@ -428,6 +429,10 @@ def _provider_for_tier(tier: str):
     meaningless (T-DP19: real cells were routing to Gemini and tying at win_rate 0.00,
     which read like a model-quality signal but was really a routing artifact).
 
+    Parameterized ``openrouter:<model-id>`` tiers resolve to OpenRouterProvider with
+    that model (multi-provider leaderboard path). Cached by model id so paid cells
+    share the same adapter instance across the matrix.
+
     An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
     through to the default resolution. Actual tier->provider resolution is delegated to
@@ -438,8 +443,21 @@ def _provider_for_tier(tier: str):
     server instead of colliding on the fanout default."""
     import os
     from services.agent import config
-    from services.agent.tiers import LOCAL_TIER_MODELS, load_local_models, provider_for_tier
-    if os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
+    from services.agent.tiers import (
+        LOCAL_TIER_MODELS, load_local_models, parse_openrouter_tier, provider_for_tier,
+    )
+    if os.environ.get("AI_CAD_PROVIDER"):
+        return config.get_provider()
+    # OpenRouter paid tiers: cache by model id (no VRAM server, but reuse adapter).
+    or_model = parse_openrouter_tier(tier)
+    if or_model is not None:
+        cache_key = f"openrouter:{or_model}"
+        prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
+        if prov is None:
+            prov = provider_for_tier(tier)
+            _LOCAL_PROVIDER_CACHE[cache_key] = prov
+        return prov
+    if not tier.startswith("local"):
         return config.get_provider()
     model_id = LOCAL_TIER_MODELS.get(tier)
     if model_id is None:
@@ -452,6 +470,7 @@ def _provider_for_tier(tier: str):
         prov = provider_for_tier(tier)
         _LOCAL_PROVIDER_CACHE[model_id] = prov
     return prov
+
 
 
 def _run_mission_real(challenge: Challenge, run_id: str, tier: str) -> dict | None:

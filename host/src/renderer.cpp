@@ -826,8 +826,12 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     const float deg = 3.14159265f / 180.0f;
     float yaw = yawDeg * deg, pitch = pitchDeg * deg;
     Vec3 dir(std::cos(pitch) * std::sin(yaw), -std::cos(pitch) * std::cos(yaw), std::sin(pitch));
-    float fov = kFovDeg * deg;
-    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f / std::max(0.05f, zoom);
+    // Orbit distance is always the historical perspective framing distance so eye placement
+    // (and therefore shading lights) stays identical across modes; only the PROJECTION changes.
+    // Ortho half-height = sceneR*1.05/zoom matches the perspective silhouette at the target plane.
+    const float fov = kFovDeg * deg;
+    const float zc  = std::max(0.05f, zoom);
+    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f / zc;
     // W2-D: pan shifts the orbit target (and therefore the eye) in world space. While a sketch is
     // open, orbitOverride_ replaces the model-bbox centre with the sketch's geometric centre so the
     // view orbits/frames around the sketch (which is not part of the body bbox), not the origin.
@@ -842,30 +846,68 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                               std::sin(pitch) * std::cos(yaw),
                               std::cos(pitch)));
 
-    Mat4 proj = perspective(fov, (float)sw_ / (float)sh_, dist * 0.01f, dist * 10.0f);
-    // W2 full-bleed viewport: bake the horizontal lens shift into the projection's unused m[8]
-    // slot BEFORE building mvp, so the asymmetric frustum re-centers the part in the un-occluded
-    // region and the shift travels through cam_.mvp to the id-pass + overlays (pixel-exact).
-    proj.m[8] = lensShiftX_;
+    const float aspect = (float)sw_ / (float)sh_;
+    // World half-height of the view volume at the orbit target. Perspective uses dist*tan(fov/2)
+    // (classic frustum); orthographic uses sceneR*1.05/zoom so zoom=1 frames the same sphere.
+    // The two are equal under the historical dist = R/sin(fov/2)*1.05/zoom identity, so switching
+    // modes keeps framing continuous.
+    const float halfH = orthographic_
+        ? (sceneR * 1.05f / zc)
+        : (dist * std::tan(fov * 0.5f));
+    const float halfW = halfH * aspect;
+
+    Mat4 proj;
+    if (orthographic_) {
+        // Generous near/far in VIEW space (lookAt puts the eye at the origin looking -Z, so
+        // the target sits at z=-dist). ±10*sceneR from the eye covers the whole model even when
+        // the camera is rolled past it; avoids the tight perspective near/far clipping.
+        // lensShiftX_ is NDC offset: convert to world offset = shift * halfW so the asymmetric
+        // ortho volume re-centers the part in the un-occluded region (same contract as proj.m[8]).
+        const float shiftW = lensShiftX_ * halfW;
+        proj = makeOrtho(-halfW + shiftW, halfW + shiftW,
+                         -halfH,           halfH,
+                         -10.0f * sceneR,  10.0f * sceneR);
+    } else {
+        proj = perspective(fov, aspect, dist * 0.01f, dist * 10.0f);
+        // W2 full-bleed viewport: bake the horizontal lens shift into the projection's unused m[8]
+        // slot BEFORE building mvp, so the asymmetric frustum re-centers the part in the un-occluded
+        // region and the shift travels through cam_.mvp to the id-pass + overlays (pixel-exact).
+        proj.m[8] = lensShiftX_;
+    }
     Mat4 view = lookAt(eye, target, up);
     Mat4 mvp = mul(proj, view);
 
-    // Publish the transform so the ID-buffer pass and overlays (C15) align to this exact frame.
+    // Camera-relative basis (published for pan/zoom helpers so they never re-derive FOV).
+    Vec3 V = normalize(dir);                       // model -> camera
+    Vec3 R = normalize(cross(up, V));
+    Vec3 U = normalize(cross(V, R));
+
+    // Publish the transform so the ID-buffer pass and overlays (C15) align to this exact frame,
+    // and so every screen<->world helper can read halfHeight / worldPerPixel without hardcoding FOV.
     cam_.mvp = mvp;
+    cam_.proj = proj;
+    cam_.view = view;
     cam_.eye = eye;
     cam_.center = target;
+    cam_.dir = V;
+    cam_.right = R;
+    cam_.up = U;
     cam_.radius = sceneR;
+    cam_.dist = dist;
+    cam_.halfHeight = halfH;
+    cam_.zoom = zc;
+    cam_.orthographic = orthographic_;
     cam_.ssWidth = sw_;
     cam_.ssHeight = sh_;
+    cam_.vpWidth = w_;
+    cam_.vpHeight = h_;
 
     // Soft ground contact shadow under the model (after bg, under geometry).
     drawGroundShadow(mvp, eye, up);
 
     // Camera-relative studio rig: soft key from the upper-left, fill from the right; the rim is
     // nearly off (tuned for the near-white studio bg where halos read wrong).
-    Vec3 V = normalize(dir);                       // model -> camera
-    Vec3 R = normalize(cross(up, V));
-    Vec3 U = normalize(cross(V, R));
+    // (V/R/U already computed above for cam_ publish.)
     Vec3 keyDir = normalize(V + R * -0.45f + U * 0.85f);
     Vec3 fillDir = normalize(V + R * 0.85f + U * 0.10f);
     Vec3 rimDir = normalize(V * -1.0f + U * 0.55f);
@@ -1157,8 +1199,10 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
     const float deg = 3.14159265f / 180.0f;
     float yaw = yawDeg * deg, pitch = pitchDeg * deg;
     Vec3 dir(std::cos(pitch) * std::sin(yaw), -std::cos(pitch) * std::cos(yaw), std::sin(pitch));
-    float fov = kFovDeg * deg;
-    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f;  // zoom=1 fit, no pan
+    const float fov = kFovDeg * deg;
+    // Orbit distance matches live view (zoom=1 fit, no pan). Ortho half-height matches perspective
+    // framing so the thumbnail silhouette is continuous across projection modes.
+    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f;
     Vec3 target = center_;
     Vec3 eye = target + dir * dist;
     // Same continuous up-vector as drawCurrent (see note there) so thumbnails match the live view.
@@ -1166,7 +1210,14 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
                               std::sin(pitch) * std::cos(yaw),
                               std::cos(pitch)));
 
-    Mat4 proj = perspective(fov, 1.0f, dist * 0.01f, dist * 10.0f);  // square aspect
+    const float halfH = orthographic_ ? (sceneR * 1.05f) : (dist * std::tan(fov * 0.5f));
+    Mat4 proj;
+    if (orthographic_) {
+        proj = makeOrtho(-halfH, halfH, -halfH, halfH,
+                         -10.0f * sceneR, 10.0f * sceneR);  // square aspect
+    } else {
+        proj = perspective(fov, 1.0f, dist * 0.01f, dist * 10.0f);  // square aspect
+    }
     Mat4 view = lookAt(eye, target, up);
     Mat4 mvp = mul(proj, view);
 

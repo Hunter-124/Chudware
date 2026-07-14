@@ -253,6 +253,39 @@ LOCAL_TIER_MODELS: dict[str, str] = {
 }
 
 
+def parse_openrouter_tier(tier: str) -> str | None:
+    """Return the OpenRouter model id when *tier* is ``openrouter:<model-id>``.
+
+    Examples::
+
+        openrouter:anthropic/claude-opus-4  →  "anthropic/claude-opus-4"
+        openrouter:openai/gpt-4o           →  "openai/gpt-4o"
+
+    Returns ``None`` for any other tier string (local-*, mid, frontier, …).
+    """
+    if not tier or not isinstance(tier, str):
+        return None
+    prefix = "openrouter:"
+    if not tier.startswith(prefix):
+        return None
+    model_id = tier[len(prefix):].strip()
+    return model_id or None
+
+
+def effort_tier_for(tier: str | None) -> str | None:
+    """Map a gym/CLI tier string onto a tiers.yaml profile name for effort.
+
+    Parameterized ``openrouter:<model-id>`` paid tiers reuse the ``frontier``
+    budget profile (same context class). Local / mid / frontier names pass
+    through unchanged so resolve_effort keeps working.
+    """
+    if not tier:
+        return tier
+    if parse_openrouter_tier(tier) is not None:
+        return "frontier"
+    return tier
+
+
 def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     """Resolve the :class:`Provider` a *tier* should run on.
 
@@ -273,13 +306,19 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     specific bundled model instead of the fanout default — this is the
     tokenmaxx benchmark's per-model tier matrix (T-W29/T-DP19).
 
+    Parameterized paid tiers use the ``openrouter:<model-id>`` syntax (e.g.
+    ``openrouter:anthropic/claude-opus-4``). They resolve to
+    :class:`OpenRouterProvider` with that model id and the OpenRouter API key
+    from config / ``OPENROUTER_API_KEY``. This is the multi-provider benchmark
+    path that feeds the leaderboard (contracts/leaderboard.md).
+
     An explicit ``AI_CAD_PROVIDER`` env override always wins (tests pin it to
     ``mock``; a human can force a frontier key even for a nominally local
-    tier run). Every non-local tier (``mid`` / ``frontier`` / ``None``/unset)
-    falls straight through to the ordinary ``config.get_provider()``
-    resolution — behaviour is UNCHANGED for any caller that does not pass a
-    tier at all, which is the point: this is a targeted fix, not a change to
-    cloud-default usage.
+    tier run). Every non-local, non-openrouter tier (``mid`` / ``frontier`` /
+    ``None``/unset) falls straight through to the ordinary
+    ``config.get_provider()`` resolution — behaviour is UNCHANGED for any
+    caller that does not pass a tier at all, which is the point: this is a
+    targeted fix, not a change to cloud-default usage.
 
     Raises whatever the underlying provider construction raises (e.g. no
     bundled model weights on this machine) — callers fail closed, they never
@@ -289,7 +328,25 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
 
     from services.agent import config as _config
 
-    if not tier or os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
+    # Explicit env override always wins (tests pin AI_CAD_PROVIDER=mock).
+    if os.environ.get("AI_CAD_PROVIDER"):
+        return _config.get_provider(cfg=cfg)
+
+    # Parameterized OpenRouter paid tiers: openrouter:<model-id>
+    or_model = parse_openrouter_tier(tier) if tier else None
+    if or_model is not None:
+        merged_cfg = dict(cfg or {})
+        # Prefer openrouter-scoped key, then top-level api_key, then env.
+        oc = dict(merged_cfg.get("openrouter") or {})
+        key = (oc.get("api_key")
+               or merged_cfg.get("api_key")
+               or os.environ.get("OPENROUTER_API_KEY"))
+        merged_cfg["api_key"] = key
+        merged_cfg["model"] = or_model
+        merged_cfg.setdefault("openrouter", oc)
+        return _config.get_provider("openrouter", cfg=merged_cfg)
+
+    if not tier or not tier.startswith("local"):
         return _config.get_provider(cfg=cfg)
 
     local_models = load_local_models()
@@ -302,6 +359,8 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     # llamacpp (not openai) so structured-output nodes get GBNF grammars, which
     # the local-24k/local-48k tiers require (tiers.yaml structured_output: gbnf).
     return _config.get_provider("llamacpp", cfg=merged_cfg)
+
+
 
 
 # --------------------------------------------------------------------------- tier detection
@@ -386,9 +445,15 @@ def resolve_effort(tier: str, **kwargs):
     pipeline, the design gym and the settings GUI all resolve through this ONE
     path.  Import is deferred (mirrors grammar_for_tier) to avoid cycles —
     effort.py imports this module.
+
+    Parameterized ``openrouter:<model-id>`` paid tiers share the frontier
+    budget profile (see :func:`effort_tier_for`).
     """
+    # openrouter:<model-id> paid tiers share the frontier budget profile.
+    tier = effort_tier_for(tier)
     from services.agent.effort import resolve_effort as _resolve
     return _resolve(tier, **kwargs)
+
 
 
 # --------------------------------------------------------------------------- turn assembler

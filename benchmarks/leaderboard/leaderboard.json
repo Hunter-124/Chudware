@@ -1,37 +1,154 @@
 {
   "schema": "aicad.leaderboard/1",
-  "generated": "2026-07-14T00:00:00Z",
+  "generated": "2026-07-14T13:58:04Z",
   "task_suite": "gym-C1..C8 + diag-v1-MOCK",
   "models": [
     {
-      "id": "anthropic/claude-opus-4",
-      "label": "Claude Opus 4 (mock)",
+      "id": "frontier-200k",
+      "label": "frontier-200k",
       "provider": "openrouter",
       "kind": "paid",
-      "evaluated": "2026-07-14T00:00:00Z",
+      "evaluated": "2026-07-14T13:58:04Z",
       "cycles": 1,
-      "primary": { "pass_rate": 0.42, "cells_total": 36, "cells_passed": 15 },
-      "axes": { "tool_validity": 0.91, "vision_fix": 0.5, "feature_id": 0.8, "vc_hygiene": 0.6 },
-      "failure_taxonomy": { "incoherent_geometry": 3, "execution_stall": 1 },
-      "cost": { "usd_per_task_med": 0.021, "latency_s_med": 44.0, "tokens_per_task_med": 18000 },
+      "primary": {
+        "pass_rate": 0.8889,
+        "cells_total": 18,
+        "cells_passed": 16
+      },
+      "axes": {
+        "tool_validity": null,
+        "vision_fix": null,
+        "feature_id": null,
+        "vc_hygiene": null
+      },
+      "failure_taxonomy": {
+        "tool_misuse": 3,
+        "context_loss": 2,
+        "advisory_ignored": 1,
+        "abstraction_skip": 1,
+        "incoherent_geometry": 2,
+        "grind": 2,
+        "wrong_question": 2
+      },
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": null
+      },
       "per_challenge": [
-        { "challenge": "C1", "tier": "openrouter-default", "pass_rate": 0.67, "seeds": 3 },
-        { "challenge": "C2", "tier": "openrouter-default", "pass_rate": 0.33, "seeds": 3 }
+        {
+          "challenge": "C1",
+          "tier": "frontier-200k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        },
+        {
+          "challenge": "C2",
+          "tier": "frontier-200k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        },
+        {
+          "challenge": "C3",
+          "tier": "frontier-200k",
+          "pass_rate": 0.6667,
+          "seeds": 3
+        },
+        {
+          "challenge": "C4",
+          "tier": "frontier-200k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        },
+        {
+          "challenge": "C5",
+          "tier": "frontier-200k",
+          "pass_rate": 0.6667,
+          "seeds": 3
+        },
+        {
+          "challenge": "C6",
+          "tier": "frontier-200k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        }
       ]
     },
     {
-      "id": "gemma3-4b-qat",
-      "label": "Gemma 3 4B QAT (mock)",
+      "id": "qwen3-4b",
+      "label": "qwen3-4b",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-14T00:00:00Z",
-      "cycles": 1,
-      "primary": { "pass_rate": 0.08, "cells_total": 36, "cells_passed": 3 },
-      "axes": { "tool_validity": 0.72, "vision_fix": 0.1, "feature_id": 0.4, "vc_hygiene": 0.2 },
-      "failure_taxonomy": { "incoherent_geometry": 12, "context_loss": 6 },
-      "cost": { "usd_per_task_med": null, "latency_s_med": 210.0, "tokens_per_task_med": 22000 },
+      "evaluated": "2026-07-14T13:58:04Z",
+      "cycles": 10,
+      "primary": {
+        "pass_rate": 0.3256,
+        "cells_total": 43,
+        "cells_passed": 14
+      },
+      "axes": {
+        "tool_validity": 1.0,
+        "vision_fix": null,
+        "feature_id": 1.0,
+        "vc_hygiene": 1.0
+      },
+      "failure_taxonomy": {
+        "incoherent_geometry": 29,
+        "grind": 3,
+        "advisory_ignored": 1,
+        "abstraction_skip": 1,
+        "wrong_question": 2,
+        "tool_misuse": 2,
+        "context_loss": 2
+      },
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": 459.5
+      },
       "per_challenge": [
-        { "challenge": "C1", "tier": "local-24k-gemma3-qat", "pass_rate": 0.0, "seeds": 3 }
+        {
+          "challenge": "C1",
+          "tier": "local-24k",
+          "pass_rate": 0.0,
+          "seeds": 23
+        },
+        {
+          "challenge": "C1-DP2",
+          "tier": "local-24k",
+          "pass_rate": 0.3333,
+          "seeds": 3
+        },
+        {
+          "challenge": "C2",
+          "tier": "local-24k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        },
+        {
+          "challenge": "C3",
+          "tier": "local-24k",
+          "pass_rate": 0.6667,
+          "seeds": 3
+        },
+        {
+          "challenge": "C4",
+          "tier": "local-24k",
+          "pass_rate": 1.0,
+          "seeds": 3
+        },
+        {
+          "challenge": "C5",
+          "tier": "local-24k",
+          "pass_rate": 0.6667,
+          "seeds": 3
+        },
+        {
+          "challenge": "C6",
+          "tier": "local-24k",
+          "pass_rate": 0.6,
+          "seeds": 5
+        }
       ]
     }
   ]

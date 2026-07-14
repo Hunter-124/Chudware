@@ -1175,6 +1175,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.ribbonDispatch = dispatchCmd;
 
     loadSettings(st.settings);
+    st.orthographic = st.settings.orthographic;  // live projection mode mirrors the persisted setting
     // Liquid glass v2.1: install + resolve the persisted appearance config before the first frame
     // (idempotent; re-pushed every frame in the loop below so runtime mutations self-heal).
     ui::setGlassConfig(st.settings.glassCfg);

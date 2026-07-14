@@ -1,7 +1,7 @@
 // webcam_capture.h — live webcam preview + shutter widget (RE-19)
 // Draws an ImGui child panel with:
-//   • Live preview: grabs frames via a stub CameraBackend (works headless — stub returns a
-//     solid-colour test frame when no device is available, matching RE-07 contract).
+//   • Live preview via CameraBackend (V4L2 on Linux, MF stub on Windows; synthetic
+//     test pattern when no device / open fails so AI_CAD_SHOT=reveng_capture stays green).
 //   • Coverage overlay: OpenScan-style 11-shot dome ring drawn with ImDrawList.
 //     Captured positions = green, pending = white, blurred/uncertain = amber.
 //   • Shutter button: writes JPEG to the session dir and fires async reveng_add_images.
@@ -22,7 +22,7 @@ void drawWebcamCapture(AppState& st,
                        const std::string& session_id,
                        const std::string& session_dir);
 
-// Release the GL texture + stub camera resources held by the widget.
+// Release the GL texture + CameraBackend resources held by the widget.
 // Call once on workspace teardown.
 void webcamCaptureShutdown();
 

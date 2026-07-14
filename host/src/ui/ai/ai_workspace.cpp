@@ -36,6 +36,7 @@
 #include "core/app_state.h"
 #include "ui/legacy_chat.h"
 #include "ui_theme.h"
+#include "ui/leaderboard_ui.h"
 
 namespace ui {
 
@@ -57,9 +58,10 @@ struct DagRun {
 };
 
 struct AiWsState {
-    // Which DAG the upper pane shows (M7): 0 = Agent Workflow, 1 = Session Plan.
-    // Phase 1 renders the buildgraph view for BOTH; Phase 2 swaps a live agent-execution DAG
-    // into Agent Workflow. The conversation window is always visible below (M6), never a tab.
+    // Which DAG the upper pane shows (M7): 0 = Agent Workflow, 1 = Session Plan, 2 = Leaderboard.
+    // Phase 1 renders the buildgraph view for BOTH workflow tabs; Phase 2 swaps a live
+    // agent-execution DAG into Agent Workflow. The conversation window is always visible below
+    // (M6), never a tab. Leaderboard reads benchmarks/leaderboard/leaderboard.json.
     int  dagView      = 0;     // default to Agent Workflow (Phase 2 live execution DAG)
     bool showSettings = true;
 
@@ -88,6 +90,10 @@ struct AiWsState {
     // canvas pan/zoom
     ImVec2 pan{0.0f, 0.0f};
     float  zoom = 1.0f;
+
+    // Leaderboard cache (aicad.leaderboard/1).
+    ui::leaderboard::Board lb;
+    bool                   lbLoaded = false;
 };
 
 static AiWsState s_ai;
@@ -1527,18 +1533,19 @@ static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
 
 // ---- public entry point ------------------------------------------------------------
 
-// The upper DAG pane: tab strip (Agent Workflow | Session Plan) + gear, then the graph canvas.
+// The upper DAG pane: tab strip (Agent Workflow | Session Plan | Leaderboard) + gear.
 static void drawDagPane(AppState& st, bool /*busy*/) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
     ImGui::BeginChild("##ai_ws_dag", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    // Tab strip switches ONLY this pane (M7). Both tabs render the buildgraph view in Phase 1;
-    // the live agent-execution DAG lands under "Agent Workflow" in Phase 2.
+    // Tab strip switches ONLY this pane (M7). Leaderboard is the aicad.leaderboard/1 consumer.
     if (viewChip("Agent Workflow", s_ai.dagView == 0)) s_ai.dagView = 0;
     ImGui::SameLine();
     if (viewChip("Session Plan", s_ai.dagView == 1)) s_ai.dagView = 1;
+    ImGui::SameLine();
+    if (viewChip("Leaderboard", s_ai.dagView == 2)) s_ai.dagView = 2;
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          std::max(0.0f, ImGui::GetContentRegionAvail().x - 84.0f * S));
@@ -1549,17 +1556,25 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
         ImGui::SetTooltip("Show / hide the AI workflow options pane.");
     ImGui::Spacing();
 
-    if (s_ai.dagView == 0) {
-        // Phase 2 (M9/M10): the LIVE agent-execution DAG — tool calls / thoughts / context
-        // injections joined by parent_id→id, with collapsible branches. Fed from the JobState
-        // event drain (feedAgentDagEvent). Renders its own honest empty-state; does NOT need the
-        // worker to be up to show the empty-state, and never touches the buildgraph store.
+    if (s_ai.dagView == 2) {
+        if (!s_ai.lbLoaded) {
+            s_ai.lb = ui::leaderboard::load();
+            s_ai.lbLoaded = true;
+        }
+        bool wantRefresh = false;
+        ui::leaderboard::drawFullPane(s_ai.lb, wantRefresh);
+        if (wantRefresh) {
+            s_ai.lb = ui::leaderboard::load();
+            s_ai.lbLoaded = true;
+        }
+    } else if (s_ai.dagView == 0) {
+        // Phase 2 (M9/M10): the LIVE agent-execution DAG.
         drawAgentWorkflowView(st);
     } else if (!st.workerStarted) {
         emptyState("[#]", "Worker not running",
                    "The Billet worker service is required to load and steer plans.");
     } else {
-        // Session Plan: the persisted buildgraph view (unchanged Phase-1 behavior).
+        // Session Plan: the persisted buildgraph view.
         drawDagView(st);
     }
     ImGui::EndChild();

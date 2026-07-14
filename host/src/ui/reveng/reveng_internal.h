@@ -98,17 +98,41 @@ struct RevEngState {
     std::string datasheetErr;
     bool datasheetPending = false;
 
+    // Phone capture session (start_capture_session / stop_capture_session).
+    bool        phonePending = false;
+    bool        phoneActive  = false;
+    int         phonePort    = 8742;
+    int         phoneCount   = 0;          // photos received (last known)
+    std::string phoneUrl;                  // upload_url for the phone
+    std::string phoneQr;                   // data:image/png;base64,… or raw URL fallback
+    std::string phoneErr;
+    std::string phoneStatus;               // short status line
+    unsigned int phoneQrTex = 0;           // GL texture for QR PNG (0 = none)
+    int         phoneQrW = 0;
+    int         phoneQrH = 0;
+    double      phonePollT = -100.0;       // last stop/poll attempt
+
     // RE-21: Reconstruct stage.
     ReconstructState recon;
 
     // RE-21: GL overlay — point cloud + camera frusta. Owned here so it persists across frames.
     render::RePoints rePoints;
 
-    // RE-28 (wired RE-27): 3DGS splat renderer. Loaded with a canned .ply fixture when
-    // Stage::Reconstruct is entered and recon.done is true (or in the reveng_splat shot mode).
+    // RE-28 (wired RE-27): 3DGS splat renderer. Prefer session artifacts.splat_path when
+    // present; fall back to the canned fixture only for demo/shot modes.
     // draw() is a no-op until a cloud is loaded; safe to call every frame.
     render::SplatRenderer splat;
     bool splatLoaded = false;   // true once load() has been attempted for this session
+    std::string splatPathTried; // path last load attempt used (avoid reloading same path)
+
+    // Session detail mirror (from get_reveng_session) — artifact paths for Reconstruct.
+    std::string detailSessionId;     // session_id the detail was fetched for
+    std::string artifactSplatPath;   // absolute or session-relative splat .ply
+    std::string artifactMeshPath;    // absolute or session-relative mesh
+    std::string artifactSparseDir;
+    bool        detailPending = false;
+    double      lastDetailT = -100.0;
+    std::string detailErr;
 
     // RE-21: Canned fixture loaded flag (true once buildCannedSparseFixture has been applied).
     bool cannedFixtureLoaded = false;

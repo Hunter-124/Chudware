@@ -2448,38 +2448,79 @@ float PropertyManager::drawChromeButtons(AppState& st, float rightX, float cente
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Confirm (OK) — palette statusOk role (adapts to the active theme; no baked greens).
+    // Confirm (OK) + Cancel: neutral rest fill always. Hover/active is a status-tinted glowing
+    // edge (layered outer rings + crisp border + faint inner wash) — never a solid status block.
+    // Matches the soft-halo language of drawManipArrow / doc_tabs AI pulse, statusOk for check
+    // and statusErr for X so the pair reads as a matched set.
+    auto drawChromeHoverGlow = [&](const ImVec2& mn, const ImVec2& mx, const float status[4],
+                                   bool hovered, bool active) {
+        if (!hovered && !active) return;
+        const float rnd = ImGui::GetStyle().FrameRounding;
+        // Faint status wash inside the face (low alpha so the neutral fill still dominates).
+        {
+            float wash[4];
+            Palette::withAlpha(status, wash, active ? 0.16f : 0.09f);
+            dl->AddRectFilled(mn, mx, Palette::toU32(wash), rnd);
+        }
+        // Soft outer glow: layered AddRect rings stepping outward with decreasing alpha
+        // (same layered-halo idea as doc_tabs AI pulse / drawManipArrow under-stroke).
+        const float baseA = active ? 0.30f : 0.20f;
+        for (int k = 3; k >= 1; --k) {
+            const float grow = (float)k * 2.0f * S;
+            const float a = baseA * (float)k / 3.0f;
+            float g[4]; Palette::withAlpha(status, g, a);
+            dl->AddRect(ImVec2(mn.x - grow, mn.y - grow),
+                        ImVec2(mx.x + grow, mx.y + grow),
+                        Palette::toU32(g), rnd + grow, 0, 2.0f * S);
+        }
+        // Crisp status-tinted border ring; pressed deepens it.
+        {
+            float edge[4];
+            Palette::withAlpha(status, edge, active ? 1.0f : 0.90f);
+            dl->AddRect(mn, mx, Palette::toU32(edge), rnd, 0,
+                        (active ? 2.2f : 1.6f) * S);
+        }
+    };
+
+    // Neutral face for both buttons (rest fill stays put on hover — glow carries the state).
+    const ImVec4 faceRest(
+        pal.button[0], pal.button[1], pal.button[2], 0.92f);
+    const ImVec4 faceHover(
+        pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.92f);
+    const ImVec4 faceActive(
+        pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.95f);
+    // Glyph on the neutral face: palette text role is light-on-dark / dark-on-light.
+    const ImU32 glyphCol = Palette::toU32(pal.text);
+
+    // Confirm (OK) — statusOk glow on hover/active.
     ImGui::SetCursorScreenPos(ImVec2(x0, y0));
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button,        faceRest);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, faceHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  faceActive);
     ok = ImGui::Button("##pm_ok", ImVec2(btn, btn));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
     {
         ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
         ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        // White glyph reads on the green fill in both themes.
-        drawCheck(dl, c, btn * 0.5f, IM_COL32(255, 255, 255, 255), 3.0f * S);
+        drawChromeHoverGlow(mn, mx, pal.statusOk,
+                            ImGui::IsItemHovered(), ImGui::IsItemActive());
+        drawCheck(dl, c, btn * 0.5f, glyphCol, 3.0f * S);
     }
     ImGui::PopStyleColor(3);
 
-    // Cancel — neutral button fill, error-red on hover.
+    // Cancel — statusErr glow on hover/active (no solid red face).
     ImGui::SetCursorScreenPos(ImVec2(x0 + btn + gap, y0));
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
+    ImGui::PushStyleColor(ImGuiCol_Button,        faceRest);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, faceHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  faceActive);
     cancel = ImGui::Button("##pm_cancel", ImVec2(btn, btn));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
     {
         ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
         ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        drawX(dl, c, btn * 0.5f, IM_COL32(235, 235, 235, 255), 3.0f * S);
+        drawChromeHoverGlow(mn, mx, pal.statusErr,
+                            ImGui::IsItemHovered(), ImGui::IsItemActive());
+        drawX(dl, c, btn * 0.5f, glyphCol, 3.0f * S);
     }
     ImGui::PopStyleColor(3);
 

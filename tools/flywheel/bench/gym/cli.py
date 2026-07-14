@@ -13,6 +13,17 @@ several in one cycle (real hardware) to find the best local-model config:
   python3 -m tools.flywheel.bench.gym.cli run --real \\
       --tiers local-24k,local-24k-gemma3-qat,local-24k-gemma4-e4b
 
+Multi-provider paid tiers (leaderboard path): ``openrouter:<model-id>`` resolves
+to OpenRouterProvider with that model (OPENROUTER_API_KEY / config). Example:
+
+  python3 -m tools.flywheel.bench.gym.cli run --real \\
+      --tiers openrouter:anthropic/claude-opus-4,openrouter:openai/gpt-4o --challenges C1
+
+Diagnostic suites (leaderboard axes — never folded into primary pass rate):
+
+  python3 -m tools.flywheel.bench.gym.cli diag --tiers openrouter:anthropic/claude-opus-4
+  python -m tools.flywheel.bench.gym.leaderboard build
+
 No "council" (multi-model debate/judge) tier exists yet: services/agent/councils.py's
 council_convene() supports diverse-model seats, but it is wired only into the ladder's
 fix-stage (services/agent/regen_diagnosis.py), not into a role-based seam that
@@ -140,15 +151,38 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_diag(args) -> int:
+    """Run diagnostic suites (tool_validity / vision_fix / feature_id / vc_hygiene)."""
+    from .diag import run_diag, write_diag_results
+
+    tiers = [t.strip() for t in args.tiers.split(",") if t.strip()] if args.tiers else ["local-24k"]
+    axes = [a.strip() for a in args.axes.split(",") if a.strip()] if args.axes else None
+    results = run_diag(tiers, seed=args.seed, axes=axes)
+    path = write_diag_results(results)
+    print(f"diag: tiers={results['tiers']} axes={results['axes']} mock={results['mock']}")
+    for row in results["results"]:
+        mid = (row.get("model") or {}).get("id", row.get("tier"))
+        if row.get("error"):
+            print(f"  {mid}: ERROR {row['error']}")
+            continue
+        scores = {ax: (payload.get("score") if isinstance(payload, dict) else None)
+                  for ax, payload in (row.get("axes") or {}).items()}
+        print(f"  {mid}: {scores}")
+    print(f"  wrote: {path}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Design gym (T-W27)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run the challenge matrix + report")
     r.add_argument("--cycle", default="cycle-1")
     r.add_argument("--tiers", default=None,
-                   help="comma list, e.g. local-24k,frontier-200k — local tokenmaxxing "
-                        "tiers: local-24k (qwen3-4b), local-24k-gemma3-qat (gemma3-4b-qat, "
-                        "full GBNF), local-24k-gemma4-e4b (gemma4-e4b, GBNF backup)")
+                   help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4 "
+                        "— local tokenmaxxing tiers: local-24k (qwen3-4b), "
+                        "local-24k-gemma3-qat (gemma3-4b-qat, full GBNF), "
+                        "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
+                        "paid: openrouter:<model-id> (OPENROUTER_API_KEY)")
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
     r.add_argument("--real", action="store_true",
@@ -157,8 +191,19 @@ def main(argv=None) -> int:
                         "real-runnable). T-W30.")
     r.add_argument("--no-adjust", action="store_true", help="skip the assess-adjust-rerun step")
     r.set_defaults(func=cmd_run)
+
+    d = sub.add_parser("diag", help="run diagnostic suites (leaderboard axes)")
+    d.add_argument("--tiers", default="local-24k",
+                   help="comma list of tiers, e.g. local-24k,openrouter:anthropic/claude-opus-4")
+    d.add_argument("--axes", default=None,
+                   help="comma list of axes (default: all four): "
+                        "tool_validity,vision_fix,feature_id,vc_hygiene")
+    d.add_argument("--seed", type=int, default=1, help="fixed seed (default 1)")
+    d.set_defaults(func=cmd_diag)
+
     args = ap.parse_args(argv)
     return args.func(args)
+
 
 
 if __name__ == "__main__":

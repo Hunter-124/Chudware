@@ -3,11 +3,11 @@
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
-// + status + Sessions), the conversation log with a per-turn transparent activity timeline (what
-// the AI is doing / thinking, expandable), and a bottom composer (segmented Design|Edit|Ask
-// toggle + Permissions + context meter; transparent prompt with an in-box send button; model/
-// thinking toolbar). The header gear opens a compact AI-settings popover (drawAISettingsBody);
-// the full form lives in the Settings modal's AI tab.
+// + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
+// timeline (what the AI is doing / thinking, expandable), and a bottom composer (segmented
+// Design|Edit|Ask toggle + Permissions + context meter; transparent prompt with an in-box send
+// button; model/thinking toolbar). Header gear swaps the chat area for a compact AI-settings
+// overlay (same in-column pattern as Sessions); the full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
 // as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
 // H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
@@ -1539,6 +1539,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 // drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
 // restarts.
 static bool s_cpCollapsed = false;
+// In-column AI-settings overlay (header gear). Mutually exclusive with showSessionsPicker —
+// same swap pattern: hide chat log, fill the body with the compact settings form
+// (AppState::showAISettingsOverlay).
 
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
 // defined below with the picker helpers, hosted by the header gear's popup.
@@ -1594,12 +1597,12 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    // Right-side control cluster: [Sessions|< Chat toggle] [settings gear] [status dot], hard-
-    // anchored to the column's right edge so every control is ALWAYS on-screen and clickable at
-    // any tab width (T-G17). Width is measured from the WIDER of the two session labels so the
-    // wordmark never reflows when toggling chat <-> sessions (one brand in both views).
+    // Right-side control cluster: [Sessions|< Chat] [settings gear] [status], hard-anchored to
+    // the column's right edge so every control is always on-screen (T-G17). Sessions and Settings
+    // are mutually exclusive in-column overlays over the chat log.
     const float gearW = lh;
     const bool sessionsOpen = st.showSessionsPicker;
+    const bool settingsOpen = st.showAISettingsOverlay;
     const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
     const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
                                  ImGui::CalcTextSize("< Chat").x) + style.FramePadding.x * 2.0f;
@@ -1608,7 +1611,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + dotW;
     const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
 
-    // Wordmark: "AI-CAD" in the heading font, "Copilot" as a baseline-aligned secondary-ink
+    // Wordmark: "Billet" in the heading font, "Copilot" as a baseline-aligned secondary-ink
     // suffix. Degrades whole-word (drop the suffix, then the wordmark) — never a mid-word clip.
     {
         const float titleAvail = anchorX - ImGui::GetCursorPosX() - style.ItemSpacing.x;
@@ -1627,8 +1630,6 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             if (wordF) ImGui::PopFont();
             if (titleAvail >= wmW + sufW) {
                 ImGui::SameLine(0, sufGap);
-                // Align the smaller suffix on the wordmark's BASELINE (ascent difference), not
-                // its box top — mixed-size text sitting off-baseline reads as a bug.
                 const float dy = (wordF && wordF != ImGui::GetFont())
                                      ? wordF->Ascent - ImGui::GetFont()->Ascent : 0.0f;
                 ImGui::SetCursorPosY(rowTop + (rowH - wordLh) * 0.5f + dy);
@@ -1643,7 +1644,10 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
     centerY(lh);
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton(sessLabel)) st.showSessionsPicker = !st.showSessionsPicker;
+    if (ImGui::SmallButton(sessLabel)) {
+        st.showSessionsPicker = !st.showSessionsPicker;
+        if (st.showSessionsPicker) st.showAISettingsOverlay = false;
+    }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
@@ -1652,29 +1656,29 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     ImGui::SameLine();
     centerY(gearW);
     IconUV gear = ui::getIcon("settings", 20);
-    bool openPopover = false;
-    // Frame padding sized so image + padding == one text-line square, centering like its neighbors.
+    bool gearClicked = false;
+    // Highlight the gear when the settings overlay is open (same visual language as Sessions).
+    if (settingsOpen) {
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
+                   ui::palette.chipBg[3]));
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * sc, 2 * sc));
     if (gear.valid)
-        openPopover = ImGui::ImageButton("##aiheadergear", gear.texId,
+        gearClicked = ImGui::ImageButton("##aiheadergear", gear.texId,
                                          ImVec2(gearW - 4 * sc, gearW - 4 * sc),
                                          gear.uv0, gear.uv1);
     else
-        openPopover = ImGui::SmallButton("set");
+        gearClicked = ImGui::SmallButton(settingsOpen ? "<" : "set");
     ImGui::PopStyleVar();
-    if (openPopover) ImGui::OpenPopup("##cp_ai_popover");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
-    // Compact quick-settings popover — provider/model/effort + "All settings..." (the old full-
-    // page inline settings view inside the column is gone).
-    {
-        const float popW = std::max(240.0f * sc,
-                                    std::min(340.0f * sc, ImGui::GetWindowWidth() - 16.0f * sc));
-        ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
-        if (ImGui::BeginPopup("##cp_ai_popover")) {
-            drawAISettingsBody(st, busy);
-            ImGui::EndPopup();
-        }
+    if (settingsOpen) ImGui::PopStyleColor();
+    if (gearClicked) {
+        st.showAISettingsOverlay = !st.showAISettingsOverlay;
+        if (st.showAISettingsOverlay) st.showSessionsPicker = false;
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(settingsOpen ? "Back to the chat."
+                                       : "AI settings — provider, model, privacy.");
 
     ImGui::SameLine();
     centerY(lh);
@@ -1701,22 +1705,33 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     ensureConversations(st);
 
-    // New-session button spans the full tab width (T-G17 item 6). The Sessions<->Back toggle now
-    // lives in the header (drawCopilotHeader), so there is no separate "Back to chat" control here.
+    // New-session button spans the full tab width. Sessions <-> Chat toggle lives in the header.
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("+ New session", ImVec2(-1, 0))) { newConversation(st); st.prompt[0] = 0; }
+    if (ImGui::Button("+ New session", ImVec2(-1, 0))) {
+        newConversation(st);
+        st.prompt[0] = 0;
+        st.showAISettingsOverlay = false;
+    }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextWrapped("Switch sessions — running ones keep working in the background.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
 
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float pad = 8 * sc;
+    const float padX = 10.0f * sc;
+    const float padY = 8.0f * sc;
+    const float rowGap = 4.0f * sc;
+    const float fh = ImGui::GetFontSize();
+    const float titleH = fh;
+    const float subH  = fh * 0.92f;
+    const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
+    const float trashSz = ImGui::GetFrameHeight();
+
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
         std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
@@ -1727,52 +1742,71 @@ static void drawSessionsPanel(AppState& st, bool busy) {
         if (i == st.activeConv && aiTurnActive(st)) running = true;
         bool active = (i == st.activeConv);
 
+        char sub[96];
+        const int nMsg = (int)msgs.size();
+        if (nMsg == 0)
+            std::snprintf(sub, sizeof(sub), "Empty session");
+        else if (nMsg == 1)
+            std::snprintf(sub, sizeof(sub), "1 message");
+        else
+            std::snprintf(sub, sizeof(sub), "%d messages", nMsg);
+
         ImGui::PushID(i);
-        const float rowH    = ImGui::GetFrameHeight() + 6 * sc;   // roomy, touch-friendly row
-        const float trashSz = ImGui::GetFrameHeight();            // square trash box
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float  rowW   = ImGui::GetContentRegionAvail().x;
         const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
-        const float  midY   = rowMin.y + rowH * 0.5f;
-        const float  fh     = ImGui::GetFontSize();
 
-        // Whole-row click target (everything left of the trash) switches to that session.
-        bool picked = ImGui::InvisibleButton("##pickconv", ImVec2(rowW - trashSz - pad, rowH));
+        bool picked = ImGui::InvisibleButton("##pickconv",
+                                            ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
         bool rowHov = ImGui::IsItemHovered();
-        if (picked && !busy) switchConversation(st, i);
-
-        // Glass row pill — matches the FeatureManager rows: alternating stripe + a restrained accent
-        // card for the active session, a light wash on hover. Drawn behind the (later) text.
-        float wash = active ? 0.52f : (rowHov ? 0.44f : 0.32f);
-        ui::glassRowBackground(dl, rowMin, rowMax, 6.0f, (i % 2) == 1, active, wash);
-
-        // Title text, vertically centered in the row. Primary adaptive ink on every row so inactive
-        // sessions stay readable over the light glass (active is set apart by its accent card, not by
-        // dimming the text). Adaptive ink only — T-G14 owns the dark-mode color work.
-        ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-        dl->AddText(ImVec2(rowMin.x + pad, midY - fh * 0.5f), ink, title.c_str());
-        if (running) {
-            float tw = ImGui::CalcTextSize(title.c_str()).x;
-            ImVec4 rc = semanticOnGlass(ui::palette.accent, surf);
-            dl->AddText(ImVec2(rowMin.x + pad + tw + 8 * sc, midY - fh * 0.5f),
-                        ImGui::ColorConvertFloat4ToU32(rc), "\xe2\x80\xa2 running");
+        if (picked && !busy) {
+            switchConversation(st, i);
+            st.showAISettingsOverlay = false;
         }
 
-        // Trash button: right-anchored WITH an inset so it never clips the column edge, and
-        // vertically centered on the row (T-G17 item 4).
-        const float img  = trashSz - 8 * sc;
-        const float btnW = img + style.FramePadding.x * 2.0f;
-        const float btnH = img + style.FramePadding.y * 2.0f;
-        ImGui::SetCursorScreenPos(ImVec2(rowMax.x - btnW - 2 * sc, midY - btnH * 0.5f));
-        IconUV trash = ui::getIcon("delete", 20);
-        bool del = trash.valid
-            ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
-            : ImGui::SmallButton("x");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
-        bool doDel = del && !busy;
+        float wash = active ? 0.55f : (rowHov ? 0.42f : 0.28f);
+        ui::glassRowBackground(dl, rowMin, rowMax, 8.0f * sc, (i % 2) == 1, active, wash);
 
-        // Advance the ImGui cursor past the row (the buttons above left it mid-row).
-        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 3 * sc));
+        const float titleY = rowMin.y + padY;
+        ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+        dl->AddText(ImVec2(rowMin.x + padX, titleY), ink, title.c_str());
+        if (running) {
+            const float tw = ImGui::CalcTextSize(title.c_str()).x;
+            const char* badge = "running";
+            const ImVec2 bsz = ImGui::CalcTextSize(badge);
+            const float bx0 = rowMin.x + padX + tw + 8.0f * sc;
+            const float by0 = titleY + (titleH - bsz.y) * 0.5f - 1.0f * sc;
+            const float bx1 = bx0 + bsz.x + 8.0f * sc;
+            const float by1 = by0 + bsz.y + 2.0f * sc;
+            ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
+            acc.w = 0.22f;
+            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                              ImGui::ColorConvertFloat4ToU32(acc), 4.0f * sc);
+            ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
+            accInk.w = 1.0f;
+            dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
+                        ImGui::ColorConvertFloat4ToU32(accInk), badge);
+        }
+
+        dl->AddText(ImVec2(rowMin.x + padX, titleY + titleH + 2.0f * sc),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), sub);
+
+        bool doDel = false;
+        if (rowHov || active) {
+            const float img  = trashSz - 8.0f * sc;
+            const float btnW = img + style.FramePadding.x * 2.0f;
+            const float btnH = img + style.FramePadding.y * 2.0f;
+            ImGui::SetCursorScreenPos(
+                ImVec2(rowMax.x - btnW - 4.0f * sc, rowMin.y + (rowH - btnH) * 0.5f));
+            IconUV trash = ui::getIcon("delete", 20);
+            bool del = trash.valid
+                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
+                : ImGui::SmallButton("x");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
+            doDel = del && !busy;
+        }
+
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
         ImGui::PopID();
         if (doDel) { closeConversation(st, i); break; }
     }
@@ -2194,7 +2228,7 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
                              sizeof(s.model) - 1);
             s.vision = false;
         } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
-            // Default to Alibaba DashScope Qwen-Max; the preset dropdown can switch service+model.
+            // OpenRouter is the paid-model hub going forward — default the cloud slot to it.
             const auto& cp = ui::cloudPresets();
             if (!cp.empty()) {
                 std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
@@ -2209,16 +2243,18 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
 
     // ---- model ----
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
-        // Cloud OpenAI-compatible API: a preset bundles the service base URL + model id, plus a
-        // free-text model field. Credentials (base URL + key) are edited in the section below.
+        // Cloud OpenAI-compatible API: OpenRouter (paid-model hub) + Alibaba DashScope + DeepSeek.
+        // A preset bundles the service base URL + model id; credentials edited below.
         ImGui::TextUnformatted("Service / model preset");
-        dimText("Alibaba Cloud (DashScope) Qwen and the official DeepSeek API. These are CLOUD "
-                "providers — Offline (ITAR) mode refuses them; use the local presets for ITAR.");
+        dimText("OpenRouter (one key, many models — paid hub), Alibaba Cloud (DashScope) Qwen, "
+                "and the official DeepSeek API. CLOUD providers — Offline (ITAR) mode refuses them.");
         const auto& cps = ui::cloudPresets();
         std::vector<const char*> plabels;
-        plabels.push_back("(choose a preset…)");
+        plabels.push_back("(choose a preset\xe2\x80\xa6)");
         for (const auto& p : cps) plabels.push_back(p.label.c_str());
         int psel = 0;
+        for (int i = 0; i < (int)cps.size(); ++i)
+            if (s.model[0] && cps[i].id == s.model) { psel = i + 1; break; }
         ImGui::SetNextItemWidth(-1);
         if (ImGui::Combo("##cloudpreset", &psel, plabels.data(), (int)plabels.size()) &&
             psel > 0 && psel - 1 < (int)cps.size()) {
@@ -2379,10 +2415,13 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
         // Cloud OpenAI-compatible: needs BOTH an endpoint (set by the preset, editable) and a key.
-        ImGui::TextUnformatted("Endpoint (base URL)");
+        // OpenRouter is first-class — key status names the active service.
+        const char* svc = ui::cloudServiceKey(s.baseUrl);
+        const bool isOR = (std::strcmp(svc, "openrouter") == 0);
+        ImGui::TextUnformatted(isOR ? "OpenRouter endpoint" : "Endpoint (base URL)");
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudbase", s.baseUrl, sizeof(s.baseUrl))) changed = true;
-        ImGui::TextUnformatted("API key");
+        ImGui::TextUnformatted(isOR ? "OpenRouter API key" : "API key");
         char* key = providerKeyBuf(s, s.provider);
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
@@ -2390,8 +2429,12 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
         bool haveKey = key[0] != '\0';
         ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
                                                      : ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
-                                       : "no API key — add your DashScope / DeepSeek key");
+        if (isOR)
+            ImGui::TextUnformatted(haveKey ? "OpenRouter key set — models available (blocked in Offline mode)"
+                                           : "no OpenRouter key — add one at openrouter.ai/keys");
+        else
+            ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
+                                           : "no API key — add your OpenRouter / DashScope / DeepSeek key");
         ImGui::PopStyleColor();
     } else if (cloud) {
         ImGui::TextUnformatted("API key");
@@ -2573,41 +2616,267 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
     return changed;
 }
 
-// The AI settings popover body (opened from the composer's settings glyph): the shared
-// provider/model/reasoning picker plus the common run-behavior toggles. No outer child — the
-// popup window provides the frame.
+// Compact AI-settings OVERLAY body — fills the Copilot chat area when the header gear is
+// toggled (same in-column swap as Sessions). Provider + model on one row each, reasoning,
+// collapsible Advanced (tokens/window), API key + status, privacy, and footer actions.
 static void drawAISettingsBody(AppState& st, bool busy) {
-    Settings& settings = st.settings;
+    Settings& s = st.settings;
+    const float S = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    bool changed = false;
+    refreshModelAvailability(st, false);
 
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * S, 5.0f * S));
     ImGui::PushFont(st.fonts.medium);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     ImGui::TextUnformatted("AI Settings");
+    ImGui::PopStyleColor();
     ImGui::PopFont();
-    dimText("Provider, model, privacy, and run behavior.");
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextWrapped("Provider, model, and privacy. Full form lives in Settings.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 2.0f * S));
     ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 2.0f * S));
 
-    // Shared provider + availability-filtered model picker + reasoning effort (Settings modal
-    // uses the same widget, so the two never diverge). Persist on change — this popover has no
-    // Save button; run mode, units, and theme live in their canonical Settings-modal tabs
-    // (Agent / General / Appearance) instead of duplicating here with divergent persistence.
-    // slim=true: quick picker only. The full form (keys, endpoints, Manage models) lives in the
-    // Settings window's AI tab, reached by "All settings..." below — no full-page settings form
-    // renders inside the Copilot column anymore.
-    if (ui::drawProviderModelPicker(st, busy, /*slim=*/true)) saveSettings(settings);
+    ImGui::TextUnformatted("Provider");
+    ImGui::SetNextItemWidth(-1);
+    const char* provs[ui::PROV_COUNT];
+    for (int i = 0; i < ui::PROV_COUNT; ++i) provs[i] = ui::providerLabel(i);
+    int prevProvider = s.provider;
+    if (ImGui::Combo("##cp_provider", &s.provider, provs, ui::PROV_COUNT) &&
+        s.provider != prevProvider) {
+        changed = true;
+        if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
+                                              std::strstr(s.model, "claude")))
+            std::strncpy(s.model, "gemini-2.5-pro", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_ANTHROPIC)
+            std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_OPENAI)
+            std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_LOCAL) {
+            std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
+            if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
+                std::strstr(s.model, "claude"))
+                std::strncpy(s.model, "gemma-4-e4b", sizeof(s.model) - 1);
+            s.vision = true;
+        } else if (s.provider == ui::PROV_LLAMACPP) {
+            std::strncpy(s.baseUrl, "http://127.0.0.1:1234/v1", sizeof(s.baseUrl) - 1);
+            if (!std::strstr(s.model, ".gguf"))
+                std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf", sizeof(s.model) - 1);
+            s.vision = false;
+        } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
+            const auto& cp = ui::cloudPresets();
+            if (!cp.empty()) {
+                std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
+                std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+                s.vision = cp[0].vision;
+            }
+        }
+    }
 
-    ImGui::Separator();
+    const bool cloud = ui::providerIsCloud(s.provider);
+    if (s.provider == ui::PROV_CLOUDCOMPAT) {
+        ImGui::TextUnformatted("Model");
+        const auto& cps = ui::cloudPresets();
+        std::vector<const char*> plabels;
+        plabels.push_back("(choose a preset\xe2\x80\xa6)");
+        for (const auto& p : cps) plabels.push_back(p.label.c_str());
+        int psel = 0;
+        for (int i = 0; i < (int)cps.size(); ++i)
+            if (s.model[0] && cps[i].id == s.model) { psel = i + 1; break; }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##cp_cloudpreset", &psel, plabels.data(), (int)plabels.size()) &&
+            psel > 0 && psel - 1 < (int)cps.size()) {
+            const auto& p = cps[psel - 1];
+            std::strncpy(s.model, p.id.c_str(), sizeof(s.model) - 1);
+            std::strncpy(s.baseUrl, p.baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+            s.vision = p.vision;
+            changed = true;
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##cp_cloudmodel", "model id", s.model, sizeof(s.model)))
+            changed = true;
+    } else if (cloud) {
+        std::vector<const char*> ids, labels;
+        for (const auto& m : ui::builtinModels())
+            if (m.provider == s.provider) {
+                ids.push_back(m.id.c_str());
+                labels.push_back(m.label.c_str());
+            }
+        int cur = -1;
+        for (size_t i = 0; i < ids.size(); ++i)
+            if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+        std::string customLabel;
+        if (cur < 0) {
+            customLabel = std::string(s.model[0] ? s.model : "(choose a model)") + "  (custom)";
+            labels.push_back(customLabel.c_str());
+            cur = (int)labels.size() - 1;
+        }
+        ImGui::TextUnformatted("Model");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##cp_modelpick", &cur, labels.data(), (int)labels.size())) {
+            if (cur >= 0 && cur < (int)ids.size()) {
+                std::strncpy(s.model, ids[cur], sizeof(s.model) - 1);
+                changed = true;
+            }
+        }
+    } else {
+        ImGui::TextUnformatted(s.provider == ui::PROV_LLAMACPP ? "GGUF path" : "Model");
+        const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
+                                                          ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
+        if (s.provider != ui::PROV_LLAMACPP && pm.ok && !pm.models.empty()) {
+            std::vector<const char*> ids;
+            for (const auto& id : pm.models) ids.push_back(id.c_str());
+            int cur = -1;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+            std::string customLabel;
+            if (cur < 0) {
+                customLabel = std::string(s.model[0] ? s.model : "(select)") + "  (custom)";
+                ids.push_back(customLabel.c_str());
+                cur = (int)ids.size() - 1;
+            }
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##cp_localmodel", &cur, ids.data(), (int)ids.size())) {
+                if (cur >= 0 && (size_t)cur < pm.models.size()) {
+                    std::strncpy(s.model, pm.models[cur].c_str(), sizeof(s.model) - 1);
+                    changed = true;
+                }
+            }
+        } else {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##cp_localmodeltext", s.model, sizeof(s.model))) changed = true;
+        }
+    }
+
+    {
+        const char* effLabels[8] = {};
+        const char* effValues[8] = {};
+        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+        if (nEff > 0) {
+            ImGui::TextUnformatted("Reasoning effort");
+            int effIdx = 0;
+            for (int i = 0; i < nEff; ++i)
+                if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##cp_effort", &effIdx, effLabels, nEff)) {
+                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
+                changed = true;
+            }
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Advanced")) {
+        ImGui::SetNextItemWidth(-1);
+        int mt = s.maxTokens;
+        if (ImGui::InputInt("Max tokens##cp_mt", &mt, 1024, 4096)) {
+            if (mt < 0) mt = 0;
+            if (mt > 0 && mt < 512) mt = 512;
+            if (mt > 200000) mt = 200000;
+            s.maxTokens = mt;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Output token cap per model call. 0 = automatic.");
+        ImGui::SetNextItemWidth(-1);
+        int cw = s.contextWindow;
+        if (ImGui::InputInt("Context window##cp_cw", &cw, 1024, 8192)) {
+            if (cw < 0) cw = 0;
+            if (cw > 0 && cw < 2048) cw = 2048;
+            if (cw > 2000000) cw = 2000000;
+            s.contextWindow = cw;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Model's total token window. 0 = automatic.");
+        if (s.provider == ui::PROV_CLOUDCOMPAT || s.provider == ui::PROV_LOCAL ||
+            s.provider == ui::PROV_LLAMACPP) {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("Base URL##cp_base", s.baseUrl, sizeof(s.baseUrl))) {
+                changed = true;
+                if (s.provider != ui::PROV_CLOUDCOMPAT) refreshModelAvailability(st, true);
+            }
+        }
+    }
+
+    if (cloud || s.provider == ui::PROV_LOCAL) {
+        ImGui::Dummy(ImVec2(0, 2.0f * S));
+        ImGui::TextUnformatted(s.provider == ui::PROV_LOCAL ? "API key (optional)" : "API key");
+        char* key = providerKeyBuf(s, s.provider);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##cp_provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
+        bool haveKey = key[0] != '\0';
+        const char* statusMsg = nullptr;
+        ImU32 statusCol = ui::Palette::toU32(ui::palette.textDim);
+        if (s.provider == ui::PROV_CLOUDCOMPAT) {
+            const char* svc = ui::cloudServiceKey(s.baseUrl);
+            if (std::strcmp(svc, "openrouter") == 0) {
+                statusMsg = haveKey ? "OpenRouter key set"
+                                    : "no OpenRouter key — add one at openrouter.ai/keys";
+            } else {
+                statusMsg = haveKey ? "key set — cloud API available"
+                                    : "no API key — add your OpenRouter / DashScope / DeepSeek key";
+            }
+            statusCol = haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                : ui::Palette::toU32(ui::palette.statusWarn);
+        } else if (cloud) {
+            statusMsg = haveKey ? "key set — model available"
+                                : "no API key — add one to use this provider";
+            statusCol = haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                : ui::Palette::toU32(ui::palette.statusWarn);
+        } else {
+            const ProviderModels& pm = st.providerModels[ui::PROV_LOCAL];
+            if (!pm.checked) { statusMsg = "checking endpoint\xe2\x80\xa6"; }
+            else if (pm.ok) {
+                statusMsg = "endpoint reachable";
+                statusCol = ui::Palette::toU32(ui::palette.statusOk);
+            } else {
+                statusMsg = "endpoint unreachable";
+                statusCol = ui::Palette::toU32(ui::palette.statusErr);
+            }
+        }
+        if (statusMsg) {
+            ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
+            ImGui::TextWrapped("%s", statusMsg);
+            ImGui::PopStyleColor();
+        }
+    } else if (s.provider == ui::PROV_LLAMACPP) {
+        const ProviderModels& pm = st.providerModels[ui::PROV_LLAMACPP];
+        const char* msg; ImU32 col;
+        if (!pm.checked) { msg = "checking endpoint\xe2\x80\xa6"; col = ui::Palette::toU32(ui::palette.textDim); }
+        else if (pm.ok) { msg = "endpoint reachable"; col = ui::Palette::toU32(ui::palette.statusOk); }
+        else { msg = "endpoint unreachable"; col = ui::Palette::toU32(ui::palette.statusErr); }
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(msg);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy(ImVec2(0, 2.0f * S));
+    ImGui::SeparatorText("Privacy");
+    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Refuse cloud providers. Only a local loopback endpoint is allowed.");
     ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show the AI's reasoning steps inline (like Claude Code verbose mode).");
+        ImGui::SetTooltip("Show the AI's reasoning steps inline.");
 
-    if (ImGui::Button("All settings...", ImVec2(-1, 0))) {
+    if (changed) saveSettings(s);
+
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    if (ImGui::Button("All settings\xe2\x80\xa6", ImVec2(-1, 0))) {
         st.openSettings    = true;
-        st.openSettingsTab = 2;   // jump straight to the Settings modal's AI tab
-        ImGui::CloseCurrentPopup();
+        st.openSettingsTab = 2;
+        st.showAISettingsOverlay = false;
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Open the Settings modal AI tab (full form + leaderboard).");
     if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
         !st.setupRunning.load() && !st.job.running.load()) {
         st.startSetup(true);
     }
+    ImGui::PopStyleVar();
+    (void)busy;
 }
 
 // ============================ searchable model dropdown ============================
@@ -3264,7 +3533,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     // No backing strip here: the theme's glassBg wash didn't track the adaptive ink (dark text on
     // a dark strip over a light model — visual-review fix). The chips carry their own fills; the
     // pane's glass is the only background, so the adaptive text always reads.
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7 * sc, 2 * sc));
     // Translucent chips over the glass composer (opaque fills fought the adaptive text).
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
@@ -3346,7 +3615,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
 
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar();
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
 }
 
 // Toolbar row below the prompt: model picker + thinking effort + paperclip. The send/stop
@@ -3926,12 +4195,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::SetCursorPos(keep);
     }
 
-    // Any leftover focus-AI-settings request routes to the MAIN Settings window (AI tab) — the
-    // full-page inline settings view inside the column is gone; quick knobs live in the header
-    // gear's compact popover (drawAISettingsBody).
+    // focusSettingsTab opens the Settings modal AI tab (full form + leaderboard).
+    // The in-column gear uses showAISettingsOverlay instead.
     if (st.focusSettingsTab) {
-        st.openSettings    = true;
-        st.openSettingsTab = 2;
+        st.openSettings     = true;
+        st.openSettingsTab  = 2;
         st.focusSettingsTab = false;
     }
 
@@ -3956,9 +4224,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
         if (std::strcmp(cpView, "sessions") == 0) {
             st.showSessionsPicker = true;
+            st.showAISettingsOverlay = false;
+        } else if (std::strcmp(cpView, "settings") == 0) {
+            st.showAISettingsOverlay = true;
+            st.showSessionsPicker = false;
         }
-        // ("settings" no longer forces a view — the inline settings page was consolidated into
-        // the header gear's popover + the Settings modal's AI tab.)
     }
 
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
@@ -3973,37 +4243,40 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (s_cpAnim.bodyVisible()) {
         drawRuntimeBanner(st);
 
-        // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
+        // Settings / Sessions overlays replace the chat log (and hide the composer) while open.
+        const bool overlayOpen = st.showSessionsPicker || st.showAISettingsOverlay;
         static float s_composerH = 0.0f;
         const float bottomClearance = ui::metrics::U(5);
-        float reserve = (s_composerH > 0 ? s_composerH
-                                         : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
-                        ui::metrics::U(2) + bottomClearance;
+        float reserve = 0.0f;
+        if (!overlayOpen) {
+            reserve = (s_composerH > 0 ? s_composerH
+                                       : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
+                      ui::metrics::U(2) + bottomClearance;
+        } else {
+            reserve = bottomClearance;
+        }
         float chatH = ImGui::GetContentRegionAvail().y - reserve;
         if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
-        if (st.showSessionsPicker) {
+        if (st.showAISettingsOverlay) {
+            drawAISettingsBody(st, busy);
+        } else if (st.showSessionsPicker) {
             drawSessionsPanel(st, busy);
         } else {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
-            if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
                 ImGui::SetScrollHereY(1.0f);
         }
-        const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
+        const bool  logScrolled = !overlayOpen && ImGui::GetScrollY() > 0.5f;
         const ImVec2 logP0 = ImGui::GetWindowPos();
         const float  logVisW = ImGui::GetWindowSize().x;
         ImGui::EndChild();
 
-        // Top fade mask over the conversation scroll viewport: once the log is scrolled, the first
-        // visible line clips mid-glyph right under the header divider — wash those half glyphs out
-        // with a surface-tint gradient instead of showing them cut (visual-review fix). Drawn in its
-        // own input-transparent overlay CHILD submitted after the log, because the message cards are
-        // nested child windows that render after both the log's and this window's draw lists.
+        // Top fade mask over the conversation scroll viewport.
         if (logScrolled) {
             const ImVec2 keep = ImGui::GetCursorPos();
-            // One full text row tall, so a mid-glyph clipped line is washed out along its whole height.
             const float fadeH = ImGui::GetTextLineHeight() + ui::metrics::px(6.0f);
             ImGui::SetCursorScreenPos(logP0);
             ImGui::BeginChild("##chatlog_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
@@ -4021,13 +4294,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
         ImGui::PopStyleColor();
 
-        // ---- composer (measure its height for next frame's reserve) ----
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
-        ImGui::BeginGroup();
-        drawComposer(st, busy, canRun);
-        ImGui::EndGroup();
-        s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
-        ImGui::Dummy(ImVec2(0, bottomClearance));
+        // Composer is hidden under Sessions / Settings overlays (same pattern as before for
+        // sessions was "chat log only" — keep the composer under chat only).
+        if (!overlayOpen) {
+            ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+            ImGui::BeginGroup();
+            drawComposer(st, busy, canRun);
+            ImGui::EndGroup();
+            s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
+            ImGui::Dummy(ImVec2(0, bottomClearance));
+        } else {
+            ImGui::Dummy(ImVec2(0, bottomClearance));
+        }
     }  // s_cpAnim.bodyVisible()
 
     ImGui::End();

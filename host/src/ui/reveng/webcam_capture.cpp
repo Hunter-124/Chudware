@@ -1,10 +1,11 @@
 // webcam_capture.cpp — live webcam preview + coverage overlay + shutter (RE-19)
 // Draws a panel with:
-//   1. Live preview via a stub frame generator (no CameraBackend dependency — RE-07 owns
-//      that header; we generate a solid-colour test pattern headlessly so the widget works
-//      in AI_CAD_SHOT=reveng_capture without a real device).
+//   1. Live preview via CameraBackend (V4L2 on Linux, MF stub on Windows, synthetic
+//      stub as fallback when no device / open fails — keeps AI_CAD_SHOT=reveng_capture
+//      working headless).
 //   2. OpenScan-style 11-shot dome coverage ring (ImDrawList) — green=captured, amber=blurred.
-//   3. Shutter button: encodes frame as JPEG (stb_image_write), fires async reveng_add_images.
+//   3. Shutter button: encodes the latest frame as JPEG (stb_image_write), fires async
+//      reveng_add_images.
 //
 // GL-thread only.  NEVER call st.rpc.call synchronously in a draw path (known freeze bug).
 #include "webcam_capture.h"
@@ -15,6 +16,10 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
+#include <filesystem>
+#include <system_error>
+#include <cstdlib>
 
 #include "imgui.h"
 #include <glad/gl.h>
@@ -22,6 +27,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
+#include "platform/camera.h"
 
 // stb_image_write — implementation compiled in host/src/stb_impl.cpp; include header only.
 #include "stb_image_write.h"
@@ -45,11 +51,26 @@ static const ShotPos kShotPlan[11] = {
 };
 
 struct WebcamState {
-    // Stub frame texture
+    // Preview texture
     GLuint texId  = 0;
     int    texW   = 320;
     int    texH   = 240;
-    bool   texDirty = true;   // needs a fresh upload
+    int    allocW = 0;   // currently allocated GL texture size
+    int    allocH = 0;
+
+    // Latest RGBA frame (source of truth for preview + shutter)
+    std::vector<unsigned char> lastRgba;
+    bool   haveFrame = false;
+
+    // Camera backend
+    std::unique_ptr<aicad::platform::CameraBackend> cam;
+    std::vector<aicad::platform::CameraInfo> devices;
+    int    deviceIdx = -1;
+    bool   camOpened = false;
+    bool   usingStub = true;       // true when falling back to synthetic frames
+    bool   enumDone  = false;
+    std::string camStatus;         // human-readable device/open status
+    std::string camErr;            // sticky open/enum failure
 
     // Coverage tracking (which of the 11 shot positions have been captured)
     bool captured[11] = {};
@@ -57,21 +78,23 @@ struct WebcamState {
     int  captureCount = 0;
 
     // Async shutter state
-    bool   shuttingDown = false;
     bool   addPending   = false;
     std::string lastShotPath;
     std::string lastErr;
     std::string sessionId;
 
-    // Stub frame: hue cycles to show liveness
+    // Stub frame: hue cycles to show liveness when no real camera
     float hue = 0.0f;
+
+    // Throttle grab attempts a bit so a failing device doesn't spam open()
+    double lastGrabT = -100.0;
+    double lastOpenAttemptT = -100.0;
 };
 
 static WebcamState g_wcam;
 
 // ---------------------------------------------------------------------------
-// Stub frame generator — produces a solid colour RGBA frame cycling through hue.
-// When a real CameraBackend is available (RE-07) this would call grabFrame() instead.
+// Stub frame generator — used when no CameraBackend device is available.
 // ---------------------------------------------------------------------------
 
 static void buildStubFrameRGBA(std::vector<unsigned char>& px, int w, int h, float hue) {
@@ -109,16 +132,16 @@ static void buildStubFrameRGBA(std::vector<unsigned char>& px, int w, int h, flo
     }
 }
 
-// Upload/update the stub preview texture.
-static void updateStubTex() {
+// Upload/update the preview texture from `px` (RGBA8, w×h).
+static void uploadPreviewTex(const unsigned char* px, int w, int h) {
+    if (!px || w <= 0 || h <= 0) return;
     WebcamState& ws = g_wcam;
-    std::vector<unsigned char> px;
-    buildStubFrameRGBA(px, ws.texW, ws.texH, ws.hue);
-
     if (!ws.texId) {
         GLuint id = 0;
         glGenTextures(1, &id);
         ws.texId = id;
+        ws.allocW = 0;
+        ws.allocH = 0;
     }
     glBindTexture(GL_TEXTURE_2D, ws.texId);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -126,9 +149,121 @@ static void updateStubTex() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ws.texW, ws.texH, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    if (w != ws.allocW || h != ws.allocH) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, px);
+        ws.allocW = w;
+        ws.allocH = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                        GL_RGBA, GL_UNSIGNED_BYTE, px);
+    }
+    ws.texW = w;
+    ws.texH = h;
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// Ensure the CameraBackend exists and (when possible) a device is open.
+// Falls back to the synthetic stub when enumeration/open fails — never silent.
+static void ensureCamera() {
+    WebcamState& ws = g_wcam;
+    if (!ws.cam) {
+        ws.cam = aicad::platform::CameraBackend::create();
+        ws.enumDone = false;
+        ws.camOpened = false;
+        ws.usingStub = true;
+    }
+    if (!ws.enumDone) {
+        ws.enumDone = true;
+        ws.devices = ws.cam->listDevices();
+        if (ws.devices.empty()) {
+            ws.camErr = "No camera devices found — showing test pattern.";
+            ws.camStatus = "stub (no devices)";
+            ws.usingStub = true;
+            // Try opening a well-known stub id so grabFrame works on pure stub backends.
+            if (ws.cam->open("stub:0")) {
+                ws.camOpened = true;
+                ws.deviceIdx = -1;
+            }
+            return;
+        }
+        // Prefer first real device.
+        ws.deviceIdx = 0;
+        ws.camErr.clear();
+    }
+    if (!ws.camOpened && ws.deviceIdx >= 0 &&
+        ws.deviceIdx < (int)ws.devices.size()) {
+        const double now = ImGui::GetTime();
+        // Throttle re-open attempts (~1 Hz) after a failure.
+        if (now - ws.lastOpenAttemptT < 1.0) return;
+        ws.lastOpenAttemptT = now;
+        const auto& dev = ws.devices[(size_t)ws.deviceIdx];
+        if (ws.cam->open(dev.device_id)) {
+            ws.camOpened = true;
+            ws.usingStub = false;
+            ws.camErr.clear();
+            ws.camStatus = dev.label.empty() ? dev.device_id
+                                             : (dev.label + " (" + dev.device_id + ")");
+        } else {
+            ws.camOpened = false;
+            ws.usingStub = true;
+            ws.camErr = "Failed to open " +
+                        (dev.label.empty() ? dev.device_id : dev.label) +
+                        " (" + dev.device_id + ") — showing test pattern.";
+            ws.camStatus = "stub (open failed)";
+            // Fall back to stub open so grabFrame still yields a frame when the
+            // backend is the pure stub; V4L2 open failure leaves fd closed.
+            if (ws.cam->open("stub:0")) {
+                ws.camOpened = true;
+            }
+        }
+    }
+}
+
+// Pull a fresh frame into lastRgba (real camera or stub) and upload the texture.
+static void updatePreviewFrame() {
+    WebcamState& ws = g_wcam;
+    ensureCamera();
+
+    const double now = ImGui::GetTime();
+    // Cap grab rate ~30 Hz so a slow V4L2 read doesn't stall the UI.
+    if (now - ws.lastGrabT < (1.0 / 30.0) && ws.haveFrame) {
+        return;
+    }
+    ws.lastGrabT = now;
+
+    aicad::platform::CameraFrame frame;
+    bool got = false;
+    if (ws.camOpened && ws.cam) {
+        got = ws.cam->grabFrame(frame);
+    }
+
+    if (got && frame.width > 0 && frame.height > 0 &&
+        (int)frame.rgba.size() >= frame.width * frame.height * 4) {
+        const int fw = frame.width;
+        const int fh = frame.height;
+        ws.lastRgba = std::move(frame.rgba);
+        // If grab succeeded after a real open, clear the open-error banner.
+        if (!ws.usingStub) ws.camErr.clear();
+        uploadPreviewTex(ws.lastRgba.data(), fw, fh);
+        ws.haveFrame = true;
+        return;
+    }
+
+    // Fallback: synthetic animated test pattern (also used when grabFrame fails
+    // mid-stream, e.g. device unplugged).
+    ws.usingStub = true;
+    if (ws.camOpened && !ws.devices.empty() && ws.camErr.empty()) {
+        ws.camErr = "Camera grab failed — showing test pattern.";
+    }
+    ws.hue += 0.0014f;
+    if (ws.hue > 1.0f) ws.hue -= 1.0f;
+    // Keep a stable stub resolution.
+    const int sw = ws.texW > 0 ? ws.texW : 320;
+    const int sh = ws.texH > 0 ? ws.texH : 240;
+    buildStubFrameRGBA(ws.lastRgba, sw, sh, ws.hue);
+    uploadPreviewTex(ws.lastRgba.data(), sw, sh);
+    ws.haveFrame = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +314,42 @@ static void drawCoverageRing(ImDrawList* dl, ImVec2 centre, float radius,
 }
 
 // ---------------------------------------------------------------------------
+// Session directory helper
+// ---------------------------------------------------------------------------
+
+static std::string defaultSessionDir(const std::string& session_id) {
+    // Mirror services/mcp/reveng_tools._reveng_dir default so JPEGs land next to
+    // the session the worker knows about.
+    const char* override = std::getenv("AICAD_REVENG_DIR");
+    std::string root;
+    if (override && override[0]) {
+        root = override;
+    } else {
+        const char* xdg = std::getenv("XDG_DATA_HOME");
+        if (xdg && xdg[0]) {
+            root = std::string(xdg) + "/AI-CAD/reveng";
+        } else {
+            const char* home = std::getenv("HOME");
+            root = (home && home[0] ? std::string(home) : std::string(".")) +
+                   "/.local/share/AI-CAD/reveng";
+        }
+    }
+    if (!session_id.empty()) {
+        if (!root.empty() && root.back() != '/') root += '/';
+        root += session_id;
+        root += "/images";
+    }
+    return root;
+}
+
+// Best-effort mkdir -p for the images directory.
+static void ensureDir(const std::string& dir) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
+}
+
+// ---------------------------------------------------------------------------
 // JPEG encode + async RPC
 // ---------------------------------------------------------------------------
 
@@ -188,25 +359,36 @@ static void shutterFire(AppState& st,
     WebcamState& ws = g_wcam;
     if (ws.addPending) return;  // already in-flight
 
-    // Build a stub RGBA frame (same as the preview)
-    std::vector<unsigned char> px;
-    buildStubFrameRGBA(px, ws.texW, ws.texH, ws.hue);
+    // Prefer the live frame; rebuild stub if somehow empty.
+    if (!ws.haveFrame || ws.lastRgba.empty()) {
+        buildStubFrameRGBA(ws.lastRgba, ws.texW > 0 ? ws.texW : 320,
+                           ws.texH > 0 ? ws.texH : 240, ws.hue);
+        ws.haveFrame = true;
+    }
+    const int w = ws.texW > 0 ? ws.texW : 320;
+    const int h = ws.texH > 0 ? ws.texH : 240;
+    if ((int)ws.lastRgba.size() < w * h * 4) {
+        ws.lastErr = "No frame available to capture";
+        return;
+    }
 
     // Determine next shot index & path
     char fname[64];
     std::snprintf(fname, sizeof(fname), "webcam_%03d.jpg", ws.captureCount);
-    std::string path = session_dir.empty() ? std::string(".") : session_dir;
-    if (path.back() != '/') path += '/';
+    std::string dir = session_dir.empty() ? defaultSessionDir(session_id) : session_dir;
+    ensureDir(dir);
+    std::string path = dir;
+    if (!path.empty() && path.back() != '/') path += '/';
     path += fname;
 
     // Encode JPEG via stb_image_write (component order RGB — drop alpha)
-    std::vector<unsigned char> rgb((size_t)ws.texW * ws.texH * 3);
-    for (int i = 0; i < ws.texW * ws.texH; ++i) {
-        rgb[(size_t)i*3+0] = px[(size_t)i*4+0];
-        rgb[(size_t)i*3+1] = px[(size_t)i*4+1];
-        rgb[(size_t)i*3+2] = px[(size_t)i*4+2];
+    std::vector<unsigned char> rgb((size_t)w * h * 3);
+    for (int i = 0; i < w * h; ++i) {
+        rgb[(size_t)i*3+0] = ws.lastRgba[(size_t)i*4+0];
+        rgb[(size_t)i*3+1] = ws.lastRgba[(size_t)i*4+1];
+        rgb[(size_t)i*3+2] = ws.lastRgba[(size_t)i*4+2];
     }
-    const int ok = stbi_write_jpg(path.c_str(), ws.texW, ws.texH, 3, rgb.data(), 85);
+    const int ok = stbi_write_jpg(path.c_str(), w, h, 3, rgb.data(), 85);
     if (!ok) {
         ws.lastErr = "JPEG write failed: " + path;
         return;
@@ -230,6 +412,8 @@ static void shutterFire(AppState& st,
         ws2.addPending = false;
         if (!r.ok) {
             ws2.lastErr = r.err.empty() ? "reveng_add_images failed" : r.err;
+        } else if (r.result.is_object() && !r.result.value("ok", true)) {
+            ws2.lastErr = r.result.value("reason", std::string("reveng_add_images failed"));
         }
     });
 }
@@ -246,16 +430,62 @@ void drawWebcamCapture(AppState& st,
     WebcamState& ws = g_wcam;
     const float sc = ui::uiScale;
 
-    // Advance stub frame hue for liveness (~0.5 deg / frame)
-    ws.hue += 0.0014f;
-    if (ws.hue > 1.0f) ws.hue -= 1.0f;
-    updateStubTex();
+    updatePreviewFrame();
+
+    // Device / status line
+    if (!ws.camStatus.empty()) {
+        ImGui::TextDisabled("Camera: %s", ws.camStatus.c_str());
+    }
+    if (!ws.camErr.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.2f, 1.0f));
+        ImGui::TextWrapped("%s", ws.camErr.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // Device picker when multiple devices are available
+    if (ws.devices.size() > 1) {
+        ImGui::SetNextItemWidth(220.0f * sc);
+        const char* preview =
+            (ws.deviceIdx >= 0 && ws.deviceIdx < (int)ws.devices.size())
+                ? (ws.devices[(size_t)ws.deviceIdx].label.empty()
+                       ? ws.devices[(size_t)ws.deviceIdx].device_id.c_str()
+                       : ws.devices[(size_t)ws.deviceIdx].label.c_str())
+                : "(select camera)";
+        if (ImGui::BeginCombo("##cam_dev", preview)) {
+            for (int i = 0; i < (int)ws.devices.size(); ++i) {
+                const bool sel = (i == ws.deviceIdx);
+                const std::string& lab = ws.devices[(size_t)i].label.empty()
+                    ? ws.devices[(size_t)i].device_id
+                    : ws.devices[(size_t)i].label;
+                if (ImGui::Selectable(lab.c_str(), sel)) {
+                    if (i != ws.deviceIdx) {
+                        if (ws.cam) ws.cam->close();
+                        ws.camOpened = false;
+                        ws.deviceIdx = i;
+                        ws.camErr.clear();
+                        ws.lastOpenAttemptT = -100.0;  // allow immediate reopen
+                    }
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rescan##cam")) {
+            if (ws.cam) ws.cam->close();
+            ws.camOpened = false;
+            ws.enumDone = false;
+            ws.devices.clear();
+            ws.camErr.clear();
+            ws.lastOpenAttemptT = -100.0;
+        }
+    }
 
     // ---- layout: preview left, coverage ring right ----
     const float avW  = ImGui::GetContentRegionAvail().x;
     const float avH  = ImGui::GetContentRegionAvail().y;
     const float prevW = std::min(avW * 0.55f, 360.0f * sc);
-    const float prevH = prevW * (float)ws.texH / (float)ws.texW;
+    const float prevH = prevW * (float)ws.texH / (float)std::max(ws.texW, 1);
     const float ringDiam = std::min(avW - prevW - 24.0f * sc, avH - 80.0f * sc);
     const float ringR    = (ringDiam * 0.5f) * 0.85f;
 
@@ -269,7 +499,7 @@ void drawWebcamCapture(AppState& st,
     // Shutter button below preview
     ImGui::Spacing();
     {
-        const bool canShoot = !session_id.empty() && !ws.addPending;
+        const bool canShoot = !session_id.empty() && !ws.addPending && ws.haveFrame;
         if (!canShoot) ImGui::BeginDisabled();
         if (ImGui::Button("  Capture  ", ImVec2(prevW, 28.0f * sc))) {
             shutterFire(st, session_id, session_dir);
@@ -315,6 +545,10 @@ void drawWebcamCapture(AppState& st,
 }
 
 void webcamCaptureShutdown() {
+    if (g_wcam.cam) {
+        g_wcam.cam->close();
+        g_wcam.cam.reset();
+    }
     if (g_wcam.texId) {
         glDeleteTextures(1, &g_wcam.texId);
         g_wcam.texId = 0;

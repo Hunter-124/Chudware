@@ -1356,7 +1356,12 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
     // world-per-pixel at the face depth: project a point one mm along the normal and measure the
     // screen displacement. (Robust to perspective: uses the centroid's actual depth, not the orbit
     // target plane.) Use a 1mm probe; if the normal is near edge-on the screen vector is tiny, so
-    // fall back to the camera-plane scale used by pan/zoom.
+    // fall back to the camera-plane scale published by Renderer::worldPerPixel().
+    //
+    // INVARIANT (extrude-arrow sign): tipPos/tipNeg are the endpoints actually drawn, and nsx/nsy
+    // is always (tipPos - centroid) normalized — the same screen direction the arrow is rasterized
+    // along. Drag projects the cursor delta onto THAT, so the handle always moves with the cursor
+    // (no separate probe-normal projection for the delta path that can invert vs the drawn arrow).
     float Cp[3] = {cx + nx, cy + ny, cz + nz};
     ImVec2 cpSp;
     bool gotProbe = ppProject(renderer, vr0, vr1, vw, vh, Cp, cpSp);
@@ -1368,22 +1373,12 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
         nsx = sdx / slen; nsy = sdy / slen;
         worldPerPx = 1.0f / slen;   // 1mm spans `slen` px => mm-per-px = 1/slen
     } else {
-        // Face is nearly edge-on: derive a screen direction from the camera basis projection of the
-        // normal and fall back to the orbit-plane world-per-px (matches pan/zoom conversion).
-        const float deg = 3.14159265f / 180.0f;
-        const float fov = Renderer::kFovDeg * deg;
-        float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-        float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-        worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
-        // screen-space normal direction from the camera right/up basis.
-        float yr = st.yaw * deg, pr = st.pitch * deg;
-        Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-        Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
-        Vec3 V = normalize(vdir);
-        Vec3 R = normalize(cross(worldUp, V));
-        Vec3 U = normalize(cross(V, R));
+        // Face is nearly edge-on: fall back to the published camera basis + worldPerPixel seam
+        // (matches pan/zoom conversion in both ortho and perspective).
+        worldPerPx = renderer.worldPerPixel(vh);
+        const auto& cam = renderer.camera();
         Vec3 N(nx, ny, nz);
-        float rN = dot(R, N), uN = dot(U, N);
+        float rN = dot(cam.right, N), uN = dot(cam.up, N);
         float l2 = std::sqrt(rN*rN + uN*uN);
         if (l2 < 1e-4f) return false;  // truly edge-on AND parallel to view: no usable handle
         // screen x is +R, screen y is -U (y down).
@@ -1393,6 +1388,12 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
     float armLenPx = 46.0f * ui::uiScale;  // arrow length in screen px
     tipPos = ImVec2(centroidSp.x + nsx * armLenPx, centroidSp.y + nsy * armLenPx);
     tipNeg = ImVec2(centroidSp.x - nsx * armLenPx, centroidSp.y - nsy * armLenPx);
+    // Re-derive unit screen dir from the drawn endpoints (single source of truth for drag sign).
+    {
+        float tdx = tipPos.x - centroidSp.x, tdy = tipPos.y - centroidSp.y;
+        float tlen = std::sqrt(tdx * tdx + tdy * tdy);
+        if (tlen > 1e-3f) { nsx = tdx / tlen; nsy = tdy / tlen; }
+    }
     bodyId = h.body_id; topoId = h.topo_id;
     return true;
 }
@@ -1670,13 +1671,9 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
             dsx = sdx / slen; dsy = sdy / slen;
             worldPerPx = 1.0f / slen;       // 1mm spans `slen` px
         } else {
-            // Direction is nearly edge-on to the screen: fall back to the orbit-plane scale and a
-            // screen-horizontal handle so the dim is still grabbable (rare; degenerate camera).
-            const float deg = 3.14159265f / 180.0f;
-            const float fov = Renderer::kFovDeg * deg;
-            float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-            float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-            worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+            // Direction is nearly edge-on to the screen: fall back to the published camera-plane
+            // scale and a screen-horizontal handle so the dim is still grabbable (rare; degenerate).
+            worldPerPx = renderer.worldPerPixel(vh);
             dsx = 1.0f; dsy = 0.0f;
         }
         degPerPx = 0.0f;
@@ -1684,6 +1681,12 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
     float armLenPx = 42.0f * ui::uiScale;
     tipPos = ImVec2(anchorSp.x + dsx * armLenPx, anchorSp.y + dsy * armLenPx);
     tipNeg = ImVec2(anchorSp.x - dsx * armLenPx, anchorSp.y - dsy * armLenPx);
+    // Unit drag dir from the drawn endpoints (single source of truth for sign).
+    {
+        float tdx = tipPos.x - anchorSp.x, tdy = tipPos.y - anchorSp.y;
+        float tlen = std::sqrt(tdx * tdx + tdy * tdy);
+        if (tlen > 1e-3f) { dsx = tdx / tlen; dsy = tdy / tlen; }
+    }
     return true;
 }
 
@@ -2093,6 +2096,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 renderer.setLensShiftX(0.0f);
             }
         }
+        // Projection mode: live AppState mirror (persisted via Settings::orthographic).
+        renderer.setOrthographic(st.orthographic);
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
@@ -2256,27 +2261,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
         // in-flight tween so the user takes over instantly.
         if (imgHovered && !inSketch && !inSketch3d) {
-            // Pixels -> world units at the orbit target plane (matches drawCurrent's FOV/dist):
-            //   dist = R / sin(fov/2) * 1.05 / zoom;  worldPerPx = 2*dist*tan(fov/2) / viewportH.
-            const float deg = 3.14159265f / 180.0f;
-            const float fov = Renderer::kFovDeg * deg;
-            float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-            // effectiveSceneRadius (not modelRadius): on an empty part radius_==0 would make
-            // worldPerPx 0, so middle-drag pan moved nothing until the first body existed.
-            float dist = renderer.effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-            float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
-
-            // Camera basis for screen-space pan: right (R) and up (U) in world space. Mirrors
-            // drawCurrent: dir = view direction (target->eye), up = +Z (or +Y near a pole).
-            float yr = st.yaw * deg, pr = st.pitch * deg;
-            Vec3 dir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-            // Continuous turntable up (matches Renderer's camera up): well-defined past the poles
-            // so pan / zoom-to-cursor stay correct when the free orbit has rolled over the top.
-            Vec3 worldUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
-                                           std::sin(pr) * std::cos(yr), std::cos(pr)));
-            Vec3 V = normalize(dir);
-            Vec3 R = normalize(cross(worldUp, V));   // screen-right in world space
-            Vec3 U = normalize(cross(V, R));         // screen-up in world space
+            // Pixels -> world units at the orbit target plane via the published camera seam
+            // (Renderer::worldPerPixel / viewHalfHeight). Works for both ortho and perspective.
+            float worldPerPx = renderer.worldPerPixel(vh);
+            const auto& cam = renderer.camera();
+            Vec3 R = cam.right;   // screen-right in world space
+            Vec3 U = cam.up;     // screen-up in world space
 
             // Lenient pan clamp (see kClampPan/kPanLeniency). pan is the world-space offset of the
             // look-at target from the model center, so |pan| is exactly how far the model center
@@ -2286,10 +2276,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (!kClampPan) return;
                 const float sceneR = renderer.modelRadius();
                 if (sceneR <= 1e-5f) return;
-                // Recompute from the LIVE zoom (the wheel handler mutates st.zoom after `dist` above).
+                // Live half-height scales with 1/zoom; recompute from current zoom so wheel-zoom
+                // then pan still clamps correctly (cam_.halfHeight is from the last drawn frame).
                 float zl = st.zoom < 0.05f ? 0.05f : st.zoom;
-                float distL = sceneR / std::sin(fov * 0.5f) * 1.05f / zl;
-                const float viewHalf = distL * std::tan(fov * 0.5f);  // world half-height at target
+                float zDrawn = cam.zoom > 1e-5f ? cam.zoom : 1.0f;
+                const float viewHalf = cam.halfHeight * (zDrawn / zl);
                 const float maxPan   = viewHalf + sceneR * kPanLeniency;
                 float pl = std::sqrt(st.pan[0]*st.pan[0] + st.pan[1]*st.pan[1] + st.pan[2]*st.pan[2]);
                 if (pl > maxPan && pl > 1e-6f) {
@@ -2526,12 +2517,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
                 // Drag: convert cursor motion to a cumulative signed distance and queue a sample
                 // (T-PERF2 latest-wins async; ~0.05mm throttle so steady holds don't spam).
+                // Screen direction is re-derived every frame from the drawn arrow endpoints
+                // (tipPos - centroid) so the handle always moves WITH the cursor — single source
+                // of truth for sign (no separate probe-normal projection that can invert).
                 if (s_pp.active && !s_pp.finishing && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Crosshair);
                     cancelCameraAnimation();
+                    ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
+                    if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
+                                         nsx, nsy, wpp, bId, tId)) {
+                        s_pp.nsx = nsx; s_pp.nsy = nsy;
+                        s_pp.worldPerPx = wpp;
+                    }
                     float dx = io.MousePos.x - s_pp.pressPos.x;
                     float dy = io.MousePos.y - s_pp.pressPos.y;
-                    float px = dx * s_pp.nsx + dy * s_pp.nsy;   // signed px along the normal axis
+                    float px = dx * s_pp.nsx + dy * s_pp.nsy;   // signed px along the drawn arrow
                     double cumulative = (double)px * (double)s_pp.worldPerPx;
                     s_pp.curDist = cumulative;
                     if (std::fabs(cumulative - s_pp.lastApplied) >= 0.05)
@@ -2601,9 +2601,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
 
                 // Drag: convert cursor motion to an absolute value and push it into the PM field.
+                // Length dims re-derive (dsx,dsy,worldPerPx) from the drawn arrow endpoints each
+                // frame so the handle moves with the cursor (same invariant as push-pull).
                 if (s_dim.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Crosshair);
                     cancelCameraAnimation();
+                    if (!s_dim.angle) {
+                        auto cands = dimCandidates(st, s_dim.featureId);
+                        for (const auto& c : cands) {
+                            if (c.param != s_dim.param) continue;
+                            ImVec2 aSp, tipP, tipN; float dsx, dsy, wpp, dpp;
+                            if (dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP,
+                                                   tipN, dsx, dsy, wpp, dpp)) {
+                                // Unit dir from drawn endpoints (tipP - anchor).
+                                float tdx = tipP.x - aSp.x, tdy = tipP.y - aSp.y;
+                                float tlen = std::sqrt(tdx * tdx + tdy * tdy);
+                                if (tlen > 1e-3f) {
+                                    s_dim.dsx = tdx / tlen; s_dim.dsy = tdy / tlen;
+                                    s_dim.worldPerPx = wpp;
+                                }
+                            }
+                            break;
+                        }
+                    }
                     float dx = io.MousePos.x - s_dim.pressPos.x;
                     float dy = io.MousePos.y - s_dim.pressPos.y;
                     float px = dx * s_dim.dsx + dy * s_dim.dsy;   // signed px along the handle axis
@@ -2697,7 +2717,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // cursor stays put. Cursor offset from viewport center, in pixels.
             if (io.MouseWheel != 0) {
                 cancelCameraAnimation();
-                float oldZoom = zc;
+                float oldZoom = st.zoom < 0.05f ? 0.05f : st.zoom;
                 st.zoom *= (1.0f + io.MouseWheel * 0.1f);
                 st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
                 float newZoom = st.zoom;
@@ -2707,6 +2727,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     // worldPerPx is inversely proportional to zoom; the target must move so the
                     // cursor ray hits the same world point. delta = cursorOffset * (1/old - 1/new)
                     // in world units, projected onto the camera plane (R right, U up; y is down).
+                    // Recompute scale at the OLD zoom (worldPerPx above is from last drawn frame).
                     float k = worldPerPx * (1.0f - oldZoom / newZoom);
                     st.pan[0] += ( R.x * cxp - U.x * cyp) * k;
                     st.pan[1] += ( R.y * cxp - U.y * cyp) * k;
@@ -2731,20 +2752,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (ctrl) {
-                    // World-space pan (mirrors the !inSketch applyPan basis math).
-                    const float deg = 3.14159265f / 180.0f;
-                    const float fov = Renderer::kFovDeg * deg;
-                    float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-                    // effectiveSceneRadius: empty-sketch (no body yet) pan would otherwise be 0.
-                    float dist = renderer.effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-                    float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
-                    float yr = st.yaw * deg, pr = st.pitch * deg;
-                    Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-                    Vec3 worldUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
-                                                   std::sin(pr) * std::cos(yr), std::cos(pr)));
-                    Vec3 V = normalize(vdir);
-                    Vec3 R = normalize(cross(worldUp, V));
-                    Vec3 U = normalize(cross(V, R));
+                    // World-space pan via the published camera seam (ortho + perspective).
+                    float worldPerPx = renderer.worldPerPixel(vh);
+                    const auto& cam = renderer.camera();
+                    Vec3 R = cam.right;
+                    Vec3 U = cam.up;
                     st.pan[0] += (-R.x * io.MouseDelta.x + U.x * io.MouseDelta.y) * worldPerPx;
                     st.pan[1] += (-R.y * io.MouseDelta.x + U.y * io.MouseDelta.y) * worldPerPx;
                     st.pan[2] += (-R.z * io.MouseDelta.x + U.z * io.MouseDelta.y) * worldPerPx;

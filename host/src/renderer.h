@@ -79,15 +79,42 @@ public:
     // The camera transform for the most recently rendered orbit/view, exposed so the ID-buffer
     // pass (render/id_pass) and the hover/selection overlays (render/overlays) can draw the same
     // geometry in pixel-exact alignment with the studio shaded pass. (C15 picking integration.)
+    // Also the single camera/projection seam: every screen<->world helper (pan, push-pull scale,
+    // sketch auto-pan, etc.) MUST go through these published fields instead of hardcoding FOV.
     struct CameraXform {
         Mat4 mvp;          // model->clip used by the last drawCurrent()
+        Mat4 proj;         // projection alone (perspective or ortho, with lens shift baked in)
+        Mat4 view;         // lookAt view matrix
         Vec3 eye;          // world-space camera position
-        Vec3 center;       // model bounding-sphere center
-        float radius = 1.0f;
+        Vec3 center;       // orbit look-at target (bbox center + pan, or sketch override)
+        Vec3 dir;          // unit target->eye (camera forward from the model)
+        Vec3 right;        // unit screen-right in world space
+        Vec3 up;           // unit screen-up in world space
+        float radius = 1.0f;     // scene radius used for framing
+        float dist = 1.0f;       // |eye - center| (orbit radius)
+        float halfHeight = 1.0f; // world half-height of the view volume at the orbit target
+                                 // (perspective: dist*tan(fov/2); ortho: sceneR*1.05/zoom)
+        float zoom = 1.0f;
+        bool  orthographic = true;  // projection mode of this frame
         int ssWidth = 0, ssHeight = 0;  // supersampled framebuffer size (matches colorTexture)
+        // Viewport pixel size used when the frame was drawn (final, not supersampled).
+        int vpWidth = 0, vpHeight = 0;
     };
     const CameraXform& camera() const { return cam_; }
     int supersample() const { return SS; }
+
+    // World units per screen pixel at the orbit-target plane for the CURRENT camera framing.
+    // Uses the published halfHeight / viewport height so pan, push-pull fallbacks, and sketch
+    // auto-pan all share one formula across perspective and orthographic modes.
+    // Pass the FINAL (non-supersampled) viewport height in pixels; falls back to cam_.vpHeight.
+    float worldPerPixel(int viewportHeightPx = 0) const {
+        int vh = viewportHeightPx > 0 ? viewportHeightPx
+                                     : (cam_.vpHeight > 0 ? cam_.vpHeight : h_);
+        if (vh < 1) vh = 1;
+        return 2.0f * cam_.halfHeight / (float)vh;
+    }
+    // World half-height of the view volume at the orbit target (matches drawCurrent framing).
+    float viewHalfHeight() const { return cam_.halfHeight; }
 
     // Bind the studio color framebuffer + supersampled viewport so the C15 overlays can draw
     // highlights on top of the shaded model (call right after renderOrbit, then endOverlay()).
@@ -155,7 +182,7 @@ public:
     void renderOrbit(float yawDeg, float pitchDeg, float zoom, const float pan[3]);
 
     // W2-D: bounding radius of the loaded model (1 if none). The viewport input code uses it to
-    // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent's FOV/dist).
+    // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent framing).
     float modelRadius() const { return radius_; }
     // Effective scene radius for camera math: the real bbox radius, or — when the part is empty
     // (no bodies, radius_==0) — the same fallback the camera uses to frame an empty scene. Pan/zoom
@@ -163,8 +190,15 @@ public:
     // (worldPerPx == 0) and the view never moves until the first body exists.
     float effectiveSceneRadius() const { return radius_ > 0.0f ? radius_ : kEmptySceneRadius; }
     Vec3 modelCenter() const { return center_; }
-    static constexpr float kFovDeg = 35.0f;  // shared with drawCurrent's projection
+    // Perspective vertical FOV (degrees). Only used when orthographic() is false; kept so
+    // external math that still needs the historical framing constant can share one source.
+    static constexpr float kFovDeg = 35.0f;
     static constexpr float kEmptySceneRadius = 35.0f;  // scene radius used to frame an empty part
+
+    // Projection mode: orthographic is the default (CAD-standard parallel projection). Perspective
+    // remains available as a toggle (View Selector / heads-up). Applied by drawCurrent + thumbnail.
+    void setOrthographic(bool on) { orthographic_ = on; }
+    bool orthographic() const { return orthographic_; }
 
     // ---- reference planes (Front=XY, Top=XZ, Right=YZ) ----
     // Translucent datum planes drawn over the model. `show[3]` toggles each; `emphasized` (0..2,
@@ -469,7 +503,8 @@ private:
     Mat4  ghostXform_;   // extra model xform for the ghost pass only (identity = no shift); see setGhostTransform
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
-    float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift baked into proj.m[8] (see setLensShiftX)
+    float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift (proj.m[8] / ortho offset)
+    bool orthographic_ = true; // default: orthographic projection (CAD parallel view)
     float radius_ = 1.0f;
     CameraXform cam_;  // updated each drawCurrent()
 

@@ -75,28 +75,33 @@ const ViewAngle kPopup[7] = {
 
 // Layout of the top-center orientation popup. Deterministic from the viewport rect + uiScale, so
 // update() (dismiss-click guard) and draw() (button placement) agree without sharing state.
+// nBtns = 7 orientation views + 1 projection toggle (Ortho/Persp).
 struct PopupLayout {
     float x0, y0;           // bar top-left (screen)
     float w, h;             // bar size
-    float btnX[7], btnW[7]; // per-button left + width
+    float btnX[8], btnW[8]; // per-button left + width (7 views + projection)
     float btnY, btnH;       // shared button top + height
+    int   nBtns = 8;
 };
-PopupLayout popupLayout(ImVec2 vr0, ImVec2 vr1) {
+PopupLayout popupLayout(ImVec2 vr0, ImVec2 vr1, bool orthographic) {
     const float s = ui::uiScale;
     const float btnPadX = 9.0f * s, btnH = 22.0f * s, gap = 3.0f * s;
     const float padX = 8.0f * s, padY = 4.0f * s;
-    PopupLayout L; L.btnH = btnH;
+    PopupLayout L; L.btnH = btnH; L.nBtns = 8;
+    const char* projLabel = orthographic ? "Ortho" : "Persp";
     float barW = padX * 2;
     for (int i = 0; i < 7; ++i) {
         L.btnW[i] = ImGui::CalcTextSize(kPopup[i].name).x + btnPadX * 2;
         barW += L.btnW[i] + (i ? gap : 0);
     }
+    L.btnW[7] = ImGui::CalcTextSize(projLabel).x + btnPadX * 2;
+    barW += gap + L.btnW[7];
     L.w = barW; L.h = btnH + padY * 2;
     L.x0 = (vr0.x + vr1.x) * 0.5f - barW * 0.5f;
     L.y0 = vr0.y + 48.0f * s;   // sits just below the C24 heads-up toolbar
     L.btnY = L.y0 + padY;
     float x = L.x0 + padX;
-    for (int i = 0; i < 7; ++i) { L.btnX[i] = x; x += L.btnW[i] + gap; }
+    for (int i = 0; i < 8; ++i) { L.btnX[i] = x; x += L.btnW[i] + gap; }
     return L;
 }
 
@@ -311,7 +316,7 @@ void ViewSelector::update(AppState& st, Renderer& renderer, bool imgHovered, boo
     // Click: fire the hovered zone's view, else close (click-on-empty dismisses). Clicks inside the
     // top-center orientation popup are left for draw()'s InvisibleButtons to handle (don't dismiss).
     if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        PopupLayout L = popupLayout(vr0, vr1);
+        PopupLayout L = popupLayout(vr0, vr1, st.orthographic);
         bool inPopup = io.MousePos.x >= L.x0 && io.MousePos.x <= L.x0 + L.w &&
                        io.MousePos.y >= L.y0 && io.MousePos.y <= L.y0 + L.h;
         if (!inPopup) {
@@ -481,16 +486,16 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
     }
 
     // ---- orientation popup, top-center (below the heads-up toolbar) ----
+    // 7 standard views + Ortho/Persp projection toggle (persisted via Settings::orthographic).
     {
-        const int n = 7;
-        PopupLayout L = popupLayout(vr0, vr1);
+        PopupLayout L = popupLayout(vr0, vr1, st.orthographic);
         ImRect barR(ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h));
         const ui::AdaptiveSurface& barSurf =
             ui::adaptivePanel(ui::panelId("viewsel_popup"), barR, ui::GlassGroup::Hud);
         ui::glassPanel(dl, barR, ui::GlassLevel::Thin, L.h * 0.30f / s, barSurf);
 
         ImGui::PushID("##viewsel_popup");
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < 7; ++i) {
             float bxi = L.btnX[i], byi = L.btnY;
             ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
             ImGui::PushID(i);
@@ -508,6 +513,34 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
             if (clicked) {
                 requestCameraAnimation(st, kPopup[i].yaw, kPopup[i].pitch);
                 close();
+            }
+            ImGui::PopID();
+        }
+        // Projection toggle (index 7): flips st.orthographic + Settings and persists.
+        {
+            const int i = 7;
+            float bxi = L.btnX[i], byi = L.btnY;
+            ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
+            ImGui::PushID(i);
+            bool clicked = ImGui::InvisibleButton("##vb", ImVec2(L.btnW[i], L.btnH));
+            bool hov = ImGui::IsItemHovered();
+            if (hov)
+                ui::glassRowBackground(dl, ImVec2(bxi, byi),
+                                       ImVec2(bxi + L.btnW[i], byi + L.btnH), 3.0f, false, true);
+            // Accent when orthographic (the CAD default) so the active mode reads clearly.
+            if (st.orthographic)
+                ui::glassRowBackground(dl, ImVec2(bxi, byi),
+                                       ImVec2(bxi + L.btnW[i], byi + L.btnH), 3.0f, true, false);
+            const char* projLabel = st.orthographic ? "Ortho" : "Persp";
+            ImVec2 lts = ImGui::CalcTextSize(projLabel);
+            ui::glassText(dl, nullptr, ImGui::GetFontSize(),
+                          ImVec2(bxi + (L.btnW[i] - lts.x) * 0.5f, byi + (L.btnH - lts.y) * 0.5f),
+                          barSurf, projLabel);
+            if (clicked) {
+                st.orthographic = !st.orthographic;
+                st.settings.orthographic = st.orthographic;
+                saveSettings(st.settings);
+                if (st.renderer) st.renderer->setOrthographic(st.orthographic);
             }
             ImGui::PopID();
         }

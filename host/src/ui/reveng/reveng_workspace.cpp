@@ -64,10 +64,11 @@ void feedRevEngEvent(const RevEngEvent& ev) {
 void seedSplatFixture() {
     RevEngState& s = S();
     if (s.splatLoaded) return;
-    s.splatLoaded = true;
     const char* repo = std::getenv("AI_CAD_REPO");
     std::string base = repo ? std::string(repo) : std::string(".");
     std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
+    s.splatLoaded = true;
+    s.splatPathTried = plyPath;
     std::string err;
     if (!s.splat.load(plyPath, err))
         std::fprintf(stderr, "reveng seedSplatFixture: %s\n", err.c_str());
@@ -118,6 +119,143 @@ static void loadSessions(AppState& st, bool force = false) {
         if (st2.selected >= (int)st2.sessions.size()) st2.selected = -1;
     });
 }
+
+// Resolve a session-relative artifact path against $AICAD_REVENG_DIR/<sid>/.
+static std::string resolveSessionPath(const std::string& session_id,
+                                      const std::string& rel_or_abs) {
+    if (rel_or_abs.empty()) return {};
+    if (!rel_or_abs.empty() && rel_or_abs[0] == '/') return rel_or_abs;
+#if defined(_WIN32)
+    if (rel_or_abs.size() > 2 && rel_or_abs[1] == ':') return rel_or_abs;
+#endif
+    const char* override = std::getenv("AICAD_REVENG_DIR");
+    std::string root;
+    if (override && override[0]) {
+        root = override;
+    } else {
+        const char* xdg = std::getenv("XDG_DATA_HOME");
+        if (xdg && xdg[0]) root = std::string(xdg) + "/AI-CAD/reveng";
+        else {
+            const char* home = std::getenv("HOME");
+            root = (home && home[0] ? std::string(home) : std::string(".")) +
+                   "/.local/share/AI-CAD/reveng";
+        }
+    }
+    if (!root.empty() && root.back() != '/') root += '/';
+    if (!session_id.empty()) {
+        root += session_id;
+        root += '/';
+    }
+    root += rel_or_abs;
+    return root;
+}
+
+// Async: pull full session manifest so Reconstruct can load real splat/mesh artifacts.
+static void loadSessionDetail(AppState& st, bool force = false) {
+    if (!st.workerStarted) return;
+    RevEngState& s = S();
+    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) return;
+    const std::string& sid = s.sessions[s.selected].session_id;
+    if (sid.empty()) return;
+    if (s.detailPending) return;
+    const double now = ImGui::GetTime();
+    if (!force && s.detailSessionId == sid && now - s.lastDetailT < 3.0) return;
+    s.detailPending = true;
+    s.lastDetailT = now;
+    nlohmann::json params = nlohmann::json::object();
+    params["session_id"] = sid;
+    st.rpc.call("get_reveng_session", params, [sid](const core::RpcResult& r) {
+        RevEngState& st2 = S();
+        st2.detailPending = false;
+        if (!r.ok) {
+            st2.detailErr = r.err.empty() ? "get_reveng_session failed" : r.err;
+            return;
+        }
+        if (!r.result.is_object() || !r.result.value("ok", false)) {
+            st2.detailErr = r.result.is_object()
+                ? r.result.value("reason", std::string("get_reveng_session failed"))
+                : std::string("get_reveng_session failed");
+            return;
+        }
+        st2.detailErr.clear();
+        st2.detailSessionId = sid;
+        st2.artifactSplatPath.clear();
+        st2.artifactMeshPath.clear();
+        st2.artifactSparseDir.clear();
+        if (!r.result.contains("session") || !r.result["session"].is_object()) return;
+        const auto& sess = r.result["session"];
+        if (sess.contains("artifacts") && sess["artifacts"].is_object()) {
+            const auto& art = sess["artifacts"];
+            auto take = [&](const char* key) -> std::string {
+                if (!art.contains(key) || art[key].is_null()) return {};
+                if (art[key].is_string()) return art[key].get<std::string>();
+                return {};
+            };
+            const std::string splat = take("splat_path");
+            const std::string mesh  = take("mesh_path");
+            const std::string sparse = take("sparse_dir");
+            if (!splat.empty())
+                st2.artifactSplatPath = resolveSessionPath(sid, splat);
+            if (!mesh.empty())
+                st2.artifactMeshPath = resolveSessionPath(sid, mesh);
+            if (!sparse.empty())
+                st2.artifactSparseDir = resolveSessionPath(sid, sparse);
+        }
+        // If reconstruction completed server-side, mirror that into recon.done so the
+        // stage UI + splat loader engage even without a live event stream.
+        if (sess.contains("stages") && sess["stages"].is_object()) {
+            const std::string reconBadge = sess["stages"].value("reconstruct", std::string());
+            if (reconBadge == "done" || reconBadge == "complete") {
+                st2.recon.done = true;
+                st2.recon.active = false;
+                st2.recon.pct = 100;
+            }
+        }
+        const std::string status = sess.value("status", std::string());
+        if (status == "done" || status == "review" || status == "modeling") {
+            // Artifacts may exist even if reconstruct badge is still "idle" in older sessions.
+            if (!st2.artifactSplatPath.empty() || !st2.artifactMeshPath.empty()) {
+                st2.recon.done = true;
+            }
+        }
+    });
+}
+
+// Prefer session splat; fall back to the canned fixture only when no session artifact
+// exists and reconstruction is marked done (demo / shot path).
+static void ensureSplatForSession(RevEngState& s) {
+    // Pick the path we want to show.
+    std::string want;
+    bool demoFallback = false;
+    if (!s.artifactSplatPath.empty()) {
+        want = s.artifactSplatPath;
+    } else if (s.recon.done) {
+        // Explicit demo fallback — only when reconstruction completed with no splat_path.
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        want = base + "/host/tests/fixtures/splat_tiny.ply";
+        demoFallback = true;
+    } else {
+        return;  // nothing to load yet
+    }
+
+    if (want.empty()) return;
+    if (s.splatLoaded && s.splatPathTried == want) return;
+
+    s.splatLoaded = true;
+    s.splatPathTried = want;
+    std::string err;
+    if (!s.splat.load(want, err)) {
+        std::fprintf(stderr, "reveng splat load failed (%s): %s\n",
+                     demoFallback ? "fixture" : "session", err.c_str());
+        // Allow a later retry if a better path arrives.
+        if (!demoFallback) {
+            s.splatLoaded = false;
+            s.splatPathTried.clear();
+        }
+    }
+}
+
 
 // ---- adaptive stepper helpers --------------------------------------------------
 
@@ -180,13 +318,16 @@ static const char* stageBlurb(Stage stg) {
 // RE-21: Reconstruct stage center panel — progress stepper + point-cloud overlay note.
 // The GL overlay (rePoints) is drawn by the caller (drawRevEngWorkspace) via beginOverlay /
 // endOverlay AFTER ImGui rendering; this panel draws the ImGui progress UI only.
-// RE-27: splat preview — when recon.done (or splatLoaded is already set), the RevEngState
-// singleton owns a SplatRenderer that app.cpp's GL section calls after ImGui renders.
-static void drawReconstructStage(AppState& /*st*/) {
+// RE-27: splat preview prefers session.artifacts.splat_path; fixture only as demo fallback.
+static void drawReconstructStage(AppState& st) {
     const float sc = ui::uiScale;
     RevEngState& s = S();
 
-    // Lazy-load canned sparse fixture into the RePoints overlay on first entry.
+    // Keep session artifact paths fresh while this stage is open.
+    loadSessionDetail(st);
+
+    // Lazy-load canned sparse fixture into the RePoints overlay on first entry
+    // (until a real sparse cloud lands via session artifacts).
     if (!s.cannedFixtureLoaded) {
         s.cannedFixtureLoaded = true;
         std::vector<render::SparsePoint>   pts;
@@ -196,18 +337,10 @@ static void drawReconstructStage(AppState& /*st*/) {
         s.rePoints.setFrusta(frusta);
     }
 
-    // RE-27: load the canned splat .ply once reconstruction is done (or first entry if already done).
-    // GL-safe: SplatRenderer::load() is CPU-only (GL resources are lazily created on first draw()).
-    if (!s.splatLoaded && s.recon.done) {
-        s.splatLoaded = true;  // mark before load so we don't retry on failure
-        const char* repo = std::getenv("AI_CAD_REPO");
-        std::string base = repo ? std::string(repo) : std::string(".");
-        std::string plyPath = base + "/host/tests/fixtures/splat_tiny.ply";
-        std::string err;
-        if (!s.splat.load(plyPath, err)) {
-            std::fprintf(stderr, "reveng splat load failed: %s\n", err.c_str());
-        }
-    }
+    // Load session splat when present; fixture only as explicit demo fallback.
+    // GL-safe: SplatRenderer::load() is CPU-only (GL resources lazily created on first draw()).
+    ensureSplatForSession(s);
+
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::Dummy(ImVec2(0, avail.y * 0.18f));
@@ -294,18 +427,42 @@ static void drawReconstructStage(AppState& /*st*/) {
         ImGui::PopStyleColor();
     }
 
-    // ---- Splat loaded indicator (RE-27: SplatRenderer wired) -------------------
+    // ---- Splat / mesh artifact indicator ------------------------------------
     if (s.splatLoaded && s.splat.hasSplats()) {
         ImGui::Dummy(ImVec2(0, 6 * sc));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 0.55f, 1.0f));
-        char splatInfo[80];
+        char splatInfo[160];
+        const bool isFixture = s.splatPathTried.find("splat_tiny.ply") != std::string::npos;
         std::snprintf(splatInfo, sizeof(splatInfo),
-                      "3DGS splat preview: %zu gaussians", s.splat.count());
+                      "3DGS splat preview: %zu gaussians%s",
+                      s.splat.count(),
+                      isFixture ? " (demo fixture)" : " (session)");
         const ImVec2 si = ImGui::CalcTextSize(splatInfo);
         ImGui::SetCursorPosX((avail.x - si.x) * 0.5f);
         ImGui::TextUnformatted(splatInfo);
         ImGui::PopStyleColor();
+        if (!isFixture && !s.splatPathTried.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            const ImVec2 ps = ImGui::CalcTextSize(s.splatPathTried.c_str());
+            ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
+            ImGui::TextUnformatted(s.splatPathTried.c_str());
+            ImGui::PopStyleColor();
+        }
+    } else if (!s.artifactMeshPath.empty()) {
+        ImGui::Dummy(ImVec2(0, 6 * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.85f, 0.55f, 1.0f));
+        const char* meshLbl = "Session mesh ready";
+        const ImVec2 mi = ImGui::CalcTextSize(meshLbl);
+        ImGui::SetCursorPosX((avail.x - mi.x) * 0.5f);
+        ImGui::TextUnformatted(meshLbl);
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        const ImVec2 ps = ImGui::CalcTextSize(s.artifactMeshPath.c_str());
+        ImGui::SetCursorPosX((avail.x - ps.x) * 0.5f);
+        ImGui::TextUnformatted(s.artifactMeshPath.c_str());
+        ImGui::PopStyleColor();
     }
+
 
     // ---- Idle hint (no job running) ------------------------------------------
     if (!reconRunning && !reconDone && s.recon.err.empty()) {
@@ -589,6 +746,19 @@ void drawRevEngWorkspace(AppState& st) {
             galleryFreeTextures(s.galleryImages);
             s.galleryImages.clear();
             s.gallerySession = s.selected;
+            // Drop previous session's splat/mesh mirror so Reconstruct reloads.
+            s.splatLoaded = false;
+            s.splatPathTried.clear();
+            s.artifactSplatPath.clear();
+            s.artifactMeshPath.clear();
+            s.artifactSparseDir.clear();
+            s.detailSessionId.clear();
+            s.lastDetailT = -100.0;
+            s.recon.done = false;
+            s.recon.active = false;
+            s.recon.pct = 0;
+            s.recon.phase.clear();
+            s.recon.err.clear();
         }
     }
 

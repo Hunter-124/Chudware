@@ -19,6 +19,7 @@
 #include "../renderer.h"
 #include "legacy_chat.h"  // ui::drawProviderModelPicker (shared with the inline AI tab)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
+#include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > AI)
 
 // ---- C22b prompt editor state ----
 // Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
@@ -586,6 +587,31 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // Shared provider + availability-filtered model picker + reasoning effort +
                 // privacy/offline. The inline AI Settings tab renders the SAME widget.
                 ui::drawProviderModelPicker(st, busy);
+
+                // ---- Model Leaderboard (aicad.leaderboard/1) ----
+                ImGui::Dummy(ImVec2(0, 10 * sc));
+                ImGui::SeparatorText("Model Leaderboard");
+                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
+                        "MOCK badge when task_suite ends in -MOCK.");
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                {
+                    static ui::leaderboard::Board s_lb;
+                    static bool s_lbLoaded = false;
+                    static double s_lbLast = -1e9;
+                    const double now = ImGui::GetTime();
+                    if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
+                        s_lb = ui::leaderboard::load();
+                        s_lbLoaded = true;
+                        s_lbLast = now;
+                    }
+                    if (ImGui::SmallButton("Refresh##settings_lb")) {
+                        s_lb = ui::leaderboard::load();
+                        s_lbLast = ImGui::GetTime();
+                    }
+                    ImGui::Dummy(ImVec2(0, 2 * sc));
+                    ui::leaderboard::drawCompactTable(s_lb, sc);
+                }
+
                 ImGui::EndTabItem();
             }
             // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---

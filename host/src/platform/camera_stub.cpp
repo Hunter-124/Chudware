@@ -45,13 +45,17 @@ std::unique_ptr<CameraBackend> createMFCamera();
 
 std::unique_ptr<CameraBackend> CameraBackend::create() {
 #if defined(__linux__) && !defined(_WIN32)
-    const char* ev = std::getenv("AICAD_TEST_CAMERA");
-    if (ev && std::strcmp(ev, "1") == 0)
-        return createV4L2Camera();
+    // Production path: always prefer V4L2. Unit tests force the synthetic stub with
+    // AICAD_FORCE_STUB_CAMERA=1 so CI stays hardware-free.
+    const char* force_stub = std::getenv("AICAD_FORCE_STUB_CAMERA");
+    if (force_stub && std::strcmp(force_stub, "1") == 0)
+        return std::make_unique<StubCameraBackend>();
+    return createV4L2Camera();
 #elif defined(_WIN32)
     return createMFCamera();
-#endif
+#else
     return std::make_unique<StubCameraBackend>();
+#endif
 }
 
 }  // namespace aicad::platform

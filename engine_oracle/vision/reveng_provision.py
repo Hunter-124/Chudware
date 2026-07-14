@@ -2,11 +2,11 @@
 Reverse Engineering workspace (contracts/reveng.md §8.1 ``reveng_status``).
 
 The heavy RE toolchain (COLMAP / OpenMVS / Brush binaries, TripoSR / TRELLIS /
-VGGT weights) is **never bundled** in the base runtime — it is fetched on demand
-into the user data dir, or discovered from a user-provided binary via env var.
-This module holds the SHA-pinned descriptor table and a pure, offline-safe
-``reveng_status()`` probe that reports per-capability availability without ever
-touching the network.
+VGGT / CAD-Recode weights) is **never bundled** in the base runtime — it is
+fetched on demand into the user data dir, or discovered from a user-provided
+binary via env var. This module holds the SHA-pinned descriptor table and a
+pure, offline-safe ``reveng_status()`` probe that reports per-capability
+availability without ever touching the network.
 
 License discipline (CONTRIBUTING.md guardrails):
 - **OpenMVS is AGPL** -> ``mode: "env"`` (discovery-only via ``OPENMVS_BIN``),
@@ -15,6 +15,8 @@ License discipline (CONTRIBUTING.md guardrails):
 - COLMAP (BSD) and Brush (Apache-2.0) are subprocess binaries we may fetch.
 - TripoSR (MIT) / TRELLIS (MIT) / VGGT weights are fetched model payloads;
   see ``license`` on each descriptor and ``licenses.md`` for the register.
+- CAD-Recode v1.5 weights are CC-BY-NC-4.0 (licensing consciously deferred —
+  see ``contracts/license_debt.md``); download-on-demand only.
 
 SHA pinning honesty: hashes that could not be independently verified offline are
 recorded as the sentinel ``"PENDING"``. The schema is still well-formed (the
@@ -135,6 +137,28 @@ REVENG_DESCRIPTORS: dict[str, dict] = {
         "sha256": None,
         "note": "Datasheet table/layout extraction. Installed as a Python dependency.",
     },
+    # --- ML parametric rebuild: CAD-Recode v1.5 (CC-BY-NC-4.0, deferred) ---
+    # Not a frozen §8.1 provisioning key (colmap/openmvs/brush/triposr/vggt/
+    # docling). Tracked here for discovery + status banners; availability is
+    # also exposed via capabilities["ml_parametric"] (additive, non-contract).
+    # Weights: filapro/cad-recode-v1.5 on HuggingFace. Set CAD_RECODE_WEIGHTS
+    # or let huggingface_hub cache under ~/.cache/huggingface/hub/.
+    "cad_recode": {
+        "kind": "weights",
+        "capability": "ml_parametric",
+        "license": "CC-BY-NC-4.0",
+        "mode": "download",
+        "env_var": "CAD_RECODE_WEIGHTS",
+        "url": "https://huggingface.co/filapro/cad-recode-v1.5",
+        "sha256": SHA_PENDING,
+        "note": (
+            "ML mesh→CadQuery parametric rebuild (filapro/cad-recode-v1.5). "
+            "CC-BY-NC-4.0 — licensing deferred (license_debt.md). "
+            "Provision: python -c \"from huggingface_hub import snapshot_download; "
+            "snapshot_download('filapro/cad-recode-v1.5')\" "
+            "or set CAD_RECODE_WEIGHTS. Needs torch+transformers; ~4GB VRAM bf16."
+        ),
+    },
 }
 
 
@@ -169,8 +193,25 @@ def _artifact_available(name: str) -> bool:
     if mode == "env":
         # env var not set / not resolvable above -> also try the bare tool name on PATH
         return bool(shutil.which(name))
-    # download mode with no env override and no cached artifact discoverable offline
+    # download mode: env override handled above. For HF weight caches, probe the
+    # well-known hub layout offline (no network).
+    if name == "cad_recode":
+        return _cad_recode_weights_present()
     return False
+
+
+def _cad_recode_weights_present() -> bool:
+    """Offline check for CAD-Recode weights (env or HF hub cache)."""
+    env = os.environ.get("CAD_RECODE_WEIGHTS", "").strip()
+    if env and os.path.exists(env):
+        return True
+    home = os.path.expanduser("~")
+    candidates = (
+        os.path.join(home, ".cache", "huggingface", "hub", "models--filapro--cad-recode-v1.5"),
+        os.path.join(home, ".cache", "cad_recode"),
+        "/opt/models/cad-recode-v1.5",
+    )
+    return any(os.path.exists(p) for p in candidates)
 
 
 def _gpu_available() -> bool:
@@ -233,6 +274,10 @@ def reveng_status() -> dict:
     # TRELLIS is not a contract provisioning key; fold it into single_photo.
     trellis = _artifact_available("trellis")
 
+    # CAD-Recode is discovery-only (like trellis): not a frozen §8.1 key.
+    # Availability is via REVENG_DESCRIPTORS["cad_recode"] / _artifact_available.
+    cad_recode = _artifact_available("cad_recode")
+
     capabilities = {
         "sparse": colmap or prov["vggt"]["available"],
         "dense": openmvs and colmap,  # dense needs a sparse model first
@@ -256,12 +301,24 @@ def reveng_status() -> dict:
         banners.append("3D Gaussian Splatting unavailable: Brush binary not provisioned.")
     if not capabilities["single_photo"]:
         banners.append("Single-photo tier unavailable: TripoSR/TRELLIS weights not provisioned.")
+    if not cad_recode:
+        banners.append(
+            "ML parametric (CAD-Recode) unavailable: set CAD_RECODE_WEIGHTS or "
+            "snapshot_download('filapro/cad-recode-v1.5') (~4GB VRAM bf16)."
+        )
 
     return {
         "ok": True,
         "capabilities": capabilities,
         "provisioning": {k: prov[k]["available"] for k in _PROVISIONING_KEYS},
         "provisioning_detail": prov,
+        # Additive discovery (not a frozen §8.1 provisioning key — like trellis).
+        "cad_recode": {
+            "available": cad_recode,
+            "model": "filapro/cad-recode-v1.5",
+            "env_var": "CAD_RECODE_WEIGHTS",
+            "license": "CC-BY-NC-4.0",
+        },
         "banners": banners,
         "missing": missing,
     }

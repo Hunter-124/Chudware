@@ -2841,12 +2841,55 @@ void drawFeatureTreeBody(AppState& st,
         // Filename / References / Features are three INDEPENDENT collapsible sections (Hunter):
         // collapsing the filename hides only its equations/material/solid-bodies, leaving the
         // References and Features sections in place. All three use the same section-header look.
+        //
+        // Auto-collapse (Wave 1): the part-name (file) + Reference sections start OPEN on a fresh
+        // empty part/assembly (no solid body yet) so Equations/Material/Origin/planes are one click
+        // away for the first sketch. The moment the doc gains a solid body (first extrude, or open
+        // of an assembly that already has bodies) both auto-collapse — unless the user has already
+        // toggled that header, after which their choice sticks (same sticky pattern as
+        // planesUserToggled / originUserToggled). Features stays user-controlled only.
+        // State is keyed by doc id so multi-doc tab switches don't bleed open/closed + toggle
+        // flags across documents (the previous pure-statics lived forever across every doc).
         const float kSecIndent = 8.0f * ui::uiScale;
-        static bool s_fileSecOpen = true;
-        static bool s_refSecOpen  = true;
-        static bool s_featSecOpen = true;
+        struct SecCollapseState {
+            bool fileOpen = true;
+            bool refOpen  = true;
+            bool featOpen = true;
+            bool fileUserToggled = false;
+            bool refUserToggled  = false;
+            bool lastHasMesh = false;
+            bool seeded = false;
+        };
+        static std::unordered_map<std::string, SecCollapseState> s_secByDoc;
+        const std::string secDocKey = st.docMirror.hasDoc()
+            ? st.docMirror.docId()
+            : std::string();   // empty key covers the no-doc / pre-open panel state
+        SecCollapseState& sec = s_secByDoc[secDocKey];
+        const bool hasMesh = st.hasDocMesh;
+        if (!sec.seeded) {
+            // First sight of this doc: open only while no solid body yet; assemblies (and parts
+            // reopened with geometry) land collapsed so the feature history is the focus.
+            const bool wantOpen = !hasMesh;
+            sec.fileOpen = wantOpen;
+            sec.refOpen  = wantOpen;
+            sec.lastHasMesh = hasMesh;
+            sec.seeded = true;
+        } else if (!sec.lastHasMesh && hasMesh) {
+            // false→true transition: first solid body just appeared — auto-collapse both unless
+            // the user already took control of that header.
+            if (!sec.fileUserToggled) sec.fileOpen = false;
+            if (!sec.refUserToggled)  sec.refOpen  = false;
+            sec.lastHasMesh = hasMesh;
+        } else {
+            sec.lastHasMesh = hasMesh;
+        }
+        bool& s_fileSecOpen = sec.fileOpen;
+        bool& s_refSecOpen  = sec.refOpen;
+        bool& s_featSecOpen = sec.featOpen;
         bool fileRightClicked = false;
+        const bool fileOpenBefore = s_fileSecOpen;
         fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
+        if (s_fileSecOpen != fileOpenBefore) sec.fileUserToggled = true;
 
         // C26: filename "Appearance…" — sets the primary body's color (the common single-body
         // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).
@@ -3097,7 +3140,9 @@ void drawFeatureTreeBody(AppState& st,
 
         // ---- References section (Origin + default planes) — its own collapse, independent of the
         // filename above and the Features below. ----
+        const bool refOpenBefore = s_refSecOpen;
         fmSectionDividerCollapse("Reference", &s_refSecOpen);
+        if (s_refSecOpen != refOpenBefore) sec.refUserToggled = true;
         if (s_refSecOpen) {
             ImGui::Indent(kSecIndent);
 

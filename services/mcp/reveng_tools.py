@@ -5,12 +5,12 @@ Session / ingest tools are LIVE: they read/write the session directory under
 - ``engine_oracle.vision.reveng_provision.reveng_status`` (RE-06, on master)
 - ``engine_oracle.vision.frames.extract_frames_safe`` (RE-04, on master)
 
-Long-job tools (reconstruct / build_parametric) launch the frozen DAG mission
-templates (services/dag/templates/reveng_{scan,datasheet}.json) via the executor
-when their backend is provisioned, streaming ``aicad.reveng_events/1`` progress on
-the run's EventJournal and honouring the human scale/dimension gates (RE-17). When
-the backend is absent they return the honest ``backend_not_provisioned`` envelope
-(§0 contract). single_photo / fit_primitives remain provisioning-gated stubs.
+Long-job tools (reconstruct / build_parametric / single_photo / fit_primitives)
+wire the real vision backends via ``_make_pipeline_agent_fn``: sparse
+(colmap_pipeline → ffwd_sfm fallback) → dense (openmvs/brush) → mesh_cleanup →
+segment_fit → reverse_engineer (hints) or cad_recode.build_parametric
+(strategy='ml'). Missing backends return the honest ``backend_not_provisioned``
+envelope (§0) — never a synthetic success.
 
 Conventions: ``_dumps`` / ``_err`` from cad_tools.py; never return tracebacks.
 Registration: ``register_reveng_tools(_reg.view(mcp, "reveng"))`` — see server.py.
@@ -339,20 +339,76 @@ def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
     return _emit
 
 
-def _make_pipeline_agent_fn(session_id: str):
+def _call_reverse_engineer(
+    source: str,
+    *,
+    name: Optional[str] = None,
+    hints: Optional[dict] = None,
+) -> dict:
+    """Invoke the recon ``reverse_engineer`` MCP tool programmatically.
+
+    Registers tools on a throwaway FastMCP so the pipeline agent_fn does not
+    depend on a live server. Tests may monkeypatch this helper.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
+        from mcp_server.recon_tools import register_recon_tools  # noqa: PLC0415
+
+        mcp = FastMCP("_reveng_internal")
+        register_recon_tools(mcp)
+        tool = mcp._tool_manager.get_tool("reverse_engineer")
+        if tool is None or not getattr(tool, "fn", None):
+            return {"ok": False, "error": "reverse_engineer tool not registered"}
+        raw = tool.fn(source=source, name=name, hints=hints)
+        if isinstance(raw, str):
+            return _json.loads(raw)
+        return raw if isinstance(raw, dict) else {"ok": False, "error": "bad reverse_engineer result"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"reverse_engineer failed: {exc}"}
+
+
+def _session_image_paths(session_id: str) -> list[str]:
+    """Collect stills + extracted frames for a session (images/ then frames/)."""
+    root = _session_path(session_id)
+    paths: list[str] = []
+    for sub in ("images", "frames"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in (
+                ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
+            ):
+                paths.append(str(p.resolve()))
+    return paths
+
+
+def _registration_ratio(sparse_result: dict, n_images: int) -> float:
+    """Fraction of images registered by sparse SfM (0..1)."""
+    if n_images <= 0:
+        return 0.0
+    reg = sparse_result.get("registered")
+    if reg is None:
+        reg = sparse_result.get("n_images") or sparse_result.get("n_registered") or 0
+    try:
+        return max(0.0, min(1.0, float(reg) / float(n_images)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _make_pipeline_agent_fn(session_id: str, *, strategy: str = "deterministic"):
     """Return a deterministic node ``agent_fn`` that runs the RE pipeline stages.
 
     ``agent_fn(request, context_pack) -> AgentResult`` is the seam node_runner
     dispatches every non-verify/non-gate node through. Rather than invoke an LLM,
-    this deterministic dispatcher wires each node to the pipeline module already on
-    master, degrading honestly to a non-success result (which the node ESCALATES on
-    per its on_fail) when the backend module or its provisioning is absent. It never
-    re-invokes the reveng MCP launch tools (that would recurse — see
-    work/questions/RE-17.md Q1).
+    this dispatcher wires each node to the real vision backends, degrading honestly
+    to a non-success result (which the node ESCALATES on per its on_fail) when a
+    backend module or its provisioning is absent. It never re-invokes the reveng
+    MCP launch tools (that would recurse — see work/questions/RE-17.md Q1).
 
-    The default (live) agent_fn is used when this returns None for a node it does not
-    recognise; here we always return a structured result so a mission started without
-    provisioned backends produces a clear partial run instead of hanging on the LLM.
+    strategy:
+        ``deterministic`` (default) — reverse_engineer with fit hints.
+        ``ml`` — lazy-import engine_oracle.vision.cad_recode.build_parametric.
     """
     class _Result:
         def __init__(self, ok: bool, reason: str, data: Optional[dict] = None):
@@ -360,6 +416,11 @@ def _make_pipeline_agent_fn(session_id: str):
             self.stop_reason = "confirmed" if ok else "failed"
             self.final_code = None
             self.result = data or {"detail": reason}
+
+    strat = (strategy or "deterministic").strip().lower()
+    if strat in ("override_approximate",):
+        # override is a honesty gate on the MCP tool, not a rebuild strategy
+        strat = "deterministic"
 
     def _agent_fn(request: str, context_pack: dict):
         node_id = context_pack.get("node_id") or context_pack.get("node_name", "")
@@ -374,18 +435,393 @@ def _make_pipeline_agent_fn(session_id: str):
         if node_id == "n_capture":
             return _Result(True, "capture sources ingested")
 
-        # Reconstruction stages require the sparse/dense backends.
+        # ── Reconstruction: sparse → (ffwd fallback) → dense → mesh cleanup ──
         if node_id in ("n_reconstruct",):
-            if not (caps.get("sparse") or caps.get("dense")):
-                return _Result(False, "backend_not_provisioned: colmap/dense absent")
-            return _Result(True, "reconstruction complete")
+            images = _session_image_paths(session_id)
+            if not images:
+                return _Result(
+                    False,
+                    "no_images",
+                    {"detail": "session has no images/ or frames/ for reconstruction"},
+                )
+            session_dir = str(_session_path(session_id))
+            image_dir = str(_session_path(session_id) / "images")
+            # Prefer images/ when present; otherwise point at frames/.
+            if not (_session_path(session_id) / "images").is_dir() or not any(
+                _session_path(session_id).joinpath("images").iterdir()
+                if (_session_path(session_id) / "images").is_dir() else []
+            ):
+                image_dir = str(_session_path(session_id) / "frames")
+
+            sparse_result: dict = {"ok": False, "reason": "sparse_not_attempted"}
+            used_ffwd = False
+
+            # Primary sparse: COLMAP / pycolmap
+            try:
+                from engine_oracle.vision.colmap_pipeline import run_sparse  # noqa: PLC0415
+            except Exception as exc:  # noqa: BLE001
+                run_sparse = None  # type: ignore[assignment]
+                sparse_result = {
+                    "ok": False,
+                    "reason": "backend_not_provisioned",
+                    "hint": f"colmap_pipeline import failed: {exc}",
+                }
+            if run_sparse is not None:
+                try:
+                    sparse_result = run_sparse(image_dir, session_dir) or {
+                        "ok": False, "reason": "run_sparse returned empty",
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    sparse_result = {
+                        "ok": False,
+                        "reason": f"run_sparse error: {exc}",
+                        "hint": "check pycolmap / image set",
+                    }
+
+            weak = (
+                not sparse_result.get("ok")
+                or _registration_ratio(sparse_result, len(images)) < 0.60
+            )
+            if weak:
+                try:
+                    from engine_oracle.vision.ffwd_sfm import run_ffwd_sfm  # noqa: PLC0415
+                    ffwd = run_ffwd_sfm(images, session_dir) or {
+                        "ok": False, "reason": "run_ffwd_sfm returned empty",
+                    }
+                    if ffwd.get("ok"):
+                        sparse_result = ffwd
+                        used_ffwd = True
+                    elif not sparse_result.get("ok"):
+                        sparse_result = ffwd
+                except Exception as exc:  # noqa: BLE001
+                    if not sparse_result.get("ok"):
+                        sparse_result = {
+                            "ok": False,
+                            "reason": "backend_not_provisioned",
+                            "hint": f"sparse+ffwd unavailable: {exc}",
+                        }
+
+            if not sparse_result.get("ok"):
+                return _Result(
+                    False,
+                    sparse_result.get("reason") or "backend_not_provisioned: sparse",
+                    sparse_result,
+                )
+
+            sparse_dir = (
+                sparse_result.get("sparse_dir")
+                or str(_Path(session_dir) / "sparse")
+            )
+            s = _load_session(session_id) or _make_session(session_id, session_id, None)
+            s.setdefault("artifacts", {})
+            s["artifacts"]["sparse_dir"] = sparse_dir
+            s["stages"]["reconstruct"] = "running"
+            _save_session(s)
+
+            # Dense: OpenMVS and/or Brush — first success wins for mesh_path.
+            mesh_path: Optional[str] = None
+            splat_path: Optional[str] = None
+            dense_notes: list = []
+            dense_ok = False
+
+            if _os.environ.get("OPENMVS_BIN"):
+                try:
+                    from engine_oracle.vision.dense_backends import run_openmvs  # noqa: PLC0415
+                    omvs = run_openmvs(sparse_dir, session_dir) or {}
+                    if omvs.get("ok") and omvs.get("mesh_path"):
+                        mesh_path = omvs["mesh_path"]
+                        dense_ok = True
+                        dense_notes.append("openmvs")
+                    else:
+                        dense_notes.append(
+                            f"openmvs:{omvs.get('reason') or 'failed'}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    dense_notes.append(f"openmvs_import:{exc}")
+
+            # Brush when provisioned (BRUSH_BIN) — also yields splat.
+            if _os.environ.get("BRUSH_BIN") or caps.get("splat"):
+                try:
+                    from engine_oracle.vision.dense_backends import run_brush  # noqa: PLC0415
+                    brush = run_brush(sparse_dir, session_dir) or {}
+                    if brush.get("ok"):
+                        dense_ok = True
+                        dense_notes.append("brush")
+                        if brush.get("splat_path"):
+                            splat_path = brush["splat_path"]
+                        if not mesh_path and brush.get("mesh_path"):
+                            mesh_path = brush["mesh_path"]
+                    else:
+                        dense_notes.append(
+                            f"brush:{brush.get('reason') or 'failed'}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    dense_notes.append(f"brush_import:{exc}")
+
+            if not dense_ok and not mesh_path:
+                # Sparse-only is not a full reconstruct success for the mesh path,
+                # but if sparse ok we still report honest partial.
+                s = _load_session(session_id) or s
+                s.setdefault("artifacts", {})
+                s["artifacts"]["sparse_dir"] = sparse_dir
+                if splat_path:
+                    s["artifacts"]["splat_path"] = splat_path
+                _save_session(s)
+                return _Result(
+                    False,
+                    "backend_not_provisioned: dense",
+                    {
+                        "sparse": sparse_result,
+                        "dense_notes": dense_notes,
+                        "used_ffwd": used_ffwd,
+                        "hint": "set OPENMVS_BIN and/or BRUSH_BIN; check reveng_status()",
+                    },
+                )
+
+            # Mesh cleanup when we have a mesh
+            cleaned = mesh_path
+            if mesh_path:
+                try:
+                    from engine_oracle.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
+                    out_clean = str(
+                        _Path(session_dir) / "mesh" / "cleaned.ply"
+                    )
+                    _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
+                    scale_mm = None
+                    try:
+                        scale_mm = (_load_session(session_id) or {}).get(
+                            "scale", {}
+                        ).get("mm_per_unit")
+                        if scale_mm is not None:
+                            scale_mm = float(scale_mm)
+                    except (TypeError, ValueError):
+                        scale_mm = None
+                    cl = cleanup_mesh(mesh_path, out_clean, scale_mm=scale_mm) or {}
+                    if cl.get("ok") and cl.get("mesh_path"):
+                        cleaned = cl["mesh_path"]
+                    else:
+                        dense_notes.append(
+                            f"cleanup:{cl.get('reason') or 'skipped'}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    dense_notes.append(f"cleanup_import:{exc}")
+
+            s = _load_session(session_id) or s
+            s.setdefault("artifacts", {})
+            s["artifacts"]["sparse_dir"] = sparse_dir
+            if cleaned:
+                s["artifacts"]["mesh_path"] = cleaned
+            if splat_path:
+                s["artifacts"]["splat_path"] = splat_path
+            s["stages"]["reconstruct"] = "done"
+            s["provenance"].append({
+                "step": "n_reconstruct",
+                "sparse_backend": sparse_result.get("backend"),
+                "used_ffwd": used_ffwd,
+                "dense": dense_notes,
+                "ts": _now_iso(),
+            })
+            _save_session(s)
+            return _Result(
+                True,
+                "reconstruction complete",
+                {
+                    "sparse": sparse_result,
+                    "mesh_path": cleaned,
+                    "splat_path": splat_path,
+                    "used_ffwd": used_ffwd,
+                    "dense_notes": dense_notes,
+                },
+            )
+
+        # ── Primitive fit ────────────────────────────────────────────────────
         if node_id in ("n_fit",):
-            if not caps.get("dense"):
-                return _Result(False, "backend_not_provisioned: mesh/segment_fit absent")
-            return _Result(True, "primitives fit")
+            s = _load_session(session_id)
+            if s is None:
+                return _Result(False, f"session {session_id!r} not found")
+            mesh_path = (s.get("artifacts") or {}).get("mesh_path")
+            if not mesh_path:
+                return _Result(
+                    False,
+                    "no_mesh",
+                    {"detail": "run reconstruction first; session has no mesh_path"},
+                )
+            try:
+                from engine_oracle.vision.segment_fit import segment_fit  # noqa: PLC0415
+            except Exception as exc:  # noqa: BLE001
+                return _Result(
+                    False,
+                    "backend_not_provisioned: segment_fit",
+                    {"hint": f"segment_fit import failed: {exc}"},
+                )
+            try:
+                fits = segment_fit(mesh_path, session_id=session_id) or {}
+            except Exception as exc:  # noqa: BLE001
+                return _Result(False, f"segment_fit error: {exc}")
+            if not fits.get("ok"):
+                return _Result(
+                    False,
+                    fits.get("reason") or "backend_not_provisioned: segment_fit",
+                    fits,
+                )
+            # Persist aicad.reveng_fits/1 for n_parametric / GUI
+            fits_path = _session_path(session_id) / "fits.json"
+            try:
+                fits_path.write_text(_json.dumps(fits, indent=2))
+            except Exception:  # noqa: BLE001
+                pass
+            s.setdefault("artifacts", {})
+            s["artifacts"]["fits_path"] = str(fits_path)
+            s["stages"]["model"] = "fitting"
+            s["provenance"].append({
+                "step": "n_fit",
+                "n_fits": len(fits.get("fits") or []),
+                "ts": _now_iso(),
+            })
+            _save_session(s)
+            return _Result(True, "primitives fit", fits)
+
+        # ── Parametric rebuild ───────────────────────────────────────────────
         if node_id in ("n_parametric", "n_iterate"):
-            # Parametric build needs a fit result; degrade honestly when absent.
-            return _Result(False, "backend_not_provisioned: parametric build absent")
+            s = _load_session(session_id)
+            if s is None:
+                return _Result(False, f"session {session_id!r} not found")
+            mesh_path = (s.get("artifacts") or {}).get("mesh_path")
+            if not mesh_path:
+                return _Result(
+                    False,
+                    "no_mesh",
+                    {"detail": "parametric build needs a cleaned mesh_path"},
+                )
+
+            # Load fits hints if present
+            hints = None
+            fits_path = (s.get("artifacts") or {}).get("fits_path")
+            if fits_path and _Path(fits_path).is_file():
+                try:
+                    hints = _json.loads(_Path(fits_path).read_text())
+                except Exception:  # noqa: BLE001
+                    hints = None
+            if hints is None:
+                alt = _session_path(session_id) / "fits.json"
+                if alt.is_file():
+                    try:
+                        hints = _json.loads(alt.read_text())
+                    except Exception:  # noqa: BLE001
+                        hints = None
+
+            scale_transform = None
+            sc = s.get("scale") or {}
+            if sc.get("mm_per_unit") is not None:
+                scale_transform = {
+                    "scale": sc.get("mm_per_unit"),
+                    "method": sc.get("method"),
+                }
+
+            if strat == "ml":
+                try:
+                    from engine_oracle.vision.cad_recode import (  # noqa: PLC0415
+                        build_parametric,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return _Result(
+                        False,
+                        "backend_not_provisioned: cad_recode",
+                        {"hint": f"cad_recode import failed: {exc}"},
+                    )
+                try:
+                    ml = build_parametric(
+                        mesh_path,
+                        str(_session_path(session_id)),
+                        scale_transform,
+                    ) or {}
+                except TypeError:
+                    # tolerate keyword-only signature variants
+                    try:
+                        ml = build_parametric(
+                            mesh_path,
+                            str(_session_path(session_id)),
+                            scale_transform=scale_transform,
+                        ) or {}
+                    except Exception as exc:  # noqa: BLE001
+                        return _Result(False, f"build_parametric error: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    return _Result(False, f"build_parametric error: {exc}")
+                if not ml.get("ok") and ml.get("error"):
+                    return _Result(
+                        False,
+                        ml.get("error") or "ml parametric failed",
+                        ml,
+                    )
+                # Prefer step import into a doc when step_path present
+                doc_id = ml.get("doc_id")
+                step_path = ml.get("step_path")
+                if not doc_id and step_path and _Path(str(step_path)).is_file():
+                    re_res = _call_reverse_engineer(
+                        str(step_path),
+                        name=s.get("name"),
+                        hints=hints if isinstance(hints, dict) else None,
+                    )
+                    if re_res.get("ok") and re_res.get("doc_id"):
+                        doc_id = re_res["doc_id"]
+                        ml = {**ml, "reverse_engineer": re_res}
+                s = _load_session(session_id) or s
+                s.setdefault("artifacts", {})
+                if doc_id:
+                    s["artifacts"]["doc_id"] = doc_id
+                if step_path:
+                    s["artifacts"]["step_path"] = step_path
+                if ml.get("cadquery_src"):
+                    cq_path = _session_path(session_id) / "cad_recode.py"
+                    try:
+                        cq_path.write_text(str(ml["cadquery_src"]))
+                        s["artifacts"]["cadquery_path"] = str(cq_path)
+                    except Exception:  # noqa: BLE001
+                        pass
+                s["stages"]["model"] = "done" if doc_id or step_path else "failed"
+                s["provenance"].append({
+                    "step": "n_parametric",
+                    "strategy": "ml",
+                    "ts": _now_iso(),
+                })
+                _save_session(s)
+                if not (doc_id or step_path or ml.get("cadquery_src")):
+                    return _Result(
+                        False,
+                        ml.get("error") or "ml parametric produced no artifact",
+                        ml,
+                    )
+                return _Result(True, "ml parametric complete", ml)
+
+            # Default: deterministic reverse_engineer with fit hints
+            re_res = _call_reverse_engineer(
+                mesh_path,
+                name=s.get("name"),
+                hints=hints if isinstance(hints, dict) else None,
+            )
+            if not re_res.get("ok"):
+                return _Result(
+                    False,
+                    re_res.get("error")
+                    or re_res.get("reason")
+                    or "reverse_engineer failed",
+                    re_res,
+                )
+            doc_id = re_res.get("doc_id")
+            s = _load_session(session_id) or s
+            s.setdefault("artifacts", {})
+            if doc_id:
+                s["artifacts"]["doc_id"] = doc_id
+            s["stages"]["model"] = "done" if doc_id else "failed"
+            s["provenance"].append({
+                "step": "n_parametric",
+                "strategy": "deterministic",
+                "match_pct": re_res.get("match_pct"),
+                "ts": _now_iso(),
+            })
+            _save_session(s)
+            return _Result(True, "parametric complete", re_res)
+
         if node_id in ("n_ingest", "n_mpn_fastpath", "n_datasheet_read"):
             # Datasheet pipeline nodes (RE-15 datasheet_ingest).
             try:
@@ -404,12 +840,14 @@ def _make_pipeline_agent_fn(session_id: str):
     return _agent_fn
 
 
+
 def _launch_reveng_mission(
     session_id: str,
     template_name: str,
     stage_map: dict,
     *,
     autonomy_default: str = "auto",
+    strategy: str = "deterministic",
 ) -> dict:
     """Load a frozen template, start it via the executor, translate progress.
 
@@ -421,16 +859,19 @@ def _launch_reveng_mission(
     without interruption; the GUI/human resumes each gate via the DAG resume path.
     (Promoting to ``autonomy_default="approve"`` would gate *every* auto node,
     pausing immediately at ``n_capture`` — not what the template intends.)
+
+    strategy is forwarded to the pipeline agent_fn for n_parametric
+    (``deterministic`` | ``ml``).
     """
     from services.dag import executor
 
     graph = _load_template(template_name)
     run_id = "run_" + _secrets.token_hex(4)
     emit = make_reveng_emit(run_id, session_id, stage_map)
-    agent_fn = _make_pipeline_agent_fn(session_id)
+    agent_fn = _make_pipeline_agent_fn(session_id, strategy=strategy)
     result = executor.run(
         graph,
-        initial_state={"inputs": {"session_id": session_id}},
+        initial_state={"inputs": {"session_id": session_id, "strategy": strategy}},
         run_id=run_id,
         runs_dir=_reveng_runs_dir(),
         emit=emit,
@@ -439,7 +880,9 @@ def _launch_reveng_mission(
     )
     result["session_id"] = session_id
     result["template"] = template_name
+    result["strategy"] = strategy
     return result
+
 
 
 # ── registration ─────────────────────────────────────────────────────────────
@@ -927,25 +1370,117 @@ def register_reveng_tools(mcp: FastMCP) -> None:
         """Run single-photo mesh reconstruction (TripoSR or TRELLIS tier).
 
         Force-tags the session ``honesty.approximate = true`` — result is reference/
-        preview only, not fit-critical.  Returns ``backend_not_provisioned`` until RE-17.
-        ``tier`` must be ``triposr`` or ``trellis``.
+        preview only, not fit-critical. ``tier`` maps to quality: ``triposr`` → low,
+        ``trellis`` → high. Degrades honestly when the backend is not provisioned.
         """
-        return _not_provisioned(
-            "single-photo backend not yet wired (RE-17). "
-            "Check reveng_status() for TripoSR/TRELLIS availability."
+        s = _load_session(session_id)
+        if s is None:
+            return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        quality = "high" if str(tier).lower() in ("trellis", "high") else "low"
+        # Prefer first image in session images/ as the source photo
+        images = _session_image_paths(session_id)
+        if not images:
+            return _dumps({
+                "ok": False,
+                "reason": "no_images",
+                "hint": "reveng_add_images first with a single photo path",
+            })
+        image_path = images[0]
+        try:
+            from engine_oracle.vision.single_photo import (  # noqa: PLC0415
+                reconstruct_single_photo,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _not_provisioned(
+                f"single-photo backend not available ({exc}). "
+                "Check reveng_status() for TripoSR/TRELLIS provisioning."
+            )
+        try:
+            result = reconstruct_single_photo(
+                image_path,
+                session_id,
+                quality=quality,
+                output_dir=str(_session_path(session_id) / "mesh"),
+            ) or {}
+        except Exception as exc:  # noqa: BLE001
+            return _dumps({
+                "ok": False,
+                "reason": f"single_photo error: {exc}",
+                "honesty": {"approximate": True},
+            })
+        # Always tag honesty.approximate for single-photo
+        s = _load_session(session_id) or s
+        s.setdefault("honesty", {})
+        s["honesty"]["approximate"] = True
+        s["honesty"]["single_photo_tier"] = (
+            result.get("backend") or ("trellis" if quality == "high" else "triposr")
         )
+        if result.get("ok") and result.get("mesh_path"):
+            s.setdefault("artifacts", {})
+            s["artifacts"]["mesh_path"] = result["mesh_path"]
+            s["stages"]["reconstruct"] = "done"
+        s["provenance"].append({
+            "step": "reveng_single_photo",
+            "tier": tier,
+            "quality": quality,
+            "ok": bool(result.get("ok")),
+            "ts": _now_iso(),
+        })
+        _save_session(s)
+        # Surface honesty on the response envelope
+        out = dict(result)
+        out.setdefault("honesty", "approximate")
+        out["session_id"] = session_id
+        return _dumps(out)
 
     @mcp.tool()
     def reveng_fit_primitives(session_id: str) -> str:
         """Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.).
 
         Returns ``aicad.reveng_fits/1`` (contracts/reveng.md §3) when the mesh is ready.
-        Returns ``backend_not_provisioned`` until RE-17 wires the fit-primitives DAG step.
+        Persists fits.json on the session for reverse_engineer(hints=…) / n_parametric.
         """
-        return _not_provisioned(
-            "primitive fitting not yet wired (RE-17). "
-            "Run reveng_reconstruct first to produce a mesh, then RE-17 enables this."
-        )
+        s = _load_session(session_id)
+        if s is None:
+            return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        mesh_path = (s.get("artifacts") or {}).get("mesh_path")
+        if not mesh_path:
+            return _dumps({
+                "ok": False,
+                "reason": "no_mesh",
+                "hint": "Run reveng_reconstruct (or reveng_single_photo) first to produce a mesh.",
+            })
+        try:
+            from engine_oracle.vision.segment_fit import segment_fit  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001
+            return _not_provisioned(
+                f"segment_fit unavailable ({exc}). pip install open3d"
+            )
+        try:
+            fits = segment_fit(mesh_path, session_id=session_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            return _dumps({"ok": False, "reason": f"segment_fit error: {exc}"})
+        if not fits.get("ok"):
+            return _dumps(fits if isinstance(fits, dict) else {
+                "ok": False, "reason": "segment_fit failed",
+            })
+        fits_path = _session_path(session_id) / "fits.json"
+        try:
+            fits_path.write_text(_json.dumps(fits, indent=2))
+        except Exception:  # noqa: BLE001
+            fits_path = None  # type: ignore[assignment]
+        s = _load_session(session_id) or s
+        s.setdefault("artifacts", {})
+        if fits_path is not None:
+            s["artifacts"]["fits_path"] = str(fits_path)
+        s["stages"]["model"] = "fitting"
+        s["provenance"].append({
+            "step": "reveng_fit_primitives",
+            "n_fits": len(fits.get("fits") or []),
+            "ts": _now_iso(),
+        })
+        _save_session(s)
+        return _dumps(fits)
 
     @mcp.tool()
     def reveng_build_parametric(
@@ -954,39 +1489,90 @@ def register_reveng_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Build an editable parametric model from the reconstructed mesh.
 
+        strategy:
+          - ``deterministic`` (default) — reverse_engineer with fit hints
+          - ``ml`` — CAD-Recode build_parametric (engine_oracle.vision.cad_recode)
+          - ``override_approximate`` — allow parametric on single-photo meshes
+            (honesty gate only; rebuild strategy stays deterministic)
+
         Refuses when ``session.honesty.approximate`` is true unless
         ``strategy = "override_approximate"``.
-        Returns ``backend_not_provisioned`` until RE-17 wires the DAG.
         """
         s = _load_session(session_id)
-        if s is not None:
-            if s.get("honesty", {}).get("approximate") and strategy != "override_approximate":
-                return _dumps({
-                    "ok": False,
-                    "reason": "session marked approximate (single-photo tier)",
-                    "hint": (
-                        "Parametric modeling from a single-photo mesh is unreliable. "
-                        "Pass strategy='override_approximate' to force, or capture "
-                        "multi-view images and run reveng_reconstruct instead."
-                    ),
-                })
         if s is None:
             return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        strat_in = (strategy or "deterministic").strip().lower()
+        if s.get("honesty", {}).get("approximate") and strat_in != "override_approximate":
+            return _dumps({
+                "ok": False,
+                "reason": "session marked approximate (single-photo tier)",
+                "hint": (
+                    "Parametric modeling from a single-photo mesh is unreliable. "
+                    "Pass strategy='override_approximate' to force, or capture "
+                    "multi-view images and run reveng_reconstruct instead."
+                ),
+            })
+        # Map honesty override to deterministic rebuild; ml is explicit.
+        rebuild_strategy = "deterministic" if strat_in in (
+            "override_approximate", "deterministic", "",
+        ) else strat_in
+        if rebuild_strategy not in ("deterministic", "ml"):
+            return _dumps({
+                "ok": False,
+                "reason": f"unknown strategy {strategy!r}",
+                "hint": "use strategy='deterministic' or strategy='ml'",
+            })
+
+        # Prefer a direct agent_fn call for the parametric node so strategy is
+        # honoured without requiring dense capability just to launch the mission.
+        mesh_path = (s.get("artifacts") or {}).get("mesh_path")
+        if not mesh_path:
+            # Fall back to full mission when no mesh yet (will degrade honestly).
+            try:
+                caps = (_reveng_status() or {}).get("capabilities", {})
+            except Exception:  # noqa: BLE001
+                caps = {}
+            if not caps.get("dense"):
+                return _not_provisioned(
+                    "parametric build needs a mesh (no dense/mesh capability and no "
+                    "session artifacts.mesh_path). Run reveng_reconstruct first."
+                )
+            try:
+                result = _launch_reveng_mission(
+                    session_id, "reveng_scan", _SCAN_NODE_STAGE,
+                    strategy=rebuild_strategy,
+                )
+                return _dumps({"ok": True, **result})
+            except Exception as e:
+                return _err(e)
+
+        # Direct n_parametric via the real agent_fn
         try:
-            caps = (_reveng_status() or {}).get("capabilities", {})
-        except Exception:  # noqa: BLE001
-            caps = {}
-        # Parametric build needs at least a reconstructed/dense mesh to fit against.
-        if not caps.get("dense"):
-            return _not_provisioned(
-                "parametric build backend not provisioned (no dense/mesh capability). "
-                "Run reveng_reconstruct + reveng_fit_primitives first; check reveng_status()."
+            agent_fn = _make_pipeline_agent_fn(
+                session_id, strategy=rebuild_strategy,
             )
-        try:
-            result = _launch_reveng_mission(session_id, "reveng_scan", _SCAN_NODE_STAGE)
-            return _dumps({"ok": True, **result})
+            res = agent_fn(
+                "build parametric",
+                {"node_id": "n_parametric", "session_id": session_id},
+            )
+            payload = getattr(res, "result", None) or {}
+            ok = bool(getattr(res, "success", False))
+            out = {
+                "ok": ok,
+                "strategy": rebuild_strategy,
+                "session_id": session_id,
+            }
+            if isinstance(payload, dict):
+                out.update(payload)
+            if not ok and "reason" not in out and "error" not in out:
+                out["reason"] = (
+                    payload.get("detail") if isinstance(payload, dict)
+                    else "parametric build failed"
+                )
+            return _dumps(out)
         except Exception as e:
             return _err(e)
+
 
     # ── §8.2 WRITE — session management ─────────────────────────────────────
 

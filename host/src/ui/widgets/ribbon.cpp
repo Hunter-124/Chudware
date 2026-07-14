@@ -246,6 +246,11 @@ static float ribbon_wrapLabel(const char* label, std::string& l1, std::string& l
     return w1 > w2 ? w1 : w2;
 }
 
+// C25: snap to nearest integer pixel for crisp atlas rendering.
+// Declared early so measure helpers (ribbon_bigBtnW / ribbon_smBtnW) and all button
+// draw paths share the same pixel-grid math.
+static inline float snap(float v) { return std::floor(v + 0.5f); }
+
 // Width of a big button in screen pixels.
 // §2.1: ribbon_wrapLabel returns a CalcTextSize result (already screen-px / DPI-scaled), so the
 // label width is computed entirely in screen px (kBigLblPad scaled once) and clamped against the
@@ -261,14 +266,17 @@ static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop)
     // The dropdown arrow sits in a bottom strip (bottom-right corner), so a split button is exactly
     // as wide as a plain one — never fattened. hasDrop kept for call-site stability.
     (void)hasDrop;
-    return base;
+    // Pixel-snap so measure, hit, fill, and content-centering all share one integer width at
+    // every uiScale (1.0 / 1.25 / 1.5) — fractional widths were the root of tile misalignment.
+    return snap(base);
 }
 
 // Width of a small button in screen pixels.
 // Mirrors the hit/draw geometry in ribbon_smBtn (icon + 4px gap + label + trailing pad).
 static float ribbon_smBtnW(const char* label) {
     float s = ui::uiScale;
-    return kSmIconSz * s + 4.0f * s + ImGui::CalcTextSize(label).x + 8.0f * s;
+    // Snap so column packing, hit rect, fill, and content centering share one integer width.
+    return snap(kSmIconSz * s + 4.0f * s + ImGui::CalcTextSize(label).x + 8.0f * s);
 }
 
 // C25c FIX (defect 1): a small-button stack flows top->bottom then wraps into a new column.
@@ -305,8 +313,8 @@ static float ribbon_columnsTotalW(const std::vector<SmColumn>& cols) {
 // How many small rows fit vertically in the body small-zone.
 static int ribbon_rowsPerCol() {
     float s = ui::uiScale;
-    float smZoneH = (kBodyH - kCaptionH) * s;
-    int n = (int)std::floor(smZoneH / (kSmRowH * s));
+    float smZoneH = snap((kBodyH - kCaptionH) * s);
+    int n = (int)std::floor(smZoneH / snap(kSmRowH * s));
     return n < 1 ? 1 : n;
 }
 
@@ -322,9 +330,6 @@ struct RibbonGroup {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-// C25: snap to nearest integer pixel for crisp atlas rendering.
-static inline float snap(float v) { return std::floor(v + 0.5f); }
 
 // Glass v2.1: the ribbon stays a SOLID chrome band (locked design — no frosting over the
 // viewport), but it subtly adopts the Global glass group's user tint so the shell follows the
@@ -451,7 +456,8 @@ static float ribbon_bigBtnAsSmallWMax(const RibbonGroup& grp, const ui::RibbonCm
         for (const auto* sc : grp.subCmds)
             if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
                 w = ImMax(w, ribbon_smBtnW(sc->label));
-        w += kDropArrowW * s;
+        // Snap the trailing arrow slot so mainW + dropW == totalW on the pixel grid.
+        w += snap(kDropArrowW * s);
     }
     return w;
 }
@@ -839,7 +845,14 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
     float shineMul = !enabled ? 0.35f : (hovered ? 0.95f : 0.55f);
     ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(lineA * 255));
-    if (inset) { p0.y += 1.0f; p1.y -= 1.0f; }
+    if (inset) {
+        // Scale-aware 1px vertical inset so stacked rows don't share an edge pixel at any DPI.
+        // (Was hard-coded 1.0f — under-inset at 125%/150% and left a fractional mismatch vs
+        // the hit/content rect which never shrank.)
+        const float ins = snap(1.0f * ui::uiScale);
+        p0.y += ins;
+        p1.y -= ins;
+    }
     // Colored gradient background: a faint neutral base plus a top->bottom accent wash so every
     // button reads as tinted "liquid glass" in the app color, brightening on hover.
     float baseA    = !enabled ? 0.04f : (hovered ? 0.10f : 0.06f);
@@ -891,11 +904,18 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                            float wOverride = -1.0f, bool highlight = false,
                            bool finishBadge = false) {
     float s   = ui::uiScale;
-    float bw  = wOverride >= 0.0f ? wOverride : ribbon_bigBtnW(cmd_id, label, hasDrop);
-    float bh  = (kBodyH - kCaptionH) * s;
+    // ONE snapped geometry rect for hit / fill / content. Measure helpers already snap widths;
+    // re-snap here so a fractional wOverride (or unsapped caller) cannot desync the three.
+    float bw  = snap(wOverride >= 0.0f ? wOverride : ribbon_bigBtnW(cmd_id, label, hasDrop));
+    float bh  = snap((kBodyH - kCaptionH) * s);
     float rnd = ui::metrics::ribbonBtnRound();
 
+    // Pixel-snap origin so the tile lands on the grid even when the group cursor is fractional
+    // (SetCursorPos(bx) at non-integer uiScale). Hit, fill, and content all start from this.
     ImVec2 p0 = ImGui::GetCursorScreenPos();
+    p0.x = snap(p0.x);
+    p0.y = snap(p0.y);
+    ImGui::SetCursorScreenPos(p0);
     ImGui::PushID(cmd_id);
 
     bool clicked     = false;
@@ -911,21 +931,24 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // tucked into the bottom-RIGHT corner (under the icon, right side). The button keeps its natural
     // width (never fattened) and the taller body (kBodyH bump) gives the 2-line caption room so it is
     // no longer clipped by the strip.
-    float dropH = hasDrop ? 12.0f * s : 0.0f;
-    clicked = ImGui::InvisibleButton("##main", ImVec2(bw, bh - dropH));
+    // dropH is snapped so mainH + dropH == bh exactly (no fractional seam between hit strips).
+    float dropH = hasDrop ? snap(12.0f * s) : 0.0f;
+    float mainH = bh - dropH;
+    clicked = ImGui::InvisibleButton("##main", ImVec2(bw, mainH));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
     bool mainPress  = ImGui::IsItemActive();
     bool dropHov    = false;
 
     if (hasDrop) {
-        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + bh - dropH));
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + mainH));
         dropClicked = ImGui::InvisibleButton("##drop", ImVec2(bw, dropH));
         dropHov = ImGui::IsItemHovered();
         if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Same snapped p0 + (bw, bh) used for fill, active outline, press, and content clip.
     const ImVec2 p1(p0.x + bw, p0.y + bh);
 
     // State layering: liquid-glass rest/hover fill → bold active outline → press overlay.
@@ -950,7 +973,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         // Dropdown arrow: bottom strip, tucked to the RIGHT (under the icon, right side). Its own
         // strip sits below the caption block, so it never overlaps the text.
         float ax = snap(p0.x + bw - 8.0f * s);
-        float ay = p0.y + bh - dropH * 0.5f;
+        float ay = snap(p0.y + mainH + dropH * 0.5f);
         ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
         float hs = 3.5f * s;
@@ -968,7 +991,9 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(2);
 
-    // Draw icon + label — vertically centered within the button body.
+    // Draw icon + label — vertically centered within the CONTENT rect (full tile minus drop strip).
+    // Content uses the same p0/bw/mainH as the hit/fill rect so the block cannot drift relative
+    // to the background tile (the prior bug: fractional p0 + independent snap on cx/iy only).
     // Block = iconSz + optional swatch bar (4px+gap) + label lines. Centered with ≥3px edge pad.
     {
         float iconSz = snap(kBigIconSz * s);
@@ -986,12 +1011,12 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         float labelH  = nLines > 0 ? (lineH * (float)nLines + 2.0f * s + swatchH) : 0.0f;
         float blockH  = iconSz + labelH;
         // Vertical centering excludes the bottom arrow strip so icon+label never collide with it.
-        float bhContent = bh - dropH;
+        // mainH is the same snapped value used for the main hit strip.
         float iy;
         if (visibleLabel[0] == '\0') {
-            iy = snap(p0.y + (bhContent - iconSz) * 0.5f);
+            iy = snap(p0.y + (mainH - iconSz) * 0.5f);
         } else {
-            iy = snap(p0.y + (bhContent - blockH) * 0.5f);
+            iy = snap(p0.y + (mainH - blockH) * 0.5f);
             if (iy < p0.y + 3.0f * s) iy = snap(p0.y + 3.0f * s);
         }
 
@@ -1001,7 +1026,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
         // applies. The label below is nudged down (see ty) so the bar never overlaps the text.
         if (matRgb) {
-            float swW = 20.0f * s, swH = 4.0f * s;
+            float swW = snap(20.0f * s), swH = snap(4.0f * s);
             float sx0 = snap(cx - swW * 0.5f);
             float sy0 = snap(iy + iconSz + 1.0f * s);
             ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
@@ -1015,14 +1040,16 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
 
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
-        float ty = iy + iconSz + swatchH + 2.0f * s;
-        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + bw, p0.y + bh - dropH), true);
+        float ty = snap(iy + iconSz + swatchH + 2.0f * s);
+        // Clip to the content rect (same as main hit) so labels never spill into the drop strip.
+        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + bw, p0.y + mainH), true);
         if (visibleLabel[0] != '\0') {
             ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
-            dl->AddText(nullptr, 0.0f, ImVec2(cx - t1.x * 0.5f, ty), tCol, l1.c_str());
+            dl->AddText(nullptr, 0.0f, ImVec2(snap(cx - t1.x * 0.5f), ty), tCol, l1.c_str());
             if (!l2.empty()) {
                 ImVec2 t2 = ImGui::CalcTextSize(l2.c_str());
-                dl->AddText(nullptr, 0.0f, ImVec2(cx - t2.x * 0.5f, ty + lineH), tCol, l2.c_str());
+                dl->AddText(nullptr, 0.0f, ImVec2(snap(cx - t2.x * 0.5f), snap(ty + lineH)),
+                            tCol, l2.c_str());
             }
         }
         dl->PopClipRect();
@@ -1056,7 +1083,8 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
 // row height). Layout MUST advance sy by this value, not kSmRowH*s, or these taller rows overlap.
 static float ribbon_bigBtnAsSmallRowH() {
     float s = ui::uiScale;
-    return ImMax(snap((kBodyH - kCaptionH) * s / 3.0f), kSmRowH * s);
+    // Snap both candidates so row advance, hit, and fill share one integer height.
+    return ImMax(snap((kBodyH - kCaptionH) * s / 3.0f), snap(kSmRowH * s));
 }
 
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
@@ -1069,10 +1097,17 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     // §2.2 (same fix as ribbon_smBtn): drive the drawn/hit width from the SAME helper the column
     // packer measures with, so measure and draw never disagree.
     // N1-N5: wOverride (widest-variant width) keeps the row stable when the face label changes.
-    float totalW = wOverride >= 0.0f ? wOverride
-                                     : ribbon_smBtnW(label) + (hasDrop ? kDropArrowW * s : 0.0f);
+    // ONE snapped totalW / dropW / mainW for hit, fill, and content (mainW + dropW == totalW).
+    float dropW  = hasDrop ? snap(kDropArrowW * s) : 0.0f;
+    float totalW = snap(wOverride >= 0.0f ? wOverride
+                                          : ribbon_smBtnW(label) + dropW);
+    float mainW  = totalW - dropW;
 
+    // Pixel-snap origin so hit/fill/content share one grid-aligned tile.
     ImVec2 p0 = ImGui::GetCursorScreenPos();
+    p0.x = snap(p0.x);
+    p0.y = snap(p0.y);
+    ImGui::SetCursorScreenPos(p0);
     ImGui::PushID(cmd_id);
 
     bool clicked     = false;
@@ -1083,7 +1118,6 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
 
-    float mainW = hasDrop ? (totalW - kDropArrowW * s) : totalW;
     clicked = ImGui::InvisibleButton("##msm", ImVec2(mainW, rowH));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
@@ -1092,7 +1126,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
 
     if (hasDrop) {
         ImGui::SameLine(0, 0);
-        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(kDropArrowW * s, rowH));
+        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(dropW, rowH));
         dropHov = ImGui::IsItemHovered();
         if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
     }
@@ -1103,16 +1137,16 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     ImVec2 p1_sm(p0.x + totalW, p0.y + rowH);
 
     // State layering: liquid-glass rest/hover → active (bold outline) → press overlay.
-    // inset=true: 1px vertical inset so stacked rows don't share an edge pixel.
+    // inset=true: scale-aware 1px vertical inset so stacked rows don't share an edge pixel.
     // (Compact horizontal row: no room to stack the arrow under the 20px icon, so the arrow
-    // keeps its trailing slot here — the row is left-aligned so centering is unaffected.)
+    // keeps its trailing slot here — content is centered inside mainW, not the full totalW.)
     ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled, /*inset=*/true,
                    /*hovered=*/(mainHov || dropHov) && enabled);
     if (isActiveSm) ribbon_btnActive(dl_sm, p0, p1_sm, rnd_sm);
 
     if (hasDrop) {
-        float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
-        float ay = p0.y + rowH * 0.5f;
+        float ax = snap(p0.x + mainW + dropW * 0.5f);
+        float ay = snap(p0.y + rowH * 0.5f);
         ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
         float hs = 3.0f * s;
@@ -1131,6 +1165,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
         // Center the icon+text block horizontally within the main (non-arrow) area.
+        // Content rect is [p0.x, p0.x+mainW] × [p0.y, p0.y+rowH] — same as the main hit strip.
         const float matPad   = matRgb ? 6.0f * s : 0.0f;
         const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
         const float xoff     = snap(ImMax(2.0f * s, (mainW - contentW) * 0.5f));
@@ -1140,7 +1175,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
                     ribbon_isActive(cmd_id));
         if (matRgb) {
             // Vertical color swatch strip to the left of the icon (compact row layout).
-            float stW = 4.0f * s, stH = 14.0f * s;
+            float stW = snap(4.0f * s), stH = snap(14.0f * s);
             float stx = snap(p0.x + xoff);
             float sty = snap(p0.y + (rowH - stH) * 0.5f);
             ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
@@ -1155,7 +1190,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         float ty  = snap(p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
-        dl->PushClipRect(ImVec2(tx, p0.y), ImVec2(p0.x + mainW, p0.y + rowH), true);
+        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + rowH), true);
         dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label);
         dl->PopClipRect();
     }
@@ -1408,15 +1443,20 @@ static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
 static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
                           const char* label, bool enabled, float wOverride = -1.0f) {
     float s      = ui::uiScale;
-    float rowH   = kSmRowH * s;
-    float iconSz = kSmIconSz * s;
+    // ONE snapped geometry for hit / fill / content — same integer totalW and rowH at every scale.
+    float rowH   = snap(kSmRowH * s);
+    float iconSz = snap(kSmIconSz * s);
     // §2.2: drive the drawn/hit width from the SAME helper the packer measures with, so measure
     // and draw never disagree (previously the helper returned text+18*s but this drew text+10*s).
     // wOverride >= 0 draws at the COLUMN width so every small button in a stacked column shares one
     // edge (clean, aligned display) instead of each hugging its own label width.
-    float totalW = wOverride >= 0.0f ? wOverride : ribbon_smBtnW(label);
+    float totalW = snap(wOverride >= 0.0f ? wOverride : ribbon_smBtnW(label));
 
+    // Pixel-snap origin so the background tile and content share one grid-aligned rect.
     ImVec2 p0 = ImGui::GetCursorScreenPos();
+    p0.x = snap(p0.x);
+    p0.y = snap(p0.y);
+    ImGui::SetCursorScreenPos(p0);
     ImGui::PushID(cmd_id);
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
@@ -1431,8 +1471,8 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     ImGui::PopStyleVar();
 
     // State layering: liquid-glass rest/hover (unified with big buttons) → active (bold
-    // outline) → press overlay. inset=true: 1px vertical inset so stacked small rows don't
-    // share a grid-line edge.
+    // outline) → press overlay. inset=true: scale-aware 1px vertical inset so stacked small
+    // rows don't share a grid-line edge. Fill uses the same p0/totalW/rowH as the hit rect.
     {
         ImDrawList* dl_s = ImGui::GetWindowDrawList();
         float rnd_s = ui::metrics::ribbonBtnRound();
@@ -1449,19 +1489,19 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
 
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        float snappedIconSz = snap(iconSz);
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
-        // Center the icon+text block horizontally within the (column-wide) button.
+        // Center the icon+text block horizontally within the (column-wide) button — same totalW
+        // as hit/fill, so content cannot drift relative to the background tile.
         const float matPad   = matRgb ? 6.0f * s : 0.0f;
-        const float contentW = matPad + snappedIconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
+        const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
         const float xoff     = snap(ImMax(0.0f, (totalW - contentW) * 0.5f));
         float ix  = snap(p0.x + xoff + matPad);
-        float iy  = snap(p0.y + (rowH - snappedIconSz) * 0.5f);
-        ribbon_icon(dl, iconName, ix + snappedIconSz * 0.5f, iy + snappedIconSz * 0.5f,
-                    snappedIconSz, enabled, ribbon_isActive(cmd_id));
+        float iy  = snap(p0.y + (rowH - iconSz) * 0.5f);
+        ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f,
+                    iconSz, enabled, ribbon_isActive(cmd_id));
         if (matRgb) {
             // Vertical color swatch strip to the left of the icon.
-            float stW = 4.0f * s, stH = 14.0f * s;
+            float stW = snap(4.0f * s), stH = snap(14.0f * s);
             float stx = snap(p0.x + xoff);
             float sty = snap(p0.y + (rowH - stH) * 0.5f);
             ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
@@ -1472,7 +1512,7 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
                         ui::Palette::toU32(ui::palette.border), 1.0f * s, 0,
                         ui::metrics::stroke(1.0f));
         }
-        float tx  = snap(ix + snappedIconSz + 4.0f * s);
+        float tx  = snap(ix + iconSz + 4.0f * s);
         float ty  = snap(p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
@@ -1893,7 +1933,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         ImGui::SetCursorPos(ImVec2(sx, sy));
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
                                      col.width);
-                        sy += kSmRowH * s;
+                        sy += snap(kSmRowH * s);
                     }
                     sx += col.width;
                 }
@@ -1946,7 +1986,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                                      col.width);
                     }
                     // §2.3: degraded big rows are taller than kSmRowH — advance by the actual height.
-                    sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : kSmRowH * s;
+                    sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : snap(kSmRowH * s);
                 }
                 sx += col.width;
             }

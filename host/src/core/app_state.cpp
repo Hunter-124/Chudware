@@ -178,6 +178,7 @@ void loadSettings(Settings& s) {
         s.contextWindow = j.value("context_window", 0);
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
+        s.orthographic = j.value("orthographic", true);
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
         s.partsGridView = j.value("parts_grid_view", false);
         s.partsSortMode = j.value("parts_sort_mode", 0);
@@ -300,6 +301,7 @@ void saveSettings(const Settings& s) {
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
+    j["orthographic"] = s.orthographic;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
     j["parts_grid_view"] = s.partsGridView;
     j["parts_sort_mode"] = s.partsSortMode;

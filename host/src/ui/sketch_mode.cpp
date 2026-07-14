@@ -6247,18 +6247,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // the edge, feed the negated outward vector as the grab delta.
                 float gx = -ox * kDragPanMaxPx * dt;
                 float gy = -oy * kDragPanMaxPx * dt;
-                const float deg = 3.14159265f / 180.0f;
-                const float fov = Renderer::kFovDeg * deg;
-                float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-                float dist = st.renderer->effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
-                float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
-                float yr = st.yaw * deg, pr = st.pitch * deg;
-                Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-                Vec3 wUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
-                                           std::sin(pr) * std::cos(yr), std::cos(pr)));
-                Vec3 V = normalize(vdir);
-                Vec3 R = normalize(cross(wUp, V));
-                Vec3 U = normalize(cross(V, R));
+                // Camera seam: worldPerPixel + published basis (works for ortho and perspective).
+                float worldPerPx = st.renderer->worldPerPixel(vh);
+                const auto& cam = st.renderer->camera();
+                Vec3 R = cam.right;
+                Vec3 U = cam.up;
                 st.pan[0] += (-R.x * gx + U.x * gy) * worldPerPx;
                 st.pan[1] += (-R.y * gx + U.y * gy) * worldPerPx;
                 st.pan[2] += (-R.z * gx + U.z * gy) * worldPerPx;

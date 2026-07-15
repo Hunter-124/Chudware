@@ -184,14 +184,17 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
     if role == "ecad_engineer":
         return (
             "PRODUCE this deliverable's ECAD artifacts with the engine tools — "
-            "not prose. Entry path: ecad_new_schematic → place/wire parts "
-            "(ecad_find_part / part_search + ecad_place_symbol + ecad_wire) → "
-            "ecad_run_erc → ecad_simulate (3V3 OP when in scope) → "
-            "board_from_schematic → ecad_run_drc. Antenna/RF when required: "
-            "ecad_antenna_design + ecad_antenna_analyze (honest SKIP with "
-            "provision note if backend absent). ledger_note every artifact "
-            "(sch/board doc_id). Do not declare done without schematic + board "
-            "tool evidence (or a blocked handoff naming the tool failure)."
+            "not prose. Entry path (forced order): ecad_new_schematic → "
+            "ecad_find_part + ecad_place_symbol → ecad_wire + ecad_add_power "
+            "(nets REQUIRED before SPICE; place-only yields empty netlist) → "
+            "ecad_run_erc → ecad_simulate OP on 3V3 (measure V(3V3)) → "
+            "board_from_schematic → ecad_run_drc. After place/wire the next "
+            "tools MUST be board_from_schematic then ecad_run_drc — schematic+place "
+            "alone is NOT done. Antenna/RF when required: ecad_antenna_design + "
+            "ecad_antenna_analyze (honest SKIP with provision note if backend "
+            "absent). ledger_note every artifact (sch/board doc_id). Do not "
+            "declare done without schematic + board tool evidence (or a blocked "
+            "handoff naming the tool failure)."
         )
     if role == "firmware_engineer":
         return (
@@ -210,13 +213,40 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
             "criteria (anchor first, then solve, then compare). Record "
             "verdicts with numbers — do not invent outcomes."
         )
-    # Mechanical / default BUILD
+    # Mechanical / default BUILD — concrete airframe geometry guidance (mega-13 AC1)
+    name = str(d.get("name") or d.get("id") or "").lower()
+    desc = str(d.get("description") or "").lower()
+    blob = f"{name} {desc}"
+    if any(k in blob for k in (
+        "airframe", "rocket", "fuselage", "payload", "body_tube", "boost",
+    )):
+        return (
+            "BUILD the boost-glide airframe as editable CAD features (not a "
+            "hollow placeholder). Concrete geometry targets (use these dims "
+            "unless ledger DIMs override): "
+            "(1) body tube: revolve or extrude OD≈60 mm, wall≥1.5 mm, length≈520 mm "
+            "overall with nose ogive ≈90 mm; "
+            "(2) motor mount aft: tube ID≈29 mm OD≈32 mm length≈200 mm; "
+            "(3) payload bay for FC: internal clear ≥56×86×20 mm (board envelope "
+            "50×80×1.6 + component height; AC2 bay ≥ board); bay lid ≈2 mm; "
+            "4× M2 mount bosses on 44×74 mm pattern raised ≈3 mm from bay floor; "
+            "(4) wing/glide surface: span≈400 mm, root chord≈100 tip≈60, thickness≈3 mm; "
+            "(5) 3 fins aft: root≈70 tip≈35 span≈55 thickness≈2.5 mm. "
+            "Feature order: new_part → add_features solid body (revolve/extrude shell "
+            "with real wall thickness — no zero-thickness sheets) → bay pocket/cut → "
+            "fins/wing as pads or extrudes → measure_part volume. "
+            "Keep walls ≥1.5 mm, manifold closed solid, volume large enough for bay "
+            "(order 1e5 mm³ class). After solids exist run verify_battery(doc_id) and "
+            "record honest PASS/WARN/FAIL — do not declare done without battery or "
+            "check tool evidence."
+        )
     return (
         "build this deliverable's geometry with the engine tools so every "
-        "acceptance criterion can pass. After the solid exists, run "
-        "verify_battery(doc_id) (or check_feature_overlap) and record the "
-        "honest PASS/WARN/FAIL — do not declare done without a battery or "
-        "check tool run."
+        "acceptance criterion can pass. Prefer real wall thicknesses (≥1.5 mm), "
+        "closed manifold solids, and named features (box/revolve/extrude/cut) — "
+        "not empty shells. After the solid exists, run verify_battery(doc_id) "
+        "(or check_feature_overlap) and record the honest PASS/WARN/FAIL — do "
+        "not declare done without a battery or check tool run."
     )
 
 

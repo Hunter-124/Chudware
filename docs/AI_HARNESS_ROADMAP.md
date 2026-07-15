@@ -248,3 +248,22 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   PASS** (add_features ok, fw ELF, battery doc_id, clean stop). Residuals: board
   force-tool chain; AC5 empty netlist; AC9 missing legs; typed-refusal live.
   Findings: `reports/runs/mega-12/findings.md`.
+
+
+- 2026-07-15 mega-13 (WS5): board-chain + AC expansion under
+  `reports/runs/mega-13/` (`mega-13-fc-rocket-20260715`). Baseline `6894f19d`.
+  Fixer13 (DustyGibbon) bound ECAD force-chain + wire-before-SPICE + AC9 leg
+  mapping + airframe BUILD brief (70p) + post-launch frontier rank floor /
+  empty-tool product done block. Preflight PASS: hostd running==disk
+  (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`; spawn_probe with ECAD
+  chain tools; auto_pick leaves→ollama. Attempt-1 (ollama-all, measured
+  grok-4.5 rank=1) and attempt-2 (API Model not found: grok-4-5) archived.
+  **Attempt-3** pid 3500779 wall **610.86s** (harness user rank override
+  grok-4.5=5), terminal `needs_correction`/`verify_failed: [AC1,AC4,AC5]`
+  (**AC2+AC3+AC6+AC7+AC8+AC9 PASS**). Scoreboard: **Q PASS** (6 live PASS),
+  **P FAIL** (schematic+place×6; board_from_schematic/DRC still 0; force-chain
+  residual), **R FAIL** (empty-netlist SPICE; no wire tools), **N PASS** /
+  **O FAIL**, **A–M regression PASS** (add_features ok×19, fw ELF
+  `3c1ef7a802cd`, AC9 all 12 legs, battery doc_id). Residuals: live force-chain
+  injection; wire-before-sim; AC1 soft zeros; auto_pick model-id/rank floor.
+  Findings: `reports/runs/mega-13/findings.md`.

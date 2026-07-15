@@ -1,0 +1,3 @@
+Attempt-2: enabled model id grok-4-5 (rank 5) selected by auto_pick but xAI API
+returns HTTP 400 Model not found: grok-4-5. All BUILD/SPECIFY xai nodes died
+provider_auth. API accepts grok-4.5 only.

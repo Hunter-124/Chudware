@@ -34,6 +34,8 @@ def test_ecad_engineer_role_has_domain_tools_and_delegate():
     assert "delegate" in tools
     for must in (
         "ecad_new_schematic",
+        "ecad_wire",
+        "ecad_add_power",
         "board_from_schematic",
         "ecad_run_erc",
         "ecad_run_drc",
@@ -131,6 +133,39 @@ def test_build_job_names_entry_tools():
     job_fw = _build_job_for(fw, "firmware_engineer")
     assert "fw_new_project" in job_fw
     assert "fw_build" in job_fw
+
+
+def test_build_job_ecad_requires_wire_before_sim_and_board():
+    """mega-13: empty-netlist residual — brief must force wire + board chain."""
+    job = _build_job_for(
+        {"id": "DL3", "name": "flight_computer_ecad", "kind": "analysis"},
+        "ecad_engineer",
+    )
+    assert "ecad_wire" in job
+    assert "ecad_add_power" in job
+    assert "board_from_schematic" in job
+    assert "ecad_run_drc" in job
+    # wire before simulate called out
+    assert "empty netlist" in job.lower() or "nets required" in job.lower()
+
+
+def test_build_job_airframe_names_concrete_geometry():
+    """mega-13 AC1: airframe BUILD brief carries dims/features, not hollow shell."""
+    job = _build_job_for(
+        {
+            "id": "DL1",
+            "name": "rocket_plane_airframe",
+            "kind": "part",
+            "description": "boost-glide airframe body tube fins payload bay",
+        },
+        "feature_modeler",
+    )
+    low = job.lower()
+    assert "payload bay" in low or "payload" in low
+    assert "wall" in low
+    assert "new_part" in low and "add_features" in low
+    assert any(x in job for x in ("60", "1.5", "520", "56"))
+    assert "verify_battery" in low
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +468,321 @@ def test_ecad_schematic_then_board_auto_completes(tmp_path, monkeypatch):
         handoff.get("outputs", {}).get("auto_complete") is True
         or handoff.get("outputs", {}).get("tool_calls", 0) >= 2
     )
+
+
+def test_ecad_place_without_wire_bootstrap_incomplete():
+    """mega-13: schematic+place without wire is incomplete (empty netlist)."""
+    from services.agent.agent_turn import _bootstrap_incomplete
+
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True},
+        {"tool": "ecad_place_symbol", "ok": True},
+        {"tool": "ecad_place_symbol", "ok": True},
+    ]
+    allow = {
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire", "ecad_add_power",
+        "board_from_schematic", "ecad_run_drc",
+    }
+    why = _bootstrap_incomplete(calls, allow)
+    assert why is not None
+    assert "wire" in why.lower() or "board_from_schematic" in why.lower()
+
+
+def test_ecad_force_chain_injects_board_after_place(tmp_path, monkeypatch):
+    """mega-13 axis O: after place saturation, scaffold forces board_from_schematic."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega13_ecad_chain", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+    seen_user = []
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            # Capture enablement scaffolds from user messages.
+            for m in messages or []:
+                if m.get("role") == "user":
+                    c = m.get("content")
+                    if isinstance(c, list):
+                        text = " ".join(
+                            (p.get("text") or "") for p in c if isinstance(p, dict)
+                        )
+                    else:
+                        text = str(c or "")
+                    if "[ECAD enablement]" in text:
+                        seen_user.append(text)
+            if seq["n"] == 1:
+                return (
+                    '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```'
+                )
+            if seq["n"] <= 4:
+                return (
+                    '```json\n{"tool":"ecad_place_symbol","args":'
+                    '{"libid":"Device:R","x":0,"y":0}}\n```'
+                )
+            # After scaffolds, model still refuses board — turn ends incomplete.
+            return "still no board"
+
+    def _dispatch(tool, args):
+        if tool == "ecad_new_schematic":
+            return {"ok": True, "doc_id": "sch-m13"}
+        if tool == "ecad_place_symbol":
+            return {"ok": True, "ref": "R1"}
+        if tool == "board_from_schematic":
+            return {"ok": True, "doc_id": "pcb-m13"}
+        return {"ok": True}
+
+    allow = [
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire", "ecad_add_power",
+        "board_from_schematic", "ecad_run_drc", "ledger_get", "ledger_note",
+    ]
+    res = at.run_turn(
+        "Build flight computer schematic and board",
+        _Prov(),
+        name="BUILD DL3",
+        ledger=ledger,
+        allowed_tools=allow,
+        tool_dispatch=_dispatch,
+        max_tool_calls=5,
+        phase="build",
+    )
+    blob = "\n".join(seen_user)
+    assert "board_from_schematic" in blob, blob[:800]
+    assert "ecad_wire" in blob or "ecad_add_power" in blob, blob[:800]
+    # Still not product-success without board call.
+    tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert "board_from_schematic" not in tools_used
+    assert res.success is False or res.result.get("bootstrapped_only") is True
+
+
+def test_ecad_wire_then_board_then_drc_chain(tmp_path, monkeypatch):
+    """Happy path mega-13: wire → board → DRC counts as ECAD product success."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega13_ecad_ok", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            order = [
+                '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```',
+                '```json\n{"tool":"ecad_place_symbol","args":{"libid":"Device:R"}}\n```',
+                '```json\n{"tool":"ecad_wire","args":{"from_ref":"R1","from_pin":"1",'
+                '"to_ref":"R2","to_pin":"1"}}\n```',
+                '```json\n{"tool":"board_from_schematic","args":{}}\n```',
+                '```json\n{"tool":"ecad_run_drc","args":{}}\n```',
+            ]
+            if seq["n"] <= len(order):
+                return order[seq["n"] - 1]
+            return "done"
+
+    def _dispatch(tool, args):
+        if tool == "ecad_new_schematic":
+            return {"ok": True, "doc_id": "sch-1"}
+        if tool == "ecad_place_symbol":
+            return {"ok": True, "ref": "R1"}
+        if tool == "ecad_wire":
+            return {"ok": True, "net": "N1", "net_size": 2}
+        if tool == "board_from_schematic":
+            return {"ok": True, "doc_id": "pcb-1"}
+        if tool == "ecad_run_drc":
+            return {"ok": True, "errors": 0}
+        return {"ok": True}
+
+    res = at.run_turn(
+        "Build schematic wire board DRC",
+        _Prov(),
+        name="BUILD DL3",
+        ledger=ledger,
+        allowed_tools=[
+            "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+            "board_from_schematic", "ecad_run_drc", "ledger_note",
+        ],
+        tool_dispatch=_dispatch,
+        max_tool_calls=6,
+        phase="build",
+    )
+    tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert "ecad_wire" in tools_used
+    assert "board_from_schematic" in tools_used
+    assert "ecad_run_drc" in tools_used
+    assert res.success is True
+
+
+
+def test_auto_pick_frontier_floor_not_demoted_to_ollama():
+    """mega-13: measured grok-4.5 pass_rate=0 must not force ollama on analysis."""
+    from services.agent.role_models import (
+        ModelRank,
+        auto_pick_model,
+        load_rankings,
+    )
+
+    # Simulate measured demotion of dotted id + shipped hyphen alias.
+    ranks = {
+        "grok-4.5": ModelRank(
+            model_id="grok-4.5", rank=4, source="measured",
+            notes="floor", provider="xai", pass_rate=0.0, cycles=4,
+        ),
+        "grok-4-5": ModelRank(
+            model_id="grok-4-5", rank=5, source="shipped",
+            notes="alias", provider="xai",
+        ),
+        "llama3.2:latest": ModelRank(
+            model_id="llama3.2:latest", rank=1, source="shipped",
+            notes="local", provider="ollama",
+        ),
+    }
+    enabled = [
+        {"provider": "xai-sub", "model": "grok-4.5"},
+        {"provider": "xai-sub", "model": "grok-4-5"},
+        {"provider": "ollama", "model": "llama3.2:latest"},
+    ]
+    a = auto_pick_model(
+        task_class="analysis", min_rank=4, rankings=ranks, enabled=enabled,
+    )
+    assert a.provider == "xai-sub", a
+    assert a.model in ("grok-4.5", "grok-4-5"), a
+    assert (a.rank or 0) >= 4, a
+
+
+def test_empty_product_handoff_block_ecad():
+    from services.agent.agent_turn import _empty_product_handoff_block
+
+    msg = _empty_product_handoff_block(
+        {"ecad_new_schematic", "board_from_schematic", "ecad_run_drc"},
+        "BUILD DL3: flight_computer_ecad",
+    )
+    assert msg is not None
+    assert "board_from_schematic" in msg
+
+
+def test_ecad_zero_tool_done_not_accepted(tmp_path, monkeypatch):
+    """mega-13 residual: hollow done with fabricated board ids is rejected."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega13_empty_done", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            if seq["n"] == 1:
+                return (
+                    '```json\n{"status":"done","summary":"board done",'
+                    '"outputs":{"schematic_doc_id":"fake","board_doc_id":"fake2",'
+                    '"artifacts":[],"checks_run":[],"reasoning_summary":"x"}}\n```'
+                )
+            if seq["n"] == 2:
+                return (
+                    '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```'
+                )
+            if seq["n"] == 3:
+                return (
+                    '```json\n{"tool":"board_from_schematic","args":{}}\n```'
+                )
+            return (
+                '```json\n{"status":"done","summary":"ok",'
+                '"outputs":{"artifacts":[],"checks_run":[],'
+                '"reasoning_summary":"wired"}}\n```'
+            )
+
+    def _dispatch(tool, args):
+        if tool == "ecad_new_schematic":
+            return {"ok": True, "doc_id": "sch-1"}
+        if tool == "board_from_schematic":
+            return {"ok": True, "doc_id": "pcb-1"}
+        return {"ok": True}
+
+    res = at.run_turn(
+        "Build flight computer board",
+        _Prov(),
+        name="BUILD DL3: flight_computer_ecad",
+        ledger=ledger,
+        allowed_tools=[
+            "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+            "board_from_schematic", "ecad_run_drc", "ledger_note",
+        ],
+        tool_dispatch=_dispatch,
+        max_tool_calls=6,
+        phase="build",
+    )
+    tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert "ecad_new_schematic" in tools_used or "board_from_schematic" in tools_used
+    # First hollow done must not be the terminal success without tools.
+    if res.success:
+        assert tools_used, "done without tools accepted"
+
+
+def test_ecad_hard_gate_blocks_place_until_wire(tmp_path, monkeypatch):
+    """mega-13 a3 residual: soft nudge ignored — hard-deny thrash place after first."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega13_hard_gate", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            order = [
+                '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```',
+                '```json\n{"tool":"ecad_place_symbol","args":{"libid":"Device:R"}}\n```',
+                # thrash — must be hard-denied
+                '```json\n{"tool":"ecad_place_symbol","args":{"libid":"Device:C"}}\n```',
+                '```json\n{"tool":"ecad_wire","args":{"from_ref":"R1","from_pin":"1",'
+                '"to_ref":"C1","to_pin":"1"}}\n```',
+                '```json\n{"tool":"board_from_schematic","args":{}}\n```',
+                '```json\n{"tool":"ecad_run_drc","args":{}}\n```',
+            ]
+            if seq["n"] <= len(order):
+                return order[seq["n"] - 1]
+            return "done"
+
+    def _dispatch(tool, args):
+        return {"ok": True, "doc_id": "x", "ref": "R1", "net": "N1",
+                "net_size": 2, "errors": 0}
+
+    res = at.run_turn(
+        "Build board",
+        _Prov(),
+        name="BUILD DL3",
+        ledger=ledger,
+        allowed_tools=[
+            "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+            "ecad_add_power", "board_from_schematic", "ecad_run_drc",
+        ],
+        tool_dispatch=_dispatch,
+        max_tool_calls=10,
+        phase="build",
+    )
+    calls = (res.result or {}).get("calls") or []
+    tools = [c.get("tool") for c in calls]
+    assert "ecad_wire" in tools
+    assert "board_from_schematic" in tools
+    assert "ecad_run_drc" in tools
+    assert any(
+        c.get("tool") == "ecad_place_symbol" and c.get("ok") is False
+        and "ECAD chain" in str(c.get("error") or "")
+        for c in calls
+    ), calls

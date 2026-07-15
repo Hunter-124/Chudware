@@ -203,6 +203,18 @@ def _measured_rank_from_pass_rate(pass_rate: float) -> int:
     return 1
 
 
+# Frontier model id stems: measured C1 gym demotions must not collapse live
+# mission auto_pick to ollama (mega-13: grok-4.5 pass_rate=0 → rank 1 → all
+# BUILD nodes fell back to llama3.2). Keep a floor so subscription/API frontier
+# remains eligible for min_rank≥3/4 analysis/assembly work.
+_FRONTIER_RANK_FLOOR_IDS = frozenset({
+    "grok-4.5", "grok-4-5", "grok-4.20", "grok-4",
+    "claude-4", "claude-sonnet-4", "claude-opus-4",
+    "gpt-5", "gemini-2.5-pro",
+})
+_FRONTIER_MEASURED_FLOOR = 4
+
+
 def _load_measured_rankings(
     leaderboard_path: Path | None = None,
 ) -> dict[str, ModelRank]:
@@ -290,11 +302,27 @@ def load_rankings(
         for mid, mr in _load_measured_rankings(leaderboard_path).items():
             base = merged.get(mid)
             notes = mr.notes
+            rank = int(mr.rank)
+            # mega-13: do not let zero-pass gym rows demote frontier models below
+            # the tool-capable band (analysis/assembly min_rank 3–4).
+            mid_l = str(mid).strip().lower()
+            if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
+                mid_l.startswith(stem) for stem in (
+                    "grok-4", "claude-sonnet-4", "claude-opus-4", "gpt-5",
+                    "gemini-2.5-pro",
+                )
+            ):
+                if rank < _FRONTIER_MEASURED_FLOOR:
+                    notes = (
+                        f"{notes}; frontier floor rank>={_FRONTIER_MEASURED_FLOOR} "
+                        f"(was measured {rank}; mega-13 auto_pick)"
+                    )
+                    rank = _FRONTIER_MEASURED_FLOOR
             if base is not None and base.source == "shipped":
-                notes = f"{mr.notes} (was shipped rank {base.rank})"
+                notes = f"{notes} (was shipped rank {base.rank})"
             merged[mid] = ModelRank(
                 model_id=mid,
-                rank=mr.rank,
+                rank=rank,
                 source="measured",
                 notes=notes,
                 provider=mr.provider or (base.provider if base else ""),
@@ -706,6 +734,9 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
     sub = cfg.get("subscription_auth") or {}
     if isinstance(sub, Mapping):
         if "xai-sub" in sub or "xai" in sub:
+            # API model id is dotted grok-4.5 (hyphen grok-4-5 → HTTP 400
+            # "Model not found" on attempt-2). Measured demotion is floored
+            # to rank>=4 in load_rankings so auto_pick still selects it.
             _add("xai-sub", "grok-4.5")
         if "anthropic-sub" in sub or "claude" in sub:
             _add("anthropic-sub", "claude-sonnet-4")

@@ -978,3 +978,113 @@ def test_live_ac7_injects_project_id_from_ledger(monkeypatch):
     results = re.run_acceptance_checks(manifest, led)
     assert results["AC7"] == re.PASS, (results, seen)
     assert seen.get("project_id") == "bc70b9ea15b4", seen
+
+
+# ---------------------------------------------------------------------------
+# mega-13 AC9 — plan / trace_opt / power legs from real ledger evidence
+# ---------------------------------------------------------------------------
+
+
+def test_ac9_plan_from_stage_entered():
+    """Pipeline stage=plan with entered maps to plan WARN/PASS (not missing)."""
+    from services.agent import reviewer_exec as re
+    from services.agent.mission_criteria import ROCKET_PLANE_LEGS
+
+    led = _MemLedger()
+    led.append("pipeline", "stage", {
+        "stage": "plan",
+        "entered": "2026-07-15T04:02:50Z",
+        "exited": None,
+        "exit_gate": None,
+    })
+    # Seed other legs so only plan was the previous residual class.
+    for leg in ROCKET_PLANE_LEGS:
+        if leg == "plan":
+            continue
+        led.append("builder", "decision", {"leg": leg, "verdict": "PASS"})
+    evidence = re.grade_report_card_from_ledger(
+        led, {"legs": list(ROCKET_PLANE_LEGS)},
+    )
+    assert evidence["leg_verdicts"].get("plan") in ("PASS", "WARN"), evidence
+    v, d = re.evaluate_pass_rule(
+        "all legs have PASS|WARN|FAIL|SKIP", evidence,
+    )
+    assert v == re.PASS, (v, d, evidence["leg_verdicts"])
+
+
+def test_ac9_power_from_battery_power_budget():
+    """Battery power_budget check PASSes the power report-card leg."""
+    from services.agent import reviewer_exec as re
+
+    led = _MemLedger()
+    led.append("reviewer", "battery_result", {
+        "verdict": "FAIL",
+        "ok": False,
+        "checks": [
+            {"name": "power_budget", "verdict": "PASS", "score": 1.0},
+            {"name": "is_manifold", "verdict": "PASS", "score": 1.0},
+        ],
+        "evidence": {"scores": {"power_budget": 1.0}},
+    })
+    evidence = re.grade_report_card_from_ledger(
+        led, {"legs": ["power", "airframe"]},
+    )
+    assert evidence["leg_verdicts"].get("power") == "PASS", evidence
+    assert evidence["leg_verdicts"].get("airframe") == "FAIL", evidence
+
+
+def test_ac9_trace_opt_warn_when_board_pass_without_optimize():
+    """Board path without ecad_optimize_traces → trace_opt WARN (honest residual)."""
+    from services.agent import reviewer_exec as re
+
+    led = _MemLedger()
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "board_from_schematic",
+        "ok": True,
+        "result": {"ok": True, "doc_id": "pcb-1"},
+    })
+    evidence = re.grade_report_card_from_ledger(
+        led, {"legs": ["board", "trace_opt"]},
+    )
+    assert evidence["leg_verdicts"].get("board") == "PASS", evidence
+    assert evidence["leg_verdicts"].get("trace_opt") == "WARN", evidence
+
+
+def test_ac9_mega12_residual_legs_grade_from_live_shaped_ledger():
+    """Regrade shape of mega-12 missing plan/trace_opt/power → covered."""
+    from services.agent import reviewer_exec as re
+    from services.agent.mission_criteria import ROCKET_PLANE_LEGS
+
+    led = _MemLedger()
+    # What mega-12 had for the three missing legs:
+    led.append("pipeline", "stage", {
+        "stage": "plan", "entered": "2026-07-15T04:12:21Z",
+    })
+    led.append("reviewer", "battery_result", {
+        "verdict": "FAIL",
+        "checks": [{"name": "power_budget", "verdict": "PASS", "score": 1.0}],
+        "evidence": {"scores": {"power_budget": 1.0}},
+    })
+    # Board FAIL (no DRC path) → trace_opt inherits FAIL, not missing.
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "ecad_run_drc",
+        "ok": False,
+        "result": {"ok": False, "errors": 1},
+    })
+    # Other legs present as decisions.
+    for leg in (
+        "parts", "schematic", "sim", "antenna", "checks",
+        "firmware", "sensor_loop", "airframe",
+    ):
+        led.append("builder", "decision", {"leg": leg, "verdict": "PASS"})
+    evidence = re.grade_report_card_from_ledger(
+        led, {"legs": list(ROCKET_PLANE_LEGS)},
+    )
+    for must in ("plan", "trace_opt", "power"):
+        assert must in evidence["leg_verdicts"], (must, evidence["leg_verdicts"])
+    v, d = re.evaluate_pass_rule(
+        "all legs have PASS|WARN|FAIL|SKIP", evidence,
+    )
+    assert v == re.PASS, (v, d, evidence["leg_verdicts"])

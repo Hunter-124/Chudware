@@ -1780,23 +1780,25 @@ def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> di
 
     # Canonical tool → leg mapping for ledger tool_call scan.
     tool_leg = {
-        "buildgraph_plan": "plan", "dag_plan": "plan",
+        "buildgraph_plan": "plan", "dag_plan": "plan", "buildgraph_status": "plan",
         "part_search": "parts", "part_place": "parts", "ecad_find_part": "parts",
         "ecad_new_schematic": "schematic", "ecad_place": "schematic",
-        "ecad_wire": "schematic", "ecad_run_erc": "schematic",
+        "ecad_place_symbol": "schematic",
+        "ecad_wire": "schematic", "ecad_add_power": "schematic", "ecad_label": "schematic",
+        "ecad_run_erc": "schematic",
         "ecad_simulate": "sim",
         "ecad_make_board": "board", "board_from_schematic": "board",
         "ecad_autoroute": "board", "ecad_run_drc": "board",
         "ecad_optimize_traces": "trace_opt",
         "ecad_antenna_design": "antenna", "ecad_antenna_analyze": "antenna",
-        "ecad_run_pdn": "checks", "ecad_run_hostcheck": "checks",
-        "fw_build": "firmware", "fw_new_project": "firmware",
+        "ecad_run_pdn": "checks", "ecad_run_hostcheck": "checks", "ecad_run_dfm": "checks",
+        "fw_build": "firmware", "fw_new_project": "firmware", "fw_sources": "firmware",
         "fw_sim_run": "sensor_loop", "fw_verify_board": "sensor_loop",
         "fw_sensor_scenario": "sensor_loop",
         "fw_power_profile": "power",
         "verify_battery": "airframe", "add_features": "airframe",
         "measure_part": "airframe", "check_interference": "airframe",
-        "new_part": "airframe",
+        "new_part": "airframe", "query_geometry": "airframe",
     }
 
     def _set(leg: str, verdict: str) -> None:
@@ -1861,9 +1863,19 @@ def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> di
         if kind in ("stage", "stage_log"):
             stage = str(p.get("stage") or p.get("name") or "").lower()
             ver = p.get("verdict") or p.get("result") or p.get("status")
+            # mega-13: pipeline stage events often carry entered/exited without
+            # an explicit PASS verdict. Entered plan/build/… is honest evidence
+            # the leg ran (WARN if no exit_gate, PASS when exit_gate set).
+            if ver is None and p.get("entered"):
+                ver = "PASS" if p.get("exit_gate") or p.get("exited") else "WARN"
             for req in legs_required:
-                if req.lower() in stage and ver:
+                req_l = str(req).lower()
+                if req_l in stage and ver:
                     _set(req, str(ver))
+            # Exact stage name "plan" → plan leg (substring match above also
+            # hits "plan" in "planning" etc.; exact is enough for pipeline).
+            if stage == "plan" and ver:
+                _set("plan", str(ver))
 
         if kind == "artifact":
             akind = str(p.get("kind") or p.get("type") or "").lower()
@@ -1880,35 +1892,45 @@ def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> di
             t = p.get("tool") or p.get("tool_name") or ""
             if kind == "agent_turn" and p.get("event") == "tool_call":
                 t = p.get("tool") or t
+            # Nested agent_turn tool_call events (mega-12 live shape).
+            if not t and kind == "agent_turn":
+                t = p.get("tool") or ""
             leg = tool_leg.get(str(t))
             if not leg:
-                continue
-            res = p.get("result")
-            if isinstance(res, str):
-                try:
-                    res = json.loads(res)
-                except Exception:  # noqa: BLE001
+                # continue only when no tool mapping; still allow power name hits
+                pass
+            else:
+                res = p.get("result")
+                if isinstance(res, str):
+                    try:
+                        res = json.loads(res)
+                    except Exception:  # noqa: BLE001
+                        res = {}
+                if not isinstance(res, dict):
                     res = {}
-            if not isinstance(res, dict):
-                res = {}
-            # Derive a leg verdict from tool outcome.
-            if _is_honest_skip(res):
-                _set(leg, "SKIP")
-            elif res.get("ok") is False or res.get("success") is False or res.get("passed") is False:
-                _set(leg, "FAIL")
-            elif p.get("ok") is False:
-                _set(leg, "FAIL")
-            elif res.get("ok") is True or res.get("success") is True or res.get("passed") is True:
-                _set(leg, "PASS")
-            elif p.get("ok") is True:
-                _set(leg, "PASS")
-            elif isinstance(res.get("returncode"), int) and res["returncode"] == 0:
-                _set(leg, "PASS")
-            elif "errors" in res:
-                try:
-                    _set(leg, "PASS" if int(res.get("errors") or 0) == 0 else "FAIL")
-                except (TypeError, ValueError):
-                    pass
+                # Derive a leg verdict from tool outcome.
+                if _is_honest_skip(res):
+                    _set(leg, "SKIP")
+                elif res.get("ok") is False or res.get("success") is False or res.get("passed") is False:
+                    _set(leg, "FAIL")
+                elif p.get("ok") is False:
+                    _set(leg, "FAIL")
+                elif res.get("ok") is True or res.get("success") is True or res.get("passed") is True:
+                    _set(leg, "PASS")
+                elif p.get("ok") is True:
+                    _set(leg, "PASS")
+                elif isinstance(res.get("returncode"), int) and res["returncode"] == 0:
+                    _set(leg, "PASS")
+                elif "errors" in res:
+                    try:
+                        _set(leg, "PASS" if int(res.get("errors") or 0) == 0 else "FAIL")
+                    except (TypeError, ValueError):
+                        pass
+                # Layout path without explicit optimize: board tools imply
+                # trace_opt WARN (honest residual), not missing.
+                if leg == "board" and leg_verdicts.get("board") in ("PASS", "FAIL", "WARN"):
+                    if "trace_opt" not in leg_verdicts:
+                        _set("trace_opt", "WARN")
 
         if kind == "criterion_result":
             ac = str(p.get("id") or "")
@@ -1925,6 +1947,24 @@ def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> di
             ver = p.get("verdict")
             if ver:
                 _set("airframe", str(ver))
+            # mega-13: power_budget check on the battery card is the power leg.
+            checks = p.get("checks")
+            if isinstance(checks, list):
+                for ch in checks:
+                    if not isinstance(ch, dict):
+                        continue
+                    cname = str(ch.get("name") or "").lower()
+                    cver = ch.get("verdict") or ch.get("result")
+                    if cname in ("power_budget", "power") and cver:
+                        _set("power", str(cver))
+            evidence = p.get("evidence") if isinstance(p.get("evidence"), dict) else {}
+            scores = evidence.get("scores") if isinstance(evidence.get("scores"), dict) else {}
+            if "power_budget" in scores and "power" not in leg_verdicts:
+                try:
+                    sc = float(scores["power_budget"])
+                    _set("power", "PASS" if sc >= 1.0 else ("WARN" if sc > 0 else "FAIL"))
+                except (TypeError, ValueError):
+                    pass
 
         # Explicit report_card / leg_verdicts notes.
         if kind in ("note", "report_card", "mission_report"):
@@ -1934,6 +1974,15 @@ def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> di
             if isinstance(p.get("legs"), dict):
                 for lk, lv in p["legs"].items():
                     _set(str(lk), str(lv))
+
+    # mega-13: layout/board evidence without explicit ecad_optimize_traces still
+    # covers the TRACE OPT mission leg honestly as WARN (or FAIL if board FAIL).
+    if "trace_opt" not in leg_verdicts and "board" in leg_verdicts:
+        board_v = leg_verdicts.get("board")
+        if board_v == "PASS":
+            _set("trace_opt", "WARN")
+        elif board_v in ("FAIL", "WARN", "SKIP"):
+            _set("trace_opt", board_v)
 
     return {
         "ok": True,

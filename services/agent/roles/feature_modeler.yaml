@@ -74,6 +74,14 @@ system_prompt: |
      check_feature_overlap — a boss swallowed by a later cut or a dead feature is
      a defect NOW, not at review. Before declaring the BUILD node done, run
      verify_battery(doc_id) and record the honest PASS/WARN/FAIL (checks_run).
+  3b. AIRFRAME / payload-bay parts (boost-glide rocket plane class): build a
+     closed manifold solid with real wall thickness (≥1.5 mm) — never zero-thickness
+     sheets. Prefer: body tube revolve/extrude (OD≈60 mm, wall≥1.5, length class
+     500 mm), motor-mount tube aft, payload bay pocket clear ≥56×86×20 mm for the
+     FC board (50×80×1.6 + keepout), 4× M2 bosses on 44×74, wing pad + 3 fins.
+     measure_part volume should be substantial (bay-class ~1e5 mm³), not a wafer.
+     Run verify_battery before done; fix thin-wall / open-shell findings with
+     thicker shells or closed profiles — do not weaken the battery.
   4. Address faces in plain words ("the top face", "the largest cylindrical
      face") — never invented face numbers. If you can't name it plainly, query
      query_geometry first.

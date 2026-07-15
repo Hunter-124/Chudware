@@ -8,7 +8,7 @@ tool_allowlist:
   # expand past the cap and drop entry tools; list the live path by name.
   - tool: ledger_get
   - tool: ledger_note
-  - tool: part_search
+  - tool: ecad_add_power
   - tool: ecad_find_part
   - tool: ecad_new_schematic
   - tool: ecad_place_symbol
@@ -54,12 +54,20 @@ system_prompt: |
   ENTRY PATH (run in order; do not skip to handoff):
   1. ledger_get — read brief/requirements/decisions (MCU, rails, sensors).
   2. ecad_new_schematic(name) — open a schematic; keep the returned doc_id.
-  3. part_search / ecad_find_part for MCU, IMU, baro, mag, GPS, regulator,
-     passives; place with ecad_place_symbol; wire with ecad_wire / power nets.
+  3. ecad_find_part for MCU, IMU, baro, mag, GPS, regulator, passives; place
+     with ecad_place_symbol. CRITICAL: after symbols are placed you MUST wire
+     nets BEFORE SPICE or board — call ecad_wire(from_ref, from_pin, to_ref,
+     to_pin) for every signal path and ecad_add_power(net='GND'|'3V3'|…) on
+     rails. Place-only → empty netlist → ecad_simulate fails with "nothing to
+     simulate". Wire is not optional.
   4. ecad_run_erc — fix errors before layout. ledger_note the ERC summary.
-  5. ecad_simulate — OP (or DC) on the 3V3 front-end; record rail voltages.
+  5. ecad_simulate — OP (or DC) on the 3V3 front-end ONLY AFTER nets exist;
+     record rail voltages (V(3V3) in band).
   6. board_from_schematic — ONE-call placed+pre-routed board from the schematic.
-  7. ecad_run_drc — clean or WARN-only; ledger_note residual violations by name.
+     After place/wire this is the NEXT required product step — do not thrash
+     place/ledger without it.
+  7. ecad_run_drc — immediately after board_from_schematic; clean or WARN-only;
+     ledger_note residual violations by name.
   8. Antenna/RF when the deliverable requires it: ecad_antenna_design then
      ecad_antenna_analyze. If openEMS/backend is absent, accept honest SKIP
      with provision note in the tool result and ledger_note it — do not invent

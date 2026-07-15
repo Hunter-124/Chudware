@@ -527,12 +527,16 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 # the phase machine can advance past a honest blocked report
                 # rather than looping as specify_incomplete forever.
             # mega-11: refuse status=done when only bootstrap openers ran.
+            # mega-13: also refuse product-role done with ZERO tool calls
+            # (ollama hollow handoff inventing board_doc_id without tools).
             handoff_status = str(
                 (handoff or {}).get("status") or
                 ("done" if parsed.get("done") else "")
             ).lower()
             if handoff_status in ("", "done"):
                 boot_msg = _bootstrap_incomplete(calls, allow)
+                if boot_msg is None and tool_calls_made == 0:
+                    boot_msg = _empty_product_handoff_block(allow, actor)
                 if boot_msg is not None:
                     messages.append({"role": "user", "content": _parts(
                         f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
@@ -560,6 +564,122 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             messages.append({"role": "user", "content": _parts(
                 f"Tool {tool!r} is not permitted. Choose an allowed tool.")})
             continue
+
+        # mega-13: HARD block thrash tools that skip the ECAD product chain.
+        # Soft [ECAD enablement] nudges were ignored live (place×6 → max_iters,
+        # zero wire/board). Refuse the thrash call and force the next tool.
+        try:
+            _ok_so_far = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
+            _n_place_so_far = sum(
+                1 for c in calls
+                if c.get("ok") and c.get("tool") == "ecad_place_symbol"
+            )
+            _has_wire_so_far = bool(
+                _ok_so_far & {"ecad_wire", "ecad_add_power", "ecad_label"}
+            )
+            _has_board_so_far = bool(_ok_so_far & _ECAD_PRODUCT_TOOLS)
+            _has_sch_so_far = "ecad_new_schematic" in _ok_so_far
+            _allow_now = allow or set()
+            if (
+                _has_sch_so_far
+                and _n_place_so_far >= 1
+                and not _has_wire_so_far
+                and ({"ecad_wire", "ecad_add_power"} & _allow_now)
+                and tool in (
+                    "ecad_place_symbol", "ecad_find_part", "part_search",
+                    "ledger_get", "ledger_note", "ecad_simulate",
+                    "ecad_antenna_design", "ecad_antenna_analyze",
+                    "resolve_process", "research_material_lookup",
+                    "research_eng_calc", "fit_calc", "recommend_fit",
+                    "em_status", "fw_status",
+                )
+            ):
+                note = {
+                    "tool": tool,
+                    "error": (
+                        "ECAD chain gate: nets empty after place. Call "
+                        "ecad_wire / ecad_add_power before more place/find/"
+                        "ledger/simulate (mega-13)."
+                    ),
+                    "ok": False,
+                }
+                calls.append(note)
+                _log(ledger, actor, {"event": "tool_denied", **note})
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] BLOCKED " + tool + ". Wire nets NOW: "
+                    "ecad_wire(from_ref, from_pin, to_ref, to_pin) and "
+                    "ecad_add_power(net='GND'|'3V3'). Place-only → empty "
+                    "netlist. After ≥1 wire, call board_from_schematic then "
+                    "ecad_run_drc."
+                )})
+                try:
+                    _log(ledger, actor or "agent_turn", {
+                        "event": "ecad_chain_gate",
+                        "blocked_tool": tool,
+                        "need": "ecad_wire|ecad_add_power",
+                        "n_place": _n_place_so_far,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            if (
+                _has_sch_so_far
+                and (_has_wire_so_far or _n_place_so_far >= 2)
+                and not _has_board_so_far
+                and (_ECAD_PRODUCT_TOOLS & _allow_now)
+                and tool in (
+                    "ecad_place_symbol", "ecad_find_part", "part_search",
+                    "ledger_get", "ledger_note", "ecad_run_erc",
+                    "ecad_simulate", "ecad_antenna_design",
+                    "ecad_antenna_analyze", "ecad_wire", "ecad_add_power",
+                    "ecad_label",
+                )
+                # Allow first few wires; after 1 wire + 2 places, force board.
+                and not (
+                    tool in ("ecad_wire", "ecad_add_power", "ecad_label")
+                    and not _has_wire_so_far
+                )
+                and (
+                    # After wire exists, block more wire/place thrash — need board
+                    (_has_wire_so_far and tool in (
+                        "ecad_place_symbol", "ecad_find_part", "ledger_get",
+                        "ledger_note", "ecad_simulate", "ecad_run_erc",
+                        "ecad_antenna_design", "ecad_antenna_analyze",
+                        "ecad_wire", "ecad_add_power", "ecad_label",
+                    ))
+                    # Or place saturation ≥3 with zero wire already handled above
+                    or False
+                )
+            ):
+                note = {
+                    "tool": tool,
+                    "error": (
+                        "ECAD chain gate: call board_from_schematic next "
+                        "(then ecad_run_drc). Schematic+place is not product "
+                        "success (mega-13)."
+                    ),
+                    "ok": False,
+                }
+                calls.append(note)
+                _log(ledger, actor, {"event": "tool_denied", **note})
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] BLOCKED " + tool + ". Next tool MUST be "
+                    "board_from_schematic, then ecad_run_drc. Do not thrash "
+                    "place/wire/ledger."
+                )})
+                try:
+                    _log(ledger, actor or "agent_turn", {
+                        "event": "ecad_chain_gate",
+                        "blocked_tool": tool,
+                        "need": "board_from_schematic",
+                        "n_place": _n_place_so_far,
+                        "has_wire": _has_wire_so_far,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+        except Exception:  # noqa: BLE001 — gate never breaks the turn
+            pass
 
         if tool_calls_made >= budget:
             last_reason = (
@@ -736,6 +856,134 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     "feature (box or sketch+extrude) on the active doc_id. Further "
                     "preflight_ops results will be ignored for product success."
                 )})
+        # mega-13: ECAD place-only never reached board_from_schematic/DRC (axis O).
+        # Mirror new_part→add_features force-chain: after schematic/place, hard-nudge
+        # wire → board_from_schematic → ecad_run_drc; re-nudge thrash tools.
+        try:
+            _allow_s = allow or set()
+            _ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
+            _n_place = sum(
+                1 for c in calls
+                if c.get("ok") and c.get("tool") == "ecad_place_symbol"
+            )
+            _has_wire = bool(_ok_tools & {"ecad_wire", "ecad_add_power", "ecad_label"})
+            _has_board = bool(_ok_tools & _ECAD_PRODUCT_TOOLS)
+            _has_drc = "ecad_run_drc" in _ok_tools
+            _has_sch = "ecad_new_schematic" in _ok_tools
+            _ecad_board_allowed = bool(_ECAD_PRODUCT_TOOLS & _allow_s)
+            _wire_allowed = bool(
+                {"ecad_wire", "ecad_add_power", "ecad_label"} & _allow_s
+            )
+
+            # After place (or first place success): force net wiring before SPICE/board.
+            if (
+                ok
+                and tool == "ecad_place_symbol"
+                and _has_sch
+                and _wire_allowed
+                and not _has_wire
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] Symbols placed but nets are still empty. "
+                    "Next tools MUST wire the design BEFORE ecad_simulate or "
+                    "board_from_schematic: call ecad_wire(from_ref, from_pin, "
+                    "to_ref, to_pin) for signal pins and ecad_add_power(net='GND'| "
+                    "'3V3'|…) on rails. Empty netlist → SPICE 'nothing to simulate'. "
+                    "Do NOT thrash ecad_place_symbol / ledger_get until ≥1 wire or "
+                    "power port succeeds."
+                )})
+                try:
+                    _log(ledger, actor or "agent_turn", {
+                        "event": "ecad_enablement_inject",
+                        "kind": "wire_after_place",
+                        "tool": tool,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Place thrash without wire: re-nudge.
+            if (
+                tool in (
+                    "ecad_place_symbol", "ecad_find_part", "part_search",
+                    "ledger_get", "ledger_note", "ecad_status",
+                )
+                and _has_sch
+                and _n_place >= 1
+                and _wire_allowed
+                and not _has_wire
+                and tool != "ecad_wire"
+            ):
+                # Avoid double-inject on the same place success (handled above).
+                if not (ok and tool == "ecad_place_symbol"):
+                    messages.append({"role": "user", "content": _parts(
+                        "[ECAD enablement] Still waiting for nets. Call ecad_wire / "
+                        "ecad_add_power NOW before ERC/SPICE/board."
+                    )})
+
+            # After wire (or place saturation ≥3 without board): force board chain.
+            if (
+                ok
+                and tool in ("ecad_wire", "ecad_add_power", "ecad_label",
+                             "ecad_run_erc", "ecad_place_symbol")
+                and _ecad_board_allowed
+                and not _has_board
+                and _has_sch
+                and (_has_wire or _n_place >= 3)
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] Schematic path is ready for layout. Next tool "
+                    "MUST be board_from_schematic (one-call placed+pre-routed board), "
+                    "then ecad_run_drc. Schematic+place alone is NOT product success "
+                    "(mega-11/12). Do NOT call ledger_get / more place_symbol — call "
+                    "board_from_schematic NOW."
+                )})
+
+            # Re-nudge every thrash call after place/wire until board product.
+            if (
+                tool not in _ECAD_PRODUCT_TOOLS
+                and _ecad_board_allowed
+                and _has_sch
+                and not _has_board
+                and (_has_wire or _n_place >= 2)
+                and tool in (
+                    "ledger_get", "ledger_note", "ecad_find_part", "part_search",
+                    "ecad_place_symbol", "ecad_status", "ecad_run_erc",
+                    "ecad_simulate", "ecad_antenna_design", "ecad_antenna_analyze",
+                )
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] Still waiting for board_from_schematic after "
+                    "schematic work. Stop thrashing; call board_from_schematic NOW, "
+                    "then ecad_run_drc."
+                )})
+
+            # After board product without DRC: force DRC.
+            if (
+                ok
+                and tool in ("board_from_schematic", "ecad_make_board")
+                and "ecad_run_drc" in _allow_s
+                and not _has_drc
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] Board created. Next tool MUST be ecad_run_drc "
+                    "(errors==0 or honest FAIL with named residuals). Call it NOW."
+                )})
+
+            # Soft-block empty-netlist SPICE: after simulate attempt without wire, re-nudge.
+            if (
+                tool == "ecad_simulate"
+                and _wire_allowed
+                and not _has_wire
+                and _has_sch
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] ecad_simulate without nets yields empty netlist. "
+                    "Wire first: ecad_wire + ecad_add_power on 3V3/GND rails, then "
+                    "re-run ecad_simulate('op') and measure V(3V3)."
+                )})
+        except Exception:  # noqa: BLE001 — enablement never breaks the turn
+            pass
+
 
         # AI-VC: post-success path retains create tools (doc_id only after call)
         # and stamps provenance. Pre-tool checkpoint (above) is the v2 primary.
@@ -810,6 +1058,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         "ledger_note", "buildgraph_plan", "dag_plan", "add_features",
         "board_from_schematic", "ecad_run_drc", "ecad_run_erc",
         "ecad_simulate", "ecad_antenna_design", "ecad_make_board",
+        # mega-13: net wiring is product progress (empty netlist kills AC5 SPICE)
+        "ecad_wire", "ecad_add_power", "ecad_label",
         "fw_build",
         "verify_battery",
     })
@@ -1109,6 +1359,38 @@ _BOOTSTRAP_OPENERS = frozenset({
 })
 
 
+def _empty_product_handoff_block(
+    allow: set[str] | None,
+    actor: str | None,
+) -> str | None:
+    """mega-13: refuse status=done with zero tools on product BUILD roles.
+
+    Live: ollama ecad_engineer emitted fabricated schematic/board doc_ids and
+    completed with tool_calls=0 — force-chain never fired. Same class for
+    firmware/geometry producers with domain mutators on the allowlist.
+    """
+    allow_set = allow or set()
+    actor_l = str(actor or "").lower()
+    if _ECAD_PRODUCT_TOOLS & allow_set or "ecad" in actor_l:
+        return (
+            "ECAD product role cannot declare done with zero tool calls. "
+            "ENTRY PATH required: ecad_new_schematic → place → ecad_wire/"
+            "ecad_add_power → board_from_schematic → ecad_run_drc. Call a tool "
+            "NOW (start with ecad_new_schematic)."
+        )
+    if "fw_build" in allow_set or "firmware" in actor_l:
+        return (
+            "Firmware product role cannot declare done with zero tool calls. "
+            "Call fw_new_project then fw_build NOW."
+        )
+    if "add_features" in allow_set and "new_part" in allow_set:
+        return (
+            "Geometry product role cannot declare done with zero tool calls. "
+            "Call new_part then add_features NOW."
+        )
+    return None
+
+
 def _bootstrap_incomplete(
     calls: list,
     allow: set[str] | None,
@@ -1118,6 +1400,9 @@ def _bootstrap_incomplete(
     mega-6: new_part without add_features.
     mega-11: ecad_new_schematic without board product; fw_new_project without
     fw_build. None means product (or no bootstrap opener) is present.
+    mega-13: schematic+place without wire still incomplete for SPICE path, but
+    board product remains the ECAD success floor (wire is a hard mid-chain gate
+    via post-tool scaffold, not a substitute for board_from_schematic).
     """
     allow_set = allow or set()
     ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
@@ -1137,6 +1422,19 @@ def _bootstrap_incomplete(
         and (_ECAD_PRODUCT_TOOLS & allow_set)
         and not (ok_tools & _ECAD_PRODUCT_TOOLS)
     ):
+        n_place = sum(
+            1 for c in calls
+            if c.get("ok") and c.get("tool") == "ecad_place_symbol"
+        )
+        has_wire = bool(ok_tools & {"ecad_wire", "ecad_add_power", "ecad_label"})
+        if n_place >= 1 and not has_wire and (
+            {"ecad_wire", "ecad_add_power"} & allow_set
+        ):
+            return (
+                "ecad_new_schematic+place without ecad_wire/ecad_add_power — "
+                "empty nets are not ECAD product (mega-13). Wire pins/rails, "
+                "then board_from_schematic → ecad_run_drc."
+            )
         return (
             "ecad_new_schematic without board_from_schematic/ecad_run_drc — "
             "schematic-only is not ECAD product success (mega-11). Call "

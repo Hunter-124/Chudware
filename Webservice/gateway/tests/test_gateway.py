@@ -534,3 +534,55 @@ def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch
     assert f"{proj}:/home/user/Projects/TeamParts:ro,z" in joined
     assert "BILLET_DEFAULT_PROJECT=TeamParts" in joined
     assert "BILLET_OPEN_DOC=Frame.step+" in joined
+
+
+# ---------------------------------------------------------------- admin ops
+def test_admin_ops_and_paste(client, _admin_env, _isolate, monkeypatch):
+    mgr = _isolate
+    # ops: admin-gated, reports host + limits even with no sessions
+    assert client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code == 403
+    async def fake_stats():
+        return {"billet-sess-demo": {"cpu": "3.0%", "mem": "1GB / 5GB"}}
+    monkeypatch.setattr(mgr, "container_stats", fake_stats)
+    r = client.get("/api/admin/ops", headers=_auth("boss@example.com"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sessions"] == []
+    assert body["limits"]["max_sessions"] > 0
+    assert "mem_available_gib" in body["host"]
+
+    # paste with no session -> 409
+    r2 = client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
+                     json={"text": "hello"})
+    assert r2.status_code == 409
+
+    # seed a running session, then paste routes through manager.paste_text
+    _seed_session(mgr, "demo@example.com")
+    typed = []
+    async def fake_paste(sess, text):
+        typed.append(text)
+        return True, "ok"
+    monkeypatch.setattr(mgr, "paste_text", fake_paste)
+    r3 = client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
+                     json={"text": "M6x1.0 tap drill 5.0mm"})
+    assert r3.status_code == 200 and typed == ["M6x1.0 tap drill 5.0mm"]
+    assert client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
+                       json={"text": ""}).status_code == 400
+    assert client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
+                       json={"text": "x" * 20001}).status_code == 413
+
+    # admin stop of that session
+    sid = mgr.get_for_user("demo@example.com").sid
+    stopped = []
+    async def fake_stop(s, email=None):
+        stopped.append(s)
+        return mgr.get(s)
+    monkeypatch.setattr(mgr, "stop", fake_stop)
+    r4 = client.post(f"/api/admin/sessions/{sid}/stop", headers=_auth("boss@example.com"))
+    assert r4.status_code == 200 and stopped == [sid]
+
+
+def test_security_headers(client, _isolate):
+    r = client.get("/healthz")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["x-frame-options"] == "SAMEORIGIN"

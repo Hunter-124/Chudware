@@ -203,6 +203,44 @@ loginctl show-user "$USER" -p Linger
 sudo loginctl enable-linger "$USER"
 ```
 
+## (f) Admin ops dashboard + backups
+
+### /admin live ops (added post-v1)
+
+`https://cad.scootware.us/admin` (admin role) now shows, above the allowlist:
+
+- **Live sessions** — per seat: screenshot thumbnail (refreshes ~10 s), status,
+  uptime, idle, CPU/mem (`podman stats`), and a **Stop** button.
+- **Host bar** — seats used/max, free RAM, VRAM used/total + GPU util
+  (`nvidia-smi`), load, idle timeout.
+- **Gateway log** — journal tail in the page (`/api/admin/logs`), optional
+  5 s follow. No SSH needed for demo-day triage.
+
+Portal users get a **Paste text…** button in the stream bar — types text into
+the focused widget inside their seat via `xdotool` (the browser clipboard can't
+reach the container's X clipboard). 20k char cap, argv-passed (no shell).
+
+### Nightly backups
+
+`billet-backup.timer` (03:30 + jitter, `Persistent=true`) runs
+`Webservice/deploy/backup.sh`:
+
+- Tars **all of `~/billet-web-data/`** (PLM bare repos, users.yaml, chat.db,
+  per-user homes incl. unpushed WIP, env files) minus caches/logs/tmp.
+- Homes are subuid-owned → tar runs under **`podman unshare`**.
+- Destination `~/billet-web-backups/` (mode 700, tarballs 600), newest
+  **14** kept. Override via `BILLET_WEB_BACKUP_DIR` / `BILLET_WEB_BACKUP_KEEP`.
+
+```bash
+systemctl --user start billet-backup.service     # manual backup now
+systemctl --user list-timers billet-backup.timer # next run
+# restore (same subuid mapping):
+podman unshare tar -xzf ~/billet-web-backups/billet-web-data-<stamp>.tar.gz -C ~
+```
+
+Off-host copies are on you: rsync the backup dir somewhere that isn't this
+machine when the project data starts mattering.
+
 ---
 
 ## Layout reference

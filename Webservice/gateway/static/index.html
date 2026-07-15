@@ -54,6 +54,7 @@
             <div class="stream-actions">
               <button id="btn-import" class="btn ghost" type="button" title="Upload a part from your computer into the session">Import part…</button>
               <input type="file" id="import-file" accept=".step,.stp,.step+,.stl,.3mf,.iges,.igs,.brep,.aicm" style="display:none">
+              <button id="btn-paste" class="btn ghost" type="button" title="Type text into the session (AI keys, dimensions, anything on your clipboard)">Paste text…</button>
               <button id="btn-fullscreen" class="btn ghost" type="button" title="Fullscreen (Esc to exit)">Fullscreen</button>
               <button id="btn-popout" class="btn ghost" type="button" title="Open stream in new tab">Pop out</button>
               <button id="btn-stop-stream" class="btn danger" type="button">Stop</button>
@@ -90,6 +91,19 @@
       </aside>
     </div>
   </div>
-  <script src="/static/portal.js?v=3" defer></script>
+  <div id="paste-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60">
+    <div style="max-width:520px;margin:14vh auto;background:var(--panel,#16181d);border:1px solid var(--border,#2a2e36);border-radius:12px;padding:18px 22px">
+      <h3 style="margin:0 0 6px">Paste into session</h3>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">
+        Click the target field <em>inside</em> the CAD view first — this types into
+        whatever has focus there.</p>
+      <textarea id="paste-text" rows="5" style="width:100%;box-sizing:border-box;background:var(--bg,#0e1013);color:var(--fg,#e8eaf0);border:1px solid var(--border,#2a2e36);border-radius:8px;padding:8px 10px;font:inherit"></textarea>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+        <button type="button" id="paste-cancel" class="btn ghost">Cancel</button>
+        <button type="button" id="paste-send" class="btn primary">Type it</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/portal.js?v=4" defer></script>
 </body>
 </html>

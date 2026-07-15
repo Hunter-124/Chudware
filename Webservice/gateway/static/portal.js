@@ -554,6 +554,49 @@
       btnFullscreen.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
     });
   }
+  var btnPaste = document.getElementById("btn-paste");
+  var pasteModal = document.getElementById("paste-modal");
+  if (btnPaste && pasteModal) {
+    var pasteText = document.getElementById("paste-text");
+    var pasteSend = document.getElementById("paste-send");
+    function closePaste() { pasteModal.style.display = "none"; pasteText.value = ""; }
+    btnPaste.addEventListener("click", function () {
+      if (!isLive(state.status)) { setStatusPill("error", "Start a session first"); return; }
+      pasteModal.style.display = "block";
+      // Best effort: pre-fill from the browser clipboard when permitted.
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(function (t) {
+          if (t && !pasteText.value) pasteText.value = t;
+        }).catch(function () {});
+      }
+      pasteText.focus();
+    });
+    document.getElementById("paste-cancel").addEventListener("click", closePaste);
+    pasteModal.addEventListener("click", function (ev) {
+      if (ev.target === pasteModal) closePaste();
+    });
+    pasteSend.addEventListener("click", function () {
+      var text = pasteText.value;
+      if (!text) { closePaste(); return; }
+      pasteSend.disabled = true;
+      pasteSend.textContent = "Typing…";
+      fetch("/api/sessions/paste", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+      }).then(function (res) {
+        if (!res.ok) return res.json().then(function (d) {
+          throw new Error((d && d.detail) || res.status);
+        });
+        closePaste();
+      }).catch(function (e) {
+        setStatusPill("error", "Paste failed: " + (e.message || e));
+      }).finally(function () {
+        pasteSend.disabled = false;
+        pasteSend.textContent = "Type it";
+      });
+    });
+  }
   var btnImport = document.getElementById("btn-import");
   var importFile = document.getElementById("import-file");
   if (btnImport && importFile) {

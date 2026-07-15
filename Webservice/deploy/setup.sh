@@ -61,7 +61,7 @@ echo "    venv ok: ${VENV}"
 
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in billet-gateway.service billet-cloudflared.service billet-monitor.service billet-monitor.timer; do
+for u in billet-gateway.service billet-cloudflared.service billet-monitor.service billet-monitor.timer billet-backup.service billet-backup.timer; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -88,8 +88,8 @@ if command -v loginctl >/dev/null 2>&1; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable billet-gateway.service billet-cloudflared.service billet-monitor.timer
-echo "    enabled: billet-gateway, billet-cloudflared, billet-monitor.timer"
+systemctl --user enable billet-gateway.service billet-cloudflared.service billet-monitor.timer billet-backup.timer
+echo "    enabled: billet-gateway, billet-cloudflared, billet-monitor.timer, billet-backup.timer"
 
 # --- image reminder (no build here) ------------------------------------------
 echo

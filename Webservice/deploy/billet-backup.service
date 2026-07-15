@@ -1,0 +1,8 @@
+[Unit]
+Description=billet-web data backup (PLM repos, users, chat, homes)
+
+[Service]
+Type=oneshot
+ExecStart=%h/Repositories/CAD/Webservice/deploy/backup.sh
+Nice=15
+IOSchedulingClass=idle

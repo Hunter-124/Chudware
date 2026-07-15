@@ -1373,3 +1373,16 @@ Turned Billet into a self-hostable web service: per-user rootless-podman session
 
 ## 2026-07-15 — billet-web finish-line (T-WEB2)
 Advisor consult (work/questions/T-WEB2.md) closed v1: invite-key auth REJECTED (strict CF Access + users.yaml stays the only trust root; operator friction solved by `cf_provision.py --sync-users` pushing users.yaml emails into the Access policy — example.com entries never synced). PLM bootstrap glue landed: `gateway/plm_seed.py` seeds bare remotes WITH a real tip (Demo = samples/mech_part Bracket; empty-bare clones break origin registration), session entrypoint clones `/plm/*.git` → `~/Projects/<name>` and does pull-only sync on restart — auto-push on stop is advisor-overruled (unrehearsed saves would spam the shared timeline). Fixed two live bugs: (1) session volumes lacked SELinux relabel — container_t vs user_home_t AVC meant NOTHING persisted in seats; now `:U,Z` (home) / `:U,z` (plm). (2) /transfer wrote host-side into subuid-owned volumes (PermissionError) — rewritten through `podman cp` on the running seat (labels+userns correct, 409 without a session). novnc is now the declared default stream backend (selkies pip broken on Fedora). monitor.timer live-fired. Desktop app untouched — webservice remains an additive deployment of the same binaries.
+
+## 2026-07-15 - billet-web ops wave (autonomous)
+Admin /admin gains a live-ops layer: GET /api/admin/ops (sessions merged with
+podman stats + host RAM/VRAM/load), POST /api/admin/sessions/{sid}/stop,
+GET /api/admin/screenshot/{sid} (xwd|magick thumbnail, podman_bytes helper),
+GET /api/admin/logs (journal tail). Portal gains "Paste text..." ->
+POST /api/sessions/paste (xdotool type, argv-only, 20k cap). Security headers
+middleware (nosniff/same-origin/SAMEORIGIN). Nightly billet-backup.timer tars
+~/billet-web-data under podman unshare (subuid homes), keep-14, wired into
+setup.sh; RUNBOOK section (f). Gateway tests 24/24; live-verified: ops JSON,
+560px PNG thumbnail, paste typed into seat prompt, dashboard rendered, backup
+tarball restored listing. Gotcha: host tar cannot read :U-chowned homes -
+anything touching them must run inside podman unshare.

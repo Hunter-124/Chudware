@@ -197,4 +197,87 @@
   refresh().catch(function (e) {
     setStatus("Failed to load users: " + (e.message || e) + " (admin only)", true);
   });
+
+  /* ---- live ops: sessions, host health, log tail ---- */
+  var opsRows = document.getElementById("ops-rows");
+  var opsEmpty = document.getElementById("ops-empty");
+  var hostBar = document.getElementById("host-bar");
+
+  function fmtDur(sec) {
+    if (sec < 90) return sec + "s";
+    var m = Math.round(sec / 60);
+    if (m < 90) return m + "m";
+    return (sec / 3600).toFixed(1) + "h";
+  }
+
+  async function refreshOps() {
+    if (!opsRows) return;
+    var data = await api("/api/admin/ops");
+    var h = data.host || {};
+    var bits = [];
+    bits.push((data.sessions.length) + "/" + data.limits.max_sessions + " seats");
+    if (h.mem_available_gib != null) bits.push(h.mem_available_gib.toFixed(1) + " GiB RAM free");
+    if (h.gpu) bits.push("VRAM " + (h.gpu.vram_used_mib / 1024).toFixed(1) + "/" +
+                         (h.gpu.vram_total_mib / 1024).toFixed(1) + " GiB · GPU " + h.gpu.util_pct + "%");
+    if (h.load1 != null) bits.push("load " + h.load1.toFixed(1));
+    bits.push("idle timeout " + Math.round(data.limits.idle_timeout_sec / 60) + "m");
+    hostBar.textContent = bits.join("  ·  ");
+
+    opsEmpty.style.display = data.sessions.length ? "none" : "block";
+    var seen = {};
+    data.sessions.forEach(function (s) {
+      seen[s.sid] = true;
+      var row = document.getElementById("ops-" + s.sid);
+      if (!row) {
+        row = document.createElement("div");
+        row.id = "ops-" + s.sid;
+        row.style.cssText = "display:flex;gap:14px;align-items:flex-start;border:1px solid var(--border,#2a2e36);border-radius:10px;padding:10px";
+        row.innerHTML =
+          "<img class='shot' width='224' style='border-radius:6px;background:#000;flex:none' alt=''>" +
+          "<div style='flex:1;min-width:0'><div class='who' style='font-weight:600'></div>" +
+          "<div class='meta' style='font-size:.82rem;color:var(--muted,#8b93a3);margin-top:4px'></div></div>" +
+          "<button type='button' class='rm-btn stop' style='flex:none'>Stop</button>";
+        row.querySelector(".stop").addEventListener("click", async function () {
+          if (!confirm("Stop " + s.email + "'s session? Unsaved work in their seat is lost.")) return;
+          try { await api("/api/admin/sessions/" + s.sid + "/stop", { method: "POST" }); refreshOps(); }
+          catch (e) { setStatus(String(e.message || e), true); }
+        });
+        opsRows.appendChild(row);
+      }
+      row.querySelector(".who").textContent =
+        (s.display || s.email) + (s.heavy ? "  ·  GPU seat" : "");
+      row.querySelector(".meta").textContent =
+        s.email + "  ·  " + s.status + "  ·  up " + fmtDur(s.uptime_sec) +
+        "  ·  idle " + fmtDur(s.idle_sec) +
+        (s.cpu ? "  ·  cpu " + s.cpu : "") + (s.mem ? "  ·  mem " + s.mem : "");
+      var img = row.querySelector(".shot");
+      if (s.status === "running" && (!img.dataset.at || Date.now() - img.dataset.at > 10000)) {
+        img.dataset.at = Date.now();
+        img.src = "/api/admin/screenshot/" + s.sid + "?t=" + Date.now();
+      }
+    });
+    Array.prototype.slice.call(opsRows.children).forEach(function (row) {
+      if (!seen[row.id.slice(4)]) row.remove();
+    });
+  }
+
+  var logPre = document.getElementById("log-pre");
+  async function refreshLog() {
+    var res = await fetch("/api/admin/logs?lines=300");
+    logPre.textContent = await res.text();
+    logPre.scrollTop = logPre.scrollHeight;
+  }
+  var logBtn = document.getElementById("log-refresh");
+  if (logBtn) logBtn.addEventListener("click", function () {
+    refreshLog().catch(function (e) { setStatus(String(e.message || e), true); });
+  });
+
+  if (opsRows) {
+    refreshOps().catch(function () { hostBar.textContent = "ops unavailable"; });
+    setInterval(function () {
+      refreshOps().catch(function () {});
+      if (document.getElementById("log-follow") &&
+          document.getElementById("log-follow").checked) refreshLog().catch(function () {});
+    }, 5000);
+  }
 })();

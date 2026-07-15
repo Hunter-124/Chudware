@@ -613,7 +613,32 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
                     )})
                     last_reason = _RETRY
-                    continue
+                    # mega-19 A residual: model handed off after power with
+                    # wire=0 — force-EXECUTE the remaining chain now.
+                    if tool_calls_made < budget:
+                        _need = _ecad_chain_need(calls, allow)
+                        if _need and _need in (allow or set()):
+                            calls, tool_calls_made = _ecad_force_chain_cascade(
+                                calls=calls,
+                                allow=allow,
+                                dispatch=dispatch,
+                                ledger=ledger,
+                                actor=actor,
+                                messages=messages,
+                                tool_calls_made=tool_calls_made,
+                                budget=budget,
+                                reason="done_incomplete_force",
+                            )
+                            # Re-check: if chain complete, fall through to done.
+                            boot_msg2 = _bootstrap_incomplete(calls, allow)
+                            if boot_msg2 is None:
+                                pass  # allow subsequent done_guardrail/return
+                            else:
+                                continue
+                        else:
+                            continue
+                    else:
+                        continue
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
@@ -647,9 +672,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 if c.get("ok") and c.get("tool") == "ecad_place_symbol"
             )
             _has_wire_so_far = _ecad_has_real_wire(calls)
-            _has_power_port = any(
-                c.get("ok") and c.get("tool") == "ecad_add_power" for c in calls
-            )
+            _has_power_port = _ecad_power_satisfied(calls)
             _nets_ready = _ecad_nets_ready_for_board(calls, allow)
             _has_board_product = bool(
                 _ok_so_far & {"board_from_schematic", "ecad_make_board"}
@@ -781,8 +804,18 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     pass
                 # mega-14/18 Z2r: after denial cap, force-EXECUTE the full next
                 # chain (add_power → wire → …) so power is never only scheduled.
+                # mega-19: force after 1 denial when power already satisfied and
+                # need is wire/board (live a1: denials=1 then model left ECAD).
+                _force_after = _ECAD_GATE_FORCE_AFTER
                 if (
-                    _ecad_gate_denials >= _ECAD_GATE_FORCE_AFTER
+                    _has_power_port
+                    and _gate_need in (
+                        "ecad_wire", "board_from_schematic", "ecad_run_drc",
+                    )
+                ):
+                    _force_after = 1
+                if (
+                    _ecad_gate_denials >= _force_after
                     and tool_calls_made < budget
                 ):
                     _need = _ecad_chain_need(calls, allow)
@@ -1206,6 +1239,85 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     "re-run ecad_simulate('op') and measure V(3V3)."
                 )})
         except Exception:  # noqa: BLE001 — enablement never breaks the turn
+            pass
+
+        # mega-19 A residual: model called add_power then abandoned ECAD (wire=0,
+        # force_inject=0). After successful power/place/wire, force-EXECUTE the
+        # next chain need in-process so rail wire + board + DRC + sim source run.
+        try:
+            if (
+                ok
+                and tool in (
+                    "ecad_add_power", "ecad_place_symbol", "ecad_wire",
+                    "ecad_label", "board_from_schematic", "ecad_make_board",
+                    "ecad_run_drc", "ecad_run_erc",
+                )
+                and tool_calls_made < budget
+            ):
+                _need_now = _ecad_chain_need(calls, allow)
+                _allow_now2 = allow or set()
+                if (
+                    _need_now
+                    and _need_now in _allow_now2
+                    and _need_now != tool
+                    and _need_now in (
+                        "ecad_add_power", "ecad_wire", "ecad_place_symbol",
+                        "board_from_schematic", "ecad_make_board",
+                        "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
+                    )
+                ):
+                    # After power: always cascade into wire (live mega-19 miss).
+                    # After place with power already satisfied: cascade into wire.
+                    # After wire: cascade into board/drc/…
+                    _should = False
+                    if tool == "ecad_add_power" and _need_now in (
+                        "ecad_wire", "ecad_place_symbol", "ecad_add_power",
+                        "board_from_schematic", "ecad_make_board",
+                    ):
+                        _should = True
+                    elif tool == "ecad_place_symbol" and _need_now in (
+                        "ecad_add_power", "ecad_wire", "ecad_place_symbol",
+                    ):
+                        # Only auto-cascade place→power/wire when at least one
+                        # place already succeeded (avoid pre-sch noise).
+                        _should = _ecad_power_satisfied(calls) or (
+                            sum(
+                                1 for c in calls
+                                if c.get("ok")
+                                and c.get("tool") == "ecad_place_symbol"
+                            ) >= 1
+                        )
+                    elif tool in ("ecad_wire", "ecad_label") and _need_now in (
+                        "board_from_schematic", "ecad_make_board",
+                        "ecad_run_drc", "ecad_add_power", "ecad_wire",
+                        "ecad_place_symbol",
+                    ):
+                        _should = True
+                    elif tool in (
+                        "board_from_schematic", "ecad_make_board",
+                    ) and _need_now in (
+                        "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
+                    ):
+                        _should = True
+                    elif tool == "ecad_run_drc" and _need_now in (
+                        "ecad_run_erc", "ecad_simulate",
+                    ):
+                        _should = True
+                    elif tool == "ecad_run_erc" and _need_now == "ecad_simulate":
+                        _should = True
+                    if _should:
+                        calls, tool_calls_made = _ecad_force_chain_cascade(
+                            calls=calls,
+                            allow=allow,
+                            dispatch=dispatch,
+                            ledger=ledger,
+                            actor=actor,
+                            messages=messages,
+                            tool_calls_made=tool_calls_made,
+                            budget=budget,
+                            reason=f"post_success_cascade:{tool}",
+                        )
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -1806,20 +1918,12 @@ def _ecad_chain_need(
 ) -> str | None:
     """Return the next forced ECAD product tool name, or None if chain ok.
 
-    mega-14 live: ecad_add_power alone (net_size=0 orphan port) was counted as
-    "wired" and force-injected board_from_schematic → empty netlist SPICE (AC5)
-    + ERC errors (AC4). Require a real ecad_wire (or label) before board; power
-    is a prep step, not a substitute for pin-to-pin nets.
-
-    mega-17 residual: passive self-loop (R1.1↔R1.2) unlocked board without
-    ecad_add_power → ERC power_not_driven. Require add_power when allowed, and
-    a cross-ref wire (not same-ref self-loop) before board.
-
-    mega-18 residual: model placed orphan power (net_size=0) then cascade
-    forced Device:R + U1↔R1 and unlocked board — power_not_driven remained.
-    Require *bonded* power (port on pin xy / net_size≥1) before board; re-force
-    add_power at pin xy when only orphans exist; never place passive before
-    bonded power when add_power is allowed.
+    mega-14: IC-only → force Device:R for SPICE models.
+    mega-17: require add_power + cross-ref wire before board (no self-loop).
+    mega-18: orphan off-pin power rebond at pin xy before passive/board.
+    mega-19 D: power-satisfied = add_power executed OR power symbols/nets
+    already present — never demand add_power forever when power already exists.
+    Board unlocks on power-satisfied + cross wire (not bonded-only).
     """
     allow_set = allow or set()
     ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
@@ -1829,8 +1933,10 @@ def _ecad_chain_need(
         1 for c in calls
         if c.get("ok") and c.get("tool") == "ecad_place_symbol"
     )
-    has_power_any = "ecad_add_power" in ok_tools
-    has_bonded = _ecad_has_bonded_power(calls)
+    power_ok = _ecad_power_satisfied(calls)
+    power_ready = (
+        _ecad_has_bonded_power(calls) or _ecad_power_xy_on_pin(calls)
+    )
     has_cross = _ecad_has_cross_wire(calls)
     has_board = bool(ok_tools & {"board_from_schematic", "ecad_make_board"})
     has_drc = "ecad_run_drc" in ok_tools
@@ -1839,29 +1945,31 @@ def _ecad_chain_need(
         and _ecad_place_is_passive(c)
         for c in calls
     )
-    # 1) Bonded power first (re-force at pin xy when only orphans exist).
+    # 1) IC-only: rebond orphan power before placing Device:R (mega-18 a1).
+    #    When no power yet, place passive first (mega-11 IC-only → Device:R).
+    if n_place >= 1 and not has_passive and "ecad_place_symbol" in allow_set:
+        if (
+            power_ok
+            and not power_ready
+            and "ecad_add_power" in allow_set
+            and _ecad_should_retry_add_power(calls)
+        ):
+            return "ecad_add_power"
+        return "ecad_place_symbol"
+    # 2) First power port when none yet (or no existing power symbols).
     if (
         n_place >= 1
         and "ecad_add_power" in allow_set
-        and not has_bonded
-        and _ecad_should_retry_add_power(calls)
+        and not power_ok
     ):
         return "ecad_add_power"
-    # 2) SPICE-capable passive after power bonded (or when power not allowed).
-    if (
-        n_place >= 1
-        and not has_passive
-        and "ecad_place_symbol" in allow_set
-        and (has_bonded or "ecad_add_power" not in allow_set)
-    ):
-        return "ecad_place_symbol"
-    # 3) Cross-ref wire (never self-loop as product).
+    # 3) Cross-ref wire.
     if n_place >= 1 and not has_cross and "ecad_wire" in allow_set:
         return "ecad_wire"
-    # 4) Board only after bonded power (when allowed) + cross wire.
+    # 4) Board when power-satisfied (mega-19 D) + cross wire.
     if (
         has_cross
-        and (has_bonded or "ecad_add_power" not in allow_set)
+        and (power_ok or "ecad_add_power" not in allow_set)
         and not has_board
         and (_ECAD_PRODUCT_TOOLS & allow_set)
     ):
@@ -1893,6 +2001,7 @@ def _ecad_chain_need(
         and not has_sim
         and "ecad_simulate" in allow_set
         and (has_erc or "ecad_run_erc" not in allow_set)
+        and (power_ok or "ecad_add_power" not in allow_set)
     ):
         return "ecad_simulate"
     return None
@@ -2024,35 +2133,233 @@ def _ecad_power_xy_on_pin(calls: list, tol: float = 0.6) -> bool:
     return False
 
 
+def _ecad_existing_power_symbols_or_nets(calls: list) -> bool:
+    """True when ledger already shows power symbols / power nets without add_power.
+
+    mega-19 D: fixtures with manually-placed power must not demand ecad_add_power
+    forever. Detect #PWR* refs, power: libids, or power_in nets already labeled.
+    """
+    for c in calls or []:
+        if not c.get("ok"):
+            continue
+        tool = c.get("tool")
+        res = _ecad_parse_result(c.get("result"))
+        args = c.get("args") if isinstance(c.get("args"), dict) else {}
+        if tool == "ecad_place_symbol":
+            ref = str(res.get("ref") or args.get("ref") or "")
+            lib = str(res.get("libid") or args.get("libid") or "").lower()
+            if ref.startswith("#") or ref.upper().startswith("PWR"):
+                return True
+            if any(
+                tok in lib
+                for tok in (
+                    "power:", "power_pwr", "device:v", "device:i",
+                    "simulator_spice:v", "spice:v",
+                )
+            ):
+                return True
+            # Placed V/I sources count as power present for chain.
+            if ref.upper().startswith(("V", "I")) and (
+                "device:v" in lib or "device:i" in lib or "vsource" in lib
+                or str(args.get("value") or "").upper().startswith(
+                    ("V", "DC", "3V", "5V")
+                )
+            ):
+                return True
+        if tool == "ecad_label":
+            net = str(
+                res.get("net") or args.get("net") or args.get("name") or ""
+            ).upper()
+            if net in {
+                "GND", "VCC", "VDD", "3V3", "+3V3", "5V", "+5V", "VIN",
+                "VBAT", "VSS", "AGND", "DGND", "0",
+            }:
+                return True
+        # Truncated ledger strings may still mention power symbols.
+        raw = c.get("result")
+        if isinstance(raw, str) and (
+            "#PWR" in raw or "power:" in raw.lower() or '"net": "GND"' in raw
+            or '"net":"GND"' in raw or '"net": "3V3"' in raw
+            or '"net":"3V3"' in raw
+        ):
+            # Only count when this is a place/power/label-ish tool.
+            if tool in (
+                "ecad_place_symbol", "ecad_add_power", "ecad_label",
+                "ecad_status",
+            ):
+                return True
+    return False
+
+
+def _ecad_power_satisfied(calls: list) -> bool:
+    """mega-19 D: add_power executed OR power symbols/nets already present.
+
+    Orphan add_power (net_size=0) still counts as power-satisfied for chain
+    progression — rail bonding is A (wire pairs), not a second power gate.
+    """
+    for c in calls or []:
+        if c.get("ok") and c.get("tool") == "ecad_add_power":
+            return True
+    if _ecad_existing_power_symbols_or_nets(calls):
+        return True
+    # Bonded / on-pin also satisfy (subset).
+    if _ecad_has_bonded_power(calls) or _ecad_power_xy_on_pin(calls):
+        return True
+    return False
+
+
+def _ecad_power_ready(calls: list) -> bool:
+    """Alias used by soft-gate paths — same as power_satisfied (mega-19 D)."""
+    return _ecad_power_satisfied(calls)
+
+
 def _ecad_should_retry_add_power(calls: list) -> bool:
-    """Whether to force another add_power (missing, orphan, or not on pin xy)."""
-    if _ecad_has_bonded_power(calls):
+    """Force add_power when missing, or rebond off-pin orphans (mega-18).
+
+    mega-19 D: if power is satisfied via *existing symbols/nets* (no add_power
+    ledger entry needed), do NOT re-force add_power. If add_power ran but is
+    still off-pin orphan, allow a capped rebond.
+    """
+    # Existing power symbols/nets without needing add_power → no retry.
+    has_add = any(
+        c.get("ok") and c.get("tool") == "ecad_add_power" for c in (calls or [])
+    )
+    if not has_add and _ecad_existing_power_symbols_or_nets(calls):
+        return False
+    if _ecad_has_bonded_power(calls) or _ecad_power_xy_on_pin(calls):
         return False
     n_power = sum(
         1 for c in (calls or [])
         if c.get("ok") and c.get("tool") == "ecad_add_power"
     )
-    # Cap retries: GND + 3V3 + one rebond each ≈ 4; avoid infinite cascade.
+    # Cap retries: GND + 3V3 orphans + up to 2 rebond attempts.
     if n_power >= 4:
         return False
     if n_power == 0:
         return True
-    # Orphans only: re-force until a port lands on a pin xy (or bonded).
-    if not _ecad_power_xy_on_pin(calls):
-        return True
-    # On-pin but still net_size=0 — one more try then stop.
-    return n_power < 3
+    # Off-pin orphans → rebond.
+    return not _ecad_power_xy_on_pin(calls)
+
+
+def _ecad_has_sim_source(calls: list) -> bool:
+    """True when netlist already has a V/I source for SPICE (mega-19 C)."""
+    for c in calls or []:
+        if not (c.get("ok") and c.get("tool") == "ecad_place_symbol"):
+            continue
+        res = _ecad_parse_result(c.get("result"))
+        args = c.get("args") if isinstance(c.get("args"), dict) else {}
+        ref = str(res.get("ref") or args.get("ref") or "")
+        lib = str(res.get("libid") or args.get("libid") or "").lower()
+        val = str(res.get("value") or args.get("value") or "").lower()
+        if ref.upper().startswith("V") or ref.upper().startswith("I"):
+            return True
+        if any(
+            tok in lib
+            for tok in (
+                "device:v", "device:i", "simulator_spice:v", "spice:v",
+                "vsource", "isource",
+            )
+        ):
+            return True
+        if val.startswith("dc ") or val.endswith("v") and any(
+            ch.isdigit() for ch in val
+        ):
+            # e.g. value "3.3V" on a V device place
+            if "device:v" in lib or ref.upper().startswith("V"):
+                return True
+    return False
+
+
+def _ecad_board_doc_id(calls: list) -> str | None:
+    """Harvest board doc_id from board_from_schematic / make_board results.
+
+    mega-19 B: subsequent forced DRC/trace/autoroute must target the board
+    doc, never the schematic. Handles truncated ledger JSON strings.
+    """
+    for c in reversed(calls or []):
+        if not c.get("ok"):
+            continue
+        tool = c.get("tool")
+        if tool not in ("board_from_schematic", "ecad_make_board", "ecad_new_pcb"):
+            continue
+        res = c.get("result")
+        # Prefer structured parse.
+        obj = _ecad_parse_result(res)
+        for key in ("board_doc_id", "doc_id", "pcb_doc_id", "board_id"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip():
+                # Avoid treating pure sch ids when board_doc_id present.
+                if key == "doc_id" and obj.get("sch_doc_id") and not obj.get(
+                    "board_doc_id"
+                ):
+                    # board_from_schematic always sets doc_id=board.
+                    if tool in ("board_from_schematic", "ecad_make_board"):
+                        return v.strip()
+                    continue
+                return v.strip()
+        # Regex harvest from truncated string (mega-18 live shape).
+        if isinstance(res, str):
+            for key in ("board_doc_id", "doc_id"):
+                m = re.search(
+                    rf'["\']{key}["\']\s*:\s*["\']([^"\']+)["\']', res,
+                )
+                if m:
+                    return m.group(1).strip()
+        args = c.get("args") if isinstance(c.get("args"), dict) else {}
+        for key in ("board_doc_id", "doc_id"):
+            v = args.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _ecad_sch_doc_id(calls: list) -> str | None:
+    """Harvest schematic doc_id for sch-scoped forced tools."""
+    for c in reversed(calls or []):
+        if not c.get("ok"):
+            continue
+        tool = c.get("tool")
+        res = c.get("result")
+        obj = _ecad_parse_result(res)
+        if tool in ("ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+                    "ecad_add_power", "ecad_run_erc", "ecad_simulate"):
+            for key in ("sch_doc_id", "doc_id"):
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip():
+                    # board result may also carry sch_doc_id
+                    if key == "doc_id" and tool == "board_from_schematic":
+                        continue
+                    return v.strip()
+        if tool == "board_from_schematic":
+            v = obj.get("sch_doc_id")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        if isinstance(res, str):
+            m = re.search(
+                r'["\']sch_doc_id["\']\s*:\s*["\']([^"\']+)["\']', res,
+            )
+            if m:
+                return m.group(1).strip()
+            if tool == "ecad_new_schematic":
+                m = re.search(
+                    r'["\']doc_id["\']\s*:\s*["\']([^"\']+)["\']', res,
+                )
+                if m:
+                    return m.group(1).strip()
+    return None
 
 
 def _ecad_nets_ready_for_board(
     calls: list, allow: set[str] | None = None,
 ) -> bool:
-    """Board may open only after *bonded* power (when allowed) + product wire.
+    """Board may open only after power-satisfied (when allowed) + product wire.
 
-    mega-18: orphan add_power (net_size=0) must NOT unlock board.
+    mega-19 D: power-satisfied = add_power executed OR power symbols/nets
+    already present. Cross-ref wire still required (orphan power alone never
+    unlocks board — mega-18 residual held via missing cross wire).
     """
     allow_set = allow or set()
-    if "ecad_add_power" in allow_set and not _ecad_has_bonded_power(calls):
+    if "ecad_add_power" in allow_set and not _ecad_power_satisfied(calls):
         return False
     return _ecad_has_cross_wire(calls)
 
@@ -2063,11 +2370,31 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
     mega-15: derive CONCRETE pin/net/xy from placed-symbol results so force-
     injected ecad_wire / ecad_add_power actually bond nets (AC4 power_not_driven
     + AC5 empty netlist residuals). Orphan power at (0,0) does not drive pins.
+    mega-19 A: wire pairs prefer power_in → rail refs returned by add_power.
+    mega-19 B: board-scoped tools carry board doc_id from board_from_schematic.
+    mega-19 C: pre-simulate place Device:V when no source present.
     """
     pins = _ecad_place_pin_records(calls)
     refs = _ecad_last_place_refs(calls)
 
     if need == "ecad_place_symbol":
+        # mega-19 C: if power+cross ready but no sim source, inject V on 3V3.
+        if (
+            _ecad_has_cross_wire(calls)
+            and _ecad_power_satisfied(calls)
+            and not _ecad_has_sim_source(calls)
+        ):
+            sch = _ecad_sch_doc_id(calls)
+            args = {
+                "libid": "Device:V",
+                "value": "DC 3.3",
+                "ref": "V1",
+                "x": 40.0,
+                "y": 0.0,
+            }
+            if sch:
+                args["doc_id"] = sch
+            return args
         # SPICE-capable passive — AC5 residual was IC-only (no sim models).
         return {
             "libid": "Device:R",
@@ -2131,18 +2458,23 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
             )
             for c in calls
         )
+        sch = _ecad_sch_doc_id(calls)
         if has_gnd:
             cand = _unused([
                 p for p in pwr_pins if "gnd" not in p["name"].lower()
             ] or pwr_pins or pins)
             target = cand[0] if cand else None
             if target is not None:
-                return {
+                out = {
                     "net": "3V3",
                     "x": float(target["x"]),
                     "y": float(target["y"]),
                 }
-            return {"net": "3V3", "x": 0.0, "y": 10.0}
+            else:
+                out = {"net": "3V3", "x": 0.0, "y": 10.0}
+            if sch:
+                out["doc_id"] = sch
+            return out
         cand = _unused(gnd_pins or [
             p for p in pins
             if p["ref"].upper().startswith(("R", "C", "L"))
@@ -2150,24 +2482,59 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         ] or pins)
         target = cand[0] if cand else None
         if target is not None:
-            return {
+            out = {
                 "net": "GND",
                 "x": float(target["x"]),
                 "y": float(target["y"]),
             }
-        return {"net": "GND", "x": 0.0, "y": 0.0}
+        else:
+            out = {"net": "GND", "x": 0.0, "y": 0.0}
+        if sch:
+            out["doc_id"] = sch
+        return out
 
     if need == "ecad_wire":
-        # mega-17/18 Z2r: derive endpoints ONLY from live place/add_power.
+        # mega-17/18/19 Z2r: derive endpoints ONLY from live place/add_power.
         # Never hardcode #PWR1. Prefer power-pin → rail; never self-loop when
         # ≥2 live refs exist (mega-17 residual R1.1↔R1.2 unlocked board).
-        return _ecad_derive_wire_args(calls, pins=pins, refs=refs)
+        args = _ecad_derive_wire_args(calls, pins=pins, refs=refs)
+        sch = _ecad_sch_doc_id(calls)
+        if sch and not args.get("doc_id"):
+            args["doc_id"] = sch
+        return args
+
+    # mega-19 B: board-chain tools must carry board doc_id.
+    board_id = _ecad_board_doc_id(calls)
+    sch_id = _ecad_sch_doc_id(calls)
+
+    if need in (
+        "ecad_run_drc", "ecad_autoroute", "ecad_to_3d", "ecad_run_pdn",
+        "ecad_export",
+    ):
+        out: dict = {}
+        if board_id:
+            out["doc_id"] = board_id
+        return out
+
+    if need in ("board_from_schematic", "ecad_make_board"):
+        out = {}
+        if sch_id:
+            out["doc_id"] = sch_id
+            out["sch_doc_id"] = sch_id
+        return out
 
     if need == "ecad_run_erc":
-        return {}
+        out = {}
+        if sch_id:
+            out["doc_id"] = sch_id
+        return out
+
     if need == "ecad_simulate":
         # mega-17 Z3: OP analysis on 3V3 for AC5.
-        return {"analysis": "op", "probes": ["V(3V3)"]}
+        out = {"analysis": "op", "probes": ["V(3V3)"]}
+        if sch_id:
+            out["doc_id"] = sch_id
+        return out
     return {}
 
 
@@ -2178,9 +2545,10 @@ def _ecad_derive_wire_args(
 ) -> dict:
     """Derive net-aware ecad_wire args; never same-ref when multi-ref exists.
 
-    mega-18 Z2r: map power pins (VDD/GND/…) toward rail/power symbols when
-    add_power returned a ref; otherwise passive↔IC. Self-loop is last resort
-    only for single-ref schematics.
+    mega-18/19 Z2r: map power pins (VDD/GND/…) toward rail/power symbols when
+    add_power returned a ref; otherwise IC power_in ↔ passive. Self-loop is
+    last resort only for single-ref schematics. Never passive↔passive when an
+    IC is present (mega-19 A residual: U1↔R1 is OK only when no rail ref).
     """
     pins = pins if pins is not None else _ecad_place_pin_records(calls)
     place_refs = refs if refs is not None else _ecad_last_place_refs(calls)
@@ -2208,30 +2576,54 @@ def _ecad_derive_wire_args(
             return plist[0]["pin"]
         return prefer or "1"
 
-    def _power_pin_of(ref: str) -> str | None:
+    def _power_pin_of(ref: str, net_hint: str | None = None) -> str | None:
         """Prefer a power_in / VDD / GND pin on *ref* for rail bonding."""
+        hint = (net_hint or "").upper()
+        ranked: list[tuple[int, str]] = []
         for p in by_ref.get(ref) or []:
             nm = (p.get("name") or "").upper()
             typ = (p.get("type") or "").lower()
-            if typ in ("power_in", "power_out", "power") or any(
+            is_pwr = typ in ("power_in", "power_out", "power") or any(
                 tok in nm for tok in (
                     "VDD", "VCC", "3V3", "3.3", "5V", "GND", "VSS", "VIN",
+                    "VBAT", "VDDIO", "VDDA",
                 )
-            ):
-                return p["pin"]
+            )
+            if not is_pwr:
+                continue
+            score = 0
+            if typ == "power_in":
+                score += 2
+            if hint:
+                if hint in nm or (hint == "GND" and ("GND" in nm or "VSS" in nm)):
+                    score += 5
+                if hint in ("3V3", "VCC", "VDD") and any(
+                    t in nm for t in ("3V3", "VCC", "VDD", "VDDIO")
+                ):
+                    score += 5
+            ranked.append((score, p["pin"]))
+        if ranked:
+            ranked.sort(key=lambda t: -t[0])
+            return ranked[0][1]
         return None
 
     # Prefer: power pin on IC/passive → live power-symbol ref (engine ref).
+    # mega-19 A: use refs RETURNED by ecad_add_power (never invent #PWR1).
     if live_power_refs and (passive_refs or ic_refs):
-        a = (ic_refs or passive_refs)[0]
-        pwr = next((p for p in power_recs if p.get("ref")), power_recs[0])
-        a_pin = _power_pin_of(a) or _pin_of(a, "1")
-        return {
-            "from_ref": a,
-            "from_pin": a_pin,
-            "to_ref": pwr["ref"],
-            "to_pin": str(pwr.get("pin") or pwr.get("net") or "1"),
-        }
+        # Pick the freshest power rec with a ref; match net to pin name.
+        pwr = next(
+            (p for p in reversed(power_recs) if p.get("ref")),
+            power_recs[-1] if power_recs else None,
+        )
+        if pwr and pwr.get("ref"):
+            a = (ic_refs or passive_refs)[0]
+            a_pin = _power_pin_of(a, pwr.get("net")) or _pin_of(a, "1")
+            return {
+                "from_ref": a,
+                "from_pin": a_pin,
+                "to_ref": pwr["ref"],
+                "to_pin": str(pwr.get("pin") or pwr.get("net") or "1"),
+            }
     # Bond a power pin on an IC to a passive pin when no power-symbol ref.
     if passive_refs and ic_refs:
         a, b = ic_refs[0], passive_refs[0]
@@ -2241,7 +2633,12 @@ def _ecad_derive_wire_args(
             "to_ref": b, "to_pin": _pin_of(b, "1"),
         }
     if len(place_refs) >= 2:
-        a, b = place_refs[0], place_refs[1]
+        # Prefer non-passive as from when possible (avoid pure passive-passive).
+        non_pass = [r for r in place_refs if r not in passive_refs]
+        if non_pass and passive_refs:
+            a, b = non_pass[0], passive_refs[0]
+        else:
+            a, b = place_refs[0], place_refs[1]
         return {
             "from_ref": a, "from_pin": _power_pin_of(a) or _pin_of(a, "1"),
             "to_ref": b, "to_pin": _pin_of(b, "1"),
@@ -2441,6 +2838,41 @@ def _ecad_force_chain_cascade(
             "ecad_run_erc", "ecad_simulate",
         ):
             break
+        # mega-19 C: sourceless netlist → force-place Device:V before simulate.
+        if (
+            need == "ecad_simulate"
+            and not _ecad_has_sim_source(calls)
+            and "ecad_place_symbol" in allow_set
+            and tool_calls_made < budget
+        ):
+            v_args = _ecad_forced_tool_args("ecad_place_symbol", calls)
+            # Ensure V supply even if passive path would return Device:R.
+            if "Device:V" not in str(v_args.get("libid") or ""):
+                v_args = {
+                    "libid": "Device:V",
+                    "value": "DC 3.3",
+                    "ref": "V1",
+                    "x": 40.0,
+                    "y": 0.0,
+                }
+                sch = _ecad_sch_doc_id(calls)
+                if sch:
+                    v_args["doc_id"] = sch
+            calls, tool_calls_made, _vrec, _vok = _ecad_dispatch_forced_step(
+                tool="ecad_place_symbol",
+                args=v_args,
+                calls=calls,
+                dispatch=dispatch,
+                ledger=ledger,
+                actor=actor,
+                messages=messages,
+                reason=f"{reason}:inject_v_source",
+                tool_calls_made=tool_calls_made,
+                budget=budget,
+            )
+            steps += 1
+            if tool_calls_made >= budget or steps >= max_steps:
+                break
         args = _ecad_forced_tool_args(need, calls)
         calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
             tool=need,

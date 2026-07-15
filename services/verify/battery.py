@@ -201,17 +201,59 @@ def _adapt_check_kwargs(
         return call_kwargs, None
 
     if check_name == "measure_between":
-        if call_kwargs.get("a_query") in (None, ""):
-            # Prefer plain-word face pair; engine resolves side words.
-            # Derive from features when present (solid exists → faces exist).
-            feats = _doc_features(doc_id)
-            if not feats:
-                return None, _skip_json(
-                    check_name, "no features to measure between"
-                )
-            call_kwargs["a_query"] = "top face"
-            if call_kwargs.get("b_query") in (None, ""):
-                call_kwargs["b_query"] = "bottom face"
+        # mega-19 C/AC1: derive two real feature refs from the doc, or honest SKIP.
+        # Never leave a_query empty (signature-zero) and never invent face words
+        # that score 0 when no solid faces exist.
+        a_q = call_kwargs.get("a_query")
+        b_q = call_kwargs.get("b_query")
+        feats = _doc_features(doc_id)
+        feat_ids = []
+        for f in feats:
+            fid = f.get("id") or f.get("name") or f.get("feature_id")
+            if fid:
+                feat_ids.append(str(fid))
+        if a_q in (None, "") or b_q in (None, ""):
+            if len(feat_ids) >= 2:
+                if a_q in (None, ""):
+                    call_kwargs["a_query"] = feat_ids[0]
+                if b_q in (None, ""):
+                    call_kwargs["b_query"] = feat_ids[1]
+            elif len(feat_ids) == 1 and feats:
+                # One feature: measure between its top/bottom faces if solid-ish.
+                f0 = feats[0]
+                ftype = str(f0.get("type") or f0.get("kind") or "").lower()
+                if ftype in (
+                    "box", "extrude", "revolve", "cylinder", "pad", "boss",
+                    "solid", "body",
+                ) or "extrud" in ftype or "revolv" in ftype:
+                    if a_q in (None, ""):
+                        call_kwargs["a_query"] = "top face"
+                    if b_q in (None, ""):
+                        call_kwargs["b_query"] = "bottom face"
+                else:
+                    return None, _skip_json(
+                        check_name,
+                        "need two feature refs for measure_between; only one feature",
+                    )
+            else:
+                # Try plain-word faces when features exist but lack ids.
+                if feats:
+                    if a_q in (None, ""):
+                        call_kwargs["a_query"] = "top face"
+                    if b_q in (None, ""):
+                        call_kwargs["b_query"] = "bottom face"
+                else:
+                    return None, _skip_json(
+                        check_name,
+                        "no features to measure between (honest SKIP)",
+                    )
+        # Final guard: still missing either endpoint → SKIP not zero-score.
+        if call_kwargs.get("a_query") in (None, "") or call_kwargs.get(
+            "b_query"
+        ) in (None, ""):
+            return None, _skip_json(
+                check_name, "could not derive two measure endpoints",
+            )
         return call_kwargs, None
 
     if check_name == "ecad_check_impedance":

@@ -302,7 +302,12 @@ def test_mega17_ledger_replay_produces_add_power_and_valid_wire():
                 "ok": True,
                 "net": (args or {}).get("net") or "GND",
                 "ref": "#PWRGND",
-                "net_size": 0,
+                "net_size": 2,
+                "net_members": ["U1.2"],
+                "pos": [
+                    (args or {}).get("x", 0),
+                    (args or {}).get("y", 0),
+                ],
             }
         if tool == "ecad_wire":
             a = args or {}
@@ -313,7 +318,10 @@ def test_mega17_ledger_replay_produces_add_power_and_valid_wire():
                 }
             return {"ok": True, "net": "N1", "net_size": 2}
         if tool == "board_from_schematic":
-            return {"ok": True, "doc_id": "pcb-replay"}
+            return {
+                "ok": True, "doc_id": "pcb-replay",
+                "board_doc_id": "pcb-replay",
+            }
         if tool == "ecad_run_drc":
             return {"ok": True, "errors": 0}
         if tool == "ecad_place_symbol":
@@ -425,9 +433,16 @@ def test_live_force_inject_turn_hits_add_power(tmp_path, monkeypatch):
                 ],
             }
         if tool == "ecad_add_power":
+            # Bond when xy is near a pin (forced path); orphan if arbitrary.
+            x = float((args or {}).get("x") or 0)
+            y = float((args or {}).get("y") or 0)
+            bonded = abs(x) < 1.0 and abs(y) < 6.0  # U1 pins at (0,5)/(0,0)
             return {
                 "ok": True, "net": (args or {}).get("net") or "GND",
-                "ref": "#PWR01", "net_size": 0,
+                "ref": "#PWR01",
+                "net_size": 2 if bonded else 0,
+                "net_members": ["U1.2"] if bonded else [],
+                "pos": [x, y],
             }
         if tool == "ecad_wire":
             a = args or {}
@@ -435,7 +450,9 @@ def test_live_force_inject_turn_hits_add_power(tmp_path, monkeypatch):
                 return {"ok": True, "net": "Nself", "net_size": 2}
             return {"ok": True, "net": "N1", "net_size": 2}
         if tool == "board_from_schematic":
-            return {"ok": True, "doc_id": "pcb-m18"}
+            return {
+                "ok": True, "doc_id": "pcb-m18", "board_doc_id": "pcb-m18",
+            }
         if tool == "ecad_run_drc":
             return {"ok": True, "errors": 0}
         return {"ok": True}
@@ -558,3 +575,190 @@ def test_ac5_missing_probe_with_converged_is_fail():
     )
     assert v == FAIL, (v, d)
     assert "3V3" in d or "3v3" in d.lower() or "missing" in d.lower(), d
+
+
+# ---------------------------------------------------------------------------
+# mega-18 a1 residuals — orphan power + AC4 board doc
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_power_does_not_unlock_board():
+    """mega-18 a1: net_size=0 ports must not unlock board; re-force pin xy."""
+    from services.agent.agent_turn import (
+        _ecad_chain_need, _ecad_forced_tool_args, _ecad_has_bonded_power,
+        _ecad_nets_ready_for_board,
+    )
+
+    allow = {
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+        "ecad_add_power", "board_from_schematic", "ecad_run_drc",
+    }
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True, "result": {"doc_id": "s"}},
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "MCU:X", "ref": "U1"},
+            "result": {
+                "ref": "U1",
+                "pins": [
+                    {"number": "1", "name": "VBAT", "type": "power_in",
+                     "xy": [34.76, 53.97]},
+                    {"number": "2", "name": "GND", "type": "power_in",
+                     "xy": [34.76, 40.0]},
+                ],
+            },
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "GND", "x": 10.0, "y": 80.0},
+            "result": {
+                "ok": True, "net": "GND", "net_size": 0, "pos": [10.0, 80.0],
+            },
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "3V3", "x": 10.0, "y": 10.0},
+            "result": {
+                "ok": True, "net": "3V3", "net_size": 0, "pos": [10.0, 10.0],
+            },
+        },
+    ]
+    assert _ecad_has_bonded_power(calls) is False
+    assert _ecad_nets_ready_for_board(calls, allow) is False
+    # Must re-force add_power at pin xy — not place Device:R.
+    assert _ecad_chain_need(calls, allow) == "ecad_add_power"
+    args = _ecad_forced_tool_args("ecad_add_power", calls)
+    # Land on a U1 power pin xy, not the orphan (10,80).
+    assert (round(float(args["x"]), 2), round(float(args["y"]), 2)) in {
+        (34.76, 53.97), (34.76, 40.0),
+    }, args
+
+
+def test_cascade_after_orphan_power_rebonds_then_wire():
+    """After orphan GND+3V3, cascade rebinds pin then wires power_in→rail."""
+    from services.agent.agent_turn import _ecad_force_chain_cascade
+
+    allow = {
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+        "ecad_add_power", "board_from_schematic", "ecad_run_drc",
+    }
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True, "result": {"doc_id": "s"}},
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "MCU:X"},
+            "result": {
+                "ref": "U1",
+                "pins": [
+                    {"number": "1", "name": "VBAT", "type": "power_in",
+                     "xy": [34.76, 53.97]},
+                    {"number": "2", "name": "GND", "type": "power_in",
+                     "xy": [34.76, 40.0]},
+                ],
+            },
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "GND", "x": 10.0, "y": 80.0},
+            "result": {"ok": True, "net": "GND", "net_size": 0, "pos": [10, 80]},
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "3V3", "x": 10.0, "y": 10.0},
+            "result": {"ok": True, "net": "3V3", "net_size": 0, "pos": [10, 10]},
+        },
+    ]
+    dispatched = []
+
+    def _dispatch(tool, args):
+        dispatched.append((tool, dict(args or {})))
+        if tool == "ecad_add_power":
+            return {
+                "ok": True, "net": (args or {}).get("net") or "GND",
+                "net_size": 2, "ref": "#PWRX",
+                "pos": [(args or {}).get("x"), (args or {}).get("y")],
+            }
+        if tool == "ecad_place_symbol":
+            return {
+                "ok": True, "ref": "R1", "libid": "Device:R", "value": "1k",
+                "pins": [
+                    {"number": "1", "xy": [20, 20]},
+                    {"number": "2", "xy": [30, 20]},
+                ],
+            }
+        if tool == "ecad_wire":
+            a = args or {}
+            assert a.get("from_ref") != a.get("to_ref"), a
+            return {"ok": True, "net": "N1", "net_size": 2}
+        if tool == "board_from_schematic":
+            return {"ok": True, "doc_id": "pcb1", "board_doc_id": "pcb1"}
+        if tool == "ecad_run_drc":
+            return {"ok": True, "errors": 0}
+        return {"ok": True}
+
+    new, _ = _ecad_force_chain_cascade(
+        calls=list(calls), allow=allow, dispatch=_dispatch, ledger=None,
+        actor="t", messages=[], tool_calls_made=0, budget=10,
+        reason="z2r_orphan_rebond",
+    )
+    # First cascade step must re-add_power (not place R).
+    assert dispatched[0][0] == "ecad_add_power", dispatched
+    # Wire must include power rail ref when available.
+    wires = [
+        c for c in new
+        if c.get("tool") == "ecad_wire" and c.get("ok") and c.get("forced")
+    ]
+    assert wires, new
+    wargs = wires[0].get("args") or {}
+    assert "#PWRX" in {wargs.get("from_ref"), wargs.get("to_ref")} or (
+        wargs.get("from_ref") != wargs.get("to_ref")
+    ), wargs
+
+
+def test_ac4_drc_resolves_board_doc_from_truncated_result():
+    """mega-18 a1: DRC must use board_doc_id 08cf… not sch 0ce…."""
+    from services.agent.reviewer_exec import _resolve_domain_doc_id
+
+    class _Led:
+        events = []
+
+    led = _Led()
+    board_res = (
+        '{"ok":true,"doc_id":"08cfb42d9b98","board_doc_id":"08cfb42d9b98",'
+        '"sch_doc_id":"0ce20163ee10","revision":5,"placed":2,"routed":1,'
+        '"routed_nets":["N$1"],"failed_nets":[],"residual_drc":[],'
+        '"drc_errors":0,"report":{"ratsnest_before":1,"ratsnest_after":0,'
+        '"corners_rounded":0,"teardrops":1,"nets_tuned":0,"drc_errors":0,'
+        '"seed":0,"steps":[{"step":"update_from_sch","ok":true,"added":2,'
+        '"updated":0,"unresolved":0},{"step":"place_board","ok":true,'
+        '"moved":2,"n_footprints":2,"ratsnest_le'
+    )
+    led.events = [
+        {
+            "kind": "agent_turn",
+            "payload": {
+                "event": "tool_call", "tool": "ecad_new_schematic",
+                "ok": True,
+                "result": {"ok": True, "doc_id": "0ce20163ee10"},
+            },
+        },
+        {
+            "kind": "agent_turn",
+            "payload": {
+                "event": "tool_call", "tool": "ecad_place_symbol",
+                "ok": True, "args": {"doc_id": "0ce20163ee10"},
+                "result": '{"ok":true,"doc_id":"0ce20163ee10","ref":"U1"}',
+            },
+        },
+        {
+            "kind": "agent_turn",
+            "payload": {
+                "event": "tool_call", "tool": "board_from_schematic",
+                "ok": True, "args": {}, "result": board_res,
+            },
+        },
+    ]
+    assert _resolve_domain_doc_id("ecad_run_drc", led) == "08cfb42d9b98"
+    # ERC/simulate still prefer schematic.
+    assert _resolve_domain_doc_id("ecad_run_erc", led) == "0ce20163ee10"
+

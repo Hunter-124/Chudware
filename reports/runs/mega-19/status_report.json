@@ -1,0 +1,58 @@
+{
+  "run_id": "mega-19-fc-rocket-20260715",
+  "wall_s": 459.44,
+  "terminal": "done",
+  "stop_reason": "deliver_partial",
+  "live_pass_ids": [
+    "AC2",
+    "AC3",
+    "AC6",
+    "AC7",
+    "AC8",
+    "AC9"
+  ],
+  "live_pass_count": 6,
+  "axes": {
+    "A19": "FAIL",
+    "B19": "FAIL",
+    "C19": "FAIL",
+    "D19": "PASS",
+    "Z1": "PASS",
+    "Z2": "FAIL",
+    "Z2r": "FAIL",
+    "Z3": "FAIL",
+    "Z4": "PASS",
+    "G18": "PARTIAL",
+    "Y": "PASS",
+    "W": "FAIL",
+    "X": "FAIL",
+    "S": "FAIL",
+    "P": "FAIL",
+    "V": "PASS",
+    "A": "PASS",
+    "B": "PASS",
+    "C": "PASS",
+    "D": "PASS",
+    "Fix8": "PASS"
+  },
+  "xai_token_usage": null,
+  "model_assignment": {
+    "ollama": 13,
+    "xai-sub": 12
+  },
+  "xai_account": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "spend_delta_usd": 0.0,
+  "residuals": [
+    "A19_wire_not_rail_correct_or_no_wire_live_power_not_driven",
+    "B19_DRC_on_sch_not_board_doc_id_not_threaded",
+    "C19_AC5_empty_netlist_no_sim_source_or_AC1_measure_between_zero",
+    "Z3_AC5_empty_netlist_no_simulate_live",
+    "Z2r_no_force_wire_power_live_but_wire_zero",
+    "live_AC_pass_6_of_9_target_ge_8",
+    "G18_live_pass_lt_7"
+  ],
+  "baseline_commit": "6d11238b",
+  "preflight_ready": true,
+  "fixer": "ColdMuskox",
+  "harness": "UnemployedTuna"
+}

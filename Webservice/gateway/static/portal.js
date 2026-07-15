@@ -554,6 +554,37 @@
       btnFullscreen.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
     });
   }
+  var btnImport = document.getElementById("btn-import");
+  var importFile = document.getElementById("import-file");
+  if (btnImport && importFile) {
+    btnImport.addEventListener("click", function () {
+      if (!isLive(state.status)) { setStatusPill("error", "Start a session first"); return; }
+      importFile.click();
+    });
+    importFile.addEventListener("change", async function () {
+      var f = importFile.files && importFile.files[0];
+      importFile.value = "";
+      if (!f) return;
+      if (f.size > 256 * 1024 * 1024) { alert("File too large (256 MB max)."); return; }
+      btnImport.disabled = true;
+      btnImport.textContent = "Uploading…";
+      try {
+        var fd = new FormData();
+        fd.append("file", f, f.name);
+        var r = await fetch("/transfer?path=" + encodeURIComponent("Projects/imports/" + f.name),
+                            { method: "POST", body: fd, credentials: "same-origin" });
+        if (!r.ok) throw new Error((await r.json().catch(function () { return {}; })).detail || ("upload failed (" + r.status + ")"));
+        btnImport.textContent = "Imported \u2713";
+        alert("Uploaded " + f.name + ".\n\nIn the app: File \u2192 Open \u2192 imports/" + f.name);
+      } catch (e) {
+        alert("Import failed: " + (e.message || e));
+        btnImport.textContent = "Import part\u2026";
+      } finally {
+        btnImport.disabled = false;
+        setTimeout(function () { btnImport.textContent = "Import part\u2026"; }, 4000);
+      }
+    });
+  }
   el.chatToggle.addEventListener("click", function () { setChatOpen(!state.chatOpen); });
   el.chatCollapse.addEventListener("click", function () { setChatOpen(false); });
   el.chatRailBtn.addEventListener("click", function () { setChatOpen(true); });

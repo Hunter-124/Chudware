@@ -230,7 +230,7 @@ def _parts_taxonomy(params: dict, _emit: Callable) -> dict:
     ``[that subtree]``. Unknown ids degrade to ok:false (never a traceback).
     """
     try:
-        from engine_oracle.parts_hub import taxonomy as _tax
+        from ..parts_hub import taxonomy as _tax
         cid = str((params or {}).get("category_id", "")).strip()
         doc = _tax.load_taxonomy()
         tree = _tax.flat_tree_for_gui(cid or None)
@@ -259,7 +259,7 @@ def _compute_routing(p: dict) -> dict:
 
     if category_id:
         # V2 taxonomy routing — unknown ids degrade to an unrouted search.
-        from engine_oracle.parts_hub import taxonomy as _tax
+        from ..parts_hub import taxonomy as _tax
         if _tax.get_node(category_id) is not None:
             routing = _tax.route(category_id)
             domain = routing["domains"] or None
@@ -319,8 +319,8 @@ def _filter_items(records: list[dict], p: dict, facet_defs: list[dict]) -> list[
     source    = str(p.get("source", "")).strip().lower()  # "", "local", "live"
 
     if facets_q:
-        from engine_oracle.parts_hub.source import facet_params_view as _fpv
-        from engine_oracle.parts_hub.taxonomy import match_facets as _match_facets
+        from ..parts_hub.source import facet_params_view as _fpv
+        from ..parts_hub.taxonomy import match_facets as _match_facets
         items = [i for i, r in zip(items, records)
                  if _match_facets(_fpv(r.get("params") or {}, facets_q.keys()),
                                   facets_q, facet_defs)]
@@ -346,7 +346,7 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
     ``parts_search_live_start`` / ``parts_search_live_poll`` so results paint as they
     arrive instead of blocking on the slowest vendor."""
     try:
-        from engine_oracle.parts_hub import search as _search
+        from ..parts_hub import search as _search
         p = params or {}
         limit = max(1, min(int(p.get("limit", 50)), 200))
         want_live = bool(p.get("live", True)) and str(p.get("source", "")).lower() != "local"
@@ -396,7 +396,7 @@ _LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
 
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
-    from engine_oracle.parts_hub import search as _search
+    from ..parts_hub import search as _search
     # Flip this vendor's inline status to "loading" before the blocking scrape starts.
     with _live_lock:
         if job.get("cancelled"):
@@ -539,7 +539,7 @@ def _parts_queue_status(params: dict, _emit: Callable) -> dict:
 def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
     """Import a finished fetch-queue artifact (STEP/IGES) as a new editable doc."""
     try:
-        from engine_oracle.parts_hub.place import _place_import_file
+        from ..parts_hub.place import _place_import_file
         path = str((params or {}).get("artifact_path", "")).strip()
         if not path:
             return {"ok": False, "reason": "artifact_path required"}
@@ -551,7 +551,7 @@ def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
 
 def _parts_insert_into_doc(params: dict, _emit: Callable) -> dict:
     try:
-        from engine_oracle.parts_hub.place import place as _place
+        from ..parts_hub.place import place as _place
         part_id = str((params or {}).get("item_id", "")).strip()
         if not part_id:
             return {"ok": False, "reason": "item_id required"}
@@ -612,7 +612,7 @@ def _vendor_status(params: dict, _emit: Callable) -> dict:
 
         api: list[dict] = []
         try:
-            from engine_oracle.parts_providers import _resolve_creds
+            from ..parts_providers import _resolve_creds
             for pid, spec in _API_PROVIDERS.items():
                 cfg_key = spec.get("config_key", pid)
                 creds = _resolve_creds(cfg_key, spec["env"])
@@ -916,7 +916,7 @@ def _resolve_core_family(part_id: str) -> tuple[str, str] | None:
     if part_id.startswith(("catalog:", "vendorlogo:")):
         return None   # live vendor product / a logo — not a local parametric part
     try:
-        from engine_oracle import parts_hub  # noqa: PLC0415
+        from .. import parts_hub  # noqa: PLC0415
         rec = parts_hub.get(part_id)
     except Exception:  # noqa: BLE001 — unknown / non-local id
         return None
@@ -1035,7 +1035,7 @@ def _parts_match_model(params: dict, _emit: Callable) -> dict:
     ``fallback.how == "reverse_engineer"`` routes to ``reveng_start_from_product``.
     """
     try:
-        from engine_oracle.parts_hub.model_matcher import match_model as _match
+        from ..parts_hub.model_matcher import match_model as _match
         p = params or {}
         pid = str(p.get("part_id", "")).strip()
         title = str(p.get("title", "")).strip()
@@ -1047,7 +1047,7 @@ def _parts_match_model(params: dict, _emit: Callable) -> dict:
         # don't want just to match. A returned error envelope (ok:false) is ignored.
         if pid and not (title or mpn) and not pid.startswith("catalog:"):
             try:
-                from engine_oracle.parts_hub import get as _get_record
+                from ..parts_hub import get as _get_record
                 rec = _get_record(pid)
                 if isinstance(rec, dict) and rec.get("ok") is not False and \
                         (rec.get("title") or rec.get("params")):

@@ -73,9 +73,11 @@ enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
-    int provider = 4;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini.
-                       // Default to Google Gemini (see kSeededGeminiKey) for out-of-box copilot.
-    char model[512] = "gemini-2.5-flash";  // flash: reliable free-tier quota for multi-call runs
+    int provider = 6;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
+                       // 5=Cloud OpenAI-compat 6=xAI. Default xAI grok-4.5 (owner directive
+                       // 2026-07-14: SuperGrok subscription is the cheapest tested tier; the
+                       // Accounts sign-in wires credentials; Gemini stays one pick away).
+    char model[512] = "grok-4.5";  // frontier default; auto-pick still routes cheap work down
     char apiKey[256] = "";        // active-provider key (local OpenAI-compat optional key)
     // Per-provider keys so the picker can hide providers with no key while keeping each key
     // around when another provider is active. Serialized under config.json "keys".
@@ -100,7 +102,7 @@ struct Settings {
                                  // default: cloud large, local 8192). Input + output are fitted to
                                  // this so a small LOCAL model never overruns it and breaks the chain.
     std::string systemPrompt;    // system prompt override; empty = built-in
-    std::string theme = "dark";  // "dark" | "light" — persisted to config.json
+    std::string theme = "light";  // "dark" | "light" — persisted to config.json (owner default: light)
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
     bool orthographic = true;    // viewport projection: true=orthographic (CAD default), false=perspective
                                  // — persisted to config.json as "orthographic"

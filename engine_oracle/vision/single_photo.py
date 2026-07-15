@@ -52,7 +52,7 @@ def _backend_available() -> tuple[bool, str]:
     Checks via reveng_provision._artifact_available which reads env vars +
     filesystem only.  Never imports the heavy ML frameworks.
     """
-    from engine_oracle.vision.reveng_provision import _artifact_available  # type: ignore[import]
+    from ..vision.reveng_provision import _artifact_available  # type: ignore[import]
 
     if _artifact_available("trellis"):
         return True, "trellis"
@@ -195,7 +195,7 @@ def reconstruct_single_photo(
     image_path = Path(image_path)
 
     # Select backend: prefer the quality hint but fall back gracefully.
-    from engine_oracle.vision.reveng_provision import _artifact_available  # noqa: PLC0415
+    from ..vision.reveng_provision import _artifact_available  # noqa: PLC0415
 
     if quality == "high" and _artifact_available("trellis"):
         selected = "trellis"

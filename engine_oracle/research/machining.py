@@ -74,7 +74,7 @@ def _material_row(mat_id: str) -> Optional[dict]:
 
     # Try registry alias -> cam_id mapping, then look up by cam_id.
     try:
-        from engine_oracle.materials import registry as _reg  # noqa: PLC0415
+        from ..materials import registry as _reg  # noqa: PLC0415
         resolved = _reg.resolve_key(mat_id)
         if resolved and resolved in mats:
             return mats[resolved]
@@ -493,7 +493,7 @@ def _lookup_tap_drill(designation: str) -> Optional[dict]:
                     return row
         # Compute fallback: tap drill ≈ major - pitch (ISO 2306 rule, 75% thread).
         try:
-            from engine_oracle.research import thread_spec as _ts  # noqa: PLC0415
+            from ..research import thread_spec as _ts  # noqa: PLC0415
             ts = _ts.thread_spec(designation)
             if ts.get("ok"):
                 minor_int = ts["answer"].get("minor_diameter_internal_mm") or ts["answer"].get("minor_diameter_mm")

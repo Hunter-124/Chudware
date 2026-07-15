@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import pytest
 
-from engine_oracle.research.fits import (
+from ..research.fits import (
     FitError,
     fit_calc,
     tolerance_band,

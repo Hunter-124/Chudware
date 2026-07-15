@@ -64,7 +64,7 @@ def _validate_record(rec: dict) -> None:
 
 class TestBoltsAdapter:
     def setup_method(self):
-        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
+        from ..parts_hub.adapters.bolts_adapter import BoltsAdapter
         self.adapter = BoltsAdapter()
 
     def test_iter_records_nonempty(self):
@@ -145,7 +145,7 @@ class TestBoltsAdapter:
 
 class TestCoreFamiliesAdapter:
     def setup_method(self):
-        from engine_oracle.parts_hub.adapters.core_families_adapter import CoreFamiliesAdapter
+        from ..parts_hub.adapters.core_families_adapter import CoreFamiliesAdapter
         self.adapter = CoreFamiliesAdapter()
 
     def test_degrades_gracefully_without_core(self):
@@ -185,8 +185,8 @@ class TestCoreFamiliesAdapter:
 
 class TestPartsIndex:
     def setup_method(self):
-        from engine_oracle.parts_hub.index import PartsIndex
-        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
+        from ..parts_hub.index import PartsIndex
+        from ..parts_hub.adapters.bolts_adapter import BoltsAdapter
         self.index = PartsIndex()
         adapter = BoltsAdapter()
         self.count = self.index.rebuild(adapter.iter_records())
@@ -195,7 +195,7 @@ class TestPartsIndex:
         assert self.count > 10
 
     def test_rebuild_idempotent(self):
-        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
+        from ..parts_hub.adapters.bolts_adapter import BoltsAdapter
         count2 = self.index.rebuild(BoltsAdapter().iter_records())
         assert count2 == self.count
 
@@ -255,7 +255,7 @@ class TestPartsIndex:
 
 class TestPartsHub:
     def setup_method(self):
-        from engine_oracle.parts_hub.hub import PartsHub
+        from ..parts_hub.hub import PartsHub
         self.hub = PartsHub()
         self.hub.bootstrap()
 
@@ -401,7 +401,7 @@ class TestPartsHub:
                 raise NotImplementedError
 
         # Fresh hub without the real browser catalog (so we only hit stubs).
-        from engine_oracle.parts_hub.hub import PartsHub
+        from ..parts_hub.hub import PartsHub
         hub = PartsHub()
         hub.register(_FastLive())
         hub.register(_SlowLive())
@@ -423,7 +423,7 @@ class TestPartsHub:
     def test_browser_bootstrap_error_is_diagnostic(self, monkeypatch):
         """Browser adapter import failure must leave local search working and
         surface browser_bootstrap_error (not silent)."""
-        from engine_oracle.parts_hub.hub import PartsHub
+        from ..parts_hub.hub import PartsHub
 
         hub = PartsHub()
 
@@ -441,7 +441,7 @@ class TestPartsHub:
 
         monkeypatch.setattr(hub, "_register_browser_catalog_adapters", _failing_register)
         # Minimal bootstrap: bolts only + failing browser register.
-        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
+        from ..parts_hub.adapters.bolts_adapter import BoltsAdapter
         hub.register(BoltsAdapter())
         hub._register_browser_catalog_adapters()
         hub._ensure_index()

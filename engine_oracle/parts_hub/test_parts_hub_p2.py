@@ -27,7 +27,7 @@ if str(_REPO) not in sys.path:
 
 def _make_hub(extra_providers=None):
     """Return a freshly bootstrapped PartsHub."""
-    from engine_oracle.parts_hub.hub import PartsHub
+    from ..parts_hub.hub import PartsHub
     hub = PartsHub()
     hub.bootstrap()
     if extra_providers:
@@ -44,21 +44,21 @@ def _make_hub(extra_providers=None):
 class TestStructuralSectionsAdapter:
 
     def test_iter_records_yields_aisc(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         aisc = [r for r in records if r["standard"] == "AISC360"]
         assert len(aisc) > 0, "Expected AISC section records"
 
     def test_iter_records_yields_lumber(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         lumber = [r for r in records if r["standard"] == "NDS"]
         assert len(lumber) > 0, "Expected lumber records"
 
     def test_aisc_record_shape(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         aisc = [r for r in records if r["standard"] == "AISC360"]
@@ -71,7 +71,7 @@ class TestStructuralSectionsAdapter:
         assert "A" in rec["params"]  # cross-section area
 
     def test_lumber_record_shape(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         lumber = [r for r in records if r["standard"] == "NDS"]
@@ -83,7 +83,7 @@ class TestStructuralSectionsAdapter:
         assert "b_actual_mm" in rec["params"]
 
     def test_get_by_part_id_aisc(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         aisc = [r for r in records if r["standard"] == "AISC360"]
@@ -94,21 +94,21 @@ class TestStructuralSectionsAdapter:
         assert result["part_id"] == pid
 
     def test_search_w8(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         results = adapter.search("W8")
         assert len(results) > 0
         assert all(r["domain"] == "section" for r in results)
 
     def test_wrong_domain_returns_empty(self):
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         results = adapter.search("W8", domain="fastener")
         assert results == []
 
     def test_params_native_keys_verbatim(self):
         """Params carry native AISC column names, not renamed."""
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
         adapter = StructuralSectionsAdapter()
         records = list(adapter.iter_records())
         aisc = [r for r in records if r["standard"] == "AISC360"]
@@ -125,13 +125,13 @@ class TestStructuralSectionsAdapter:
 class TestPipingFittingsAdapter:
 
     def test_iter_records_yields_fittings(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         records = list(adapter.iter_records())
         assert len(records) > 0, "Expected fitting records from CSV"
 
     def test_record_shape(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         records = list(adapter.iter_records())
         rec = records[0]
@@ -142,34 +142,34 @@ class TestPipingFittingsAdapter:
         assert "nps" in rec["params"]
 
     def test_elbow_record(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         records = list(adapter.iter_records())
         elbows = [r for r in records if "elbow" in r["title"].lower()]
         assert len(elbows) > 0
 
     def test_search_elbow(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         results = adapter.search("elbow")
         assert len(results) > 0
         assert all(r["domain"] == "fitting" for r in results)
 
     def test_wrong_domain_returns_empty(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         results = adapter.search("elbow", domain="fastener")
         assert results == []
 
     def test_params_carry_nps_verbatim(self):
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
         adapter = PipingFittingsAdapter()
         records = list(adapter.iter_records())
         assert all("nps" in r["params"] for r in records)
 
     def test_graceful_no_csv(self, tmp_path):
         """Adapter degrades gracefully when CSV is missing."""
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter, _get_rows
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter, _get_rows
         # Monkeypatch _get_rows to return empty tuple (simulates missing CSV)
         with patch("engine_oracle.parts_hub.adapters.piping_fittings_adapter._get_rows",
                    return_value=()):
@@ -185,13 +185,13 @@ class TestPipingFittingsAdapter:
 class TestHydraulicComponentsAdapter:
 
     def test_iter_records_all_types(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         records = list(adapter.iter_records())
         assert len(records) >= 12, f"Expected ≥12 ISO 1219 types, got {len(records)}"
 
     def test_record_shape(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         records = list(adapter.iter_records())
         rec = records[0]
@@ -203,7 +203,7 @@ class TestHydraulicComponentsAdapter:
         assert rec["license"] == "clean-room"
 
     def test_get_pump(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         rec = adapter.get("hydraulic:ISO1219:pump")
         assert rec is not None
@@ -211,27 +211,27 @@ class TestHydraulicComponentsAdapter:
         assert "pump_types" in rec["params"]
 
     def test_get_cylinder(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         rec = adapter.get("hydraulic:ISO1219:cylinder_linear")
         assert rec is not None
         assert "actuator_types" in rec["params"]
 
     def test_search_pump(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         results = adapter.search("pump")
         assert len(results) > 0
         assert any("pump" in r["designation"] for r in results)
 
     def test_wrong_domain_returns_empty(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         results = adapter.search("pump", domain="fastener")
         assert results == []
 
     def test_get_unknown_returns_none(self):
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         adapter = HydraulicComponentsAdapter()
         assert adapter.get("hydraulic:ISO1219:nonexistent") is None
         assert adapter.get("fastener:ISO4762:M3") is None
@@ -244,14 +244,14 @@ class TestHydraulicComponentsAdapter:
 class TestEcadKicadAdapter:
 
     def test_iter_records_yields_starter_symbols(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
         syms = [r for r in records if r["params"].get("kind") == "symbol"]
         assert len(syms) > 0, "Expected starter symbol records"
 
     def test_iter_records_yields_starter_footprints(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
         fps = [r for r in records if r["params"].get("kind") == "footprint"]
@@ -259,7 +259,7 @@ class TestEcadKicadAdapter:
 
     def test_m3_mounting_hole_in_starter(self):
         """M3 mounting hole footprint must be in the starter library (T-P2 cross-domain DoD)."""
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
         m3_fps = [r for r in records
@@ -270,7 +270,7 @@ class TestEcadKicadAdapter:
         )
 
     def test_symbol_record_shape(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
         sym = next(r for r in records if r["params"].get("kind") == "symbol")
@@ -280,7 +280,7 @@ class TestEcadKicadAdapter:
         assert "pin_count" in sym["params"]
 
     def test_footprint_record_shape(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
         fp = next(r for r in records if r["params"].get("kind") == "footprint")
@@ -288,21 +288,21 @@ class TestEcadKicadAdapter:
         assert fp["geometry_ref"]["kind"] == "symbol_footprint"
 
     def test_search_resistor(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         results = adapter.search("resistor")
         assert len(results) > 0
         assert all(r["domain"] == "ecad" for r in results)
 
     def test_wrong_domain_returns_empty(self):
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         results = adapter.search("resistor", domain="fastener")
         assert results == []
 
     def test_user_lib_path_env_not_set(self):
         """Without AICAD_KICAD_SYM_PATH, iter_records uses only starter — no crash."""
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         env = os.environ.copy()
         env.pop("AICAD_KICAD_SYM_PATH", None)
         adapter = EcadKicadAdapter()
@@ -328,7 +328,7 @@ class TestEcadVendorAdapter:
         }
 
     def test_search_returns_live_record(self):
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         vp = self._mock_vendor_part()
         with patch("engine_oracle.parts_hub.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
@@ -343,7 +343,7 @@ class TestEcadVendorAdapter:
         assert "GRM155R61A105KE15D" in rec["part_id"]
 
     def test_search_no_creds_returns_empty(self):
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         with patch("engine_oracle.parts_hub.adapters.ecad_vendor_adapter._get_chain",
                    return_value=None):
@@ -351,7 +351,7 @@ class TestEcadVendorAdapter:
         assert results == []
 
     def test_search_chain_returns_none_gives_empty(self):
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         with patch("engine_oracle.parts_hub.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
             chain = mock_chain.return_value
@@ -360,20 +360,20 @@ class TestEcadVendorAdapter:
         assert results == []
 
     def test_iter_records_raises(self):
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         with pytest.raises(NotImplementedError):
             list(adapter.iter_records())
 
     def test_count_raises(self):
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         with pytest.raises(NotImplementedError):
             adapter.count()
 
     def test_live_marker_in_record(self):
         """source:"live" is present on every vendor record."""
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         adapter = EcadVendorAdapter()
         vp = self._mock_vendor_part()
         with patch("engine_oracle.parts_hub.adapters.ecad_vendor_adapter._get_chain") as mock_chain:
@@ -465,7 +465,7 @@ class TestFederation:
 
     def test_live_fallback_on_empty_index(self):
         """Live-only providers are queried when index has no hits."""
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         hub = _make_hub()
         vp = {"mpn": "VERY_UNIQUE_XYZ999", "manufacturer": "Acme",
               "description": "Test part", "price": 1.0}
@@ -480,7 +480,7 @@ class TestFederation:
 
     def test_live_results_marked_source_live(self):
         """Live vendor records carry source='live'."""
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
         hub = _make_hub()
         vp = {"mpn": "LIVE_TEST_MPN", "manufacturer": "TestCo",
               "description": "A live result", "price": 5.0}

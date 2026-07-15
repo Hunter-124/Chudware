@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from engine_oracle.intake.intake import (
+from ..intake.intake import (
     CriticalDimension,
     CriticalDimensionLedger,
     apply_confirmation,
@@ -79,7 +79,7 @@ def test_critical_dimension_from_dict_missing_audit_defaults_empty():
 def test_audit_does_not_break_gate_ok():
     """Audit fields on confirmed rows do not affect gate logic."""
     ledger = _make_ledger()
-    from engine_oracle.intake.intake import gate_ok, unresolved_critical
+    from ..intake.intake import gate_ok, unresolved_critical
     assert not gate_ok(ledger)  # starts unknown
     apply_confirmation(ledger, "shaft.dia", 12.0, who="u", ts="t")
     assert gate_ok(ledger)

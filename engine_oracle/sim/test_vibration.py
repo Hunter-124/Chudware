@@ -21,7 +21,7 @@ import math
 
 import pytest
 
-from engine_oracle.sim.vibration import (
+from ..sim.vibration import (
     _interp_psd,
     evaluate_vibration_spec,
     harmonic_response,

@@ -319,7 +319,10 @@ def build_mission_graph(
                                        manifest, d,
                                        "build this deliverable's geometry with the "
                                        "engine tools so every acceptance criterion "
-                                       "can pass.")},
+                                       "can pass. After the solid exists, run "
+                                       "verify_battery(doc_id) (or check_feature_overlap) "
+                                       "and record the honest PASS/WARN/FAIL — do not "
+                                       "declare done without a battery or check tool run.")},
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": plan_id, "to": bid})
 
@@ -338,7 +341,9 @@ def build_mission_graph(
                                        manifest, d,
                                        "run each acceptance criterion's NAMED check "
                                        "tool and report PASS/FAIL/NOT-CHECKED per "
-                                       "criterion — never guess a result.")},
+                                       "criterion — never guess a result. ALWAYS also "
+                                       "run verify_battery(doc_id) and log the per-check "
+                                       "verdicts (PASS/WARN/FAIL honest) before handoff.")},
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": build_ids[did], "to": vid})
 

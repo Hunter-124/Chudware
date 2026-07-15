@@ -14,7 +14,7 @@ import pytest
 # Ensure the vision package is importable when running from repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from engine_oracle.vision.dense_backends import (
+from ..vision.dense_backends import (
     brush_commands,
     openmvs_commands,
     run_brush,

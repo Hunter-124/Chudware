@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from engine_oracle.mechanical.gear_check import DISCLAIMER  # single source of truth
+from ..mechanical.gear_check import DISCLAIMER  # single source of truth
 
 # ---------------------------------------------------------------------------
 # Result type

@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from engine_oracle.vision.ffwd_sfm import run_ffwd_sfm, write_colmap_sparse
+from ..vision.ffwd_sfm import run_ffwd_sfm, write_colmap_sparse
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ def test_no_backend_returns_not_provisioned(tmp_path, monkeypatch):
     monkeypatch.delenv("MAPANYTHING_WEIGHTS_DIR", raising=False)
 
     # Patch _vggt_available and _mapanything_available to False
-    import engine_oracle.vision.ffwd_sfm as mod
+    from ..vision import ffwd_sfm as mod
     monkeypatch.setattr(mod, "_vggt_available", lambda: False)
     monkeypatch.setattr(mod, "_mapanything_available", lambda: False)
 
@@ -43,7 +43,7 @@ def test_no_backend_returns_not_provisioned(tmp_path, monkeypatch):
 
 def test_no_images_returns_error(tmp_path, monkeypatch):
     """Empty image list should return ok=False without crashing."""
-    import engine_oracle.vision.ffwd_sfm as mod
+    from ..vision import ffwd_sfm as mod
     monkeypatch.setattr(mod, "_vggt_available", lambda: False)
     monkeypatch.setattr(mod, "_mapanything_available", lambda: False)
 
@@ -148,7 +148,7 @@ def test_write_colmap_points3d_exists(tmp_path):
 
 def test_run_ffwd_sfm_with_mocked_vggt(tmp_path, monkeypatch):
     """run_ffwd_sfm with _vggt_available=True + mocked _run_vggt must succeed."""
-    import engine_oracle.vision.ffwd_sfm as mod
+    from ..vision import ffwd_sfm as mod
 
     monkeypatch.setattr(mod, "_vggt_available", lambda: True)
 

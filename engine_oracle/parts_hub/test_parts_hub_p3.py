@@ -45,7 +45,7 @@ needs_core = pytest.mark.skipif(not _CORE_AVAILABLE, reason="native core not ava
 
 def _place(part_id: str, doc=None, params=None):
     """Thin wrapper: call place() and assert invariants."""
-    from engine_oracle.parts_hub.place import place
+    from ..parts_hub.place import place
     result = place(part_id, doc=doc, params=params)
     assert isinstance(result, dict), "place() must always return a dict"
     assert "ok" in result, "PlacementResult must have 'ok'"
@@ -53,7 +53,7 @@ def _place(part_id: str, doc=None, params=None):
 
 
 def _make_hub():
-    from engine_oracle.parts_hub.hub import PartsHub
+    from ..parts_hub.hub import PartsHub
     hub = PartsHub()
     hub.bootstrap()
     return hub
@@ -79,7 +79,7 @@ class TestPlaceCoreFamily:
     @needs_core
     def test_place_fastener_m8_creates_doc(self):
         """Search for M8 SHCS, place it — must return editable doc_id."""
-        from engine_oracle.parts_hub import search
+        from ..parts_hub import search
         hits = search("M8 socket head", domain="fastener", limit=5)
         # Find one with a geometry_ref.kind = core_family
         rec = next((h for h in hits if h.get("geometry_ref", {}).get("kind") == "core_family"), None)
@@ -114,7 +114,7 @@ class TestPlaceGenerateModel:
         step = tmp_path / "generated.step"
         step.write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
 
-        import engine_oracle.spec_sheet_matcher as ssm
+        from .. import spec_sheet_matcher as ssm
         monkeypatch.setattr(ssm, "generate_model", lambda match: str(step))
 
         from services.mcp import core_bridge as cb
@@ -124,7 +124,7 @@ class TestPlaceGenerateModel:
             if verb == "import_file" else {},
         )
 
-        from engine_oracle.parts_hub.place import _place_generate_model
+        from ..parts_hub.place import _place_generate_model
         r = _place_generate_model(
             {"kind": "generate_model", "match": {"source": "test", "id": "x"}},
             None, None,
@@ -136,9 +136,9 @@ class TestPlaceGenerateModel:
         assert r["detail"]["step_path"] == str(step)
 
     def test_generate_model_none_is_error(self, monkeypatch):
-        import engine_oracle.spec_sheet_matcher as ssm
+        from .. import spec_sheet_matcher as ssm
         monkeypatch.setattr(ssm, "generate_model", lambda match: None)
-        from engine_oracle.parts_hub.place import _place_generate_model
+        from ..parts_hub.place import _place_generate_model
         r = _place_generate_model(
             {"kind": "generate_model", "match": {"source": "kicad"}},
             None, None,
@@ -151,14 +151,14 @@ class TestPlaceSymbolFootprint:
 
     def _make_sch(self):
         """Create a minimal aicad.ecad/1 schematic document."""
-        from engine_oracle.ecad import schema as ecad_schema
+        from ..ecad import schema as ecad_schema
         return ecad_schema.new_schematic("TestSchematic")
 
     def test_place_symbol_no_doc_returns_actionable_error(self):
         """Without a doc, must fail with an actionable hint."""
         # Use a fake ecad part_id with core_family-like gref to test no-doc path;
         # but here we directly test the symbol_footprint placer path.
-        from engine_oracle.parts_hub.place import _place_symbol_footprint
+        from ..parts_hub.place import _place_symbol_footprint
         gref = {"kind": "symbol_footprint", "libid": "Device:R"}
         r = _place_symbol_footprint(gref, None, None)
         assert r["ok"] is False
@@ -167,7 +167,7 @@ class TestPlaceSymbolFootprint:
     def test_place_symbol_with_doc_is_editable(self):
         """sch_add_symbol must append to doc['symbols'] and return entity_id."""
         sch = self._make_sch()
-        from engine_oracle.parts_hub.place import _place_symbol_footprint
+        from ..parts_hub.place import _place_symbol_footprint
         gref = {"kind": "symbol_footprint", "libid": "Device:R"}
         params = {"pos": [10, 20], "value": "1k", "ref": "R1"}
         r = _place_symbol_footprint(gref, sch, params)
@@ -183,7 +183,7 @@ class TestPlaceSymbolFootprint:
     def test_place_symbol_parametric_patch(self):
         """The placed symbol must be re-editable: verify the symbol remains mutable in doc."""
         sch = self._make_sch()
-        from engine_oracle.parts_hub.place import _place_symbol_footprint
+        from ..parts_hub.place import _place_symbol_footprint
         gref = {"kind": "symbol_footprint", "libid": "Device:R"}
         params = {"pos": [0, 0], "value": "4k7", "ref": "R2"}
         r = _place_symbol_footprint(gref, sch, params)
@@ -210,12 +210,12 @@ class TestPlaceSectionProfile:
     """Structural section placement: append StructuralElement to a structure doc."""
 
     def _make_struct(self):
-        from engine_oracle.structural.elements import StructureDoc
+        from ..structural.elements import StructureDoc
         doc = StructureDoc("TestStructure")
         return doc.to_dict()
 
     def test_place_section_no_doc_returns_error(self):
-        from engine_oracle.parts_hub.place import _place_section_profile
+        from ..parts_hub.place import _place_section_profile
         gref = {"kind": "section_profile", "standard": "AISC", "designation": "W8x31"}
         r = _place_section_profile(gref, None, None)
         assert r["ok"] is False
@@ -223,7 +223,7 @@ class TestPlaceSectionProfile:
 
     def test_place_section_appends_element(self):
         struct_doc = self._make_struct()
-        from engine_oracle.parts_hub.place import _place_section_profile
+        from ..parts_hub.place import _place_section_profile
         gref = {"kind": "section_profile", "standard": "AISC", "designation": "W8x31"}
         params = {"kind": "beam", "length_mm": 3000.0, "material": "steel"}
         r = _place_section_profile(gref, struct_doc, params)
@@ -239,7 +239,7 @@ class TestPlaceSectionProfile:
     def test_place_section_editability_by_removal(self):
         """Placed element must be removable (proves it's an editable schema op, not opaque)."""
         struct_doc = self._make_struct()
-        from engine_oracle.parts_hub.place import _place_section_profile
+        from ..parts_hub.place import _place_section_profile
         gref = {"kind": "section_profile", "standard": "AISC", "designation": "W8x31"}
         r = _place_section_profile(gref, struct_doc, {"length_mm": 5000})
         assert r["ok"] is True
@@ -254,18 +254,18 @@ class TestPlaceFittingId:
     """Piping fitting placement: append fitting to aicad.piping/1 doc."""
 
     def _make_piping(self):
-        from engine_oracle.piping.schema import new_piping
+        from ..piping.schema import new_piping
         return new_piping("TestPiping")
 
     def test_place_fitting_no_doc_returns_error(self):
-        from engine_oracle.parts_hub.place import _place_fitting_id
+        from ..parts_hub.place import _place_fitting_id
         gref = {"kind": "fitting_id", "fitting_id": "elbow:NPS1"}
         r = _place_fitting_id(gref, None, None)
         assert r["ok"] is False
 
     def test_place_fitting_appends_to_doc(self):
         piping_doc = self._make_piping()
-        from engine_oracle.parts_hub.place import _place_fitting_id
+        from ..parts_hub.place import _place_fitting_id
         gref = {"kind": "fitting_id", "fitting_id": "elbow:NPS1"}
         params = {"type": "elbow", "nps": 1.0}
         r = _place_fitting_id(gref, piping_doc, params)
@@ -280,18 +280,18 @@ class TestPlaceFmuComponent:
     """Hydraulic component placement: append to aicad.hydraulic/1 doc."""
 
     def _make_hydraulic(self):
-        from engine_oracle.hydraulic.schema import new_hydraulic
+        from ..hydraulic.schema import new_hydraulic
         return new_hydraulic("TestHydraulic")
 
     def test_place_component_no_doc_returns_error(self):
-        from engine_oracle.parts_hub.place import _place_fmu_component
+        from ..parts_hub.place import _place_fmu_component
         gref = {"kind": "fmu_component", "component_id": "pump:gear-1cc"}
         r = _place_fmu_component(gref, None, None)
         assert r["ok"] is False
 
     def test_place_component_appends_to_doc(self):
         hyd_doc = self._make_hydraulic()
-        from engine_oracle.parts_hub.place import _place_fmu_component
+        from ..parts_hub.place import _place_fmu_component
         gref = {"kind": "fmu_component", "component_id": "pump:gear-1cc"}
         params = {"type": "pump", "displacement_cc_rev": 1.0}
         r = _place_fmu_component(gref, hyd_doc, params)
@@ -326,7 +326,7 @@ class TestDedupeRelatedIds:
         ]
 
     def test_no_overlap_passthrough(self):
-        from engine_oracle.parts_hub.hub import _dedupe_related
+        from ..parts_hub.hub import _dedupe_related
         recs = self._make_records([
             ("fastener", "M8", "fastener:ISO 4762:M8"),
             ("bearing",  "6205", "bearing:ISO 15:6205"),
@@ -335,7 +335,7 @@ class TestDedupeRelatedIds:
         assert len(result) == 2
 
     def test_overlap_injects_related_ids(self):
-        from engine_oracle.parts_hub.hub import _dedupe_related
+        from ..parts_hub.hub import _dedupe_related
         recs = self._make_records([
             ("fastener",   "M8", "fastener:ISO 4762:M8"),
             ("mech_family","M8", "mech_family:shcs:M8"),
@@ -351,7 +351,7 @@ class TestDedupeRelatedIds:
             assert r["related_ids"][0] in ids
 
     def test_overlap_fastener_ranked_before_mech_family(self):
-        from engine_oracle.parts_hub.hub import _dedupe_related
+        from ..parts_hub.hub import _dedupe_related
         # mech_family first in input — fastener must be promoted.
         recs = self._make_records([
             ("mech_family", "M8", "mech_family:shcs:M8"),
@@ -362,7 +362,7 @@ class TestDedupeRelatedIds:
             "fastener must rank above mech_family for same designation"
 
     def test_non_overlap_domains_untouched(self):
-        from engine_oracle.parts_hub.hub import _dedupe_related
+        from ..parts_hub.hub import _dedupe_related
         recs = self._make_records([
             ("ecad",    "R", "ecad:Device:R"),
             ("section", "W8x31", "section:AISC:W8x31"),
@@ -373,7 +373,7 @@ class TestDedupeRelatedIds:
 
     def test_related_ids_is_additive_field(self):
         """related_ids must not appear on records without a sibling."""
-        from engine_oracle.parts_hub.hub import _dedupe_related
+        from ..parts_hub.hub import _dedupe_related
         recs = self._make_records([
             ("fastener", "M8",  "fastener:ISO 4762:M8"),
             ("fastener", "M10", "fastener:ISO4762:M10"),
@@ -484,8 +484,8 @@ class TestDemoStandardPartsDesign:
         Step 3 — Place it (creates an editable part doc).
         Step 4 — Assert the result is editable (not an opaque solid).
         """
-        from engine_oracle.parts_hub import search, get
-        from engine_oracle.parts_hub.place import place
+        from ..parts_hub import search, get
+        from ..parts_hub.place import place
 
         # Step 1: search
         hits = search("M8 socket head cap screw", domain="fastener", limit=5)
@@ -533,9 +533,9 @@ class TestDemoStandardPartsDesign:
         Step 3 — Place the resistor symbol.
         Step 4 — Assert the symbol is in doc['symbols'] (editable schema op).
         """
-        from engine_oracle.parts_hub import search
-        from engine_oracle.parts_hub.place import place
-        from engine_oracle.ecad import schema as ecad_schema
+        from ..parts_hub import search
+        from ..parts_hub.place import place
+        from ..ecad import schema as ecad_schema
 
         # Step 1: search
         hits = search("resistor", domain="ecad", limit=10)
@@ -587,7 +587,7 @@ class TestDemoStandardPartsDesign:
                            params={"pos": [20, 10], "value": "10k", "ref": "R1"})
         else:
             # ecad record without a resolved libid — use placer directly with a known libid.
-            from engine_oracle.parts_hub.place import _place_symbol_footprint
+            from ..parts_hub.place import _place_symbol_footprint
             gref2 = {"kind": "symbol_footprint", "libid": "Device:R"}
             result = _place_symbol_footprint(gref2, sch,
                                              {"pos": [20, 10],
@@ -617,7 +617,7 @@ class TestDemoStandardPartsDesign:
         DEMO: Search across all domains — illustrates the 'design anything from standard parts'
         capability.  One search call returns hardware, sections, and ecad in ranked order.
         """
-        from engine_oracle.parts_hub import search
+        from ..parts_hub import search
 
         # Cross-domain search: "M8" surfaces fasteners AND ecad footprints.
         hits = search("M8", limit=10)
@@ -640,7 +640,7 @@ class TestDemoStandardPartsDesign:
         DEMO: searching 'M8' across domains annotates same-designation results with related_ids,
         so the agent sees one canonical row with the family as its instantiation recipe.
         """
-        from engine_oracle.parts_hub import search
+        from ..parts_hub import search
 
         hits = search("M8", domain=None, limit=20)
         m8_hits = [h for h in hits if (h.get("designation") or "").upper() in ("M8",)]

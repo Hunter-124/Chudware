@@ -110,14 +110,14 @@ def test_scanned_step_is_searchable_via_parts_hub(tmp_path, monkeypatch) -> None
 
     monkeypatch.setattr("engine_oracle.parts_hub.rebuild_index", _rebuild, raising=False)
     # parts_library imports rebuild lazily inside the function; patch the hub module.
-    import engine_oracle.parts_hub as ph
+    from . import parts_hub as ph
     monkeypatch.setattr(ph, "rebuild_index", _rebuild)
 
     result = parts_library.scan_library_folder(str(lib))
     assert result["added"] == 1
     assert rebuilt, "scan must refresh the PartsHub index"
 
-    from engine_oracle.parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
+    from .parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
     adapter = LocalLibraryAdapter()
     recs = list(adapter.iter_records())
     assert recs, "local library adapter saw no records after scan"
@@ -137,14 +137,14 @@ def test_local_library_place_is_import_file(tmp_path, monkeypatch) -> None:
     src = tmp_path / "Widget-X.step"
     src.write_text(_STEP, encoding="utf-8")
     # Suppress hub rebuild during pure-metadata registration.
-    import engine_oracle.parts_hub as ph
+    from . import parts_hub as ph
     monkeypatch.setattr(ph, "rebuild_index", lambda: 0)
 
     vendor_parts.register_local_cad(
         supplier="library", part_number="Widget-X",
         description="Widget X", cad_path=str(src), copy_file=False,
     )
-    from engine_oracle.parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
+    from .parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
     adapter = LocalLibraryAdapter()
     part = next(iter(adapter.iter_records()), None)
     assert part is not None
@@ -157,7 +157,7 @@ def test_local_library_place_is_import_file(tmp_path, monkeypatch) -> None:
         lambda verb, params: {"doc_id": "doc-lib-1", "body_count": 1}
         if verb == "import_file" else {},
     )
-    from engine_oracle.parts_hub.place import place
+    from .parts_hub.place import place
     monkeypatch.setattr(ph, "get", lambda pid: part)
     r = place(part["part_id"])
     assert r["ok"] is True, f"place failed: {r}"

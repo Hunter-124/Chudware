@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-from engine_oracle.parts_hub import taxonomy as _tax
+from ..parts_hub import taxonomy as _tax
 
 # ---------------------------------------------------------------------------
 # Tokenization + numeric-hint extraction
@@ -317,7 +317,7 @@ def _is_discrete_product(rec: dict, gref: dict) -> bool:
     if pid.startswith("catalog:"):
         site = pid[len("catalog:"):].split("::", 1)[0]
         try:
-            from engine_oracle.parts_hub.model_matcher import CAD_MODEL_SITES
+            from ..parts_hub.model_matcher import CAD_MODEL_SITES
             if site in CAD_MODEL_SITES:
                 return False
         except Exception:  # noqa: BLE001 — matcher optional; fall through to identity check
@@ -440,7 +440,7 @@ def source(need: str, constraints: str | None = None, limit: int = 5, *,
     need_tokens = set(_tokens(text))
 
     if search_fn is None:
-        from engine_oracle.parts_hub import search as search_fn  # noqa: PLC0415
+        from ..parts_hub import search as search_fn  # noqa: PLC0415
 
     categories = match_categories(text)
     primary = categories[0] if categories else ""

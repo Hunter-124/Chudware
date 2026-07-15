@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from engine_oracle.parts_hub import product_media
+from ..parts_hub import product_media
 
 _HTML = """
 <html><head>

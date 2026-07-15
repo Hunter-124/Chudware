@@ -324,15 +324,37 @@ if [ ! -x "$BILLET_BIN" ]; then
     log "FATAL: $BILLET_BIN not executable"
     exit 1
 fi
+# File dialogs / Feature-Manager explorer start in the shared projects tree.
+export AI_CAD_START_DIR="${AI_CAD_START_DIR:-$HOME/Projects}"
+
+# Default project: open its work-in-progress document at startup (bare path
+# argv = the app's file-association open path). Pull-only PLM bootstrap above
+# has already cloned /plm/*.git into $HOME/Projects/. "WIP" = the most
+# recently modified .step+ in the project.
+BILLET_OPEN_ARGS=()
+if [ -n "${BILLET_DEFAULT_PROJECT:-}" ]; then
+    proj_dir="$HOME/Projects/${BILLET_DEFAULT_PROJECT}"
+    if [ -d "$proj_dir" ]; then
+        doc="$(find "$proj_dir" -maxdepth 2 -name '*.step+' -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+        if [ -n "$doc" ]; then
+            BILLET_OPEN_ARGS=("$doc")
+            log "default project '$BILLET_DEFAULT_PROJECT' — opening $(basename "$doc")"
+        else
+            log "default project '$BILLET_DEFAULT_PROJECT' has no .step+ document yet"
+        fi
+    else
+        log "WARN default project dir missing: $proj_dir"
+    fi
+fi
 
 launch_billet() {
     log "launching Billet as ${BILLET_USER_EMAIL:-?} / ${AICAD_USER_DISPLAY}"
     log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$BILLET_HEAVY USE_VGL=$USE_VGL"
     log "  prefix=${BILLET_PREFIX[*]:-(none)}"
     if [ ${#BILLET_PREFIX[@]} -gt 0 ]; then
-        "${BILLET_PREFIX[@]}" "$BILLET_BIN" &
+        "${BILLET_PREFIX[@]}" "$BILLET_BIN" "${BILLET_OPEN_ARGS[@]}" &
     else
-        "$BILLET_BIN" &
+        "$BILLET_BIN" "${BILLET_OPEN_ARGS[@]}" &
     fi
     BILLET_PID=$!
     # Replace any previous Billet pid in PIDS with the live one.

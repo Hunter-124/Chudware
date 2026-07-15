@@ -80,7 +80,7 @@ class PipingFittingsAdapter:
 
 def _get_rows() -> tuple:
     try:
-        from engine_oracle.piping.catalog import _load_rows  # type: ignore[attr-defined]
+        from ...piping.catalog import _load_rows  # type: ignore[attr-defined]
         return _load_rows()
     except Exception as exc:  # noqa: BLE001
         log.debug("PipingFittingsAdapter: catalog unavailable: %s", exc)

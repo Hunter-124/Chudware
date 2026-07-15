@@ -51,10 +51,10 @@ class TestBackendNotProvisioned:
         _clear_backend_env(monkeypatch)
 
         # Ensure _artifact_available always returns False for single_photo backends
-        from engine_oracle.vision import reveng_provision
+        from ..vision import reveng_provision
         monkeypatch.setattr(reveng_provision, "_artifact_available", lambda name: False)
 
-        from engine_oracle.vision.single_photo import (
+        from ..vision.single_photo import (
             reconstruct_single_photo,
             BACKEND_NOT_PROVISIONED,
         )
@@ -73,10 +73,10 @@ class TestBackendNotProvisioned:
         """Degradation envelope must not contain raw exception text / traceback."""
         _clear_backend_env(monkeypatch)
 
-        from engine_oracle.vision import reveng_provision
+        from ..vision import reveng_provision
         monkeypatch.setattr(reveng_provision, "_artifact_available", lambda name: False)
 
-        from engine_oracle.vision.single_photo import reconstruct_single_photo
+        from ..vision.single_photo import reconstruct_single_photo
 
         fake_image = tmp_path / "part.jpg"
         fake_image.write_bytes(b"\xff\xd8\xff")
@@ -95,7 +95,7 @@ class TestBackendNotProvisioned:
 class TestApproximateTag:
     def test_tag_approximate_helper_sets_field(self):
         """_tag_approximate always writes honesty='approximate'."""
-        from engine_oracle.vision.single_photo import _tag_approximate, APPROXIMATE_TAG
+        from ..vision.single_photo import _tag_approximate, APPROXIMATE_TAG
 
         result: dict = {"ok": True, "mesh_path": "/tmp/a.obj"}
         _tag_approximate(result)
@@ -105,7 +105,7 @@ class TestApproximateTag:
         """When backend is mocked to succeed, the result must carry approximate tag."""
         _clear_backend_env(monkeypatch)
 
-        from engine_oracle.vision import reveng_provision, single_photo
+        from ..vision import reveng_provision, single_photo
         # Fake a provisioned triposr backend
         monkeypatch.setattr(
             reveng_provision, "_artifact_available",
@@ -121,7 +121,7 @@ class TestApproximateTag:
             lambda backend, img, out, sid: fake_mesh,
         )
 
-        from engine_oracle.vision.single_photo import reconstruct_single_photo, APPROXIMATE_TAG
+        from ..vision.single_photo import reconstruct_single_photo, APPROXIMATE_TAG
 
         fake_image = tmp_path / "part.jpg"
         fake_image.write_bytes(b"\xff\xd8\xff")
@@ -135,7 +135,7 @@ class TestApproximateTag:
         """Even on backend RuntimeError, the returned envelope carries approximate tag."""
         _clear_backend_env(monkeypatch)
 
-        from engine_oracle.vision import reveng_provision, single_photo
+        from ..vision import reveng_provision, single_photo
         monkeypatch.setattr(
             reveng_provision, "_artifact_available",
             lambda name: name == "triposr",
@@ -145,7 +145,7 @@ class TestApproximateTag:
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("GPU OOM")),
         )
 
-        from engine_oracle.vision.single_photo import reconstruct_single_photo, APPROXIMATE_TAG
+        from ..vision.single_photo import reconstruct_single_photo, APPROXIMATE_TAG
 
         fake_image = tmp_path / "part.jpg"
         fake_image.write_bytes(b"\xff\xd8\xff")
@@ -156,7 +156,7 @@ class TestApproximateTag:
 
     def test_fake_mesh_dict_has_approximate(self):
         """Sanity: helper produces correctly tagged dict."""
-        from engine_oracle.vision.single_photo import APPROXIMATE_TAG
+        from ..vision.single_photo import APPROXIMATE_TAG
 
         result = _make_fake_mesh_result(ok=True)
         assert result["honesty"] == APPROXIMATE_TAG
@@ -169,7 +169,7 @@ class TestApproximateTag:
 class TestApproximateMeshGuard:
     def test_raises_without_override(self):
         """assert_not_approximate raises when honesty=approximate and no override."""
-        from engine_oracle.vision.single_photo import (
+        from ..vision.single_photo import (
             assert_not_approximate,
             ApproximateMeshGuardError,
             APPROXIMATE_TAG,
@@ -182,7 +182,7 @@ class TestApproximateMeshGuard:
 
     def test_raises_by_default(self):
         """Default allow_approximate=False — no kwarg needed to trigger the guard."""
-        from engine_oracle.vision.single_photo import (
+        from ..vision.single_photo import (
             assert_not_approximate,
             ApproximateMeshGuardError,
             APPROXIMATE_TAG,
@@ -195,7 +195,7 @@ class TestApproximateMeshGuard:
 
     def test_passes_with_explicit_override(self):
         """allow_approximate=True lets the call through silently."""
-        from engine_oracle.vision.single_photo import assert_not_approximate, APPROXIMATE_TAG
+        from ..vision.single_photo import assert_not_approximate, APPROXIMATE_TAG
 
         mesh = {"ok": True, "honesty": APPROXIMATE_TAG}
         # Should NOT raise
@@ -203,7 +203,7 @@ class TestApproximateMeshGuard:
 
     def test_passes_for_non_approximate_mesh(self):
         """A mesh without the approximate tag passes through without override."""
-        from engine_oracle.vision.single_photo import assert_not_approximate
+        from ..vision.single_photo import assert_not_approximate
 
         mesh = {"ok": True, "honesty": "fitted", "mesh_path": "/tmp/b.obj"}
         # Should NOT raise
@@ -211,7 +211,7 @@ class TestApproximateMeshGuard:
 
     def test_error_message_mentions_override(self):
         """Error message tells the user how to fix it."""
-        from engine_oracle.vision.single_photo import (
+        from ..vision.single_photo import (
             assert_not_approximate,
             ApproximateMeshGuardError,
             APPROXIMATE_TAG,
@@ -225,7 +225,7 @@ class TestApproximateMeshGuard:
     def test_not_provisioned_envelope_also_blocked(self):
         """The not_provisioned envelope (ok=False) has no honesty tag → passes guard
         (it cannot enter the parametric path anyway — it has no mesh)."""
-        from engine_oracle.vision.single_photo import assert_not_approximate
+        from ..vision.single_photo import assert_not_approximate
 
         envelope = _make_fake_mesh_result(ok=False)
         # ok=False result has no honesty tag → should not raise

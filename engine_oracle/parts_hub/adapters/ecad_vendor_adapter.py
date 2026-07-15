@@ -88,7 +88,7 @@ class EcadVendorAdapter:
 def _get_chain():
     """Return a ProviderChain instance, or None if unavailable."""
     try:
-        from engine_oracle.parts_providers import default_pricing_chain
+        from ...parts_providers import default_pricing_chain
         return default_pricing_chain()
     except Exception as exc:  # noqa: BLE001
         log.debug("EcadVendorAdapter: ProviderChain unavailable: %s", exc)

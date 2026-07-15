@@ -10,7 +10,7 @@ import re
 
 import pytest
 
-from engine_oracle import quote_providers as qp
+from . import quote_providers as qp
 
 # HMAC-SHA256(base64) over "POST\n/v1/quote\n1700000000000\ntestnonce123\n{\"q\": 5}" keyed with
 # b"test-secret-key" — recomputed independently; pins the exact string-to-sign.

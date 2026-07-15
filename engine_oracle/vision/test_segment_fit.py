@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from engine_oracle.vision import segment_fit
+from ..vision import segment_fit
 
 
 def test_envelope_backend_absent(monkeypatch):

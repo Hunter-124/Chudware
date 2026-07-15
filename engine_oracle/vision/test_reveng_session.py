@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from engine_oracle.vision import reveng_session as rs
+from ..vision import reveng_session as rs
 
 
 @pytest.fixture()

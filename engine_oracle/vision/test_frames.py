@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from engine_oracle.vision import frames as F
+from ..vision import frames as F
 
 # --------------------------------------------------------------- no-cv2 degradation (import-safe)
 

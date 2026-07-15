@@ -76,7 +76,7 @@ def _ensure_fixture() -> Path:
 
 def _ingest(pdf: Path, session_root: Path) -> dict:
     # Reload so monkeypatching takes effect across test cases cleanly
-    import engine_oracle.vision.datasheet_ingest as mod
+    from ..vision import datasheet_ingest as mod
     importlib.reload(mod)
     return mod.ingest_datasheet(pdf, session_root)
 
@@ -195,7 +195,7 @@ class TestNoBackendEnvelope:
 
         pdf = _ensure_fixture()
 
-        import engine_oracle.vision.datasheet_ingest as mod
+        from ..vision import datasheet_ingest as mod
         importlib.reload(mod)
         result = mod.ingest_datasheet(pdf, tmp_path)
 
@@ -211,7 +211,7 @@ class TestNoBackendEnvelope:
 
         pdf = _ensure_fixture()
 
-        import engine_oracle.vision.datasheet_ingest as mod
+        from ..vision import datasheet_ingest as mod
         importlib.reload(mod)
         mod.ingest_datasheet(pdf, tmp_path)
 
@@ -223,7 +223,7 @@ class TestNoBackendEnvelope:
 
     def test_missing_pdf_envelope(self, tmp_path: Path) -> None:
         """Non-existent PDF should return ok=false with reason=pdf_not_found."""
-        import engine_oracle.vision.datasheet_ingest as mod
+        from ..vision import datasheet_ingest as mod
         importlib.reload(mod)
         result = mod.ingest_datasheet(tmp_path / "nonexistent.pdf", tmp_path)
         assert result.get("ok") is False

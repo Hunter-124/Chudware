@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from engine_oracle.requirements import RequirementsDoc
+from ..requirements import RequirementsDoc
 
 
 def build_example_brief() -> RequirementsDoc:

@@ -1079,7 +1079,12 @@ def is_multi_domain_plan_or_build(
 
 
 def extract_typed_refusal(payload: Any) -> dict[str, Any] | None:
-    """Pull a typed refusal object from a handoff / agent result if valid."""
+    """Pull a typed refusal object from a handoff / agent result if valid.
+
+    mega-9 a2 residual: models sometimes bury the envelope under free-form
+    ``ledger_note`` text / decision payloads instead of handoff.outputs —
+    salvage JSON objects that already match the schema.
+    """
     if not isinstance(payload, dict):
         return None
     candidates: list[Any] = [
@@ -1100,6 +1105,16 @@ def extract_typed_refusal(payload: Any) -> dict[str, Any] | None:
         candidates.append(outs if outs else None)
     # Direct envelope shape on payload.
     candidates.append(payload)
+    # Scan tool call args for ledger_note bodies that embed the envelope.
+    calls = payload.get("calls")
+    if isinstance(calls, list):
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            args = c.get("args") if isinstance(c.get("args"), dict) else {}
+            for key in ("payload", "body", "text", "note", "content"):
+                candidates.append(_maybe_json_obj(args.get(key)))
+            candidates.append(_maybe_json_obj(c.get("result")))
     for c in candidates:
         if isinstance(c, dict) and not validate_typed_refusal(c):
             return {
@@ -1109,6 +1124,43 @@ def extract_typed_refusal(payload: Any) -> dict[str, Any] | None:
                 ],
                 "why_flat": str(c["why_flat"]).strip(),
             }
+    return None
+
+
+def _maybe_json_obj(value: Any) -> Any:
+    """Parse a JSON object from str, or return dict as-is; else None."""
+    if isinstance(value, dict):
+        # Nested typed_refusal key.
+        if "typed_refusal" in value and isinstance(value["typed_refusal"], dict):
+            return value["typed_refusal"]
+        return value
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or ("domains_considered" not in s and "why_flat" not in s):
+        return None
+    import json as _json  # noqa: PLC0415
+    # Full parse.
+    try:
+        obj = _json.loads(s)
+        if isinstance(obj, dict):
+            if "typed_refusal" in obj and isinstance(obj["typed_refusal"], dict):
+                return obj["typed_refusal"]
+            return obj
+    except Exception:  # noqa: BLE001
+        pass
+    # Substring salvage: first {...} containing the keys.
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = _json.loads(s[start:end + 1])
+            if isinstance(obj, dict):
+                if "typed_refusal" in obj and isinstance(obj["typed_refusal"], dict):
+                    return obj["typed_refusal"]
+                return obj
+        except Exception:  # noqa: BLE001
+            return None
     return None
 
 

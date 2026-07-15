@@ -13,7 +13,7 @@ import pytest
 @pytest.fixture()
 def bench_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Isolate bench_rpc status/logs under tmp and mock subprocess."""
-    import engine_oracle.parts_hub.bench_rpc as br
+    from ..parts_hub import bench_rpc as br
 
     repo = tmp_path / "repo"
     reports = repo / "tools" / "flywheel" / "bench" / "gym" / "reports"
@@ -214,7 +214,7 @@ def test_bench_run_process_failure(bench_env):
 
 
 def test_bench_methods_registered():
-    from engine_oracle.parts_hub.bench_rpc import BENCH_METHODS
+    from ..parts_hub.bench_rpc import BENCH_METHODS
 
     assert "bench_run" in BENCH_METHODS
     assert "bench_status" in BENCH_METHODS
@@ -222,7 +222,7 @@ def test_bench_methods_registered():
 
 
 def test_worker_rpc_imports_bench_methods():
-    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+    from ..parts_hub.worker_rpc import WORKER_METHODS
 
     assert "bench_run" in WORKER_METHODS
     assert "bench_status" in WORKER_METHODS
@@ -242,7 +242,7 @@ def test_bench_categories_lists_six(bench_env):
     import tools.flywheel.bench.categories as cats
 
     # Monkeypatch categories root to the temp repo so last-result reads stay isolated.
-    import engine_oracle.parts_hub.bench_rpc as br_mod
+    from ..parts_hub import bench_rpc as br_mod
     # br._repo_root already returns repo; bench_categories uses br._repo_root.
 
     out = br._bench_categories({}, _emit)

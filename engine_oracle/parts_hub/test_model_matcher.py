@@ -22,7 +22,7 @@ _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from engine_oracle.parts_hub import model_matcher as mm  # noqa: E402
+from ..parts_hub import model_matcher as mm  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,1170 @@
+{
+  "generated_at": "2026-07-15T02:35:33Z",
+  "run_id": "mega-9-fc-rocket-20260714",
+  "baseline_commit": "b8181b97",
+  "roles": {
+    "assembly_fit_engineer": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "part_place",
+        "solve_mates",
+        "check_interference",
+        "measure_between",
+        "fit_report",
+        "describe_assembly",
+        "describe_scene",
+        "list_world_bodies",
+        "fit_calc",
+        "render_part",
+        "delegate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "part_place",
+        "solve_mates",
+        "check_interference",
+        "measure_between",
+        "fit_report",
+        "describe_assembly",
+        "describe_scene",
+        "list_world_bodies",
+        "fit_calc",
+        "render_part",
+        "delegate"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "cam_programmer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "cam_new_job",
+        "cam_tool_import",
+        "cam_add_tool",
+        "cam_add_setup",
+        "cam_add_operation",
+        "cam_update_operation",
+        "cam_generate",
+        "cam_simulate",
+        "cam_post",
+        "feeds_speeds",
+        "cam_materials",
+        "cam_cost_estimate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "cam_new_job",
+        "cam_tool_import",
+        "cam_add_tool",
+        "cam_add_setup",
+        "cam_add_operation",
+        "cam_update_operation",
+        "cam_generate",
+        "cam_simulate",
+        "cam_post",
+        "feeds_speeds",
+        "cam_materials",
+        "cam_cost_estimate"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "clarifier": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ask_user",
+        "ledger_get",
+        "ledger_note",
+        "req_update",
+        "confirm_dimensions",
+        "describe_part"
+      ],
+      "allowlist": [
+        "ask_user",
+        "ledger_get",
+        "ledger_note",
+        "req_update",
+        "confirm_dimensions",
+        "describe_part"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "council_seats": {
+      "error": "/home/hunter/Repositories/CAD/services/agent/roles/council_seats.yaml: schema is 'aicad.council_seats/1', expected 'aicad.role/1'"
+    },
+    "department_manager": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "buildgraph_status",
+        "delegate",
+        "channel_send",
+        "request_resolve",
+        "council_convene",
+        "describe_part",
+        "workspace_status"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "buildgraph_status",
+        "delegate",
+        "channel_send",
+        "request_resolve",
+        "council_convene",
+        "describe_part",
+        "workspace_status"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "design_thinker": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "fit_calc",
+        "recommend_fit",
+        "research_eng_calc",
+        "research_material_lookup",
+        "research_thread_spec",
+        "part_search",
+        "parts_taxonomy",
+        "part_source"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "fit_calc",
+        "recommend_fit",
+        "research_eng_calc",
+        "research_material_lookup",
+        "research_thread_spec",
+        "part_search",
+        "parts_taxonomy",
+        "part_source"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "feature_architect": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "ask_user",
+        "advise",
+        "advisory_dispute",
+        "research_material_lookup",
+        "research_standard_section",
+        "research_web_search"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "ask_user",
+        "advise",
+        "advisory_dispute",
+        "research_material_lookup",
+        "research_standard_section",
+        "research_web_search"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "feature_modeler": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [
+        "add_features",
+        "new_part",
+        "preflight_ops"
+      ],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "new_part",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "verify_battery",
+        "regen_diagnose",
+        "part_search",
+        "part_place",
+        "delegate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "new_part",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "verify_battery",
+        "regen_diagnose",
+        "part_search",
+        "part_place",
+        "delegate"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "fixer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [
+        "add_features",
+        "preflight_ops"
+      ],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "regen_diagnose",
+        "regen_resolve",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "sketch_health",
+        "check_interference",
+        "check_feature_overlap",
+        "measure_part",
+        "fit_calc",
+        "undo"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "regen_diagnose",
+        "regen_resolve",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "sketch_health",
+        "check_interference",
+        "check_feature_overlap",
+        "measure_part",
+        "fit_calc",
+        "undo"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "geometry_designer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "fit_calc",
+        "recommend_fit",
+        "research_thread_spec",
+        "tap_drill",
+        "wall_thickness",
+        "research_material_lookup",
+        "research_standard_section",
+        "research_web_search",
+        "resolve_process",
+        "draft_analysis",
+        "describe_part"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "fit_calc",
+        "recommend_fit",
+        "research_thread_spec",
+        "tap_drill",
+        "wall_thickness",
+        "research_material_lookup",
+        "research_standard_section",
+        "research_web_search",
+        "resolve_process",
+        "draft_analysis",
+        "describe_part"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "intake_analyst": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_project",
+        "describe_part",
+        "list_parts",
+        "part_search",
+        "req_create",
+        "research_web_search"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_project",
+        "describe_part",
+        "list_parts",
+        "part_search",
+        "req_create",
+        "research_web_search"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "layout_engineer": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "describe_scene",
+        "measure_part",
+        "measure_between",
+        "query_geometry",
+        "part_search",
+        "parts_taxonomy",
+        "part_source",
+        "delegate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "describe_scene",
+        "measure_part",
+        "measure_between",
+        "query_geometry",
+        "part_search",
+        "parts_taxonomy",
+        "part_source",
+        "delegate"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "linkage_planner": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "check_interference",
+        "check_sketch",
+        "query_geometry",
+        "measure_part",
+        "sketch_health",
+        "draft_analysis",
+        "research_web_search",
+        "resolve_process"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "check_interference",
+        "check_sketch",
+        "query_geometry",
+        "measure_part",
+        "sketch_health",
+        "draft_analysis",
+        "research_web_search",
+        "resolve_process"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "orchestrator": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "dag_plan",
+        "dag_run",
+        "dag_status",
+        "dag_replan",
+        "buildgraph_plan",
+        "buildgraph_status",
+        "workspace_status",
+        "delegate",
+        "ask_user",
+        "describe_project"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "dag_plan",
+        "dag_run",
+        "dag_status",
+        "dag_replan",
+        "buildgraph_plan",
+        "buildgraph_status",
+        "workspace_status",
+        "delegate",
+        "ask_user",
+        "describe_project"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "overseer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "buildgraph_status",
+        "workspace_status",
+        "dag_status",
+        "describe_project",
+        "describe_part",
+        "ask_user"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "buildgraph_status",
+        "workspace_status",
+        "dag_status",
+        "describe_project",
+        "describe_part",
+        "ask_user"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "re_datasheet_reader": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "research_datasheet_fetch",
+        "research_fetch_page",
+        "research_web_search",
+        "match_part_number",
+        "spec_sheet_match",
+        "measure_part",
+        "query_geometry",
+        "hover",
+        "describe_part",
+        "confirm_dimensions",
+        "research_unit_convert"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "research_datasheet_fetch",
+        "research_fetch_page",
+        "research_web_search",
+        "match_part_number",
+        "spec_sheet_match",
+        "measure_part",
+        "query_geometry",
+        "hover",
+        "describe_part",
+        "confirm_dimensions",
+        "research_unit_convert"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "re_geometry_verifier": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "compare_parts",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "describe_part",
+        "hover",
+        "wall_thickness",
+        "inspect_section",
+        "check_symmetry",
+        "draft_analysis",
+        "render_part"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "compare_parts",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "describe_part",
+        "hover",
+        "wall_thickness",
+        "inspect_section",
+        "check_symmetry",
+        "draft_analysis",
+        "render_part"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "re_modeler": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [
+        "add_features"
+      ],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "reverse_engineer",
+        "import_part",
+        "describe_part",
+        "hover",
+        "query_geometry",
+        "convert_face_to_sketch",
+        "project_into_sketch",
+        "add_features",
+        "compare_parts",
+        "regen_diagnose",
+        "undo",
+        "render_part"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "reverse_engineer",
+        "import_part",
+        "describe_part",
+        "hover",
+        "query_geometry",
+        "convert_face_to_sketch",
+        "project_into_sketch",
+        "add_features",
+        "compare_parts",
+        "regen_diagnose",
+        "undo",
+        "render_part"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "reviewer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "verify_battery",
+        "design_review",
+        "dfm_check",
+        "check_interference",
+        "check_feature_overlap",
+        "fit_report",
+        "measure_part",
+        "measure_between",
+        "describe_part",
+        "describe_assembly",
+        "render_part",
+        "review_drawing"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "verify_battery",
+        "design_review",
+        "dfm_check",
+        "check_interference",
+        "check_feature_overlap",
+        "fit_report",
+        "measure_part",
+        "measure_between",
+        "describe_part",
+        "describe_assembly",
+        "render_part",
+        "review_drawing"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "sim_engineer": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "set_material",
+        "run_fea_static",
+        "run_fea_modal",
+        "run_cfd_flow",
+        "describe_results",
+        "describe_part",
+        "measure_part",
+        "research_material_lookup",
+        "research_eng_calc",
+        "struct_analyze"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "set_material",
+        "run_fea_static",
+        "run_fea_modal",
+        "run_cfd_flow",
+        "describe_results",
+        "describe_part",
+        "measure_part",
+        "research_material_lookup",
+        "research_eng_calc",
+        "struct_analyze"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "sketcher": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [
+        "add_features"
+      ],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_sketch",
+        "sketch_health",
+        "sketch_auto_constrain",
+        "check_sketch",
+        "suggest_dimension_scheme",
+        "add_features",
+        "convert_face_to_sketch",
+        "describe_part",
+        "fit_calc"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_sketch",
+        "sketch_health",
+        "sketch_auto_constrain",
+        "check_sketch",
+        "suggest_dimension_scheme",
+        "add_features",
+        "convert_face_to_sketch",
+        "describe_part",
+        "fit_calc"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "sourcing_specialist": {
+      "has_delegate": false,
+      "raw_allowlist_has_delegate": false,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "parts_taxonomy",
+        "part_search",
+        "part_get",
+        "part_source",
+        "match_model",
+        "reverse_engineer_product",
+        "vendors_health",
+        "scrape_enqueue",
+        "scrape_queue_status",
+        "import_artifact",
+        "part_place",
+        "bom_price"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "parts_taxonomy",
+        "part_search",
+        "part_get",
+        "part_source",
+        "match_model",
+        "reverse_engineer_product",
+        "vendors_health",
+        "scrape_enqueue",
+        "scrape_queue_status",
+        "import_artifact",
+        "part_place",
+        "bom_price",
+        "request_quote",
+        "cam_tool_import"
+      ],
+      "prompt_has_budget_tokens": false,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": ""
+    },
+    "spec_writer": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "research_material_lookup",
+        "research_eng_calc",
+        "fit_calc",
+        "recommend_fit",
+        "resolve_process",
+        "part_search",
+        "delegate",
+        "describe_part",
+        "board_from_schematic",
+        "ecad_new_schematic",
+        "em_status",
+        "fw_status"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "research_material_lookup",
+        "research_eng_calc",
+        "fit_calc",
+        "recommend_fit",
+        "resolve_process",
+        "part_search",
+        "delegate",
+        "describe_part",
+        "family:ecad",
+        "family:em",
+        "family:fw",
+        "board_from_schematic"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    }
+  },
+  "required_roles": [
+    "spec_writer",
+    "layout_engineer",
+    "feature_modeler"
+  ],
+  "plan_roles_capability_separation": {
+    "department_manager": {
+      "no_exec_tools": true,
+      "has_delegate": true,
+      "forbidden_present": [],
+      "tools_sample": [
+        "ledger_get",
+        "ledger_note",
+        "buildgraph_status",
+        "delegate",
+        "channel_send",
+        "request_resolve",
+        "council_convene",
+        "describe_part",
+        "workspace_status"
+      ]
+    },
+    "layout_engineer": {
+      "no_exec_tools": true,
+      "has_delegate": true,
+      "forbidden_present": [],
+      "tools_sample": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "describe_scene",
+        "measure_part",
+        "measure_between",
+        "query_geometry",
+        "part_search",
+        "parts_taxonomy",
+        "part_source",
+        "delegate"
+      ]
+    },
+    "orchestrator": {
+      "no_exec_tools": true,
+      "has_delegate": true,
+      "forbidden_present": [],
+      "tools_sample": [
+        "ledger_get",
+        "ledger_note",
+        "dag_plan",
+        "dag_run",
+        "dag_status",
+        "dag_replan",
+        "buildgraph_plan",
+        "buildgraph_status",
+        "workspace_status",
+        "delegate",
+        "ask_user",
+        "describe_project"
+      ]
+    }
+  },
+  "capability_separation_ok": true,
+  "leaf_feature_modeler_keeps_exec": true,
+  "verdict": "PASS",
+  "budget_tokens_preflight": {
+    "required_roles_rendered_schema_has_budget_tokens": {
+      "feature_modeler": true,
+      "layout_engineer": true,
+      "spec_writer": true
+    },
+    "required_roles_prompt_has_budget_tokens": {
+      "feature_modeler": true,
+      "layout_engineer": true,
+      "spec_writer": true
+    },
+    "orchestrator_prompt_has_budget_tokens": true,
+    "spec_writer_prompt_has_budget_tokens": true,
+    "all_required_rendered_ok": true,
+    "detail": {
+      "assembly_fit_engineer": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      },
+      "cam_programmer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "clarifier": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "department_manager": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      },
+      "design_thinker": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "feature_architect": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "feature_modeler": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      },
+      "fixer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "geometry_designer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "intake_analyst": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "layout_engineer": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      },
+      "linkage_planner": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "orchestrator": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      },
+      "overseer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "re_datasheet_reader": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "re_geometry_verifier": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "re_modeler": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "reviewer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "sim_engineer": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "sketcher": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "sourcing_specialist": {
+        "prompt_budget_tokens": false,
+        "rendered_budget_tokens": true,
+        "snippet": "",
+        "prompt_sig_ok": false
+      },
+      "spec_writer": {
+        "prompt_budget_tokens": true,
+        "rendered_budget_tokens": true,
+        "snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)",
+        "prompt_sig_ok": true
+      }
+    }
+  },
+  "required_role_detail": {
+    "feature_modeler": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [
+        "add_features",
+        "new_part",
+        "preflight_ops"
+      ],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "new_part",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "verify_battery",
+        "regen_diagnose",
+        "part_search",
+        "part_place",
+        "delegate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "new_part",
+        "add_features",
+        "preflight_ops",
+        "describe_part",
+        "measure_part",
+        "query_geometry",
+        "check_feature_overlap",
+        "verify_battery",
+        "regen_diagnose",
+        "part_search",
+        "part_place",
+        "delegate"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "layout_engineer": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "describe_scene",
+        "measure_part",
+        "measure_between",
+        "query_geometry",
+        "part_search",
+        "parts_taxonomy",
+        "part_source",
+        "delegate"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "describe_part",
+        "describe_scene",
+        "measure_part",
+        "measure_between",
+        "query_geometry",
+        "part_search",
+        "parts_taxonomy",
+        "part_source",
+        "delegate"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    },
+    "spec_writer": {
+      "has_delegate": true,
+      "raw_allowlist_has_delegate": true,
+      "has_exec_tools": [],
+      "tools": [
+        "ledger_get",
+        "ledger_note",
+        "research_material_lookup",
+        "research_eng_calc",
+        "fit_calc",
+        "recommend_fit",
+        "resolve_process",
+        "part_search",
+        "delegate",
+        "describe_part",
+        "board_from_schematic",
+        "ecad_new_schematic",
+        "em_status",
+        "fw_status"
+      ],
+      "allowlist": [
+        "ledger_get",
+        "ledger_note",
+        "research_material_lookup",
+        "research_eng_calc",
+        "fit_calc",
+        "recommend_fit",
+        "resolve_process",
+        "part_search",
+        "delegate",
+        "describe_part",
+        "family:ecad",
+        "family:em",
+        "family:fw",
+        "board_from_schematic"
+      ],
+      "prompt_has_budget_tokens": true,
+      "prompt_has_stale_budget_sig": false,
+      "rendered_tools_has_budget_tokens": true,
+      "rendered_delegate_snippet": "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)"
+    }
+  },
+  "conservation": {
+    "no_per_node_frontier_injection": true,
+    "fallback_tier": "xai:grok-4-5",
+    "auto_pick_first": true
+  },
+  "cycle9_axes": {
+    "A_op_vocab_cheatsheet": "runtime_regression",
+    "B_capability_separation": "preflight+runtime_regression",
+    "C_cheap_leaf_oneshot": "runtime_regression",
+    "D_deliver_partial": "runtime_regression",
+    "E_verify_battery_ledger": "runtime",
+    "F_clean_stop_reason": "runtime",
+    "G_typed_refusal_envelope": "runtime"
+  }
+}

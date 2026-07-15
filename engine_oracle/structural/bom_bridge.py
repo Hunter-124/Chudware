@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from engine_oracle.bom import BomLine
-from engine_oracle.structural.estimate import TakeoffLine, estimate, fastener_count
+from ..bom import BomLine
+from ..structural.estimate import TakeoffLine, estimate, fastener_count
 
 
 def _takeoff_to_bom_line(line: TakeoffLine, *, currency: str = "USD") -> BomLine:

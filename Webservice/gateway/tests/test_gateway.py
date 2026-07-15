@@ -417,3 +417,75 @@ def test_team_domain_normalization(monkeypatch):
     assert _normalize_team_domain("bruh.cloudflareaccess.com") == "https://bruh.cloudflareaccess.com"
     assert _normalize_team_domain("https://bruh.cloudflareaccess.com/") == "https://bruh.cloudflareaccess.com"
     assert _normalize_team_domain("") == ""
+
+
+def test_admin_project_field_and_env(client, _admin_env, _isolate, monkeypatch):
+    directory, synced, users = _admin_env
+    r = client.post(
+        "/api/admin/users",
+        headers=_auth("boss@example.com"),
+        json={"email": "pal@ua.edu", "project": "Demo"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["user"]["project"] == "Demo"
+    assert "project: Demo" in users.read_text()
+
+    # invalid project name rejected
+    r2 = client.post(
+        "/api/admin/users",
+        headers=_auth("boss@example.com"),
+        json={"email": "pal2@ua.edu", "project": "../evil"},
+    )
+    assert r2.status_code == 400
+
+    # session env carries BILLET_DEFAULT_PROJECT
+    calls = []
+
+    async def fake_podman(args, timeout=120.0):
+        calls.append(list(args))
+        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
+
+    async def fake_wait(sess):
+        return True
+
+    mgr = _isolate
+    monkeypatch.setattr(mgr, "run_podman", fake_podman)
+    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
+    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
+    r3 = client.post("/api/sessions", headers=_auth("pal@ua.edu"))
+    assert r3.status_code == 200, r3.text
+    joined = " ".join(next(c for c in calls if c[0] == "run"))
+    assert "BILLET_DEFAULT_PROJECT=Demo" in joined
+
+
+def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
+    directory, synced, users = _admin_env
+    r = client.put("/api/admin/default-project",
+                   headers=_auth("boss@example.com"), json={"project": "Demo"})
+    assert r.status_code == 200
+    assert "default_project: Demo" in users.read_text()
+    body = client.get("/api/admin/users", headers=_auth("boss@example.com")).json()
+    assert body["default_project"] == "Demo"
+
+    # non-admin blocked
+    assert client.put("/api/admin/default-project",
+                      headers=_auth("demo@example.com"), json={"project": "X"}).status_code == 403
+
+    # session start for a user with no explicit project inherits the default
+    calls = []
+
+    async def fake_podman(args, timeout=120.0):
+        calls.append(list(args))
+        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
+
+    async def fake_wait(sess):
+        return True
+
+    mgr = _isolate
+    monkeypatch.setattr(mgr, "run_podman", fake_podman)
+    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
+    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
+    r3 = client.post("/api/sessions", headers=_auth("demo@example.com"))
+    assert r3.status_code == 200, r3.text
+    joined = " ".join(next(c for c in calls if c[0] == "run"))
+    assert "BILLET_DEFAULT_PROJECT=Demo" in joined

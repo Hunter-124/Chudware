@@ -55,7 +55,7 @@ class HydraulicComponentsAdapter:
 
     def _get_types(self) -> set:
         try:
-            from engine_oracle.hydraulic.schema import HYD_COMPONENT_TYPES
+            from ...hydraulic.schema import HYD_COMPONENT_TYPES
             return set(HYD_COMPONENT_TYPES)
         except Exception as exc:  # noqa: BLE001
             log.debug("HydraulicComponentsAdapter: schema unavailable: %s", exc)

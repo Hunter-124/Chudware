@@ -19,7 +19,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Import the module under test
 # ---------------------------------------------------------------------------
-import engine_oracle.vision.reveng_provision as rp
+from ..vision import reveng_provision as rp
 
 # ---------------------------------------------------------------------------
 # Helpers

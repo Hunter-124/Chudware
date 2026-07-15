@@ -27,7 +27,7 @@ import services.mcp.core_bridge as _core_bridge  # noqa: E402
 sys.modules.setdefault("core_bridge", _core_bridge)
 
 # Reuse the exact cache dir + render helper the RPC uses, so keys/paths can never drift.
-from engine_oracle.parts_hub.gui_rpc import (  # noqa: E402
+from ..parts_hub.gui_rpc import (  # noqa: E402
     _render_local_part_png,
     _thumb_cache_dir,
 )

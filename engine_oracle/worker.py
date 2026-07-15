@@ -244,7 +244,7 @@ except Exception as _deliv_import_err:  # noqa: BLE001
 # asynchronously via AsyncRpc with no bespoke transport.  Degrades gracefully when the hub
 # or its backing data is unavailable (returns empty results, never a traceback).
 try:
-    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
+    from .parts_hub.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
     _METHODS.update(_PARTS_METHODS)
 except Exception as _parts_import_err:  # noqa: BLE001
     import logging as _logging
@@ -259,7 +259,7 @@ except Exception as _parts_import_err:  # noqa: BLE001
 # with no bespoke transport.  Gracefully absent when the RE suite isn't installed
 # (the tab degrades to "Reverse Eng tools unavailable").
 try:
-    from engine_oracle.reveng_rpc import REVENG_WORKER_METHODS as _REVENG_METHODS  # noqa: E402
+    from .reveng_rpc import REVENG_WORKER_METHODS as _REVENG_METHODS  # noqa: E402
     _METHODS.update(_REVENG_METHODS)
 except Exception as _reveng_import_err:  # noqa: BLE001
     import logging as _logging
@@ -273,7 +273,7 @@ except Exception as _reveng_import_err:  # noqa: BLE001
 # via AsyncRpc with no bespoke transport.  Gracefully absent when the engine.bom module is not
 # yet provisioned (e.g. CI without the ML track) — the panel degrades to an error state.
 try:
-    from engine_oracle.sourcing_worker_rpc import WORKER_METHODS as _SOURCING_METHODS  # noqa: E402
+    from .sourcing_worker_rpc import WORKER_METHODS as _SOURCING_METHODS  # noqa: E402
     _METHODS.update(_SOURCING_METHODS)
 except Exception as _sourcing_import_err:  # noqa: BLE001
     import logging as _logging

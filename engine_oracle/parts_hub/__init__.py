@@ -11,9 +11,9 @@ Public API:
 """
 from __future__ import annotations
 
-from engine_oracle.parts_hub.registry import ProviderRegistry
-from engine_oracle.parts_hub.index import PartsIndex
-from engine_oracle.parts_hub.hub import PartsHub
+from ..parts_hub.registry import ProviderRegistry
+from ..parts_hub.index import PartsIndex
+from ..parts_hub.hub import PartsHub
 
 # Module-level singleton hub (lazy-init on first call).
 _hub: PartsHub | None = None

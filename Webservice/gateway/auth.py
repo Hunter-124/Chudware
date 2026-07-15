@@ -29,6 +29,7 @@ class User:
     display: str
     role: str
     heavy: bool
+    project: str = ""  # default PLM project opened at session start (/plm/<name>.git)
 
 
 class UserDirectory:
@@ -38,6 +39,7 @@ class UserDirectory:
         self.path = path
         self._mtime: float | None = None
         self._by_email: dict[str, User] = {}
+        self.default_project: str = ""  # site-wide default; users without a project inherit it
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -54,6 +56,8 @@ class UserDirectory:
         with self.path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
         users = data.get("users") or data if isinstance(data, list) else data.get("users") or []
+        if isinstance(data, dict):
+            self.default_project = str(data.get("default_project") or "").strip()
         by_email: dict[str, User] = {}
         for row in users:
             if not isinstance(row, dict):
@@ -66,6 +70,7 @@ class UserDirectory:
                 display=str(row.get("display") or email.split("@")[0]),
                 role=str(row.get("role") or "user"),
                 heavy=bool(row.get("heavy", False)),
+                project=str(row.get("project") or "").strip(),
             )
         self._by_email = by_email
         self._mtime = st.st_mtime
@@ -85,6 +90,15 @@ class UserDirectory:
         self._by_email[user.email.strip().lower()] = user
         self._write()
 
+    def set_default_project(self, project: str) -> None:
+        """Site-wide default project (users with no explicit project inherit it)."""
+        self.reload()
+        self.default_project = project.strip()
+        self._write()
+
+    def effective_project(self, user: User) -> str:
+        return user.project or self.default_project
+
     def remove(self, email: str) -> bool:
         self.reload()
         removed = self._by_email.pop(email.strip().lower(), None) is not None
@@ -94,12 +108,14 @@ class UserDirectory:
 
     def _write(self) -> None:
         payload = {
+            "default_project": self.default_project,
             "users": [
                 {
                     "email": u.email,
                     "display": u.display,
                     "role": u.role,
                     "heavy": u.heavy,
+                    "project": u.project,
                 }
                 for u in sorted(self._by_email.values(), key=lambda u: u.email)
             ]

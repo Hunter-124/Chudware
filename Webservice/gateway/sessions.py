@@ -446,6 +446,8 @@ class SessionManager:
             "DISPLAY": ":0",
             "BILLET_PLM_DIR": "/plm",
         }
+        if user.project:
+            env["BILLET_DEFAULT_PROJECT"] = user.project
         # Shared remote-model provider credentials (host-owned file); per-user
         # subscriptions live in the app's own Settings inside the HOME volume.
         provider_vars = self.cfg.ai_provider_vars()

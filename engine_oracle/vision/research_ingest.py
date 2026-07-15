@@ -103,13 +103,13 @@ def _get_research_fn(name: str):
     return None
 
 try:
-    from engine_oracle.spec_sheet_matcher import normalize_mpn
+    from ..spec_sheet_matcher import normalize_mpn
 except Exception:
     def normalize_mpn(pn: str) -> str:  # type: ignore[misc]
         return str(pn or "").strip()
 
 try:
-    from engine_oracle.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet
+    from ..vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet
 except Exception:
     _ingest_datasheet = None  # type: ignore[assignment]
 

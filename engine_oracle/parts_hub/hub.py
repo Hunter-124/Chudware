@@ -28,8 +28,8 @@ import threading
 import time
 from typing import Iterator
 
-from engine_oracle.parts_hub.registry import ProviderRegistry
-from engine_oracle.parts_hub.index import PartsIndex
+from ..parts_hub.registry import ProviderRegistry
+from ..parts_hub.index import PartsIndex
 
 # Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
 # Override with AI_CAD_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
@@ -62,19 +62,19 @@ class PartsHub:
     def bootstrap(self) -> None:
         """Auto-register all built-in adapters (T-P1 + T-P2 + local library)."""
         # T-P1 adapters
-        from engine_oracle.parts_hub.adapters.bolts_adapter import BoltsAdapter
-        from engine_oracle.parts_hub.adapters.core_families_adapter import CoreFamiliesAdapter
+        from ..parts_hub.adapters.bolts_adapter import BoltsAdapter
+        from ..parts_hub.adapters.core_families_adapter import CoreFamiliesAdapter
         # T-P2 domain adapters (indexable)
-        from engine_oracle.parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
-        from engine_oracle.parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
-        from engine_oracle.parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
-        from engine_oracle.parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from ..parts_hub.adapters.structural_sections_adapter import StructuralSectionsAdapter
+        from ..parts_hub.adapters.piping_fittings_adapter import PipingFittingsAdapter
+        from ..parts_hub.adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
+        from ..parts_hub.adapters.ecad_kicad_adapter import EcadKicadAdapter
         # T-FIN17 curated heatsink catalog (thermal metadata for heatsink_select)
-        from engine_oracle.parts_hub.adapters.heatsinks_adapter import HeatsinksAdapter
+        from ..parts_hub.adapters.heatsinks_adapter import HeatsinksAdapter
         # Watched local library (vendor_parts index) — indexable STEP/STEP+ files
-        from engine_oracle.parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
+        from ..parts_hub.adapters.local_library_adapter import LocalLibraryAdapter
         # T-P2 live-vendor adapter (non-indexed, search-only)
-        from engine_oracle.parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
+        from ..parts_hub.adapters.ecad_vendor_adapter import EcadVendorAdapter
 
         self.register(BoltsAdapter())
         self.register(CoreFamiliesAdapter())

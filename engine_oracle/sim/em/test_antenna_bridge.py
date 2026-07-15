@@ -12,8 +12,8 @@ import unittest
 
 import numpy as np
 
-from engine_oracle.ecad import antenna as ant
-from engine_oracle.sim.em import antenna_bridge as bridge
+from ...ecad import antenna as ant
+from ...sim.em import antenna_bridge as bridge
 
 
 def _ms(t0: float) -> float:

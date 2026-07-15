@@ -14,11 +14,11 @@ import math
 import pytest
 
 # Importing the package registers all calculators
-import engine_oracle.research.calcs as calcs
-from engine_oracle.research.calcs.registry import run_calc, list_calcs, calc_fail
-from engine_oracle.research.calcs.beam import beam_calc_raw, section_props
-from engine_oracle.research.calcs.bolted_joint import tensile_stress_area
-from engine_oracle.research.calcs.press_fit import press_fit_raw
+from ...research import calcs as calcs
+from ...research.calcs.registry import run_calc, list_calcs, calc_fail
+from ...research.calcs.beam import beam_calc_raw, section_props
+from ...research.calcs.bolted_joint import tensile_stress_area
+from ...research.calcs.press_fit import press_fit_raw
 
 
 # =========================================================================
@@ -166,7 +166,7 @@ class TestBeamDeflection:
         assert abs(r["max_stress_mpa"] - sigma_expected) < 1e-6
 
     def test_beam_envelope_returns_aicad_schema(self):
-        from engine_oracle.research.calcs.beam import beam
+        from ...research.calcs.beam import beam
         r = beam("cantilever", "point", "rect", 200, 200000,
                  F_n=500, b_mm=10, h_mm=20)
         assert r["schema"] == "aicad.calc/1"
@@ -174,19 +174,19 @@ class TestBeamDeflection:
         assert "max_deflection_mm" in r["answer"]
 
     def test_beam_envelope_records_prefilled(self):
-        from engine_oracle.research.calcs.beam import beam
+        from ...research.calcs.beam import beam
         pf = {"L_mm": "doc_bbox z body=shaft"}
         r = beam("simply_supported", "udl", "round", 300, 69000,
                  w_n_mm=1, d_mm=15, prefilled=pf)
         assert r["inputs"]["prefilled"] == pf
 
     def test_beam_bad_section_returns_fail(self):
-        from engine_oracle.research.calcs.beam import beam
+        from ...research.calcs.beam import beam
         r = beam("cantilever", "point", "hex", 100, 200000, F_n=100, side_mm=10)
         assert r["ok"] is False
 
     def test_beam_bad_support_returns_fail(self):
-        from engine_oracle.research.calcs.beam import beam
+        from ...research.calcs.beam import beam
         r = beam("fixed_fixed", "point", "rect", 100, 200000,
                  F_n=100, b_mm=10, h_mm=10)
         assert r["ok"] is False
@@ -226,7 +226,7 @@ class TestBoltedJoint:
         # F_p = 20.12 × 600 = 12072 N
         # F_i = 0.75 × 12072 = 9054 N
         # T = K·F_i·d = 0.2×9054×6 = 10865 N·mm = 10.865 N·m
-        from engine_oracle.research.calcs.bolted_joint import bolted_joint
+        from ...research.calcs.bolted_joint import bolted_joint
         r = bolted_joint(d_mm=6, grade="8.8")
         assert r["ok"] is True
         assert r["schema"] == "aicad.calc/1"
@@ -242,7 +242,7 @@ class TestBoltedJoint:
         # sigma_i = F_i / A_t = 10000 / 20.12 = 497 MPa
         # S_p = 600 MPa → no yielding
         # utilisation = 10000/12072 = 82.8%
-        from engine_oracle.research.calcs.bolted_joint import bolted_joint
+        from ...research.calcs.bolted_joint import bolted_joint
         r = bolted_joint(d_mm=6, grade="8.8", T_nm=12.0)
         assert r["ok"] is True
         ans = r["answer"]
@@ -250,7 +250,7 @@ class TestBoltedJoint:
         assert ans["utilisation_pct"] < 100.0  # not overstressed
 
     def test_unknown_grade_fails(self):
-        from engine_oracle.research.calcs.bolted_joint import bolted_joint
+        from ...research.calcs.bolted_joint import bolted_joint
         r = bolted_joint(d_mm=6, grade="3.6")
         assert r["ok"] is False
         assert r["reason"] == "bad_query"
@@ -275,7 +275,7 @@ class TestThreadEngagement:
     """
 
     def test_M6_into_alu_6061_approx_9mm(self):
-        from engine_oracle.research.calcs.thread_engagement import thread_engagement
+        from ...research.calcs.thread_engagement import thread_engagement
         r = thread_engagement(d_mm=6, grade="8.8",
                               internal_material_id="alu_6061")
         assert r["ok"] is True
@@ -287,20 +287,20 @@ class TestThreadEngagement:
 
     def test_M6_into_steel_shorter_than_alu(self):
         """Steel internal thread needs less engagement than aluminium."""
-        from engine_oracle.research.calcs.thread_engagement import thread_engagement
+        from ...research.calcs.thread_engagement import thread_engagement
         r_alu = thread_engagement(6, "8.8", "alu_6061")
         r_steel = thread_engagement(6, "8.8", "steel_1018")
         assert r_alu["answer"]["recommended_engagement_mm"] > \
                r_steel["answer"]["recommended_engagement_mm"]
 
     def test_returns_aicad_schema(self):
-        from engine_oracle.research.calcs.thread_engagement import thread_engagement
+        from ...research.calcs.thread_engagement import thread_engagement
         r = thread_engagement(8, "10.9", "steel_1018")
         assert r["schema"] == "aicad.calc/1"
         assert r["ok"] is True
 
     def test_unknown_material_fails(self):
-        from engine_oracle.research.calcs.thread_engagement import thread_engagement
+        from ...research.calcs.thread_engagement import thread_engagement
         r = thread_engagement(6, "8.8", "unobtanium")
         assert r["ok"] is False
 
@@ -346,14 +346,14 @@ class TestPressFit:
         assert abs(r2["p_mpa"] / r1["p_mpa"] - 2.0) < 0.01
 
     def test_press_fit_envelope(self):
-        from engine_oracle.research.calcs.press_fit import press_fit
+        from ...research.calcs.press_fit import press_fit
         r = press_fit(50, 80, 0.05)
         assert r["schema"] == "aicad.calc/1"
         assert r["ok"] is True
         assert "interface_pressure_mpa" in r["answer"]
 
     def test_press_fit_with_engagement_length(self):
-        from engine_oracle.research.calcs.press_fit import press_fit
+        from ...research.calcs.press_fit import press_fit
         r = press_fit(50, 80, 0.05, L_mm=30)
         assert "F_assembly_total_n" in r["answer"]
         # Total = per_mm × 30
@@ -361,12 +361,12 @@ class TestPressFit:
                    r["answer"]["F_assembly_per_mm_n"] * 30) < 0.1
 
     def test_press_fit_notes_diametral_convention(self):
-        from engine_oracle.research.calcs.press_fit import press_fit
+        from ...research.calcs.press_fit import press_fit
         r = press_fit(50, 80, 0.05)
         assert any("diametral" in n.lower() for n in r["notes"])
 
     def test_invalid_hub_diameter_fails(self):
-        from engine_oracle.research.calcs.press_fit import press_fit
+        from ...research.calcs.press_fit import press_fit
         r = press_fit(50, 40, 0.05)  # d_o < d
         assert r["ok"] is False
 
@@ -380,7 +380,7 @@ class TestWallThickness:
 
     def test_machining_steel_aspect_3(self):
         # h=30, steel → aspect=3.0, min_wall=30/3=10 mm
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("machining", feature_height_mm=30,
                            material_family="steel")
         assert r["ok"] is True
@@ -388,43 +388,43 @@ class TestWallThickness:
 
     def test_machining_aluminium_aspect_5(self):
         # h=50, aluminium → aspect=5.0, min_wall=50/5=10 mm
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("machining", feature_height_mm=50,
                            material_family="aluminium")
         assert abs(r["answer"]["min_wall_mm"] - 10.0) < 0.01
 
     def test_fdm_default_nozzle(self):
         # nozzle=0.4 → 2×0.4=0.8 < 1.2 structural min → min_wall=1.2
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("fdm_3dp")
         assert abs(r["answer"]["min_wall_mm"] - 1.2) < 0.01
 
     def test_fdm_large_nozzle(self):
         # nozzle=0.8 → 2×0.8=1.6 > 1.2 → min_wall=1.6
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("fdm_3dp", nozzle_dia_mm=0.8)
         assert abs(r["answer"]["min_wall_mm"] - 1.6) < 0.01
 
     def test_injection_molding_abs(self):
         # ABS: min=1.2, max=3.5, nominal=2.0
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("injection_molding", material_family="abs")
         assert r["ok"] is True
         assert r["answer"]["min_wall_mm"] == 1.2
         assert r["answer"]["nominal_wall_mm"] == 2.0
 
     def test_source_kind_heuristic(self):
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("machining", feature_height_mm=20)
         assert r["source"]["kind"] == "heuristic"
 
     def test_unknown_process_fails(self):
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("casting")
         assert r["ok"] is False
 
     def test_machining_requires_height(self):
-        from engine_oracle.research.calcs.wall_thickness import wall_thickness
+        from ...research.calcs.wall_thickness import wall_thickness
         r = wall_thickness("machining")
         assert r["ok"] is False
 
@@ -448,14 +448,14 @@ class TestSnapFit:
 
     def test_snap_fit_root_strain(self):
         # ε_root = 1.5×2×1.5/400 = 0.01125
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(L_mm=20, h_mm=2, b_mm=5, delta_mm=1.5, material_id="abs")
         assert r["ok"] is True
         assert abs(r["answer"]["epsilon_root"] - 0.01125) < 1e-5
 
     def test_snap_fit_force(self):
         # F = 3×2300×3.333×1.5/8000 = 4.313 N
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(L_mm=20, h_mm=2, b_mm=5, delta_mm=1.5, material_id="abs")
         # I = 5×8/12 = 3.333
         I = 5 * 2**3 / 12
@@ -464,24 +464,24 @@ class TestSnapFit:
 
     def test_snap_fit_not_viable_abs_thin_long(self):
         # The reference case: ε_root > ε_allow → not viable
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(L_mm=20, h_mm=2, b_mm=5, delta_mm=1.5, material_id="abs")
         assert r["answer"]["viable"] is False
 
     def test_snap_fit_viable_longer_arm(self):
         # Longer arm → smaller strain → viable
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(L_mm=40, h_mm=2, b_mm=5, delta_mm=1.5, material_id="abs")
         # ε_root = 1.5×2×1.5/1600 = 0.00281 < ε_allow ✓
         assert r["answer"]["viable"] is True
 
     def test_snap_fit_returns_aicad_schema(self):
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(20, 2, 5, 1.5, "abs")
         assert r["schema"] == "aicad.calc/1"
 
     def test_snap_fit_unknown_material_fails(self):
-        from engine_oracle.research.calcs.snap_fit import snap_fit
+        from ...research.calcs.snap_fit import snap_fit
         r = snap_fit(20, 2, 5, 1.5, "vibranium")
         assert r["ok"] is False
 

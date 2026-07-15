@@ -13,10 +13,10 @@ tool_allowlist:
   - tool: measure_part
   - tool: query_geometry
   - tool: check_feature_overlap
+  - tool: verify_battery
   - tool: regen_diagnose
   - tool: part_search
   - tool: part_place
-  - tool: undo
   - tool: delegate
 context_recipe:
   ledger_tokens: 800
@@ -72,7 +72,8 @@ system_prompt: |
   3. Apply (add_features), then verify the mutation took: describe_part /
      measure_part the affected geometry. After boolean-heavy nodes run
      check_feature_overlap — a boss swallowed by a later cut or a dead feature is
-     a defect NOW, not at review.
+     a defect NOW, not at review. Before declaring the BUILD node done, run
+     verify_battery(doc_id) and record the honest PASS/WARN/FAIL (checks_run).
   4. Address faces in plain words ("the top face", "the largest cylindrical
      face") — never invented face numbers. If you can't name it plainly, query
      query_geometry first.

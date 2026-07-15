@@ -21,18 +21,18 @@ def _noop_emit(_):
     pass
 
 def _search(query, domain=None, limit=20):
-    from engine_oracle.parts_hub.worker_rpc import _part_search
+    from ..parts_hub.worker_rpc import _part_search
     params = {"query": query, "limit": limit}
     if domain:
         params["domain"] = domain
     return _part_search(params, _noop_emit)
 
 def _get(part_id):
-    from engine_oracle.parts_hub.worker_rpc import _part_get
+    from ..parts_hub.worker_rpc import _part_get
     return _part_get({"part_id": part_id}, _noop_emit)
 
 def _place(part_id, doc=None, extra=None):
-    from engine_oracle.parts_hub.worker_rpc import _part_place
+    from ..parts_hub.worker_rpc import _part_place
     params = {"part_id": part_id}
     if doc is not None:
         params["doc"] = doc
@@ -48,13 +48,13 @@ def _place(part_id, doc=None, extra=None):
 class TestWorkerRpcRegistration:
     def test_worker_methods_keys(self):
         """WORKER_METHODS exposes exactly part_search / part_get / part_place."""
-        from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+        from ..parts_hub.worker_rpc import WORKER_METHODS
         assert "part_search" in WORKER_METHODS
         assert "part_get"    in WORKER_METHODS
         assert "part_place"  in WORKER_METHODS
 
     def test_all_methods_callable(self):
-        from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
+        from ..parts_hub.worker_rpc import WORKER_METHODS
         for name, fn in WORKER_METHODS.items():
             assert callable(fn), f"{name} must be callable"
 
@@ -162,11 +162,11 @@ class TestPartsTaxonomyRpc:
     """Parts Library V2: the parts_taxonomy GUI RPC envelope."""
 
     def _taxonomy(self, params=None):
-        from engine_oracle.parts_hub.gui_rpc import _parts_taxonomy
+        from ..parts_hub.gui_rpc import _parts_taxonomy
         return _parts_taxonomy(params or {}, _noop_emit)
 
     def test_registered_in_gui_worker_methods(self):
-        from engine_oracle.parts_hub.gui_rpc import GUI_WORKER_METHODS
+        from ..parts_hub.gui_rpc import GUI_WORKER_METHODS
         for name in ("parts_taxonomy", "vendors_health_check", "vendors_health_status"):
             assert name in GUI_WORKER_METHODS and callable(GUI_WORKER_METHODS[name])
 
@@ -195,7 +195,7 @@ class TestCategoryRoutedPartsSearch:
     """Parts Library V2: parts_search with category_id routing + facet filters."""
 
     def _gui_search(self, **params):
-        from engine_oracle.parts_hub.gui_rpc import _parts_search
+        from ..parts_hub.gui_rpc import _parts_search
         return _parts_search(params, _noop_emit)
 
     def test_category_routed_search(self):
@@ -220,7 +220,7 @@ class TestCategoryRoutedPartsSearch:
 
     def test_facet_range_filters_synthetic_bolt(self, monkeypatch):
         """A facets length_mm range must keep the in-range bolt and drop the long one."""
-        import engine_oracle.parts_hub as hub_mod
+        from .. import parts_hub as hub_mod
 
         def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             def bolt(pid, length):
@@ -239,7 +239,7 @@ class TestCategoryRoutedPartsSearch:
         assert not any(i.endswith("M8x80") for i in ids), f"out-of-range bolt kept: {ids}"
 
     def test_facet_enum_filters_synthetic_bolt(self, monkeypatch):
-        import engine_oracle.parts_hub as hub_mod
+        from .. import parts_hub as hub_mod
 
         def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             return [{"part_id": "fastener:SYN:M8", "domain": "fastener",
@@ -258,7 +258,7 @@ class TestCategoryRoutedPartsSearch:
     def test_facet_alias_bore_mm_keeps_local_bearing(self, monkeypatch):
         """Host facet filter must alias bore→bore_mm so a 12 mm-bore local bearing
         is kept when the GUI queries facets={bore_mm: 12} (parity with MCP)."""
-        import engine_oracle.parts_hub as hub_mod
+        from .. import parts_hub as hub_mod
 
         def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             return [
@@ -293,7 +293,7 @@ class TestVendorsHealthRpc:
         """services.browser.health is another agent's module — absence must yield
         the documented ok:false envelope (never a traceback). When it exists,
         the call must return {ok:true, started:bool}."""
-        from engine_oracle.parts_hub.gui_rpc import _vendors_health_check
+        from ..parts_hub.gui_rpc import _vendors_health_check
         r = _vendors_health_check({}, _noop_emit)
         assert "ok" in r
         if r["ok"]:
@@ -302,12 +302,12 @@ class TestVendorsHealthRpc:
             assert r.get("error") == "health module not available"
 
     def test_check_rejects_non_list_sites(self):
-        from engine_oracle.parts_hub.gui_rpc import _vendors_health_check
+        from ..parts_hub.gui_rpc import _vendors_health_check
         r = _vendors_health_check({"sites": "mcmaster"}, _noop_emit)
         assert r.get("ok") is False
 
     def test_status_envelope(self):
-        from engine_oracle.parts_hub.gui_rpc import _vendors_health_status
+        from ..parts_hub.gui_rpc import _vendors_health_status
         r = _vendors_health_status({}, _noop_emit)
         assert r.get("ok") is True
         for key in ("running", "results", "started_ts", "finished_ts"):
@@ -319,7 +319,7 @@ class TestDomainListSearch:
     """Parts Library V2: PartsIndex/hub accept domain as a list (SQL IN)."""
 
     def test_index_domain_list(self):
-        from engine_oracle.parts_hub import PartsIndex
+        from ..parts_hub import PartsIndex
         idx = PartsIndex()
         recs = [
             {"part_id": "fastener:T:1", "domain": "fastener", "title": "bolt one", "params": {}},
@@ -333,7 +333,7 @@ class TestDomainListSearch:
         assert got_one == {"ecad"}
 
     def test_hub_search_domain_list(self):
-        from engine_oracle.parts_hub import search as _search
+        from ..parts_hub import search as _search
         recs = _search("M8", domain=["fastener", "mech_family"], limit=20)
         for rec in recs:
             assert rec["domain"] in ("fastener", "mech_family")

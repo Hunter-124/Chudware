@@ -205,7 +205,12 @@ std::string homeDir() {
     return h ? std::string(h) : std::string(".");
 }
 
-std::string startDir() { return s_lastDir.empty() ? homeDir() : s_lastDir; }
+std::string startDir() {
+    if (!s_lastDir.empty()) return s_lastDir;
+    // Managed sessions (billet-web) point dialogs at the shared-projects tree.
+    if (const char* d = std::getenv("AI_CAD_START_DIR"); d && *d) return d;
+    return homeDir();
+}
 
 void rememberDir(const std::string& full) {
     size_t cut = full.find_last_of('/');

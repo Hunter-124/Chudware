@@ -104,7 +104,7 @@ def _sim_caps(params: dict) -> dict:
         caps["ccx"] = {"found": False, "path": "", "hint": f"fea_advanced unavailable: {e}"}
     try:
         import numpy  # noqa: F401
-        from engine_oracle.sim import vibration  # noqa: F401
+        from ..sim import vibration  # noqa: F401
         caps["freq_response"] = {"available": True, "hint": ""}
     except Exception as e:  # noqa: BLE001
         caps["freq_response"] = {"available": False,
@@ -212,7 +212,7 @@ def _sim_freq_response(params: dict) -> dict:
       excitation_dir?[3], sweep_hz?[], zeta?, base_accel_g?, psd_breakpoints?[[f,psd]],
       vibration_spec?{max_peak_accel_g, max_grms}."""
     try:
-        from engine_oracle.sim.vibration import (
+        from ..sim.vibration import (
             evaluate_vibration_spec, harmonic_response, miles_response)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"vibration post-processing unavailable: {e}",

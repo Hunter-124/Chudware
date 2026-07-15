@@ -27,8 +27,36 @@
     return d.innerHTML;
   }
 
+  var state = { defaultProject: "" };
+
+  var defForm = document.getElementById("default-form");
+  if (defForm) {
+    defForm.addEventListener("submit", async function (ev) {
+      ev.preventDefault();
+      var p = document.getElementById("f-default-project").value.trim();
+      setStatus(p ? "Setting default project to " + p + "…" : "Clearing default project…");
+      try {
+        await api("/api/admin/default-project", { method: "PUT", body: JSON.stringify({ project: p }) });
+        setStatus(p ? "Default project set: everyone without an explicit project now opens " + p +
+                      " on their next session start." : "Default project cleared.");
+        refresh();
+      } catch (e) { setStatus(String(e.message || e), true); }
+    });
+  }
   async function refresh() {
     var data = await api("/api/admin/users");
+    var dl = document.getElementById("project-list");
+    if (dl && data.projects) {
+      dl.innerHTML = "";
+      data.projects.forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p;
+        dl.appendChild(o);
+      });
+    }
+    var defInput = document.getElementById("f-default-project");
+    if (defInput && document.activeElement !== defInput) defInput.value = data.default_project || "";
+    state.defaultProject = data.default_project || "";
     rows.innerHTML = "";
     data.users.forEach(function (u) {
       var tr = document.createElement("tr");
@@ -37,6 +65,9 @@
         "<td>" + esc(u.display) + "</td>" +
         "<td><span class='pill " + (u.role === "admin" ? "admin" : "user") + "'>" + esc(u.role) + "</span>" +
         (u.heavy ? "<span class='pill heavy'>GPU</span>" : "") + "</td>" +
+        "<td>" + (u.project ? esc(u.project)
+                 : state.defaultProject ? "<span style='opacity:.6'>" + esc(state.defaultProject) + " (default)</span>"
+                 : "—") + "</td>" +
         "<td></td>";
       var btn = document.createElement("button");
       btn.className = "rm-btn";
@@ -69,6 +100,7 @@
           display: document.getElementById("f-display").value.trim(),
           role: document.getElementById("f-admin").checked ? "admin" : "user",
           heavy: document.getElementById("f-heavy").checked,
+          project: document.getElementById("f-project").value.trim(),
         }),
       });
       setStatus("Added " + r.user.email + ". Access policy: " +

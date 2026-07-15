@@ -96,7 +96,7 @@ def _match_part_number(params: dict, _emit: Callable) -> dict:
     mpn = p.get("mpn", "")
     generate = p.get("generate", True)
     try:
-        from engine_oracle import spec_sheet_matcher as ssm  # type: ignore[import]
+        from . import spec_sheet_matcher as ssm  # type: ignore[import]
         result = ssm.match_part_number(mpn, generate=generate)
         return {"ok": True, "match": result}
     except Exception as e:  # noqa: BLE001

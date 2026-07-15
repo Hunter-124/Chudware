@@ -13,8 +13,8 @@ from __future__ import annotations
 import re
 from typing import Iterator
 
-from engine_oracle import bolts_loader
-from engine_oracle.bolts_loader import Standard
+from ... import bolts_loader
+from ...bolts_loader import Standard
 
 
 # Family-hint text to include in the search index alongside the family key.

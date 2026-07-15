@@ -29,7 +29,7 @@ from typing import Any
 # MPN normalisation — reuse existing, no reinvention
 # ---------------------------------------------------------------------------
 try:
-    from engine_oracle.spec_sheet_matcher import normalize_mpn
+    from ..spec_sheet_matcher import normalize_mpn
 except Exception:  # pragma: no cover
     # Fallback shim when running standalone outside the package tree
     def normalize_mpn(pn: str) -> str:  # type: ignore[misc]

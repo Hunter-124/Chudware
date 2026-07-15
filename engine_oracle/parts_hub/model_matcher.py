@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from engine_oracle import spec_sheet_matcher as _ssm
+from .. import spec_sheet_matcher as _ssm
 
 # CAD-model-yielding sites ONLY (contracts/sourcing.md §2a). Commerce/datasheet
 # adapters do not yield importable geometry and are excluded from the fan-out.

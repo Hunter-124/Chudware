@@ -17,7 +17,7 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from engine_oracle.vision import cad_recode as cr
+from ..vision import cad_recode as cr
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ class TestBuildParametricDegradation:
 
 class TestProvisionDescriptor:
     def test_cad_recode_descriptor_present(self):
-        from engine_oracle.vision import reveng_provision as rp
+        from ..vision import reveng_provision as rp
 
         assert "cad_recode" in rp.REVENG_DESCRIPTORS
         d = rp.REVENG_DESCRIPTORS["cad_recode"]
@@ -254,7 +254,7 @@ class TestProvisionDescriptor:
         assert d["license"] == "CC-BY-NC-4.0"
 
     def test_reveng_status_reports_cad_recode(self, monkeypatch):
-        from engine_oracle.vision import reveng_provision as rp
+        from ..vision import reveng_provision as rp
 
         monkeypatch.setattr(rp, "_artifact_available", lambda name: name != "cad_recode")
         monkeypatch.setattr(rp, "_gpu_available", lambda: True)

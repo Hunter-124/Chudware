@@ -120,7 +120,7 @@ def register_local_cad(*, supplier: str, part_number: str, cad_path: str,
     _write_index(idx)
     # Keep PartsHub FTS in sync so part_search finds freshly registered files.
     try:
-        from engine_oracle.parts_hub import rebuild_index as _rebuild  # noqa: PLC0415
+        from .parts_hub import rebuild_index as _rebuild  # noqa: PLC0415
         _rebuild()
     except Exception:  # noqa: BLE001 — hub optional in pure-metadata contexts
         pass

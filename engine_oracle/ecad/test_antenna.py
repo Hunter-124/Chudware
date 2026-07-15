@@ -12,7 +12,7 @@ import unittest
 
 from engine.ecad import impedance as z0_mod
 from engine.ecad import schema
-from engine_oracle.ecad import antenna as ant
+from ..ecad import antenna as ant
 
 
 def _ms(t0: float) -> float:

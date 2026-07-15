@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from engine_oracle.requirements import RequirementsDoc, VALID_VERIFIERS
-from engine_oracle.requirements.requirements import (
+from ..requirements import RequirementsDoc, VALID_VERIFIERS
+from ..requirements.requirements import (
     Quantity,
     VerifyRef,
     StakeholderNeed,
@@ -287,7 +287,7 @@ class TestSortKey:
 
 class TestExample:
     def test_example_runs(self):
-        from engine_oracle.requirements.example import build_example_brief, simulate_verification
+        from ..requirements.example import build_example_brief, simulate_verification
         doc = build_example_brief()
         doc.validate()
         doc = simulate_verification(doc)

@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import pytest
 
-from engine_oracle.mechanical.gear_check import (
+from ..mechanical.gear_check import (
     DISCLAIMER,
     GearCheckResult,
     gear_check,
 )
-from engine_oracle.mechanical.bearing_life import (
+from ..mechanical.bearing_life import (
     BearingLifeResult,
     bearing_life,
 )
@@ -209,7 +209,7 @@ class TestBearingLifeDisclaimer:
 
     def test_disclaimer_constant_matches_gear_module(self):
         """bearing_life imports DISCLAIMER from gear_check — must be identical."""
-        from engine_oracle.mechanical.bearing_life import DISCLAIMER as BL_DISC
+        from ..mechanical.bearing_life import DISCLAIMER as BL_DISC
         assert BL_DISC == self.EXPECTED
 
     def test_bearing_result_carries_disclaimer(self):

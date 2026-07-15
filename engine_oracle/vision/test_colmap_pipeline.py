@@ -59,7 +59,7 @@ def test_graceful_skip_when_not_installed(tmp_path):
     if PYCOLMAP_AVAILABLE:
         pytest.skip("pycolmap is installed — skip absence test")
 
-    from engine_oracle.vision.colmap_pipeline import run_sparse
+    from ..vision.colmap_pipeline import run_sparse
 
     result = run_sparse(str(FIXTURE_DIR), str(tmp_path))
 
@@ -70,7 +70,7 @@ def test_graceful_skip_when_not_installed(tmp_path):
 
 def test_availability_flag_matches_import():
     """available() must agree with actual importability of pycolmap."""
-    from engine_oracle.vision.colmap_pipeline import available
+    from ..vision.colmap_pipeline import available
 
     assert available() == PYCOLMAP_AVAILABLE
 
@@ -86,7 +86,7 @@ def test_sparse_reconstruction_on_fixture(tmp_path):
     if len(renders) < RENDER_COUNT:
         pytest.skip(f"expected {RENDER_COUNT} renders, found {len(renders)}")
 
-    from engine_oracle.vision.colmap_pipeline import run_sparse
+    from ..vision.colmap_pipeline import run_sparse
 
     result = run_sparse(str(FIXTURE_DIR), str(tmp_path))
 

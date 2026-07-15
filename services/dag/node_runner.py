@@ -951,6 +951,11 @@ def run(
     final_code: str | None = getattr(agent_result, "final_code", None)
     agent_result_dict: dict | None = getattr(agent_result, "result", None)
     doc_id = node_inputs.get("doc_id")
+    # mega-9 a2: BUILD often creates the part via new_part without stamping
+    # inputs.doc_id — lift it from the agent result so VERIFY/battery can target
+    # the mission-built doc when ≥2 parts are open.
+    if not doc_id:
+        doc_id = _extract_doc_id_from_agent_result(agent_result_dict)
 
     # mega-8 a4: SqliteSaver raised "string or blob too big" when node_states
     # accumulated full tool results / handoffs. Keep a compact agent_result for
@@ -965,6 +970,7 @@ def run(
             "final_code": final_code,
             "agent_result": compact_ar,
             "elapsed_ms": round(elapsed_ms, 1),
+            **({"doc_id": doc_id} if doc_id else {}),
         },
         "retry_remaining": new_retry_remaining,
         "doc_id": doc_id,
@@ -1140,18 +1146,32 @@ def _build_request(
                 "\n[CAPABILITY / DELEGATION GATE] Multi-domain PLAN/BUILD: "
                 "before you finish you MUST either (1) call delegate(role, brief, "
                 "budget_tokens) for ≥1 independent slice, OR (2) emit a typed "
-                "refusal object in your handoff outputs:\n"
-                '  "typed_refusal": {"reason": "...", "domains_considered": '
-                '["geometry","assembly",…], "why_flat": "..."}\n'
-                "Free-form ledger_note alone does NOT satisfy this gate."
+                "refusal object in your handoff outputs. Exact schema (all three "
+                "keys required; free-form ledger_note does NOT satisfy):\n"
+                '  "typed_refusal": {\n'
+                '    "reason": "<short why you stay flat — non-empty string>",\n'
+                '    "domains_considered": ["geometry","assembly"],\n'
+                '    "why_flat": "<why spawn would not help — non-empty string>"\n'
+                "  }\n"
+                "Example valid envelope:\n"
+                '  {"reason":"single integrated solid","domains_considered":'
+                '["geometry","assembly"],"why_flat":"mates share one doc; '
+                'spawn thrash"}\n'
+                "Place it under handoff.outputs.typed_refusal (or top-level "
+                "typed_refusal). domains_considered MUST be a non-empty array "
+                "of non-empty strings."
             )
-            # Retry path: prior gate failure hint.
+            # Retry path: prior gate failure hint with paste-ready envelope.
             prev = context_pack.get("delegate_gate") or node_inputs.get("delegate_gate")
             if isinstance(prev, dict) and prev.get("blocked"):
                 parts.append(
                     "\n[GATE RETRY] Previous turn was blocked: "
                     f"{prev.get('reason') or 'missing_delegate_or_typed_refusal'}. "
-                    "Call delegate(...) now OR return typed_refusal — do not free-form complete."
+                    "Call delegate(role, brief, budget_tokens) NOW, OR return ONLY this "
+                    "exact JSON (no free-form prose) under handoff.outputs.typed_refusal:\n"
+                    '{"reason":"single integrated solid","domains_considered":'
+                    '["geometry","assembly"],"why_flat":"mates share one doc; spawn thrash"}\n'
+                    "Do not free-form complete. ledger_note alone will be blocked again."
                 )
     except Exception:  # noqa: BLE001
         pass
@@ -1180,6 +1200,41 @@ def _synthesise_request(node_type: str, node_inputs: dict[str, Any]) -> str:
     return f"Execute the {node_type} node{doc_ref}."
 
 
+def _extract_doc_id_from_agent_result(agent_result_dict: Any) -> str | None:
+    """Best-effort doc_id from handoff outputs / tool call results."""
+    if not isinstance(agent_result_dict, dict):
+        return None
+    handoff = agent_result_dict.get("handoff")
+    if isinstance(handoff, dict):
+        outs = handoff.get("outputs")
+        if isinstance(outs, dict) and outs.get("doc_id"):
+            return str(outs["doc_id"]).strip() or None
+        if handoff.get("doc_id"):
+            return str(handoff["doc_id"]).strip() or None
+    if agent_result_dict.get("doc_id"):
+        return str(agent_result_dict["doc_id"]).strip() or None
+    calls = agent_result_dict.get("calls")
+    if isinstance(calls, list):
+        for c in reversed(calls):
+            if not isinstance(c, dict):
+                continue
+            if c.get("tool") not in ("new_part", "add_features", "open_part"):
+                continue
+            res = c.get("result")
+            if isinstance(res, str):
+                try:
+                    import json as _json  # noqa: PLC0415
+                    res = _json.loads(res)
+                except Exception:  # noqa: BLE001
+                    res = None
+            if isinstance(res, dict) and res.get("doc_id"):
+                return str(res["doc_id"]).strip() or None
+            args = c.get("args") if isinstance(c.get("args"), dict) else {}
+            if args.get("doc_id"):
+                return str(args["doc_id"]).strip() or None
+    return None
+
+
 def _compact_agent_result(agent_result_dict: Any) -> Any:
     """Shrink agent_result for SqliteSaver node_states (mega-8 a4 blob crash).
 
@@ -1203,13 +1258,22 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
         outs = handoff.get("outputs")
         if isinstance(outs, dict):
             slim = {}
+            _KEEP_OUT = (
+                "typed_refusal", "leaf_envelope", "one_shot",
+                "auto_complete", "productive_tools", "wrote_ledger",
+                "no_op", "reason", "doc_id", "checks_run",
+            )
             for ok, ov in outs.items():
-                if ok in ("typed_refusal", "leaf_envelope", "one_shot",
-                          "auto_complete", "productive_tools", "wrote_ledger",
-                          "no_op", "reason"):
+                if ok not in _KEEP_OUT:
+                    # Drop unknown fat keys (mesh dumps, free-form blobs).
+                    if isinstance(ov, str) and len(ov) > 120:
+                        continue
+                    if isinstance(ov, (dict, list)):
+                        continue
+                if ok in _KEEP_OUT:
                     slim[ok] = ov
                 elif isinstance(ov, str):
-                    slim[ok] = ov[:400]
+                    slim[ok] = ov[:120]
                 elif isinstance(ov, (int, float, bool)) or ov is None:
                     slim[ok] = ov
             if slim:
@@ -1224,16 +1288,23 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
         out["tool_calls"] = len(calls)
     elif "tool_calls" in agent_result_dict:
         out["tool_calls"] = agent_result_dict.get("tool_calls")
-    # Cap overall JSON size hard.
+    # Cap overall JSON size hard (checkpoint + emit paths share this).
     try:
         import json as _json  # noqa: PLC0415
         blob = _json.dumps(out, default=str)
-        if len(blob) > 12000:
+        if len(blob) > 8000:
             out = {
                 "stop_reason": out.get("stop_reason"),
-                "handoff": out.get("handoff"),
+                "handoff": {
+                    "status": (out.get("handoff") or {}).get("status")
+                    if isinstance(out.get("handoff"), dict) else None,
+                    "summary": str(
+                        (out.get("handoff") or {}).get("summary")
+                        if isinstance(out.get("handoff"), dict) else ""
+                    )[:300],
+                },
                 "tool_calls": out.get("tool_calls"),
-                "calls": out.get("calls", [])[:20],
+                "calls": out.get("calls", [])[:15],
                 "truncated": True,
             }
     except Exception:  # noqa: BLE001

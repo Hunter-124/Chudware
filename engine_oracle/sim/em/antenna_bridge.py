@@ -21,7 +21,7 @@ import os
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
-from engine_oracle.sim.em.analytic import C0
+from ...sim.em.analytic import C0
 
 # Re-export for callers that want the vacuum constant from this module.
 __all__ = [

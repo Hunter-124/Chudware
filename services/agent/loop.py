@@ -610,6 +610,51 @@ def normalize_on_event(on_event: "EventFn | None") -> "EventFn | None":
 
     return _safe
 
+# ---------------------------------------------------------------------------
+# mega-9 Fix11 residual: clean terminal stop_reason classes (no raw blobs)
+# ---------------------------------------------------------------------------
+
+# Known clean dag_error classes — short snake tokens after the prefix.
+# Never embed raw exception text (LangGraph SqliteSaver / concurrent-update
+# messages can be multi-line or multi-MB when str(exc) includes state).
+_DAG_ERROR_CLASSES: tuple[tuple[str, str], ...] = (
+    ("string or blob too big", "checkpoint_blob"),
+    ("blob too big", "checkpoint_blob"),
+    ("invalid_concurrent_graph_update", "concurrent_update"),
+    ("can receive only one value per step", "concurrent_update"),
+    ("annotated key to handle multiple values", "concurrent_update"),
+    ("connection", "connection"),
+    ("timeout", "timeout"),
+    ("timed out", "timeout"),
+    ("permission", "permission"),
+    ("disk", "io"),
+    ("i/o", "io"),
+    ("io error", "io"),
+    ("no such table", "checkpoint_schema"),
+    ("database is locked", "checkpoint_locked"),
+    ("sqlite", "checkpoint"),
+)
+
+
+def classify_dag_error(exc: BaseException | str) -> str:
+    """Map a DAG execution failure → clean ``dag_error:<class>`` stop_reason.
+
+    mega-8 a4 terminal was ``dag_error: string or blob too big`` (raw Sqlite
+    message). mega-9 axis F requires string *classes*, never raw blobs / stack
+    dumps. Always returns a short ``dag_error:<token>`` with no exception body.
+    """
+    if isinstance(exc, BaseException):
+        text = f"{type(exc).__name__}: {exc}"
+    else:
+        text = str(exc or "")
+    low = text.lower()
+    for needle, cls in _DAG_ERROR_CLASSES:
+        if needle in low:
+            return f"dag_error:{cls}"
+    # Unknown: keep a stable class token only (no payload).
+    return "dag_error:execution"
+
+
 
 def _extract_code(reply: str) -> str | None:
     m = _PY_RE.search(reply)
@@ -2033,12 +2078,15 @@ def run_mission(
                 graph, run_id=run_id, emit=_dag_emit, agent_fn=effective_agent_fn,
                 autonomy_default=autonomy_default)
         except Exception as exc:  # noqa: BLE001
-            # DAG execution failure does not corrupt the mission record; report it.
+            # DAG execution failure does not corrupt the mission record; report
+            # it with a CLEAN stop_reason class (mega-9 Fix11 residual — never
+            # embed raw Sqlite / LangGraph exception text).
             return MissionRun(
                 request=request, run_id=run_id, phase=Phase.PLAN.value,
                 status="failed", manifest=manifest, graph=graph,
                 ledger_path=str(ledger.path) if ledger else None,
-                phases_completed=completed, stop_reason=f"dag_error: {exc}",
+                phases_completed=completed,
+                stop_reason=classify_dag_error(exc),
                 findings=[str(f) for f in findings])
 
     # --- Drive the phase machine in LOCKSTEP with the DAG result -----------
@@ -2450,23 +2498,49 @@ def _run_reviewer_checks(manifest, ledger, dag_result) -> None:
     """Invoke the deterministic reviewer to run each AC's named check tool and
     record per-criterion results on the ledger.  Best-effort: any failure leaves
     the criteria unrecorded → NOT-CHECKED → the gate fails closed (never a
-    fabricated pass)."""
+    fabricated pass).
+
+    mega-9 axis E / a2 residual: resolve an *explicit* mission-built ``doc_id``
+    (BUILD node output or latest new_part) so battery/measure tools do not hit
+    "2 parts are open" ambiguity, then run verify_battery with honest scoring.
+    """
     if ledger is None:
         return
+    doc_id = None
     try:
-        from services.agent import reviewer_exec
-        # Resolve the doc the mission built (if the DAG surfaced one) so the check
-        # tools run against real geometry; None lets each tool fall back to _CUR.
+        from services.agent.reviewer_exec import resolve_mission_doc_id
+        doc_id = resolve_mission_doc_id(dag_result=dag_result, ledger=ledger)
+    except Exception:  # noqa: BLE001
         doc_id = None
+    if not doc_id:
+        # Fallback: first node-level doc_id (pre-a2 path).
         nodes = (dag_result or {}).get("nodes", {}) or {}
         for ns in nodes.values():
+            if not isinstance(ns, dict):
+                continue
             d = (ns.get("output") or {}).get("doc_id") or ns.get("doc_id")
             if d:
                 doc_id = d
                 break
+    try:
+        from services.agent import reviewer_exec
         reviewer_exec.run_acceptance_checks(manifest, ledger, doc_id=doc_id)
     except Exception:  # noqa: BLE001 — a broken reviewer must not fabricate a pass
         pass
+    try:
+        from services.agent import reviewer_exec as _re
+        _re.run_verify_battery(ledger, doc_id=doc_id, actor="reviewer")
+    except Exception:  # noqa: BLE001 — battery miss is NOT a fabricated PASS
+        try:
+            ledger.append("reviewer", "battery_result", {
+                "verdict": "NOT-CHECKED",
+                "ok": False,
+                "detail": "verify_battery did not run (resolver/backend error)",
+                "checks": [],
+                "doc_id": doc_id,
+            })
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _run_intake(request: str, provider: Provider,

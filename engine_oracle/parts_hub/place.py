@@ -129,7 +129,7 @@ def _place_generate_model(gref: dict, doc_context: dict | None,
         return _err(domain, "geometry_ref missing 'match' dict",
                     "Fetch the PartRecord via part_get to confirm geometry_ref fields.")
     try:
-        from engine_oracle import spec_sheet_matcher as ssm  # noqa: PLC0415
+        from .. import spec_sheet_matcher as ssm  # noqa: PLC0415
         path = ssm.generate_model(match)
         if path is None:
             return _err(domain, "generate_model returned None (no geometry available)",
@@ -193,7 +193,7 @@ def _place_symbol_footprint(gref: dict, doc_context: dict | None,
                     "then call part_place with the doc.")
 
     try:
-        from engine_oracle.ecad import ops as ecad_ops  # noqa: PLC0415
+        from ..ecad import ops as ecad_ops  # noqa: PLC0415
 
         # Build the op.
         # sch_add_symbol requires pos as [x, y] (see ecad_ops.md §1 / _require_xy).
@@ -271,7 +271,7 @@ def _place_section_profile(gref: dict, doc_context: dict | None,
                     "Create one with new_structure(), then call part_place with it.")
 
     try:
-        from engine_oracle.structural.elements import (  # noqa: PLC0415
+        from ..structural.elements import (  # noqa: PLC0415
             Beam, Column, Post, Joist,
         )
 
@@ -324,7 +324,7 @@ def _place_fitting_id(gref: dict, doc_context: dict | None,
                     "Create one with piping tools, then call part_place with that doc.")
 
     try:
-        from engine_oracle.piping.schema import new_fitting, next_id  # noqa: PLC0415
+        from ..piping.schema import new_fitting, next_id  # noqa: PLC0415
 
         elem_params = params or {}
         ft_id = elem_params.get("id") or next_id(doc, "ft")
@@ -364,7 +364,7 @@ def _place_fmu_component(gref: dict, doc_context: dict | None,
                     "Create one with hydraulic tools, then call part_place with that doc.")
 
     try:
-        from engine_oracle.hydraulic.schema import new_component, next_id  # noqa: PLC0415
+        from ..hydraulic.schema import new_component, next_id  # noqa: PLC0415
 
         elem_params = params or {}
         comp_id = elem_params.get("id") or next_id(doc, "c")
@@ -471,7 +471,7 @@ def place(part_id: str, *,
     """
     # 1. Retrieve the PartRecord.
     try:
-        from engine_oracle.parts_hub import get as _get  # noqa: PLC0415
+        from ..parts_hub import get as _get  # noqa: PLC0415
         record = _get(part_id)
     except Exception as exc:  # noqa: BLE001
         return _err("unknown", f"parts_hub.get failed: {exc}",

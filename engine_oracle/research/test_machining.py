@@ -16,7 +16,7 @@ _REPO = pathlib.Path(__file__).resolve().parents[3]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from engine_oracle.research.machining import (
+from ..research.machining import (
     check_envelope,
     feeds_speeds,
     tap_drill,
@@ -305,7 +305,7 @@ class TestRelativeSpeeds:
 
     def test_all_materials_produce_positive_rpm(self):
         """Every material in the table must produce positive rpm for endmill_flat roughing."""
-        from engine_oracle.research.machining import _load_db
+        from ..research.machining import _load_db
         db = _load_db()
         for mat_id, mat_row in db["materials"].items():
             if "endmill_flat" not in mat_row.get("tool_types", {}):

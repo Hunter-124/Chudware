@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from engine_oracle.parts_hub import taxonomy as tax
+from ..parts_hub import taxonomy as tax
 
 
 @pytest.fixture(autouse=True)
@@ -347,7 +347,7 @@ def test_routed_search_only_fetches_fitting_vendors(monkeypatch):
     FETCHED (the request that could get a user rate-limited), not on results.
     """
     import services.browser.session as bsession
-    from engine_oracle import parts_hub
+    from .. import parts_hub
 
     fetched: list[str] = []
 

@@ -15,12 +15,12 @@ import unittest
 
 import numpy as np
 
-from engine_oracle.sim.em import analytic, fdfd
-from engine_oracle.sim.em.adapters import (
+from ...sim.em import analytic, fdfd
+from ...sim.em.adapters import (
     AnalyticAdapter, BuiltinFdfdAdapter, EmSolverError, registry, select_adapter,
     resolve_cross_section)
-from engine_oracle.sim.em.openems_adapter import OpenEmsAdapter
-from engine_oracle.sim.em.worker_rpc import WORKER_METHODS
+from ...sim.em.openems_adapter import OpenEmsAdapter
+from ...sim.em.worker_rpc import WORKER_METHODS
 
 WR90_TE10_HZ = 6.5571e9  # c / (2 * 22.86 mm)
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
+from dataclasses import replace
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -91,13 +92,40 @@ async def _sync_access_policy() -> dict[str, Any]:
     return {"synced": ok, "detail": out[-500:]}
 
 
+def _user_dict(u: User) -> dict[str, Any]:
+    return {"email": u.email, "display": u.display, "role": u.role,
+            "heavy": u.heavy, "project": u.project}
+
+
+def _available_projects() -> list[str]:
+    try:
+        return sorted(p.name[:-4] for p in settings.plm_dir.glob("*.git"))
+    except OSError:
+        return []
+
+
 @admin_router.get("/users")
 async def admin_list_users(request: Request) -> dict[str, Any]:
     _require_admin(request)
-    return {"users": [
-        {"email": u.email, "display": u.display, "role": u.role, "heavy": u.heavy}
-        for u in sorted(user_directory.all(), key=lambda u: u.email)
-    ]}
+    return {
+        "users": [_user_dict(u) for u in sorted(user_directory.all(), key=lambda u: u.email)],
+        "projects": _available_projects(),
+        "default_project": user_directory.default_project,
+    }
+
+
+@admin_router.put("/default-project")
+async def admin_set_default_project(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Site-wide default project — every user without an explicit project inherits it."""
+    _require_admin(request)
+    project = str(body.get("project") or "").strip()
+    if project and not _PROJECT_RE.match(project):
+        raise HTTPException(status_code=400, detail="invalid project name")
+    user_directory.set_default_project(project)
+    return {"ok": True, "default_project": project}
+
+
+_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 
 
 @admin_router.post("/users")
@@ -109,17 +137,19 @@ async def admin_add_user(request: Request, body: dict[str, Any]) -> dict[str, An
     role = str(body.get("role", "user"))
     if role not in {"admin", "user"}:
         raise HTTPException(status_code=400, detail="role must be admin or user")
+    project = str(body.get("project") or "").strip()
+    if project and not _PROJECT_RE.match(project):
+        raise HTTPException(status_code=400, detail="invalid project name")
     user = User(
         email=email,
         display=str(body.get("display") or email.split("@")[0]),
         role=role,
         heavy=bool(body.get("heavy", False)),
+        project=project,
     )
     user_directory.upsert(user)
     sync = await _sync_access_policy()
-    return {"ok": True, "user": {"email": user.email, "display": user.display,
-                                 "role": user.role, "heavy": user.heavy},
-            "access_policy": sync}
+    return {"ok": True, "user": _user_dict(user), "access_policy": sync}
 
 
 @admin_router.delete("/users/{email}")
@@ -169,6 +199,9 @@ async def sessions_status(request: Request) -> dict[str, Any]:
 @sessions_router.post("")
 async def sessions_start(request: Request) -> dict[str, Any]:
     user = get_current_user(request)
+    # Site-wide default project: users without an explicit project inherit it.
+    if not user.project and user_directory.default_project:
+        user = replace(user, project=user_directory.default_project)
     try:
         sess = await manager.start(user)
     except SessionBusy as exc:

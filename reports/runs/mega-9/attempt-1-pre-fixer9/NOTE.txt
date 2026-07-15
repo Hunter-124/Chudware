@@ -1,0 +1,2 @@
+Pre-Fixer9 rebind kill. Pid 2763529. Wall ~262.0s. Still in specify when killed.
+Fixer9 F/E/G landed unit-green mid-run; relaunch required for bind.

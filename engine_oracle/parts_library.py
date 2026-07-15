@@ -140,7 +140,7 @@ def scan_library_folder(folder: str | None = None) -> dict:
     # Best-effort: hub may be unavailable in pure-metadata tests / core-less CI.
     if added or updated:
         try:
-            from engine_oracle.parts_hub import rebuild_index as _rebuild  # noqa: PLC0415
+            from .parts_hub import rebuild_index as _rebuild  # noqa: PLC0415
             _rebuild()
         except Exception:  # noqa: BLE001
             pass

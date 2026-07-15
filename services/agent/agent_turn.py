@@ -1251,6 +1251,44 @@ def _mirror_c1_grading_evidence(tool: str, args: dict, result: Any,
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mega-9 E: also emit battery_result so guardrails/ledger scanners
+            # see an explicit event (not only the artifact).
+            try:
+                checks = []
+                for src in (payload, answer):
+                    if not isinstance(src, dict):
+                        continue
+                    raw_checks = src.get("checks") or src.get("results") or src.get("scores")
+                    if isinstance(raw_checks, list):
+                        checks = [
+                            {
+                                "name": c.get("name") or c.get("check") or c.get("id") or "?",
+                                "verdict": str(
+                                    c.get("verdict") or c.get("status") or c.get("result") or "?"
+                                ).upper(),
+                            }
+                            for c in raw_checks[:40]
+                            if isinstance(c, dict)
+                        ]
+                        break
+                    if isinstance(raw_checks, dict):
+                        checks = [
+                            {"name": str(k), "verdict": str(v).upper()
+                             if not isinstance(v, dict)
+                             else str(v.get("verdict") or v.get("status") or "?").upper()}
+                            for k, v in list(raw_checks.items())[:40]
+                        ]
+                        break
+                ledger.append(actor, "battery_result", {
+                    "verdict": verdict,
+                    "ok": verdict == "PASS",
+                    "detail": f"verify_battery {verdict}",
+                    "checks": checks,
+                    "source": "agent_turn_mirror",
+                    "doc_id": (args or {}).get("doc_id") if isinstance(args, dict) else None,
+                })
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _args_contain_bolt_circle(args: dict | None) -> bool:

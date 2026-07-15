@@ -108,7 +108,7 @@ def _seed_from_part_ref(t, session: dict, sid: str, part_ref: str) -> dict:
     Best-effort: never raises."""
     seeded: dict = {}
     try:
-        from engine_oracle.parts_hub import get as _hub_get
+        from .parts_hub import get as _hub_get
         record = _hub_get(part_ref)
         if not record:
             return seeded
@@ -294,7 +294,7 @@ def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
         if not ref:
             return _fail("no_reference", "pass a part_id or url")
 
-        from engine_oracle.parts_hub.product_media import harvest_product_media
+        from .parts_hub.product_media import harvest_product_media
         harvest = harvest_product_media(ref)
         images = harvest.get("images", []) if harvest.get("ok") else []
         documents = harvest.get("documents", []) if harvest.get("ok") else []
@@ -371,7 +371,7 @@ def _start_capture_session(params: dict, _emit: Callable) -> dict:
 
         # Prefer engine_oracle path; fall back to engine symlink.
         try:
-            from engine_oracle.vision.capture_server import start_session
+            from .vision.capture_server import start_session
         except ImportError:
             from engine.vision.capture_server import start_session  # type: ignore
 
@@ -423,7 +423,7 @@ def _stop_capture_session(params: dict, _emit: Callable) -> dict:
         run_reconstruction = bool(p.get("run_reconstruction", False))
 
         try:
-            from engine_oracle.vision.capture_server import stop_session
+            from .vision.capture_server import stop_session
         except ImportError:
             from engine.vision.capture_server import stop_session  # type: ignore
 
@@ -453,8 +453,8 @@ def _stop_capture_session(params: dict, _emit: Callable) -> dict:
         # Optional photogrammetry (legacy MCP default was True; GUI uses False).
         try:
             try:
-                from engine_oracle.vision import photogrammetry as _pg
-                from engine_oracle.vision import mesh_cleanup as _mc
+                from .vision import photogrammetry as _pg
+                from .vision import mesh_cleanup as _mc
             except ImportError:
                 from engine.vision import photogrammetry as _pg  # type: ignore
                 from engine.vision import mesh_cleanup as _mc  # type: ignore

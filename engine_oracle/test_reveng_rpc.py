@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from engine_oracle import reveng_rpc
+from . import reveng_rpc
 
 
 @pytest.fixture()
@@ -27,7 +27,7 @@ def _emit(*_a, **_k):  # the bridge never emits; a no-op sink
 
 def test_methods_registered_on_worker():
     """The bridge's methods land in the aggregated worker table (GUI reachability)."""
-    import engine_oracle.worker as w
+    from . import worker as w
     for name in ("list_reveng_sessions", "get_reveng_session", "reveng_start_session",
                  "reveng_add_images", "reveng_ingest_datasheet",
                  "reveng_start_from_product"):
@@ -68,7 +68,7 @@ def test_add_images_delivers_photos(reveng_dir, tmp_path):
 def test_start_from_product_threads_media(reveng_dir, monkeypatch):
     """§2b hand-off: harvested images+documents are downloaded into the session
     and threaded through add_images / ingest_datasheet."""
-    import engine_oracle.parts_hub.product_media as pm
+    from .parts_hub import product_media as pm
     from services.browser import session as bsession
 
     monkeypatch.setattr(pm, "harvest_product_media", lambda ref: {
@@ -97,7 +97,7 @@ def test_start_from_product_threads_media(reveng_dir, monkeypatch):
 
 
 def test_start_from_product_empty_harvest_still_starts_session(reveng_dir, monkeypatch):
-    import engine_oracle.parts_hub.product_media as pm
+    from .parts_hub import product_media as pm
     monkeypatch.setattr(pm, "harvest_product_media",
                         lambda ref: {"ok": False, "reason": "captcha_or_2fa_detected"})
 

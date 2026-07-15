@@ -64,7 +64,7 @@ def _mesh_to_tmp(mesh, suffix=".ply") -> str:
 # ------------------------------------------------------------------
 # Import the module under test (always succeeds — graceful envelope)
 # ------------------------------------------------------------------
-from engine_oracle.vision.deviation import (
+from ..vision.deviation import (
     compute_deviation,
     compute_deviation_from_arrays,
     DEFAULT_BUCKETS_MM,
@@ -80,11 +80,11 @@ class TestGracefulEnvelope:
 
     def test_import_succeeds(self):
         """Module must be importable even without scipy/trimesh."""
-        from engine_oracle.vision import deviation  # noqa: F401
+        from ..vision import deviation  # noqa: F401
 
     def test_missing_deps_return_ok_false(self, monkeypatch):
         """Monkeypatch dep flags → compute_deviation returns ok:False gracefully."""
-        import engine_oracle.vision.deviation as dev_mod
+        from ..vision import deviation as dev_mod
         monkeypatch.setattr(dev_mod, "_HAVE_NP", False)
         result = dev_mod.compute_deviation("a.ply", "b.ply")
         assert result["ok"] is False
@@ -92,14 +92,14 @@ class TestGracefulEnvelope:
         assert "hint" in result
 
     def test_missing_scipy_returns_ok_false(self, monkeypatch):
-        import engine_oracle.vision.deviation as dev_mod
+        from ..vision import deviation as dev_mod
         monkeypatch.setattr(dev_mod, "_HAVE_NP", True)
         monkeypatch.setattr(dev_mod, "_HAVE_SCIPY", False)
         result = dev_mod.compute_deviation("a.ply", "b.ply")
         assert result["ok"] is False
 
     def test_missing_trimesh_returns_ok_false(self, monkeypatch):
-        import engine_oracle.vision.deviation as dev_mod
+        from ..vision import deviation as dev_mod
         monkeypatch.setattr(dev_mod, "_HAVE_NP", True)
         monkeypatch.setattr(dev_mod, "_HAVE_SCIPY", True)
         monkeypatch.setattr(dev_mod, "_HAVE_TRIMESH", False)

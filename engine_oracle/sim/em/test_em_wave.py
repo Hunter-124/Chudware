@@ -25,12 +25,12 @@ import unittest
 
 import numpy as np
 
-from engine_oracle.sim.em import analytic, fdfd
-from engine_oracle.sim.em.adapters import (
+from ...sim.em import analytic, fdfd
+from ...sim.em.adapters import (
     BuiltinFdfdAdapter, ElmerAdapter, EmSolverError, GetdpAdapter, MeepAdapter,
     registry, select_adapter)
-from engine_oracle.sim.em.openems_adapter import OpenEmsAdapter
-from engine_oracle.sim.em.worker_rpc import WORKER_METHODS
+from ...sim.em.openems_adapter import OpenEmsAdapter
+from ...sim.em.worker_rpc import WORKER_METHODS
 
 
 def _openems_installed() -> bool:
@@ -81,7 +81,7 @@ class TestAnalyticImpedances(unittest.TestCase):
         # independent IPC-2141A implementation in engine_oracle/ecad/impedance.py,
         # inside the IPC validity band 0.1 < w/h < 2.0, 1 < er < 15, t = 0.
         # The two published closed forms agree to ~10% there.
-        from engine_oracle.ecad.impedance import microstrip_z0 as ipc_z0
+        from ...ecad.impedance import microstrip_z0 as ipc_z0
         for er in (2.2, 4.4, 6.15):
             for u in (0.5, 1.0, 1.5, 2.0):
                 h = 0.2
@@ -291,7 +291,7 @@ class TestUpstreamSeam(unittest.TestCase):
         # NOTE: the symlink means `engine.sim.em` and `engine_oracle.sim.em` are
         # two module objects (classic dual-import); the RPC surface is stateless
         # so only the method-name sets must agree.
-        import engine_oracle.sim.em.worker_rpc as canonical
+        from ...sim.em import worker_rpc as canonical
         self.assertEqual(set(mod.WORKER_METHODS), set(canonical.WORKER_METHODS))
         # the alias RPCs actually run
         res = mod.WORKER_METHODS["em_eigenmode"]({"standard": "WR-90",

@@ -244,7 +244,12 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
 
     Returns PASS only when the rule shape is one this function can mechanically
     verify AND the tool output satisfies it.  Every non-mechanical or unmet rule is
-    NOT-CHECKED / FAIL — never a fabricated PASS."""
+    NOT-CHECKED / FAIL — never a fabricated PASS.
+
+    mega-9 a2: verify_battery returns ``{scores, findings}`` without a top-level
+    ``verdict`` field. Literal pass_rule ``PASS`` must still evaluate that shape
+    (derive FAIL when findings ok:false / zero scores on critical checks).
+    """
     rule = (pass_rule or "").strip()
 
     # A tool that reported an error can never PASS.
@@ -253,20 +258,40 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
 
     # Shape 1: literal "PASS" verdict — the tool must emit a PASS-ish signal.
     if rule.upper() == "PASS":
-        verdict_field = None
+        # Prefer explicit verdict/status/result/ok.
         if isinstance(result, dict):
-            for key in ("verdict", "status", "result", "ok"):
-                if key in result:
+            for key in ("verdict", "status", "result"):
+                if key in result and result[key] is not None:
                     verdict_field = result[key]
-                    break
-        if isinstance(verdict_field, str) and verdict_field.strip().upper() in (
-                "PASS", "OK", "PASSED"):
-            return PASS, f"tool verdict {verdict_field!r}"
-        if verdict_field is True:
-            return PASS, "tool ok=true"
-        if verdict_field is None:
-            return NOT_CHECKED, "tool output carries no verdict/status field to match 'PASS'"
-        return FAIL, f"tool verdict {verdict_field!r} is not PASS"
+                    if isinstance(verdict_field, str) and verdict_field.strip().upper() in (
+                            "PASS", "OK", "PASSED"):
+                        return PASS, f"tool verdict {verdict_field!r}"
+                    if isinstance(verdict_field, str) and verdict_field.strip().upper() in (
+                            "FAIL", "FAILED", "ERROR"):
+                        return FAIL, f"tool verdict {verdict_field!r}"
+                    if isinstance(verdict_field, str) and verdict_field.strip().upper() in (
+                            "WARN", "WARNING"):
+                        return FAIL, f"tool verdict {verdict_field!r} (not PASS)"
+                    if verdict_field is True:
+                        return PASS, "tool ok=true"
+                    if isinstance(verdict_field, str) and verdict_field.strip():
+                        return FAIL, f"tool verdict {verdict_field!r} is not PASS"
+            # scores/findings battery shape (no top-level verdict).
+            if "scores" in result or "findings" in result:
+                derived, detail = interpret_battery_result(result)
+                if derived == PASS:
+                    return PASS, detail or "battery scores/findings PASS"
+                if derived == FAIL:
+                    return FAIL, detail or "battery scores/findings FAIL"
+                if derived == "WARN":
+                    return FAIL, detail or "battery WARN (not PASS for AC)"
+                return NOT_CHECKED, detail or "battery shape not evaluable"
+            if "ok" in result:
+                if result.get("ok") is True:
+                    return PASS, "tool ok=true"
+                if result.get("ok") is False:
+                    return FAIL, "tool ok=false"
+        return NOT_CHECKED, "tool output carries no verdict/status field to match 'PASS'"
 
     # Shape 2: numeric interval, e.g. "clearance in [0,0.042]".
     m = _INTERVAL_RE.search(rule)
@@ -292,6 +317,87 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     # Any other prose rule (e.g. "4 holes d4.5 on PCD34") is NOT mechanically
     # evaluable from generic tool output — honestly NOT-CHECKED, not a guessed PASS.
     return NOT_CHECKED, f"pass_rule {rule!r} is not mechanically evaluable"
+
+
+# Geometry-critical battery checks: a 0.0 score / ok:false finding here is FAIL,
+# not a silent PASS (mega-9 a2: is_manifold 0.0 under fabricated overall PASS).
+_CRITICAL_BATTERY_CHECKS = frozenset({
+    "is_manifold", "eval_check", "check_feature_overlap", "check_interference",
+    "solid_valid", "manifold", "volume", "measure_part",
+})
+
+
+def interpret_battery_result(result: dict) -> tuple[str, str]:
+    """Derive honest PASS/WARN/FAIL/NOT-CHECKED from a verify_battery payload.
+
+    Prefer explicit verdict. Else:
+      * findings with ok:false OR severity fail/error/blocker → FAIL
+      * critical score ≤ 0 → FAIL
+      * non-critical zero scores / warn severity → WARN
+      * empty findings + all positive scores (or ok:true) → PASS
+    """
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "battery result not an object"
+    for k in ("verdict", "status", "result"):
+        v = result.get(k)
+        if isinstance(v, str) and v.strip():
+            up = v.strip().upper()
+            if up in ("PASS", "OK", "PASSED"):
+                return PASS, f"explicit {k}={v!r}"
+            if up in ("FAIL", "FAILED", "ERROR"):
+                return FAIL, f"explicit {k}={v!r}"
+            if up in ("WARN", "WARNING"):
+                return "WARN", f"explicit {k}={v!r}"
+    findings = result.get("findings")
+    failing: list[str] = []
+    warnings: list[str] = []
+    if isinstance(findings, list):
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("check") or f.get("name") or f.get("id") or "?")
+            sev = str(f.get("severity") or f.get("level") or "").lower()
+            if f.get("ok") is False or sev in ("fail", "error", "blocker"):
+                failing.append(name)
+            elif sev in ("warn", "warning"):
+                warnings.append(name)
+    scores = result.get("scores")
+    crit_zero: list[str] = []
+    soft_zero: list[str] = []
+    if isinstance(scores, dict):
+        for k, v in scores.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv <= 0.0:
+                key = str(k)
+                if key.lower() in _CRITICAL_BATTERY_CHECKS or any(
+                    c in key.lower() for c in ("manifold", "eval", "interference", "overlap")
+                ):
+                    crit_zero.append(key)
+                else:
+                    soft_zero.append(key)
+    if failing or crit_zero:
+        bits = []
+        if failing:
+            bits.append(f"failing findings={failing[:6]}")
+        if crit_zero:
+            bits.append(f"critical_scores_zero={crit_zero[:6]}")
+        return FAIL, "; ".join(bits)
+    if warnings or soft_zero:
+        bits = []
+        if warnings:
+            bits.append(f"warn findings={warnings[:6]}")
+        if soft_zero:
+            bits.append(f"soft_scores_zero={soft_zero[:6]}")
+        return "WARN", "; ".join(bits)
+    if result.get("ok") is False:
+        return FAIL, "ok=false"
+    if isinstance(findings, list) or isinstance(scores, dict) or result.get("ok") is True:
+        return PASS, "no failing findings/critical zeros"
+    return NOT_CHECKED, "no scores/findings/verdict"
+
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +432,214 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
                 except Exception:  # noqa: BLE001 — ledger write must not break the sweep
                     pass
     return results
+
+def run_verify_battery(ledger, *, doc_id: str | None = None,
+                       actor: str = REVIEWER_ACTOR) -> dict[str, Any]:
+    """Run ``verify_battery`` once and log honest per-check results (mega-9 E).
+
+    Always writes a ``battery_result`` event (and a ``battery`` artifact) so the
+    mission ledger records that the battery executed — even when the verdict is
+    WARN/FAIL/NOT-CHECKED. Never fabricates PASS on a missing backend or on
+    zero critical scores (mega-9 a2 residual: is_manifold 0.0 ≠ PASS).
+    Returns the event payload.
+    """
+    payload: dict[str, Any] = {
+        "verdict": NOT_CHECKED,
+        "ok": False,
+        "detail": "",
+        "checks": [],
+        "doc_id": doc_id,
+        "source": "run_verify_battery",
+    }
+    fn = _resolve_fn("verify_battery")
+    if fn is None:
+        payload["detail"] = "verify_battery could not be resolved (backend absent?)"
+    else:
+        raw = _call_tool(fn, doc_id, {})
+        if raw is None:
+            payload["detail"] = "verify_battery raised — treated as not-checked"
+        else:
+            result = _as_dict(raw)
+            payload["evidence"] = _slim_battery_evidence(result)
+            verdict, detail = interpret_battery_result(result)
+            payload["verdict"] = verdict
+            payload["ok"] = verdict == PASS
+            payload["detail"] = detail or f"verify_battery {verdict}"
+            # Per-check rows when present (honest even if WARN/FAIL).
+            checks = result.get("checks") or result.get("results") or result.get("scores")
+            if isinstance(checks, list):
+                payload["checks"] = [
+                    {
+                        "name": c.get("name") or c.get("check") or c.get("id") or "?",
+                        "verdict": str(c.get("verdict") or c.get("status") or c.get("result") or "?").upper(),
+                    }
+                    for c in checks[:40]
+                    if isinstance(c, dict)
+                ]
+            elif isinstance(checks, dict):
+                payload["checks"] = [
+                    {
+                        "name": str(k),
+                        "verdict": (
+                            "PASS" if _score_pass(v) else
+                            ("FAIL" if _score_fail(v) else str(v).upper())
+                        ),
+                        "score": v if isinstance(v, (int, float)) and not isinstance(v, bool) else None,
+                    }
+                    for k, v in list(checks.items())[:40]
+                ]
+
+    if ledger is not None:
+        try:
+            ledger.append(actor, "battery_result", payload)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ledger.add_artifact(
+                actor, "battery", "battery",
+                path="", stage="verify",
+                note=payload.get("detail") or f"verify_battery {payload.get('verdict')}",
+                verdict=payload.get("verdict"),
+                doc_id=doc_id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # Synthetic criterion so scanners see battery ran (declared ACs still own gate).
+        try:
+            ledger.add_criterion_result(
+                actor, "BATTERY", payload.get("verdict") or NOT_CHECKED,
+                check_tool="verify_battery",
+                pass_rule="PASS",
+                detail=str(payload.get("detail") or ""),
+                evidence=payload.get("evidence") or {"checks": payload.get("checks") or []},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return payload
+
+
+def _score_pass(v: Any) -> bool:
+    try:
+        return float(v) > 0.0
+    except (TypeError, ValueError):
+        if isinstance(v, dict):
+            return str(v.get("verdict") or v.get("status") or "").upper() in ("PASS", "OK")
+        return str(v).upper() in ("PASS", "OK", "1", "1.0", "TRUE")
+
+
+def _score_fail(v: Any) -> bool:
+    try:
+        return float(v) <= 0.0
+    except (TypeError, ValueError):
+        if isinstance(v, dict):
+            return str(v.get("verdict") or v.get("status") or "").upper() in ("FAIL", "ERROR")
+        return str(v).upper() in ("FAIL", "0", "0.0", "FALSE")
+
+
+def resolve_mission_doc_id(
+    *,
+    dag_result: dict | None = None,
+    ledger: Any = None,
+    prefer: str | None = None,
+) -> str | None:
+    """Pick an explicit part doc_id for VERIFY / battery (mega-9 a2 residual).
+
+    When ≥2 parts are open, tools refuse a bare current-part call. Prefer:
+      1. explicit *prefer*
+      2. doc_id on BUILD node outputs in dag_result
+      3. latest successful new_part / add_features doc_id from ledger tool_calls
+    """
+    if prefer and str(prefer).strip():
+        return str(prefer).strip()
+
+    candidates: list[str] = []
+
+    def _push(v: Any) -> None:
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if s not in candidates:
+                candidates.append(s)
+
+    nodes = (dag_result or {}).get("nodes", {}) or {}
+    # Prefer BUILD nodes first.
+    ordered = sorted(
+        nodes.items(),
+        key=lambda kv: (0 if str(kv[0]).startswith("n_build") else 1, str(kv[0])),
+    )
+    for nid, ns in ordered:
+        if not isinstance(ns, dict):
+            continue
+        out = ns.get("output") if isinstance(ns.get("output"), dict) else {}
+        data = out.get("data") if isinstance(out.get("data"), dict) else {}
+        ar = data.get("agent_result") if isinstance(data.get("agent_result"), dict) else {}
+        for src in (
+            out.get("doc_id"), ns.get("doc_id"), data.get("doc_id"),
+            (ar.get("handoff") or {}).get("outputs", {}).get("doc_id")
+            if isinstance(ar.get("handoff"), dict) else None,
+            ar.get("doc_id"),
+        ):
+            _push(src)
+
+    # Ledger tool_call trail — newest first.
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        events = []
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("kind") or ""
+        p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        # agent_turn tool_call events nest under payload.
+        tool = p.get("tool") or p.get("tool_name") or ""
+        if kind in ("tool_call", "agent_turn") or tool:
+            if kind == "agent_turn" and p.get("event") == "tool_call":
+                tool = p.get("tool") or tool
+            if tool in ("new_part", "add_features", "open_part", "import_step", "import_part"):
+                # result may be JSON string
+                res = p.get("result")
+                if isinstance(res, str):
+                    try:
+                        res = json.loads(res)
+                    except Exception:  # noqa: BLE001
+                        res = {}
+                if isinstance(res, dict):
+                    _push(res.get("doc_id"))
+                args = p.get("args") if isinstance(p.get("args"), dict) else {}
+                _push(args.get("doc_id"))
+        # Also direct doc_id on payload.
+        _push(p.get("doc_id"))
+
+    # Prefer cpp engine docs (mission-built parts).
+    for c in candidates:
+        if c.startswith("doc-cpp") or c.startswith("doc_"):
+            return c
+    return candidates[0] if candidates else None
+
+
+
+def _slim_battery_evidence(result: dict) -> dict:
+    """Keep a compact, ledger-safe subset of battery tool output."""
+    out: dict[str, Any] = {}
+    for k in ("verdict", "status", "result", "ok", "summary"):
+        if k in result:
+            out[k] = result[k]
+    findings = result.get("findings")
+    if isinstance(findings, list):
+        out["findings"] = [
+            {
+                "name": f.get("name") or f.get("check") or f.get("id"),
+                "severity": f.get("severity") or f.get("level"),
+                "message": str(f.get("message") or f.get("detail") or "")[:200],
+            }
+            for f in findings[:30]
+            if isinstance(f, dict)
+        ]
+    scores = result.get("scores")
+    if isinstance(scores, dict):
+        out["scores"] = {str(k): scores[k] for k in list(scores)[:20]}
+    return out
+
 
 
 def _run_one(tool: str, pass_rule: str, check: dict,

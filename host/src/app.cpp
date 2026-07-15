@@ -882,12 +882,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (v >= 0.5f && v <= 4.0f) scale = v;
     }
 
-    // Theme: honour AI_CAD_THEME env override, then persisted setting, then dark default.
-    // Applied once here; runtime toggle in the View menu calls applyTheme() again.
+    // Theme: honour AI_CAD_THEME env override, then persisted setting, then LIGHT default
+    // (owner default 2026-07-14). Applied once here; the settings load at first frame
+    // re-applies the persisted choice, and the View-menu toggle calls applyTheme() again.
     {
         const char* envTheme = std::getenv("AI_CAD_THEME");
-        ui::Theme initTheme = ui::Theme::Dark;
-        if (envTheme && std::strcmp(envTheme, "light") == 0) initTheme = ui::Theme::Light;
+        ui::Theme initTheme = ui::Theme::Light;
+        if (envTheme && std::strcmp(envTheme, "dark") == 0) initTheme = ui::Theme::Dark;
         ui::applyTheme(initTheme, scale);
     }
     ui::Fonts fonts = ui::loadFonts(assets, scale);

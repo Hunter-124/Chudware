@@ -188,3 +188,17 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   **D PASS** (explicit `failed`/`dag_error: string or blob too big` — not
   running+empty; Fix11 compact node_states residual). Fixer8 Fixes 1–11 in
   `fixes.md`. Findings: `reports/runs/mega-8/findings.md`.
+- 2026-07-14/15 mega-9 (WS5): quality cycle under
+  `reports/runs/mega-9/` (`mega-9-fc-rocket-20260714`). Baseline `b8181b97`
+  + Fixer9 F/E/G (unit-green 36p). Preflight PASS: daemon git_rev matches
+  disk (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`; PLAN/layout
+  cap-sep; auto_pick depth-2 → ollama. Attempt-1 pre-Fixer9 archived
+  (`attempt-1-pre-fixer9/`). **Attempt-2** pid 2788930 wall **415.77s**
+  terminal `needs_correction`/`verify_failed: [AC1…AC9]`. Scoreboard:
+  **E PASS** (`battery_result` + 15 per-check + BATTERY criterion in ledger;
+  residual doc_id=null / AC1 NOT-CHECKED), **F PASS** (clean stop_reason,
+  no raw blob), **G PASS** (schema taught + unit E2E; live refuse envelope
+  still 0), **A–D regression PASS** (add_features ok×4, delegate+spawn,
+  oneshot_ok×7/miss×4, explicit terminal). Fixer9 `fixes.md`. Findings:
+  `reports/runs/mega-9/findings.md`.
+

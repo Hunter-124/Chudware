@@ -21,14 +21,14 @@ if str(_SVC_MCP) not in sys.path:
 # ── _place_import_file (place.py) ────────────────────────────────────────────
 
 def test_place_import_file_missing_path():
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file"}, None, None)
     assert r["ok"] is False
     assert "path" in r["reason"]
 
 
 def test_place_import_file_file_not_found():
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file", "path": "/no/such/file.step"}, None, None)
     assert r["ok"] is False
     assert "not found" in r["reason"]
@@ -41,7 +41,7 @@ def test_place_import_file_success(tmp_path, monkeypatch):
     from services.mcp import core_bridge as cb  # canonical module place.py imports
     monkeypatch.setattr(cb, "call", lambda verb, params: {"doc_id": "doc-abc", "body_count": 1})
 
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
 
     assert r["ok"] is True
@@ -91,7 +91,7 @@ def test_place_import_file_real_core_editable_doc(tmp_path):
     assert step.is_file() and step.stat().st_size > 0, f"export_file produced no file: {exp!r}"
 
     # The real placement: import the STEP as a NEW editable doc.
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file", "path": str(step)}, None, None)
 
     assert r["ok"] is True, f"real import failed: {r.get('reason')!r}"
@@ -116,7 +116,7 @@ def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch)
         raise cb.CoreError("libaicad.so not found")
     monkeypatch.setattr(cb, "call", _unavailable)
 
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
     assert r["ok"] is False
     assert "import_file RPC failed" in r["reason"]
@@ -133,7 +133,7 @@ def test_place_import_file_rpc_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cb, "call", _raise)
 
-    from engine_oracle.parts_hub.place import _place_import_file
+    from ..parts_hub.place import _place_import_file
     r = _place_import_file({"kind": "import_file", "path": str(fake_step)}, None, None)
     assert r["ok"] is False
     assert "import_file RPC failed" in r["reason"]
@@ -141,7 +141,7 @@ def test_place_import_file_rpc_failure(tmp_path, monkeypatch):
 
 def test_place_dispatches_import_file_kind():
     """place.py's public dispatch table must route the new kind."""
-    from engine_oracle.parts_hub.place import _PLACERS
+    from ..parts_hub.place import _PLACERS
     assert "import_file" in _PLACERS
 
 
@@ -178,9 +178,9 @@ def test_parts_provider_get_enriches_acquire_failure_with_identity():
 
 
 def _place_with_record(monkeypatch, record):
-    import engine_oracle.parts_hub as ph
+    from .. import parts_hub as ph
     monkeypatch.setattr(ph, "get", lambda pid: record)
-    from engine_oracle.parts_hub.place import place
+    from ..parts_hub.place import place
     return place("catalog:mcmaster::https://mcmaster.com/p/84881A248")
 
 
@@ -226,9 +226,9 @@ def test_place_still_reports_plain_missing_geometry(monkeypatch):
     """A genuine PartRecord with no geometry_ref (not a failure envelope) keeps the
     original 'no geometry_ref' error — the seam must not swallow that case."""
     rec = {"part_id": "catalog:x::y", "domain": "catalog", "geometry_ref": None}
-    import engine_oracle.parts_hub as ph
+    from .. import parts_hub as ph
     monkeypatch.setattr(ph, "get", lambda pid: rec)
-    from engine_oracle.parts_hub.place import place
+    from ..parts_hub.place import place
     r = place("catalog:x::y")
     assert r["ok"] is False
     assert "no geometry_ref" in r["reason"]
@@ -237,7 +237,7 @@ def test_place_still_reports_plain_missing_geometry(monkeypatch):
 # ── hub wiring (bootstrap registers browser catalog providers) ──────────────
 
 def _make_hub():
-    from engine_oracle.parts_hub.hub import PartsHub
+    from ..parts_hub.hub import PartsHub
     hub = PartsHub()
     hub.bootstrap()
     return hub

@@ -64,7 +64,7 @@ class LocalLibraryAdapter:
             from engine import vendor_parts  # type: ignore  # noqa: PLC0415
         except Exception:  # noqa: BLE001
             try:
-                from engine_oracle import vendor_parts  # noqa: PLC0415
+                from ... import vendor_parts  # noqa: PLC0415
             except Exception:
                 return
         try:

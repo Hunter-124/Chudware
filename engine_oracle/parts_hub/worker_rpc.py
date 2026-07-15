@@ -17,7 +17,7 @@ from typing import Callable
 def _part_search(params: dict, _emit: Callable) -> dict:
     """Worker method ``part_search`` → ranked PartRecord list."""
     try:
-        from engine_oracle.parts_hub import search as _search
+        from ..parts_hub import search as _search
         query = (params or {}).get("query", "")
         domain = (params or {}).get("domain") or None
         limit = int((params or {}).get("limit", 20))
@@ -31,7 +31,7 @@ def _part_search(params: dict, _emit: Callable) -> dict:
 def _part_get(params: dict, _emit: Callable) -> dict:
     """Worker method ``part_get`` → single PartRecord or ok:false."""
     try:
-        from engine_oracle.parts_hub import get as _get
+        from ..parts_hub import get as _get
         part_id = (params or {}).get("part_id", "")
         rec = _get(part_id)
         if rec is None:
@@ -45,7 +45,7 @@ def _part_get(params: dict, _emit: Callable) -> dict:
 def _part_place(params: dict, _emit: Callable) -> dict:
     """Worker method ``part_place`` → PlacementResult (editable, R1)."""
     try:
-        from engine_oracle.parts_hub.place import place as _place
+        from ..parts_hub.place import place as _place
         part_id = (params or {}).get("part_id", "")
         doc = (params or {}).get("doc") or None
         extra = (params or {}).get("params") or None
@@ -65,7 +65,7 @@ WORKER_METHODS: dict[str, Callable] = {
 # GUI-shaped methods for the Parts Library workspace (host/src/ui/parts/) —
 # categories, filtered search, vendor login/status, fetch queue, thumbnails.
 try:
-    from engine_oracle.parts_hub.gui_rpc import GUI_WORKER_METHODS as _GUI_METHODS
+    from ..parts_hub.gui_rpc import GUI_WORKER_METHODS as _GUI_METHODS
     WORKER_METHODS.update(_GUI_METHODS)
 except Exception:  # noqa: BLE001 — GUI seam is optional; agent tools above still register
     pass
@@ -75,49 +75,57 @@ except Exception:  # noqa: BLE001 — GUI seam is optional; agent tools above st
 # over services.browser.embed (CDP screencast); degrade to ok:false envelopes
 # when Playwright isn't provisioned.
 try:
-    from engine_oracle.embed_rpc import EMBED_WORKER_METHODS as _EMBED_METHODS
+    from ..embed_rpc import EMBED_WORKER_METHODS as _EMBED_METHODS
     WORKER_METHODS.update(_EMBED_METHODS)
-except Exception:  # noqa: BLE001 — embed seam is optional; methods above still register
-    pass
+except Exception as _embed_err:  # noqa: BLE001 — embed seam is optional; methods above still register
+    import logging
+    logging.getLogger("ai-cad.worker").warning(
+        "embed_rpc unavailable — embed methods not registered: %s", _embed_err)
 
 # Subscription-auth login methods (§4.4) for the Settings panel.
 try:
-    from engine_oracle.parts_hub.subscription_rpc import SUBSCRIPTION_METHODS as _SUB_METHODS
+    from ..parts_hub.subscription_rpc import SUBSCRIPTION_METHODS as _SUB_METHODS
     WORKER_METHODS.update(_SUB_METHODS)
-except Exception:  # noqa: BLE001 — optional seam; core methods still register
-    pass
+except Exception as _sub_err:  # noqa: BLE001 — optional seam; core methods still register.
+    # NEVER a bare pass: a silent swallow here hid the engine_oracle-alias import break
+    # in deployed payloads (Settings Accounts showed "unknown method: subscription_*").
+    import logging
+    logging.getLogger("ai-cad.worker").warning(
+        "subscription_rpc unavailable — subscription_* methods not registered: %s", _sub_err)
 
 # GUI-launched gym benchmarks (Settings → AI Model Leaderboard).
 try:
-    from engine_oracle.parts_hub.bench_rpc import BENCH_METHODS as _BENCH_METHODS
+    from ..parts_hub.bench_rpc import BENCH_METHODS as _BENCH_METHODS
     WORKER_METHODS.update(_BENCH_METHODS)
-except Exception:  # noqa: BLE001 — optional seam; core methods still register
-    pass
+except Exception as _bench_err:  # noqa: BLE001 — optional seam; core methods still register
+    import logging
+    logging.getLogger("ai-cad.worker").warning(
+        "bench_rpc unavailable — bench_* methods not registered: %s", _bench_err)
 
 # WS2: per-role model assignment + rankings (Settings ModelRolesAuto).
 try:
-    from engine_oracle.parts_hub.role_models_rpc import ROLE_MODELS_METHODS as _ROLE_METHODS
+    from ..parts_hub.role_models_rpc import ROLE_MODELS_METHODS as _ROLE_METHODS
     WORKER_METHODS.update(_ROLE_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
 # CAD project graph (contracts/cad_graph.md v1) — get / blast / path.
 try:
-    from engine_oracle.parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS as _CAD_GRAPH_METHODS
+    from ..parts_hub.cad_graph_rpc import CAD_GRAPH_METHODS as _CAD_GRAPH_METHODS
     WORKER_METHODS.update(_CAD_GRAPH_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
 # Copilot skills (contracts/skills.md v1).
 try:
-    from engine_oracle.parts_hub.skills_rpc import SKILLS_METHODS as _SKILLS_METHODS
+    from ..parts_hub.skills_rpc import SKILLS_METHODS as _SKILLS_METHODS
     WORKER_METHODS.update(_SKILLS_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
 # PLM lightweight branching (wave-2) — create / list / switch / merge.
 try:
-    from engine_oracle.parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS
+    from ..parts_hub.plm_branch_rpc import PLM_BRANCH_METHODS as _PLM_BRANCH_METHODS
     WORKER_METHODS.update(_PLM_BRANCH_METHODS)
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass

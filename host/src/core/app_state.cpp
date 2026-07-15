@@ -121,7 +121,7 @@ void loadSettings(Settings& s) {
     try {
         nlohmann::json j;
         f >> j;
-        std::string prov = j.value("provider", "gemini");
+        std::string prov = j.value("provider", "xai-sub");
         auto oai = j.value("openai", nlohmann::json::object());
         auto llama = j.value("llamacpp", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
@@ -145,6 +145,7 @@ void loadSettings(Settings& s) {
         std::string model = j.value("model", "");
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
+        if (s.provider == 6 && model.empty()) model = "grok-4.5";
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");
         copyStr(s.apiKey, sizeof(s.apiKey), activeKey);
@@ -181,7 +182,7 @@ void loadSettings(Settings& s) {
         s.maxTokens = j.value("max_output_tokens", 0);
         s.contextWindow = j.value("context_window", 0);
         s.systemPrompt = j.value("system_prompt", "");
-        s.theme = j.value("theme", "dark");
+        s.theme = j.value("theme", "light");
         s.orthographic = j.value("orthographic", true);
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
         s.partsGridView = j.value("parts_grid_view", false);
@@ -310,7 +311,7 @@ void saveSettings(const Settings& s) {
         } else {
             j["provider"] = "xai-sub";
         }
-        j["model"] = s.model[0] ? s.model : "grok-4";
+        j["model"] = s.model[0] ? s.model : "grok-4.5";
     } else {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";

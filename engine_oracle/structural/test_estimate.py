@@ -20,10 +20,10 @@ from pathlib import Path
 
 import pytest
 
-from engine_oracle.structural.elements import (
+from ..structural.elements import (
     Beam, Column, Joist, Post, StructureDoc, StudWall, make_element,
 )
-from engine_oracle.structural.estimate import (
+from ..structural.estimate import (
     DISCLAIMER,
     TakeoffLine,
     board_feet,
@@ -215,8 +215,8 @@ class TestEstimate:
 
 class TestBomBridge:
     def test_structural_bom_lines_returns_bom_lines(self):
-        from engine_oracle.bom import BomLine
-        from engine_oracle.structural.bom_bridge import structural_bom_lines
+        from ..bom import BomLine
+        from ..structural.bom_bridge import structural_bom_lines
 
         doc = _simple_doc()
         bom_lines = structural_bom_lines(doc)
@@ -227,7 +227,7 @@ class TestBomBridge:
             assert bl.currency == "USD"
 
     def test_bom_lines_have_cost_model(self):
-        from engine_oracle.structural.bom_bridge import structural_bom_lines
+        from ..structural.bom_bridge import structural_bom_lines
 
         doc = _simple_doc()
         bom_lines = structural_bom_lines(doc)
@@ -238,7 +238,7 @@ class TestBomBridge:
 
     def test_structural_bom_dicts_consumable_by_bom_rollup(self):
         """structural_bom_dicts() output can be consumed by services.deliverables.joins.bom_rollup."""
-        from engine_oracle.structural.bom_bridge import structural_bom_dicts
+        from ..structural.bom_bridge import structural_bom_dicts
 
         doc = _simple_doc()
         dicts = structural_bom_dicts(doc)
@@ -251,7 +251,7 @@ class TestBomBridge:
 
     def test_bom_rollup_accepts_structural_output(self):
         """End-to-end: structural_bom_dicts passes through bom_rollup without error."""
-        from engine_oracle.structural.bom_bridge import structural_bom_dicts
+        from ..structural.bom_bridge import structural_bom_dicts
 
         doc = _simple_doc()
         dicts = structural_bom_dicts(doc)
@@ -288,8 +288,8 @@ class TestIntegrationDemo:
 
     def test_cedar_post_estimate_plausible(self):
         """Cedar post estimate returns a plausible total in $50–200."""
-        from engine_oracle.structural.elements import StructureDoc as SD
-        from engine_oracle.structural.estimate import estimate
+        from ..structural.elements import StructureDoc as SD
+        from ..structural.estimate import estimate
 
         doc = StructureDoc(name="Demo")
         doc.add(Post(section_name="4x4", material="cedar", length_mm=8.0 * 304.8))
@@ -309,8 +309,8 @@ class TestIntegrationDemo:
 
     def test_struct_estimate_via_json_file(self):
         """Write a cedar post doc to JSON, run the estimate engine from it."""
-        from engine_oracle.structural.elements import StructureDoc as SD
-        from engine_oracle.structural.estimate import estimate
+        from ..structural.elements import StructureDoc as SD
+        from ..structural.estimate import estimate
 
         doc_dict = self._make_cedar_post_doc()
         with tempfile.NamedTemporaryFile(

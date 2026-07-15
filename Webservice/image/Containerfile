@@ -76,6 +76,8 @@ RUN dnf -y install \
         xdpyinfo \
         ImageMagick \
         xwd \
+        zenity \
+        xdotool \
         curl \
         VirtualGL \
     && dnf clean all \

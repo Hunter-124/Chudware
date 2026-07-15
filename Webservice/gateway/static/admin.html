@@ -21,8 +21,8 @@
   .rm-btn { background: none; border: 1px solid #55303a; color: #e07a8a;
             border-radius: 8px; padding: 3px 10px; cursor: pointer; }
   .rm-btn:hover { background: #2a1a20; }
-  form.add-user { display: grid; grid-template-columns: 2fr 1.4fr auto auto auto; gap: 10px;
-                  align-items: center; }
+  form.add-user { display: grid; grid-template-columns: 1.8fr 1.2fr 1.2fr auto auto auto;
+                  gap: 10px; align-items: center; }
   form.add-user input[type=text], form.add-user input[type=email] {
       background: var(--bg, #0e1013); color: inherit; border: 1px solid var(--border, #2a2e36);
       border-radius: 8px; padding: 8px 10px; }
@@ -44,8 +44,13 @@
       policy, so new people can log in immediately (email OTP or Google).
       <code>example.com</code> entries are dev-only and never pushed to Access.
     </p>
+    <form id="default-form" style="display:flex;gap:10px;align-items:center;margin:0 0 14px">
+      <label style="white-space:nowrap;font-size:.9rem">Default project for everyone:</label>
+      <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1">
+      <button type="submit" class="btn primary">Set for all</button>
+    </form>
     <table class="users">
-      <thead><tr><th>Email</th><th>Name</th><th>Role</th><th></th></tr></thead>
+      <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Project</th><th></th></tr></thead>
       <tbody id="user-rows"></tbody>
     </table>
   </div>
@@ -54,9 +59,11 @@
     <form class="add-user" id="add-form">
       <input type="email" id="f-email" placeholder="email@example.edu" required>
       <input type="text" id="f-display" placeholder="Display name">
+      <input type="text" id="f-project" placeholder="Default project" list="project-list" title="PLM project opened when their session starts">
+      <datalist id="project-list"></datalist>
       <label><input type="checkbox" id="f-admin"> admin</label>
       <label><input type="checkbox" id="f-heavy"> GPU seat</label>
-      <button type="submit" class="primary">Add</button>
+      <button type="submit" class="btn primary">Add</button>
     </form>
     <div id="admin-status"></div>
   </div>

@@ -61,7 +61,8 @@ system_prompt: |
      failure_review councils when a fixer exhausts a card in your department.
   4. DISPATCH AND PACE. Assign ready buildgraph nodes to workers via
      delegate(role, brief, budget_tokens) (worker or ponder kind) within your budget.
-     Two failed attempts on a node =
+     HARD: if ≥2 ready independent nodes exist, you MUST call delegate at least
+     once this turn (children auto_pick cheap). Two failed attempts on a node =
      you demand the replan_request, not a third try. Watch for a worker drifting
      from spec (their handoffs cite values that exist nowhere — spec_drift) and
      stop it at YOUR level before the overseer has to.

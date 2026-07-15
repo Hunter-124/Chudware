@@ -152,3 +152,23 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   provider_usage, BUILD floor, ollama degrade, model_assignment on node resolve,
   add_features nudge) — Fix6–7 need relaunch. Findings + grok delta + TOP5:
   `reports/runs/mega-6/findings.md`.
+
+- 2026-07-14/15 mega-7 (WS5): DELIVER + conservation validation under
+  `reports/runs/mega-7/` (`mega-7-fc-rocket-20260714`). Baseline `84963165`.
+  Attempt-1 (pre-Fixer7, account `79066dcc-…`) archived
+  `attempt-1-pre-fixer7-rebind/` after Fix6 `model_assignment` proof; killed for
+  relaunch. Attempt-2 primary: fresh SuperGrok `17d17fb1-…` + Fixer7 Fixes 1–4
+  bound. Preflight PASS (spawn_probe budget_tokens; auto_pick depth2→ollama;
+  subscription_accounts prefer newest). Wall **382.98s**. Mission no longer
+  freezes on `deliver_incomplete` — soft-join advanced deliver when any
+  `n_deliver_*` done (`phases_completed` includes deliver; stage exit
+  `mission_report_ledger_closed`). DAG 19/19 (**9 done / 10 failed**).
+  **Cheap-share live >0:** task_class stamps → 11/19 model_assignment rows
+  ollama (leaf/simple_part); token share **0.72%** (21k/2.96M; ollama leaves
+  die no_code cheaply while SuperGrok still owns long loops). **BUILD partial:**
+  `new_part`×1 then **`add_features`×13** (Fix3 sequence) but all ops rejected
+  (`unknown op` vocabulary) → hollow solid. **Delegation still 0** (mega-6
+  regression holds despite Fix2 prompt MUST). Phase honesty PASS. Explicit
+  six verdicts + TOP5: `reports/runs/mega-7/findings.md`. Fixer7 fixes.md
+  (deliver soft-join, delegate preference, add_features thrash block,
+  task_class stamp).

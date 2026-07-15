@@ -369,11 +369,20 @@ class MissionDispatch:
 
     # ------------------------------------------------------------------ delegate
     # Model-facing role aliases → loadable role cards (mega-5: part_fixer invented).
+    # mega-7: part_designer / edit-part appeared on live agent.spawn (attempt-2);
+    # map skill-ish and designer names onto feature_modeler so children get
+    # new_part/add_features allowlist instead of a bare unknown role.
     _ROLE_ALIASES = {
         "part_fixer": "feature_modeler",
         "geometry_fixer": "feature_modeler",
         "cad_fixer": "feature_modeler",
         "part_modeler": "feature_modeler",
+        "part_designer": "feature_modeler",
+        "geometry_designer": "geometry_designer",  # real card if present
+        "edit-part": "feature_modeler",
+        "edit_part": "feature_modeler",
+        "part_builder": "feature_modeler",
+        "solid_modeler": "feature_modeler",
         "mech_fixer": "fixer",
         "feature_fixer": "fixer",
     }

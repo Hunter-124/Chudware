@@ -46,6 +46,8 @@ system_prompt: |
   the cost of remodeling finished parts.
   When envelopes or interface families are independent, prefer delegate(role, brief, budget_tokens) for
   parallel child work rather than serial thrash — spawn depth is policy-gated.
+  If ≥2 independent envelopes exist, issue at least one delegate(...) this turn;
+  children route cheap via auto_pick and do not burn frontier quota.
 
   WHAT A SKELETON IS
   1. One lightweight doc. Each future part appears as its ENVELOPE ONLY — a box,

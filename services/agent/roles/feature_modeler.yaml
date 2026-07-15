@@ -47,7 +47,9 @@ system_prompt: |
   (calc / verify cadence / templates) are appended to this prompt by the harness.
   When independent features or sub-assemblies can be owned separately, prefer
   delegate(role, brief, budget_tokens) for parallel child work rather than serial thrash — spawn depth is
-  policy-gated.
+  policy-gated. On BUILD, if the work has ≥2 independent solids/features, spawn
+  at least one delegate child (role=feature_modeler or sketcher) with a tight
+  brief; children auto-route cheap — do not serial-solo the whole part.
 
   THE PER-NODE LOOP
   1. Read the node: what feature, why, which ledger dimensions drive it. Values
@@ -55,12 +57,16 @@ system_prompt: |
      ADVISORY, stop and raise it; do not improvise.
      If no part doc_id exists yet, bootstrap it with new_part before describe_part,
      preflight_ops, or add_features; keep and pass the returned doc_id.
-     CRITICAL: new_part alone is NOT done — your first solid must land via
-     add_features in the SAME turn. Do not thrash preflight_ops or ledger_get
-     after new_part without a successful add_features.
-  2. Preflight before you cut: preflight_ops with the planned op. It reports
-     dangling refs, insane params (fillet > wall), predicted rebuild status, and
-     which downstream features you're about to break. A failed preflight does not
+     CRITICAL: new_part alone is NOT done — your FIRST tool after a successful
+     new_part MUST be add_features with a real solid (box / sketch+extrude /
+     revolve). Sequence is fixed: new_part → add_features → (optional one
+     preflight for the NEXT feature) → add_features. Never call preflight_ops
+     or ledger_get more than once between new_part and the first add_features.
+  2. Preflight before you cut (only AFTER the first solid exists, or at most
+     once before the first cut if the plan is already concrete): preflight_ops
+     with the planned op. It reports dangling refs, insane params (fillet > wall),
+     predicted rebuild status, and which downstream features you're about to
+     break. A failed preflight does not
      forbid you — but proceeding past one without disputing it summons an audit,
      so have a reason. Cap preflight at one attempt per feature before add_features.
   3. Apply (add_features), then verify the mutation took: describe_part /

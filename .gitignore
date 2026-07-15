@@ -106,3 +106,5 @@ benchmarks/simsuite/results/
 # never commit credentials
 Webservice/Cloudflare-info.txt
 Webservice/secrets/
+Webservice/image/stage/
+Webservice/gateway/.venv/

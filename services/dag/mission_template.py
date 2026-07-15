@@ -63,6 +63,23 @@ _DELIVER_ROLE_BY_KIND = {
     "report": "reviewer",
 }
 
+# mega-7: map deliverable kind → role_models TaskClass so depth-0 leaf nodes
+# (VERIFY/DELIVER/INTAKE) can auto_pick cheap models. Without this stamp every
+# node defaults to unknown→min_rank=3→frontier and cheap-share stays 0%.
+_KIND_TASK_CLASS = {
+    "part": "multi_feature_part",
+    "assembly": "assembly",
+    "cam_program": "cam_program",
+    "analysis": "analysis",
+    "modification": "modification",
+    "enclosure": "enclosure",
+    "drawing": "simple_part",
+    "report": "simple_part",
+}
+# Phase/role leaf classes (low difficulty) — conservation routing targets.
+_LEAF_TASK_CLASS = "leaf"
+_REPORT_TASK_CLASS = "simple_part"
+
 
 def _role_prompt(role_id: str) -> str:
     """Load a role card's system prompt VERBATIM (T-W7 loader).  Best-effort: a
@@ -202,14 +219,16 @@ def build_mission_graph(
                        inputs={"request": (
                            f"{mission_ctx}\n\nYour job on this node: confirm the "
                            "deliverable manifest for this mission is complete and "
-                           "recorded." if mission_ctx else None)}))
+                           "recorded." if mission_ctx else None),
+                               "task_class": _LEAF_TASK_CLASS}))
     tail = intake_id
 
     # --- Phase 1: CLARIFY (only when a blocking ambiguity exists) ----------
     if has_blocking:
         clarify_id = "n_clarify"
         nodes.append(_node(clarify_id, _TYPE_CLARIFY, "CLARIFY: resolve ambiguities",
-                           "clarifier", on_fail="pause", autonomy=default_autonomy))
+                           "clarifier", on_fail="pause", autonomy=default_autonomy,
+                           inputs={"task_class": _LEAF_TASK_CLASS}))
         edges.append({"from": tail, "to": clarify_id})
         tail = clarify_id
 
@@ -219,9 +238,11 @@ def build_mission_graph(
         did = d["id"]
         sid = f"n_spec_{did}"
         spec_ids[did] = sid
+        tc = _KIND_TASK_CLASS.get(d.get("kind"), "unknown")
         nodes.append(_node(sid, _TYPE_SPEC, f"SPECIFY {did}: {d.get('name', '')}",
                            "spec_writer",
                            inputs={"deliverable": did,
+                                   "task_class": tc,
                                    "request": _deliverable_request(
                                        manifest, d,
                                        "write the engineering specification for this "
@@ -241,7 +262,8 @@ def build_mission_graph(
                        inputs={"request": (
                            f"{mission_ctx}\n\nYour job on this node: audit that every "
                            "deliverable's specification is complete; report any gap."
-                           if mission_ctx else None)}))
+                           if mission_ctx else None),
+                               "task_class": _LEAF_TASK_CLASS}))
     for sid in spec_ids.values():
         edges.append({"from": sid, "to": spec_join})
     tail = spec_join
@@ -254,7 +276,8 @@ def build_mission_graph(
                            inputs={"request": (
                                f"{mission_ctx}\n\nYour job on this node: group the "
                                "mission's deliverables into departments and confirm "
-                               "each has an owner role." if mission_ctx else None)}))
+                               "each has an owner role." if mission_ctx else None),
+                                   "task_class": _LEAF_TASK_CLASS}))
         edges.append({"from": tail, "to": org_id})
         tail = org_id
 
@@ -262,7 +285,8 @@ def build_mission_graph(
     if is_assembly:
         layout_id = "n_layout"
         nodes.append(_node(layout_id, _TYPE_LAYOUT, "PLAN: layout skeleton",
-                           "layout_engineer", autonomy=default_autonomy))
+                           "layout_engineer", autonomy=default_autonomy,
+                           inputs={"task_class": "assembly"}))
         edges.append({"from": tail, "to": layout_id})
         tail = layout_id
     plan_id = "n_plan"
@@ -271,7 +295,8 @@ def build_mission_graph(
                        inputs={"request": (
                            f"{mission_ctx}\n\nYour job on this node: produce the build "
                            "plan (ordered steps per deliverable) for this mission."
-                           if mission_ctx else None)}))
+                           if mission_ctx else None),
+                               "task_class": "multi_feature_part"}))
     edges.append({"from": tail, "to": plan_id})
 
     # --- Phase 4: BUILD (fan-out per buildable deliverable) ----------------
@@ -283,11 +308,13 @@ def build_mission_graph(
         bid = f"n_build_{did}"
         build_ids[did] = bid
         role = _BUILD_ROLE_BY_KIND.get(d.get("kind"), "feature_modeler")
+        tc = _KIND_TASK_CLASS.get(d.get("kind"), "multi_feature_part")
         # BUILD depends on PLAN (build graphs) + this deliverable's SPEC. Independent
         # parts share no edge → the executor ready-set runs them in parallel.
         nodes.append(_node(bid, _TYPE_BUILD, f"BUILD {did}: {d.get('name', '')}",
                            role,
                            inputs={"deliverable": did,
+                                   "task_class": tc,
                                    "request": _deliverable_request(
                                        manifest, d,
                                        "build this deliverable's geometry with the "
@@ -305,6 +332,8 @@ def build_mission_graph(
         nodes.append(_node(vid, _TYPE_VERIFY, f"VERIFY {did}: run acceptance checks",
                            "reviewer",
                            inputs={"deliverable": did,
+                                   "task_class": _LEAF_TASK_CLASS,
+                                   "risk": "low",
                                    "request": _deliverable_request(
                                        manifest, d,
                                        "run each acceptance criterion's NAMED check "
@@ -322,6 +351,8 @@ def build_mission_graph(
         nodes.append(_node(del_id, _TYPE_DELIVER, f"DELIVER {did}: {kind}",
                            role,
                            inputs={"deliverable": did,
+                                   "task_class": _REPORT_TASK_CLASS,
+                                   "risk": "low",
                                    "request": _deliverable_request(
                                        manifest, d,
                                        "summarise what was built and verified for "
@@ -342,6 +373,11 @@ def build_mission_graph(
         for n in nodes:
             n.setdefault("inputs", {})["tier"] = tier
 
+    # mega-7 safety net: every node must carry task_class for auto_pick.
+    for n in nodes:
+        ni = n.setdefault("inputs", {})
+        if not ni.get("task_class"):
+            ni["task_class"] = _LEAF_TASK_CLASS
     graph = {
         "schema": "aicad.dag/1",
         "id": graph_id,

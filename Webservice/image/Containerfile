@@ -1,0 +1,129 @@
+# billet-session — per-user streamed Billet CAD seat (Fedora 44)
+# Build (from repo root, after stage.sh):
+#   Webservice/image/stage.sh
+#   podman build -t localhost/billet-session:latest -f Webservice/image/Containerfile Webservice/image
+#
+# Default stream backend is noVNC (x11vnc + websockify). Selkies is attempted at
+# image build time; if pip/selkies fails or lacks a working capture stack on
+# Fedora, the image still boots with STREAM_BACKEND=novnc.
+
+FROM registry.fedoraproject.org/fedora:44
+
+LABEL org.opencontainers.image.title="billet-session" \
+      org.opencontainers.image.description="Per-user Billet CAD session (Xvfb + stream)" \
+      org.opencontainers.image.source="https://github.com/local/billet-web"
+
+# Match host OCCT 7.9.3-2.fc44 packages (rpm -q --whatprovides /usr/lib64/libTKernel.so.7.9
+# → opencascade-foundation). Install runtime subsets only.
+RUN dnf -y install \
+        opencascade-foundation \
+        opencascade-modeling \
+        opencascade-ocaf \
+        opencascade-visualization \
+        tbb \
+        suitesparse \
+        freeimage \
+        glfw \
+        mesa-dri-drivers \
+        mesa-libGL \
+        mesa-libEGL \
+        mesa-libgbm \
+        libglvnd-glx \
+        libglvnd-egl \
+        libX11 \
+        libXext \
+        libXrender \
+        libXi \
+        libXcursor \
+        libXinerama \
+        libXrandr \
+        libXfixes \
+        libXcomposite \
+        libXdamage \
+        libXtst \
+        libxkbcommon \
+        libxkbcommon-x11 \
+        xorg-x11-server-Xvfb \
+        x11vnc \
+        novnc \
+        python3-websockify \
+        python3 \
+        python3-pip \
+        python3-pillow \
+        ca-certificates \
+        dejavu-sans-fonts \
+        google-noto-sans-fonts \
+        google-noto-fonts-common \
+        fontconfig \
+        nss \
+        nspr \
+        atk \
+        at-spi2-atk \
+        at-spi2-core \
+        cups-libs \
+        libdrm \
+        dbus-libs \
+        alsa-lib \
+        pango \
+        cairo \
+        procps-ng \
+        which \
+        xprop \
+        xdpyinfo \
+        ImageMagick \
+        xwd \
+        curl \
+        VirtualGL \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Selkies: attempt pip install. PyPI "selkies==1.6.1" is the legacy GStreamer
+# WebRTC stack (selkies-gstreamer). The modern pixelflux-based Selkies is not a
+# single pip package that works out-of-the-box on Fedora 44 without the full
+# GHCR desktop image. We try the pip package; on failure the image still ships
+# with STREAM_BACKEND=novnc as the working default.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        'selkies==1.6.1' \
+        websockets basicauth gputil prometheus-client msgpack \
+        pynput psutil watchdog python-xlib \
+    && echo "SELKIES_PIP=ok" > /opt/billet-selkies.status \
+    || { echo "SELKIES_PIP=failed — defaulting to novnc" > /opt/billet-selkies.status; \
+         echo "WARNING: selkies pip install failed; STREAM_BACKEND=novnc is the default" >&2; true; }
+
+# Session user (uid 1000) — private HOME is bind-mounted by the gateway.
+RUN useradd -m -u 1000 -s /bin/bash user \
+    && mkdir -p /opt/billet /plm /home/user \
+    && chown -R user:user /home/user /opt/billet
+
+# Staged host build tree (produced by stage.sh → Webservice/image/stage/)
+COPY --chown=user:user stage/ /opt/billet/
+COPY entrypoint.sh /usr/local/bin/billet-entrypoint.sh
+RUN chmod 755 /usr/local/bin/billet-entrypoint.sh \
+    && chmod 755 /opt/billet/bin/Billet \
+    && ( [ -x /opt/billet/bin/aicad-hostd ] && chmod 755 /opt/billet/bin/aicad-hostd || true ) \
+    && ( [ -x /opt/billet/bin/ai_cad_cef_helper ] && chmod 755 /opt/billet/bin/ai_cad_cef_helper || true ) \
+    && chown -R user:user /opt/billet \
+    && fc-cache -f || true
+
+ENV BILLET_ROOT=/opt/billet \
+    PATH=/opt/billet/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=/opt/billet/lib:/opt/billet/bin \
+    AI_CAD_LIBAICAD=/opt/billet/bin/libaicad.so \
+    HOME=/home/user \
+    DISPLAY=:0 \
+    STREAM_BACKEND=novnc \
+    SELKIES_ENCODER=x264enc \
+    BILLET_HEAVY=0 \
+    BILLET_PLM_DIR=/plm \
+    AI_CAD_CEF_LAZY=1 \
+    NVIDIA_DRIVER_CAPABILITIES=graphics,utility,video,compute,display \
+    NVIDIA_VISIBLE_DEVICES=all
+
+USER user
+WORKDIR /home/user
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/billet-entrypoint.sh"]

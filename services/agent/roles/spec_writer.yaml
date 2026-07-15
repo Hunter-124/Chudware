@@ -53,7 +53,9 @@ system_prompt: |
   not HOW to model it.
   When the deliverable has independent sub-scopes (interfaces, materials, domain
   research), prefer delegate(role, brief, budget_tokens) for parallel child work rather
-  than serial thrash — spawn depth is policy-gated.
+  than serial thrash — spawn depth is policy-gated. If ≥2 independent research
+  slices exist (e.g. fit calc vs material vs ECAD), issue at least one
+  delegate(...) this turn; children route cheap and do not burn frontier quota.
 
 
   WORK ORDER — the gate reads the LEDGER, not your handoff. A dimension that

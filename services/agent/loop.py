@@ -2225,6 +2225,12 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         progress only reconciles the phase cursor with the already-run DAG; it
         must not fabricate a passed exit gate or add the phase to
         ``phases_completed`` when its own nodes failed.
+
+        mega-7: DELIVER is a terminal fan-out (``on_fail=skip`` on each
+        ``n_deliver_*``) with no join node — same class as the mega-2/3
+        specify soft-join bug. One successful deliver report must not freeze
+        the mission at ``deliver_incomplete`` because sibling deliverables
+        failed/skipped.
         """
         nodes = _phase_nodes(prefixes)
         join = _PHASE_JOIN_NODES.get(phase_name)
@@ -2237,6 +2243,16 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
             workers = [n for n in workers if n != "n_spec_done"]
         if workers and all(_node_status(n) == "done" for n in workers):
             return True, False
+        # Terminal DELIVER soft-join: any successful report node advances the
+        # phase for real (mission_report path ran). Remaining failed/skipped
+        # siblings are honest partial delivery, not a freeze.
+        if phase_name == "deliver" and workers:
+            if any(_node_status(n) == "done" for n in workers):
+                return True, False
+            # All workers terminal-failed with no success → incomplete.
+            terminal = {"done", "failed", "skipped"}
+            if all(_node_status(n) in terminal for n in workers):
+                return False, False
         if _downstream_progressed(phase_name):
             return True, True
         return False, False

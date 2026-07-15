@@ -2285,7 +2285,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // Sessions and Settings are mutually exclusive in-column overlays over the chat log.
     // Checkpoints opens the AI-VC popover (hidden when AI-VC RPCs are absent).
     // Sessions / Checkpoints / gear share drawHeaderTextButton (rectangular less-rounded boxes).
-    const float gearW = lh + 4.0f * sc;  // square-ish box for the gear glyph
+    const float gearW = ImGui::CalcTextSize("Settings").x + 16.0f * sc;  // text box like Sessions
     const bool sessionsOpen = st.showSessionsPicker;
     const bool settingsOpen = st.showAISettingsOverlay;
     const bool showAiVc = s_aiVc.available;
@@ -2363,43 +2363,15 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     ImGui::SameLine();
     centerY(lh);
-    // Gear as a rectangular box matching Sessions/Checkpoints (icon drawn inside).
-    {
-        const float round = ui::metrics::rounding(4.0f);
-        const ui::AdaptiveSurface& surf = chatSurf();
-        const ImVec4 txt = surf.textPrimary;
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, round);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.0f * sc, 2.0f * sc));
-        ImGui::PushStyleColor(ImGuiCol_Button, settingsOpen
-            ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
-                     ui::palette.chipBg[3])
-            : ImVec4(txt.x, txt.y, txt.z, 0.06f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
-        IconUV gear = ui::getIcon("settings", 20);
-        bool gearClicked = false;
-        if (gear.valid)
-            gearClicked = ImGui::ImageButton("##aiheadergear", gear.texId,
-                                             ImVec2(gearW - 4.0f * sc, gearW - 4.0f * sc),
-                                             gear.uv0, gear.uv1);
-        else
-            gearClicked = drawHeaderTextButton("##hdr_gear", settingsOpen ? "<" : "set",
-                                              settingsOpen, gearW);
-        ImGui::GetWindowDrawList()->AddRect(
-            ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(txt.x, txt.y, txt.z, settingsOpen ? 0.45f : 0.25f)),
-            round, 0, ui::metrics::stroke(1.0f));
-        ImGui::PopStyleColor(3);
-        ImGui::PopStyleVar(2);
-        if (gearClicked) {
-            st.showAISettingsOverlay = !st.showAISettingsOverlay;
-            if (st.showAISettingsOverlay) st.showSessionsPicker = false;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(settingsOpen ? "Back to the chat."
-                                           : "AI settings — provider, model, privacy.");
+    // Settings as the same stretched rectangular text box as Sessions / Checkpoints (owner ask:
+    // identical style, horizontally sized to the label — no icon-only square).
+    if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW)) {
+        st.showAISettingsOverlay = !st.showAISettingsOverlay;
+        if (st.showAISettingsOverlay) st.showSessionsPicker = false;
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(settingsOpen ? "Back to the chat."
+                                       : "AI settings — provider, model, privacy.");
 
     ImGui::SameLine();
     centerY(lh);

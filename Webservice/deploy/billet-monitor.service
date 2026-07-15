@@ -1,0 +1,13 @@
+[Unit]
+Description=billet-web host monitor (RAM/disk/GPU/session reaper)
+Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=BILLET_WEB_DATA=%h/billet-web-data
+Environment=BILLET_GATEWAY_HEALTHZ=http://127.0.0.1:8300/healthz
+ExecStart=/usr/bin/python3 %h/Repositories/CAD/Webservice/deploy/monitor.py
+Nice=10
+
+# No Install section — driven by billet-monitor.timer

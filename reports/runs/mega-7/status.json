@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-7-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 2154280,
+  "started_wall": 1784076186.9858735,
+  "cycle": "mega-7",
+  "conservation": true,
+  "baseline_commit": "84963165",
+  "finished_wall": 1784076569.9637618,
+  "wall_s": 382.98,
+  "result": {
+    "status": "running",
+    "phase": "deliver",
+    "stop_reason": "",
+    "error": null
+  }
+}

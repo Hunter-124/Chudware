@@ -110,7 +110,7 @@ def assemble(
                 # Degrade gracefully — the node can still run without a description.
                 part_description = None
 
-    return {
+    pack = {
         "node_id": node_id,
         "node_type": node_type,
         "node_name": node_name,
@@ -120,3 +120,11 @@ def assemble(
         "end_condition": end_condition,
         "part_description": part_description,
     }
+    # mega-7: promote difficulty routing fields to the pack root so
+    # node_runner._resolve_provider / role_models see them without digging.
+    for key in ("task_class", "depth", "risk", "role"):
+        if key in node_inputs and node_inputs[key] is not None:
+            pack[key] = node_inputs[key]
+    if "role" in node_inputs and "role_id" not in pack:
+        pack["role_id"] = node_inputs["role"]
+    return pack

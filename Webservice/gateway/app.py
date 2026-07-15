@@ -1,0 +1,270 @@
+"""billet-web gateway — portal, sessions, stream proxy, chat, transfer."""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+try:
+    from .auth import AuthMiddleware, User, get_current_user
+    from .config import settings
+    from .proxy import router as proxy_router
+    from .sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
+    from .chat import Presence, presence, router as chat_router  # noqa: F401
+except ImportError:  # uvicorn app:app from package dir
+    from auth import AuthMiddleware, User, get_current_user
+    from config import settings
+    from proxy import router as proxy_router
+    from sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
+    from chat import Presence, presence, router as chat_router  # noqa: F401
+
+log = logging.getLogger("billet-web")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+app = FastAPI(title="billet-web", version="1.0.0")
+app.add_middleware(AuthMiddleware)
+
+sessions_router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    settings.ensure_data_dirs()
+    await manager.start_reaper()
+    log.info(
+        "gateway up data_root=%s max_sessions=%s max_heavy=%s dev=%s",
+        settings.data_root,
+        settings.max_sessions,
+        settings.max_heavy,
+        settings.dev_mode,
+    )
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await manager.stop_reaper()
+
+
+@sessions_router.get("")
+async def sessions_status(request: Request) -> dict[str, Any]:
+    user = get_current_user(request)
+    sess = manager.get_for_user(user.email)
+    return manager.portal_payload(sess)
+
+
+@sessions_router.post("")
+async def sessions_start(request: Request) -> dict[str, Any]:
+    user = get_current_user(request)
+    try:
+        sess = await manager.start(user)
+    except SessionBusy as exc:
+        raise HTTPException(status_code=503, detail=exc.message) from exc
+    except PodmanError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.exception("start failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return manager.portal_payload(
+        sess, message="started" if sess.status == "ready" else sess.status
+    )
+
+
+@sessions_router.delete("")
+async def sessions_stop(request: Request) -> dict[str, Any]:
+    user = get_current_user(request)
+    sess = await manager.stop_for_user(user.email)
+    if sess is None:
+        return manager.portal_payload(None, message="no session")
+    return {
+        "status": "stopped",
+        "sid": sess.sid,
+        "stream_path": None,
+        "stream_url": None,
+        "heavy": sess.heavy,
+        "error": None,
+        "message": "stopped",
+    }
+
+
+@sessions_router.get("/{sid}")
+async def sessions_get(sid: str, request: Request) -> dict[str, Any]:
+    user = get_current_user(request)
+    sess = manager.get(sid)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if sess.email != user.email and user.role != "admin":
+        raise HTTPException(status_code=403, detail="forbidden")
+    return manager.portal_payload(sess)
+
+
+def _user_home(user: User) -> Path:
+    try:
+        from .sessions import email_slug
+    except ImportError:
+        from sessions import email_slug
+
+    home = (settings.homes_dir / email_slug(user.email)).resolve()
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
+def _safe_path(home: Path, rel: str) -> Path:
+    """Resolve rel under home; reject traversal."""
+    rel = (rel or "").lstrip("/")
+    if not rel or rel in {".", "./"}:
+        raise HTTPException(status_code=400, detail="path required")
+    if "\x00" in rel or rel.startswith("/") or rel.startswith("~"):
+        raise HTTPException(status_code=400, detail="invalid path")
+    candidate = (home / rel).resolve()
+    try:
+        candidate.relative_to(home)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="path traversal rejected") from exc
+    return candidate
+
+
+@app.post("/transfer")
+async def transfer_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    path: str = Query(default="", description="relative path under user home"),
+) -> dict[str, Any]:
+    user = get_current_user(request)
+    home = _user_home(user)
+    rel = path or file.filename or ""
+    if not rel:
+        raise HTTPException(status_code=400, detail="path or filename required")
+    dest = _safe_path(home, rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with dest.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            out.write(chunk)
+    return {
+        "ok": True,
+        "path": str(dest.relative_to(home)),
+        "bytes": size,
+    }
+
+
+@app.get("/transfer")
+async def transfer_download(
+    request: Request,
+    path: str = Query(..., description="relative path under user home"),
+) -> FileResponse:
+    user = get_current_user(request)
+    home = _user_home(user)
+    target = _safe_path(home, path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(target, filename=target.name)
+
+
+def _image_present() -> bool:
+    try:
+        r = subprocess.run(
+            ["podman", "image", "exists", settings.session_image],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _nvidia_vram() -> dict[str, Any] | None:
+    try:
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        line = r.stdout.strip().splitlines()[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            return None
+        return {
+            "used_mib": int(float(parts[0])),
+            "total_mib": int(float(parts[1])),
+            "util_pct": int(float(parts[2])) if len(parts) > 2 else None,
+        }
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, Any]:
+    mem_b = mem_available_bytes()
+    mem_g = mem_available_gib()
+    try:
+        online = await presence.list()
+        presence_n = len(online) if online is not None else 0
+    except Exception:  # noqa: BLE001
+        presence_n = None
+    return {
+        "ok": True,
+        "sessions": manager.active_count(),
+        "heavy_sessions": manager.heavy_count(),
+        "max_sessions": settings.max_sessions,
+        "max_heavy": settings.max_heavy,
+        "mem_available_bytes": mem_b,
+        "mem_available_gib": round(mem_g, 2) if mem_g is not None else None,
+        "refuse_new": settings.refuse_new_flag.exists(),
+        "image": settings.session_image,
+        "image_present": _image_present(),
+        "vram": _nvidia_vram(),
+        "presence": presence_n,
+        "dev_mode": settings.dev_mode,
+    }
+
+
+app.include_router(sessions_router)
+app.include_router(proxy_router)
+app.include_router(chat_router)
+
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", response_model=None)
+async def portal_index():
+    index = STATIC_DIR / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return HTMLResponse(
+        """<!DOCTYPE html>
+<html><head><title>billet-web</title></head>
+<body style="font-family:system-ui;background:#0f1419;color:#e7ecf1;padding:2rem">
+  <h1>billet-web</h1>
+  <p>Portal static files not installed yet (waiting for static/index.html).</p>
+  <p>API: <code>/api/sessions</code> · <code>/healthz</code> · <code>/ws/chat</code></p>
+</body></html>""",
+        status_code=200,
+    )
+
+
+__all__ = ["app"]

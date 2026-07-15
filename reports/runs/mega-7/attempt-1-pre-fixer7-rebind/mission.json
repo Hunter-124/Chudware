@@ -1,0 +1,17 @@
+{
+  "status": "needs_correction",
+  "phase": "correct",
+  "phases_completed": [
+    "intake",
+    "plan"
+  ],
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC4', 'AC5', 'AC6', 'AC7', 'AC8', 'AC9']",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-7-fc-rocket-20260714/ledger.json",
+  "run_id": "mega-7-fc-rocket-20260714",
+  "mode": "real",
+  "wall_s": 544.2,
+  "conservation": true,
+  "baseline_commit": "84963165",
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-7-fc-rocket-20260714/ledger.json"
+}

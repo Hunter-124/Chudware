@@ -1,0 +1,16 @@
+# billet-web allowlist — email must match Access/JWT or X-Dev-User.
+# role: admin | user
+# heavy: true reserves a GPU seat when available (≤ max_heavy concurrent).
+users:
+  - email: hunter@example.com
+    display: Hunter
+    role: admin
+    heavy: true
+  - email: demo@example.com
+    display: Demo User
+    role: user
+    heavy: false
+  - email: alice@ua.edu
+    display: Alice
+    role: user
+    heavy: false

@@ -613,9 +613,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
-        # mega-6 BUILD mortality: after new_part the model often thrash-preflights
+        # mega-6/7 BUILD mortality: after new_part the model thrash-preflights
         # without ever calling add_features (live: new_part + preflight×7 → empty solid).
-        # One explicit nudge after a successful bootstrap; never invent geometry.
+        # Hard nudge after bootstrap; refuse further preflight thrash.
         if ok and tool == "new_part" and "add_features" in (allow or set()):
             try:
                 doc = None
@@ -624,23 +624,26 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 messages.append({"role": "user", "content": _parts(
                     "[BUILD enablement] Part doc bootstrapped"
                     + (f" (doc_id={doc})" if doc else "")
-                    + ". Next you MUST call add_features with at least one solid "
+                    + ". Next tool MUST be add_features with at least one solid "
                     "feature (box/sketch+extrude/revolve/…) using this doc_id. "
-                    "Do NOT spend the remaining tool budget on more ledger_get or "
-                    "preflight_ops until add_features has succeeded once."
+                    "Do NOT call preflight_ops, ledger_get, or describe_part "
+                    "until add_features has succeeded once."
                 )})
             except Exception:  # noqa: BLE001
                 pass
         # Same class: preflight thrash without a mutation after new_part.
+        # mega-7: block further preflight_ops once thrash is detected so the
+        # model cannot burn the tool budget on empty solids.
         if ok and tool == "preflight_ops":
             n_new = sum(1 for c in calls if c.get("ok") and c.get("tool") == "new_part")
             n_add = sum(1 for c in calls if c.get("ok") and c.get("tool") == "add_features")
             n_pf = sum(1 for c in calls if c.get("tool") == "preflight_ops")
-            if n_new > 0 and n_add == 0 and n_pf >= 2 and "add_features" in (allow or set()):
+            if n_new > 0 and n_add == 0 and n_pf >= 1 and "add_features" in (allow or set()):
                 messages.append({"role": "user", "content": _parts(
-                    "[BUILD enablement] preflight_ops has run without add_features. "
-                    "STOP preflight thrash. Call add_features NOW with a concrete "
-                    "first feature (e.g. box or sketch+extrude) on the active doc_id."
+                    "[BUILD enablement] preflight_ops is blocked until add_features "
+                    "succeeds once. Call add_features NOW with a concrete first "
+                    "feature (box or sketch+extrude) on the active doc_id. Further "
+                    "preflight_ops results will be ignored for product success."
                 )})
 
         # AI-VC: post-success path retains create tools (doc_id only after call)

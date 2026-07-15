@@ -73,6 +73,8 @@ _COST_CLASS: dict[str, int] = {
 # TaskClass → base minimum rank threshold (1–5).
 _TASK_CLASS_MIN_RANK: dict[str, int] = {
     "simple_part": 1,
+    "simple": 1,          # alias used by auto_pick smoke / leaf prompts
+    "leaf": 1,            # mega-7: VERIFY/DELIVER/INTAKE report nodes
     "modification": 2,
     "multi_feature_part": 3,
     "enclosure": 3,

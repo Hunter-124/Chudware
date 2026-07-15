@@ -14,8 +14,8 @@ users as-is.
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
 plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4),
-plm_timeline + plm_rollback (AI-VC: silent agent checkpoints + chat rollback).
-Remote/lock tools (plm_add_remote, plm_sync, plm_lock, plm_unlock) are T-R7.
+plm_timeline + plm_rollback (AI-VC), and T-R7 remotes/locks:
+plm_add_remote, plm_sync, plm_lock, plm_unlock.
 
 plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
 ships the thin envelope early ({ok, consumers} over the derived index in
@@ -418,6 +418,69 @@ def register_plm_tools(mcp: FastMCP) -> None:
             out = ai_vc.plm_rollback(doc_id or None, to)
         except Exception as e:  # noqa: BLE001
             return _err("internal", f"{type(e).__name__}: {e}")
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    # ------------------------------------------------------------------
+    # T-R7 remotes / locks (folder kind)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def plm_add_remote(path: str, kind: str = "folder", name: str = "origin",
+                       url: str = "") -> str:
+        """Register a remote profile for team sync. ``kind`` ∈ ``folder`` |
+        ``ssh`` | ``https`` | ``aicad-cloud`` (config-only). Folder remotes use
+        a bare repo path. Returns ``{ok, remote}``."""
+        try:
+            from services.plm import remote as remote_mod
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        out = remote_mod.add_remote(path, name, path=url or None, kind=kind,
+                                    url=url or None)
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def plm_sync(path: str, remote_id: str = "origin") -> str:
+        """One-button team sync: pull others' changes, publish yours. Same-item
+        collisions become a copy under a new name (never a merge). Returns
+        ``{ok, pulled, pushed, conflicts_copied}``."""
+        try:
+            from services.plm import remote as remote_mod
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        out = remote_mod.sync(path, remote=remote_id)
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def plm_lock(path: str, item_id: str, remote_id: str = "origin") -> str:
+        """Advisory lock on an item via the shared project (compare-and-swap).
+        Returns ``{ok, lock}`` or ``{ok:false, reason:"locked"}`` when held."""
+        try:
+            from services.plm import remote as remote_mod
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        out = remote_mod.plm_lock(path, item_id, remote=remote_id)
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or ""))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def plm_unlock(path: str, item_id: str, remote_id: str = "origin") -> str:
+        """Release an advisory lock you hold. Returns ``{ok}``."""
+        try:
+            from services.plm import remote as remote_mod
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        out = remote_mod.plm_unlock(path, item_id, remote=remote_id)
         if not out.get("ok"):
             return _err(str(out.get("reason") or "internal"),
                         str(out.get("hint") or ""))

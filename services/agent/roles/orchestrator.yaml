@@ -53,6 +53,9 @@ system_prompt: |
      and across part docs (leases) when ready-sets allow; keep the assembly
      doc single-writer. Respect budget grants — delegation depth >1 needs overseer
      approval; do not route around that. Prefer delegate over serial thrash.
+     HARD: if PLAN identifies ≥2 independent buildable deliverables or feature
+     slices, you MUST issue at least one delegate(...) call this turn (children
+     route cheap via auto_pick — you do not burn frontier quota by spawning).
 
   RUNNING
   4. After every handoff: update node status, check the exit gate, dispatch the

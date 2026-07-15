@@ -611,6 +611,73 @@ def _git_gh_auth_status(params, _emit): return _git_rpc(params, _emit, "gh_auth_
 def _git_gh_auth_login(params, _emit):  return _git_rpc(params, _emit, "gh_auth_login", ("hostname", str, ""))
 
 
+
+# ---------------------------------------------------------------------------
+# T-R7 remotes / locks (services.plm.remote)
+# ---------------------------------------------------------------------------
+
+def _plm_add_remote(params: dict, _emit: Callable) -> dict:
+    """Register a remote profile (folder/ssh/https/aicad-cloud config)."""
+    try:
+        from services.plm import remote as remote_mod
+    except ImportError:
+        return dict(_NO_VAULT)
+    path = str((params or {}).get("path", "") or "")
+    kind = str((params or {}).get("kind", "folder") or "folder")
+    name = str((params or {}).get("name", "origin") or "origin")
+    url = (params or {}).get("url")
+    if url is None:
+        url = (params or {}).get("remote_path") or (params or {}).get("remote_url")
+    return remote_mod.add_remote(path, name, path=url, kind=kind, url=url)
+
+
+def _plm_sync(params: dict, _emit: Callable) -> dict:
+    """One-button sync against a folder remote (fetch + FF / CAS push)."""
+    try:
+        from services.plm import remote as remote_mod
+    except ImportError:
+        return dict(_NO_VAULT)
+    path = str((params or {}).get("path", "") or "")
+    remote = str(
+        (params or {}).get("remote_id")
+        or (params or {}).get("remote")
+        or "origin"
+    )
+    return remote_mod.sync(path, remote=remote)
+
+
+def _plm_lock(params: dict, _emit: Callable) -> dict:
+    """Advisory lock via CAS on refs/aicad/locks."""
+    try:
+        from services.plm import remote as remote_mod
+    except ImportError:
+        return dict(_NO_VAULT)
+    path = str((params or {}).get("path", "") or "")
+    item_id = str((params or {}).get("item_id", "") or "")
+    remote = str(
+        (params or {}).get("remote_id")
+        or (params or {}).get("remote")
+        or "origin"
+    )
+    return remote_mod.plm_lock(path, item_id, remote=remote)
+
+
+def _plm_unlock(params: dict, _emit: Callable) -> dict:
+    """Release an advisory lock via CAS."""
+    try:
+        from services.plm import remote as remote_mod
+    except ImportError:
+        return dict(_NO_VAULT)
+    path = str((params or {}).get("path", "") or "")
+    item_id = str((params or {}).get("item_id", "") or "")
+    remote = str(
+        (params or {}).get("remote_id")
+        or (params or {}).get("remote")
+        or "origin"
+    )
+    return remote_mod.plm_unlock(path, item_id, remote=remote)
+
+
 WORKER_METHODS = {
     "plm_open": _plm_open,
     "plm_status": _plm_status,
@@ -636,6 +703,10 @@ WORKER_METHODS = {
     "plm_draft": _plm_draft,
     "plm_timeline": _plm_timeline,
     "plm_rollback": _plm_rollback,
+    "plm_add_remote": _plm_add_remote,
+    "plm_sync": _plm_sync,
+    "plm_lock": _plm_lock,
+    "plm_unlock": _plm_unlock,
     # Git tab — real git / GitHub client
     "git_status": _git_status,
     "git_log": _git_log,

@@ -301,3 +301,135 @@ def test_mission_dispatch_classifies_ecad_fw_to_tool_tier():
             t.startswith("ecad_") or t.startswith("fw_") or t.startswith("board_")
             for t in card.concrete_tools
         ), card.concrete_tools
+
+
+# ---------------------------------------------------------------------------
+# 4. Residual polish: schematic-only is not ECAD product success
+# ---------------------------------------------------------------------------
+
+
+def test_ecad_schematic_without_board_not_auto_done(tmp_path, monkeypatch):
+    """mega-11 live residual: ecad_new_schematic+place auto-completed without board."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega11_ecad_boot", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            if seq["n"] == 1:
+                return (
+                    '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```'
+                )
+            if seq["n"] <= 4:
+                return (
+                    '```json\n{"tool":"ecad_place_symbol","args":'
+                    '{"libid":"MCU:STM32","x":0,"y":0}}\n```'
+                )
+            return "done thrashing without board"
+
+    def _dispatch(tool, args):
+        if tool == "ecad_new_schematic":
+            return {"ok": True, "doc_id": "sch-1", "name": "fc"}
+        if tool == "ecad_place_symbol":
+            return {"ok": True, "ref": "U1"}
+        return {"ok": True}
+
+    allow = [
+        "ecad_new_schematic", "ecad_place_symbol", "board_from_schematic",
+        "ecad_run_drc", "ecad_run_erc", "ledger_get", "ledger_note",
+    ]
+    res = at.run_turn(
+        "Build the flight computer schematic and board",
+        _Prov(),
+        name="BUILD DL3",
+        ledger=ledger,
+        allowed_tools=allow,
+        tool_dispatch=_dispatch,
+        max_tool_calls=4,
+        phase="build",
+    )
+    tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert "ecad_new_schematic" in tools_used
+    assert "board_from_schematic" not in tools_used
+    assert "ecad_run_drc" not in tools_used
+    # Must not be a silent product-success complete.
+    if res.success:
+        # Bare-NL or formal done must have been blocked; if confirmed, must
+        # carry bootstrapped_only (or not claim done status).
+        handoff = (res.result or {}).get("handoff") or {}
+        assert (
+            res.result.get("bootstrapped_only") is True
+            or handoff.get("status") != "done"
+            or handoff.get("outputs", {}).get("bootstrapped_only") is True
+        ), (res.stop_reason, handoff)
+    else:
+        assert res.result.get("bootstrapped_only") is True or res.stop_reason in (
+            "max_iters", "phase_step_cap", "no_code",
+        )
+
+
+def test_ecad_schematic_then_board_auto_completes(tmp_path, monkeypatch):
+    """Happy path: schematic + board_from_schematic is ECAD product success."""
+    from services.agent.ledger import Ledger
+    from services.agent import agent_turn as at
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega11_ecad_ok", path=tmp_path / "ledger.json")
+    seq = {"n": 0}
+
+    class _Prov:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seq["n"] += 1
+            if seq["n"] == 1:
+                return (
+                    '```json\n{"tool":"ecad_new_schematic","args":{"name":"fc"}}\n```'
+                )
+            if seq["n"] == 2:
+                return (
+                    '```json\n{"tool":"board_from_schematic","args":{}}\n```'
+                )
+            return "no formal done"
+
+    def _dispatch(tool, args):
+        if tool == "ecad_new_schematic":
+            return {"ok": True, "doc_id": "sch-1"}
+        if tool == "board_from_schematic":
+            return {"ok": True, "doc_id": "pcb-1", "drc_errors": 0}
+        return {"ok": True}
+
+    res = at.run_turn(
+        "Build schematic and board",
+        _Prov(),
+        name="BUILD DL3",
+        ledger=ledger,
+        allowed_tools=[
+            "ecad_new_schematic", "board_from_schematic", "ecad_run_drc",
+            "ledger_note",
+        ],
+        tool_dispatch=_dispatch,
+        max_tool_calls=3,
+        phase="build",
+    )
+    assert res.success is True
+    # agent_turn uses stop_reason "confirmed" for clean finish.
+    assert res.stop_reason == "confirmed", res.stop_reason
+    handoff = (res.result or {}).get("handoff") or {}
+    assert handoff.get("status") == "done"
+    # Either auto_complete productive path or bare-NL after board product.
+    prod = handoff.get("outputs", {}).get("productive_tools") or []
+    tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
+    assert "board_from_schematic" in tools_used
+    assert "board_from_schematic" in prod or res.result.get("auto_complete") or (
+        handoff.get("outputs", {}).get("auto_complete") is True
+        or handoff.get("outputs", {}).get("tool_calls", 0) >= 2
+    )

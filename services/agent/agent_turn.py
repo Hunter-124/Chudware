@@ -468,9 +468,17 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         if parsed is None:
             # No structured directive. If the model already ran tools, treat a bare
             # natural-language finish as done-with-handoff; otherwise it produced
-            # nothing actionable (no_code).
+            # nothing actionable (no_code). mega-11: bootstrap-only tool work
+            # (schematic open / fw_new_project / new_part) is NOT done — nudge.
             _log(ledger, actor, {"event": "turn", "kind": "text", "text": reply[:400]})
             if tool_calls_made > 0:
+                boot_msg = _bootstrap_incomplete(calls, allow)
+                if boot_msg is not None:
+                    messages.append({"role": "user", "content": _parts(
+                        f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
+                    )})
+                    last_reason = _RETRY
+                    continue
                 bare_handoff = {
                     "status": "done",
                     "summary": (reply or "")[:600],
@@ -518,6 +526,19 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 # the ledger/overseer can see it; the node still completes so
                 # the phase machine can advance past a honest blocked report
                 # rather than looping as specify_incomplete forever.
+            # mega-11: refuse status=done when only bootstrap openers ran.
+            handoff_status = str(
+                (handoff or {}).get("status") or
+                ("done" if parsed.get("done") else "")
+            ).lower()
+            if handoff_status in ("", "done"):
+                boot_msg = _bootstrap_incomplete(calls, allow)
+                if boot_msg is not None:
+                    messages.append({"role": "user", "content": _parts(
+                        f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
+                    )})
+                    last_reason = _RETRY
+                    continue
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
@@ -782,33 +803,29 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     # PLAN/BUILD handoffs of the same class complete (plan_incomplete class).
     # mega-6: new_part alone is NOT product success — live BUILD DL1 auto-completed
     # after new_part + preflight thrash with zero add_features (empty solid).
-    # Geometry/ECAD/FW mutators are the real product signal; new_part is bootstrap.
+    # mega-11: ecad_new_schematic alone is NOT product success — live BUILD DL3
+    # auto-completed after schematic+place with zero board_from_schematic/drc.
+    # Geometry/ECAD/FW mutators are the real product signal; openers are bootstrap.
     _PRODUCTIVE_TOOLS = frozenset({
         "ledger_note", "buildgraph_plan", "dag_plan", "add_features",
-        "ecad_new_schematic", "board_from_schematic", "ecad_run_drc",
-        "ecad_run_erc", "ecad_simulate", "ecad_antenna_design",
-        "fw_new_project", "fw_build",
+        "board_from_schematic", "ecad_run_drc", "ecad_run_erc",
+        "ecad_simulate", "ecad_antenna_design", "ecad_make_board",
+        "fw_build",
         "verify_battery",
     })
-    _BOOTSTRAP_ONLY = frozenset({"new_part"})
+    _BOOTSTRAP_ONLY = frozenset({
+        "new_part", "ecad_new_schematic", "fw_new_project",
+    })
     wrote = any(
         c.get("ok") and c.get("tool") in _PRODUCTIVE_TOOLS for c in calls
     )
-    bootstrapped_only = (
+    boot_why = _bootstrap_incomplete(calls, allow)
+    bootstrapped_only = bool(boot_why) or (
         not wrote
         and any(c.get("ok") and c.get("tool") in _BOOTSTRAP_ONLY for c in calls)
     )
-    # If the role can mutate geometry and did new_part, require add_features
-    # before treating the turn as productively complete.
-    if (
-        any(c.get("ok") and c.get("tool") == "new_part" for c in calls)
-        and "add_features" in (allow or set())
-        and not any(
-            c.get("ok") and c.get("tool") == "add_features" for c in calls
-        )
-    ):
+    if bootstrapped_only:
         wrote = False
-        bootstrapped_only = True
     if (tool_calls_made > 0
             and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
             and wrote):
@@ -845,17 +862,24 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                               _tu))
     if tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"):
         # mega-6: still surface a structured handoff so parent join is not null.
-        # Empty bootstrap (new_part without add_features) is NOT product success —
-        # return non-success so the node can retry instead of auto-done.
+        # Empty bootstrap (new_part / ecad_new_schematic / fw_new_project without
+        # product mutators) is NOT product success — return non-success so the
+        # node can retry instead of auto-done.
         status = "blocked" if bootstrapped_only else "done"
         ok_turn = not bootstrapped_only
+        if not boot_why and bootstrapped_only:
+            boot_why = (
+                "bootstrap opener without product mutator — not BUILD product "
+                "success"
+            )
+        if not bootstrapped_only:
+            boot_why = ""
         synth_partial = {
             "status": status,
             "summary": (
                 f"turn ended with {tool_calls_made} tool calls "
                 f"(reason={last_reason})"
-                + ("; new_part without add_features — empty solid"
-                   if bootstrapped_only else
+                + (f"; {boot_why}" if bootstrapped_only else
                    "; no formal handoff envelope")
             ),
             "outputs": {
@@ -866,8 +890,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 ],
                 "bootstrapped_only": bootstrapped_only,
                 "reasoning_summary": (
-                    "new_part ran but add_features never did; empty solid is "
-                    "not BUILD product success (mega-6)."
+                    boot_why
                     if bootstrapped_only else
                     "Partial turn completed with tools; synthesised handoff "
                     "for parent join plumbing (mega-6)."
@@ -1075,6 +1098,60 @@ def _truncate(result: Any, limit: int = 1000) -> Any:
     s = _as_text(result)
     return s if len(s) <= limit else s[:limit] + "…"
 
+
+
+# mega-11: openers without product mutators are not BUILD success.
+_ECAD_PRODUCT_TOOLS = frozenset({
+    "board_from_schematic", "ecad_run_drc", "ecad_make_board",
+})
+_BOOTSTRAP_OPENERS = frozenset({
+    "new_part", "ecad_new_schematic", "fw_new_project",
+})
+
+
+def _bootstrap_incomplete(
+    calls: list,
+    allow: set[str] | None,
+) -> str | None:
+    """Return a human reason when tools only opened a doc without product.
+
+    mega-6: new_part without add_features.
+    mega-11: ecad_new_schematic without board product; fw_new_project without
+    fw_build. None means product (or no bootstrap opener) is present.
+    """
+    allow_set = allow or set()
+    ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
+    if not ok_tools:
+        return None
+    if (
+        "new_part" in ok_tools
+        and "add_features" in allow_set
+        and "add_features" not in ok_tools
+    ):
+        return (
+            "new_part without add_features — empty solid is not BUILD product "
+            "success (mega-6). Call add_features next."
+        )
+    if (
+        "ecad_new_schematic" in ok_tools
+        and (_ECAD_PRODUCT_TOOLS & allow_set)
+        and not (ok_tools & _ECAD_PRODUCT_TOOLS)
+    ):
+        return (
+            "ecad_new_schematic without board_from_schematic/ecad_run_drc — "
+            "schematic-only is not ECAD product success (mega-11). Call "
+            "board_from_schematic (then ecad_run_drc) next."
+        )
+    if (
+        "fw_new_project" in ok_tools
+        and "fw_build" in allow_set
+        and "fw_build" not in ok_tools
+    ):
+        return (
+            "fw_new_project without fw_build — project scaffold is not "
+            "firmware product success (mega-11). Call fw_build next."
+        )
+    return None
 
 
 def _done_guardrail_block(handoff: dict, ledger, actor: str,

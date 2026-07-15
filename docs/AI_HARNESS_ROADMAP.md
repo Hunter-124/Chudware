@@ -234,3 +234,17 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   success/elf evidence; AC2 bay dims; AC5 doc routing; board DRC path incomplete.
   Findings: `reports/runs/mega-11/findings.md`.
 
+
+- 2026-07-14/15 mega-12 (WS5): live AC expansion under
+  `reports/runs/mega-12/` (`mega-12-fc-rocket-20260714`). Baseline `71dcea10`.
+  Fixer12 (AbleCattle) bound AC7 parse + AC2 volume + AC5 domain doc_id + ECAD
+  board product gate (52–61p). Preflight PASS: hostd running==disk
+  (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`; spawn_probe +
+  auto_pick depth-2→ollama; xai CLEAR from StraightFowl. Primary pid 3283812
+  wall **741.38s**, terminal `needs_correction`/`verify_failed: [AC1,AC4,AC5,AC9]`
+  (**AC2+AC3+AC6+AC7+AC8 PASS**). Scoreboard: **N PASS** (5 live PASS; AC3+AC6
+  held + AC7 + AC2 volume proxy), **O FAIL** (schematic+place only; product gate
+  blocked auto-done but board_from_schematic/DRC never ran), **A–M regression
+  PASS** (add_features ok, fw ELF, battery doc_id, clean stop). Residuals: board
+  force-tool chain; AC5 empty netlist; AC9 missing legs; typed-refusal live.
+  Findings: `reports/runs/mega-12/findings.md`.

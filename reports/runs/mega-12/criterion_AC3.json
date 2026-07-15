@@ -1,0 +1,39 @@
+{
+  "id": "AC3",
+  "result": "PASS",
+  "check_tool": "check_interference",
+  "pass_rule": "interferences empty or volume==0",
+  "detail": "interferences empty",
+  "evidence": {
+    "ok": true,
+    "doc_id": "doc-cpp0000002f",
+    "clearances": [],
+    "contacts": [],
+    "interferences": [],
+    "parts": [
+      {
+        "bbox": {
+          "max": [
+            30.0,
+            30.0,
+            215.0
+          ],
+          "min": [
+            -30.0,
+            -30.0,
+            -215.0
+          ],
+          "size": [
+            60.0,
+            60.0,
+            430.0
+          ]
+        },
+        "name": "b1",
+        "volume": 211830.31105875658
+      }
+    ],
+    "summary": "No interference detected.",
+    "source": "live"
+  }
+}

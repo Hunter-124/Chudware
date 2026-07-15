@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-12-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 3283812,
+  "started_wall": 1784088005.1002002,
+  "cycle": "mega-12",
+  "conservation": true,
+  "baseline_commit": "71dcea10",
+  "finished_wall": 1784088746.4770036,
+  "wall_s": 741.38,
+  "result": {
+    "status": "needs_correction",
+    "phase": "correct",
+    "stop_reason": "verify_failed: ['AC1', 'AC4', 'AC5', 'AC9']",
+    "error": null
+  }
+}

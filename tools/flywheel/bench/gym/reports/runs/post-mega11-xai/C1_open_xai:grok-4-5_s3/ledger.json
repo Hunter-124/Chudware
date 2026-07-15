@@ -1,0 +1,4124 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-15T03:55:15Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C1",
+        "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-15T03:55:15Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": "frontier",
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": null,
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "standard",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "standard",
+            "values": {
+              "deliberation": "standard",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "standard",
+            "values": {
+              "deliberation": "minimal",
+              "ladder": "optional",
+              "ladder_max_bounces": 2,
+              "council": "risk_gated",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 600,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "compact"
+            },
+            "sources": {
+              "deliberation": "shipped",
+              "ladder": "shipped",
+              "ladder_max_bounces": "shipped",
+              "council": "shipped",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "shipped",
+              "delegation_depth": "shipped",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "shipped",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "shipped",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "shipped"
+            },
+            "warnings": []
+          }
+        },
+        "level": "standard"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T03:55:15Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "flanged bushing",
+              "description": "bushing with a d20 sliding-fit bore and a 4xM4 flange bolt circle",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "bore is a sliding fit on the d20 h7 shaft",
+                  "check": {
+                    "tool": "fit_report",
+                    "params_hint": {
+                      "nominal": 20,
+                      "hole": "H7"
+                    },
+                    "pass_rule": "clearance in [0,0.042]"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "sliding-fit clearance in band",
+                  "check": {
+                    "tool": "fit_report",
+                    "pass_rule": "clearance in [0,0.042]"
+                  }
+                },
+                {
+                  "id": "AC3",
+                  "text": "4xM4 clearance bolt circle on PCD 34",
+                  "check": {
+                    "tool": "measure_part",
+                    "pass_rule": "4 holes d4.5 on PCD34"
+                  }
+                },
+                {
+                  "id": "AC4",
+                  "text": "geometry coherent",
+                  "check": {
+                    "tool": "verify_battery",
+                    "pass_rule": "PASS"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "material 6061-T6 (machined bushing)",
+              "basis": "default machined",
+              "needs_confirm": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC1",
+        "text": "bore is a sliding fit on the d20 h7 shaft",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC2",
+        "text": "sliding-fit clearance in band",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC3",
+        "text": "4xM4 clearance bolt circle on PCD 34",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC4",
+        "text": "geometry coherent",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T03:55:15Z",
+        "exited": "2026-07-15T03:55:15Z",
+        "exit_gate": "manifest_valid"
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "orchestrator",
+      "kind": "delegation",
+      "payload": {
+        "schema": "aicad.delegation/1",
+        "node_id": "dg_8b7221fbf14c",
+        "role": "orchestrator",
+        "status": "approved",
+        "depth": 0,
+        "kind": "worker",
+        "model": {
+          "provider": "",
+          "id": "",
+          "tier": ""
+        },
+        "budget": {
+          "tokens_granted": 50000,
+          "tokens_spent": 0,
+          "attempts": 0
+        },
+        "note": "root node auto-approved at init"
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "intake_analyst"
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_miss",
+        "errors": [
+          "leaf_envelope: require non-empty ops[] OR (no_op=true + reason)"
+        ],
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "reply_head": "{\n  \"goal\": \"verify deliverable manifest for flanged bushing design\",\n  \"no_op\": false,\n  \"reason\": null,\n  \"artifacts\": [\n    {\n      \"type\": \"manifest\",\n      \"value\": {\n        \"deliverables\": [\n          {\n            \"id\": \"{{del_id_fl"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 322,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "describe_project",
+          "describe_part",
+          "list_parts",
+          "part_search",
+          "req_create",
+          "research_web_search"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000018",
+        "kind": "prompt",
+        "checkpoint_id": "9b4d0d0814f23656cf8631794a54cfab",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "turn": 0
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3735,
+        "completion_tokens": 27,
+        "total_tokens": 3904,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "text",
+        "text": "I'll decompose the request into a deliverables manifest—first checking project state and the ledger so we don't invent work or miss open docs."
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T03:55:25Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "multi_feature_part",
+        "min_rank": 3,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=3 task_class=multi_feature_part depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000018",
+        "kind": "prompt",
+        "checkpoint_id": "9b4d0d0814f23656cf8631794a54cfab",
+        "dedup": true,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "turn": 0
+      }
+    },
+    {
+      "seq": 21,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4666,
+        "completion_tokens": 30,
+        "total_tokens": 4782,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 22,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {},
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s3]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s3\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Requirements\\n  DL1/AC1 [open]: bore is a sliding fit on the d20 h7 shaft\\n  DL1/AC2 [open]: sliding-fit clearance in band\\n  DL1/AC3 [open]: 4xM4 clearance bolt circle on PCD 34\\n  DL1/AC4 [open]: geometry coherent\\n\\n## Stage Log\\n  intake: entered=2026-07-15T03:55:15Z exited=2026-07-15T03:55:15Z gate=manifest_valid\\n  specify: entered=2026-07-15T03:55:25Z exited=ongoing\\n\\n## Artifacts\\n  [manifest] manifest:  (stage=intake) 1 deliverables\\n\\n[/LEDGER]\", \"event_count\": 21}"
+      }
+    },
+    {
+      "seq": 23,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5037,
+        "completion_tokens": 51,
+        "total_tokens": 5238,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 24,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "recommend_fit",
+        "args": {
+          "function": "sliding fit for bushing bore on shaft"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"recommend_fit\",\n  \"answer\": [\n    {\n      \"id\": \"sliding\",\n      \"recommended_classes\": [\n        \"H7/g6\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Small controlled clearance for sliding without rotation. Parts can be assembled/disassembled by hand.\",\n      \"applications\": [\n        \"lathe spindles\",\n        \"milling arbors\",\n        \"precision machine slides\",\n        \"gearbox shafts not rotating\"\n      ],\n      \"notes\": \"Classic precision sliding fit. 20H7/g6 gives 0.007-0.041mm clearance on 20mm nominal.\",\n      \"typical_clearance_range_um\": [\n        2,\n        25\n      ]\n    },\n    {\n      \"id\": \"press_fit\",\n      \"recommended_classes\": [\n        \"H7/r6\",\n        \"H7/s6\"\n      ],\n      \"character\": \"press\",\n      \"rationale\": \"Substantial interference requiring hydraulic press or thermal expansion. Reliable torque and axial load without fasteners.\",\n      \"applications\": [\n        \"wheel hubs\",\n        \"heav…"
+      }
+    },
+    {
+      "seq": 25,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5654,
+        "completion_tokens": 2048,
+        "total_tokens": 8026,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 26,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H7/h6"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.013,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.034\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.987,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H7/h6\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H7/h6\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 27,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.017",
+        "rationale": "fit_calc → clearance 0.017",
+        "actor": "SPECIFY DL1: flanged bushing",
+        "ts": "2026-07-15T03:55:41Z"
+      }
+    },
+    {
+      "seq": 28,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.017",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.017,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 29,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7965,
+        "completion_tokens": 2048,
+        "total_tokens": 10083,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 30,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H7/h7"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.021,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.042\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.979,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H7/h7\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H7/h7\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 31,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.021",
+        "rationale": "fit_calc → clearance 0.021",
+        "actor": "SPECIFY DL1: flanged bushing",
+        "ts": "2026-07-15T03:55:51Z"
+      }
+    },
+    {
+      "seq": 32,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.021",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.021,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 33,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10276,
+        "completion_tokens": 2048,
+        "total_tokens": 12493,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 34,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 20,
+          "fit": "H7/h7"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.021\n    ],\n    \"shaft\": [\n      -0.021,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.042\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      20.0,\n      20.021\n    ],\n    \"shaft_absolute\": [\n      19.979,\n      20.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=20mm, H7/h7\",\n  \"inputs\": {\n    \"nominal\": 20,\n    \"fit\": \"H7/h7\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 35,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.021",
+        "rationale": "fit_calc → clearance 0.021",
+        "actor": "SPECIFY DL1: flanged bushing",
+        "ts": "2026-07-15T03:56:03Z"
+      }
+    },
+    {
+      "seq": 36,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.021",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.021,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 37,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 12587,
+        "completion_tokens": 77,
+        "total_tokens": 12886,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 38,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "flanged bushing with precision sliding H7 bore and bolt circle, CNC preferred for tight bore tolerance",
+          "material": "bronze",
+          "quantity": 1
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"cnc_mill\",\n  \"confidence\": 0.95,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [],\n  \"why\": \"explicit 'cnc_mill' process cue in the request\"\n}"
+      }
+    },
+    {
+      "seq": 39,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 12754,
+        "completion_tokens": 2048,
+        "total_tokens": 14860,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 40,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "bronze",
+          "property": null
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": null,\n  \"units\": null,\n  \"source_url\": \"https://material-properties.org/bronze-density-strength-hardness-melting-point/\",\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T03:56:19Z\",\n  \"confidence\": \"limited\",\n  \"cached\": false,\n  \"query\": \"bronze material mechanical properties\",\n  \"provider\": \"ddg\",\n  \"results\": [\n    {\n      \"title\": \"Bronze | Density, Strength, Hardness, Melting Point - Material Properties\",\n      \"url\": \"https://material-properties.org/bronze-density-strength-hardness-melting-point/\",\n      \"snippet\": \"Mechanical Properties of Bronzes Materials are frequently chosen for various applications because they have desirable combinations of mechanical characteristics. For structural applications, material properties are crucial and engineers must take them into account. Strength of Bronzes In mechanics of materials, the strength of a material is its ability to withstand an applied load without ...\"\n    },\n    {\n      \"title\": \"Bronze Material Guide…"
+      }
+    },
+    {
+      "seq": 41,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 15284,
+        "completion_tokens": 2048,
+        "total_tokens": 17351,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 42,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "C93200 bearing bronze",
+          "property": null
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": null,\n  \"units\": null,\n  \"source_url\": \"https://www.concast.com/c93200.php\",\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T03:56:30Z\",\n  \"confidence\": \"limited\",\n  \"cached\": false,\n  \"query\": \"C93200 bearing bronze material mechanical properties\",\n  \"provider\": \"ddg\",\n  \"results\": [\n    {\n      \"title\": \"C93200 Alloy, C932 Leaded Tin Bronze | Wieland Concast\",\n      \"url\": \"https://www.concast.com/c93200.php\",\n      \"snippet\": \"Alloy C93200, also termed C932, is widely used in many bearing applications. Lead content in high Leaded Tin Bronze alloys is between 7.00% & 15.00%.\"\n    },\n    {\n      \"title\": \"C93200 Bronze: Composition, Properties, Processing, Applications\",\n      \"url\": \"https://www.rapid-protos.com/c93200-bronze-guide/\",\n      \"snippet\": \"C93200 bronze, which is also called SAE 660 bearing bronze, is a high-performance copper-tin-lead alloy made just for bearings and bushings. It is one of the most common bearing materials used in industrial and…"
+      }
+    },
+    {
+      "seq": 43,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 17900,
+        "completion_tokens": 2048,
+        "total_tokens": 20505,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 44,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "bore_diameter",
+        "value": "Ø20 H7 (+0.021/0)",
+        "driver": "mates d20 h7 shaft, sliding clearance 0.000–0.042 mm per AC1/AC2",
+        "provenance": "fit_calc H7/h7 @20mm ISO 286-2",
+        "id": "bore_diameter"
+      }
+    },
+    {
+      "seq": 45,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "bore_diameter",
+            "value": "Ø20 H7 (+0.021/0)",
+            "driver": "mates d20 h7 shaft, sliding clearance 0.000–0.042 mm per AC1/AC2",
+            "provenance": "fit_calc H7/h7 @20mm ISO 286-2"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 43, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T03:56:45Z\"}"
+      }
+    },
+    {
+      "seq": 46,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 20023,
+        "completion_tokens": 2048,
+        "total_tokens": 22176,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 47,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 2500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s3]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s3\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  bore_diameter bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft, sliding clearance 0.000\\u20130.042 mm per AC1/AC2\\n\\n## Decisions\\n  fit_bore [specify]: fit from fit_calc: clearance\\u22480.021 \\u2014 fit_calc mean/interval clearance\\n\\n## Requirements\\n  DL1/AC1 [open]: bore is a sliding fit on the d20 h7 shaft\\n  DL1/AC2 [open]: sliding-fit clearance in band\\n  DL1/AC3 [open]: 4xM4 clearance bolt circle on PCD 34\\n  DL1/AC4 [open]: geometry coherent\\n\\n## Stage Log\\n  intake: entered=2026-07-15T03:55:15Z exited=2026-07-15T03:55:15Z gate=manifest_valid\\n  specify: entered=2026-07-15T03:55:25Z exited=ongoing\\n\\n## Artifacts\\n  [ma…"
+      }
+    },
+    {
+      "seq": 48,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 22514,
+        "completion_tokens": 2048,
+        "total_tokens": 24654,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 49,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "bore_diameter",
+        "value": "Ø20 H7 (+0.021/0)",
+        "driver": "mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2",
+        "provenance": "fit_calc H7/h7 @20mm ISO 286-2",
+        "id": "bore_diameter"
+      }
+    },
+    {
+      "seq": 50,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "bore_diameter",
+            "value": "Ø20 H7 (+0.021/0)",
+            "driver": "mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2",
+            "provenance": "fit_calc H7/h7 @20mm ISO 286-2"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 48, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T03:57:09Z\"}"
+      }
+    },
+    {
+      "seq": 51,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 24637,
+        "completion_tokens": 25,
+        "total_tokens": 24706,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 52,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 4000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s3]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s3\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  bore_diameter bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2\\n\\n## Decisions\\n  fit_bore [specify]: fit from fit_calc: clearance\\u22480.021 \\u2014 fit_calc mean/interval clearance\\n\\n## Requirements\\n  DL1/AC1 [open]: bore is a sliding fit on the d20 h7 shaft\\n  DL1/AC2 [open]: sliding-fit clearance in band\\n  DL1/AC3 [open]: 4xM4 clearance bolt circle on PCD 34\\n  DL1/AC4 [open]: geometry coherent\\n\\n## Stage Log\\n  intake: entered=2026-07-15T03:55:15Z exited=2026-07-15T03:55:15Z gate=manifest_valid\\n  specify: entered=2026-07-15T03:55:25Z exited=ongoing\\n\\n## Artifacts\\n  [man…"
+      }
+    },
+    {
+      "seq": 53,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 25103,
+        "completion_tokens": 2048,
+        "total_tokens": 27236,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 54,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "bolt_hole_diameter",
+        "value": "Ø4.5 mm through ×4",
+        "driver": "M4 clearance bolt circle per AC3",
+        "provenance": "mission AC3 pass_rule: 4 holes d4.5 on PCD34",
+        "id": "bolt_hole_diameter"
+      }
+    },
+    {
+      "seq": 55,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "bolt_hole_diameter",
+            "value": "Ø4.5 mm through ×4",
+            "driver": "M4 clearance bolt circle per AC3",
+            "provenance": "mission AC3 pass_rule: 4 holes d4.5 on PCD34"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 53, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T03:57:21Z\"}"
+      }
+    },
+    {
+      "seq": 56,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 27226,
+        "completion_tokens": 1222,
+        "total_tokens": 28703,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 57,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 58,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 59,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 60,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "done",
+        "handoff": {
+          "status": "done",
+          "summary": "Flanged bushing DL1 spec: Ø20 H7 sliding bore on d20 h7 shaft (clearance 0.000–0.042 mm), 4×Ø4.5 on PCD 34 for M4, C93200 bronze CNC, free envelope for hub/flange.",
+          "outputs": {
+            "handoff": {
+              "deliverable_id": "DL1",
+              "kind": "part",
+              "name": "flanged_bushing",
+              "status": "specified",
+              "spec": {
+                "envelope": {
+                  "description": "Flanged bushing: cylindrical hub with integral flange. Bore through full length. Overall hub length, flange thickness, and ODs are free geometry provided interfaces are met.",
+                  "guidance": {
+                    "hub_od_min_mm": 28,
+                    "flange_od_min_mm": 45,
+                    "rationale": "≥4 mm radial wall on Ø20 bore; flange OD covers PCD 34 + Ø4.5 holes + edge distance"
+                  }
+                },
+                "interfaces": [
+                  {
+                    "name": "sliding_bore",
+                    "mates": "d20 h7 shaft",
+                    "callout": "Ø20 H7 (+0.021/0)",
+                    "fit": "H7/h7 sliding clearance",
+                    "clearance_mm": [
+                      0.0,
+                      0.042
+                    ],
+                    "provenance": "fit_calc H7/h7 @20mm ISO 286-2; matches AC1/AC2 band [0,0.042]"
+                  },
+                  {
+                    "name": "flange_bolt_circle",
+                    "mates": "4× M4 fasteners (clearance)",
+                    "callout": "4× Ø4.5 through on PCD 34 mm, equally spaced 90°, pattern coaxial with bore axis",
+                    "provenance": "mission AC3 pass_rule: 4 holes d4.5 on PCD34"
+                  }
+                ],
+                "functional_dimensions": [
+                  {
+                    "name": "bore_diameter",
+                    "value": "Ø20 H7 (+0.021/0)",
+                    "driver": "sliding fit on d20 h7 shaft; clearance 0.000–0.042 mm",
+                    "provenance": "fit_calc H7/h7"
+                  },
+                  {
+                    "name": "fit_clearance_band",
+                    "value": "0.000–0.042 mm",
+                    "driver": "AC1/AC2 pass rule",
+                    "provenance": "fit_calc H7/h7 clearance"
+                  },
+                  {
+                    "name": "bolt_hole_diameter",
+                    "value": "Ø4.5 mm ×4 through",
+                    "driver": "M4 clearance",
+                    "provenance": "mission AC3"
+                  },
+                  {
+                    "name": "bolt_circle_pcd",
+                    "value": "34 mm",
+                    "driver": "flange bolt pattern",
+                    "provenance": "mission AC3"
+                  },
+                  {
+                    "name": "bolt_pattern",
+                    "value": "4 holes @ 90° on PCD 34, coaxial with bore",
+                    "driver": "mounting pattern",
+                    "provenance": "mission AC3 + geometry"
+                  }
+                ],
+                "material": {
+                  "name": "C93200 (SAE 660) high-leaded tin bearing bronze",
+                  "reason": "standard bushing alloy: anti-friction, wear resistance, excellent machinability for precision H7 bore",
+                  "needs_confirm": true,
+                  "provenance": "research_material_lookup C93200"
+                },
+                "process": {
+                  "name": "cnc_mill",
+                  "notes": "CNC turn hub/bore + mill flange bolt pattern acceptable; H7 bore requires machining",
+                  "general_tolerance": "ISO 2768-m for non-fit dims",
+                  "provenance": "resolve_process confidence 0.95"
+                },
+                "free_geometry": [
+                  "hub length / engagement length",
+                  "flange thickness",
+                  "overall length",
+                  "hub OD (≥28 mm recommended)",
+                  "flange OD (≥45 mm recommended)",
+                  "chamfers, fillets, corner breaks"
+                ],
+                "assumptions": [
+                  "Material C93200 not user-specified — needs_confirm",
+                  "No loads/speeds given — geometry-only bushing",
+                  "Bore is through; flange face flat for bolt seating",
+                  "No standard catalog part required — custom machined part"
+                ]
+              },
+              "verification_plan": [
+                {
+                  "criterion_id": "AC1",
+                  "check_tool": "fit_report",
+                  "params": {
+                    "bore": "Ø20 H7",
+                    "shaft": "d20 h7"
+                  },
+                  "pass_rule": "clearance in [0, 0.042]"
+                },
+                {
+                  "criterion_id": "AC2",
+                  "check_tool": "fit_report",
+                  "params": {
+                    "fit": "H7/h7",
+                    "nominal_mm": 20
+                  },
+                  "pass_rule": "clearance in [0, 0.042]"
+                },
+                {
+                  "criterion_id": "AC3",
+                  "check_tool": "measure_part",
+                  "params": {
+                    "features": "bolt_holes"
+                  },
+                  "pass_rule": "4 holes d4.5 on PCD34"
+                },
+                {
+                  "criterion_id": "AC4",
+                  "check_tool": "verify_battery",
+                  "params": {},
+                  "pass_rule": "PASS"
+                }
+              ],
+              "reasoning_summary": "Shaft fixed as d20 h7. recommend_fit suggested H7/g6 for classic sliding, but AC pass band is [0,0.042]. fit_calc H7/h7 yields clearance [0.0, 0.042] exactly matching AC1/AC2 — selected as fit class. Bore callout Ø20 H7. AC3 mandates 4× d4.5 on PCD 34 for M4 clearance. Material C93200 bronze (bushing standard) with needs_confirm; process cnc_mill for H7 capability. Envelope/hub/flange sizes left free with DFM guidance only."
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 61,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "overseer"
+      }
+    },
+    {
+      "seq": 62,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": true,
+        "n_ops": 0
+      }
+    },
+    {
+      "seq": 63,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "department_manager"
+      }
+    },
+    {
+      "seq": 64,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": false,
+        "n_ops": 3
+      }
+    },
+    {
+      "seq": 65,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T03:57:41Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 66,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "multi_feature_part",
+        "min_rank": 3,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=3 task_class=multi_feature_part depth=0 risk=none",
+        "role": "orchestrator"
+      }
+    },
+    {
+      "seq": 67,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 367,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "dag_plan",
+          "buildgraph_plan",
+          "buildgraph_status",
+          "workspace_status",
+          "delegate",
+          "ask_user",
+          "describe_project"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "dag_run",
+          "dag_status",
+          "dag_replan"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 68,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000018",
+        "kind": "prompt",
+        "checkpoint_id": "9b4d0d0814f23656cf8631794a54cfab",
+        "dedup": true,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "turn": 0
+      }
+    },
+    {
+      "seq": 69,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 2556,
+        "completion_tokens": 2048,
+        "total_tokens": 4705,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 70,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "text",
+        "text": "I'll start by inspecting the mission ledger and current plan so the build graph matches ratified specs and interface order. ethinking_effort:80 | 3e8b2a3c1a0d9f7e6b5a4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0 | 2025-03-21T12:00:00Z | orchestrator | start | Inspecting ledger and plan for flanged bushing mission. | {\"mission\":\"flanged bushing 20mm sliding-fit bore, 4-hole M4 bolt circle\"} | |"
+      }
+    },
+    {
+      "seq": 71,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T03:57:50Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 72,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "multi_feature_part",
+        "min_rank": 3,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=3 task_class=multi_feature_part depth=0 risk=none",
+        "role": "feature_modeler"
+      }
+    },
+    {
+      "seq": 73,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 686,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "new_part",
+          "add_features",
+          "preflight_ops",
+          "describe_part",
+          "measure_part",
+          "query_geometry",
+          "check_feature_overlap",
+          "verify_battery",
+          "regen_diagnose",
+          "part_search",
+          "part_place",
+          "delegate"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 74,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000018",
+        "kind": "prompt",
+        "checkpoint_id": "9b4d0d0814f23656cf8631794a54cfab",
+        "dedup": true,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "turn": 0
+      }
+    },
+    {
+      "seq": 75,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3435,
+        "completion_tokens": 54,
+        "total_tokens": 3539,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 76,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1200
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s3]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s3\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  bolt_hole_diameter bolt_hole_diameter: \\u00d84.5 mm through \\u00d74  [?]\\n    driver: M4 clearance bolt circle per AC3\\n  bore_diameter bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2\\n\\n## Decisions\\n  fit_bore [specify]: fit from fit_calc: clearance\\u22480.021 \\u2014 fit_calc mean/interval clearance\\n\\n## Requirements\\n  DL1/AC1 [open]: bore is a sliding fit on the d20 h7 shaft\\n  DL1/AC2 [open]: sliding-fit clearance in band\\n  DL1/AC3 [open]: 4xM4 clearance bolt circle on PCD 34\\n  DL1/AC4 [open]: geometry coherent\\n\\n## Stage Log\\n  intake: entered=2026-07-15T03:55:15Z exite…"
+      }
+    },
+    {
+      "seq": 77,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4019,
+        "completion_tokens": 58,
+        "total_tokens": 4129,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 78,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": null,
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=gym_C1_open_xai:grok-4-5_s3]\\n\\n## Mission Brief\\nTitle: Mission gym_C1_open_xai:grok-4-5_s3\\nSummary: Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.\\n\\n## Dimensions\\n  bolt_hole_diameter bolt_hole_diameter: \\u00d84.5 mm through \\u00d74  [?]\\n    driver: M4 clearance bolt circle per AC3\\n  bore_diameter bore_diameter: \\u00d820 H7 (+0.021/0)  [?]\\n    driver: mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2\\n\\n## Decisions\\n  fit_bore [specify]: fit from fit_calc: clearance\\u22480.021 \\u2014 fit_calc mean/interval clearance\\n\\n## Requirements\\n  DL1/AC1 [open]: bore is a sliding fit on the d20 h7 shaft\\n  DL1/AC2 [open]: sliding-fit clearance in band\\n  DL1/AC3 [open]: 4xM4 clearance bolt circle on PCD 34\\n  DL1/AC4 [open]: geometry coherent\\n\\n## Stage Log\\n  intake: entered=2026-07-15T03:55:15Z exite…"
+      }
+    },
+    {
+      "seq": 79,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4607,
+        "completion_tokens": 53,
+        "total_tokens": 5880,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 80,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "flanged bushing 20mm bore M4 bolt circle",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 10, \"has_live\": false, \"results\": [{\"part_id\": \"fastener:ISO 4017:M4\", \"title\": \"Hex Head Bolt M4 hex head bolt hex bolt hhcs hex head\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M4\", \"score\": null}, {\"part_id\": \"fastener:ISO 7089:M4\", \"title\": \"Flat Washer M4 flat washer washer\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M4\", \"score\": null}, {\"part_id\": \"fastener:ISO 4032:M4\", \"title\": \"Hex Nut M4 hex nut nut\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M4\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M4\", \"title\": \"Button Head Cap Screw M4 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M4\", \"score\": null}, {\"part_id\": \"fastener:ISO 4017:M3\", \"title\": \"Hex Head Bolt M3 hex head bolt hex bolt hhcs hex head\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 4017:M5\"…"
+      }
+    },
+    {
+      "seq": 81,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5357,
+        "completion_tokens": 278,
+        "total_tokens": 6951,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 82,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "agent",
+      "kind": "decision",
+      "payload": {
+        "id": "envelope_dims",
+        "summary": "Flanged bushing envelope defaults (not in ledger DIMs; ACs only constrain bore fit + PCD)",
+        "values": {
+          "body_od_mm": 28.0,
+          "body_length_mm": 16.0,
+          "flange_od_mm": 48.0,
+          "flange_thickness_mm": 5.0,
+          "overall_length_mm": 21.0,
+          "bolt_pcd_mm": 34.0,
+          "bore_nominal_mm": 20.0,
+          "bolt_hole_d_mm": 4.5,
+          "bolt_count": 4
+        },
+        "basis": "body_od 28 common for d20 sleeve bushings (3 mm radial wall); flange_od 48 gives ~5 mm edge distance outside PCD34/Ø4.5 holes; flange_thk 5 and hub 16 are typical light-duty proportions; bore modeled at H7 nominal 20.0 (fit band via AC/fit_report)",
+        "stage": "verify",
+        "text": "Flanged bushing envelope defaults (not in ledger DIMs; ACs only constrain bore fit + PCD)",
+        "rationale": ""
+      }
+    },
+    {
+      "seq": 83,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "decision",
+          "payload": {
+            "id": "envelope_dims",
+            "summary": "Flanged bushing envelope defaults (not in ledger DIMs; ACs only constrain bore fit + PCD)",
+            "values": {
+              "body_od_mm": 28.0,
+              "body_length_mm": 16.0,
+              "flange_od_mm": 48.0,
+              "flange_thickness_mm": 5.0,
+              "overall_length_mm": 21.0,
+              "bolt_pcd_mm": 34.0,
+              "bore_nominal_mm": 20.0,
+              "bolt_hole_d_mm": 4.5,
+              "bolt_count": 4
+            },
+            "basis": "body_od 28 common for d20 sleeve bushings (3 mm radial wall); flange_od 48 gives ~5 mm edge distance outside PCD34/Ø4.5 holes; flange_thk 5 and hub 16 are typical light-duty proportions; bore modeled at H7 nominal 20.0 (fit band via AC/fit_report)"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 81, \"run_id\": \"gym_C1_open_xai:grok-4-5_s3\", \"kind\": \"decision\", \"ts\": \"2026-07-15T03:58:21Z\"}"
+      }
+    },
+    {
+      "seq": 84,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5710,
+        "completion_tokens": 37,
+        "total_tokens": 6239,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 85,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000018",
+        "tool": "new_part",
+        "kind": "tool",
+        "checkpoint_id": "03371ecb4a077341d9f5e7feaf6141b3",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 5,
+          "i": 4
+        },
+        "turn": 5
+      }
+    },
+    {
+      "seq": 86,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "new_part",
+        "args": {
+          "name": "flanged_bushing"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"name\": \"flanged_bushing\",\n  \"revision\": 0\n}"
+      }
+    },
+    {
+      "seq": 87,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5943,
+        "completion_tokens": 106,
+        "total_tokens": 6422,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 88,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 89,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "5dbf60487883f5582adcdbac4139789c",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 6,
+          "i": 5
+        },
+        "turn": 6
+      }
+    },
+    {
+      "seq": 90,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "add_feature",
+              "feature": {
+                "type": "cylinder",
+                "name": "Hub",
+                "params": {
+                  "radius": {
+                    "value": 14.0,
+                    "expr": null
+                  },
+                  "height": {
+                    "value": 16.0,
+                    "expr": null
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"revision\": 1,\n  \"body_count\": 1,\n  \"volume_mm3\": 9852.034561657594,\n  \"features\": [\n    {\n      \"id\": \"f1\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    }\n  ],\n  \"changes\": {\n    \"summary\": \"added 3 face(s) (+1 cylinder, +2 plane); volume 0.0->9852.0 mm^3 (+9852.0)\",\n    \"faces_delta\": 3,\n    \"bores_delta\": 0,\n    \"volume_delta_mm3\": 9852.0346\n  }\n}"
+      }
+    },
+    {
+      "seq": 91,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "65b6c43be5ff3fb118ff0ad306a121ed",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 6,
+          "i": 5
+        },
+        "turn": 6
+      }
+    },
+    {
+      "seq": 92,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6241,
+        "completion_tokens": 46,
+        "total_tokens": 6388,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 93,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "describe_part",
+        "args": {
+          "doc_id": "doc-cpp00000023"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"outline\": \"Part \\\"flanged_bushing4\\\"  bbox 28x28x16 mm  | 3 faces, 3 edges\\nFeatures (placement narrative, one line each):\\n  - f1 Hub [cylinder] (3 face(s)): on top face, centered 14 mm from -X edge / 14 mm from -Y edge\\nFlat faces by side: top=Fa08dcc, bottom=F8cbd5c\\nRefer to any face/edge by its sid (e.g. \\\"fillet the edge ...\\\") or expand one with hover(sid).\",\n  \"digest\": {\n    \"part\": \"flanged_bushing4\",\n    \"bbox_mm\": [\n      28.025229146268924,\n      28.00000020000001,\n      16.025229146268924\n    ],\n    \"faces\": 3,\n    \"edges\": 3,\n    \"symmetry\": null,\n    \"feature_groups\": [\n      {\n        \"id\": \"f1\",\n        \"name\": \"Hub\",\n        \"type\": \"cylinder\",\n        \"faces\": 3,\n        \"placement\": {\n          \"centroid\": [\n            0.0,\n            0.0,\n            0.0\n          ],\n          \"side\": \"top\",\n          \"offsets\": {\n            \"x\": {\n              \"from_min_mm\": 14.01,\n              \"from_max_mm\": 14.01\n            },\n            \"y\": {\n       …"
+      }
+    },
+    {
+      "seq": 94,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6789,
+        "completion_tokens": 149,
+        "total_tokens": 7518,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 95,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "preflight_ops",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "add_feature",
+              "feature": {
+                "type": "cylinder",
+                "name": "Flange",
+                "params": {
+                  "radius": {
+                    "value": 24.0,
+                    "expr": null
+                  },
+                  "height": {
+                    "value": 5.0,
+                    "expr": null
+                  },
+                  "origin": {
+                    "x": 0,
+                    "y": 0,
+                    "z": 10.5
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\"schema\": \"aicad.preflight/1\", \"id\": \"pf_67dd6b4bbea8\", \"target\": {\"doc_id\": \"doc-cpp00000023\", \"tool\": \"add_features\", \"ops_hash\": \"34119df03ad7f3f9\"}, \"verdict\": \"pass\", \"checks\": [{\"check\": \"refs_resolve\", \"result\": \"pass\", \"detail\": \"all refs resolve\", \"refs\": {}}, {\"check\": \"params_sane\", \"result\": \"pass\", \"detail\": \"parameters look sane\", \"refs\": {}}, {\"check\": \"rebuild_predict\", \"result\": \"pass\", \"detail\": \"all 2 feature(s) rebuild ok on clone\", \"refs\": {}}, {\"check\": \"downstream_impact\", \"result\": \"pass\", \"detail\": \"no downstream features affected\", \"refs\": {}}], \"predicted\": {\"feature_status\": [{\"id\": \"f1\", \"ok\": true, \"error\": null, \"warning\": null}, {\"id\": \"f2\", \"ok\": true, \"error\": null, \"warning\": null}], \"dof\": null, \"interference_delta\": null}, \"downstream\": [], \"advisory_items\": []}"
+      }
+    },
+    {
+      "seq": 96,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7223,
+        "completion_tokens": 125,
+        "total_tokens": 7607,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 97,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 98,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "5597d07c61f9523363b6a31d2e5e0ac2",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 9,
+          "i": 8
+        },
+        "turn": 9
+      }
+    },
+    {
+      "seq": 99,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "add_feature",
+              "feature": {
+                "type": "cylinder",
+                "name": "Flange",
+                "params": {
+                  "radius": {
+                    "value": 24.0,
+                    "expr": null
+                  },
+                  "height": {
+                    "value": 5.0,
+                    "expr": null
+                  },
+                  "origin": {
+                    "x": 0,
+                    "y": 0,
+                    "z": 10.5
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"revision\": 2,\n  \"body_count\": 1,\n  \"volume_mm3\": 15821.0606034782,\n  \"features\": [\n    {\n      \"id\": \"f1\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    },\n    {\n      \"id\": \"f2\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    }\n  ],\n  \"changes\": {\n    \"summary\": \"added 4 face(s) (+2 cylinder, +2 plane); volume 9852.0->15821.1 mm^3 (+5969.0)\",\n    \"faces_delta\": 4,\n    \"bores_delta\": 0,\n    \"volume_delta_mm3\": 5969.026\n  },\n  \"overlap_warnings\": {\n    \"summary\": \"1 overlapping pair(s) (0 boss_swallowed, 1 boss_overlap, 0 cut_overlap, 0 cut_into_boss); 0 dead feature(s); largest Hub<->Flange (boss_overlap) = 3078.8 mm^3\",\n    \"pairs\": [\n      {\n        \"a\": \"f1\",\n        \"a_name\": \"Hub\",\n        \"b\": \"f2\",\n        \"b_name\": \"Flange\",\n        \"kind\": \"boss_overlap\",\n        \"volume_mm3\": 3078.7608005179977\n      }\n    ],\n    \"dead_features\": []\n  }\n}"
+      }
+    },
+    {
+      "seq": 100,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "5b21d67427683ee198d777540d1dbe7c",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 9,
+          "i": 8
+        },
+        "turn": 9
+      }
+    },
+    {
+      "seq": 101,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7733,
+        "completion_tokens": 48,
+        "total_tokens": 8617,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 102,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "describe_part",
+        "args": {
+          "doc_id": "doc-cpp00000023"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"outline\": \"Part \\\"flanged_bushing4\\\"  bbox 48x48x16 mm  | 7 faces, 9 edges\\nFeatures (placement narrative, one line each):\\n  - f1 Hub [cylinder] (2 face(s)): on top face of f2, centered 24 mm from -X edge / 24 mm from -Y edge\\n  - f2 Flange [cylinder] (5 face(s)): on top face of f1, centered 24 mm from -X edge / 24 mm from -Y edge\\nFlat faces by side: top=F79be50, top=Fa08dcc, bottom=F76ee01, bottom=F8cbd5c\\nRefer to any face/edge by its sid (e.g. \\\"fillet the edge ...\\\") or expand one with hover(sid).\",\n  \"digest\": {\n    \"part\": \"flanged_bushing4\",\n    \"bbox_mm\": [\n      48.04100379740956,\n      48.04100379740956,\n      16.02939192484993\n    ],\n    \"faces\": 7,\n    \"edges\": 9,\n    \"symmetry\": null,\n    \"feature_groups\": [\n      {\n        \"id\": \"f1\",\n        \"name\": \"Hub\",\n        \"type\": \"cylinder\",\n        \"faces\": 2,\n        \"placement\": {\n          \"centroid\": [\n            0.0,\n            0.0,\n            0.0\n          ],\n          \"side\": \"top\",\n          \"off…"
+      }
+    },
+    {
+      "seq": 103,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8459,
+        "completion_tokens": 81,
+        "total_tokens": 9763,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 104,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 105,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "auto_checkpoint",
+      "payload": {
+        "trigger_tool": "add_features",
+        "doc_id": "doc-cpp00000023",
+        "via": "doc_checkpoint",
+        "checkpoint": "ckpt-000000001d"
+      }
+    },
+    {
+      "seq": 106,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "auto_checkpoint",
+        "outcome": "passed",
+        "reason": "checkpoint before add_features"
+      }
+    },
+    {
+      "seq": 107,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "1b26e8430500620cc936e90387872489",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 10,
+          "i": 0
+        },
+        "turn": 10
+      }
+    },
+    {
+      "seq": 108,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "4dc25fc223617c7214a3a9d0e9c8f1bc",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 11,
+          "i": 10
+        },
+        "turn": 11
+      }
+    },
+    {
+      "seq": 109,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "delete_feature",
+              "feature_id": "f2"
+            }
+          ]
+        },
+        "ok": false,
+        "result": "{\n  \"ok\": false,\n  \"error\": \"delete_feature: no feature ''\"\n}"
+      }
+    },
+    {
+      "seq": 110,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8575,
+        "completion_tokens": 66,
+        "total_tokens": 8659,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 111,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "preflight_ops",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "delete_feature",
+              "id": "f2"
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\"schema\": \"aicad.preflight/1\", \"id\": \"pf_9953514d964c\", \"target\": {\"doc_id\": \"doc-cpp00000023\", \"tool\": \"add_features\", \"ops_hash\": \"7c317606457b9106\"}, \"verdict\": \"pass\", \"checks\": [{\"check\": \"refs_resolve\", \"result\": \"pass\", \"detail\": \"all refs resolve\", \"refs\": {}}, {\"check\": \"params_sane\", \"result\": \"pass\", \"detail\": \"parameters look sane\", \"refs\": {}}, {\"check\": \"rebuild_predict\", \"result\": \"pass\", \"detail\": \"all 1 feature(s) rebuild ok on clone\", \"refs\": {}}, {\"check\": \"downstream_impact\", \"result\": \"pass\", \"detail\": \"no downstream features affected\", \"refs\": {}}], \"predicted\": {\"feature_status\": [{\"id\": \"f1\", \"ok\": true, \"error\": null, \"warning\": null}], \"dof\": null, \"interference_delta\": null}, \"downstream\": [], \"advisory_items\": []}"
+      }
+    },
+    {
+      "seq": 112,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8900,
+        "completion_tokens": 71,
+        "total_tokens": 8989,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 113,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 114,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "auto_checkpoint",
+      "payload": {
+        "trigger_tool": "add_features",
+        "doc_id": "doc-cpp00000023",
+        "via": "doc_checkpoint",
+        "checkpoint": "ckpt-000000001f"
+      }
+    },
+    {
+      "seq": 115,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "auto_checkpoint",
+        "outcome": "passed",
+        "reason": "checkpoint before add_features"
+      }
+    },
+    {
+      "seq": 116,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "e2ea8a700bf49459f27f9a8d1419eba0",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 12,
+          "i": 0
+        },
+        "turn": 12
+      }
+    },
+    {
+      "seq": 117,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "8dab7914f93e6259bef61845da1624b9",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 13,
+          "i": 12
+        },
+        "turn": 13
+      }
+    },
+    {
+      "seq": 118,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "delete_feature",
+              "id": "f2"
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"revision\": 3,\n  \"body_count\": 1,\n  \"volume_mm3\": 9852.034561657594,\n  \"features\": [\n    {\n      \"id\": \"f1\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    }\n  ],\n  \"changes\": {\n    \"summary\": \"removed 4 face(s); volume 15821.1->9852.0 mm^3 (-5969.0)\",\n    \"faces_delta\": -4,\n    \"bores_delta\": 0,\n    \"volume_delta_mm3\": -5969.026\n  }\n}"
+      }
+    },
+    {
+      "seq": 119,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "fe5a7d6f7d0ed73fe4d80c11d3084ed5",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 13,
+          "i": 12
+        },
+        "turn": 13
+      }
+    },
+    {
+      "seq": 120,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 9153,
+        "completion_tokens": 145,
+        "total_tokens": 9953,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 121,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "preflight_ops",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "add_feature",
+              "feature": {
+                "type": "cylinder",
+                "name": "Flange",
+                "params": {
+                  "radius": {
+                    "value": 24.0,
+                    "expr": null
+                  },
+                  "height": {
+                    "value": 5.0,
+                    "expr": null
+                  },
+                  "origin": {
+                    "x": 0,
+                    "y": 0,
+                    "z": -5
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\"schema\": \"aicad.preflight/1\", \"id\": \"pf_603fe19a0949\", \"target\": {\"doc_id\": \"doc-cpp00000023\", \"tool\": \"add_features\", \"ops_hash\": \"8ec00ed2e3766972\"}, \"verdict\": \"pass\", \"checks\": [{\"check\": \"refs_resolve\", \"result\": \"pass\", \"detail\": \"all refs resolve\", \"refs\": {}}, {\"check\": \"params_sane\", \"result\": \"pass\", \"detail\": \"parameters look sane\", \"refs\": {}}, {\"check\": \"rebuild_predict\", \"result\": \"pass\", \"detail\": \"all 2 feature(s) rebuild ok on clone\", \"refs\": {}}, {\"check\": \"downstream_impact\", \"result\": \"pass\", \"detail\": \"no downstream features affected\", \"refs\": {}}], \"predicted\": {\"feature_status\": [{\"id\": \"f1\", \"ok\": true, \"error\": null, \"warning\": null}, {\"id\": \"f2\", \"ok\": true, \"error\": null, \"warning\": null}], \"dof\": null, \"interference_delta\": null}, \"downstream\": [], \"advisory_items\": []}"
+      }
+    },
+    {
+      "seq": 122,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 9580,
+        "completion_tokens": 121,
+        "total_tokens": 9716,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 123,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 124,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "4d3962429734b38743482b5479eb6abc",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 15,
+          "i": 14
+        },
+        "turn": 15
+      }
+    },
+    {
+      "seq": 125,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "add_feature",
+              "feature": {
+                "type": "cylinder",
+                "name": "Flange",
+                "params": {
+                  "radius": {
+                    "value": 24.0,
+                    "expr": null
+                  },
+                  "height": {
+                    "value": 5.0,
+                    "expr": null
+                  },
+                  "origin": {
+                    "x": 0,
+                    "y": 0,
+                    "z": -5
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"revision\": 4,\n  \"body_count\": 1,\n  \"volume_mm3\": 15821.0606034782,\n  \"features\": [\n    {\n      \"id\": \"f1\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    },\n    {\n      \"id\": \"f2\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    }\n  ],\n  \"changes\": {\n    \"summary\": \"added 4 face(s) (+2 cylinder, +2 plane); volume 9852.0->15821.1 mm^3 (+5969.0)\",\n    \"faces_delta\": 4,\n    \"bores_delta\": 0,\n    \"volume_delta_mm3\": 5969.026\n  },\n  \"overlap_warnings\": {\n    \"summary\": \"1 overlapping pair(s) (0 boss_swallowed, 1 boss_overlap, 0 cut_overlap, 0 cut_into_boss); 0 dead feature(s); largest Hub<->Flange (boss_overlap) = 3078.8 mm^3\",\n    \"pairs\": [\n      {\n        \"a\": \"f1\",\n        \"a_name\": \"Hub\",\n        \"b\": \"f2\",\n        \"b_name\": \"Flange\",\n        \"kind\": \"boss_overlap\",\n        \"volume_mm3\": 3078.7608005179977\n      }\n    ],\n    \"dead_features\": []\n  }\n}"
+      }
+    },
+    {
+      "seq": 126,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "c9306d0e3a9db240ccc8d03038370904",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 15,
+          "i": 14
+        },
+        "turn": 15
+      }
+    },
+    {
+      "seq": 127,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10086,
+        "completion_tokens": 79,
+        "total_tokens": 11069,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 128,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "refs_resolve",
+        "outcome": "passed",
+        "reason": "all refs resolve"
+      }
+    },
+    {
+      "seq": 129,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "auto_checkpoint",
+      "payload": {
+        "trigger_tool": "add_features",
+        "doc_id": "doc-cpp00000023",
+        "via": "doc_checkpoint",
+        "checkpoint": "ckpt-0000000022"
+      }
+    },
+    {
+      "seq": 130,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "auto_checkpoint",
+        "outcome": "passed",
+        "reason": "checkpoint before add_features"
+      }
+    },
+    {
+      "seq": 131,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "d7e715207e3586e3f4ce8b9d011058ab",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 15,
+          "i": 0
+        },
+        "turn": 15
+      }
+    },
+    {
+      "seq": 132,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "3f1d774c6891109eabf20170fd5d7511",
+        "dedup": false,
+        "content_unchanged": true,
+        "msg_idx": null,
+        "call": {
+          "turn": 16,
+          "i": 15
+        },
+        "turn": 16
+      }
+    },
+    {
+      "seq": 133,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "add_features",
+        "args": {
+          "doc_id": "doc-cpp00000023",
+          "ops": [
+            {
+              "op": "delete_feature",
+              "id": "f2"
+            }
+          ]
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"doc_id\": \"doc-cpp00000023\",\n  \"revision\": 5,\n  \"body_count\": 1,\n  \"volume_mm3\": 9852.034561657594,\n  \"features\": [\n    {\n      \"id\": \"f1\",\n      \"ok\": true,\n      \"error\": null,\n      \"warning\": null\n    }\n  ],\n  \"changes\": {\n    \"summary\": \"removed 4 face(s); volume 15821.1->9852.0 mm^3 (-5969.0)\",\n    \"faces_delta\": -4,\n    \"bores_delta\": 0,\n    \"volume_delta_mm3\": -5969.026\n  }\n}"
+      }
+    },
+    {
+      "seq": 134,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "ai_vc_checkpoint",
+      "payload": {
+        "ok": true,
+        "doc_id": "doc-cpp00000023",
+        "tool": "add_features",
+        "kind": "tool",
+        "checkpoint_id": "8fc910f6555514724cb6f646af6755c1",
+        "dedup": false,
+        "content_unchanged": false,
+        "msg_idx": null,
+        "call": {
+          "turn": 16,
+          "i": 15
+        },
+        "turn": 16
+      }
+    },
+    {
+      "seq": 135,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10347,
+        "completion_tokens": 148,
+        "total_tokens": 10650,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 136,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "BUILD DL1: flanged bushing",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "done",
+        "handoff": {
+          "status": "done",
+          "summary": "auto-completed after 16 tool calls (budget=16, reason=max_iters); model did not emit a formal handoff envelope",
+          "outputs": {
+            "auto_complete": true,
+            "tool_calls": 16,
+            "wrote_ledger": true,
+            "productive_tools": [
+              "add_features",
+              "ledger_note"
+            ],
+            "reasoning_summary": "Turn ended without a formal handoff after productive tool work; synthesised a done handoff so the phase can exit."
+          }
+        },
+        "auto": true
+      }
+    },
+    {
+      "seq": 137,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T03:59:29Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 138,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "VERIFY DL1: run acceptance checks",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=low",
+        "role": "reviewer"
+      }
+    },
+    {
+      "seq": 139,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "VERIFY DL1: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": false,
+        "n_ops": 7
+      }
+    },
+    {
+      "seq": 140,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "deliver",
+        "entered": "2026-07-15T03:59:45Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 141,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "DELIVER DL1: part",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "simple_part",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=simple_part depth=0 risk=low",
+        "role": "reviewer"
+      }
+    },
+    {
+      "seq": 142,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "DELIVER DL1: part",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "simple_part",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": false,
+        "n_ops": 2
+      }
+    },
+    {
+      "seq": 143,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 144,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": "2026-07-15T03:59:53Z",
+        "exit_gate": "spec_audited_criteria_covered"
+      }
+    },
+    {
+      "seq": 145,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 146,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 147,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": "2026-07-15T03:59:53Z",
+        "exit_gate": "nodes_done_or_carded"
+      }
+    },
+    {
+      "seq": 148,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 149,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "battery_result",
+      "payload": {
+        "verdict": "FAIL",
+        "ok": false,
+        "detail": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "checks": [
+          {
+            "name": "check_sketch",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "dim_coverage",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "ecad_check_diff_impedance",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "ecad_check_impedance",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "ecad_run_erc",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "eval_check",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "groundedness",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "is_manifold",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "layout_coverage",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "measure_between",
+            "verdict": "FAIL",
+            "score": 0.0
+          },
+          {
+            "name": "measure_part",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "power_budget",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "query_geometry",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "req_join",
+            "verdict": "PASS",
+            "score": 1.0
+          },
+          {
+            "name": "unit_sanity",
+            "verdict": "PASS",
+            "score": 1.0
+          }
+        ],
+        "doc_id": "doc-cpp00000023",
+        "source": "run_verify_battery",
+        "evidence": {
+          "findings": [
+            {
+              "name": "check_sketch",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+            },
+            {
+              "name": "dim_coverage",
+              "severity": null,
+              "message": "no open drawing 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "severity": null,
+              "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+            },
+            {
+              "name": "ecad_check_impedance",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_run_erc",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "measure_between",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+            }
+          ],
+          "scores": {
+            "check_sketch": 0.0,
+            "dim_coverage": 0.0,
+            "ecad_check_diff_impedance": 0.0,
+            "ecad_check_impedance": 0.0,
+            "ecad_run_erc": 0.0,
+            "eval_check": 1.0,
+            "groundedness": 1.0,
+            "is_manifold": 1.0,
+            "layout_coverage": 1.0,
+            "measure_between": 0.0,
+            "measure_part": 1.0,
+            "power_budget": 1.0,
+            "query_geometry": 1.0,
+            "req_join": 1.0,
+            "unit_sanity": 1.0
+          }
+        }
+      }
+    },
+    {
+      "seq": 150,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "artifact",
+      "payload": {
+        "kind": "battery",
+        "id": "battery",
+        "path": "",
+        "stage": "verify",
+        "note": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "verdict": "FAIL",
+        "doc_id": "doc-cpp00000023"
+      }
+    },
+    {
+      "seq": 151,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "criterion_result",
+      "payload": {
+        "id": "BATTERY",
+        "result": "FAIL",
+        "check_tool": "verify_battery",
+        "pass_rule": "PASS",
+        "detail": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "evidence": {
+          "findings": [
+            {
+              "name": "check_sketch",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+            },
+            {
+              "name": "dim_coverage",
+              "severity": null,
+              "message": "no open drawing 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "severity": null,
+              "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+            },
+            {
+              "name": "ecad_check_impedance",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_run_erc",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "measure_between",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+            }
+          ],
+          "scores": {
+            "check_sketch": 0.0,
+            "dim_coverage": 0.0,
+            "ecad_check_diff_impedance": 0.0,
+            "ecad_check_impedance": 0.0,
+            "ecad_run_erc": 0.0,
+            "eval_check": 1.0,
+            "groundedness": 1.0,
+            "is_manifold": 1.0,
+            "layout_coverage": 1.0,
+            "measure_between": 0.0,
+            "measure_part": 1.0,
+            "power_budget": 1.0,
+            "query_geometry": 1.0,
+            "req_join": 1.0,
+            "unit_sanity": 1.0
+          }
+        }
+      }
+    },
+    {
+      "seq": 152,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "criterion_result",
+      "payload": {
+        "id": "AC1",
+        "result": "FAIL",
+        "check_tool": "fit_report",
+        "pass_rule": "clearance in [0,0.042]",
+        "detail": "check tool reported error: nothing measured yet",
+        "evidence": {
+          "ok": false,
+          "error": "nothing measured yet",
+          "source": "live"
+        }
+      }
+    },
+    {
+      "seq": 153,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "criterion_result",
+      "payload": {
+        "id": "AC2",
+        "result": "FAIL",
+        "check_tool": "fit_report",
+        "pass_rule": "clearance in [0,0.042]",
+        "detail": "check tool reported error: nothing measured yet",
+        "evidence": {
+          "ok": false,
+          "error": "nothing measured yet",
+          "source": "live"
+        }
+      }
+    },
+    {
+      "seq": 154,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "criterion_result",
+      "payload": {
+        "id": "AC3",
+        "result": "NOT-CHECKED",
+        "check_tool": "measure_part",
+        "pass_rule": "4 holes d4.5 on PCD34",
+        "detail": "pass_rule '4 holes d4.5 on PCD34' is not mechanically evaluable",
+        "evidence": {
+          "ok": true,
+          "doc_id": "doc-cpp00000023",
+          "mass": {
+            "body_count": 1,
+            "com": [
+              5.53892515955551e-16,
+              5.4596922308181163e-17,
+              1.8463083865185035e-16
+            ],
+            "inertia": [
+              5439.472482067244,
+              5.12198790492684e-13,
+              -1.7134880181401967e-13,
+              5.12198790492684e-13,
+              5439.4724820671645,
+              -4.555993346838677e-15,
+              -1.7134880181401967e-13,
+              -4.555993346838677e-15,
+              7579.170188283224
+            ],
+            "mass_g": 77.3384713090121,
+            "material": {
+              "density_g_cm3": 7.85
+            },
+            "principal_axes": [
+              [
+                0.0,
+                -1.0000000000000002,
+                -1.1102230246251565e-16
+              ],
+              [
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                -0.0,
+                -1.1102230246251565e-16,
+                1.0000000000000002
+              ]
+            ],
+            "principal_moments": [
+              5439.472482067166,
+              5439.472482067244,
+              7579.170188283226
+            ],
+            "volume_mm3": 9852.034561657594
+          },
+          "check": {
+            "issues": []
+          },
+          "source": "live"
+        }
+      }
+    },
+    {
+      "seq": 155,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "reviewer",
+      "kind": "criterion_result",
+      "payload": {
+        "id": "AC4",
+        "result": "FAIL",
+        "check_tool": "verify_battery",
+        "pass_rule": "PASS",
+        "detail": "soft_scores_zero=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "evidence": {
+          "source": "battery_result",
+          "doc_id": "doc-cpp00000023",
+          "verdict": "FAIL",
+          "ok": false,
+          "scores": {
+            "check_sketch": 0.0,
+            "dim_coverage": 0.0,
+            "ecad_check_diff_impedance": 0.0,
+            "ecad_check_impedance": 0.0,
+            "ecad_run_erc": 0.0,
+            "eval_check": 1.0,
+            "groundedness": 1.0,
+            "is_manifold": 1.0,
+            "layout_coverage": 1.0,
+            "measure_between": 0.0,
+            "measure_part": 1.0,
+            "power_budget": 1.0,
+            "query_geometry": 1.0,
+            "req_join": 1.0,
+            "unit_sanity": 1.0
+          },
+          "findings": [
+            {
+              "name": "check_sketch",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+            },
+            {
+              "name": "dim_coverage",
+              "severity": null,
+              "message": "no open drawing 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "severity": null,
+              "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+            },
+            {
+              "name": "ecad_check_impedance",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_run_erc",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "measure_between",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+            }
+          ],
+          "checks": [
+            {
+              "name": "check_sketch",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "dim_coverage",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_check_impedance",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_run_erc",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "eval_check",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "groundedness",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "is_manifold",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "layout_coverage",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "measure_between",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "measure_part",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "power_budget",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "query_geometry",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "req_join",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "unit_sanity",
+              "verdict": "PASS",
+              "score": 1.0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 156,
+      "ts": "2026-07-15T03:59:53Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "correct",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C1_open_xai:grok-4-5_s3",
+    "brief": {
+      "title": "Gym C1",
+      "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+      "success_criteria": []
+    },
+    "requirements": [
+      {
+        "req_id": "DL1/AC1",
+        "text": "bore is a sliding fit on the d20 h7 shaft",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL1/AC2",
+        "text": "sliding-fit clearance in band",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL1/AC3",
+        "text": "4xM4 clearance bolt circle on PCD 34",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL1/AC4",
+        "text": "geometry coherent",
+        "source": "manifest",
+        "status": "open"
+      }
+    ],
+    "decisions": [
+      {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.021",
+        "rationale": "fit_calc mean/interval clearance",
+        "actor": "SPECIFY DL1: flanged bushing",
+        "ts": "2026-07-15T03:56:03Z",
+        "clearance": 0.021,
+        "source_tool": "fit_calc"
+      },
+      {
+        "id": "envelope_dims",
+        "summary": "Flanged bushing envelope defaults (not in ledger DIMs; ACs only constrain bore fit + PCD)",
+        "values": {
+          "body_od_mm": 28.0,
+          "body_length_mm": 16.0,
+          "flange_od_mm": 48.0,
+          "flange_thickness_mm": 5.0,
+          "overall_length_mm": 21.0,
+          "bolt_pcd_mm": 34.0,
+          "bore_nominal_mm": 20.0,
+          "bolt_hole_d_mm": 4.5,
+          "bolt_count": 4
+        },
+        "basis": "body_od 28 common for d20 sleeve bushings (3 mm radial wall); flange_od 48 gives ~5 mm edge distance outside PCD34/Ø4.5 holes; flange_thk 5 and hub 16 are typical light-duty proportions; bore modeled at H7 nominal 20.0 (fit band via AC/fit_report)",
+        "stage": "verify",
+        "text": "Flanged bushing envelope defaults (not in ledger DIMs; ACs only constrain bore fit + PCD)",
+        "rationale": ""
+      }
+    ],
+    "dimensions": [
+      {
+        "name": "bore_diameter",
+        "value": "Ø20 H7 (+0.021/0)",
+        "driver": "mates d20 h7 shaft; sliding clearance 0.000-0.042 mm matches AC1/AC2",
+        "id": "bore_diameter"
+      },
+      {
+        "name": "bolt_hole_diameter",
+        "value": "Ø4.5 mm through ×4",
+        "driver": "M4 clearance bolt circle per AC3",
+        "id": "bolt_hole_diameter"
+      }
+    ],
+    "questions": [],
+    "stage_log": [
+      {
+        "stage": "intake",
+        "entered": "2026-07-15T03:55:15Z",
+        "exited": "2026-07-15T03:55:15Z",
+        "exit_gate": "manifest_valid"
+      },
+      {
+        "stage": "specify",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": "2026-07-15T03:59:53Z",
+        "exit_gate": "spec_audited_criteria_covered"
+      },
+      {
+        "stage": "plan",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "build",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": "2026-07-15T03:59:53Z",
+        "exit_gate": "nodes_done_or_carded"
+      },
+      {
+        "stage": "verify",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "deliver",
+        "entered": "2026-07-15T03:59:45Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "correct",
+        "entered": "2026-07-15T03:59:53Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "1 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "flanged bushing",
+              "description": "bushing with a d20 sliding-fit bore and a 4xM4 flange bolt circle",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "bore is a sliding fit on the d20 h7 shaft",
+                  "check": {
+                    "tool": "fit_report",
+                    "params_hint": {
+                      "nominal": 20,
+                      "hole": "H7"
+                    },
+                    "pass_rule": "clearance in [0,0.042]"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "sliding-fit clearance in band",
+                  "check": {
+                    "tool": "fit_report",
+                    "pass_rule": "clearance in [0,0.042]"
+                  }
+                },
+                {
+                  "id": "AC3",
+                  "text": "4xM4 clearance bolt circle on PCD 34",
+                  "check": {
+                    "tool": "measure_part",
+                    "pass_rule": "4 holes d4.5 on PCD34"
+                  }
+                },
+                {
+                  "id": "AC4",
+                  "text": "geometry coherent",
+                  "check": {
+                    "tool": "verify_battery",
+                    "pass_rule": "PASS"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "material 6061-T6 (machined bushing)",
+              "basis": "default machined",
+              "needs_confirm": false
+            }
+          ]
+        }
+      },
+      {
+        "kind": "battery",
+        "id": "battery",
+        "path": "",
+        "stage": "verify",
+        "note": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "verdict": "FAIL",
+        "doc_id": "doc-cpp00000023"
+      }
+    ],
+    "criterion_results": [
+      {
+        "id": "BATTERY",
+        "result": "FAIL",
+        "check_tool": "verify_battery",
+        "pass_rule": "PASS",
+        "detail": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "evidence": {
+          "findings": [
+            {
+              "name": "check_sketch",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+            },
+            {
+              "name": "dim_coverage",
+              "severity": null,
+              "message": "no open drawing 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "severity": null,
+              "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+            },
+            {
+              "name": "ecad_check_impedance",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_run_erc",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "measure_between",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+            }
+          ],
+          "scores": {
+            "check_sketch": 0.0,
+            "dim_coverage": 0.0,
+            "ecad_check_diff_impedance": 0.0,
+            "ecad_check_impedance": 0.0,
+            "ecad_run_erc": 0.0,
+            "eval_check": 1.0,
+            "groundedness": 1.0,
+            "is_manifold": 1.0,
+            "layout_coverage": 1.0,
+            "measure_between": 0.0,
+            "measure_part": 1.0,
+            "power_budget": 1.0,
+            "query_geometry": 1.0,
+            "req_join": 1.0,
+            "unit_sanity": 1.0
+          }
+        }
+      },
+      {
+        "id": "AC1",
+        "result": "FAIL",
+        "check_tool": "fit_report",
+        "pass_rule": "clearance in [0,0.042]",
+        "detail": "check tool reported error: nothing measured yet",
+        "evidence": {
+          "ok": false,
+          "error": "nothing measured yet",
+          "source": "live"
+        }
+      },
+      {
+        "id": "AC2",
+        "result": "FAIL",
+        "check_tool": "fit_report",
+        "pass_rule": "clearance in [0,0.042]",
+        "detail": "check tool reported error: nothing measured yet",
+        "evidence": {
+          "ok": false,
+          "error": "nothing measured yet",
+          "source": "live"
+        }
+      },
+      {
+        "id": "AC3",
+        "result": "NOT-CHECKED",
+        "check_tool": "measure_part",
+        "pass_rule": "4 holes d4.5 on PCD34",
+        "detail": "pass_rule '4 holes d4.5 on PCD34' is not mechanically evaluable",
+        "evidence": {
+          "ok": true,
+          "doc_id": "doc-cpp00000023",
+          "mass": {
+            "body_count": 1,
+            "com": [
+              5.53892515955551e-16,
+              5.4596922308181163e-17,
+              1.8463083865185035e-16
+            ],
+            "inertia": [
+              5439.472482067244,
+              5.12198790492684e-13,
+              -1.7134880181401967e-13,
+              5.12198790492684e-13,
+              5439.4724820671645,
+              -4.555993346838677e-15,
+              -1.7134880181401967e-13,
+              -4.555993346838677e-15,
+              7579.170188283224
+            ],
+            "mass_g": 77.3384713090121,
+            "material": {
+              "density_g_cm3": 7.85
+            },
+            "principal_axes": [
+              [
+                0.0,
+                -1.0000000000000002,
+                -1.1102230246251565e-16
+              ],
+              [
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                -0.0,
+                -1.1102230246251565e-16,
+                1.0000000000000002
+              ]
+            ],
+            "principal_moments": [
+              5439.472482067166,
+              5439.472482067244,
+              7579.170188283226
+            ],
+            "volume_mm3": 9852.034561657594
+          },
+          "check": {
+            "issues": []
+          },
+          "source": "live"
+        }
+      },
+      {
+        "id": "AC4",
+        "result": "FAIL",
+        "check_tool": "verify_battery",
+        "pass_rule": "PASS",
+        "detail": "soft_scores_zero=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+        "evidence": {
+          "source": "battery_result",
+          "doc_id": "doc-cpp00000023",
+          "verdict": "FAIL",
+          "ok": false,
+          "scores": {
+            "check_sketch": 0.0,
+            "dim_coverage": 0.0,
+            "ecad_check_diff_impedance": 0.0,
+            "ecad_check_impedance": 0.0,
+            "ecad_run_erc": 0.0,
+            "eval_check": 1.0,
+            "groundedness": 1.0,
+            "is_manifold": 1.0,
+            "layout_coverage": 1.0,
+            "measure_between": 0.0,
+            "measure_part": 1.0,
+            "power_budget": 1.0,
+            "query_geometry": 1.0,
+            "req_join": 1.0,
+            "unit_sanity": 1.0
+          },
+          "findings": [
+            {
+              "name": "check_sketch",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+            },
+            {
+              "name": "dim_coverage",
+              "severity": null,
+              "message": "no open drawing 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "severity": null,
+              "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+            },
+            {
+              "name": "ecad_check_impedance",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "ecad_run_erc",
+              "severity": null,
+              "message": "no open ECAD document 'doc-cpp00000023'"
+            },
+            {
+              "name": "measure_between",
+              "severity": null,
+              "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+            }
+          ],
+          "checks": [
+            {
+              "name": "check_sketch",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "dim_coverage",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_check_diff_impedance",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_check_impedance",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "ecad_run_erc",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "eval_check",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "groundedness",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "is_manifold",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "layout_coverage",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "measure_between",
+              "verdict": "FAIL",
+              "score": 0.0
+            },
+            {
+              "name": "measure_part",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "power_budget",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "query_geometry",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "req_join",
+              "verdict": "PASS",
+              "score": 1.0
+            },
+            {
+              "name": "unit_sanity",
+              "verdict": "PASS",
+              "score": 1.0
+            }
+          ]
+        }
+      }
+    ],
+    "features": [],
+    "geometry_specs": [],
+    "linkages": [],
+    "build_nodes": []
+  }
+}

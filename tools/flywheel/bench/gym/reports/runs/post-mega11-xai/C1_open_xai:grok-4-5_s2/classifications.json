@@ -1,0 +1,34 @@
+[
+  {
+    "failure_class": "incoherent_geometry",
+    "detail": "acceptance criteria failed: AC2, AC3, AC4",
+    "evidence_seqs": [
+      183
+    ],
+    "evidence": [
+      {
+        "seq": 183,
+        "kind": "artifact",
+        "actor": "reviewer",
+        "why": "verify_battery / AC check failed"
+      }
+    ]
+  },
+  {
+    "failure_class": "grind",
+    "detail": "3 attempts on '?' with no changed hypothesis",
+    "evidence_seqs": [
+      20,
+      87,
+      114
+    ],
+    "evidence": [
+      {
+        "seq": 20,
+        "kind": "agent_turn",
+        "actor": "INTAKE: build manifest",
+        "why": "3 identical attempts (anti-grind)"
+      }
+    ]
+  }
+]

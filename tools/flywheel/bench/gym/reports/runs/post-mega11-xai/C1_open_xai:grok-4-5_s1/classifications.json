@@ -1,0 +1,34 @@
+[
+  {
+    "failure_class": "incoherent_geometry",
+    "detail": "acceptance criteria failed: AC2, AC3",
+    "evidence_seqs": [
+      159
+    ],
+    "evidence": [
+      {
+        "seq": 159,
+        "kind": "artifact",
+        "actor": "VERIFY DL1: run acceptance checks",
+        "why": "verify_battery / AC check failed"
+      }
+    ]
+  },
+  {
+    "failure_class": "grind",
+    "detail": "3 attempts on '?' with no changed hypothesis",
+    "evidence_seqs": [
+      27,
+      73,
+      95
+    ],
+    "evidence": [
+      {
+        "seq": 27,
+        "kind": "agent_turn",
+        "actor": "SPECIFY DL1: flanged bushing",
+        "why": "3 identical attempts (anti-grind)"
+      }
+    ]
+  }
+]

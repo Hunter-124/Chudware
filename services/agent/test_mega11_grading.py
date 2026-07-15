@@ -716,3 +716,265 @@ def test_end_to_end_ac_sweep_mixed(monkeypatch):
     }
     for ac in ("AC1", "AC2", "AC3", "AC4", "AC5", "AC6", "AC7", "AC8", "AC9"):
         assert ac in ids, (ac, ids)
+
+
+# ---------------------------------------------------------------------------
+# Live mega-11 primary defects (RelievedWildebeest)
+# ---------------------------------------------------------------------------
+
+
+def test_live_ac7_text_wrapped_fw_build_json():
+    """AC7 graded NOT-CHECKED when ledger stored JSON string under text."""
+    from services.agent.reviewer_exec import PASS, evaluate_pass_rule
+
+    # Exact live shape (truncated stderr common).
+    evidence = {
+        "text": (
+            '{\n  "success": true,\n'
+            '  "elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf",\n'
+            '  "map_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.map",\n'
+            '  "stderr": "-- The C compiler identification is GNU 15.2.0'
+        ),
+        "source": "ledger_tool_call",
+    }
+    v, d = evaluate_pass_rule("returncode==0", evidence)
+    assert v == PASS, (v, d)
+    assert "elf" in d.lower()
+
+
+def test_live_ac7_artifact_fallback(monkeypatch):
+    """When live fw_build fails, grade from ledger artifact with elf_path."""
+    from services.agent import reviewer_exec as re
+
+    monkeypatch.setattr(
+        re, "_resolve_fn",
+        lambda tool: (lambda **kw: {"ok": False, "error": "project_id required"})
+        if tool == "fw_build" else None,
+    )
+    led = _MemLedger()
+    led.append("builder", "artifact", {
+        "ac": "AC7", "success": True,
+        "elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf",
+        "verdict": "PASS",
+    })
+    # Also seed a text-wrapped prior tool_call that normalizes to success.
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "fw_build",
+        "ok": True,
+        "result": (
+            '{"success": true, '
+            '"elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf", '
+            '"returncode": 0}'
+        ),
+    })
+    manifest = {
+        "deliverables": [{
+            "id": "DL4",
+            "acceptance_criteria": [{
+                "id": "AC7",
+                "check": {"tool": "fw_build", "pass_rule": "returncode==0"},
+            }],
+        }],
+    }
+    results = re.run_acceptance_checks(manifest, led)
+    assert results["AC7"] == re.PASS, results
+
+
+def test_live_ac2_volume_only_measure_part():
+    """AC2: measure_part mass.volume_mm3 alone must grade (live 170198 mm³)."""
+    from services.agent.reviewer_exec import PASS, FAIL, evaluate_pass_rule
+
+    v, d = evaluate_pass_rule(
+        "bay envelope >= board outline",
+        {
+            "ok": True,
+            "doc_id": "doc-cpp0000000b",
+            "mass": {
+                "body_count": 1,
+                "mass_g": 1336.06,
+                "volume_mm3": 170198.92360088055,
+            },
+            "check": {"issues": []},
+            "source": "live",
+        },
+    )
+    assert v == PASS, (v, d)
+
+    v2, d2 = evaluate_pass_rule(
+        "bay envelope >= board outline",
+        {"ok": True, "mass": {"volume_mm3": 100.0}},
+    )
+    assert v2 == FAIL, (v2, d2)
+
+
+def test_live_ac5_does_not_pass_cad_doc_id(monkeypatch):
+    """AC5 ecad_simulate must not inherit mechanical CAD doc_id."""
+    from services.agent import reviewer_exec as re
+
+    seen = {}
+
+    def _fake_sim(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "V(3V3)": 3.30, "analysis": "op"}
+
+    monkeypatch.setattr(
+        re, "_resolve_fn",
+        lambda tool: _fake_sim if tool == "ecad_simulate" else None,
+    )
+    led = _MemLedger()
+    manifest = {
+        "deliverables": [{
+            "id": "DL3",
+            "acceptance_criteria": [{
+                "id": "AC5",
+                "check": {
+                    "tool": "ecad_simulate",
+                    "params_hint": {"analysis": "op", "probes": ["V(3V3)"]},
+                    "pass_rule": "V(3V3) in [3.135, 3.465]",
+                },
+            }],
+        }],
+    }
+    results = re.run_acceptance_checks(
+        manifest, led, doc_id="doc-cpp0000000b",
+    )
+    assert results["AC5"] == re.PASS, results
+    assert "doc_id" not in seen or seen.get("doc_id") in (None, ""), seen
+
+
+def test_live_ac5_threads_schematic_doc_id_from_ledger(monkeypatch):
+    """AC5: when mechanical CAD doc is mission current, use ledger sch doc_id."""
+    from services.agent import reviewer_exec as re
+
+    seen = {}
+
+    def _fake_sim(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "V(3V3)": 3.301, "analysis": "op"}
+
+    monkeypatch.setattr(
+        re, "_resolve_fn",
+        lambda tool: _fake_sim if tool == "ecad_simulate" else None,
+    )
+    led = _MemLedger()
+    # Live mega-11: schematic session id is a hex string, not doc-cpp*.
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "ecad_new_schematic",
+        "ok": True,
+        "result": (
+            '{"ok":true,"doc_id":"84b59c77b1b0","kind":"sch",'
+            '"name":"flight_computer"}'
+        ),
+    })
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "ecad_place_symbol",
+        "ok": True,
+        "result": '{"ok":true,"doc_id":"84b59c77b1b0","ref":"U1"}',
+    })
+    manifest = {
+        "deliverables": [{
+            "id": "DL3",
+            "acceptance_criteria": [{
+                "id": "AC5",
+                "check": {
+                    "tool": "ecad_simulate",
+                    "params_hint": {"analysis": "op", "probes": ["V(3V3)"]},
+                    "pass_rule": "V(3V3) in [3.135, 3.465]",
+                },
+            }],
+        }],
+    }
+    results = re.run_acceptance_checks(
+        manifest, led, doc_id="doc-cpp0000000b",
+    )
+    assert results["AC5"] == re.PASS, (results, seen)
+    assert seen.get("doc_id") == "84b59c77b1b0", seen
+
+
+def test_live_ac2_measure_part_from_ledger_when_live_misses(monkeypatch):
+    """AC2: consume measure_part/query_geometry volume evidence from ledger."""
+    from services.agent import reviewer_exec as re
+
+    # Live tool returns no volume; ledger has the successful measure.
+    monkeypatch.setattr(
+        re, "_resolve_fn",
+        lambda tool: (
+            (lambda **kw: {"ok": True, "doc_id": "doc-cpp0000000b", "mass": {}})
+            if tool == "measure_part" else None
+        ),
+    )
+    led = _MemLedger()
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "measure_part",
+        "ok": True,
+        "result": {
+            "ok": True,
+            "doc_id": "doc-cpp0000000b",
+            "mass": {"body_count": 1, "volume_mm3": 170198.92, "mass_g": 1336.0},
+        },
+    })
+    manifest = {
+        "deliverables": [{
+            "id": "DL1",
+            "acceptance_criteria": [{
+                "id": "AC2",
+                "check": {
+                    "tool": "measure_part",
+                    "pass_rule": "bay envelope >= board outline",
+                },
+            }],
+        }],
+    }
+    results = re.run_acceptance_checks(
+        manifest, led, doc_id="doc-cpp0000000b",
+    )
+    assert results["AC2"] == re.PASS, results
+
+
+def test_live_ac7_injects_project_id_from_ledger(monkeypatch):
+    """AC7 live re-call gets project_id from ledger when params_hint lacks it."""
+    from services.agent import reviewer_exec as re
+
+    seen = {}
+
+    def _fake_fw(**kwargs):
+        seen.update(kwargs)
+        if not kwargs.get("project_id"):
+            return {"ok": False, "error": "project_id required", "success": False}
+        return {
+            "success": True, "returncode": 0,
+            "elf_path": f"/tmp/{kwargs['project_id']}/firmware.elf",
+        }
+
+    monkeypatch.setattr(
+        re, "_resolve_fn",
+        lambda tool: _fake_fw if tool == "fw_build" else None,
+    )
+    led = _MemLedger()
+    led.append("builder", "agent_turn", {
+        "event": "tool_call",
+        "tool": "fw_new_project",
+        "ok": True,
+        "args": {"mcu_family": "stm32f4"},
+        "result": {"ok": True, "project_id": "bc70b9ea15b4"},
+    })
+    manifest = {
+        "deliverables": [{
+            "id": "DL4",
+            "acceptance_criteria": [{
+                "id": "AC7",
+                "check": {
+                    "tool": "fw_build",
+                    "params_hint": {"leg": "firmware"},
+                    "pass_rule": "returncode==0",
+                },
+            }],
+        }],
+    }
+    results = re.run_acceptance_checks(manifest, led)
+    assert results["AC7"] == re.PASS, (results, seen)
+    assert seen.get("project_id") == "bc70b9ea15b4", seen

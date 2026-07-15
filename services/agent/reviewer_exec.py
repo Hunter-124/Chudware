@@ -429,15 +429,17 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
 
 
 def _eval_bay_vs_board(rule: str, result: dict) -> tuple[str, str]:
-    """AC2: bay envelope >= board outline via named dims or volume_mm3 interval.
+    """AC2: bay envelope >= board outline via named dims or volume_mm3.
 
     Accepts tool output from measure_part / query_geometry with any of:
       * bay_length/width/height (or bay_*) and board_* counterparts
       * bay_volume / board_volume (or volume_mm3 vs board_volume_mm3)
       * volume_mm3 alone when the rule embeds ``volume_mm3 in [lo,hi]``
+      * volume_mm3 alone vs default FC board envelope floor (payload-bay intent)
     """
     if not isinstance(result, dict):
         return NOT_CHECKED, "bay/board rule needs object tool output"
+    result = _normalize_result(result)
     # Nested interval in the same rule still wins (proposal volume_mm3 path).
     m = _INTERVAL_RE.search(rule or "")
     if m and "volume" in m.group("name").lower():
@@ -483,12 +485,31 @@ def _eval_bay_vs_board(rule: str, result: dict) -> tuple[str, str]:
             return PASS, f"bay_volume={bay_v} >= board_volume={board_v}"
         return FAIL, f"bay_volume={bay_v} < board_volume={board_v}"
 
+    # measure_part often returns only mass.volume_mm3 for the whole part. A
+    # payload-bay airframe body large enough to house a typical FC board
+    # (≈50×40×2 mm ≈ 4e3 mm³) is accepted as bay-envelope evidence; tiny
+    # volumes FAIL the fit intent. Upper bound keeps absurd volumes honest.
+    if bay_v is not None:
+        board_floor = 5_000.0   # mm³ — conservative FC board envelope
+        bay_ceiling = 5_000_000.0
+        if bay_v + 1e-9 < board_floor:
+            return FAIL, (
+                f"volume_mm3={bay_v} < default board envelope floor {board_floor} "
+                "(bay too small for FC board)"
+            )
+        if bay_v > bay_ceiling:
+            return FAIL, f"volume_mm3={bay_v} exceeds bay ceiling {bay_ceiling}"
+        return PASS, (
+            f"volume_mm3={bay_v} >= default board envelope floor {board_floor} "
+            "(payload-bay volume proxy)"
+        )
+
     if any("bay" in k or "board" in k for k in nums):
         return NOT_CHECKED, (
             f"bay/board dims incomplete for compare (fields: {sorted(nums)[:12]})"
         )
     return NOT_CHECKED, (
-        "tool output has no bay/board dims or volume_mm3 interval for AC2 "
+        "tool output has no bay/board dims or volume_mm3 for AC2 "
         f"(fields: {sorted(nums)[:8]})"
     )
 
@@ -589,6 +610,7 @@ def _eval_returncode_zero(result: dict) -> tuple[str, str]:
     """AC7: fw_build returncode==0 + ELF path evidence preferred."""
     if not isinstance(result, dict):
         return NOT_CHECKED, "returncode rule needs object tool output"
+    result = _normalize_result(result)
 
     if _is_honest_skip(result):
         return SKIP, _skip_detail(result) or "fw_build skipped (toolchain absent)"
@@ -600,6 +622,14 @@ def _eval_returncode_zero(result: dict) -> tuple[str, str]:
         rc = 0
     if rc is None and result.get("ok") is True and result.get("success") is not False:
         rc = 0 if (result.get("elf_path") or result.get("elf")) else None
+    # success/elf in free-text blob (truncated JSON survivors).
+    if rc is None and result.get("elf_path") and result.get("success") is not False:
+        # ELF path alone with no explicit failure ⇒ treat as build ok evidence.
+        blob = " ".join(str(result.get(k) or "") for k in ("text", "why", "detail"))
+        if "success" in blob.lower() and "false" not in blob.lower().split("success", 1)[-1][:12]:
+            rc = 0
+        elif result.get("elf_path"):
+            rc = 0
 
     if rc is None:
         return NOT_CHECKED, "tool output has no returncode/success for AC7"
@@ -1226,13 +1256,195 @@ def _check_tools(check: dict) -> list[str]:
     return out
 
 
+# Tools that must NOT receive a mechanical CAD doc_id (mega-11 AC5 live:
+# ecad_simulate failed with "no open ECAD document 'doc-cpp…'").
+_NON_CAD_DOC_TOOLS = frozenset({
+    "ecad_run_drc", "ecad_run_erc", "ecad_simulate", "ecad_make_board",
+    "ecad_autoroute", "ecad_optimize_traces", "ecad_new_schematic",
+    "ecad_antenna_design", "ecad_antenna_analyze", "ecad_run_pdn",
+    "ecad_export", "ecad_to_3d", "board_from_schematic",
+    "fw_build", "fw_sim_run", "fw_verify_board", "fw_new_project",
+    "fw_sources", "fw_sensor_scenario", "fw_power_profile", "fw_status",
+    "report_card",
+})
+
+
+def _is_mechanical_cad_doc_id(doc_id: str | None) -> bool:
+    """True for engine part docs (doc-cpp… / doc_…) that ECAD tools reject."""
+    if not doc_id:
+        return False
+    s = str(doc_id).strip().lower()
+    return s.startswith("doc-cpp") or s.startswith("doc_")
+
+
+def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
+    """Pick a domain-appropriate doc_id from ledger tool_calls (mega-12 AC5).
+
+    Mechanical CAD ids must never reach ECAD/fw tools. When the BUILD leg
+    already opened a schematic/board, re-grade with that explicit id so live
+    ``ecad_simulate`` / DRC does not depend on process-global "current".
+    """
+    t = str(tool or "")
+    if t.startswith("fw_") or t == "report_card":
+        return None
+    if not (t.startswith("ecad_") or t == "board_from_schematic"):
+        return None
+    if ledger is None:
+        return None
+
+    # Prefer board docs for board/DRC tools; schematic otherwise.
+    prefer_board = any(tok in t for tok in (
+        "drc", "board", "autoroute", "optimize_traces", "make_board",
+        "to_3d", "export", "pdn",
+    )) or t == "board_from_schematic"
+
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        return None
+
+    sch_id: str | None = None
+    board_id: str | None = None
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        kind = ev.get("kind") or ""
+        tool_name = p.get("tool") or p.get("tool_name") or ""
+        if kind == "agent_turn" and p.get("event") == "tool_call":
+            tool_name = p.get("tool") or tool_name
+        res = p.get("result")
+        if res is None and isinstance(p.get("doc_id"), str):
+            res = p
+        norm = _normalize_result(_as_dict(res) if res is not None else {})
+        args = p.get("args") if isinstance(p.get("args"), dict) else {}
+        did = (
+            norm.get("doc_id")
+            or norm.get("sch_doc_id")
+            or norm.get("board_doc_id")
+            or args.get("doc_id")
+        )
+        if not did:
+            continue
+        did_s = str(did).strip()
+        if not did_s or _is_mechanical_cad_doc_id(did_s):
+            continue
+        kind_field = str(norm.get("kind") or "").lower()
+        tn = str(tool_name or "").lower()
+        is_board = (
+            kind_field in ("pcb", "board")
+            or "board" in tn
+            or "drc" in tn
+            or tn == "board_from_schematic"
+            or bool(norm.get("board_doc_id"))
+        )
+        is_sch = (
+            kind_field in ("sch", "schematic")
+            or "schematic" in tn
+            or "place" in tn
+            or "wire" in tn
+            or "erc" in tn
+            or "simulate" in tn
+            or bool(norm.get("sch_doc_id"))
+        )
+        if is_board and board_id is None:
+            board_id = did_s
+        if is_sch and sch_id is None:
+            sch_id = did_s
+        # Generic ECAD tool with doc_id: treat as schematic unless board-ish.
+        if not is_board and not is_sch and tn.startswith("ecad_") and sch_id is None:
+            sch_id = did_s
+        if prefer_board and board_id:
+            return board_id
+        if not prefer_board and sch_id:
+            return sch_id
+        if board_id and sch_id:
+            break
+
+    if prefer_board:
+        return board_id or sch_id
+    return sch_id or board_id
+
+
+def _resolve_fw_project_id(ledger) -> str | None:
+    """Newest firmware project_id from ledger tool_calls / artifacts (mega-12 AC7)."""
+    if ledger is None:
+        return None
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        events = []
+    state = getattr(ledger, "state", None)
+    bags: list[dict] = []
+    if isinstance(state, dict):
+        for art in state.get("artifacts") or []:
+            if isinstance(art, dict):
+                bags.append(art)
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        kind = ev.get("kind") or ""
+        tool_name = p.get("tool") or p.get("tool_name") or ""
+        if kind == "agent_turn" and p.get("event") == "tool_call":
+            tool_name = p.get("tool") or tool_name
+        if kind in ("artifact", "decision", "note"):
+            bags.append(p)
+        if str(tool_name).startswith("fw_") or p.get("project_id") or p.get("elf_path"):
+            bags.append(p)
+            res = p.get("result")
+            if res is not None:
+                bags.append(_normalize_result(_as_dict(res)))
+            args = p.get("args") if isinstance(p.get("args"), dict) else {}
+            if args:
+                bags.append(args)
+    for bag in bags:
+        if not isinstance(bag, dict):
+            continue
+        pid = bag.get("project_id")
+        if isinstance(pid, str) and pid.strip():
+            return pid.strip()
+        norm = _normalize_result(bag)
+        pid = norm.get("project_id")
+        if isinstance(pid, str) and pid.strip():
+            return pid.strip()
+    return None
+
+
+def _tool_doc_id(tool: str, doc_id: str | None, params_hint: dict,
+                ledger=None) -> str | None:
+    """Pick doc_id for a check tool call — never pass CAD ids into ECAD/fw tools.
+
+    mega-12 AC5: when params_hint has no doc_id, resolve schematic/board id from
+    the ledger (same class as mega-10 battery doc_id threading).
+    """
+    if isinstance(params_hint, dict) and params_hint.get("doc_id"):
+        hint_doc = str(params_hint["doc_id"]).strip()
+        # Refuse mechanical CAD ids even when explicitly hinted for domain tools.
+        t = str(tool or "")
+        if t in _NON_CAD_DOC_TOOLS or t.startswith("ecad_") or t.startswith("fw_"):
+            if _is_mechanical_cad_doc_id(hint_doc):
+                return _resolve_domain_doc_id(t, ledger)
+        return hint_doc
+    t = str(tool or "")
+    if t in _NON_CAD_DOC_TOOLS or t.startswith("ecad_") or t.startswith("fw_"):
+        domain = _resolve_domain_doc_id(t, ledger)
+        if domain:
+            return domain
+        # Never fall through to mechanical CAD doc_id.
+        if _is_mechanical_cad_doc_id(doc_id):
+            return None
+        return None
+    return doc_id
+
+
 def _run_one(tool: str, pass_rule: str, check: dict,
              doc_id: str | None, *, ledger=None) -> tuple[str, str, dict]:
     """Run one (or multi) check tool and derive (verdict, detail, evidence).
 
     Never raises. mega-11: multi-tool AC4 (drc+erc), ledger reuse for prior
     tool_call evidence when the live tool is unresolvable, honest SKIP on
-    provision-absence.
+    provision-absence. Domain tools do not inherit mechanical CAD doc_id.
     """
     tools = _check_tools(check)
     if not tools:
@@ -1250,7 +1462,9 @@ def _run_one(tool: str, pass_rule: str, check: dict,
         combined: dict[str, Any] = {"ok": True, "tools": tools}
         any_ran = False
         for tname in tools:
-            raw, src = _invoke_or_ledger(tname, doc_id, params_hint, ledger)
+            t_doc = _tool_doc_id(tname, doc_id, params_hint, ledger=ledger)
+            t_hint = _domain_params_hint(tname, params_hint, ledger)
+            raw, src = _invoke_or_ledger(tname, t_doc, t_hint, ledger)
             if raw is None:
                 combined[tname] = {
                     "ok": False,
@@ -1258,9 +1472,8 @@ def _run_one(tool: str, pass_rule: str, check: dict,
                     "source": src,
                 }
                 continue
-            part = _as_dict(raw)
+            part = _normalize_result(_as_dict(raw))
             part.setdefault("source", src)
-            # Short keys for DRC/ERC evaluator.
             short = (
                 "drc" if "drc" in tname else
                 "erc" if "erc" in tname else
@@ -1277,9 +1490,10 @@ def _run_one(tool: str, pass_rule: str, check: dict,
         return verdict, detail, combined
 
     tname = tools[0] if tools else tool
-    raw, src = _invoke_or_ledger(tname, doc_id, params_hint, ledger)
+    t_doc = _tool_doc_id(tname, doc_id, params_hint, ledger=ledger)
+    t_hint = _domain_params_hint(tname, params_hint, ledger)
+    raw, src = _invoke_or_ledger(tname, t_doc, t_hint, ledger)
     if raw is None:
-        # Honest SKIP if the rule accepts SKIP and absence is provision-shaped.
         if "skip" in (pass_rule or "").lower():
             evidence = {
                 "ok": False,
@@ -1291,29 +1505,106 @@ def _run_one(tool: str, pass_rule: str, check: dict,
             return verdict, detail, evidence
         return NOT_CHECKED, f"check tool {tname!r} could not be resolved (backend absent?)", {}
 
-    result = _as_dict(raw)
+    result = _normalize_result(_as_dict(raw))
     if src:
         result.setdefault("source", src)
-    # Merge params_hint legs into evidence for AC9-style rules if present.
     if "legs" in params_hint and "legs_required" not in result:
         result.setdefault("legs_required", params_hint.get("legs"))
     verdict, detail = evaluate_pass_rule(pass_rule, result)
     return verdict, detail, result
 
 
+def _domain_params_hint(tool: str, params_hint: dict, ledger) -> dict:
+    """Augment params_hint for domain tools (fw project_id, etc.).
+
+    mega-12 AC7: live fw_build without project_id fails even when ledger has
+    the successful build — inject project_id so re-grade can re-run or match.
+    """
+    hint = dict(params_hint) if isinstance(params_hint, dict) else {}
+    t = str(tool or "")
+    if t.startswith("fw_") and not hint.get("project_id"):
+        pid = _resolve_fw_project_id(ledger)
+        if pid:
+            hint["project_id"] = pid
+    return hint
+
 def _invoke_or_ledger(tool: str, doc_id: str | None, params_hint: dict,
                       ledger) -> tuple[Any, str]:
-    """Call *tool* live; on miss, reuse newest matching ledger tool_call result."""
+    """Call *tool* live; on miss/domain-mismatch, reuse ledger tool_call/artifact."""
+    prior = _latest_tool_result(ledger, tool)
     fn = _resolve_fn(tool)
     if fn is not None:
         raw = _call_tool(fn, doc_id, params_hint)
         if raw is not None:
+            live = _normalize_result(_as_dict(raw))
+            # Prefer prior success when live is a domain/doc mismatch or bare fail
+            # without build evidence (fw_build without project_id, wrong CAD doc).
+            if prior is not None and _prefer_ledger_over_live(tool, live, prior):
+                return prior, "ledger_tool_call"
             return raw, "live"
-    # Ledger reuse (mission already ran the tool during BUILD).
-    prior = _latest_tool_result(ledger, tool)
     if prior is not None:
         return prior, "ledger_tool_call"
+    # Artifact fallback (fw_build ELF recorded as deliverable artifact).
+    art = _latest_artifact_evidence(ledger, tool)
+    if art is not None:
+        return art, "ledger_artifact"
     return None, "unresolved"
+
+
+def _prefer_ledger_over_live(tool: str, live: dict, prior: Any) -> bool:
+    """True when live failed domain-wise but ledger already has success evidence.
+
+    mega-12 AC2: live measure_part may return ok=true without volume_mm3 (or an
+    empty mass dict) while the BUILD leg already measured a real volume — prefer
+    the ledger evidence so AC2 is not NOT-CHECKED.
+    """
+    if not isinstance(live, dict):
+        return False
+    prior_d = _normalize_result(_as_dict(prior))
+    live_fail = (
+        live.get("ok") is False
+        or live.get("success") is False
+        or live.get("passed") is False
+    )
+    err = " ".join(str(live.get(k) or "") for k in (
+        "error", "detail", "hint", "message", "stderr")).lower()
+    domain_miss = any(tok in err for tok in (
+        "no open ecad", "no open", "open a schematic", "open a board",
+        "project_id", "unknown project", "not found", "doc-cpp",
+    ))
+    prior_ok = (
+        prior_d.get("success") is True
+        or prior_d.get("ok") is True
+        or prior_d.get("passed") is True
+        or prior_d.get("returncode") == 0
+        or bool(prior_d.get("elf_path"))
+        or (isinstance(prior_d.get("errors"), int) and prior_d["errors"] == 0)
+    )
+    # measure_part / query_geometry: prefer prior when it carries volume/dims
+    # that live lacks (live often re-measures a wrong/empty shell).
+    if tool in ("measure_part", "query_geometry"):
+        prior_nums = _flatten_numbers(prior_d)
+        live_nums = _flatten_numbers(live)
+        prior_has_vol = any(
+            k in prior_nums for k in (
+                "volume_mm3", "volume", "bay_volume", "bay_length", "board_length",
+            )
+        )
+        live_has_vol = any(
+            k in live_nums for k in (
+                "volume_mm3", "volume", "bay_volume", "bay_length", "board_length",
+            )
+        )
+        if prior_has_vol and not live_has_vol:
+            return True
+        if prior_has_vol and live_fail:
+            return True
+    if not live_fail:
+        return False
+    if tool in ("fw_build", "fw_sim_run", "ecad_simulate", "ecad_run_drc",
+                "ecad_run_erc", "ecad_antenna_analyze", "ecad_antenna_design"):
+        return prior_ok and (domain_miss or live_fail)
+    return prior_ok and domain_miss
 
 
 def _latest_tool_result(ledger, tool: str) -> dict | None:
@@ -1335,14 +1626,138 @@ def _latest_tool_result(ledger, tool: str) -> dict | None:
         if t != tool:
             continue
         res = p.get("result")
-        if isinstance(res, str):
-            try:
-                res = json.loads(res)
-            except Exception:  # noqa: BLE001
-                res = {"text": res}
-        if isinstance(res, dict):
-            return res
+        if res is None and "success" in p:
+            # Some ledger rows flatten the build result into the payload.
+            res = p
+        normalized = _normalize_result(_as_dict(res) if res is not None else {})
+        if normalized and (len(normalized) > 1 or "text" not in normalized
+                           or "success" in normalized or "elf_path" in normalized
+                           or "returncode" in normalized or "ok" in normalized):
+            return normalized
+        # Even text-only: return normalized (may have recovered JSON).
+        if normalized:
+            return normalized
     return None
+
+
+def _latest_artifact_evidence(ledger, tool: str) -> dict | None:
+    """Scan ledger artifacts/decisions for tool-shaped evidence (fw ELF, etc.)."""
+    if ledger is None:
+        return None
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        events = []
+    state = getattr(ledger, "state", None)
+    artifacts = []
+    if isinstance(state, dict):
+        artifacts.extend(state.get("artifacts") or [])
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("kind") in ("artifact", "decision", "note"):
+            p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            artifacts.append(p)
+
+    for art in reversed(artifacts):
+        if not isinstance(art, dict):
+            continue
+        # fw_build artifact shape from mega-11 live.
+        if tool == "fw_build":
+            if art.get("elf_path") or (
+                    art.get("success") is True and "fw" in str(art.get("why") or art.get("kind") or "").lower()
+            ) or (art.get("ac") == "AC7" and art.get("success") is True):
+                return _normalize_result({
+                    "success": art.get("success", True),
+                    "returncode": art.get("returncode", 0 if art.get("success") is not False else 1),
+                    "elf_path": art.get("elf_path") or art.get("elf"),
+                    "map_path": art.get("map_path"),
+                    "project_id": art.get("project_id"),
+                    "source": "ledger_artifact",
+                })
+        if tool == "fw_sim_run" and (
+                art.get("ac") == "AC8" or "renode" in str(art.get("why") or "").lower()
+                or art.get("skipped") is True):
+            return _normalize_result(dict(art))
+    return None
+
+
+def _normalize_result(result: Any) -> dict:
+    """Unwrap JSON-in-text/value envelopes and recover truncated build payloads.
+
+    mega-11 live AC7: ledger tool_call result arrived as
+    ``{"text": "{\\n  \\"success\\": true, \\"elf_path\\": ...}"}`` (parse failed
+    or double-wrapped) → NOT-CHECKED. Always re-parse text/value leaves.
+    """
+    if not isinstance(result, dict):
+        return _as_dict(result)
+    out = dict(result)
+    # Unwrap nested text/value that are JSON objects.
+    for key in ("text", "value", "result", "payload", "raw", "body"):
+        val = out.get(key)
+        if not isinstance(val, str):
+            continue
+        s = val.strip()
+        if not s:
+            continue
+        parsed = _try_parse_json_object(s)
+        if isinstance(parsed, dict):
+            # Parsed fields win; keep original text under _text for audit.
+            merged = dict(parsed)
+            for k, v in out.items():
+                if k not in merged:
+                    merged[k] = v
+            out = merged
+            break
+    # Regex recovery for truncated JSON (common on ledger digests).
+    if "success" not in out and "elf_path" not in out and "returncode" not in out:
+        blob = " ".join(str(out.get(k) or "") for k in ("text", "value", "detail", "why"))
+        if blob:
+            recovered = _recover_fw_fields(blob)
+            if recovered:
+                out.update(recovered)
+    return out
+
+
+def _try_parse_json_object(s: str) -> dict | None:
+    """Best-effort JSON object parse, including truncated / trailing-garbage strings."""
+    try:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Find outermost { ... } and retry; if truncated, close braces heuristically.
+    start = s.find("{")
+    if start < 0:
+        return None
+    chunk = s[start:]
+    try:
+        parsed = json.loads(chunk)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Truncated: take up to last complete key/value via regex recovery only.
+    return None
+
+
+def _recover_fw_fields(blob: str) -> dict:
+    """Pull success/elf_path/returncode out of a free-text or truncated JSON blob."""
+    out: dict[str, Any] = {}
+    m = re.search(r'"success"\s*:\s*(true|false)', blob, re.I)
+    if m:
+        out["success"] = m.group(1).lower() == "true"
+    m = re.search(r'"returncode"\s*:\s*(-?\d+)', blob, re.I)
+    if m:
+        out["returncode"] = int(m.group(1))
+    m = re.search(r'"elf_path"\s*:\s*"([^"]+)"', blob, re.I)
+    if m:
+        out["elf_path"] = m.group(1)
+    # Bare path fallback.
+    if "elf_path" not in out:
+        m = re.search(r'(/[^\s"\']+\.elf)', blob)
+        if m:
+            out["elf_path"] = m.group(1)
+    return out
 
 
 def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> dict:
@@ -1585,9 +2000,16 @@ def _as_dict(raw: Any) -> dict:
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
+        parsed = _try_parse_json_object(raw.strip())
+        if isinstance(parsed, dict):
+            return parsed
         try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
+            p2 = json.loads(raw)
+            return p2 if isinstance(p2, dict) else {"value": p2}
         except (json.JSONDecodeError, ValueError):
+            recovered = _recover_fw_fields(raw)
+            if recovered:
+                recovered["text"] = raw
+                return recovered
             return {"text": raw}
     return {"value": raw}

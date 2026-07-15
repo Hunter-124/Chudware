@@ -1,14 +1,14 @@
 {
   "schema": "aicad.leaderboard/1",
-  "generated": "2026-07-14T14:19:47Z",
-  "task_suite": "gym-C1..C8 + diag-v1",
+  "generated": "2026-07-15T04:09:26Z",
+  "task_suite": "gym-C1..C15 + diag-v1",
   "models": [
     {
       "id": "gemma3-4b-qat",
       "label": "gemma3-4b-qat",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-14T14:19:47Z",
+      "evaluated": "2026-07-15T04:09:26Z",
       "cycles": 1,
       "primary": {
         "pass_rate": 0.0,
@@ -16,10 +16,13 @@
         "cells_passed": 0
       },
       "axes": {
-        "tool_validity": 1.0,
+        "tool_validity": null,
         "vision_fix": null,
-        "feature_id": 1.0,
-        "vc_hygiene": 0.6
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
       },
       "failure_taxonomy": {
         "incoherent_geometry": 3,
@@ -33,38 +36,240 @@
       "per_challenge": [
         {
           "challenge": "C1",
+          "division": "local",
           "tier": "local-24k-gemma3-qat",
           "pass_rate": 0.0,
           "seeds": 3
         }
-      ]
+      ],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.0,
+          "cells_total": 3,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.0,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.0
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
+    },
+    {
+      "id": "grok-4.5",
+      "label": "Grok 4.5",
+      "provider": "xai",
+      "kind": "paid",
+      "evaluated": "2026-07-15T04:09:26Z",
+      "cycles": 4,
+      "primary": {
+        "pass_rate": 0.0,
+        "cells_total": 12,
+        "cells_passed": 0
+      },
+      "axes": {
+        "tool_validity": null,
+        "vision_fix": null,
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
+      },
+      "failure_taxonomy": {
+        "incoherent_geometry": 12,
+        "grind": 11
+      },
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": 367.0
+      },
+      "per_challenge": [
+        {
+          "challenge": "C1",
+          "division": "open",
+          "tier": "xai:grok-4-5",
+          "pass_rate": 0.0,
+          "seeds": 12
+        }
+      ],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 12,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.0,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.0
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
+    },
+    {
+      "id": "openrouter:google/gemma-4-31b-it:free",
+      "label": "openrouter:google/gemma-4-31b-it:free",
+      "provider": "error",
+      "kind": "local",
+      "evaluated": "2026-07-15T04:09:26Z",
+      "cycles": 1,
+      "primary": {
+        "pass_rate": 0.0,
+        "cells_total": 0,
+        "cells_passed": 0
+      },
+      "axes": {
+        "tool_validity": null,
+        "vision_fix": null,
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
+      },
+      "failure_taxonomy": {},
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": null
+      },
+      "per_challenge": [],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.0,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.0
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
+    },
+    {
+      "id": "openrouter:qwen/qwen3-coder:free",
+      "label": "openrouter:qwen/qwen3-coder:free",
+      "provider": "error",
+      "kind": "local",
+      "evaluated": "2026-07-15T04:09:26Z",
+      "cycles": 1,
+      "primary": {
+        "pass_rate": 0.0,
+        "cells_total": 0,
+        "cells_passed": 0
+      },
+      "axes": {
+        "tool_validity": null,
+        "vision_fix": null,
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
+      },
+      "failure_taxonomy": {},
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": null
+      },
+      "per_challenge": [],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.0,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.0
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
     },
     {
       "id": "qwen3-4b",
       "label": "qwen3-4b",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-14T14:19:47Z",
-      "cycles": 10,
+      "evaluated": "2026-07-15T04:09:26Z",
+      "cycles": 11,
       "primary": {
-        "pass_rate": 0.3256,
-        "cells_total": 43,
-        "cells_passed": 14
+        "pass_rate": 0.3469,
+        "cells_total": 49,
+        "cells_passed": 17
       },
       "axes": {
-        "tool_validity": 1.0,
+        "tool_validity": null,
         "vision_fix": null,
-        "feature_id": 1.0,
-        "vc_hygiene": 0.8
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
       },
       "failure_taxonomy": {
-        "incoherent_geometry": 29,
+        "incoherent_geometry": 32,
         "grind": 3,
+        "tool_misuse": 3,
+        "context_loss": 3,
         "advisory_ignored": 1,
         "abstraction_skip": 1,
-        "wrong_question": 2,
-        "tool_misuse": 2,
-        "context_loss": 2
+        "wrong_question": 2
       },
       "cost": {
         "usd_per_task_med": null,
@@ -74,47 +279,79 @@
       "per_challenge": [
         {
           "challenge": "C1",
+          "division": "local",
           "tier": "local-24k",
-          "pass_rate": 0.0,
-          "seeds": 23
+          "pass_rate": 0.1034,
+          "seeds": 29
         },
         {
           "challenge": "C1-DP2",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 0.3333,
           "seeds": 3
         },
         {
           "challenge": "C2",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 1.0,
           "seeds": 3
         },
         {
           "challenge": "C3",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 0.6667,
           "seeds": 3
         },
         {
           "challenge": "C4",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 1.0,
           "seeds": 3
         },
         {
           "challenge": "C5",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 0.6667,
           "seeds": 3
         },
         {
           "challenge": "C6",
+          "division": "local",
           "tier": "local-24k",
           "pass_rate": 0.6,
           "seeds": 5
         }
-      ]
+      ],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.3469,
+          "cells_total": 49,
+          "cells_passed": 17,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.3469,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.3469
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
     }
   ]
 }

@@ -117,13 +117,24 @@ def test_session_start_stop_mocked(client, _isolate, monkeypatch):
     mgr: SessionManager = _isolate
     calls: list[list[str]] = []
 
+    running: set[str] = set()
+
     async def fake_podman(args, timeout=120.0):
         calls.append(list(args))
         if args and args[0] == "run":
+            name = args[args.index("--name") + 1]
+            running.add(name)
             return 0, "abc123deadbeef\n", ""
         if args and args[0] == "ps":
-            return 0, "", ""
+            # honor name filter the way real podman does
+            name_filter = next(
+                (a.split("=", 2)[-1].strip("^$") for a in args if a.startswith("name=")),
+                None,
+            )
+            matches = [n for n in running if not name_filter or n == name_filter]
+            return 0, "\n".join(matches), ""
         if args and args[0] in {"stop", "rm"}:
+            running.discard(args[-1])
             return 0, "", ""
         return 0, "", ""
 

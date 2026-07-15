@@ -208,13 +208,40 @@ class SessionManager:
             "container": d["container"],
         }
 
+    async def _container_running(self, name: str) -> bool:
+        rc, out, _ = await self.run_podman(
+            ["ps", "--filter", f"name=^{name}$", "--filter", "status=running",
+             "--format", "{{.ID}}"],
+            timeout=15,
+        )
+        return rc == 0 and bool(out.strip())
+
+    async def _drop_session(self, sid: str) -> None:
+        async with self._lock:
+            sess = self._sessions.pop(sid, None)
+            if sess:
+                self._ports_in_use.discard(sess.host_port)
+                if self._by_email.get(sess.email) == sid:
+                    del self._by_email[sess.email]
+
     async def start(self, user: User) -> Session:
         email = user.email.strip().lower()
+        existing = self.get_for_user(email)
+        if existing and existing.status in {"starting", "ready"}:
+            # A record can outlive its container (killed out-of-band, host
+            # reboot); verify before handing the user a dead seat.
+            if existing.status == "starting" or await self._container_running(existing.container):
+                existing.touch()
+                log.info("reconnect user %s → session %s", email, existing.sid)
+                return existing
+            log.warning("session %s container %s is gone; starting fresh",
+                        existing.sid, existing.container)
+            await self._drop_session(existing.sid)
         async with self._lock:
+            # re-check under the lock: a concurrent start may have won
             existing = self.get_for_user(email)
             if existing and existing.status in {"starting", "ready"}:
                 existing.touch()
-                log.info("reconnect user %s → session %s", email, existing.sid)
                 return existing
 
             if self.cfg.refuse_new_flag.exists():

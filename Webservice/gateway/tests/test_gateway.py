@@ -238,3 +238,45 @@ def test_portal_index(client):
     assert r.status_code == 200
     # static index from PortalChat
     assert "html" in r.headers.get("content-type", "").lower() or b"html" in r.content[:200].lower()
+
+
+# ---------------------------------------------------------------------------
+# AI provider env passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_ai_provider_vars_parse_and_forward(client, _isolate, monkeypatch, tmp_path):
+    mgr = _isolate
+    env_file = tmp_path / "ai_providers.env"
+    env_file.write_text(
+        "# shared keys\n"
+        "OPENROUTER_API_KEY=sk-or-123\n"
+        "not_upper=skipped\n"
+        "BROKEN LINE\n"
+        "ANTHROPIC_API_KEY=sk-ant-456\n"
+    )
+    monkeypatch.setattr(type(mgr.cfg), "ai_providers_env", property(lambda self: env_file))
+    vars_ = mgr.cfg.ai_provider_vars()
+    assert vars_ == {"OPENROUTER_API_KEY": "sk-or-123", "ANTHROPIC_API_KEY": "sk-ant-456"}
+
+    calls: list[list[str]] = []
+
+    async def fake_podman(args, timeout=120.0):
+        calls.append(list(args))
+        if args and args[0] == "run":
+            return 0, "abc123\n", ""
+        return 0, "", ""
+
+    async def fake_wait(sess):
+        return True
+
+    monkeypatch.setattr(mgr, "run_podman", fake_podman)
+    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
+    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
+
+    r = client.post("/api/sessions", headers=_auth("demo@example.com"))
+    assert r.status_code == 200, r.text
+    run_call = next(c for c in calls if c and c[0] == "run")
+    joined = " ".join(run_call)
+    assert "OPENROUTER_API_KEY=sk-or-123" in joined
+    assert "ANTHROPIC_API_KEY=sk-ant-456" in joined

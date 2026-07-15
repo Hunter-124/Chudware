@@ -114,6 +114,30 @@ class Settings:
         return self.data_root / "REFUSE_NEW"
 
     @property
+    def ai_providers_env(self) -> Path:
+        """Optional host-owned env file (KEY=VALUE) of remote-model provider
+        credentials forwarded into every session container (shared keys).
+        Per-user subscriptions are configured in-app and persist in the
+        user's HOME volume instead."""
+        return self.data_root / "ai_providers.env"
+
+    def ai_provider_vars(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            text = self.ai_providers_env.read_text()
+        except OSError:
+            return out
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k.isidentifier() and k.isupper():
+                out[k] = v.strip()
+        return out
+
+    @property
     def cf_issuer(self) -> str:
         return self.cf_team_domain
 

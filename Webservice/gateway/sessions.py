@@ -446,6 +446,14 @@ class SessionManager:
             "DISPLAY": ":0",
             "BILLET_PLM_DIR": "/plm",
         }
+        # Shared remote-model provider credentials (host-owned file); per-user
+        # subscriptions live in the app's own Settings inside the HOME volume.
+        provider_vars = self.cfg.ai_provider_vars()
+        for k, v in provider_vars.items():
+            env.setdefault(k, v)
+        if provider_vars:
+            log.info("forwarding %d AI provider var(s) into %s",
+                     len(provider_vars), sess.container)
         args: list[str] = [
             "run",
             "-d",

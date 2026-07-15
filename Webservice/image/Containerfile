@@ -96,23 +96,51 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
 
 # Session user (uid 1000) — private HOME is bind-mounted by the gateway.
 RUN useradd -m -u 1000 -s /bin/bash user \
-    && mkdir -p /opt/billet /plm /home/user \
+    && mkdir -p /opt/billet /opt/billet/runtime /plm /home/user \
     && chown -R user:user /home/user /opt/billet
 
 # Staged host build tree (produced by stage.sh → Webservice/image/stage/)
+# Includes bin/ (Billet+CEF+hostd), lib/, share/, and app/ (Python worker tree).
 COPY --chown=user:user stage/ /opt/billet/
 COPY entrypoint.sh /usr/local/bin/billet-entrypoint.sh
 RUN chmod 755 /usr/local/bin/billet-entrypoint.sh \
     && chmod 755 /opt/billet/bin/Billet \
     && ( [ -x /opt/billet/bin/aicad-hostd ] && chmod 755 /opt/billet/bin/aicad-hostd || true ) \
     && ( [ -x /opt/billet/bin/ai_cad_cef_helper ] && chmod 755 /opt/billet/bin/ai_cad_cef_helper || true ) \
+    && test -f /opt/billet/app/requirements.txt \
+    && test -d /opt/billet/app/engine \
+    && test -d /opt/billet/app/agent/prompts \
     && chown -R user:user /opt/billet \
     && fc-cache -f || true
 
+# Python worker venv — MUST live under /opt/billet (image layer). HOME is a
+# bind-mounted volume at runtime and would shadow anything under /home/user.
+# Playwright Chromium browsers are intentionally NOT installed (lean image);
+# the playwright *package* is still pip-installed so readiness imports succeed.
+#
+# rhino3dm + pyamg ship no cp314 wheels and fail sdist builds without a full
+# native toolchain; neither is in the provision.py readiness probe, so drop
+# them for the session image (3DM import / pyamg FEA solver extras only).
+RUN set -eux; \
+    python3 -m venv /opt/billet/runtime/venv; \
+    /opt/billet/runtime/venv/bin/pip install --upgrade pip setuptools wheel; \
+    grep -vE '^(rhino3dm|pyamg)(==|>=|~=|<|>|!)' /opt/billet/app/requirements.txt \
+        > /tmp/requirements-session.txt; \
+    /opt/billet/runtime/venv/bin/pip install --no-cache-dir \
+        -r /tmp/requirements-session.txt; \
+    /opt/billet/runtime/venv/bin/python -c \
+        'import build123d, pyvista, mcp, anthropic, openai, pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2, dulwich, playwright; print("venv probe ok")'; \
+    chown -R user:user /opt/billet/runtime /opt/billet/app; \
+    find /opt/billet/runtime/venv -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true; \
+    rm -f /tmp/requirements-session.txt
+
 ENV BILLET_ROOT=/opt/billet \
-    PATH=/opt/billet/bin:/usr/local/bin:/usr/bin:/bin \
+    PATH=/opt/billet/bin:/opt/billet/runtime/venv/bin:/usr/local/bin:/usr/bin:/bin \
     LD_LIBRARY_PATH=/opt/billet/lib:/opt/billet/bin \
     AI_CAD_LIBAICAD=/opt/billet/bin/libaicad.so \
+    AI_CAD_PYTHON=/opt/billet/runtime/venv/bin/python \
+    AI_CAD_REPO=/opt/billet/app \
+    AI_CAD_PROMPTS_DIR=/opt/billet/app/agent/prompts \
     HOME=/home/user \
     DISPLAY=:0 \
     STREAM_BACKEND=novnc \

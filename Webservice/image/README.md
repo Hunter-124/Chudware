@@ -26,10 +26,26 @@ therefore ships a **stripped** `libcef.so` (~417 MiB) + minimal CEF runtime.
 
 | Path | Role |
 |------|------|
-| `stage.sh` | Assemble `stage/` from `host/build-linux/bin` + hostd + netgen + CEF |
+| `stage.sh` | Assemble `stage/` from host build + CEF + **Python app tree** |
 | `stage/` | **Build output only** — do not commit (gitignore) |
-| `Containerfile` | Fedora 44 image |
-| `entrypoint.sh` | Xvfb → Billet → novnc/selkies; SIGTERM cleanup |
+| `Containerfile` | Fedora 44 image + `/opt/billet/runtime/venv` |
+| `entrypoint.sh` | Xvfb → Billet → novnc/selkies; exports AI_CAD_*; SIGTERM cleanup |
+
+## Python AI worker
+
+The in-app AI agent needs a Python worker process. The image ships:
+
+| Path | Role |
+|------|------|
+| `/opt/billet/app/` | Staged packages: `engine`, `agent`, `mcp_server`, `installer`, `services/*` |
+| `/opt/billet/runtime/venv/` | pip env from `requirements.txt` (**not** under HOME) |
+| `AI_CAD_PYTHON` | `/opt/billet/runtime/venv/bin/python` |
+| `AI_CAD_REPO` | `/opt/billet/app` |
+| `AI_CAD_PROMPTS_DIR` | `/opt/billet/app/agent/prompts` |
+
+Provider API keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, …) pass through the
+entrypoint unchanged (gateway injects them). Playwright **browsers** are not
+bundled; the `playwright` package is installed for import readiness only.
 
 ## Build
 
@@ -61,6 +77,8 @@ to the repo `.gitignore`.
 | `DISPLAY` | `:0` |
 | `BILLET_PLM_DIR` | `/plm` (shared bare repos mount) |
 | `AI_CAD_LIBAICAD` | `/opt/billet/bin/libaicad.so` (set in image) |
+| `AI_CAD_PYTHON` / `AI_CAD_REPO` / `AI_CAD_PROMPTS_DIR` | Worker runtime (set in image) |
+| `*_API_KEY` | LLM provider keys — pass-through, never stripped |
 
 Volumes: private `…/homes/<slug>:/home/user`, shared `…/plm:/plm`.
 
@@ -92,8 +110,10 @@ rm -rf "$TMPHOME"
 ```
 
 Observed: HTTP 200 from websockify, noVNC HTML, Billet + aicad-hostd running,
-`[engine] daemon mode: connected to aicad-hostd (state=ready)`, 1920×1080 PNG
-with Model ribbon + origin planes, status bar **Ready.**
+`[engine] daemon mode: connected to aicad-hostd`, worker
+`/opt/billet/runtime/venv/bin/python -m engine.worker` auto-starts, **no**
+`worker not started` toast, AI dock usable, status bar **Ready.**
+Image size ~5.9 GB (was ~4.1 GB before Python runtime).
 
 ## Selkies status
 
@@ -105,7 +125,8 @@ image records `/opt/billet-selkies.status` and **defaults to novnc** (verified).
 ## Open issues / notes
 
 - HOME volume: host dir must be writable by uid 1000 (`chmod 777` or `:U`).
-- Optional Python worker features (e.g. `fw_projects`) may toast "worker not
-  started" — CAD path uses libaicad/hostd; full Python app payload not in v1.
-- Missing `hostname` binary → harmless `novnc_proxy` warning.
-- Image ~4.1 GB (CEF stripped + OCCT + Mesa + VirtualGL).
+- Python worker runtime is image-layer (`/opt/billet/runtime` + `/opt/billet/app`);
+  readiness probe imports (build123d, pyvista, mcp, anthropic, openai, pptx, …)
+  must succeed. Playwright Chromium binaries are not installed.
+- Missing `hostname` binary → harmless `novnc_proxy` warning (image now includes it).
+- Image ~5+ GB after Python venv (CEF stripped + OCCT + Mesa + VirtualGL + wheels).

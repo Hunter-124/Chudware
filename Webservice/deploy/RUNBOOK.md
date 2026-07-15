@@ -216,3 +216,23 @@ sudo loginctl enable-linger "$USER"
 | `~/billet-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |
 | `~/billet-web-data/{homes,plm,logs,chat.db}` | Runtime data |
 | `Webservice/gateway/users.yaml` | Allowlist + heavy seats |
+
+## AI modeling agent (remote/subscription models)
+
+Sessions run the in-app AI agent against **remote providers only** — no local
+models on this host. Two ways to give sessions credentials:
+
+1. **Shared keys (yours):** create `~/billet-web-data/ai_providers.env`
+   (`chmod 600`) with `KEY=VALUE` lines (`OPENROUTER_API_KEY=`,
+   `ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`, `XAI_API_KEY=`, `GEMINI_API_KEY=`, …).
+   The gateway forwards every UPPER_CASE var in that file into each session
+   container at start. Restart is NOT needed — the file is re-read per session
+   start; running seats keep their old env until restarted.
+2. **Bring-your-own:** users open Billet ▸ Settings ▸ AI provider inside their
+   session and enter their own key / subscription login. It persists in their
+   private HOME volume (`~/billet-web-data/homes/<slug>`), never on the shared
+   image and never visible to other users.
+
+The session image bakes the Python worker runtime at `/opt/billet/runtime/venv`
+(`AI_CAD_PYTHON`) + app payload at `/opt/billet/app` (`AI_CAD_REPO`), so the
+agent works out of the box once a provider credential exists.

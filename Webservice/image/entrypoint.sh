@@ -28,6 +28,15 @@ export LD_LIBRARY_PATH="$BILLET_ROOT/lib:$BILLET_ROOT/bin:${LD_LIBRARY_PATH:-}"
 # candidates miss (see services/worker/cpp_core.cpp).
 export AI_CAD_LIBAICAD="${AI_CAD_LIBAICAD:-$BILLET_ROOT/bin/libaicad.so}"
 
+# Python AI worker (bootstrap.cpp runtimePython/appDir). Venv is image-layer
+# under /opt/billet — never under HOME (gateway bind-mounts HOME).
+# Provider keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# XAI_API_KEY, GEMINI_API_KEY, …) are passed through by the gateway; we never
+# unset or filter *_API_KEY from the environment.
+export AI_CAD_PYTHON="${AI_CAD_PYTHON:-$BILLET_ROOT/runtime/venv/bin/python}"
+export AI_CAD_REPO="${AI_CAD_REPO:-$BILLET_ROOT/app}"
+export AI_CAD_PROMPTS_DIR="${AI_CAD_PROMPTS_DIR:-$BILLET_ROOT/app/agent/prompts}"
+
 # Screen geometry — matches Xvfb; GLFW window is 1440x900 by default (app.cpp).
 SCREEN_W="${SCREEN_W:-1920}"
 SCREEN_H="${SCREEN_H:-1080}"

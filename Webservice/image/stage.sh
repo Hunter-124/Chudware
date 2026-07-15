@@ -133,6 +133,88 @@ fi
 chmod +x "$STAGE/bin/ai_cad_cef_helper" 2>/dev/null || true
 chmod 4755 "$STAGE/bin/chrome-sandbox" 2>/dev/null || true
 
+# ---- Python app tree (AI agent worker runtime) ------------------------------
+# Mirrors services/installer/provision.py ensure_app_code() layout so bootstrap.cpp
+# can resolve AI_CAD_REPO (dir with engine/) + import agent/mcp_server/services.*.
+# Venv lives in the image layer (/opt/billet/runtime), NOT under HOME (bind-mounted).
+echo "==> staging Python app tree into $STAGE/app"
+python3 - "$REPO" "$STAGE/app" <<'PY'
+"""Stage the app package tree the same way provision.ensure_app_code does.
+
+We do NOT import provision.py (it pulls engine.paths); this is a pure-stdlib
+mirror of APP_PACKAGES + SERVICE_PACKAGES + requirements.txt.
+"""
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+REPO = Path(sys.argv[1]).resolve()
+APP = Path(sys.argv[2]).resolve()
+
+APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
+SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
+IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "test_*", "tests")
+
+
+def pkg_src(name: str) -> Path | None:
+    """Resolve top-level package, following repo root symlinks (engine→engine_oracle, …)."""
+    p = REPO / name
+    if p.exists():
+        return p.resolve() if p.is_symlink() else p
+    return None
+
+
+if APP.exists():
+    shutil.rmtree(APP)
+APP.mkdir(parents=True, exist_ok=True)
+
+for pkg in APP_PACKAGES:
+    src = pkg_src(pkg)
+    if src is None:
+        print(f"    WARN: missing APP package {pkg}", file=sys.stderr)
+        continue
+    print(f"    app/{pkg} <- {src}")
+    shutil.copytree(src, APP / pkg, dirs_exist_ok=True, ignore=IGNORE)
+
+services_src = REPO / "services"
+if services_src.is_dir():
+    services_dst = APP / "services"
+    services_dst.mkdir(parents=True, exist_ok=True)
+    init_py = services_src / "__init__.py"
+    if init_py.exists():
+        shutil.copy2(init_py, services_dst / "__init__.py")
+    else:
+        (services_dst / "__init__.py").touch()
+    for name in SERVICE_PACKAGES:
+        s = services_src / name
+        if s.exists():
+            print(f"    app/services/{name}")
+            shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=IGNORE)
+    # services.agent / services.mcp aliases (same as provision.ensure_app_code)
+    agent_src = pkg_src("agent") or (services_src / "agent")
+    if agent_src.exists():
+        shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=IGNORE)
+    mcp_src = pkg_src("mcp_server") or (services_src / "mcp")
+    if mcp_src.exists():
+        shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=IGNORE)
+
+req = REPO / "requirements.txt"
+if req.exists():
+    shutil.copy2(req, APP / "requirements.txt")
+    print("    app/requirements.txt")
+else:
+    print("ERROR: requirements.txt missing", file=sys.stderr)
+    sys.exit(1)
+
+prompts = APP / "agent" / "prompts"
+if not prompts.is_dir():
+    print(f"ERROR: agent/prompts missing after stage ({prompts})", file=sys.stderr)
+    sys.exit(1)
+print(f"    app/agent/prompts ok ({sum(1 for _ in prompts.rglob('*'))} entries)")
+PY
+
 # ---- Manifest ---------------------------------------------------------------
 {
     echo "staged_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -140,8 +222,13 @@ chmod 4755 "$STAGE/bin/chrome-sandbox" 2>/dev/null || true
     echo "libaicad_src=$LIBAICAD"
     echo "hostd=${HOSTD:-none}"
     echo "cef=stripped"
+    echo "app_python=1"
+    if [ -f "$STAGE/app/requirements.txt" ]; then
+        echo "app_requirements=$(wc -c < "$STAGE/app/requirements.txt" | tr -d ' ')"
+    fi
 } > "$STAGE/MANIFEST.txt"
 
 echo "==> stage complete:"
-du -sh "$STAGE" "$STAGE/bin" "$STAGE/lib" 2>/dev/null || true
+du -sh "$STAGE" "$STAGE/bin" "$STAGE/lib" "$STAGE/app" 2>/dev/null || true
 ls -la "$STAGE/bin" | head -40
+ls -la "$STAGE/app" | head -20

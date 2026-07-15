@@ -2327,6 +2327,13 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         # status-bar ETA counts down as the mission advances.
         _emit_eta_for_remaining(on_event, phase.value, run_id=run_id)
 
+        # mega-17 Z1: VERIFY grading is UNCONDITIONAL at entry — even when the
+        # phase is only soft-reconciled past incomplete build nodes (mega-16:
+        # deliver_partial with verify entered but 0 criterion_result events).
+        # Soft-join may skip the VERIFY *gate*, but never the AC sweep itself.
+        if phase is Phase.VERIFY:
+            _run_reviewer_checks(manifest, ledger, dag_result)
+
         if not all_done:
             # This phase's nodes did not all complete → mission is at this phase.
             status = {"failed": "failed"}.get(
@@ -2338,12 +2345,8 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
             # The DAG soft-advanced past failed/incomplete workers. Entering the
             # later phase keeps mission status aligned with execution, but there
             # is no truthful exit gate to record for this phase.
+            # (VERIFY checks already ran above — do not skip them via continue.)
             continue
-
-        # T-W30: run the reviewer's acceptance checks at VERIFY entry, so the gate
-        # reads REAL per-criterion results (not a fabricated PASS floor).
-        if phase is Phase.VERIFY:
-            _run_reviewer_checks(manifest, ledger, dag_result)
 
         gate = machine.run_gate(
             phase, _phase_gate_context(phase, ac_ids, Phase, ledger=ledger))
@@ -2412,6 +2415,15 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         else:
             status = "blocked"
             stop_reason = f"{reached}_incomplete" if reached else "blocked"
+
+    # mega-17 Z1: every mission terminal must emit criterion results for ALL
+    # declared ACs (honest FAIL/SKIP/NOT-CHECKED when tools/artifacts absent).
+    # Covers deliver_partial / needs_correction / incomplete paths where VERIFY
+    # was soft-reconciled or never gated (mega-16: 0/9 graded).
+    _ensure_terminal_criterion_grading(
+        manifest, ledger, dag_result, ac_ids,
+        status=status, stop_reason=stop_reason,
+    )
 
     return reached, status, stop_reason
 
@@ -2496,6 +2508,134 @@ def _failing_criteria(manifest, ledger, ac_ids) -> list[str]:
     ok = {"PASS", "SKIP"}
     return [ac for ac in ac_ids
             if recorded.get(ac, "NOT-CHECKED") not in ok and ac not in waived]
+
+
+def _manifest_ac_ids(manifest: dict | None) -> list[str]:
+    """Enumerate declared AC ids; fall back to gradeable AC1–AC9 when empty.
+
+    mega-17: empty deliverables/ACs on a partial mission still need 9 graded
+    slots so live PASS counts are defined (honest NOT-CHECKED/FAIL, not silence).
+    """
+    ids: list[str] = []
+    for d in (manifest or {}).get("deliverables", []) or []:
+        if not isinstance(d, dict):
+            continue
+        for ac in d.get("acceptance_criteria") or []:
+            if isinstance(ac, dict) and ac.get("id"):
+                ids.append(str(ac["id"]))
+    if ids:
+        return ids
+    try:
+        from services.agent.mission_criteria import gradeable_ac_ids  # noqa: PLC0415
+        return list(gradeable_ac_ids())
+    except Exception:  # noqa: BLE001
+        return [f"AC{i}" for i in range(1, 10)]
+
+
+def _ensure_terminal_criterion_grading(
+    manifest,
+    ledger,
+    dag_result,
+    ac_ids,
+    *,
+    status: str = "",
+    stop_reason: str = "",
+) -> None:
+    """Force criterion_result coverage at any mission terminal (mega-17 Z1).
+
+    Runs the reviewer if nothing was graded yet, then writes honest
+    NOT-CHECKED/FAIL/SKIP stubs for any remaining declared AC so grade_run
+    always finds criterion_ACn for all 9 slots.
+    """
+    if ledger is None:
+        return
+    # Always grade at terminal — including needs_correction / deliver_partial /
+    # blocked / failed. Only skip when still mid-run (should not reach here).
+    if status == "running" and not stop_reason:
+        return
+
+    ids = list(ac_ids or []) or _manifest_ac_ids(manifest)
+    if not ids:
+        ids = [f"AC{i}" for i in range(1, 10)]
+
+    # Ensure manifest carries gradeable AC shapes when empty (rocket-plane path).
+    man = manifest if isinstance(manifest, dict) else {}
+    has_any_ac = any(
+        (d.get("acceptance_criteria") or [])
+        for d in (man.get("deliverables") or [])
+        if isinstance(d, dict)
+    )
+    if not has_any_ac:
+        try:
+            from services.agent.mission_criteria import (  # noqa: PLC0415
+                apply_rocket_plane_checks,
+                rocket_plane_flight_computer_acs,
+            )
+            if man.get("deliverables"):
+                man = apply_rocket_plane_checks(man)
+            else:
+                # Synthesize minimal DL shells so run_acceptance_checks iterates ACs.
+                acs = rocket_plane_flight_computer_acs()
+                man = {
+                    **man,
+                    "deliverables": [
+                        {
+                            "id": did,
+                            "name": did,
+                            "kind": "analysis",
+                            "description": did,
+                            "acceptance_criteria": list(aclist),
+                            "depends_on": [],
+                            "target_refs": {},
+                            "status": "pending",
+                        }
+                        for did, aclist in acs.items()
+                    ],
+                }
+            ids = _manifest_ac_ids(man)
+        except Exception:  # noqa: BLE001
+            pass
+
+    recorded, _waived = _ledger_criterion_results(ledger)
+    missing = [ac for ac in ids if ac not in recorded]
+    if missing:
+        # Reviewer may not have run (soft-reconcile) — run now from artifacts.
+        _run_reviewer_checks(man, ledger, dag_result)
+        recorded, _waived = _ledger_criterion_results(ledger)
+        missing = [ac for ac in ids if ac not in recorded]
+
+    for ac in missing:
+        # Honest absence: tools/artifacts not present → NOT-CHECKED (not PASS).
+        try:
+            ledger.add_criterion_result(
+                "reviewer", ac, "NOT-CHECKED",
+                check_tool="",
+                pass_rule="",
+                detail=(
+                    f"terminal grading ({stop_reason or status}): no evidence "
+                    f"for {ac}; honest NOT-CHECKED (mega-17 Z1)"
+                ),
+                evidence={
+                    "source": "terminal_grading",
+                    "stop_reason": stop_reason,
+                    "status": status,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                ledger.append("reviewer", "criterion_result", {
+                    "id": ac,
+                    "result": "NOT-CHECKED",
+                    "check_tool": "",
+                    "pass_rule": "",
+                    "detail": f"terminal grading stub for {ac}",
+                    "evidence": {
+                        "source": "terminal_grading",
+                        "stop_reason": stop_reason,
+                    },
+                })
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _run_reviewer_checks(manifest, ledger, dag_result) -> None:

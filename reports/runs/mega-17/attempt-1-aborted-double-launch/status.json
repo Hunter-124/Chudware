@@ -1,0 +1,12 @@
+{
+  "state": "starting",
+  "run_id": "mega-17-fc-rocket-20260715",
+  "tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "pid": 317065,
+  "started_wall": 1784137135.4487169,
+  "cycle": "mega-17",
+  "conservation": true,
+  "baseline_commit": "cd764e92",
+  "spend_before_usd": 0.1601995,
+  "spend_guard_usd": 8.0
+}

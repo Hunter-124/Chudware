@@ -1,0 +1,58 @@
+[mega-17] openrouter usage_before=$0.160199 remaining=9.8398005
+[mega-17] preflight: subscription_accounts (xai blocked; poll only)
+[mega-17] xai-sub accounts=2 active=79066dcc-36d8-44c3-8561-cc8b6a58e19d switched=False (NOT used as frontier)
+[mega-17] preflight: spawn_probe + auto_pick_smoke
+[mega-17] spawn_probe verdict=PASS budget_rendered_ok=True fix8=PASS fix_wire=PASS
+[mega-17] auto_pick_smoke verdict=PASS axis_Y=PASS hard_or_paid=True leaf_local=True
+[mega-17] fallback_provider=OpenRouterProvider model=deepseek/deepseek-chat-v3.1 run_id=mega-17-fc-rocket-20260715 conservation=auto_pick_first
+[07/15/26 13:38:52] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 13:38:53] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:38:54] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:38:55] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:38:56] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:38:57] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:38:59] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:39:01] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:39:03] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:39:04] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       
+[07/15/26 13:39:05] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 200 OK"                       

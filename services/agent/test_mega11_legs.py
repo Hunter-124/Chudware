@@ -923,16 +923,29 @@ def test_ecad_chain_need_helpers():
         "args": {"libid": "Device:R", "value": "1k"},
         "result": {"ref": "R1"},
     }]
-    assert _ecad_chain_need(calls_p, allow) in ("ecad_add_power", "ecad_wire")
-    # Orphan power does NOT unlock board.
+    assert _ecad_chain_need(calls_p, allow) == "ecad_add_power"
+    # Orphan power does NOT unlock board; still need cross-ref wire.
     calls_pow = calls_p + [{
         "tool": "ecad_add_power", "ok": True, "args": {"net": "GND"},
         "result": {"ok": True, "net": "GND", "net_size": 0, "net_members": []},
     }]
     assert _ecad_has_real_wire(calls_pow) is False
     assert _ecad_chain_need(calls_pow, allow) == "ecad_wire"
+    # Self-loop alone still does NOT unlock board when power already present
+    # but cross-ref missing — wait: after power, need wire; self-loop is wire
+    # success but not product cross-wire.
+    calls_self = calls_pow + [{
+        "tool": "ecad_wire", "ok": True,
+        "args": {"from_ref": "R1", "from_pin": "1", "to_ref": "R1", "to_pin": "2"},
+        "result": {"ok": True, "net": "N1", "net_size": 2},
+    }]
+    from services.agent.agent_turn import _ecad_has_cross_wire, _ecad_nets_ready_for_board
+    assert _ecad_has_cross_wire(calls_self) is False
+    assert _ecad_nets_ready_for_board(calls_self, allow) is False
+    assert _ecad_chain_need(calls_self, allow) == "ecad_wire"
     calls_w = calls_pow + [{
         "tool": "ecad_wire", "ok": True,
+        "args": {"from_ref": "R1", "from_pin": "1", "to_ref": "U1", "to_pin": "1"},
         "result": {"ok": True, "net": "N1", "net_size": 2},
     }]
     assert _ecad_has_real_wire(calls_w) is True

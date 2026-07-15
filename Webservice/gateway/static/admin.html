@@ -23,8 +23,9 @@
   .rm-btn:hover { background: #2a1a20; }
   form.add-user { display: grid; grid-template-columns: 1.8fr 1.2fr 1.2fr auto auto auto;
                   gap: 10px; align-items: center; }
-  form.add-user input[type=text], form.add-user input[type=email] {
-      background: var(--bg, #0e1013); color: inherit; border: 1px solid var(--border, #2a2e36);
+  .admin-wrap input[type=text], .admin-wrap input[type=email] {
+      background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
+      border: 1px solid var(--border, #2a2e36);
       border-radius: 8px; padding: 8px 10px; }
   form.add-user label { font-size: .85rem; color: var(--muted, #8b93a3); white-space: nowrap; }
   form.add-user button { padding: 8px 18px; }
@@ -44,11 +45,13 @@
       policy, so new people can log in immediately (email OTP or Google).
       <code>example.com</code> entries are dev-only and never pushed to Access.
     </p>
-    <form id="default-form" style="display:flex;gap:10px;align-items:center;margin:0 0 14px">
+    <form id="default-form" style="display:flex;gap:10px;align-items:center;margin:0 0 6px">
       <label style="white-space:nowrap;font-size:.9rem">Default project for everyone:</label>
-      <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1">
-      <button type="submit" class="btn primary">Set for all</button>
+      <input type="text" id="f-default-project" placeholder="(none)" list="project-list" style="flex:1;min-width:0">
+      <button type="button" id="btn-browse" class="btn ghost" style="white-space:nowrap">Browse host…</button>
+      <button type="submit" class="btn primary" style="white-space:nowrap">Set for all</button>
     </form>
+    <div id="default-doc-row" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 14px"></div>
     <table class="users">
       <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Project</th><th></th></tr></thead>
       <tbody id="user-rows"></tbody>
@@ -68,6 +71,21 @@
     <div id="admin-status"></div>
   </div>
 </div>
-<script src="/static/admin.js"></script>
+<div id="browse-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50">
+  <div style="max-width:640px;margin:8vh auto;background:var(--panel,#16181d);border:1px solid var(--border,#2a2e36);border-radius:12px;padding:18px 22px;max-height:78vh;display:flex;flex-direction:column">
+    <h2 style="margin:0 0 6px;font-size:1rem">Pick a project folder on this machine</h2>
+    <div style="font-size:.82rem;color:var(--muted,#8b93a3);margin-bottom:10px">
+      Click folders to navigate. Click a part file to auto-open it for everyone; or just
+      <em>Use this folder</em> (newest part opens). Sessions see it read-only under <code>~/Projects/</code>.
+    </div>
+    <div id="browse-path" style="font-family:monospace;font-size:.82rem;margin-bottom:8px;word-break:break-all"></div>
+    <div id="browse-list" style="flex:1;overflow-y:auto;border:1px solid var(--border,#2a2e36);border-radius:8px;padding:6px 0;min-height:200px"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+      <button type="button" id="browse-cancel" class="btn ghost">Cancel</button>
+      <button type="button" id="browse-use" class="btn primary">Use this folder</button>
+    </div>
+  </div>
+</div>
+<script src="/static/admin.js?v=2"></script>
 </body>
 </html>

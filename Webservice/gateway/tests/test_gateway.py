@@ -489,3 +489,48 @@ def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
     assert r3.status_code == 200, r3.text
     joined = " ".join(next(c for c in calls if c[0] == "run"))
     assert "BILLET_DEFAULT_PROJECT=Demo" in joined
+
+
+def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch, tmp_path):
+    directory, synced, users = _admin_env
+    proj = tmp_path / "TeamParts"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "Frame.step+").write_bytes(b"x")
+    (proj / "notes.txt").write_bytes(b"x")
+
+    # browse: admin only, lists dirs + CAD parts only
+    assert client.get("/api/admin/browse", headers=_auth("demo@example.com"),
+                      params={"path": str(proj)}).status_code == 403
+    r = client.get("/api/admin/browse", headers=_auth("boss@example.com"),
+                   params={"path": str(proj)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dirs"] == ["sub"] and body["parts"] == ["Frame.step+"]
+
+    # path default accepted; bogus path rejected
+    assert client.put("/api/admin/default-project", headers=_auth("boss@example.com"),
+                      json={"project": str(proj), "doc": "Frame.step+"}).status_code == 200
+    assert client.put("/api/admin/default-project", headers=_auth("boss@example.com"),
+                      json={"project": "/nope/missing"}).status_code == 400
+
+    # session start: ro bind-mount + basename project + open doc env
+    calls = []
+
+    async def fake_podman(args, timeout=120.0):
+        calls.append(list(args))
+        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
+
+    async def fake_wait(sess):
+        return True
+
+    mgr = _isolate
+    monkeypatch.setattr(mgr, "run_podman", fake_podman)
+    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
+    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
+    r3 = client.post("/api/sessions", headers=_auth("demo@example.com"))
+    assert r3.status_code == 200, r3.text
+    run = next(c for c in calls if c[0] == "run")
+    joined = " ".join(run)
+    assert f"{proj}:/home/user/Projects/TeamParts:ro,z" in joined
+    assert "BILLET_DEFAULT_PROJECT=TeamParts" in joined
+    assert "BILLET_OPEN_DOC=Frame.step+" in joined

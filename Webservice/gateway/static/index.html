@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Billet Web</title>
   <link rel="icon" type="image/png" href="/static/logo_wordmark_dark.png" />
-  <link rel="stylesheet" href="/static/portal.css" />
+  <link rel="stylesheet" href="/static/portal.css?v=2" />
 </head>
 <body>
   <div id="app">
@@ -52,6 +52,7 @@
           <div class="stream-bar">
             <span id="stream-label" class="stream-label">Session live</span>
             <div class="stream-actions">
+              <button id="btn-fullscreen" class="btn ghost" type="button" title="Fullscreen (Esc to exit)">Fullscreen</button>
               <button id="btn-popout" class="btn ghost" type="button" title="Open stream in new tab">Pop out</button>
               <button id="btn-stop-stream" class="btn danger" type="button">Stop</button>
             </div>
@@ -87,6 +88,6 @@
       </aside>
     </div>
   </div>
-  <script src="/static/portal.js" defer></script>
+  <script src="/static/portal.js?v=2" defer></script>
 </body>
 </html>

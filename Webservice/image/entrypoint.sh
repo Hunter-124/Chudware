@@ -37,11 +37,13 @@ export AI_CAD_PYTHON="${AI_CAD_PYTHON:-$BILLET_ROOT/runtime/venv/bin/python}"
 export AI_CAD_REPO="${AI_CAD_REPO:-$BILLET_ROOT/app}"
 export AI_CAD_PROMPTS_DIR="${AI_CAD_PROMPTS_DIR:-$BILLET_ROOT/app/agent/prompts}"
 
-# Screen geometry — matches Xvfb; GLFW window is 1440x900 by default (app.cpp).
+# Screen geometry — matches Xvfb; Billet is told to fill it (AI_CAD_WIN_SIZE,
+# app.cpp) since there is no window manager to maximize into.
 SCREEN_W="${SCREEN_W:-1920}"
 SCREEN_H="${SCREEN_H:-1080}"
 SCREEN_D="${SCREEN_D:-24}"
 STREAM_PORT="${STREAM_PORT:-8080}"
+export AI_CAD_WIN_SIZE="${AI_CAD_WIN_SIZE:-${SCREEN_W}x${SCREEN_H}}"
 VNC_PORT="${VNC_PORT:-5900}"
 
 # HOME may be a bind-mount; don't fail the seat if mkdir races or perms lag.

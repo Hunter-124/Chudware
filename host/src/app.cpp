@@ -835,8 +835,20 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "Billet");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "Billet");
     glfwWindowHintString(GLFW_WAYLAND_APP_ID, "Billet");
-    GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "Billet", nullptr, nullptr);
+    // AI_CAD_WIN_SIZE=WxH: explicit window geometry for managed/headless sessions
+    // (billet-web streams a fixed-size Xvfb display with no WM, so maximize hints
+    // are no-ops there — the window must be created at display size and at 0,0).
+    int winW = shot ? 1340 : 1440, winH = shot ? 838 : 900;
+    bool winSized = false;
+    if (const char* ws = std::getenv("AI_CAD_WIN_SIZE")) {
+        int w = 0, h = 0;
+        if (std::sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 480 && w <= 16384 && h <= 16384) {
+            winW = w; winH = h; winSized = true;
+        }
+    }
+    GLFWwindow* win = glfwCreateWindow(winW, winH, "Billet", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
+    if (winSized) glfwSetWindowPos(win, 0, 0);
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;

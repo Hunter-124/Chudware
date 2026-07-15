@@ -538,6 +538,22 @@
     var url = streamUrl(state.session) || el.streamFrame.getAttribute("src");
     if (url) window.open(url, "_blank", "noopener");
   });
+  var btnFullscreen = document.getElementById("btn-fullscreen");
+  if (btnFullscreen) {
+    btnFullscreen.addEventListener("click", function () {
+      // Native fullscreen on the stream iframe: full-screen CAD control.
+      // Esc (or the button again) returns to the portal with browser chrome + shoutbox.
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else if (el.streamFrame && el.streamFrame.getAttribute("src")) {
+        (el.streamFrame.requestFullscreen ? el.streamFrame.requestFullscreen()
+          : Promise.reject()).catch(function () {});
+      }
+    });
+    document.addEventListener("fullscreenchange", function () {
+      btnFullscreen.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
+    });
+  }
   el.chatToggle.addEventListener("click", function () { setChatOpen(!state.chatOpen); });
   el.chatCollapse.addEventListener("click", function () { setChatOpen(false); });
   el.chatRailBtn.addEventListener("click", function () { setChatOpen(true); });

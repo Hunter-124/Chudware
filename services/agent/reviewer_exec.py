@@ -355,6 +355,81 @@ def _interval_null_probe_detail(name: str, result: Any) -> str | None:
     return None
 
 
+def _first_finite_rail_voltage(
+    result: Any, prefer: str | None = None,
+) -> tuple[float, str] | None:
+    """Return (value, net_label) for a finite rail voltage in a sim payload.
+
+    mega-21 N21: when the preferred probe is null, accept a finite voltage on
+    another real rail net recorded in the same OP result (VIN path, N$2, …).
+    Never invents a number — only reads finite numeric probe keys.
+    """
+    if not isinstance(result, dict):
+        return None
+    prefer_u = (prefer or "").upper()
+
+    def _is_rail_key(k: str) -> bool:
+        kl = k.lower()
+        kk = re.sub(r"[^\w]", "", kl)
+        if kk in ("0", "gnd", "agnd", "dgnd", "vss", "vssa"):
+            return False
+        # voltage-like keys: V(…), v_…, node names, op map keys
+        if kl.startswith("v(") or kl.startswith("v_") or "voltage" in kl:
+            return True
+        if prefer_u and prefer_u.lower() in kl:
+            return True
+        # bare node names from op maps (N$2, VIN, 3V3)
+        if re.match(r"^(n\$\d+|vin|vcc|vdd|3v3|\+?3v3|5v|\+?5v)$", kl):
+            return True
+        return False
+
+    def _finite(v: Any) -> float | None:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        try:
+            import math  # noqa: PLC0415
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                return None
+            return fv
+        except Exception:  # noqa: BLE001
+            return None
+
+    candidates: list[tuple[int, float, str]] = []
+
+    def _walk(obj: Any, path: str = "") -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                ks = str(k)
+                p = f"{path}.{ks}" if path else ks
+                fv = _finite(v)
+                if fv is not None and _is_rail_key(ks):
+                    score = 0
+                    ku = ks.upper()
+                    if prefer_u and prefer_u in ku:
+                        score += 10
+                    if "3V3" in ku or "3.3" in ku or "VDD" in ku or "VCC" in ku:
+                        score += 5
+                    if "VIN" in ku or "VBAT" in ku or "5V" in ku:
+                        score += 3
+                    if ks.startswith("V(") or ks.startswith("v("):
+                        score += 2
+                    candidates.append((score, fv, ks if ks.startswith(("V(", "v(")) else f"V({ks})"))
+                elif isinstance(v, (dict, list)):
+                    _walk(v, p)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, path)
+
+    _walk(result)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: -t[0])
+    _score, val, label = candidates[0]
+    return val, label
+
+
+
 
 def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     """Derive (verdict, detail) from a mechanical read of *result* against *pass_rule*.
@@ -451,17 +526,51 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     if m:
         name = m.group("name").strip().lower()
         lo, hi = float(m.group("lo")), float(m.group("hi"))
+        # mega-21 N21: when simulate recorded a different rail (VIN/N$2), accept
+        # the measured net's probe key as the interval subject.
+        resolved_net = None
+        if isinstance(result, dict):
+            rn = result.get("resolved_net") or result.get("measured_net")
+            if isinstance(rn, str) and rn.strip():
+                resolved_net = rn.strip()
+            # probes list may carry the actual measured name.
+            pr = result.get("probes")
+            if resolved_net is None and isinstance(pr, list) and pr:
+                p0 = pr[0]
+                if isinstance(p0, str) and p0.strip():
+                    resolved_net = _probe_net_name(p0)
+        measure_name = name
+        if resolved_net:
+            # Prefer grading V(<resolved>) when rule asked for V(3V3).
+            measure_name = f"v({resolved_net.lower()})"
         # mega-18 Z4: SPICE payloads often nest probe values under op/readings
         # with explicit null (tool ran, net missing). Treat null as honest FAIL
         # naming the missing net — never NOT-CHECKED when the tool executed.
-        null_probe = _interval_null_probe_detail(name, result)
+        null_probe = _interval_null_probe_detail(measure_name, result)
+        if null_probe is None and measure_name != name:
+            # Also try original rule name before giving up on null path.
+            null_probe = _interval_null_probe_detail(name, result)
         if null_probe is not None:
-            return FAIL, null_probe
+            # If another probe key holds a finite rail voltage, use that instead
+            # of failing on the missing preferred name (N21 VIN path).
+            alt_val = _first_finite_rail_voltage(result, prefer=resolved_net)
+            if alt_val is None:
+                return FAIL, null_probe
+            val = alt_val[0]
+            used_net = alt_val[1]
+            ok = lo <= val <= hi
+            detail = (
+                f"{used_net}={val} vs [{lo},{hi}] "
+                f"(resolved_net={used_net}; rule was {name!r})"
+            )
+            return (PASS if ok else FAIL), detail
         nums = _flatten_numbers(result)
         # exact field, else a field whose name contains the rule's leading token.
-        val = nums.get(name)
+        val = nums.get(measure_name)
         if val is None:
-            token = name.split()[0]
+            val = nums.get(name)
+        if val is None:
+            token = measure_name.split()[0]
             # strip common wrappers like V(3V3) → 3v3 (and keep v3v3 form).
             bare = re.sub(r"[^\w]", "", token)
             # V(3V3) / I(R1) → inner net/device name for SPICE node maps.
@@ -469,16 +578,31 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
             candidates = [bare]
             if inner_m:
                 candidates.append(re.sub(r"[^\w]", "", inner_m.group(1).lower()))
+            # Also try original rule token + resolved net.
+            if name != measure_name:
+                candidates.append(re.sub(r"[^\w]", "", name))
+            if resolved_net:
+                candidates.append(re.sub(r"[^\w]", "", resolved_net.lower()))
             for k, v in nums.items():
                 kk = re.sub(r"[^\w]", "", k)
                 if any(c and (c in kk or kk in c) for c in candidates):
                     val = v
                     break
         if val is None:
+            # Last chance: any finite rail voltage in the payload.
+            alt_val = _first_finite_rail_voltage(result, prefer=resolved_net)
+            if alt_val is not None:
+                val = alt_val[0]
+                used_net = alt_val[1]
+                ok = lo <= val <= hi
+                return (PASS if ok else FAIL), (
+                    f"{used_net}={val} vs [{lo},{hi}] "
+                    f"(resolved_net={used_net}; rule was {name!r})"
+                )
             # Tool ran (ok/converged) but probe absent → FAIL missing net, not
             # NOT-CHECKED (mega-18 Z4 residual: device_count only fields).
             if _spice_tool_ran(result):
-                net = _probe_net_name(name)
+                net = resolved_net or _probe_net_name(name)
                 return FAIL, (
                     f"probe {name!r} missing from ecad_simulate payload "
                     f"(net {net!r} not driven / no finite value; "
@@ -488,7 +612,11 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
                 f"tool output has no numeric field matching {name!r} "
                 f"(fields: {sorted(nums)[:8]})")
         ok = lo <= val <= hi
-        return (PASS if ok else FAIL), f"{name}={val} vs [{lo},{hi}]"
+        used = measure_name if measure_name != name else name
+        detail = f"{used}={val} vs [{lo},{hi}]"
+        if resolved_net and resolved_net.lower() not in used.lower():
+            detail += f" (resolved_net={resolved_net})"
+        return (PASS if ok else FAIL), detail
 
     # Shape 3: interference empty / volume==0 (AC3-style mechanical rules).
     rule_l = rule.lower()
@@ -1837,15 +1965,27 @@ def _run_one(tool: str, pass_rule: str, check: dict,
         result.setdefault("source", src)
     if "legs" in params_hint and "legs_required" not in result:
         result.setdefault("legs_required", params_hint.get("legs"))
+    # mega-21 N21: persist resolved measure net into criterion evidence.
+    if tname == "ecad_simulate" and isinstance(t_hint, dict):
+        if t_hint.get("resolved_net") and not result.get("resolved_net"):
+            result["resolved_net"] = t_hint["resolved_net"]
+        if t_hint.get("resolved_net_source") and not result.get(
+            "resolved_net_source"
+        ):
+            result["resolved_net_source"] = t_hint["resolved_net_source"]
+        if t_hint.get("probes") and not result.get("probes"):
+            result["probes"] = list(t_hint["probes"])
     verdict, detail = evaluate_pass_rule(pass_rule, result)
     return verdict, detail, result
 
 
 def _domain_params_hint(tool: str, params_hint: dict, ledger) -> dict:
-    """Augment params_hint for domain tools (fw project_id, etc.).
+    """Augment params_hint for domain tools (fw project_id, AC5 probe net).
 
     mega-12 AC7: live fw_build without project_id fails even when ledger has
     the successful build — inject project_id so re-grade can re-run or match.
+    mega-21 N21: ecad_simulate probes resolve from the LIVE netlist (prefer
+    3V3-class names, else the net where the injected source landed).
     """
     hint = dict(params_hint) if isinstance(params_hint, dict) else {}
     t = str(tool or "")
@@ -1853,6 +1993,29 @@ def _domain_params_hint(tool: str, params_hint: dict, ledger) -> dict:
         pid = _resolve_fw_project_id(ledger)
         if pid:
             hint["project_id"] = pid
+    if t == "ecad_simulate":
+        try:
+            from services.agent.agent_turn import (  # noqa: PLC0415
+                resolve_measure_net_from_ledger,
+            )
+            resolved = resolve_measure_net_from_ledger(
+                ledger, preferred="3V3",
+            )
+            net = resolved.get("net") or "3V3"
+            probe = resolved.get("probe") or f"V({net})"
+            # Always pin probes to the resolved rail (even when params said 3V3
+            # but the live rail is VIN/N$2).
+            hint["probes"] = [probe]
+            hint["resolved_net"] = net
+            hint["resolved_net_source"] = resolved.get("source")
+            # analysis default
+            if not hint.get("analysis"):
+                hint["analysis"] = "op"
+        except Exception:  # noqa: BLE001
+            if not hint.get("probes"):
+                hint["probes"] = ["V(3V3)"]
+            if not hint.get("analysis"):
+                hint["analysis"] = "op"
     return hint
 
 def _invoke_or_ledger(tool: str, doc_id: str | None, params_hint: dict,

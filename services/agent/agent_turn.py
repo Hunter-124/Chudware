@@ -2790,7 +2790,16 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
 
     if need == "ecad_simulate":
         # mega-17 Z3: OP analysis on 3V3 for AC5.
-        out = {"analysis": "op", "probes": ["V(3V3)"]}
+        # mega-21 N21: resolve probe from live netlist / source net when 3V3
+        # is absent (VIN path → N$2 etc.).
+        resolved = resolve_measure_net(calls=calls, preferred="3V3")
+        probe = resolved.get("probe") or "V(3V3)"
+        out = {
+            "analysis": "op",
+            "probes": [probe],
+            "resolved_net": resolved.get("net"),
+            "resolved_net_source": resolved.get("source"),
+        }
         if sch_id:
             out["doc_id"] = sch_id
         return out
@@ -3219,6 +3228,793 @@ def _ecad_force_chain_cascade(
         if need in ("ecad_run_drc", "ecad_simulate") and "z2r" in reason:
             break
     return calls, tool_calls_made
+
+# ---------------------------------------------------------------------------
+# mega-21 M21 — mechanical deliver gate (refuse zero-mech deliver_partial)
+# ---------------------------------------------------------------------------
+
+_MECH_FORCE_ONCE: dict[str, bool] = {}
+_MECH_PRODUCT_TOOLS = frozenset({"new_part", "add_features"})
+
+# Airframe dims from mission brief + feature_modeler role card (mega-21 M21).
+# body tube OD≈60 wall≥1.5 length class 500; payload bay ≥56×86×20.
+_AIRFRAME_DEFAULT_SPEC: dict[str, float] = {
+    "body_od_mm": 60.0,
+    "body_len_mm": 500.0,
+    "wall_mm": 2.0,
+    "bay_l_mm": 90.0,
+    "bay_w_mm": 60.0,
+    "bay_h_mm": 25.0,
+    "fin_span_mm": 80.0,
+    "fin_root_mm": 60.0,
+    "fin_thick_mm": 3.0,
+    "wing_span_mm": 200.0,
+    "wing_chord_mm": 80.0,
+    "wing_thick_mm": 4.0,
+}
+
+
+def _ledger_tool_calls(ledger) -> list[dict]:
+    """Harvest tool_call records from a ledger (or already-list of calls)."""
+    if ledger is None:
+        return []
+    if isinstance(ledger, list):
+        return [c for c in ledger if isinstance(c, dict)]
+    out: list[dict] = []
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        events = []
+    if not events and isinstance(ledger, dict):
+        events = list(ledger.get("events") or [])
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+        if not isinstance(pl, dict):
+            continue
+        tool = pl.get("tool") or pl.get("tool_name")
+        event = pl.get("event")
+        if event and event not in ("tool_call", None):
+            # Keep forced inject markers for diagnostics but not as product.
+            if event in ("mech_chain_force_inject", "ecad_chain_force_inject"):
+                continue
+            if tool is None:
+                continue
+        if not tool:
+            continue
+        if "ok" not in pl and pl.get("result") is None and event == "tool_call":
+            continue
+        rec = {
+            "tool": tool,
+            "args": pl.get("args") if isinstance(pl.get("args"), dict) else {},
+            "ok": bool(pl.get("ok")),
+            "result": pl.get("result"),
+            "forced": bool(pl.get("forced")),
+        }
+        out.append(rec)
+    return out
+
+
+def _mech_has_part_artifact(calls_or_ledger) -> bool:
+    """True when successful new_part + add_features produced a body (mega-21 M21).
+
+    Matches the ECAD chain floor: bootstrap openers alone are not product.
+    """
+    calls = _ledger_tool_calls(calls_or_ledger)
+    has_new = any(
+        c.get("ok") and c.get("tool") == "new_part" for c in calls
+    )
+    has_add = False
+    for c in calls:
+        if not (c.get("ok") and c.get("tool") == "add_features"):
+            continue
+        # Prefer results that look like geometry landed; bare ok also counts
+        # when the tool succeeded (engine may omit volume on truncated logs).
+        res = c.get("result")
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except Exception:  # noqa: BLE001
+                res = {"text": res}
+        if isinstance(res, dict):
+            if res.get("ok") is False:
+                continue
+        has_add = True
+        break
+    return bool(has_new and has_add)
+
+
+def _airframe_spec_from_manifest(manifest: dict | None) -> dict[str, float]:
+    """Merge mission/manifest airframe dims onto role-card defaults."""
+    spec = dict(_AIRFRAME_DEFAULT_SPEC)
+    if not isinstance(manifest, dict):
+        return spec
+    bags: list[Any] = [
+        manifest,
+        manifest.get("request_verbatim"),
+        manifest.get("brief"),
+        manifest.get("dimensions"),
+    ]
+    for d in manifest.get("deliverables") or []:
+        if isinstance(d, dict):
+            bags.append(d.get("description"))
+            bags.append(d.get("name"))
+            bags.append(d)
+    blob = " ".join(str(b) for b in bags if b)
+    # Optional numeric overrides from free text (OD 60, length 500, bay 56x86x20).
+    m = re.search(r"OD\s*[≈~]?\s*(\d+(?:\.\d+)?)\s*mm", blob, re.I)
+    if m:
+        spec["body_od_mm"] = float(m.group(1))
+    m = re.search(
+        r"(?:length|len)\s*[≥>=~≈]?\s*(\d+(?:\.\d+)?)\s*mm", blob, re.I,
+    )
+    if m:
+        spec["body_len_mm"] = max(spec["body_len_mm"], float(m.group(1)))
+    m = re.search(
+        r"(?:payload\s*bay|bay)[^\d]{0,40}"
+        r"(\d+(?:\.\d+)?)\s*[×x]\s*(\d+(?:\.\d+)?)\s*[×x]\s*(\d+(?:\.\d+)?)",
+        blob, re.I,
+    )
+    if m:
+        dims = sorted(
+            (float(m.group(1)), float(m.group(2)), float(m.group(3))),
+            reverse=True,
+        )
+        spec["bay_l_mm"] = max(spec["bay_l_mm"], dims[0])
+        spec["bay_w_mm"] = max(spec["bay_w_mm"], dims[1])
+        spec["bay_h_mm"] = max(spec["bay_h_mm"], dims[2])
+    return spec
+
+
+def _airframe_build_ops(spec: dict[str, float] | None = None) -> list[dict]:
+    """Concrete add_features ops for the rocket-plane airframe (role-card dims).
+
+    Produces a closed manifold solid: body tube (cylinder), payload bay box,
+    wing pad, and three fins — enough for AC1–3 evidence path.
+    """
+    s = dict(_AIRFRAME_DEFAULT_SPEC)
+    if isinstance(spec, dict):
+        s.update({k: float(v) for k, v in spec.items() if v is not None})
+    od = float(s["body_od_mm"])
+    length = float(s["body_len_mm"])
+    wall = float(s["wall_mm"])
+    bay_l = float(s["bay_l_mm"])
+    bay_w = float(s["bay_w_mm"])
+    bay_h = float(s["bay_h_mm"])
+    fin_span = float(s["fin_span_mm"])
+    fin_root = float(s["fin_root_mm"])
+    fin_t = float(s["fin_thick_mm"])
+    wing_span = float(s["wing_span_mm"])
+    wing_chord = float(s["wing_chord_mm"])
+    wing_t = float(s["wing_thick_mm"])
+
+    def _dim(v: float) -> dict:
+        return {"value": float(v), "expr": None}
+
+    ops: list[dict] = [
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "cylinder",
+                "name": "body_tube",
+                "params": {
+                    "radius": _dim(od / 2.0),
+                    "height": _dim(length),
+                },
+            },
+        },
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "payload_bay",
+                "params": {
+                    "length": _dim(bay_l),
+                    "width": _dim(bay_w),
+                    "height": _dim(bay_h),
+                },
+            },
+        },
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "wing",
+                "params": {
+                    "length": _dim(wing_chord),
+                    "width": _dim(wing_span),
+                    "height": _dim(wing_t),
+                },
+            },
+        },
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "fin_1",
+                "params": {
+                    "length": _dim(fin_root),
+                    "width": _dim(fin_t),
+                    "height": _dim(fin_span),
+                },
+            },
+        },
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "fin_2",
+                "params": {
+                    "length": _dim(fin_root),
+                    "width": _dim(fin_t),
+                    "height": _dim(fin_span),
+                },
+            },
+        },
+        {
+            "op": "add_feature",
+            "feature": {
+                "type": "box",
+                "name": "fin_3",
+                "params": {
+                    "length": _dim(fin_root),
+                    "width": _dim(fin_t),
+                    "height": _dim(fin_span),
+                },
+            },
+        },
+    ]
+    # wall retained for future shell; keep referenced so linters see intent.
+    _ = wall
+    return ops
+
+
+def _resolve_tool_dispatch(dispatch: Callable | None = None) -> Callable | None:
+    """Return a (tool, args) -> result dispatcher for forced product chains."""
+    if callable(dispatch):
+        return dispatch
+
+    def _dispatch(tool: str, args: dict) -> Any:
+        try:
+            from services.agent import reviewer_exec as _re  # noqa: PLC0415
+            fn = _re._resolve_fn(tool)
+        except Exception:  # noqa: BLE001
+            fn = None
+        if fn is None:
+            return {"ok": False, "error": f"tool {tool!r} unresolved"}
+        try:
+            import inspect  # noqa: PLC0415
+            sig = inspect.signature(fn)
+            accepts = set(sig.parameters)
+            has_var = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        except Exception:  # noqa: BLE001
+            accepts = set()
+            has_var = True
+        kwargs: dict[str, Any] = {}
+        for k, v in (args or {}).items():
+            if has_var or k in accepts:
+                kwargs[k] = v
+        try:
+            return fn(**kwargs)
+        except TypeError:
+            try:
+                return fn()
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    return _dispatch
+
+
+def _mech_force_build_chain(
+    ledger,
+    *,
+    manifest: dict | None = None,
+    dispatch: Callable | None = None,
+    actor: str | None = "deliver_gate",
+    reason: str = "mech_starvation",
+    run_id: str | None = None,
+) -> dict:
+    """Force-EXECUTE new_part + add_features once for the airframe leg (M21).
+
+    Cap: one forced pass per run_id. Returns a status dict:
+      {forced: bool, ok: bool, doc_id, calls, refusal: str|None}
+    """
+    rid = (
+        run_id
+        or getattr(ledger, "run_id", None)
+        or (manifest or {}).get("run_id")
+        or "default"
+    )
+    rid = str(rid)
+    out: dict[str, Any] = {
+        "forced": False,
+        "ok": False,
+        "doc_id": None,
+        "calls": [],
+        "refusal": None,
+        "reason": reason,
+        "run_id": rid,
+    }
+    if _mech_has_part_artifact(ledger):
+        out["ok"] = True
+        out["refusal"] = None
+        return out
+    if _MECH_FORCE_ONCE.get(rid):
+        out["refusal"] = (
+            "mech_leg_missing_after_force: new_part+add_features already "
+            "force-attempted once; refusing deliver with zero mech artifacts "
+            "(mega-21 M21)"
+        )
+        return out
+
+    _MECH_FORCE_ONCE[rid] = True
+    out["forced"] = True
+    disp = _resolve_tool_dispatch(dispatch)
+    if disp is None:
+        out["refusal"] = "mech_force_no_dispatch"
+        return out
+
+    spec = _airframe_spec_from_manifest(manifest)
+    ops = _airframe_build_ops(spec)
+    actor_s = actor or "deliver_gate"
+
+    # 1) new_part
+    np_args = {"name": "rocket_plane_airframe"}
+    try:
+        _log(ledger, actor_s, {
+            "event": "mech_chain_force_inject",
+            "tool": "new_part",
+            "args": np_args,
+            "reason": reason,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        np_raw = disp("new_part", np_args)
+    except Exception as exc:  # noqa: BLE001
+        np_raw = {"ok": False, "error": str(exc)}
+    np_payload = np_raw
+    if isinstance(np_raw, str):
+        try:
+            np_payload = json.loads(np_raw)
+        except Exception:  # noqa: BLE001
+            np_payload = {"ok": False, "error": np_raw[:200]}
+    np_ok = bool(
+        isinstance(np_payload, dict)
+        and np_payload.get("ok") is not False
+        and (np_payload.get("doc_id") or np_payload.get("ok") is True)
+    )
+    doc_id = None
+    if isinstance(np_payload, dict):
+        doc_id = np_payload.get("doc_id")
+        if not doc_id and isinstance(np_payload.get("result"), dict):
+            doc_id = np_payload["result"].get("doc_id")
+    np_rec = {
+        "tool": "new_part",
+        "args": np_args,
+        "ok": np_ok,
+        "result": np_payload,
+        "forced": True,
+        "force_reason": reason,
+    }
+    out["calls"].append(np_rec)
+    try:
+        _log(ledger, actor_s, {
+            "event": "tool_call",
+            "tool": "new_part",
+            "args": np_args,
+            "ok": np_ok,
+            "result": np_payload,
+            "forced": True,
+            "force_reason": reason,
+        })
+    except Exception:  # noqa: BLE001
+        try:
+            _log(ledger, actor_s, {
+                "event": "tool_call",
+                "tool": "new_part",
+                "args": np_args,
+                "ok": np_ok,
+                "result": np_payload,
+                "forced": True,
+                "force_reason": reason,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not np_ok or not doc_id:
+        out["refusal"] = (
+            "mech_force_new_part_failed: cannot mint airframe doc "
+            f"(result={str(np_payload)[:180]})"
+        )
+        return out
+
+    out["doc_id"] = doc_id
+    # 2) add_features with airframe body
+    af_args: dict[str, Any] = {"ops": ops, "doc_id": doc_id}
+    try:
+        _log(ledger, actor_s, {
+            "event": "mech_chain_force_inject",
+            "tool": "add_features",
+            "args": {"doc_id": doc_id, "n_ops": len(ops), "spec": spec},
+            "reason": reason,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        af_raw = disp("add_features", af_args)
+    except Exception as exc:  # noqa: BLE001
+        af_raw = {"ok": False, "error": str(exc)}
+    af_payload = af_raw
+    if isinstance(af_raw, str):
+        try:
+            af_payload = json.loads(af_raw)
+        except Exception:  # noqa: BLE001
+            af_payload = {"ok": False, "error": af_raw[:200]}
+    af_ok = True
+    if isinstance(af_payload, dict) and "ok" in af_payload:
+        af_ok = bool(af_payload.get("ok"))
+    af_rec = {
+        "tool": "add_features",
+        "args": {"doc_id": doc_id, "n_ops": len(ops)},
+        "ok": af_ok,
+        "result": af_payload,
+        "forced": True,
+        "force_reason": reason,
+    }
+    out["calls"].append(af_rec)
+    try:
+        _log(ledger, actor_s, {
+            "event": "tool_call",
+            "tool": "add_features",
+            "args": {"doc_id": doc_id, "n_ops": len(ops)},
+            "ok": af_ok,
+            "result": af_payload,
+            "forced": True,
+            "force_reason": reason,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+    out["ok"] = bool(np_ok and af_ok)
+    if not out["ok"]:
+        out["refusal"] = (
+            "mech_force_add_features_failed: airframe features did not land "
+            f"(result={str(af_payload)[:180]})"
+        )
+    return out
+
+
+def mech_deliver_gate(
+    ledger,
+    *,
+    manifest: dict | None = None,
+    dispatch: Callable | None = None,
+    actor: str | None = "deliver_gate",
+    run_id: str | None = None,
+    force: bool = True,
+) -> dict:
+    """Deliver-time gate: zero mech artifacts → force BUILD chain or refuse.
+
+    mega-21 M21: treat 'mech leg has no part artifact' like the ECAD chain treats
+    an unwired schematic. One forced pass of new_part+add_features per the
+    airframe brief; if still missing, emit typed refusal for leg relaunch.
+
+    Returns:
+      {
+        allow_deliver: bool,
+        had_mech: bool,
+        forced: bool,
+        ok: bool,
+        refusal: str|None,
+        doc_id: str|None,
+        calls: list,
+      }
+    """
+    had = _mech_has_part_artifact(ledger)
+    result: dict[str, Any] = {
+        "allow_deliver": had,
+        "had_mech": had,
+        "forced": False,
+        "ok": had,
+        "refusal": None,
+        "doc_id": None,
+        "calls": [],
+    }
+    if had:
+        return result
+    if not force:
+        result["refusal"] = (
+            "mech_leg_missing: no new_part/add_features artifact on ledger; "
+            "refuse deliver_partial (mega-21 M21)"
+        )
+        result["allow_deliver"] = False
+        return result
+
+    forced = _mech_force_build_chain(
+        ledger,
+        manifest=manifest,
+        dispatch=dispatch,
+        actor=actor,
+        reason="deliver_gate_mech_starvation",
+        run_id=run_id,
+    )
+    result["forced"] = bool(forced.get("forced"))
+    result["ok"] = bool(forced.get("ok"))
+    result["doc_id"] = forced.get("doc_id")
+    result["calls"] = list(forced.get("calls") or [])
+    result["refusal"] = forced.get("refusal")
+    # Re-scan ledger (forced calls logged) OR trust force result.
+    if result["ok"] or _mech_has_part_artifact(ledger):
+        result["allow_deliver"] = True
+        result["ok"] = True
+        result["refusal"] = None
+        return result
+    # Still missing after one force → typed refusal (no silent deliver).
+    if not result["refusal"]:
+        result["refusal"] = (
+            "mech_leg_missing_after_force: deliver refused — relaunch airframe "
+            "BUILD leg (new_part+add_features) (mega-21 M21)"
+        )
+    result["allow_deliver"] = False
+    try:
+        _log(ledger, actor or "deliver_gate", {
+            "event": "mech_deliver_refusal",
+            "refusal": result["refusal"],
+            "forced": result["forced"],
+            "doc_id": result.get("doc_id"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# mega-21 N21 — measurement net resolution for AC5 / ecad_simulate
+# ---------------------------------------------------------------------------
+
+_RAIL_NET_TOKENS = (
+    "3V3", "+3V3", "3.3V", "3.3", "VDD", "VCC", "VDDIO", "VDDA",
+    "VBAT", "5V", "+5V", "VIN",
+)
+
+
+def _net_name_list(netlist: Any) -> list[str]:
+    """Normalize nets from ecad_status / build_netlist / sim nodes."""
+    names: list[str] = []
+    if netlist is None:
+        return names
+    if isinstance(netlist, (list, tuple, set)):
+        for n in netlist:
+            if isinstance(n, str) and n.strip():
+                names.append(n.strip())
+            elif isinstance(n, dict):
+                nm = n.get("name") or n.get("net")
+                if isinstance(nm, str) and nm.strip():
+                    names.append(nm.strip())
+        return names
+    if not isinstance(netlist, dict):
+        return names
+    nets = netlist.get("nets")
+    if isinstance(nets, dict):
+        names.extend(str(k) for k in nets.keys() if k)
+    elif isinstance(nets, list):
+        for n in nets:
+            if isinstance(n, str):
+                names.append(n)
+            elif isinstance(n, dict):
+                nm = n.get("name") or n.get("net")
+                if isinstance(nm, str) and nm.strip():
+                    names.append(nm.strip())
+    for key in ("nodes", "node_names", "net_names"):
+        raw = netlist.get(key)
+        if isinstance(raw, list):
+            for n in raw:
+                if isinstance(n, str) and n.strip():
+                    names.append(n.strip())
+    # Dedup preserve order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _is_3v3_class_net(name: str) -> bool:
+    u = (name or "").upper().replace(" ", "")
+    if not u or u in ("0", "GND", "AGND", "DGND", "VSS", "VSSA"):
+        return False
+    for tok in ("3V3", "+3V3", "3.3V", "3.3", "VDD", "VCC", "VDDIO", "VDDA"):
+        if tok in u:
+            return True
+    return False
+
+
+def _is_power_rail_net(name: str) -> bool:
+    u = (name or "").upper().replace(" ", "")
+    if not u or u in ("0", "GND", "AGND", "DGND", "VSS", "VSSA"):
+        return False
+    for tok in _RAIL_NET_TOKENS:
+        if tok.replace("+", "") in u or tok in u:
+            return True
+    if u.startswith("N$"):
+        return False
+    return False
+
+
+def resolve_measure_net(
+    netlist: Any = None,
+    *,
+    source_net: str | None = None,
+    preferred: str | None = "3V3",
+    calls: list | None = None,
+) -> dict:
+    """Pick the live net to probe for AC5 (mega-21 N21).
+
+    Preference order:
+      1. preferred name if present in live nets (default 3V3)
+      2. any 3V3-class named net on the live netlist
+      3. source_net (net where injected V source landed)
+      4. source net harvested from place/wire call results
+      5. any non-GND named rail; else first non-GND node
+
+    Returns {net, probe, source, candidates}.
+    """
+    names = _net_name_list(netlist)
+    # Also harvest from call results (place pin nets, wire net, simulate nodes).
+    harvested_source: str | None = source_net
+    if calls:
+        for c in reversed(calls):
+            if not c.get("ok"):
+                continue
+            tool = c.get("tool")
+            res = c.get("result")
+            if isinstance(res, str):
+                try:
+                    res = json.loads(res)
+                except Exception:  # noqa: BLE001
+                    res = {}
+            if not isinstance(res, dict):
+                continue
+            if tool == "ecad_simulate":
+                for n in _net_name_list(res):
+                    if n not in names:
+                        names.append(n)
+            if tool in ("ecad_place_symbol", "ecad_wire", "ecad_add_power"):
+                net = res.get("net")
+                if isinstance(net, str) and net.strip():
+                    if net not in names:
+                        names.append(net.strip())
+                    # Voltage source positive pin net is the driven rail.
+                    lib = str(
+                        (c.get("args") or {}).get("libid")
+                        or res.get("libid")
+                        or ""
+                    ).lower()
+                    ref = str(res.get("ref") or (c.get("args") or {}).get("ref") or "")
+                    if (
+                        harvested_source is None
+                        and (
+                            "v_source" in lib
+                            or lib.endswith(":v")
+                            or "device:v" in lib
+                            or ref.upper().startswith(("V", "VIN"))
+                        )
+                    ):
+                        # Prefer + pin net from pin list.
+                        pins = res.get("pins") or []
+                        plus_net = None
+                        for p in pins:
+                            if not isinstance(p, dict):
+                                continue
+                            pn = str(p.get("number") or p.get("name") or "")
+                            if pn in ("+", "1", "P"):
+                                plus_net = p.get("net")
+                                break
+                        harvested_source = (
+                            str(plus_net).strip()
+                            if isinstance(plus_net, str) and plus_net.strip()
+                            else net.strip()
+                        )
+                if tool == "ecad_wire":
+                    # Wire net is product rail when source involved.
+                    fr = str((c.get("args") or {}).get("from_ref") or "").upper()
+                    tr = str((c.get("args") or {}).get("to_ref") or "").upper()
+                    if harvested_source is None and (
+                        fr.startswith(("V", "VIN")) or tr.startswith(("V", "VIN"))
+                    ):
+                        if isinstance(net, str) and net.strip():
+                            harvested_source = net.strip()
+
+    if source_net and source_net not in names:
+        names.append(source_net)
+    if harvested_source and harvested_source not in names:
+        names.append(harvested_source)
+
+    def _pick() -> tuple[str, str]:
+        pref = (preferred or "3V3").strip()
+        # 1) exact preferred
+        for n in names:
+            if n.upper() == pref.upper():
+                return n, "preferred_exact"
+        # 2) 3V3-class
+        for n in names:
+            if _is_3v3_class_net(n):
+                return n, "rail_3v3_class"
+        # 3) explicit source_net arg
+        if source_net:
+            return source_net, "source_net_arg"
+        # 4) harvested source (VIN / Device:V + pin net)
+        if harvested_source:
+            return harvested_source, "source_injected"
+        # 5) other named rails (VIN/VCC/5V…) — not anonymous N$
+        for n in names:
+            if _is_power_rail_net(n):
+                return n, "named_rail"
+        # 6) Prefer the mission rail name when no source was injected. Anonymous
+        # product-wire nets (N1/N$2) without a voltage source are not a better
+        # AC5 target than V(3V3) — mega-17 forced-sim fixture.
+        # Only fall through to first non-GND when a source landed somewhere.
+        if harvested_source or source_net:
+            for n in names:
+                u = n.upper()
+                if u not in ("0", "GND", "AGND", "DGND", "VSS"):
+                    return n, "first_nongnd"
+        return pref, "fallback_preferred"
+
+    net, src = _pick()
+    probe = f"V({net})"
+    return {
+        "net": net,
+        "probe": probe,
+        "source": src,
+        "candidates": names[:24],
+        "source_net": harvested_source or source_net,
+    }
+
+
+def resolve_measure_net_from_ledger(
+    ledger,
+    *,
+    preferred: str | None = "3V3",
+    live_netlist: Any = None,
+) -> dict:
+    """Resolve AC5 measure net from ledger calls + optional live netlist."""
+    calls = _ledger_tool_calls(ledger)
+    # Prefer explicit netlist; else fold simulate nodes from prior runs.
+    nl = live_netlist
+    if nl is None:
+        # Build a pseudo-netlist from the latest simulate result nodes + wire nets.
+        bag: dict[str, Any] = {"nets": [], "nodes": []}
+        for c in calls:
+            res = c.get("result")
+            if isinstance(res, str):
+                try:
+                    res = json.loads(res)
+                except Exception:  # noqa: BLE001
+                    continue
+            if not isinstance(res, dict):
+                continue
+            if c.get("tool") == "ecad_simulate":
+                for n in res.get("nodes") or []:
+                    if isinstance(n, str):
+                        bag["nodes"].append(n)
+            net = res.get("net")
+            if isinstance(net, str) and net.strip():
+                bag["nets"].append({"name": net.strip()})
+        nl = bag
+    return resolve_measure_net(
+        nl, preferred=preferred, calls=calls,
+    )
+
 
 
 

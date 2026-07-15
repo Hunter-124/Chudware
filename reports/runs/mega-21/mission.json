@@ -1,0 +1,20 @@
+{
+  "status": "needs_correction",
+  "phase": "correct",
+  "phases_completed": [
+    "intake",
+    "specify"
+  ],
+  "stop_reason": "verify_failed: ['AC1', 'AC4', 'AC5']",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-21-fc-rocket-20260715/ledger.json",
+  "run_id": "mega-21-fc-rocket-20260715",
+  "mode": "real",
+  "wall_s": 433.95,
+  "conservation": true,
+  "baseline_commit": "175c4b81",
+  "spend_before_usd": 0.22370784,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-21-fc-rocket-20260715/ledger.json"
+}

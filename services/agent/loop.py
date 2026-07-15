@@ -2416,6 +2416,42 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
             status = "blocked"
             stop_reason = f"{reached}_incomplete" if reached else "blocked"
 
+    # mega-21 M21: refuse deliver with zero mechanical artifacts. Force-inject
+    # airframe BUILD chain (new_part+add_features) once; else typed refusal.
+    if status in ("done", "blocked", "needs_correction") and (
+        stop_reason in (
+            "deliver_partial", "mission_complete", "",
+        )
+        or (stop_reason or "").startswith("deliver")
+        or reached == Phase.DELIVER.value
+    ):
+        try:
+            from services.agent.agent_turn import mech_deliver_gate  # noqa: PLC0415
+            gate = mech_deliver_gate(
+                ledger,
+                manifest=manifest,
+                actor="deliver_gate",
+                run_id=run_id,
+                force=True,
+            )
+            if not gate.get("allow_deliver"):
+                status = "blocked"
+                stop_reason = (
+                    gate.get("refusal")
+                    or "mech_leg_missing: refuse deliver without part artifact"
+                )
+                reached = Phase.DELIVER.value
+            elif gate.get("forced") and gate.get("ok"):
+                # Forced mech chain executed — keep deliver terminal but mark
+                # partial if soft-join already set (honest about other legs).
+                if not stop_reason or stop_reason == "mission_complete":
+                    stop_reason = (
+                        "deliver_partial" if deliver_soft_partial
+                        else "mission_complete"
+                    )
+        except Exception:  # noqa: BLE001 — gate must not crash the mission driver
+            pass
+
     # mega-17 Z1: every mission terminal must emit criterion results for ALL
     # declared ACs (honest FAIL/SKIP/NOT-CHECKED when tools/artifacts absent).
     # Covers deliver_partial / needs_correction / incomplete paths where VERIFY

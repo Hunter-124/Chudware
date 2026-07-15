@@ -379,3 +379,19 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   force cascade optional when model skips add_power. Findings:
   `reports/runs/mega-20/findings.md`.
 
+
+- 2026-07-15 mega-21 (WS5): kill mega-20 variance sinks (mech starvation + AC5
+  net-name null) under `reports/runs/mega-21/` (primary
+  `mega-21-fc-rocket-20260715`). Baseline `175c4b81`. Fixer21 (TroubledSlug)
+  bound M21 deliver-gate mech force (`new_part`+`add_features` or typed refusal)
+  + N21 AC5 live-net resolve/`resolved_net` evidence (142p). Preflight PASS:
+  account `06dc3359` ACTIVE, hard→xai-sub grok-4.5 EXACT, mid openrouter
+  deepseek (keys.openrouter merge-safe), leaf ollama; hostd
+  `night2-3075-gb0e66f3d-dirty` matches disk. **a1** wall **434s**
+  terminal `needs_correction`/`verify_failed: ['AC1', 'AC4', 'AC5']` live AC PASS **6**/9
+  (AC2, AC3, AC6, AC7, AC8, AC9). Axes a1: **M21 PASS** (airframe product; AC2/AC3
+  PASS), **N21 PASS** (`resolved_net=3V3`, finite V=0.0 honest FAIL vs band),
+  C19/D19/Z1/Z2/Z3/Z4/Y/W/X/V/Fix8/A PASS; A20/B20/S **PARTIAL** (AC4 DRC
+  clearance×31, ERC=0); G18 PARTIAL (6<7). Residuals: AC5 in-band V (source
+  drive), AC4 clearance, AC1 measure_between side vocab. Findings:
+  `reports/runs/mega-21/findings.md`.

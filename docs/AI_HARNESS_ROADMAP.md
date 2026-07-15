@@ -408,3 +408,17 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   archived (infra). Residuals: finite V on 3V3; mb real score/SKIP. Findings:
   `reports/runs/mega-22/findings.md`.
 
+
+- 2026-07-15 mega-24 (WS5): fix mega-23 live thrash under
+  `reports/runs/mega-24/` (primary a3 `mega-24-fc-rocket-20260715`).
+  Baseline `8ce92d74`. Fixer24 ComingOcelot + Fixer24c BurningWildcat:
+  U24 root-cause (provider poison + tool amplifiers + terminal force skip —
+  **not** S23/T23 logic); V24 restore BUILD tool loop; force-first-tool on
+  zero-tool prose/junk-JSON; typed_refusal on plan done; fw `_err`; wire net
+  strip; ledger_note coerce; 234p offline gate. a1/a2 liveness-killed
+  (archives `221105Z`/`223717Z`); HOLD then offline FINAL_OK; **a3** wall
+  **897s** terminal `needs_correction`/`verify_failed:[AC4,AC5]` live AC
+  **7**/9 (AC1–3,6–9). **T23 PASS** (measure_between=1.0); **S23 FAIL**
+  (simulate on PCB doc). **U24/V24 PASS**. Battery `doc-cpp00000005` PASS.
+  Residuals: AC4 clearance×6; AC5 schematic doc routing. Findings:
+  `reports/runs/mega-24/findings.md`.

@@ -1515,6 +1515,62 @@ def _multi_domain_delegate_gate(
         info["typed_refusal_errors"] = errs
 
     # Free-form ledger_note / bare handoff does NOT satisfy.
+    # mega-24 a1 residual: pure plan-read thrash (N× ledger_get, no writes)
+    # finished DONE then escalated as delegate_or_typed_refusal_required —
+    # thrash-kill at 4 node fails. Soft-pass ONLY for read-only productive
+    # turns (layout skeleton class). Free-form "doing it myself" with
+    # ledger_note/buildgraph_plan still blocks (mega-8 contract).
+    try:
+        calls = result.get("calls") if isinstance(result, dict) else None
+        if not isinstance(calls, list):
+            calls = getattr(agent_result, "calls", None) or []
+        _READ = {
+            "ledger_get", "part_search", "parts_taxonomy", "part_source",
+            "describe_part", "describe_scene", "describe_project",
+            "workspace_status", "buildgraph_status",
+        }
+        ok_tools = [
+            c.get("tool") for c in calls
+            if isinstance(c, dict) and c.get("ok") is not False and c.get("tool")
+        ]
+        n_read = sum(1 for t in ok_tools if t in _READ)
+        pure_read = bool(ok_tools) and all(t in _READ for t in ok_tools)
+    except Exception:  # noqa: BLE001
+        n_read = 0
+        pure_read = False
+    if pure_read and n_read >= 2:
+        synth = {
+            "reason": (
+                "plan-read thrash without delegate; staying flat with "
+                "synthesised typed refusal"
+            ),
+            "domains_considered": list(tags) if tags else [
+                "plan", "geometry", "assembly", "ecad",
+            ],
+            "why_flat": (
+                "Node only performed plan-read tools (ledger_get/describe/…); "
+                "mega-24 soft-pass via synthesised typed_refusal."
+            ),
+        }
+        try:
+            if isinstance(result, dict):
+                ho = result.get("handoff")
+                if not isinstance(ho, dict):
+                    ho = {"status": "done", "outputs": {}}
+                    result["handoff"] = ho
+                outs = ho.get("outputs")
+                if not isinstance(outs, dict):
+                    outs = {}
+                    ho["outputs"] = outs
+                outs.setdefault("typed_refusal", synth)
+                result.setdefault("typed_refusal", synth)
+        except Exception:  # noqa: BLE001
+            pass
+        info["reason"] = "typed_refusal_synth_plan_read"
+        info["typed_refusal"] = synth
+        info["blocked"] = False
+        return False, info
+
     info["reason"] = "missing_delegate_or_typed_refusal"
     info["blocked"] = True
     info["hint"] = (

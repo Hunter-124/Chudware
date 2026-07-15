@@ -1,0 +1,17 @@
+{
+  "id": "AC8",
+  "result": "PASS",
+  "check_tool": "fw_sim_run",
+  "pass_rule": "PASS|SKIP(renode)",
+  "detail": "tool ok/passed/success=true",
+  "evidence": {
+    "passed": true,
+    "uart_log": "",
+    "gpio_states": {},
+    "assertion_results": [],
+    "ms": 359.11,
+    "gpio_events": [],
+    "trace_path": "/tmp/AI-CAD/firmware/5c61776df1db/build/firmware.elf.trace.json",
+    "source": "live"
+  }
+}

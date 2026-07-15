@@ -22,6 +22,15 @@ def _dumps(payload) -> str:
     return json.dumps(payload, indent=2)
 
 
+def _err(reason: str, hint: str = "", **extra) -> dict:
+    """Structured error envelope (mega-24: fw_sensor_scenario used _err without defining it)."""
+    out = {"ok": False, "error": str(reason), "code": str(reason)}
+    if hint:
+        out["hint"] = hint
+    out.update(extra)
+    return out
+
+
 def register_firmware_tools(mcp) -> None:
     """Register every firmware compile-loop tool on the given FastMCP instance."""
 

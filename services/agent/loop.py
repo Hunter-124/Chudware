@@ -2418,14 +2418,24 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
 
     # mega-22: terminal ECAD product force BEFORE mech gate so P22/Q22 still
     # fire when BUILD nodes starved the schematic path (a1: force_n=0).
-    if status in ("done", "blocked", "needs_correction") and (
-        stop_reason in (
-            "deliver_partial", "mission_complete", "",
+    # mega-24: also fire on verify_failed / needs_correction terminals — mega-23
+    # a1 stopped with verify_failed:AC1-5 and both product forces SKIPPED
+    # (battery doc_id=null). Product force must land even when BUILD thrashed.
+    _sr = (stop_reason or "")
+    _terminal_product_force = (
+        status in ("done", "blocked", "needs_correction", "failed")
+        and (
+            _sr in ("deliver_partial", "mission_complete", "", "needs_correction")
+            or _sr.startswith("deliver")
+            or _sr.startswith("verify_failed")
+            or _sr.startswith("mech_")
+            or reached == Phase.DELIVER.value
+            or "deliver" in completed
+            or "verify" in completed
+            or "build" in completed
         )
-        or (stop_reason or "").startswith("deliver")
-        or reached == Phase.DELIVER.value
-        or "deliver" in completed
-    ):
+    )
+    if _terminal_product_force:
         try:
             from services.agent.agent_turn import ecad_product_gate  # noqa: PLC0415
             _ecad_g = ecad_product_gate(
@@ -2445,13 +2455,8 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     # artifacts. Force-inject airframe BUILD once; typed refusal on miss.
     # Soft refusal (force attempted, features failed) does NOT hard-block
     # the mission — ECAD force above already ran; grade with honest FAIL.
-    if status in ("done", "blocked", "needs_correction") and (
-        stop_reason in (
-            "deliver_partial", "mission_complete", "",
-        )
-        or (stop_reason or "").startswith("deliver")
-        or reached == Phase.DELIVER.value
-    ):
+    # mega-24: same predicate as ECAD product force (verify_failed path).
+    if _terminal_product_force:
         try:
             from services.agent.agent_turn import mech_deliver_gate  # noqa: PLC0415
             gate = mech_deliver_gate(
@@ -2468,13 +2473,20 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                         stop_reason or ""
                     ).startswith("mech_"):
                         status = "done"
-                    stop_reason = (
-                        gate.get("refusal")
-                        or stop_reason
-                        or "deliver_partial_mech_soft_refusal"
-                    )
-                    if not stop_reason.startswith("deliver"):
-                        # Preserve typed mech refusal text for diagnostics.
+                    # Prefer existing deliver_partial / mission_complete over
+                    # long mech refusal text (mega-8 deliver contracts).
+                    _sr0 = stop_reason or ""
+                    if deliver_soft_partial:
+                        stop_reason = "deliver_partial"
+                    elif _sr0 in ("mission_complete", "deliver_partial") or _sr0.startswith("deliver"):
+                        pass  # keep
+                    elif not _sr0:
+                        stop_reason = (
+                            "deliver_partial" if deliver_soft_partial
+                            else "mission_complete"
+                        )
+                    else:
+                        # Keep non-empty prior stop; soft mech is diagnostic only.
                         pass
                     reached = Phase.DELIVER.value
                 else:

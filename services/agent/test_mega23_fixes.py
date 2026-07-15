@@ -254,18 +254,29 @@ def test_ensure_driven_wires_v_minus_to_gnd():
         steps=0,
         max_steps=20,
     )
-    # Must issue a GND return for V-.
+    # Must issue a GND return for V- (mega-24: net stays on call_rec, stripped
+    # from MCP dispatch — ecad_wire has no net kwarg).
     gnd_wires = [
-        a for t, a in dispatched
-        if t == "ecad_wire" and str(a.get("net", "")).upper() == "GND"
+        c.get("args") or {}
+        for c in new_calls
+        if c.get("tool") == "ecad_wire"
+        and c.get("forced")
+        and str((c.get("args") or {}).get("net", "")).upper() == "GND"
     ]
-    assert gnd_wires, f"expected V-/load → GND wire; got {dispatched}"
+    assert gnd_wires, (
+        f"expected V-/load → GND wire on call_rec; dispatched={dispatched} "
+        f"new_calls={[c for c in new_calls if c.get('forced')]}"
+    )
     # Prefer explicit V- pin on a GND net wire.
     assert any(
         str(a.get("from_ref", "")).upper().startswith("V")
         or str(a.get("to_ref", "")).upper().startswith("V")
         for a in gnd_wires
     ), gnd_wires
+    # Dispatch path must not TypeError on net= (stripped).
+    for t, a in dispatched:
+        if t == "ecad_wire":
+            assert "net" not in a, a
     assert made >= 1
     assert steps >= 1
     assert isinstance(new_calls, list)

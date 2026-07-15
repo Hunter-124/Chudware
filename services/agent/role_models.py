@@ -833,9 +833,10 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         ):
             _add("openrouter", mid)
         # Free-tier OpenRouter candidates (auto_pick ranks them; cost class 1).
+        # mega-24: mistralai/mistral-small:free returns 404 "No endpoints found"
+        # — removed from candidates so leaves don't thrash on dead free ids.
         for mid in (
             "nvidia/nemotron-ultra:free",
-            "mistralai/mistral-small:free",
             "google/gemma-3-27b-it:free",
         ):
             _add("openrouter", mid)
@@ -1061,6 +1062,29 @@ def normalize_leaf_envelope(payload: Any) -> dict[str, Any] | None:
     ops = out.get("ops")
     if isinstance(ops, list):
         out["ops"] = [o for o in ops if isinstance(o, dict)]
+    # mega-24 thrash: ollama leaves emit no_op=false + empty reason + empty/partial
+    # ops, or no_op=true WITH non-empty ops (DELIVER DL2 leaf_oneshot_miss).
+    # Prefer real ops; if only no_op=false garbage, coerce to no_op with a
+    # default reason when goal is present (INTAKE already wrote manifest).
+    # Do NOT invent reason for bare {goal, no_op:true} missing reason — that
+    # remains a validation error (mega-8 contract).
+    ops_list = out.get("ops") if isinstance(out.get("ops"), list) else []
+    has_ops = len(ops_list) > 0
+    no_op = out.get("no_op")
+    reason = out.get("reason")
+    if has_ops and no_op is True:
+        # Live thrash (DELIVER DL2): no_op=true WITH ops — prefer ops always.
+        # mega-8 test updated to match salvage (conflict is unusable either way).
+        out.pop("no_op", None)
+        out.pop("reason", None)
+    elif not has_ops and no_op is False:
+        goal = out.get("goal")
+        if isinstance(goal, str) and goal.strip():
+            out["no_op"] = True
+            out["reason"] = (
+                reason.strip() if isinstance(reason, str) and reason.strip()
+                else "leaf oneshot: no concrete ops; goal recorded"
+            )
     return out
 
 
@@ -1074,6 +1098,7 @@ def validate_leaf_envelope(payload: Any) -> list[str]:
 
     mega-8: local models emit ``reason: null`` and string artifacts — normalize
     those before schema check so salvageable envelopes still pass.
+    mega-24: also salvage no_op/ops conflicts (see normalize_leaf_envelope).
     """
     payload = normalize_leaf_envelope(payload)
     if payload is None:
@@ -1093,6 +1118,7 @@ def validate_leaf_envelope(payload: Any) -> list[str]:
             "leaf_envelope: require non-empty ops[] OR (no_op=true + reason)"
         )
     if no_op is True and has_ops:
+        # normalize should have cleared this; keep as hard fail if residual.
         errs.append("leaf_envelope: no_op=true conflicts with non-empty ops")
     return errs
 

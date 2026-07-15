@@ -1,0 +1,104 @@
+{
+  "id": "AC4",
+  "result": "FAIL",
+  "check_tool": "ecad_run_drc+ecad_run_erc",
+  "pass_rule": "errors==0",
+  "detail": "check tool reported error: ok=false",
+  "evidence": {
+    "ok": false,
+    "tools": [
+      "ecad_run_drc",
+      "ecad_run_erc"
+    ],
+    "drc": {
+      "ok": true,
+      "doc_id": "767f0f0fa678",
+      "revision": 6,
+      "errors": 6,
+      "warnings": [],
+      "verdict": "6 error(s), 0 warning(s). worst: [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+      "violations": [
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p9 (net '3V3') and t33 (net 'GND')"
+      ],
+      "by_rule": [
+        {
+          "rule": "clearance",
+          "severity": "error",
+          "count": 6,
+          "pins": [],
+          "nets": [],
+          "messages": [
+            "clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND')",
+            "clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3')",
+            "clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3')"
+          ]
+        }
+      ],
+      "hint": "6 error(s), 0 warning(s). worst: [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+      "next_actions": [
+        "Address the worst DRC offenders above (widen tracks / increase spacing / move parts), then re-run ecad_run_drc()."
+      ],
+      "source": "live"
+    },
+    "ecad_run_drc": {
+      "ok": true,
+      "doc_id": "767f0f0fa678",
+      "revision": 6,
+      "errors": 6,
+      "warnings": [],
+      "verdict": "6 error(s), 0 warning(s). worst: [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+      "violations": [
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+        "[ERROR] clearance: clearance 0.1296mm < required 0.2mm between p9 (net '3V3') and t33 (net 'GND')"
+      ],
+      "by_rule": [
+        {
+          "rule": "clearance",
+          "severity": "error",
+          "count": 6,
+          "pins": [],
+          "nets": [],
+          "messages": [
+            "clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND')",
+            "clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3')",
+            "clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3')"
+          ]
+        }
+      ],
+      "hint": "6 error(s), 0 warning(s). worst: [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p11 (net 'N$2') and t31 (net 'GND') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p14 (net 'N$10') and t26 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p2 (net 'N$9') and t8 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p23 (net 'GND') and t28 (net '3V3') | [ERROR] clearance: clearance 0.1296mm < required 0.2mm between p8 (net 'GND') and t10 (net '3V3')",
+      "next_actions": [
+        "Address the worst DRC offenders above (widen tracks / increase spacing / move parts), then re-run ecad_run_drc()."
+      ],
+      "source": "live"
+    },
+    "erc": {
+      "ok": false,
+      "error": "doc '767f0f0fa678' is a pcb, not a schematic",
+      "warnings": [],
+      "hint": "Open a schematic first.",
+      "next_actions": [
+        "ecad_new_schematic('mydesign')"
+      ],
+      "source": "live"
+    },
+    "ecad_run_erc": {
+      "ok": false,
+      "error": "doc '767f0f0fa678' is a pcb, not a schematic",
+      "warnings": [],
+      "hint": "Open a schematic first.",
+      "next_actions": [
+        "ecad_new_schematic('mydesign')"
+      ],
+      "source": "live"
+    }
+  }
+}

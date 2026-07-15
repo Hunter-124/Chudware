@@ -40,7 +40,8 @@ def test_turn_dispatches_tool_then_finishes():
     assert res.success is True
     assert res.stop_reason == "confirmed"
     assert seen["tool"] == "measure_part"
-    assert res.result["handoff"] == {"summary": "measured"}
+    assert res.result["handoff"]["summary"] == "measured"
+    # mega-24: formal done after tools may attach typed_refusal under outputs.
     assert res.result["calls"][0]["ok"] is True
 
 
@@ -261,7 +262,11 @@ def test_budget_exhaust_without_ledger_write_still_retries():
 
 def test_no_code_after_ledger_note_auto_completes():
     """specify-fix-1 s2: productive tools + ledger_note, then junk JSON that
-    is neither tool nor done → was no_code escalate. Ledger write is enough."""
+    is neither tool nor done → was no_code escalate. Ledger write is enough.
+
+    mega-24c: junk JSON after tools takes the bare-handoff floor (same outcome
+    as end-of-loop auto_complete — confirmed, not no_code).
+    """
     provider = _ScriptedProvider([
         '```json\n{"tool": "fit_calc", "args": {"nominal": 20}}\n```',
         '```json\n{"tool": "ledger_note", "args": {"kind": "dimension", '
@@ -278,7 +283,11 @@ def test_no_code_after_ledger_note_auto_completes():
     )
     assert res.success is True
     assert res.stop_reason == "confirmed"
-    assert res.result.get("auto_complete") is True
+    # Either end-of-loop auto_complete OR bare-handoff after tools (mega-24c).
+    assert (
+        res.result.get("auto_complete") is True
+        or ((res.result.get("handoff") or {}).get("status") == "done")
+    )
 
 
 def test_replay_grok45_specify_transcript_passes_gate():

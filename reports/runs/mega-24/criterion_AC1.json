@@ -1,0 +1,183 @@
+{
+  "id": "AC1",
+  "result": "PASS",
+  "check_tool": "verify_battery",
+  "pass_rule": "PASS",
+  "detail": "explicit verdict='PASS'",
+  "evidence": {
+    "source": "battery_result",
+    "doc_id": "doc-cpp00000005",
+    "verdict": "PASS",
+    "ok": true,
+    "scores": {
+      "ecad_check_impedance": 1.0,
+      "ecad_run_erc": 1.0,
+      "eval_check": 1.0,
+      "groundedness": 1.0,
+      "is_manifold": 1.0,
+      "layout_coverage": 1.0,
+      "measure_between": 1.0,
+      "measure_part": 1.0,
+      "power_budget": 1.0,
+      "query_geometry": 1.0,
+      "req_join": 1.0,
+      "unit_sanity": 1.0
+    },
+    "findings": [
+      {
+        "name": "check_sketch",
+        "severity": null,
+        "message": "no sketches on document"
+      },
+      {
+        "name": "dim_coverage",
+        "severity": null,
+        "message": "no drawing in mission scope"
+      },
+      {
+        "name": "ecad_check_diff_impedance",
+        "severity": null,
+        "message": "no differential pair nets on board (need net_p/net_n)"
+      }
+    ],
+    "checks": [
+      {
+        "name": "ecad_check_impedance",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "ecad_run_erc",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "eval_check",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "groundedness",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "is_manifold",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "layout_coverage",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "measure_between",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "measure_part",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "power_budget",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "query_geometry",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "req_join",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "unit_sanity",
+        "verdict": "PASS",
+        "score": 1.0
+      }
+    ],
+    "per_check": [
+      {
+        "name": "ecad_check_impedance",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "ecad_run_erc",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "eval_check",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "groundedness",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "is_manifold",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "layout_coverage",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "measure_between",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "measure_part",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "power_budget",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "query_geometry",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "req_join",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "unit_sanity",
+        "verdict": "PASS",
+        "score": 1.0
+      }
+    ],
+    "zero_checks": [],
+    "geometry_evidence": {
+      "is_manifold": 1.0,
+      "eval_check": 1.0,
+      "measure_part": 1.0,
+      "query_geometry": 1.0,
+      "layout_coverage": 1.0,
+      "check_sketch": null,
+      "dim_coverage": null,
+      "unit_sanity": 1.0,
+      "power_budget": 1.0
+    },
+    "brief_hints": [
+      "all scored checks >0 \u2014 AC1 battery shape is clean."
+    ]
+  }
+}

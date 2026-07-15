@@ -49,6 +49,7 @@ _LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
     "review_verdict": "decision",
     "audit": "decision",
     "ruling": "decision",
+    "plan_ruling": "decision",
     "spec": "decision",
     # mega-3 residual: intake/organize models write kind=manifest_confirm
     "manifest_confirm": "decision",
@@ -65,6 +66,38 @@ _LEDGER_NOTE_KIND_ALIASES: dict[str, str] = {
     "verification": "artifact",
     "verification_result": "artifact",
 }
+
+
+def _coerce_ledger_payload(payload: Any) -> dict:
+    """Normalize ledger_note payload to a dict (mega-24 leaf thrash).
+
+    Live ollama leaves often send JSON-as-string (``payload='{}'`` /
+    ``'{"name":"x"}'``). ``dict(str)`` raises
+    ``dictionary update sequence element #0 has length 1`` and burns the
+    BUILD budget on ledger_note retries.
+    """
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except (TypeError, json.JSONDecodeError, ValueError):
+            return {"text": text}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    if isinstance(payload, (list, tuple)):
+        # Try list-of-pairs; else stash under items.
+        try:
+            return dict(payload)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            return {"items": list(payload)}
+    return {"value": payload}
 
 # Model-facing section aliases → canonical ledger state keys (mega-3 residual:
 # interfaces / results / notes thrash after Fixer2 all/events/manifest).
@@ -83,11 +116,23 @@ _LEDGER_GET_SECTION_ALIASES: dict[str, str] = {
     "acceptance_criteria": "artifacts",
     "ac": "artifacts",
     "mission_brief": "brief",
+    "mission brief": "brief",
     "criterion_result": "criterion_results",
     "criterion_results": "criterion_results",
     "ac_results": "criterion_results",
     "verification": "criterion_results",
     "verifications": "criterion_results",
+    # mega-24 thrash: models capitalise section names (Decisions, Dimensions, Bom)
+    "decisions": "decisions",
+    "dimensions": "dimensions",
+    "requirements": "requirements",
+    "artifacts": "artifacts",
+    "features": "features",
+    "bom": "artifacts",
+    "bill_of_materials": "artifacts",
+    "airframe components": "artifacts",
+    "airframe_components": "artifacts",
+    "components": "artifacts",
 }
 
 # T-DP1: kinds that require a `provenance` field on write (the "never recall a
@@ -195,7 +240,14 @@ class MissionDispatch:
             }
         if section:
             # mega-3: alias model-facing section names before allow-list.
-            section = _LEDGER_GET_SECTION_ALIASES.get(section, section)
+            # mega-24: casefold so Decisions/Dimensions/Bom resolve.
+            sec_key = str(section).strip()
+            sec_low = sec_key.lower()
+            section = (
+                _LEDGER_GET_SECTION_ALIASES.get(sec_low)
+                or _LEDGER_GET_SECTION_ALIASES.get(sec_key)
+                or sec_low
+            )
             allowed = {"brief", "requirements", "decisions", "dimensions",
                        "questions", "stage_log", "artifacts", "criterion_results",
                        # T-DP1 design-pipeline sections (contract §4/§9)
@@ -254,7 +306,7 @@ class MissionDispatch:
                 ),
                 "aliased_to": dict(_LEDGER_NOTE_KIND_ALIASES),
             }
-        body = dict(payload or {})
+        body = _coerce_ledger_payload(payload)
         body.update({k: v for k, v in extra.items() if not k.startswith("_")})
         # Stash original alias for audit when we remapped.
         if raw_kind != kind:

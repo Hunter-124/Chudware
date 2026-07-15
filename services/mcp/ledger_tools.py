@@ -9,6 +9,7 @@ Schema: contracts/advisor.md §2 (``aicad.ledger/1``).
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -194,6 +195,17 @@ def register_ledger_tools(mcp) -> None:
                     "valid_kinds": sorted(VALID_KINDS | set(KIND_ALIASES)),
                     "aliased_to": KIND_ALIASES}
 
+        # mega-24: models (esp. leaves) send payload as a JSON string.
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                payload = {}
+            else:
+                try:
+                    parsed = json.loads(text)
+                    payload = parsed if isinstance(parsed, dict) else {"value": parsed}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {"text": text}
         payload = dict(payload or {})
         if kind == "artifact" and raw_kind != kind:
             payload.setdefault("id", str(

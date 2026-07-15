@@ -395,9 +395,10 @@ def test_leaf_envelope_validates():
     assert validate_leaf_envelope({
         "goal": "x", "no_op": True,  # missing reason
     })
+    # mega-24: no_op=true WITH ops is salvaged to ops-only (prefer ops).
     assert validate_leaf_envelope({
         "goal": "x", "no_op": True, "reason": "r", "ops": [{"a": 1}],
-    })
+    }) == []
 
     text = '```json\n{"goal":"g","no_op":true,"reason":"already done"}\n```'
     env, errs = parse_leaf_envelope_text(text)

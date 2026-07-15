@@ -8,6 +8,7 @@
 // operator outside {+,-,*,/,**, unary +/-}, a non-numeric constant, a call to a
 // function not in _FUNCS, keyword arguments, or any other construct. '^' -> '**'.
 #include "doc/validate.h"
+#include <algorithm>
 
 #include <cctype>
 #include <map>
@@ -1999,6 +2000,17 @@ vector<string> validate_assembly(const json& doc) {
 }
 
 }  // namespace
+
+// Export FEATURE_TYPES keys for the op registry / MCP / agent surfaces.
+// FEATURE_TYPES lives in the anonymous namespace above; this is the only
+// external query path so consumers never hand-copy the list.
+std::vector<std::string> feature_type_names() {
+    std::vector<std::string> out;
+    out.reserve(FEATURE_TYPES.size());
+    for (const auto& kv : FEATURE_TYPES) out.push_back(kv.first);
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 // --------------------------------------------------------------------------- public
 

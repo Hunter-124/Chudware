@@ -172,6 +172,14 @@ private:
     bool mdPassCFresh = false;           // C's PM was fresh (inactive) before we opened its form
     bool mdPassChop[4] = {false, false, false, false};  // A<->C hop verdicts (A,C,A,C)
 
+
+    // ---------- tabperf scenario (AI_CAD_SHOT=tabperf) ----------
+    // Opens two real parts, then hammers A<->B switchToTab for >=20 switches so logTabPerf
+    // ([perf] tab_switch ...) can be collected from stderr. Measurement-only; no UI assertions.
+    void runTabPerf(AppState& st);
+    int tpStep = 0, tpSettle = 0, tpSwitches = 0;
+    int tpIdxA = -1, tpIdxB = -1;
+    static constexpr int kTabPerfSwitches = 24;  // 12 A->B + 12 B->A
     // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
     // Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
     // PartsLibrary, AI), capturing one screenshot per workspace. Acceptance gate for the

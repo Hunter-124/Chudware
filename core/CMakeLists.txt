@@ -311,6 +311,7 @@ set_property(TARGET aicad_cam PROPERTY
 add_library(aicad_ecad STATIC
   ecad/schema.cpp
   ecad/ops.cpp
+  ecad/op_registry.cpp
   ecad/netlist.cpp
   ecad/erc.cpp
   ecad/drc.cpp
@@ -1079,6 +1080,7 @@ if(AICAD_WITH_OCCT)
     doc/sketch_geom.cpp
     doc/stepplus.cpp
     doc/validate.cpp
+    doc/op_registry.cpp
     doc/formats.cpp
     doc/dxf.cpp
     doc/pdfvec.cpp
@@ -1143,6 +1145,21 @@ if(AICAD_WITH_OCCT)
   add_test(NAME document COMMAND test_document)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Op vocabulary registry lockstep (mega-8 OpVocab) -----------------------
+  # Fails if someone adds an apply_one handler without updating op_registry, or
+  # if unknown-op errors lose their closest-suggestion text.
+  add_executable(test_op_registry
+    tests/test_op_registry.cpp)
+  target_include_directories(test_op_registry PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_op_registry PRIVATE
+    aicad_doc aicad_ecad aicad_geom_occt aicad_sketch aicad_geom aicad_util)
+  set_target_properties(test_op_registry PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME op_registry COMMAND test_op_registry)
+  set_tests_properties(op_registry PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- sketch3d document layer: wire chaining, sweep spine/guide from a 3D
   # free-space sketch, and the sketch3d_health/drag session RPCs. --------------

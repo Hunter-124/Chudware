@@ -14,11 +14,14 @@
 - **Primary evidence:** `events.jsonl`, `ledger.json`, `mission.json`, `spawn_probe.json`, `auto_pick_smoke.json`, `subscription_accounts.json`, `progress.md`, `attempt-1-pre-fixer7-rebind/`
 - **Fixer peer:** HomelessBadger (Fixer7) — Fixes 1–4 in source + `fixes.md` (32 pytest); bound on attempt-2 relaunch
 
-### Attempt-1 (pre-Fixer7 rebind) — archived, not primary
+### Attempt-1 (pre-Fixer7 rebind) — archived; **delegation evidence**
 
-- Pid 2101380, account `79066dcc-…`, wall ~5–10m (killed for relaunch)
-- Preflight PASS; **Fix6 model_assignment ×12–21** already bound (all `task_class=unknown` → xai-sub)
-- Mid-run: some `add_features` calls appeared under Fixer6 Fix7, but Fixer7 task_class / deliver soft-join / stronger nudges **not imported**
+- Pid 2101380, account `79066dcc-…`, wall **544.2s** (finished before relaunch kill window; artifacts complete)
+- Preflight PASS; **Fix6 model_assignment ×21** (19 depth0 + **2 depth1 children**); all `task_class=unknown` → xai-sub
+- **Live delegation restored vs mega-6:** `delegate`×2 on `n_build_DL2` → `agent.spawn`×2 (`part_designer` budget 8000; `edit-part` budget 12000); max depth **1**
+- BUILD: `new_part`×2, `add_features`×9, `cad_guide`×5, `verify_battery`×3 (Fixer6 Fix7 path live)
+- Mission terminal: `needs_correction` / `verify_failed: [AC1…AC9]` (not deliver_incomplete)
+- Fixer7 task_class / deliver soft-join / stronger prompts **not imported** this process
 - Artifacts: `attempt-1-pre-fixer7-rebind/`
 
 ### Pre-flight (attempt-2): PASS
@@ -48,24 +51,22 @@
 
 ---
 
-## 2) Live delegation / spawns verdict: FAIL (still 0; mega-6 regression holds)
+## 2) Live delegation / spawns verdict: PARTIAL PASS (restored on attempt-1; attempt-2 silent)
 
-| Metric | mega-5 | mega-6 | mega-7 attempt-2 |
-|---|---:|---:|---:|
-| `delegate` tool calls | **2** | **0** | **0** |
-| Child spawns | **1** (depth 1) | **0** | **0** |
-| Max depth | **1** | **0** | **0** |
-| Ledger `delegation` rows | — | root only | root only (`tokens_spent=0`) |
+| Metric | mega-5 | mega-6 | mega-7 attempt-1 | mega-7 attempt-2 (primary) |
+|---|---:|---:|---:|---:|
+| `delegate` tool calls | **2** | **0** | **2** | **0** |
+| Child spawns (`agent.spawn`) | **1** | **0** | **2** | **0** |
+| Max depth | **1** | **0** | **1** | **0** |
+| Spawn roles | part_fixer | — | `part_designer`, `edit-part` | — |
+| `budget_tokens` on spawn | 8000 | n/a | 8000 / 12000 | n/a |
 
-- Fixer7 Fix2 strengthened MUST-spawn language on role cards; tools_slot still renders `delegate` + `budget_tokens` (preflight PASS).
-- Models never called `delegate` on any of 19 nodes. Max observed depth on `model_assignment` = **0**.
-- Why (same structural trap as mega-6, prompts alone insufficient):
-  1. Mission template nodes are **flat depth-0** — no forced fan-out edges for mechanical vs ECAD vs firmware.
-  2. Productive roles that could spawn (`feature_modeler`, `layout_engineer`) spent budget on ledger thrash / failed geometry ops instead of `delegate`.
-  3. Ollama leaves fail `no_code` with **0 tool calls** — never reach a spawn decision.
-  4. Prompt preference is not a hard gate; without a scheduler-side “spawn or explain” requirement, SuperGrok still single-threads.
+- **Attempt-1 proof (pre-Fixer7):** BUILD DL2 called `delegate` twice; orchestrator emitted matching `agent.spawn` events with non-empty briefs and real budgets. Depth-1 children received `model_assignment` (still xai-sub — task_class unknown, min_rank=2).
+- **Role alias gap:** invented roles `part_designer` / `edit-part` are not stock cards; Fixer7 post-run expanded `_ROLE_ALIASES` → `feature_modeler` so next spawns inherit geometry tools.
+- **Attempt-2 (Fixer7 Fix2 bound):** tools_slot still renders `delegate` + `budget_tokens` (preflight PASS); **0** calls across 19 nodes. Shorter wall (383s) + ollama leaves dying `no_code` + BUILD DL1 burning budget on invalid `add_features` ops left no spawn turn.
+- Why mega-6 was 0 and attempt-2 can still land 0: prompt MUST is non-binding; no scheduler “spawn or refuse” gate; multi-domain work stays flat depth-0 unless a BUILD/PLAN actor chooses to fan out.
 
-**Verdict: FAIL** — exposure + contract live; actual delegation still zero (no recovery from mega-6 regression).
+**Verdict: PARTIAL PASS** — mega-6 zero-delegation regression **broken on attempt-1** (2/2); attempt-2 primary did not re-fire. Cycle-level live delegation exists; stickiness not proven under Fixer7 prompts alone.
 
 ---
 
@@ -160,13 +161,13 @@ End-of-run stage_log (ledger):
 | Tool median / p95 / max | 0.18ms / 15.9ms / **935ms** |
 | Model assignments | **19** (all nodes; Fix6 telemetry bound) |
 | Provider tokens | **2.96M** total (99.28% SuperGrok / **0.72% ollama**) |
-| Delegation spent | 0 |
+| Delegation spent | 0 on attempt-2; **attempt-1: 2 delegate / 2 spawn** |
 | DAG | 9 done / 10 failed |
 | xAI semaphore | capacity=3 observed in driver log (queue_wait present; no timeout storm) |
 
 ### TOP 5 next
 
-1. **Force or score actual `delegate`.** Prompt MUST is insufficient after two cycles at 0 calls. Add a soft gate on multi-domain PLAN/BUILD: if ≥2 independent slices and depth&lt;max, require `delegate` or an explicit `ledger_note` refusal with reason before auto-complete.
+1. **Make `delegate` sticky under Fixer7.** Attempt-1 already proved 2/2 spawns; attempt-2 (with Fix2 prompts) fired 0. Add a soft gate on multi-domain PLAN/BUILD: if ≥2 independent slices and depth&lt;max, require `delegate` or an explicit `ledger_note` refusal before auto-complete. Keep role aliases for `part_designer`/`edit-part`.
 2. **`add_features` op vocabulary assist.** After `unknown op`, inject `cad_guide` / allowed-ops snippet; reject-loop should not burn the full 16-iter budget on invented names (`box`/`cylinder`/`sketch`).
 3. **Raise cheap token share without starving hard work.** Ollama leaves dying `no_code` with 0 tools wastes the routing win — either (a) tiny tool floor for leaf roles, or (b) one-shot structured handoff template so leaves complete in ≤1k tok with a real envelope.
 4. **Clean mission terminal status.** Soft-join deliver should land `status=done|blocked` with explicit `stop_reason` (`deliver_partial` vs empty/`running`), not driver-exit `running`.
@@ -204,12 +205,12 @@ End-of-run stage_log (ledger):
 
 See `reports/runs/mega-7/fixes.md` (HomelessBadger):
 
-1. **DELIVER soft-join any-done** — **bound; PASS this run**
-2. **Delegate MUST on role cards** — bound; **unexercised (0 calls)**
-3. **Harder new_part→add_features thrash block** — **bound; sequence PASS, solids FAIL**
+1. **DELIVER soft-join any-done** — **bound on attempt-2; PASS**
+2. **Delegate MUST on role cards** — bound on attempt-2; **0 calls there**; attempt-1 (pre-Fix2) already had 2/2 — post-run `_ROLE_ALIASES` expand for invented roles
+3. **Harder new_part→add_features thrash block** — **bound; sequence PASS, solids FAIL** (`unknown op`)
 4. **task_class stamp on mission nodes** — **bound; cheap-share path PASS**
 
-Fixer6 Fix6 (model_assignment on node resolve) also confirmed bound (19 events).
+Fixer6 Fix6 (model_assignment on node resolve) confirmed on both attempts (21 / 19 events).
 
 ---
 
@@ -218,7 +219,7 @@ Fixer6 Fix6 (model_assignment on node resolve) also confirmed bound (19 events).
 | Axis | mega-6 attempt-2 | mega-7 attempt-2 | Flip? |
 |---|---|---|---|
 | **DELIVER completion** | `deliver_incomplete` freeze | **soft-join; deliver in phases_completed; stop_reason empty** | **FLIP PASS** |
-| actual_delegation | 0 / 0 / depth 0 | **0 / 0 / depth 0** | Hold FAIL |
+| actual_delegation | 0 / 0 / depth 0 | **attempt-1: 2/2 depth1; attempt-2: 0/0** | **Partial flip** |
 | cheap-share tokens | **0%** | **0.72% live** (+57.9% ollama assignments) | **FLIP PASS (>0)** |
 | BUILD outputs | new_part×2, add_features×0 | **new_part×1, add_features×13 (0 accepted ops)** | **Partial flip** |
 | phase-gate honesty | intake+specify+plan; live cursor | intake+build+deliver; live cursor; soft-join explicit | Hold PASS |

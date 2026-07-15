@@ -400,10 +400,9 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     dispatched against the live engine, results are fed back, and a structured
     handoff is returned.  The node's ``allowed_tools`` scope the callable tools.
 
-    Provider resolution is also the actual fix for the historical silent-stub bug:
-    the old code imported ``services.agent.providers.anthropic`` (wrong module name —
-    the module is ``anthropic_provider``), so the import ALWAYS failed and every
-    "live" node degraded to ``_StubAgentResult``.  We now import the real seam.
+    mega-8 (advisor Q3): cheap local/tiny leaves skip the multi-turn tool loop
+    and take a one-shot structured envelope fill-in. On schema fail → count
+    leaf_miss and fall through to the existing frontier degrade / tool-loop path.
 
     Fail-closed on genuine unavailability (no provider constructible — e.g. no model
     server and no API key): return a NON-success stub so the node ESCALATES rather
@@ -424,6 +423,21 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         # Do NOT return a confirmed stub: that is the fabrication bug. Signal a
         # non-success so the node escalates and the failure is visible.
         return _UnavailableAgentResult(f"no provider available: {exc}")
+
+    # mega-8: cheap-leaf one-shot envelope (advisor Q3 primary). Local/tiny
+    # models on leaf task classes do NOT enter the multi-turn tool loop.
+    oneshot = _maybe_run_cheap_leaf_oneshot(
+        request, context_pack, resolved_provider,
+        ledger=ledger, node_name=node_name,
+    )
+    if oneshot is not None:
+        return oneshot
+    # On oneshot miss: fall through to tool-loop on a frontier/mid provider
+    # (existing degrade path) rather than re-looping the same tiny model.
+    if context_pack.get("leaf_oneshot_miss"):
+        upgraded = _frontier_fallback_provider(context_pack, provider)
+        if upgraded is not None:
+            resolved_provider = upgraded
 
     allowed_tools = context_pack.get("allowed_tools")
     # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
@@ -476,6 +490,228 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         on_event=context_pack.get("_event_sink"),
         run_id=context_pack.get("run_id"),
         node_id=context_pack.get("node_id"))
+
+
+def _maybe_run_cheap_leaf_oneshot(
+    request: str,
+    context_pack: dict[str, Any],
+    provider: Any,
+    *,
+    ledger=None,
+    node_name: str = "dag_node",
+) -> Any | None:
+    """One-shot structured envelope for cheap local leaves (mega-8 / advisor Q3).
+
+    Returns a TurnResult-like object on success, or None to fall through to the
+    multi-turn tool loop / frontier degrade path. Schema failure increments
+    ``leaf_miss`` telemetry.
+    """
+    try:
+        from services.agent.role_models import (  # noqa: PLC0415
+            is_cheap_leaf_provider,
+            is_leaf_task_class,
+            parse_leaf_envelope_text,
+            record_leaf_miss,
+            validate_leaf_envelope,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    node_inputs = context_pack.get("node_inputs") or {}
+    task_class = (
+        context_pack.get("task_class")
+        or node_inputs.get("task_class")
+        or ""
+    )
+    if not is_leaf_task_class(str(task_class) if task_class else None):
+        return None
+
+    # Prefer role_model stamp from _resolve_provider; fall back to provider attrs.
+    rm = context_pack.get("role_model") or {}
+    prov_name = str(rm.get("provider") or getattr(provider, "name", "") or "")
+    model_name = str(rm.get("model") or getattr(provider, "model", "") or "")
+    # openai-compat ollama is stamped as openai after resolve — recover.
+    if prov_name == "openai" and (
+        "11434" in str(getattr(provider, "base_url", "") or "")
+        or "ollama" in model_name.lower()
+        or (rm.get("degraded_from") in (None, "") and model_name.endswith(":latest"))
+    ):
+        # Keep cheap if original assignment was ollama.
+        if str(rm.get("provider") or "") == "ollama" or "ollama" in model_name.lower():
+            prov_name = "ollama"
+    if rm.get("provider") == "ollama":
+        prov_name = "ollama"
+    if not is_cheap_leaf_provider(prov_name, model_name):
+        # Also accept cost_tier stamp ≤ 1 from assignment telemetry.
+        try:
+            ct = int(rm.get("cost_tier")) if rm.get("cost_tier") is not None else None
+        except (TypeError, ValueError):
+            ct = None
+        if ct is None or ct > 1:
+            return None
+
+    # Force-disable via env for tests / emergency.
+    if os.environ.get("AI_CAD_LEAF_ONESHOT", "1") in ("0", "false", "False"):
+        return None
+
+    system = (
+        "You are a leaf worker filling a fixed JSON envelope. "
+        "Reply with ONE JSON object only (no tools, no prose). Schema:\n"
+        "{\n"
+        '  "goal": string,           // required: what this leaf achieves\n'
+        '  "ops": [object, ...],     // optional: concrete actions/ops\n'
+        '  "no_op": boolean,         // true only when nothing to do\n'
+        '  "reason": string,         // required when no_op=true\n'
+        '  "artifacts": [object, ...] // optional outputs\n'
+        "}\n"
+        "Rules: either non-empty ops[] OR (no_op=true AND non-empty reason). "
+        "Do not invent tool calls. Do not wrap in markdown unless needed."
+    )
+    if context_pack.get("role_system_prompt"):
+        system = (
+            str(context_pack["role_system_prompt"])[:1200]
+            + "\n\n---\nLEAF ONE-SHOT MODE (mandatory):\n"
+            + system
+        )
+    user_msg = (
+        f"Node request:\n{request}\n\n"
+        f"task_class={task_class}. Fill the leaf envelope JSON now."
+    )
+    messages = [{"role": "user", "content": user_msg}]
+    try:
+        reply = provider.complete(system, messages, max_tokens=800)
+    except Exception as exc:  # noqa: BLE001 — degrade to tool-loop / frontier
+        record_leaf_miss(1)
+        if ledger is not None:
+            try:
+                ledger.append(node_name, "agent_turn", {
+                    "event": "leaf_oneshot_miss",
+                    "error": str(exc)[:200],
+                    "task_class": task_class,
+                    "provider": prov_name,
+                    "model": model_name,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        # Signal caller to fall through; also stash so degrade path can fire.
+        context_pack["leaf_oneshot_miss"] = True
+        context_pack["leaf_oneshot_error"] = str(exc)[:200]
+        return None
+
+    env, errs = parse_leaf_envelope_text(str(reply or ""))
+    if env is None or errs:
+        # Double-check if reply was already a dict-like via validate.
+        if env is None:
+            record_leaf_miss(1)
+            if ledger is not None:
+                try:
+                    ledger.append(node_name, "agent_turn", {
+                        "event": "leaf_oneshot_miss",
+                        "errors": list(errs or [])[:8],
+                        "task_class": task_class,
+                        "provider": prov_name,
+                        "model": model_name,
+                        "reply_head": str(reply or "")[:240],
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+            context_pack["leaf_oneshot_miss"] = True
+            context_pack["leaf_oneshot_errors"] = list(errs or [])[:8]
+            return None
+
+    # Valid envelope → confirmed leaf handoff (no multi-turn tools).
+    handoff = {
+        "status": "done" if not env.get("no_op") else "done",
+        "summary": (
+            env.get("goal")
+            or ("no_op: " + str(env.get("reason") or ""))
+        )[:600],
+        "outputs": {
+            "leaf_envelope": env,
+            "one_shot": True,
+            "ops": env.get("ops") or [],
+            "no_op": bool(env.get("no_op")),
+            "reason": env.get("reason"),
+            "artifacts": env.get("artifacts") or [],
+            "reasoning_summary": (
+                "Cheap-leaf one-shot envelope (mega-8); no multi-turn tool loop."
+            ),
+        },
+    }
+    if ledger is not None:
+        try:
+            ledger.append(node_name, "agent_turn", {
+                "event": "leaf_oneshot_ok",
+                "task_class": task_class,
+                "provider": prov_name,
+                "model": model_name,
+                "no_op": bool(env.get("no_op")),
+                "n_ops": len(env.get("ops") or []),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    return _LeafOneshotResult(handoff, env)
+
+
+
+def _frontier_fallback_provider(context_pack: dict[str, Any], injected=None):
+    """After a cheap-leaf oneshot miss, pick a non-local provider for tool-loop.
+
+    Order: openrouter free (if keyed) → injected mission provider (if non-cheap)
+    → None (keep current; ambient tool-loop still runs).
+    """
+    try:
+        from services.agent import config as agent_config  # noqa: PLC0415
+        from services.agent.role_models import is_cheap_leaf_provider  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
+        cfg = dict(agent_config.load_config() or {})
+        or_cfg = dict(cfg.get("openrouter") or {})
+        or_key = (
+            or_cfg.get("api_key")
+            or cfg.get("openrouter_api_key")
+            or _os.environ.get("OPENROUTER_API_KEY")
+        )
+        if or_key:
+            cfg_or = dict(cfg)
+            cfg_or["api_key"] = or_key
+            cfg_or["model"] = "mistralai/mistral-small:free"
+            cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
+            prov = agent_config.get_provider(name="openrouter", cfg=cfg_or)
+            try:
+                context_pack["role_model"] = {
+                    **(context_pack.get("role_model") or {}),
+                    "provider": "openrouter",
+                    "model": cfg_or["model"],
+                    "degraded_from": (context_pack.get("role_model") or {}).get(
+                        "provider"),
+                    "degrade_reason": "leaf_oneshot_miss",
+                }
+            except Exception:  # noqa: BLE001
+                pass
+            return prov
+        if injected is not None:
+            p_name = str(getattr(injected, "name", "") or "")
+            p_model = str(getattr(injected, "model", "") or "")
+            if not is_cheap_leaf_provider(p_name, p_model):
+                return injected
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+class _LeafOneshotResult:
+    """TurnResult duck-type for a successful cheap-leaf one-shot."""
+
+    def __init__(self, handoff: dict[str, Any], envelope: dict[str, Any]) -> None:
+        self.success = True
+        self.stop_reason = "confirmed"
+        self.final_code = None
+        self.result = {
+            "handoff": handoff,
+            "leaf_envelope": envelope,
+            "one_shot": True,
+            "calls": [],
+            "tool_calls": 0,
+        }
 
 
 def _tier_profile():
@@ -657,6 +893,31 @@ def run(
             # Next attempt should prefer cheaper effort/provider band.
             try:
                 context_pack["retry_cheap"] = True
+            except Exception:  # noqa: BLE001
+                pass
+
+    # mega-8 (advisor Q2): multi-domain PLAN/BUILD soft gate — auto-complete
+    # blocks until a real delegate call OR a TYPED refusal envelope
+    # {reason, domains_considered, why_flat}. Free-form ledger_note does NOT
+    # satisfy. Only when depth < max_spawn_depth.
+    if verdict == VERDICT_DONE:
+        blocked, gate_info = _multi_domain_delegate_gate(
+            node, context_pack, agent_result,
+        )
+        if blocked:
+            verdict = VERDICT_RETRY
+            stop_reason = "delegate_or_typed_refusal_required"
+            success = False
+            # Stash gate info on the result for output_state / tests.
+            try:
+                rd = getattr(agent_result, "result", None)
+                if isinstance(rd, dict):
+                    rd["delegate_gate"] = gate_info
+                else:
+                    agent_result.result = {
+                        "delegate_gate": gate_info,
+                        "handoff": rd,
+                    }
             except Exception:  # noqa: BLE001
                 pass
 
@@ -940,6 +1201,146 @@ def _run_overseer_stage_exit(node: dict[str, Any],
     except Exception:  # noqa: BLE001 — a broken auditor never breaks node execution
         return None
 
+
+
+# ---------------------------------------------------------------------------
+# mega-8: multi-domain PLAN/BUILD typed-refusal / delegate soft gate
+# ---------------------------------------------------------------------------
+
+
+def _multi_domain_delegate_gate(
+    node: dict[str, Any],
+    context_pack: dict[str, Any],
+    agent_result: Any,
+) -> tuple[bool, dict[str, Any]]:
+    """Return ``(blocked, info)`` for the multi-domain soft gate.
+
+    blocked=True means auto-complete must not stand — the node needs either a
+    ``delegate`` tool call this turn or a schema-valid typed refusal.
+    """
+    info: dict[str, Any] = {"gated": False, "blocked": False}
+    try:
+        from services.agent.role_models import (  # noqa: PLC0415
+            domain_tags_from_context,
+            extract_typed_refusal,
+            is_multi_domain_plan_or_build,
+            max_spawn_depth_for_capability,
+            validate_typed_refusal,
+        )
+    except Exception:  # noqa: BLE001
+        return False, info
+
+    node_inputs = context_pack.get("node_inputs") or node.get("inputs") or {}
+    role_id = (
+        context_pack.get("role_id")
+        or node.get("role")
+        or node_inputs.get("role")
+        or ""
+    )
+    task_class = (
+        context_pack.get("task_class")
+        or node_inputs.get("task_class")
+    )
+    tags = domain_tags_from_context(context_pack, node_inputs)
+    # If the pack already stamped domain_tags, prefer those.
+    if context_pack.get("domain_tags"):
+        try:
+            tags = [str(t).strip().lower() for t in context_pack["domain_tags"] if str(t).strip()]
+        except Exception:  # noqa: BLE001
+            pass
+
+    applies = is_multi_domain_plan_or_build(
+        role_id=str(role_id) if role_id else None,
+        node_type=str(node.get("type") or ""),
+        domain_tags=tags,
+        task_class=str(task_class) if task_class else None,
+    )
+    info.update({
+        "gated": applies,
+        "role_id": role_id,
+        "task_class": task_class,
+        "domain_tags": tags,
+        "n_domains": len(tags),
+    })
+    if not applies:
+        return False, info
+
+    # Depth check: only enforce when depth < max.
+    try:
+        depth = int(
+            context_pack.get("depth")
+            or node_inputs.get("depth")
+            or 0
+        )
+    except (TypeError, ValueError):
+        depth = 0
+    letter = context_pack.get("capability_letter")
+    try:
+        max_d = max_spawn_depth_for_capability(
+            str(letter) if letter else None,
+        )
+    except Exception:  # noqa: BLE001
+        max_d = 8
+    info["depth"] = depth
+    info["max_spawn_depth"] = max_d
+    if depth >= max_d:
+        info["reason"] = "depth_at_max"
+        return False, info
+
+    # ≥2 domain tags required (is_multi_domain may true for plan roles with
+    # fewer tags — still require multi-slice evidence via tags OR plan role
+    # with multi task_class; gate applies as long as applies=True above).
+    # Explicit: if tags < 2 AND not a coordinating plan role, skip.
+    plan_roles = {
+        "orchestrator", "department_manager", "layout_engineer", "planning",
+    }
+    if len(tags) < 2 and str(role_id).lower() not in plan_roles:
+        info["reason"] = "single_domain"
+        return False, info
+
+    result = getattr(agent_result, "result", None) or {}
+    if not isinstance(result, dict):
+        result = {}
+
+    if _agent_had_delegate_call(result, agent_result):
+        info["reason"] = "delegate_called"
+        info["blocked"] = False
+        return False, info
+
+    refusal = extract_typed_refusal(result)
+    if refusal is not None:
+        # Re-validate strictly (extract already validates, belt-and-suspenders).
+        errs = validate_typed_refusal(refusal)
+        if not errs:
+            info["reason"] = "typed_refusal"
+            info["typed_refusal"] = refusal
+            info["blocked"] = False
+            return False, info
+        info["typed_refusal_errors"] = errs
+
+    # Free-form ledger_note / bare handoff does NOT satisfy.
+    info["reason"] = "missing_delegate_or_typed_refusal"
+    info["blocked"] = True
+    info["hint"] = (
+        "Multi-domain PLAN/BUILD at depth < max must call delegate(...) "
+        "or emit typed_refusal {reason, domains_considered, why_flat}."
+    )
+    return True, info
+
+
+def _agent_had_delegate_call(result: dict[str, Any], agent_result: Any) -> bool:
+    """True if this turn successfully invoked the ``delegate`` tool."""
+    calls = result.get("calls") if isinstance(result, dict) else None
+    if not isinstance(calls, list):
+        calls = getattr(agent_result, "calls", None)
+    if not isinstance(calls, list):
+        return False
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        if c.get("tool") == "delegate" and c.get("ok") is not False:
+            return True
+    return False
 
 def _emit(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:
     if emit is None:

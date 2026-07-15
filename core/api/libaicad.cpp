@@ -71,6 +71,8 @@
 #include "doc/drawing_session.h"
 #include "doc/session.h"
 #include "doc/validate.h"
+#include "doc/op_registry.h"
+#include "ecad/op_registry.h"
 #include "parts/parts.h"
 #include "prof/sampler.h"
 #include "prof/phases.h"
@@ -2623,6 +2625,35 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             if (m == "doc_list")
                 return emit(aicad::doc::doc_list(), out_json, 0);
+            if (m == "doc_list_ops") {
+                // Closed vocabulary for add_features / doc_apply_ops — single source
+                // from op_registry (must match apply_one). Python MCP + agent middleware
+                // query this so they never hand-copy the list.
+                json ops = json::array();
+                for (const auto& k : aicad::doc::doc_op_kinds()) ops.push_back(k);
+                json ftypes = json::array();
+                for (const auto& t : aicad::doc::feature_type_names()) ftypes.push_back(t);
+                return emit(json{
+                    {"ok", true},
+                    {"ops", ops},
+                    {"feature_types", ftypes},
+                    {"example_add_feature", json{
+                        {"op", "add_feature"},
+                        {"feature", {
+                            {"type", "box"},
+                            {"name", "Block"},
+                            {"params", {
+                                {"length", {{"value", 40}, {"expr", nullptr}}},
+                                {"width",  {{"value", 30}, {"expr", nullptr}}},
+                                {"height", {{"value", 20}, {"expr", nullptr}}},
+                            }},
+                        }},
+                    }},
+                    {"cheatsheet", aicad::doc::doc_ops_cheatsheet_snippet()},
+                    {"hint", "Feature types (box/cylinder/sketch/…) are NOT ops — wrap with "
+                             "op=add_feature. Call cad_guide() for worked examples."},
+                }, out_json, 0);
+            }
             if (m == "doc_checkpoint")
                 return emit(aicad::doc::doc_checkpoint(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_revert")
@@ -3358,6 +3389,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                     ? params["base_revision"].get<long>() : -1,
                                 params.contains("ops") ? params["ops"] : json::array()),
                             out_json, 0);
+            if (m == "ecad_list_ops") {
+                json ops = json::array();
+                for (const auto& k : aicad::ecad::ecad_op_kinds()) ops.push_back(k);
+                return emit(json{{"ok", true}, {"ops", ops},
+                                {"hint", "see cad_guide() for ECAD tool workflows"}},
+                            out_json, 0);
+            }
             if (m == "ecad_undo")
                 return emit(aicad::ecad::ecad_undo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_redo")

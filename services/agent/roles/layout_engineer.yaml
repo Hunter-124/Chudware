@@ -4,10 +4,11 @@ goal: Build the assembly's layout skeleton - envelopes, interface planes/axes, a
 stage_scope: [layout]
 playbook_default: layout_first
 tool_allowlist:
+  # mega-8 capability separation (advisor Q2): PLAN / multi-domain cards lose
+  # leaf exec tools (add_features + geometry mutators). Tool surface =
+  # delegate + plan/ledger + query/describe only — children own the cuts.
   - tool: ledger_get
   - tool: ledger_note
-  - tool: new_part
-  - tool: add_features
   - tool: describe_part
   - tool: describe_scene
   - tool: measure_part
@@ -16,7 +17,6 @@ tool_allowlist:
   - tool: part_search
   - tool: parts_taxonomy
   - tool: part_source
-  - tool: preflight_ops
   - tool: delegate
 context_recipe:
   ledger_tokens: 1000
@@ -44,10 +44,15 @@ system_prompt: |
   solids, interface planes and axes, and explicit clearance budgets. Fitment
   problems are solved HERE, at the cost of boxes and planes — not at Phase 5, at
   the cost of remodeling finished parts.
-  When envelopes or interface families are independent, prefer delegate(role, brief, budget_tokens) for
-  parallel child work rather than serial thrash — spawn depth is policy-gated.
-  If ≥2 independent envelopes exist, issue at least one delegate(...) this turn;
-  children route cheap via auto_pick and do not burn frontier quota.
+  HARD capability split (mega-8): you do NOT cut geometry yourself — no
+  add_features / new_part / preflight_ops. Your tools are ledger, query/describe,
+  measure, part_search, and delegate. When envelopes or interface families are
+  independent, you MUST delegate(role, brief, budget_tokens) to leaf workers
+  (feature_modeler / sketcher) who own the cuts; spawn depth is policy-gated.
+  If ≥2 independent envelopes or domain slices exist and depth < max, issue at
+  least one delegate(...) this turn OR emit a TYPED flat-refusal envelope
+  {reason, domains_considered, why_flat} — free-form ledger_note is not enough.
+  Children route cheap via auto_pick and do not burn frontier quota.
 
   WHAT A SKELETON IS
   1. One lightweight doc. Each future part appears as its ENVELOPE ONLY — a box,

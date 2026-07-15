@@ -32,16 +32,16 @@
 - **model_assignment ×19** with real task_class stamps; **11 ollama / 8 xai-sub**
 - **Cheap-share tokens: 0.72%** (21,453 / 2,964,929) — live >0
 - **BUILD:** `new_part`×1 + `add_features`×13 (all ops `unknown op` → hollow solid)
-- **Delegation:** 0 calls / 0 spawns / depth 0
-- Findings: `findings.md` (six verdicts + TOP5)
-- Fixer7: `fixes.md` Fixes 1–4
+- **Delegation:** attempt-2 **0** calls; attempt-1 archive had **delegate×2 + spawn×2** (`part_designer`, `edit-part`, depth 1)
+- Findings: `findings.md` (six verdicts + TOP5; delegation PARTIAL PASS cycle-level)
+- Fixer7: `fixes.md` Fixes 1–4 + role-alias follow-up
 
 ## Verdict snapshot
 
 | Axis | Verdict |
 |---|---|
 | DELIVER completion | **PASS** (soft-join) |
-| Live delegation | **FAIL** (0) |
+| Live delegation | **PARTIAL PASS** (attempt-1 2/2; attempt-2 0) |
 | Cheap-share % tokens | **PASS** (0.72% >0) |
 | BUILD new_part→add_features | **PARTIAL** (sequence yes, solids no) |
 | Phase honesty | **PASS** |

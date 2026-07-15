@@ -1035,6 +1035,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
     runMultidoc(st);
 
+    // ---------- tab-switch perf scenario (AI_CAD_SHOT=tabperf) ----------
+    runTabPerf(st);
+
     // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
     runDrawing(st);
 
@@ -1654,6 +1657,85 @@ void ScenarioRunner::runMultidoc(AppState& st) {
     }
 }
 
+// Tab-switch latency harness (AI_CAD_SHOT=tabperf). Builds two real box parts, then hammers
+// A<->B via the same switchToTab path the doc-tab strip uses. logTabPerf in core/doc_tabs.cpp
+// prints "[perf] tab_switch ..." to stderr for each switch; collect those lines after the run.
+// Intentionally measurement-only — no UI assertions, no per-step screenshots.
+void ScenarioRunner::runTabPerf(AppState& st) {
+    if (!(st.wantTabPerf && st.workerStarted && !st.tabPerfShotDone)) return;
+    auto loadMesh = [&](const core::OpsResponse& r) {
+        if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    };
+    auto buildBox = [&](double L, double W, double H) -> core::OpsResponse {
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op","add_feature"},{"feature",{
+            {"type","box"},{"name","Box1"},{"params",{
+                {"length",{{"value",L},{"expr",nullptr}}},
+                {"width", {{"value",W},{"expr",nullptr}}},
+                {"height",{{"value",H},{"expr",nullptr}}},
+                {"centered",true}}}}}});
+        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+        return r;
+    };
+    // One settle frame between switches so the GPU-cache park/bind path settles and any
+    // deferred mesh drain from the previous switch has a chance to finish.
+    const int kSettle = 2;
+    if (tpSettle > 0) { --tpSettle; return; }
+    std::string err;
+    switch (tpStep) {
+        case 0: {  // Part A
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("tabperf: new_part A FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.tabPerfShotDone = true; break;
+            }
+            st.addDocTab(false);
+            auto r = buildBox(60.0, 40.0, 10.0);
+            tpIdxA = st.activeTab;
+            std::printf("tabperf: Part A doc=%s tab=%d ok=%d\n",
+                        st.docMirror.docId().c_str(), tpIdxA, (int)r.ok);
+            std::fflush(stdout);
+            ++tpStep; tpSettle = kSettle; break;
+        }
+        case 1: {  // Part B (parks A's session + GPU cache)
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("tabperf: new_part B FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.tabPerfShotDone = true; break;
+            }
+            st.addDocTab(false);
+            auto r = buildBox(80.0, 50.0, 20.0);
+            tpIdxB = st.activeTab;
+            std::printf("tabperf: Part B doc=%s tab=%d ok=%d (A tab=%d)\n",
+                        st.docMirror.docId().c_str(), tpIdxB, (int)r.ok, tpIdxA);
+            std::fflush(stdout);
+            // Prime: switch A then B once so both sessions hold a GPU cache before the timed loop.
+            // These two switches are still timed (logTabPerf fires) and count toward the total.
+            ++tpStep; tpSettle = kSettle; break;
+        }
+        case 2: {
+            // Alternate A <-> B until we have kTabPerfSwitches timed switches.
+            if (tpSwitches >= kTabPerfSwitches) {
+                std::printf("tabperf: done switches=%d\n", tpSwitches);
+                std::fflush(stdout);
+                st.tabPerfShotDone = true;
+                break;
+            }
+            const int target = (tpSwitches % 2 == 0) ? tpIdxA : tpIdxB;
+            st.switchToTab(target);
+            ++tpSwitches;
+            if (tpSwitches == 1 || tpSwitches == kTabPerfSwitches || (tpSwitches % 6) == 0) {
+                std::printf("tabperf: switch %d/%d -> tab %d doc=%s\n",
+                            tpSwitches, kTabPerfSwitches, target, st.docMirror.docId().c_str());
+                std::fflush(stdout);
+            }
+            tpSettle = kSettle;
+            break;
+        }
+        default:
+            st.tabPerfShotDone = true;
+            break;
+    }
+}
+
 // W17 engineering-drawing scenario (AI_CAD_SHOT=drawing). Build a plate with a through hole, Make
 // Drawing (standard views), then exercise the new detailing engine: Model Items auto-dimensioning,
 // a smart hole callout, a critical ±toleranced dimension, and the title block — with the contextual
@@ -2018,6 +2100,14 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         glfwSwapBuffers(st.win);
         return st.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
+    // tabperf scenario: no screenshots — just keep the frame loop alive until the switch
+    // hammer finishes, then break so the process exits and stderr can be harvested.
+    if (st.wantTabPerf) {
+        ++st.frame;
+        glfwSwapBuffers(st.win);
+        return st.tabPerfShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
     // workspaces scenario: one capture per workspace tab, last capture mirrored to screenshotPath.

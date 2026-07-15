@@ -613,6 +613,18 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
+        # mega-8 OpVocab: on FIRST unknown-op failure per mission, append the
+        # allowed-ops registry snippet so the model stops thrashing invented
+        # names (mega-7: box/cylinder/sketch as top-level ops). Seam function:
+        # _maybe_inject_op_vocab_cheatsheet (never re-injects).
+        try:
+            _ov_block = _maybe_inject_op_vocab_cheatsheet(
+                tool, result, run_id=run_id)
+            if _ov_block:
+                messages.append({"role": "user", "content": _parts(_ov_block)})
+        except Exception:  # noqa: BLE001 — inject never breaks the turn
+            pass
+
         # mega-6/7 BUILD mortality: after new_part the model thrash-preflights
         # without ever calling add_features (live: new_part + preflight×7 → empty solid).
         # Hard nudge after bootstrap; refuse further preflight thrash.
@@ -930,6 +942,73 @@ def _as_text(result: Any) -> str:
         return json.dumps(result, default=str)[:2000]
     except Exception:  # noqa: BLE001
         return str(result)[:2000]
+
+
+
+# mega-8 OpVocab: once-per-mission flag so the allowed-ops cheatsheet is injected
+# on the FIRST unknown-op failure only (never re-inject). Keyed by run_id when
+# present so parallel turns in the same mission share the flag; falls back to a
+# process-local set for standalone turns without a run_id.
+_OP_VOCAB_INJECTED_RUNS: set[str] = set()
+
+
+def _maybe_inject_op_vocab_cheatsheet(
+    tool: str,
+    result: Any,
+    *,
+    run_id: str | None = None,
+    force_key: str | None = None,
+) -> str | None:
+    """Return a one-shot allowed-ops cheatsheet after an unknown-op failure.
+
+    Middleware seam (mega-8 OpVocab / mega-7 TOP-2): when ``add_features`` (or
+    ``doc_apply_ops``) rejects with ``unknown op '…'``, append a compact registry
+    snippet so the model stops inventing ``box``/``cylinder``/``sketch`` as ops.
+    Injects at most once per mission (``run_id``); subsequent failures rely on the
+    rich engine error (closest suggestions + cad_guide pointer). NO silent alias
+    mapping — the model must re-emit the correct op name.
+
+    Returns the inject text, or None when no inject is warranted / already done.
+    """
+    if tool not in ("add_features", "doc_apply_ops", "ecad_apply_ops"):
+        return None
+    try:
+        from services.mcp import op_vocab as _ov  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        if not _ov.is_unknown_op_error(result):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    key = force_key or run_id or "_standalone"
+    if key in _OP_VOCAB_INJECTED_RUNS:
+        return None
+    _OP_VOCAB_INJECTED_RUNS.add(key)
+
+    try:
+        snippet = _ov.cheatsheet_snippet()
+    except Exception:  # noqa: BLE001
+        snippet = (
+            "[op vocabulary] Use op=add_feature with feature.type in "
+            "{box,cylinder,sketch,extrude,…}. Call cad_guide()."
+        )
+    unknown = None
+    try:
+        unknown = _ov.extract_unknown_op_name(result)
+    except Exception:  # noqa: BLE001
+        unknown = None
+    head = "[op vocabulary assist — once per mission]"
+    if unknown:
+        head += f" Rejected invented op {unknown!r}."
+    head += (
+        " Do NOT invent op names. Feature types (box/cylinder/sketch/extrude) "
+        "are NOT ops — wrap them: "
+        '{"op":"add_feature","feature":{"type":"<type>",…}}. '
+        "No silent aliasing; re-emit the correct op. See cad_guide()."
+    )
+    return head + "\n" + snippet
 
 
 def _truncate(result: Any, limit: int = 1000) -> Any:

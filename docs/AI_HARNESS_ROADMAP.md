@@ -167,8 +167,8 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   ollama (leaf/simple_part); token share **0.72%** (21k/2.96M; ollama leaves
   die no_code cheaply while SuperGrok still owns long loops). **BUILD partial:**
   `new_part`×1 then **`add_features`×13** (Fix3 sequence) but all ops rejected
-  (`unknown op` vocabulary) → hollow solid. **Delegation still 0** (mega-6
-  regression holds despite Fix2 prompt MUST). Phase honesty PASS. Explicit
+  (`unknown op` vocabulary) → hollow solid. **Delegation partial:** attempt-1 archive delegate×2/spawn×2 (part_designer,
+  edit-part); attempt-2 primary 0 despite Fix2 (stickiness open). Phase honesty PASS. Explicit
   six verdicts + TOP5: `reports/runs/mega-7/findings.md`. Fixer7 fixes.md
   (deliver soft-join, delegate preference, add_features thrash block,
   task_class stamp).

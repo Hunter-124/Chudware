@@ -1,6 +1,7 @@
 // ECAD ops implementation — see ops.h. Mirrors engine/ecad/ops.py exactly.
 
 #include "ecad/ops.h"
+#include "ecad/op_registry.h"
 
 #include <algorithm>
 #include <array>
@@ -1127,8 +1128,9 @@ void apply_one(json& doc, const json& op, int index, json& id_map, json& warning
     else if (k == "set_field")            op_set_field(doc, op, index, id_map);
     else if (k == "nop") { /* transactional no-op */ }
     else
-        throw OpError("invalid_op", "op[" + std::to_string(index) + "]: unknown op '" + k + "'",
-                      {{"index", index}, {"reason", "unsupported op '" + k + "'"}});
+        throw OpError("invalid_op", unknown_ecad_op_message(index, k),
+                      {{"index", index}, {"reason", "unsupported op '" + k + "'"},
+                       {"suggestions", suggest_ecad_ops(k, 5)}});
 }
 
 std::string join_errs(const std::vector<std::string>& errs, size_t n) {

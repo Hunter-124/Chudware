@@ -3895,7 +3895,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
     def add_features(ops: list, doc_id: Optional[str] = None, background: bool = False) -> str:
         """Apply a list of document ops to build/edit the part (the core modeling tool).
 
-        `ops` is a JSON array of ops in the vocabulary from cad_guide() — e.g.
+        `ops` is a JSON array of ops from the CLOSED vocabulary (see OP VOCABULARY below
+        and cad_guide()) — e.g.
           [{"op":"add_feature","feature":{"type":"box","name":"Block",
               "params":{"length":{"value":40,"expr":null},"width":{"value":30,"expr":null},
                         "height":{"value":20,"expr":null}}}},
@@ -3904,6 +3905,26 @@ def register_cad_tools(mcp: FastMCP) -> None:
         Dimensions are objects {"value":<n>,"expr":null}. Geometry is addressed in plain words
         via `refs` (e.g. {"face":{"of":"face","side":"top"}}). Ops in one call may reference an
         earlier op in the SAME array as "$<index>" (0-based); existing tree features by id ("f1").
+
+        OP VOCABULARY (closed — do NOT invent names):
+          ops (field op=…): add_feature, edit_feature, delete_feature, reorder_feature,
+            set_suppressed, set_folder, rename, set_units, set_material, set_appearance,
+            set_rollback, eq_set, eq_delete, sketch_add_entity, sketch_add_constraint,
+            sketch_edit_entity, sketch_delete_entity, sketch_delete_constraint, sketch_set_dim,
+            sketch_toggle_construction, sketch_convert, sketch_break_external_ref, sketch_trim,
+            sketch_extend, sketch_offset, sketch_fillet, sketch_chamfer, sketch_mirror_entities,
+            sketch_pattern_entities, sketch_move, sketch_rotate, asm_insert_component,
+            asm_edit_component, asm_delete_component, asm_add_mate, asm_edit_mate,
+            asm_delete_mate, asm_set_explode, copy_feature, paste_feature,
+            paste_feature_as_derived, sketch_paste_entities
+          feature types (ONLY under op=add_feature): box, cylinder, sphere, cone, torus,
+            sketch, extrude, revolve, loft, sweep, helix, fillet, chamfer, shell, draft,
+            hole, bolt_circle, linear_pattern, circular_pattern, mirror, transform, boolean,
+            rib, split, thread, text, import, script, plane, axis, point, csys, sketch3d, …
+          WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
+          RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
+          Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
+          Call cad_guide() for worked examples and full param shapes.
 
         Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.

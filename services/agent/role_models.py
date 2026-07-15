@@ -729,6 +729,378 @@ def cost_tier_for(provider: str, model: str = "") -> int:
     return int(_cost_key(provider, model)[0])
 
 
+# ---------------------------------------------------------------------------
+# mega-8: typed flat-refusal + cheap-leaf one-shot envelope (advisor Q2/Q3)
+# ---------------------------------------------------------------------------
+
+# Local / free tiers that must NOT run the multi-turn tool loop on leaf nodes.
+_CHEAP_LEAF_COST_MAX = 1  # llamacpp/lmstudio/ollama=0, vllm/openrouter:free=1
+
+# Routing telemetry: leaf one-shot schema/engine misses (process-local).
+_LEAF_MISS_COUNT = 0
+
+
+def leaf_miss_count() -> int:
+    """How many cheap-leaf one-shots failed validation this process."""
+    return int(_LEAF_MISS_COUNT)
+
+
+def reset_leaf_miss_count() -> None:
+    """Test helper — clear the leaf_miss counter."""
+    global _LEAF_MISS_COUNT
+    _LEAF_MISS_COUNT = 0
+
+
+def record_leaf_miss(n: int = 1) -> int:
+    """Increment leaf_miss routing telemetry; return the new total."""
+    global _LEAF_MISS_COUNT
+    _LEAF_MISS_COUNT = int(_LEAF_MISS_COUNT) + max(0, int(n or 0))
+    return _LEAF_MISS_COUNT
+
+
+def is_cheap_leaf_provider(provider: str | None, model: str = "") -> bool:
+    """True when *provider*/*model* is local/tiny (cost_tier ≤ 1)."""
+    if not provider:
+        return False
+    return cost_tier_for(str(provider), model or "") <= _CHEAP_LEAF_COST_MAX
+
+
+def is_leaf_task_class(task_class: str | None) -> bool:
+    """True for conservation leaf / simple report classes."""
+    tc = (task_class or "").strip().lower()
+    return tc in ("leaf", "simple", "simple_part")
+
+
+# Typed refusal when a multi-domain PLAN/BUILD node stays flat (advisor Q2).
+# Free-form ledger_note does NOT satisfy — schema is strict.
+TYPED_REFUSAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["reason", "domains_considered", "why_flat"],
+    "properties": {
+        "reason": {"type": "string", "maxLength": 400},
+        "domains_considered": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "why_flat": {"type": "string", "maxLength": 600},
+    },
+}
+
+# Cheap-leaf one-shot fill-in envelope (advisor Q3 primary).
+LEAF_ENVELOPE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["goal"],
+    "properties": {
+        "goal": {"type": "string", "maxLength": 800},
+        "ops": {
+            "type": "array",
+            "items": {"type": "object"},
+        },
+        "no_op": {"type": "boolean"},
+        "reason": {"type": "string", "maxLength": 600},
+        "artifacts": {
+            "type": "array",
+            "items": {"type": "object"},
+        },
+    },
+}
+
+
+def _schema_validate(value: Any, schema: dict[str, Any], path: str = "root") -> list[str]:
+    """Small dependency-free subset validator (type/required/properties/enum/array)."""
+    errs: list[str] = []
+    stype = schema.get("type")
+    if stype == "object":
+        if not isinstance(value, dict):
+            return [f"{path}: expected object, got {type(value).__name__}"]
+        for req in schema.get("required", []) or []:
+            if req not in value:
+                errs.append(f"{path}: missing required key {req!r}")
+        props = schema.get("properties") or {}
+        for key, sub in props.items():
+            if key in value:
+                errs.extend(_schema_validate(value[key], sub, f"{path}.{key}"))
+        return errs
+    if stype == "array":
+        if not isinstance(value, list):
+            return [f"{path}: expected array, got {type(value).__name__}"]
+        min_items = schema.get("minItems")
+        if min_items is not None and len(value) < int(min_items):
+            errs.append(f"{path}: array length {len(value)} < minItems {min_items}")
+        item_schema = schema.get("items")
+        if item_schema:
+            for i, item in enumerate(value):
+                errs.extend(_schema_validate(item, item_schema, f"{path}[{i}]"))
+        return errs
+    if stype == "string":
+        if not isinstance(value, str):
+            return [f"{path}: expected string, got {type(value).__name__}"]
+        mx = schema.get("maxLength")
+        if mx is not None and len(value) > int(mx):
+            errs.append(f"{path}: string length {len(value)} > maxLength {mx}")
+        return errs
+    if stype == "boolean":
+        if not isinstance(value, bool):
+            return [f"{path}: expected boolean, got {type(value).__name__}"]
+        return errs
+    if stype == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return [f"{path}: expected number, got {type(value).__name__}"]
+        return errs
+    if stype == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return [f"{path}: expected integer, got {type(value).__name__}"]
+        return errs
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path}: {value!r} not in enum {schema['enum']}")
+    return errs
+
+
+def validate_typed_refusal(payload: Any) -> list[str]:
+    """Strict validate a typed flat-refusal envelope. [] = valid.
+
+    Free-form ledger notes / bare strings NEVER pass — domains_considered must
+    be a non-empty array and reason/why_flat must be strings.
+    """
+    if not isinstance(payload, dict):
+        return ["typed_refusal: expected object"]
+    # Reject common free-form aliases that are not the typed envelope.
+    if "domains_considered" not in payload or "why_flat" not in payload:
+        return ["typed_refusal: missing required keys (reason, domains_considered, why_flat)"]
+    errs = _schema_validate(payload, TYPED_REFUSAL_SCHEMA, "typed_refusal")
+    # Extra: each domain tag must be a non-empty string.
+    domains = payload.get("domains_considered")
+    if isinstance(domains, list):
+        if not domains:
+            errs.append("typed_refusal.domains_considered: must be non-empty")
+        for i, d in enumerate(domains):
+            if not isinstance(d, str) or not d.strip():
+                errs.append(f"typed_refusal.domains_considered[{i}]: empty domain tag")
+    reason = payload.get("reason")
+    if isinstance(reason, str) and not reason.strip():
+        errs.append("typed_refusal.reason: empty")
+    why = payload.get("why_flat")
+    if isinstance(why, str) and not why.strip():
+        errs.append("typed_refusal.why_flat: empty")
+    return errs
+
+
+def validate_leaf_envelope(payload: Any) -> list[str]:
+    """Strict validate a cheap-leaf one-shot envelope. [] = valid.
+
+    Must declare *goal*. Either:
+      * ``ops`` is a non-empty array of objects, OR
+      * ``no_op`` is true with a non-empty ``reason``.
+    ``artifacts`` is optional (array of objects when present).
+    """
+    if not isinstance(payload, dict):
+        return ["leaf_envelope: expected object"]
+    errs = _schema_validate(payload, LEAF_ENVELOPE_SCHEMA, "leaf_envelope")
+    goal = payload.get("goal")
+    if isinstance(goal, str) and not goal.strip():
+        errs.append("leaf_envelope.goal: empty")
+    ops = payload.get("ops")
+    no_op = payload.get("no_op")
+    reason = payload.get("reason")
+    has_ops = isinstance(ops, list) and len(ops) > 0
+    has_noop = no_op is True and isinstance(reason, str) and bool(reason.strip())
+    if not has_ops and not has_noop:
+        errs.append(
+            "leaf_envelope: require non-empty ops[] OR (no_op=true + reason)"
+        )
+    if no_op is True and has_ops:
+        errs.append("leaf_envelope: no_op=true conflicts with non-empty ops")
+    return errs
+
+
+def domain_tags_from_context(
+    context_pack: Mapping[str, Any] | None = None,
+    node_inputs: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Collect domain tags for multi-domain soft-gate decisions.
+
+    Precedence: explicit ``domain_tags`` on pack/inputs → derived from
+    task_class / deliverable kind / role stage hints.
+    """
+    pack = dict(context_pack or {})
+    inputs = dict(node_inputs or pack.get("node_inputs") or {})
+    raw = pack.get("domain_tags") or inputs.get("domain_tags") or []
+    if isinstance(raw, (list, tuple)) and raw:
+        out = [str(x).strip().lower() for x in raw if str(x).strip()]
+        # de-dupe preserving order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for t in out:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        return uniq
+
+    tags: list[str] = []
+    tc = str(pack.get("task_class") or inputs.get("task_class") or "").lower()
+    kind = str(inputs.get("kind") or inputs.get("deliverable_kind") or "").lower()
+    role = str(
+        pack.get("role_id") or inputs.get("role") or pack.get("role") or ""
+    ).lower()
+
+    def _add(t: str) -> None:
+        if t and t not in tags:
+            tags.append(t)
+
+    # Role-level multi-domain PLAN cards.
+    if role in ("orchestrator", "department_manager", "layout_engineer"):
+        _add("plan")
+    if role == "layout_engineer":
+        _add("layout")
+        _add("assembly")
+    if role in ("feature_modeler", "sketcher", "geometry_designer"):
+        _add("geometry")
+    if role in ("assembly_fit_engineer",):
+        _add("assembly")
+        _add("fit")
+    if role in ("sim_engineer",):
+        _add("analysis")
+    if role in ("cam_programmer",):
+        _add("cam")
+    if role in ("spec_writer",):
+        _add("spec")
+
+    # Task class / deliverable kind.
+    if tc in ("assembly",) or kind == "assembly":
+        _add("assembly")
+        _add("geometry")
+    if tc in ("multi_feature_part", "enclosure") or kind in ("part", "enclosure"):
+        _add("geometry")
+    if tc in ("analysis",) or kind == "analysis":
+        _add("analysis")
+    if tc in ("cam_program",) or kind == "cam_program":
+        _add("cam")
+    if kind in ("report", "drawing"):
+        _add("report")
+
+    # Explicit multi-domain list on the request (comma / space separated).
+    multi = pack.get("domains") or inputs.get("domains")
+    if isinstance(multi, str) and multi.strip():
+        for part in multi.replace(";", ",").split(","):
+            _add(part.strip().lower())
+    elif isinstance(multi, (list, tuple)):
+        for part in multi:
+            _add(str(part).strip().lower())
+
+    return tags
+
+
+def is_multi_domain_plan_or_build(
+    *,
+    role_id: str | None = None,
+    node_type: str | None = None,
+    domain_tags: list[str] | None = None,
+    task_class: str | None = None,
+) -> bool:
+    """True when the node is a PLAN or BUILD coordinator subject to the gate.
+
+    Leaf workers (feature_modeler at pure geometry, reviewer, intake) are not
+    gated — only multi-domain PLAN/BUILD ranks that must spawn or refuse.
+    """
+    role = (role_id or "").strip().lower()
+    ntype = (node_type or "").strip().lower()
+    tags = list(domain_tags or [])
+    tc = (task_class or "").strip().lower()
+
+    plan_roles = {
+        "orchestrator", "department_manager", "layout_engineer", "planning",
+    }
+    # PLAN by role or by plan node type.
+    is_plan = role in plan_roles or ntype == "plan" or role == "overseer"
+    # BUILD multi-domain: assembly / multi-feature with ≥2 tags, or assembly role.
+    is_build = (
+        ntype in ("design", "build")
+        or role in ("feature_modeler", "assembly_fit_engineer", "geometry_designer")
+        or tc in ("assembly", "multi_feature_part", "enclosure")
+    )
+    if not (is_plan or is_build):
+        return False
+    # Leaf report/verify classes never hit this gate.
+    if tc in ("leaf", "simple", "simple_part"):
+        return False
+    if role in ("reviewer", "intake_analyst", "clarifier", "overseer") and not is_plan:
+        return False
+    # Gate only when multi-domain (≥2 tags). Single-domain leaves execute flat.
+    if len(tags) >= 2:
+        return True
+    # PLAN roles with assembly/multi task_class are multi-domain even if tags
+    # collapsed to one — layout/orchestrator always coordinate slices.
+    if role in plan_roles and tc in ("assembly", "multi_feature_part", "unknown", ""):
+        return True
+    if role == "layout_engineer":
+        return True
+    return False
+
+
+def extract_typed_refusal(payload: Any) -> dict[str, Any] | None:
+    """Pull a typed refusal object from a handoff / agent result if valid."""
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = [
+        payload.get("typed_refusal"),
+        payload.get("flat_refusal"),
+        payload.get("delegation_refusal"),
+    ]
+    handoff = payload.get("handoff")
+    if isinstance(handoff, dict):
+        outs = handoff.get("outputs") if isinstance(handoff.get("outputs"), dict) else {}
+        candidates.extend([
+            handoff.get("typed_refusal"),
+            outs.get("typed_refusal"),
+            outs.get("flat_refusal"),
+            outs.get("delegation_refusal"),
+        ])
+        # Whole outputs may itself be the envelope.
+        candidates.append(outs if outs else None)
+    # Direct envelope shape on payload.
+    candidates.append(payload)
+    for c in candidates:
+        if isinstance(c, dict) and not validate_typed_refusal(c):
+            return {
+                "reason": str(c["reason"]).strip(),
+                "domains_considered": [
+                    str(x).strip() for x in c["domains_considered"] if str(x).strip()
+                ],
+                "why_flat": str(c["why_flat"]).strip(),
+            }
+    return None
+
+
+def parse_leaf_envelope_text(text: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """Parse model text into a leaf envelope. Returns (obj|None, errors)."""
+    import json
+    import re
+
+    if not text or not str(text).strip():
+        return None, ["leaf_envelope: empty response"]
+    raw = str(text).strip()
+    # Prefer fenced JSON.
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.IGNORECASE)
+    blob = m.group(1) if m else None
+    if blob is None:
+        # Bare object.
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            blob = raw[start : end + 1]
+    if not blob:
+        return None, ["leaf_envelope: no JSON object in response"]
+    try:
+        obj = json.loads(blob)
+    except Exception as exc:  # noqa: BLE001
+        return None, [f"leaf_envelope: json parse error: {exc}"]
+    errs = validate_leaf_envelope(obj)
+    if errs:
+        return None, errs
+    return obj, []
+
+
 
 def auto_pick_model(
     *,

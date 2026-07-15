@@ -1303,6 +1303,9 @@ struct AppState {
     bool m1ShotDone = false;   // guard so the m1 scenario runs exactly once per shot
     bool wantMultidoc = false;     // AI_CAD_SHOT=multidoc scripted multi-document mid-edit scenario
     bool multidocShotDone = false; // guard so the multidoc scenario runs exactly once per shot
+    // AI_CAD_SHOT=tabperf: open 2 parts and hammer A<->B tab switches for logTabPerf timings.
+    bool wantTabPerf = false;
+    bool tabPerfShotDone = false;
     bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
     // [workspace-tabs seam] AI_CAD_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.

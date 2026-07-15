@@ -1506,6 +1506,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // switch back — assert A's form/selection/hidden-body survive and B is independent (DocSession).
     st.wantMultidoc = shot && shotMode && std::strcmp(shotMode, "multidoc") == 0;
     if (st.wantMultidoc) { st.showRibbon = true; st.showFeatureTree = true; }
+    // Tab-switch perf harness: 2 real parts + many A<->B switches; logTabPerf prints to stderr.
+    st.wantTabPerf = shot && shotMode && std::strcmp(shotMode, "tabperf") == 0;
+    if (st.wantTabPerf) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
     if (st.wantEcad) { st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow

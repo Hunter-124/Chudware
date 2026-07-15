@@ -1174,6 +1174,75 @@ _OP_HANDLERS = {
     "nop": _op_nop,
 }
 
+def _family(name: str) -> str:
+    i = name.find("_")
+    return name[:i] if i > 0 else name
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+        prev = cur
+    return prev[-1]
+
+
+def _score_match(q: str, cand: str) -> int:
+    q = q.lower()
+    cand_l = cand.lower()
+    if not q:
+        return 0
+    if cand_l == q:
+        return 100000
+    if cand_l.startswith(q):
+        return 50000 + len(q) * 10
+    if q.startswith(cand_l):
+        return 45000 + len(cand_l) * 10
+    qf, cf = _family(q), _family(cand_l)
+    if len(qf) >= 2 and qf == cf:
+        qrest = q[len(qf) + 1:] if len(q) > len(qf) + 1 else ""
+        crest = cand_l[len(cf) + 1:] if len(cand_l) > len(cf) + 1 else ""
+        bonus = 0
+        if qrest and crest.startswith(qrest):
+            bonus = 2000 + len(qrest) * 10
+        elif qrest:
+            bonus = 1000 - _levenshtein(qrest, crest) * 20
+        return 30000 + bonus
+    if q in cand_l:
+        return 20000 + len(q)
+    if cand_l in q:
+        return 15000 + len(cand_l)
+    return 10000 - _levenshtein(q, cand_l) * 100
+
+
+def list_ecad_ops() -> list[str]:
+    """Closed ECAD op vocabulary (single source: ``_OP_HANDLERS``)."""
+    return sorted(_OP_HANDLERS.keys())
+
+
+def suggest_ecad_ops(unknown: str, n: int = 5) -> list[str]:
+    """Closest N op kinds — prefix/token-family preferred over pure Levenshtein."""
+    scored = [(_score_match(unknown or "", k), k) for k in _OP_HANDLERS]
+    scored.sort(key=lambda p: (-p[0], p[1]))
+    return [k for _, k in scored[: max(0, n)]]
+
+
+def unknown_ecad_op_message(index: int, kind: str) -> str:
+    closest = suggest_ecad_ops(kind, 5)
+    msg = f"op[{index}]: unknown op '{kind}'"
+    if closest:
+        msg += ". closest: " + ", ".join(closest)
+    msg += "; see cad_guide()"
+    return msg
+
+
 
 def _apply_one(doc, op, index, idgen, id_map, warnings) -> None:
     if not isinstance(op, dict):
@@ -1183,8 +1252,9 @@ def _apply_one(doc, op, index, idgen, id_map, warnings) -> None:
         raise _invalid(index, "op.op (the op name) is required")
     handler = _OP_HANDLERS.get(kind)
     if handler is None:
-        raise OpError("invalid_op", f"op[{index}]: unknown op '{kind}'",
-                      {"index": index, "reason": f"unsupported op '{kind}'"})
+        raise OpError("invalid_op", unknown_ecad_op_message(index, kind),
+                      {"index": index, "reason": f"unsupported op '{kind}'",
+                       "suggestions": suggest_ecad_ops(kind, 5)})
     handler(doc, op, index, idgen, id_map, warnings)
 
 

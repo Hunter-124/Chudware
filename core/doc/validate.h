@@ -36,4 +36,8 @@ namespace aicad::doc {
 // Dispatches on doc["schema"]; only "aicad.part/1" is supported.
 std::vector<std::string> validate_document(const nlohmann::json& doc);
 
+// Keys of FEATURE_TYPES (add_feature.feature.type vocabulary). Sorted.
+// Owned here so MCP / op_registry / tests never hand-copy the list.
+std::vector<std::string> feature_type_names();
+
 }  // namespace aicad::doc

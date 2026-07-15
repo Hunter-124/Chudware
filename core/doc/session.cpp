@@ -5,6 +5,7 @@
 // Python transactional contract: apply to a working copy, commit on success).
 
 #include "doc/session.h"
+#include "doc/op_registry.h"
 
 #include "util/aicm_handoff.h"
 
@@ -3004,8 +3005,9 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "paste_feature_as_derived")   op_paste_feature_as_derived(doc, op, idx, gen, id_map);
     else if (k == "sketch_paste_entities")       op_sketch_paste_entities(doc, op, idx, gen, id_map);
     else
-        throw OpError("unsupported", "op[" + std::to_string(idx) + "]: unknown op '" + k + "'",
-                      {{"index", idx}, {"reason", "not ported"}});
+        throw OpError("unsupported", unknown_doc_op_message(idx, k),
+                      {{"index", idx}, {"reason", "not ported"},
+                       {"suggestions", suggest_doc_ops(k, 5)}});
 }
 
 // ----------------------------------------------------------------- rebuild + response

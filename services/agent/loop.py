@@ -2195,6 +2195,10 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     reached = Phase.PLAN.value
     status = "running"
     stop_reason = ""
+    # mega-8: track whether DELIVER completed via soft-join (any-done, not all-done)
+    # so the terminal status can carry stop_reason=deliver_partial instead of
+    # driver-exit running with an empty stop_reason (mega-7 residual).
+    deliver_soft_partial = False
 
     def _downstream_progressed(phase_name: str) -> bool:
         """True when any later phase's realising node is already done.
@@ -2218,8 +2222,8 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
 
     def _phase_completion(
         phase_name: str, prefixes: tuple[str, ...],
-    ) -> tuple[bool, bool]:
-        """Return ``(advanced, reconciled)`` for one phase.
+    ) -> tuple[bool, bool, bool]:
+        """Return ``(advanced, reconciled, deliver_partial)`` for one phase.
 
         A completed join or worker set is a real phase completion. Downstream
         progress only reconciles the phase cursor with the already-run DAG; it
@@ -2231,35 +2235,42 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         specify soft-join bug. One successful deliver report must not freeze
         the mission at ``deliver_incomplete`` because sibling deliverables
         failed/skipped.
+
+        mega-8: when DELIVER advances via any-done but not all-done, the third
+        flag is True so the terminal stop_reason becomes ``deliver_partial``.
         """
         nodes = _phase_nodes(prefixes)
         join = _PHASE_JOIN_NODES.get(phase_name)
         if join and _node_status(join) == "done":
-            return True, False
+            return True, False, False
         workers = [n for n in nodes if n != join] if join else list(nodes)
         # SPECIFY also historically matched n_spec_done via the n_spec_ prefix;
         # keep workers free of the advisory join even if join map is absent.
         if phase_name == "specify":
             workers = [n for n in workers if n != "n_spec_done"]
         if workers and all(_node_status(n) == "done" for n in workers):
-            return True, False
+            return True, False, False
         # Terminal DELIVER soft-join: any successful report node advances the
         # phase for real (mission_report path ran). Remaining failed/skipped
         # siblings are honest partial delivery, not a freeze.
         if phase_name == "deliver" and workers:
-            if any(_node_status(n) == "done" for n in workers):
-                return True, False
+            any_done = any(_node_status(n) == "done" for n in workers)
+            if any_done:
+                all_done = all(_node_status(n) == "done" for n in workers)
+                return True, False, (not all_done)
             # All workers terminal-failed with no success → incomplete.
             terminal = {"done", "failed", "skipped"}
             if all(_node_status(n) in terminal for n in workers):
-                return False, False
+                return False, False, False
         if _downstream_progressed(phase_name):
-            return True, True
-        return False, False
+            return True, True, False
+        return False, False, False
 
     for phase_name, prefixes in _PHASE_NODE_PREFIXES:
         phase = Phase(phase_name)
-        all_done, reconciled = _phase_completion(phase_name, prefixes)
+        all_done, reconciled, d_partial = _phase_completion(phase_name, prefixes)
+        if phase_name == "deliver" and d_partial:
+            deliver_soft_partial = True
 
         machine.enter(phase)
         emit_phase(phase, f"Phase {phase.value}")
@@ -2310,10 +2321,49 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                 stop_reason = f"{phase.value}_gate_failed: {exc}"
             break
     else:
-        # Every phase exited cleanly.
-        status = {"done": "done"}.get(dag_result.get("status"), status)
-        if status == "done":
+        # Every phase exited cleanly — never leave driver-exit ``running`` with
+        # an empty stop_reason (mega-7 residual after soft-join deliver).
+        dag_st = dag_result.get("status")
+        if deliver_soft_partial:
+            # Soft-join: some deliver workers done, some failed/skipped.
+            status = "done" if dag_st in ("done", "paused", "ok", None, "") else (
+                "blocked" if dag_st in ("blocked", "failed", "error") else "done"
+            )
+            stop_reason = "deliver_partial"
             reached = Phase.DELIVER.value
+        elif dag_st == "done":
+            status = "done"
+            stop_reason = stop_reason or "mission_complete"
+            reached = Phase.DELIVER.value
+        elif dag_st in ("failed", "error"):
+            status = "failed"
+            stop_reason = stop_reason or "dag_failed"
+        elif dag_st in ("blocked", "paused"):
+            # Soft-join path often leaves dag status paused; if we completed
+            # every phase including deliver, treat as done unless partial.
+            if "deliver" in completed:
+                status = "done"
+                stop_reason = stop_reason or (
+                    "deliver_partial" if deliver_soft_partial else "mission_complete"
+                )
+                reached = Phase.DELIVER.value
+            else:
+                status = "blocked"
+                stop_reason = stop_reason or f"dag_{dag_st}"
+        else:
+            # Unknown / empty dag status after full phase walk → done.
+            status = "done"
+            stop_reason = stop_reason or "mission_complete"
+            reached = Phase.DELIVER.value
+
+    # Final safety: never return running + empty stop_reason from this driver.
+    if status == "running" and not stop_reason:
+        if "deliver" in completed:
+            status = "done"
+            stop_reason = "deliver_partial" if deliver_soft_partial else "mission_complete"
+        else:
+            status = "blocked"
+            stop_reason = f"{reached}_incomplete" if reached else "blocked"
 
     return reached, status, stop_reason
 

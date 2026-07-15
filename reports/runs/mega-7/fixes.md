@@ -128,41 +128,53 @@ python3 -m pytest services/agent/test_mega7_fixes.py services/agent/test_mega6_f
 
 Attempt-1 (pid 2101380) bound baseline 84963165 **before** Fixer7 edits — archived
 under `attempt-1-pre-fixer7-rebind/`. Attempt-2 (pid 2154280) relaunched and
-**bound Fix 1–4**.
+bound Fix 1 / 3 sequence / 4. Shared cache `mega-7-fc-rocket-20260714` holds
+**both** attempts under one run_id — split by `ts < 2026-07-15T00:42:00Z` = attempt-1.
 
 ---
 
-## Attempt-2 live evidence (pid 2154280, wall 382.98s, account 17d17fb1)
+## Attempt-1 evidence (pre-Fixer7 rebind, archived)
+
+| Axis | Evidence |
+|---|---|
+| model_assignment | ×17 all `task_class=unknown` → xai-sub |
+| delegate / spawn | **delegate×2**, spawn×2 (`part_designer`, `edit-part`) |
+| BUILD tools | new_part×2, add_features×8 |
+
+Note: Fixer7 did **not** bind this process; spawns prove the tools_slot still
+exposes delegate (mega-6 regression was model behavior, not allowlist wipe).
+
+---
+
+## Attempt-2 evidence (Fixer7 bound, pid 2154280, wall 383s, account 17d17fb1)
 
 | Axis | Evidence | Verdict |
 |---|---|---|
-| Fix4 task_class stamp | MA×19: leaf/simple_part/multi_feature/assembly/analysis — **0 unknown** on attempt-2 | **PASS** |
-| Fix4 cheap routing | leaf/simple_part → ollama (MA ollama×11); hard work → xai-sub (×8). Usage tokens: llama3.2×11 completes (~29k tok as `openai` label) / xai×79 | **PASS** (routing); label residual |
-| Fix3 sequence | `new_part`×3, `add_features`×21 (events), `preflight_ops` thrash **gone** | **PASS** sequence; solids still fail on bad op schema (`missing 'op'` / `unknown op 'box'`) |
-| Fix2 delegation | **`delegate`×2** + `agent.spawn`×2 (`part_designer`, `edit-part`) | **PASS** calls restored (mega-6 was 0) |
-| Fix1 DELIVER soft-join | deliver DL1/3/4/5 done, DL2 failed → stage exit `mission_report_ledger_closed`; **no** `deliver_incomplete`; phases_completed includes deliver | **PASS** |
-| BUILD nodes | n_build_DL1/DL2 **done** | improve |
+| Fix4 task_class stamp | MA post-cutoff: leaf×5, simple_part×6, multi_feature×3, assembly×3, analysis×2, unknown×2 | **PASS** |
+| Fix4 cheap routing | ollama×11 / xai-sub×10 on MA; leaf+simple_part → llama3.2 | **PASS** |
+| Fix3 sequence | new_part×1, add_features×13, preflight thrash absent | **PASS** sequence; solids still fail bad op schema |
+| Fix2 delegation | **delegate×0**, spawn×0 this process | **NOT exercised** (attempt-1 only) |
+| Fix1 DELIVER soft-join | partial n_deliver done; stage exit `mission_report_ledger_closed`; no `deliver_incomplete` | **PASS** |
 | Wall | **383s** (mega-6: 889s) | improve |
 
-### Follow-up landed mid/post attempt-2
+### Follow-up landed post attempt-2
 
 - Expanded `_ROLE_ALIASES`: `part_designer`, `edit-part`, `edit_part`, `part_builder`,
-  `solid_modeler` → `feature_modeler` so invented spawn roles get geometry tools
-  (live spawns used those names; without alias children are bare).
+  `solid_modeler` → `feature_modeler` (from attempt-1 spawn names) so next spawn
+  gets geometry allowlist.
 
-### Residual (not this wave / next)
+### Residual
 
-- `add_features` op vocabulary: model sent `kind:box` / `op:box` — engine wants
-  cad_guide ops (e.g. sketch+extrude). Sequence fixed; geometry still hollow.
-- provider_usage labels ollama as `provider=openai` (compat client) — cheap-share
-  **token** % undercounts unless grader keys on `model=llama*`.
-- Mission wrapper `status=running` / empty stop_reason after deliver exit —
-  cosmetic vs phase-gate freeze.
+- Attempt-2 still 0 delegate — role-card MUST language needs another cycle / stronger
+  harness nudge (tools present; model chose not to call).
+- `add_features` ops still wrong vocabulary (`kind:box` / `op:box`) — not sequence.
+- provider_usage labels ollama as `openai` (compat client).
+- Cache run_id reuse mixes attempts — MegaRun should use distinct run_ids per attempt.
 
 ### Tests
 
 ```text
 python3 -m pytest services/agent/test_mega7_fixes.py \
-  services/agent/test_mega6_fixes.py services/dag/test_mission_template.py -q
-32 passed
+  services/agent/test_mega6_fixes.py -q
+30 passed
 ```

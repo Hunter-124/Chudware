@@ -410,3 +410,10 @@ def test_admin_rejects_bad_email(client, _admin_env):
         json={"email": "not-an-email"},
     )
     assert r.status_code == 400
+
+
+def test_team_domain_normalization(monkeypatch):
+    from gateway.config import _normalize_team_domain
+    assert _normalize_team_domain("bruh.cloudflareaccess.com") == "https://bruh.cloudflareaccess.com"
+    assert _normalize_team_domain("https://bruh.cloudflareaccess.com/") == "https://bruh.cloudflareaccess.com"
+    assert _normalize_team_domain("") == ""

@@ -35,6 +35,13 @@ def _env_float(name: str, default: float) -> float:
 def _expand_path(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
+def _normalize_team_domain(raw: str) -> str:
+    raw = raw.strip().rstrip("/")
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    return raw
 
 @dataclass
 class Settings:
@@ -75,7 +82,11 @@ class Settings:
         default_factory=lambda: _env("BILLET_WEB_STREAM_BACKEND", "novnc") or "novnc"
     )
     cf_team_domain: str = field(
-        default_factory=lambda: (_env("BILLET_WEB_CF_TEAM_DOMAIN", "") or "").rstrip("/")
+        # Accept "team.cloudflareaccess.com" or "https://team.cloudflareaccess.com";
+        # the Access JWT `iss` claim and the JWKS URL both need the https:// form.
+        default_factory=lambda: _normalize_team_domain(
+            _env("BILLET_WEB_CF_TEAM_DOMAIN", "") or ""
+        )
     )
     cf_aud: str = field(default_factory=lambda: _env("BILLET_WEB_CF_AUD", "") or "")
     dev_mode: bool = field(default_factory=lambda: _env_bool("BILLET_WEB_DEV", False))

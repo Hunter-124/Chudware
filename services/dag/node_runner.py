@@ -417,6 +417,16 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
             context_pack["ledger"] = ledger
         except Exception:  # noqa: BLE001
             pass
+    # mega-8: seed run_id from the bound ledger when the pack is missing it
+    # (graph_loader historically assembled packs without state.run_id).
+    if ledger is not None and not context_pack.get("run_id"):
+        try:
+            rid = getattr(ledger, "run_id", None)
+            if rid:
+                context_pack = dict(context_pack)
+                context_pack["run_id"] = rid
+        except Exception:  # noqa: BLE001
+            pass
     try:
         resolved_provider = _resolve_provider(context_pack, provider)
     except Exception as exc:  # noqa: BLE001 — no constructible provider
@@ -577,7 +587,9 @@ def _maybe_run_cheap_leaf_oneshot(
         f"Node request:\n{request}\n\n"
         f"task_class={task_class}. Fill the leaf envelope JSON now."
     )
-    messages = [{"role": "user", "content": user_msg}]
+    # Prefer agent_turn list-of-parts form so Anthropic-shaped providers work;
+    # OpenAI/ollama also accept plain strings after the mega-8 provider fix.
+    messages = [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
     try:
         reply = provider.complete(system, messages, max_tokens=800)
     except Exception as exc:  # noqa: BLE001 — degrade to tool-loop / frontier

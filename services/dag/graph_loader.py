@@ -283,6 +283,10 @@ def _make_node_handler(
                 current_node_state_v = {**current_node_state_v,
                                          "retry_remaining": initial_retry_budget}
             pack_v = cp.assemble(node, current_node_state_v)
+            rid_v = state.get("run_id")
+            if rid_v and not pack_v.get("run_id"):
+                pack_v = dict(pack_v)
+                pack_v["run_id"] = rid_v
             verdict_v, output_v = vr.run(node, pack_v, emit=_emit)
             node_entry_v: dict[str, Any] = {
                 "status": output_v.get("status", "done"),
@@ -312,6 +316,13 @@ def _make_node_handler(
         if "retry_remaining" not in current_node_state:
             current_node_state = {**current_node_state, "retry_remaining": initial_retry_budget}
         pack = cp.assemble(node, current_node_state)
+        # mega-8: seed run_id from LangGraph state so agent_turn op-vocab
+        # cheatsheet keys once-per-mission, overseer/leaf telemetry share the
+        # same id, and context_pack.get("run_id") is never silently None.
+        rid = state.get("run_id")
+        if rid and not pack.get("run_id"):
+            pack = dict(pack)
+            pack["run_id"] = rid
 
         # --- Dispatch via node_runner ----------------------------------------
         verdict, output_state = nr.run(

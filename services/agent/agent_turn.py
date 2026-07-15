@@ -591,7 +591,33 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         else:
             try:
                 result = dispatch(tool, args)
+                # mega-8: MCP tools often return JSON/dicts with ok:false without
+                # raising. Treat payload ok as the call outcome so productive_tools
+                # / new_part→add_features gates don't count rejected ops as success
+                # (live: add_features unknown op 'cylinder' still ok=True → hollow
+                # solid auto-complete).
                 ok = True
+                payload = result
+                if isinstance(result, str):
+                    try:
+                        import json as _json  # noqa: PLC0415
+                        payload = _json.loads(result)
+                    except Exception:  # noqa: BLE001
+                        payload = None
+                if isinstance(payload, dict) and "ok" in payload:
+                    ok = bool(payload.get("ok"))
+                elif isinstance(payload, dict):
+                    nested = payload.get("result")
+                    if isinstance(nested, dict) and "ok" in nested:
+                        ok = bool(nested.get("ok"))
+                    elif isinstance(nested, str) and '"ok"' in nested:
+                        try:
+                            import json as _json  # noqa: PLC0415
+                            nested_obj = _json.loads(nested)
+                            if isinstance(nested_obj, dict) and "ok" in nested_obj:
+                                ok = bool(nested_obj.get("ok"))
+                        except Exception:  # noqa: BLE001
+                            pass
             except Exception as exc:  # noqa: BLE001 — dispatch error fed back to model
                 result = {"ok": False, "error": str(exc)}
                 ok = False

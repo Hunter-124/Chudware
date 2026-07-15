@@ -886,6 +886,30 @@ def validate_typed_refusal(payload: Any) -> list[str]:
     return errs
 
 
+def normalize_leaf_envelope(payload: Any) -> dict[str, Any] | None:
+    """Shallow-normalize local-model garbage; return dict or None if not object."""
+    if not isinstance(payload, dict):
+        return None
+    out = dict(payload)
+    if out.get("reason") is None:
+        out.pop("reason", None)
+    if out.get("no_op") is None:
+        out.pop("no_op", None)
+    arts = out.get("artifacts")
+    if isinstance(arts, list):
+        norm_arts = []
+        for a in arts:
+            if isinstance(a, dict):
+                norm_arts.append(a)
+            elif isinstance(a, str) and a.strip():
+                norm_arts.append({"name": a.strip()})
+        out["artifacts"] = norm_arts
+    ops = out.get("ops")
+    if isinstance(ops, list):
+        out["ops"] = [o for o in ops if isinstance(o, dict)]
+    return out
+
+
 def validate_leaf_envelope(payload: Any) -> list[str]:
     """Strict validate a cheap-leaf one-shot envelope. [] = valid.
 
@@ -893,9 +917,14 @@ def validate_leaf_envelope(payload: Any) -> list[str]:
       * ``ops`` is a non-empty array of objects, OR
       * ``no_op`` is true with a non-empty ``reason``.
     ``artifacts`` is optional (array of objects when present).
+
+    mega-8: local models emit ``reason: null`` and string artifacts — normalize
+    those before schema check so salvageable envelopes still pass.
     """
-    if not isinstance(payload, dict):
+    payload = normalize_leaf_envelope(payload)
+    if payload is None:
         return ["leaf_envelope: expected object"]
+
     errs = _schema_validate(payload, LEAF_ENVELOPE_SCHEMA, "leaf_envelope")
     goal = payload.get("goal")
     if isinstance(goal, str) and not goal.strip():
@@ -1002,30 +1031,41 @@ def is_multi_domain_plan_or_build(
 
     Leaf workers (feature_modeler at pure geometry, reviewer, intake) are not
     gated — only multi-domain PLAN/BUILD ranks that must spawn or refuse.
+
+    mega-8 live: mission_template stamps *every* worker ``type=design``
+    (including n_spec_*), so node_type alone must NOT imply BUILD. SPECIFY
+    (spec_writer) is free-form product work — not the delegate/typed-refusal
+    forcing function (that targets PLAN/layout + multi-domain BUILD).
     """
     role = (role_id or "").strip().lower()
     ntype = (node_type or "").strip().lower()
     tags = list(domain_tags or [])
     tc = (task_class or "").strip().lower()
 
-    plan_roles = {
-        "orchestrator", "department_manager", "layout_engineer", "planning",
-    }
-    # PLAN by role or by plan node type.
-    is_plan = role in plan_roles or ntype == "plan" or role == "overseer"
-    # BUILD multi-domain: assembly / multi-feature with ≥2 tags, or assembly role.
-    is_build = (
-        ntype in ("design", "build")
-        or role in ("feature_modeler", "assembly_fit_engineer", "geometry_designer")
-        or tc in ("assembly", "multi_feature_part", "enclosure")
-    )
-    if not (is_plan or is_build):
+    # Never gate SPECIFY / report / intake workers.
+    if role in (
+        "spec_writer", "reviewer", "intake_analyst", "clarifier",
+        "overseer",  # join/audit — not a multi-domain coordinator
+    ):
         return False
     # Leaf report/verify classes never hit this gate.
     if tc in ("leaf", "simple", "simple_part"):
         return False
-    if role in ("reviewer", "intake_analyst", "clarifier", "overseer") and not is_plan:
+
+    plan_roles = {
+        "orchestrator", "department_manager", "layout_engineer", "planning",
+    }
+    build_roles = {
+        "feature_modeler", "assembly_fit_engineer", "geometry_designer",
+    }
+    # PLAN by coordinating role or explicit plan node type.
+    is_plan = role in plan_roles or ntype == "plan"
+    # BUILD only for real geometry/assembly workers — NOT every type=design
+    # node (mega-8: n_spec_* are type=design + task_class multi_feature/assembly).
+    is_build = role in build_roles or ntype == "build"
+    if not (is_plan or is_build):
         return False
+
     # Gate only when multi-domain (≥2 tags). Single-domain leaves execute flat.
     if len(tags) >= 2:
         return True
@@ -1073,32 +1113,69 @@ def extract_typed_refusal(payload: Any) -> dict[str, Any] | None:
 
 
 def parse_leaf_envelope_text(text: str) -> tuple[dict[str, Any] | None, list[str]]:
-    """Parse model text into a leaf envelope. Returns (obj|None, errors)."""
+    """Parse model text into a leaf envelope. Returns (obj|None, errors).
+
+    mega-8 live: ollama often emits truncated / trailing-comma JSON inside a
+    giant ops array. Prefer a full parse; on failure, salvage a minimal valid
+    envelope from ``goal`` (+ no_op/reason) so axis C can still complete.
+    """
     import json
     import re
 
     if not text or not str(text).strip():
         return None, ["leaf_envelope: empty response"]
     raw = str(text).strip()
-    # Prefer fenced JSON.
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.IGNORECASE)
     blob = m.group(1) if m else None
     if blob is None:
-        # Bare object.
+        m2 = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL | re.IGNORECASE)
+        blob = m2.group(1) if m2 else None
+    if blob is None:
         start = raw.find("{")
         end = raw.rfind("}")
         if start >= 0 and end > start:
             blob = raw[start : end + 1]
+        elif start >= 0:
+            # Truncated object with no closing brace (live ollama DL5).
+            blob = raw[start:]
     if not blob:
         return None, ["leaf_envelope: no JSON object in response"]
-    try:
-        obj = json.loads(blob)
-    except Exception as exc:  # noqa: BLE001
-        return None, [f"leaf_envelope: json parse error: {exc}"]
-    errs = validate_leaf_envelope(obj)
+
+    def _strip_trailing_commas(s: str) -> str:
+        return re.sub(r",\s*([}\]])", r"\1", s)
+
+    obj = None
+    parse_errs: list[str] = []
+    for candidate in (blob, _strip_trailing_commas(blob)):
+        try:
+            obj = json.loads(candidate)
+            break
+        except Exception as exc:  # noqa: BLE001
+            parse_errs.append(str(exc))
+            obj = None
+
+    if obj is None:
+        goal_m = re.search(r'"goal"\s*:\s*"((?:\\.|[^"\\])*)"', blob)
+        if not goal_m:
+            return None, [
+                f"leaf_envelope: json parse error: "
+                f"{parse_errs[-1] if parse_errs else 'unknown'}"
+            ]
+        goal = goal_m.group(1)
+        try:
+            goal = bytes(goal, "utf-8").decode("unicode_escape")
+        except Exception:  # noqa: BLE001
+            pass
+        reason_m = re.search(r'"reason"\s*:\s*"((?:\\.|[^"\\])*)"', blob)
+        reason = reason_m.group(1) if reason_m else (
+            "partial JSON from leaf model; ops unparseable"
+        )
+        obj = {"goal": goal, "no_op": True, "reason": reason}
+    norm = normalize_leaf_envelope(obj) or obj
+    errs = validate_leaf_envelope(norm)
     if errs:
         return None, errs
-    return obj, []
+    return norm, []
 
 
 

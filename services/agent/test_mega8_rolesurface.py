@@ -149,6 +149,73 @@ def test_typed_refusal_gate_blocks_free_form():
     assert gate.get("blocked") is True
     assert gate.get("reason") == "missing_delegate_or_typed_refusal"
 
+def test_typed_refusal_gate_skips_specify_workers():
+    """Live mega-8: n_spec_* are type=design + multi_feature/assembly — must NOT gate."""
+    from services.dag import node_runner as nr
+    from services.agent.role_models import is_multi_domain_plan_or_build
+
+    assert not is_multi_domain_plan_or_build(
+        role_id="spec_writer",
+        node_type="design",
+        domain_tags=["spec", "geometry"],
+        task_class="multi_feature_part",
+    )
+    assert not is_multi_domain_plan_or_build(
+        role_id="spec_writer",
+        node_type="design",
+        domain_tags=["spec", "assembly", "geometry"],
+        task_class="assembly",
+    )
+    # PLAN/layout still gated.
+    assert is_multi_domain_plan_or_build(
+        role_id="layout_engineer",
+        node_type="design",
+        domain_tags=["plan", "layout", "assembly"],
+        task_class="assembly",
+    )
+    assert is_multi_domain_plan_or_build(
+        role_id="feature_modeler",
+        node_type="design",
+        domain_tags=["geometry", "assembly"],
+        task_class="assembly",
+    )
+
+    node = {
+        "id": "n_spec_DL1",
+        "type": "design",
+        "name": "SPECIFY DL1",
+        "inputs": {
+            "role": "spec_writer",
+            "task_class": "multi_feature_part",
+            "depth": 0,
+        },
+    }
+    pack = {
+        "node_inputs": node["inputs"],
+        "role_id": "spec_writer",
+        "task_class": "multi_feature_part",
+        "depth": 0,
+        "capability_letter": "C",
+        "retry_remaining": 2,
+    }
+
+    class _R:
+        success = True
+        stop_reason = "confirmed"
+        final_code = None
+        result = {
+            "calls": [{"tool": "ledger_note", "ok": True}],
+            "handoff": {
+                "status": "done",
+                "summary": "spec written flat",
+                "outputs": {"spec": "ok"},
+            },
+        }
+
+    verdict, out = nr.run(node, pack, agent_fn=lambda r, p: _R())
+    assert verdict == nr.VERDICT_DONE, (verdict, out)
+    assert out["data"].get("stop_reason") != "delegate_or_typed_refusal_required"
+
 
 def test_typed_refusal_gate_accepts_valid_envelope():
     from services.dag import node_runner as nr
@@ -315,6 +382,30 @@ def test_leaf_envelope_validates():
     assert env["goal"] == "g"
 
 
+def test_leaf_envelope_salvages_truncated_ops_json():
+    """Live mega-8: ollama DL5 returned truncated ops[] with trailing commas."""
+    from services.agent.role_models import parse_leaf_envelope_text
+
+    blob = '''{
+  "goal": "Design a model rocket plane with flight computer",
+  "ops": [
+    {
+      "type": "fit_calc",
+    
+'''
+    env, errs = parse_leaf_envelope_text(blob)
+    assert env is not None, errs
+    assert env["goal"].startswith("Design a model rocket")
+    assert env.get("no_op") is True
+    assert env.get("reason")
+
+    env2, errs2 = parse_leaf_envelope_text(
+        '{"goal":"g","no_op":true,"reason":"nothing to do",}'
+    )
+    assert env2 is not None, errs2
+    assert env2["no_op"] is True
+
+
 def test_leaf_oneshot_success_skips_tool_loop(monkeypatch):
     from services.agent import role_models as rm
     from services.dag import node_runner as nr
@@ -442,6 +533,72 @@ def test_leaf_oneshot_miss_increments_and_falls_back(monkeypatch):
     )
     verdict, out = nr.run(node, pack, agent_fn=None)
     assert verdict == nr.VERDICT_DONE, (verdict, out)
+
+
+def test_openai_provider_accepts_string_content():
+    """Live mega-8: leaf oneshot used plain-string content; OpenAI/ollama crashed."""
+    pytest.importorskip("openai")
+    from services.agent.providers.openai_provider import OpenAIProvider
+
+    p = OpenAIProvider(api_key="k", base_url="http://127.0.0.1:11434/v1")
+    # Plain string (historical oneshot / overseer form).
+    m = p._message("user", "fill the leaf envelope")
+    assert m == {"role": "user", "content": "fill the leaf envelope"}
+    # List-of-parts still collapses to string for text-only.
+    m2 = p._message("user", [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+    assert m2 == {"role": "user", "content": "a\n\nb"}
+
+
+def test_leaf_oneshot_messages_use_parts_form():
+    """Oneshot must not pass bare strings that Anthropic-shaped providers reject."""
+    from services.dag import node_runner as nr
+    from services.agent import role_models as rm
+
+    rm.reset_leaf_miss_count()
+    seen = {}
+
+    class _Prov:
+        name = "ollama"
+        model = "llama3.2:latest"
+
+        def complete(self, system, messages, max_tokens=800):
+            seen["messages"] = messages
+            return '{"goal":"g","no_op":true,"reason":"nothing"}'
+
+    pack = {
+        "node_inputs": {"task_class": "leaf"},
+        "task_class": "leaf",
+        "role_model": {"provider": "ollama", "model": "llama3.2:latest", "cost_tier": 0},
+    }
+    out = nr._maybe_run_cheap_leaf_oneshot("do leaf", pack, _Prov(), node_name="n")
+    assert out is not None
+    msgs = seen["messages"]
+    assert isinstance(msgs[0]["content"], list), msgs
+    assert msgs[0]["content"][0]["type"] == "text"
+
+
+def test_context_pack_and_graph_seed_run_id():
+    """run_id must reach agent_turn for once-per-mission op-vocab keying."""
+    from services.dag.context_pack import assemble
+
+    node = {
+        "id": "n_build_DL1",
+        "type": "design",
+        "name": "BUILD",
+        "inputs": {"role": "feature_modeler", "task_class": "multi_feature_part",
+                   "run_id": "from-inputs"},
+    }
+    pack = assemble(node, {"retry_remaining": 1})
+    assert pack.get("run_id") == "from-inputs"
+
+    node2 = {
+        "id": "n_plan",
+        "type": "plan",
+        "name": "PLAN",
+        "inputs": {"role": "layout_engineer", "task_class": "assembly"},
+    }
+    pack2 = assemble(node2, {"retry_remaining": 1, "run_id": "from-state"})
+    assert pack2.get("run_id") == "from-state"
 
 
 # ---------------------------------------------------------------------------

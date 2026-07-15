@@ -172,3 +172,23 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   six verdicts + TOP5: `reports/runs/mega-7/findings.md`. Fixer7 fixes.md
   (deliver soft-join, delegate preference, add_features thrash block,
   task_class stamp).
+
+- 2026-07-14/15 mega-8 (WS5): cycle-8 validation under
+  `reports/runs/mega-8/` (`mega-8-fc-rocket-20260714`). Baseline `7ef7b577`
+  (op-vocab registry + capability separation + cheap-leaf oneshot +
+  `deliver_partial` terminal). Preflight PASS: account `17d17fb1-…` active;
+  PLAN/layout tools_slot has delegate and **no** add_features/new_part;
+  auto_pick depth-2 → ollama. Three processes: attempt-1 archived pre-Fixer8
+  rebind; attempt-2 (Fix 1–3, wall **926s**) and attempt-3 (Fix 4–5, wall
+  **1003.84s**). Axis scoreboard: **A FAIL** (0 accepted add_features ops;
+  a2 `unknown op 'cylinder'` without observed once-per-mission cheatsheet;
+  a3 new_part without add_features). **B PASS** (delegate×1 + depth-1 spawn
+  on BUILD DL2; layout/plan `delegate_or_typed_refusal_required` gate; SPECIFY
+  no longer false-gated). **C PASS** (`leaf_oneshot_ok`×3 + miss×8 telemetry
+  both a2/a3 after OpenAI string-content fix). **D PASS** (terminal
+  `needs_correction` / `verify_failed: [AC1…AC9]` — not running+empty;
+  `deliver_partial` not selected because VERIFY→CORRECT won). Fixer8 Fixes
+  1–6 in `fixes.md` (oneshot string crash, run_id pack seed, gate narrow,
+  JSON salvage, payload ok:false, null-reason normalize). Open defects:
+  thin unknown-op errors, cheatsheet inject not ledger-visible, typed-refusal
+  success path unused. Findings: `reports/runs/mega-8/findings.md`.

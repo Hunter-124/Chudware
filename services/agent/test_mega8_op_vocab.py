@@ -200,3 +200,36 @@ def test_middleware_live_in_run_turn():
     # Second failure would not re-inject — already covered by unit test;
     # here we only fire one unknown-op.
     assert result is not None
+
+
+def test_dispatch_ok_false_when_payload_rejects_ops():
+    """Live mega-8: add_features returned ok:false JSON but call_rec.ok stayed True."""
+    from services.agent import agent_turn as at
+
+    # Simulate the post-dispatch ok derivation used in run_turn.
+    def _derive_ok(result):
+        ok = True
+        payload = result
+        if isinstance(result, str):
+            import json as _json
+            try:
+                payload = _json.loads(result)
+            except Exception:
+                payload = None
+        if isinstance(payload, dict) and "ok" in payload:
+            ok = bool(payload.get("ok"))
+        return ok
+
+    fail = '{\n  "ok": false,\n  "error": "op[0]: unknown op \'cylinder\'"\n}'
+    assert _derive_ok(fail) is False
+    assert _derive_ok({"ok": False, "error": "x"}) is False
+    assert _derive_ok({"ok": True, "revision": 1}) is True
+    # Rejected ops must not count as productive add_features.
+    calls = [
+        {"tool": "new_part", "ok": True},
+        {"tool": "add_features", "ok": _derive_ok(fail)},
+    ]
+    productive = any(
+        c.get("ok") and c.get("tool") == "add_features" for c in calls
+    )
+    assert productive is False

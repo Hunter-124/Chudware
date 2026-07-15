@@ -1,0 +1,10 @@
+{
+  "state": "starting",
+  "run_id": "mega-8-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 2410582,
+  "started_wall": 1784078884.396624,
+  "cycle": "mega-8",
+  "conservation": true,
+  "baseline_commit": "7ef7b577"
+}

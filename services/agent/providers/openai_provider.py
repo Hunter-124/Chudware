@@ -54,10 +54,16 @@ class OpenAIProvider(Provider):
         mime = part.get("mime", "image/png")
         return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
-    def _message(self, role: str, parts: list[dict]) -> dict:
-        # Use plain-string content for text-only messages — the most broadly compatible
-        # form. Some OpenAI-compatible servers (LM Studio, llama.cpp, etc.) reject the
-        # array-of-parts form for text and return an empty/None `choices`.
+    def _message(self, role: str, parts) -> dict:
+        # Accept plain-string content (mega-8 leaf oneshot / overseer audit) as
+        # well as the agent_turn list-of-parts form. XAISubProvider already did
+        # this; OpenAI/ollama/lmstudio crashed with
+        # ``string indices must be integers`` on cheap-leaf one-shots.
+        if isinstance(parts, str):
+            return {"role": role, "content": parts}
+        # Use plain-string content for text-only messages — the most broadly
+        # compatible form. Some OpenAI-compatible servers (LM Studio, llama.cpp,
+        # etc.) reject the array-of-parts form for text and return empty choices.
         if all(p["type"] == "text" for p in parts):
             return {"role": role, "content": "\n\n".join(p["text"] for p in parts)}
         return {"role": role, "content": [self._content(p) for p in parts]}

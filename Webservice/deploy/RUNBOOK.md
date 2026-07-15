@@ -210,9 +210,17 @@ sudo loginctl enable-linger "$USER"
 `https://cad.scootware.us/admin` (admin role) now shows, above the allowlist:
 
 - **Live sessions** — per seat: screenshot thumbnail (refreshes ~10 s), status,
-  uptime, idle, CPU/mem (`podman stats`), and a **Stop** button.
+  uptime, idle, CPU/mem (`podman stats`), and a **Stop** button. **Click a
+  thumbnail to spectate** that seat live (view-only noVNC popout; the stream
+  proxy admits admins alongside the owner).
 - **Host bar** — seats used/max, free RAM, VRAM used/total + GPU util
-  (`nvidia-smi`), load, idle timeout.
+  (`nvidia-smi`), load, idle timeout, plus **service chips**
+  (cloudflared / monitor / backup unit states) and a **pause new sessions**
+  switch (touches the same `REFUSE_NEW` flag the disk monitor uses; running
+  seats are unaffected, new starts get a busy message).
+- **Allowlist table is editable in place** — click the role pill to toggle
+  admin/user (self-demotion blocked), the GPU pill to toggle the heavy seat,
+  the project cell to reassign; changes apply on their next session start.
 - **Gateway log** — journal tail in the page (`/api/admin/logs`), optional
   5 s follow. No SSH needed for demo-day triage.
 

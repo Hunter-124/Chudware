@@ -1396,3 +1396,10 @@ PATCH /api/admin/users/{email} edits display/role/heavy/project/doc in place
 spectate popup ("Connected", 1920x1080 canvas) + PATCH round-trip. Note: dev
 gateway upsert rewrites the repo users.yaml template - restored via checkout;
 prod uses ~/billet-web-data/users.yaml so this only affects dev smoke.
+
+## 2026-07-15 - billet-web ops wave 3
+Admin ops bar gains sibling-unit health chips (systemctl is-active for
+billet-cloudflared/monitor/backup) and a pause-new-sessions switch backed by
+PUT /api/admin/refuse-new (same REFUSE_NEW flag the disk monitor owns, so the
+monitor can re-assert it under disk pressure). Tests 27/27; live ops payload
+showed all three units active. RUNBOOK (f) updated for waves 2+3.

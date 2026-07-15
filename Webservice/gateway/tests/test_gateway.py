@@ -619,3 +619,19 @@ def test_admin_spectates_stream(client, _admin_env, _isolate):
     assert client.get("/stream/livesid/", headers=_auth("demo@example.com")).status_code == 502
     assert client.get("/stream/livesid/", headers=_auth("boss@example.com")).status_code == 502
     assert client.get("/stream/livesid/", headers=_auth("alice@ua.edu")).status_code == 403
+
+
+def test_admin_refuse_new_toggle(client, _admin_env, _isolate):
+    mgr = _isolate
+    flag = mgr.cfg.refuse_new_flag
+    assert client.put("/api/admin/refuse-new", headers=_auth("demo@example.com"),
+                      json={"on": True}).status_code == 403
+    r = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": True})
+    assert r.status_code == 200 and r.json()["refuse_new"] is True and flag.exists()
+    # new session start now refused with 503
+    r2 = client.post("/api/sessions", headers=_auth("demo@example.com"))
+    assert r2.status_code == 503
+    r3 = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": False})
+    assert r3.status_code == 200 and r3.json()["refuse_new"] is False and not flag.exists()
+    ops = client.get("/api/admin/ops", headers=_auth("boss@example.com")).json()
+    assert ops["refuse_new"] is False and "units" in ops["host"]

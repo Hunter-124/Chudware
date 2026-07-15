@@ -244,7 +244,38 @@
                          (h.gpu.vram_total_mib / 1024).toFixed(1) + " GiB · GPU " + h.gpu.util_pct + "%");
     if (h.load1 != null) bits.push("load " + h.load1.toFixed(1));
     bits.push("idle timeout " + Math.round(data.limits.idle_timeout_sec / 60) + "m");
-    hostBar.textContent = bits.join("  ·  ");
+    hostBar.textContent = "";
+    hostBar.appendChild(document.createTextNode(bits.join("  ·  ") + "  ·  "));
+    // Sibling service chips — a dead tunnel means nobody can reach the site.
+    Object.keys(h.units || {}).forEach(function (name) {
+      var ok = h.units[name] === "active";
+      var chip = document.createElement("span");
+      chip.className = "pill " + (ok ? "user" : "admin");
+      chip.style.marginRight = "6px";
+      chip.title = "systemd unit state: " + h.units[name];
+      chip.textContent = name + (ok ? "" : " " + h.units[name]);
+      hostBar.appendChild(chip);
+    });
+    // Pause switch — REFUSE_NEW flag (shared with the disk monitor).
+    var pause = document.createElement("button");
+    pause.type = "button";
+    pause.className = "rm-btn";
+    pause.style.marginLeft = "8px";
+    if (data.refuse_new) {
+      pause.textContent = "REFUSING new sessions — resume";
+      pause.title = "Removes the REFUSE_NEW flag so people can start seats again";
+    } else {
+      pause.textContent = "pause new sessions";
+      pause.title = "Touches the REFUSE_NEW flag: running seats stay, new starts get a busy message";
+    }
+    pause.addEventListener("click", async function () {
+      try {
+        await api("/api/admin/refuse-new",
+                  { method: "PUT", body: JSON.stringify({ on: !data.refuse_new }) });
+        refreshOps();
+      } catch (e) { setStatus(String(e.message || e), true); }
+    });
+    hostBar.appendChild(pause);
 
     opsEmpty.style.display = data.sessions.length ? "none" : "block";
     var seen = {};

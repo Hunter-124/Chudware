@@ -240,6 +240,22 @@ def _gpu_info() -> dict[str, Any] | None:
         return None
 
 
+_OPS_UNITS = ("billet-cloudflared.service", "billet-monitor.timer", "billet-backup.timer")
+
+
+def _unit_health() -> dict[str, str]:
+    """is-active for the sibling units — tunnel down = nobody can connect."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "is-active", *_OPS_UNITS],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return {u.removeprefix("billet-").split(".")[0]: (s.strip() or "unknown")
+            for u, s in zip(_OPS_UNITS, out)}
+
+
 @admin_router.get("/ops")
 async def admin_ops(request: Request) -> dict[str, Any]:
     """Live sessions + host health for the admin dashboard."""
@@ -266,10 +282,28 @@ async def admin_ops(request: Request) -> dict[str, Any]:
             "mem_available_gib": mem_available_gib(),
             "load1": load,
             "gpu": _gpu_info(),
+            "units": _unit_health(),
         },
+        "refuse_new": settings.refuse_new_flag.exists(),
         "limits": {"max_sessions": settings.max_sessions, "max_heavy": settings.max_heavy,
                    "idle_timeout_sec": settings.idle_timeout_sec},
     }
+
+
+@admin_router.put("/refuse-new")
+async def admin_refuse_new(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Pause/resume NEW session starts (running seats unaffected).
+
+    Same REFUSE_NEW flag file the disk monitor uses — the monitor may
+    re-create it while disk is critical, so a manual clear can be overridden.
+    """
+    _require_admin(request)
+    flag = settings.refuse_new_flag
+    if bool(body.get("on")):
+        flag.touch(exist_ok=True)
+    else:
+        flag.unlink(missing_ok=True)
+    return {"ok": True, "refuse_new": flag.exists()}
 
 
 @admin_router.post("/sessions/{sid}/stop")

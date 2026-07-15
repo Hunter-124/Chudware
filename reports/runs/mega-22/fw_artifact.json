@@ -1,55 +1,22 @@
 {
-  "event": "turn",
-  "kind": "done",
-  "handoff": {
-    "status": "done",
-    "summary": "DL4 firmware_sensor_loop complete: STM32F4 rocket_fc project_id=ad62fe0e913e; fw_build PASS (ELF); Renode sensor-in-loop PASS via spi_imu_stub (climb_turn_profile fixture not in catalog; fw_sensor_scenario tool NameError).",
-    "reasoning_summary": "Entry path: ledger_get \u2192 fw_status (cmake/arm-none-eabi/renode present) \u2192 fw_new_project(stm32f4) \u2192 fw_build returncode 0 ELF \u2192 fw_sim_run spi_imu_stub passed under Renode 1.16.1. climb_turn_profile absent from fixtures; closest IMU fixture used for AC8 PASS. verify_battery waived \u2014 mechanical CAD check not applicable to firmware leaf.",
-    "waivers": [
-      {
-        "check": "verify_battery",
-        "reason": "DL4 is firmware_sensor_loop (fw_build + Renode); verify_battery is mechanical CAD solid-model health and is not in FIRMWARE ENGINEER tool surface. Mechanical leg owns verify_battery for airframe."
-      }
+  "id": "AC7",
+  "result": "PASS",
+  "check_tool": "fw_build",
+  "pass_rule": "returncode==0",
+  "detail": "returncode==0 elf_path=/tmp/AI-CAD/firmware/9b5713aea0ec/build/firmware.elf",
+  "evidence": {
+    "success": true,
+    "elf_path": "/tmp/AI-CAD/firmware/9b5713aea0ec/build/firmware.elf",
+    "map_path": "/tmp/AI-CAD/firmware/9b5713aea0ec/build/firmware.map",
+    "stderr": "-- Configuring done (0.0s)\n-- Generating done (0.0s)\n-- Build files have been written to: /tmp/AI-CAD/firmware/9b5713aea0ec/build\nninja: no work to do.\n",
+    "warnings": [],
+    "returncode": 0,
+    "cmd": [
+      "cmake",
+      "--build",
+      "/tmp/AI-CAD/firmware/9b5713aea0ec/build"
     ],
-    "outputs": {
-      "deliverable": "DL4_firmware_sensor_loop",
-      "kind": "analysis",
-      "artifacts": {
-        "project_id": "ad62fe0e913e",
-        "name": "rocket_fc",
-        "mcu_family": "stm32f4",
-        "toolchain": "cmake",
-        "elf_path": "/tmp/AI-CAD/firmware/ad62fe0e913e/build/firmware.elf",
-        "map_path": "/tmp/AI-CAD/firmware/ad62fe0e913e/build/firmware.map",
-        "trace_path": "/tmp/AI-CAD/firmware/ad62fe0e913e/build/firmware.elf.trace.json",
-        "src_paths": [
-          "src/main.c",
-          "src/startup.c",
-          "src/sensors.c",
-          "include/pinmap.h",
-          "include/sensors.h"
-        ],
-        "board_doc_ref": null
-      },
-      "acceptance": {
-        "AC7_fw_build": {
-          "status": "PASS",
-          "returncode": 0,
-          "elf_path": "/tmp/AI-CAD/firmware/ad62fe0e913e/build/firmware.elf"
-        },
-        "AC8_renode_sensor_loop": {
-          "status": "PASS",
-          "scenario_used": "spi_imu_stub",
-          "scenario_requested": "climb_turn_profile",
-          "renode": "1.16.1",
-          "passed": true,
-          "note": "climb_turn_profile not in fixture set; fw_sensor_scenario broken (_err); spi_imu_stub PASS under Renode"
-        }
-      },
-      "report_card_leg": {
-        "FIRMWARE": "PASS",
-        "RENODE_SENSOR_LOOP": "PASS (spi_imu_stub; climb_turn fixture gap noted)"
-      }
-    }
+    "ms": 24.15,
+    "source": "live"
   }
 }

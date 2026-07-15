@@ -1,0 +1,22 @@
+{
+  "state": "finished",
+  "run_id": "mega-22-fc-rocket-20260715",
+  "tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "pid": 1294005,
+  "started_wall": 1784147948.5073779,
+  "cycle": "mega-22",
+  "conservation": true,
+  "baseline_commit": "0f43d126",
+  "spend_before_usd": 0.22370784,
+  "spend_guard_usd": 8.0,
+  "finished_wall": 1784148546.3238585,
+  "wall_s": 597.82,
+  "result": {
+    "status": "error",
+    "phase": "unknown",
+    "stop_reason": "process_died_without_terminal_status",
+    "error": "primary process exited without writing mission.json (a4)",
+    "spend_guard_abort": null
+  },
+  "attempt": "a4"
+}

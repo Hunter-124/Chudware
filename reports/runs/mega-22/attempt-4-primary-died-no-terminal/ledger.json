@@ -1,0 +1,4000 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Mission mega-22-fc-rocket-20260715",
+        "summary": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": null,
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 8,
+              "worker_fan_out": 2,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "override",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "override",
+              "worker_fan_out": "override",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": [
+              "delegation depth 8 exceeds the contract §12 hard cap (3) - the runtime will still enforce the cap; the extra depth buys nothing",
+              "Maximum effort on the frontier tier runs councils, ponders and full context packs on paid tokens - expect the highest possible per-mission cost"
+            ]
+          }
+        },
+        "level": "maximum"
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T20:39:09Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "5 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\n3) SCHEMATIC — ecad_new_schematic / place / WIRE nets (ecad_connect / net tools) so the netlist has simulatable devices before SPICE.\n4) SPICE — ecad_simulate OP on the wired 3V3 front-end; measure V(3V3).\n5) PCB LAYOUT + TRACE OPT — REQUIRED chain: board_from_schematic → ecad_optimize_traces → ecad_run_drc (errors==0 or honest FAIL).\n6) ANTENNA/RF — ecad_antenna_design + analyze for 2.4 GHz IFA and GPS patch; use openEMS path when provisioned, else document honest degrade/SKIP.\n7) FIRMWARE — fw_new_project(stm32f4) + pinmap from netlist + fw_build.\n8) RENODE SENSOR-IN-THE-LOOP — climb_turn_profile → fw_sensor_scenario → fw_sim_run + fw_verify_board; SKIP honestly if Renode absent.\n9) MECHANICAL — model the rocket-plane airframe as editable CAD with verify_battery PASS: body tube ~OD 40–60mm length ≥300mm, 3–4 fins, wing/glide surface, closed payload bay volume ≥ board envelope; use sketch+extrude/revolve + fillets; avoid zero-thickness and open shells.\n10) Deliver a consolidated mission report card (PASS/WARN/FAIL/SKIP per leg) and power_budget rollup.\nUse subagent delegation freely (infinitely-branching, spawn-depth policy active) to parallelize mechanical vs ECAD vs firmware vs RF workstreams. Autonomy: auto.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "rocket_plane_airframe",
+              "description": "Boost-glide model rocket plane airframe: body, fins, wing, payload bay sized for the flight-computer board.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "airframe geometry coherent (verify_battery PASS)",
+                  "check": {
+                    "tool": "verify_battery",
+                    "params_hint": {},
+                    "pass_rule": "PASS"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "payload bay volume fits flight-computer board envelope",
+                  "check": {
+                    "tool": "measure_part",
+                    "params_hint": {
+                      "feature": "payload_bay",
+                      "bay_length": "payload_bay_length",
+                      "board_length": "fc_board_length"
+                    },
+                    "pass_rule": "bay envelope >= board outline"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL2",
+              "kind": "assembly",
+              "name": "avionics_integration",
+              "description": "Airframe + flight-computer board integration; no interference; sensor FOV / antenna keepouts respected.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC3",
+                  "text": "no solid interference between board and airframe",
+                  "check": {
+                    "tool": "check_interference",
+                    "params_hint": {},
+                    "pass_rule": "interferences empty or volume==0"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL3",
+              "kind": "analysis",
+              "name": "flight_computer_ecad",
+              "description": "Flight-computer E2E: part sourcing, schematic, SPICE OP, PCB place/route/trace-opt, antenna/RF, DRC/DFM/PDN checks.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC4",
+                  "text": "schematic + board DRC/ERC clean (errors==0)",
+                  "check": {
+                    "tool": "ecad_run_drc+ecad_run_erc",
+                    "tools": [
+                      "ecad_run_drc",
+                      "ecad_run_erc"
+                    ],
+                    "params_hint": {
+                      "legs": [
+                        "parts",
+                        "schematic",
+                        "board",
+                        "trace_opt",
+                        "checks"
+                      ]
+                    },
+                    "pass_rule": "errors==0"
+                  }
+                },
+                {
+                  "id": "AC5",
+                  "text": "SPICE OP 3V3 rail within 5%",
+                  "check": {
+                    "tool": "ecad_simulate",
+                    "params_hint": {
+                      "analysis": "op",
+                      "probes": [
+                        "V(3V3)"
+                      ],
+                      "leg": "sim"
+                    },
+                    "pass_rule": "V(3V3) in [3.135, 3.465]"
+                  }
+                },
+                {
+                  "id": "AC6",
+                  "text": "antenna design produced (openEMS or analytic degrade documented)",
+                  "check": {
+                    "tool": "ecad_antenna_analyze",
+                    "params_hint": {
+                      "kind": "ifa",
+                      "freq_hz": 2400000000.0,
+                      "leg": "antenna"
+                    },
+                    "pass_rule": "PASS|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL4",
+              "kind": "analysis",
+              "name": "firmware_sensor_loop",
+              "description": "STM32F4 firmware project from pinmap, build, Renode sensor-in-the-loop climb_turn_profile scenario.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC7",
+                  "text": "fw_build succeeds (ELF produced)",
+                  "check": {
+                    "tool": "fw_build",
+                    "params_hint": {
+                      "leg": "firmware"
+                    },
+                    "pass_rule": "returncode==0"
+                  }
+                },
+                {
+                  "id": "AC8",
+                  "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+                  "check": {
+                    "tool": "fw_sim_run",
+                    "params_hint": {
+                      "leg": "sensor_loop"
+                    },
+                    "pass_rule": "PASS|SKIP(renode)"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL5",
+              "kind": "report",
+              "name": "mission_report_card",
+              "description": "Consolidated PASS/WARN/FAIL/SKIP card for all legs + power_budget rollup.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC9",
+                  "text": "report lists every leg with a verdict",
+                  "check": {
+                    "tool": "report_card",
+                    "params_hint": {
+                      "legs": [
+                        "plan",
+                        "parts",
+                        "schematic",
+                        "sim",
+                        "board",
+                        "trace_opt",
+                        "antenna",
+                        "checks",
+                        "firmware",
+                        "sensor_loop",
+                        "power",
+                        "airframe"
+                      ]
+                    },
+                    "pass_rule": "all legs have PASS|WARN|FAIL|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL2",
+                "DL3",
+                "DL4"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "MCU family STM32F4; sensors I2C MPU6050@0x68, BMP280@0x76, LIS3MDL, UART GPS",
+              "basis": "B1 flight-computer benchmark BOM",
+              "needs_confirm": false
+            },
+            {
+              "text": "openEMS/Renode may be absent — degrade with SKIP, never fabricate results",
+              "basis": "contracts honesty rule",
+              "needs_confirm": false
+            },
+            {
+              "text": "AC2/AC4–AC9 are evidence-graded from named tools (measure_part, ecad_run_drc+erc, ecad_simulate, ecad_antenna_analyze, fw_build, fw_sim_run, report_card). Honest SKIP only with provision-absence evidence (Renode/openEMS/toolchain).",
+              "basis": "mega-11 gradeability (reports/runs/mega-10/fixes.md)",
+              "needs_confirm": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC1",
+        "text": "airframe geometry coherent (verify_battery PASS)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC2",
+        "text": "payload bay volume fits flight-computer board envelope",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL2/AC3",
+        "text": "no solid interference between board and airframe",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC4",
+        "text": "schematic + board DRC/ERC clean (errors==0)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC5",
+        "text": "SPICE OP 3V3 rail within 5%",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC6",
+        "text": "antenna design produced (openEMS or analytic degrade documented)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL4/AC7",
+        "text": "fw_build succeeds (ELF produced)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL4/AC8",
+        "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL5/AC9",
+        "text": "report lists every leg with a verdict",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T20:39:09Z",
+        "exited": "2026-07-15T20:39:09Z",
+        "exit_gate": "manifest_valid"
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-07-15T20:39:09Z",
+      "actor": "orchestrator",
+      "kind": "delegation",
+      "payload": {
+        "schema": "aicad.delegation/1",
+        "node_id": "dg_9a4b743fd1bb",
+        "role": "orchestrator",
+        "status": "approved",
+        "depth": 0,
+        "kind": "worker",
+        "model": {
+          "provider": "",
+          "id": "",
+          "tier": ""
+        },
+        "budget": {
+          "tokens_granted": 50000,
+          "tokens_spent": 0,
+          "attempts": 0
+        },
+        "note": "root node auto-approved at init"
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-07-15T20:39:17Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "intake_analyst"
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": false,
+        "n_ops": 3
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T20:39:19Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T20:39:19Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T20:39:19Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "assembly",
+        "min_rank": 4,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=4 task_class=assembly depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 21,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 22,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "multi_feature_part",
+        "min_rank": 3,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=3 task_class=multi_feature_part depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 23,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "simple_part",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=simple_part depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 24,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "analysis",
+        "min_rank": 4,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=4 task_class=analysis depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 25,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "analysis",
+        "min_rank": 4,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=4 task_class=analysis depth=0 risk=none",
+        "role": "spec_writer"
+      }
+    },
+    {
+      "seq": 26,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 27,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 28,
+      "ts": "2026-07-15T20:39:19Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 29,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_miss",
+        "errors": [
+          "leaf_envelope: require non-empty ops[] OR (no_op=true + reason)"
+        ],
+        "task_class": "simple_part",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "reply_head": "{\n  \"goal\": \"Design a Model Rocket Plane with Integrated Central Flight Computer and Avionics\",\n  \"ops\": {\n    \"ecad_new_schematic\": {},\n    \"board_from_schematic\": {},\n    \"ecad_optimize_traces\": {\n      \"errors\": true\n    },\n    \"ecad_run"
+      }
+    },
+    {
+      "seq": 30,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 31,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3377,
+        "completion_tokens": 52,
+        "total_tokens": 3543,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 32,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Requirements\\n  DL1/AC1 [open]: airframe geometry coherent (verify_battery PASS)\\n  DL1/AC2 [open]: payload bay volume fits flight-computer board envelope\\n  DL2/AC3 [open]: no solid interference between board and airframe\\n  DL3/AC4 [open]: schematic + board DRC/ERC clean (errors==0)\\n  DL3/AC5 [open]: SPICE OP 3V3 rail within 5%\\n  DL3/AC6 [open]: antenna design produced (openE…"
+      }
+    },
+    {
+      "seq": 33,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 404 - {'error': {'message': 'No endpoints found for mistralai/mistral-small:free.', 'code': 404}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+        "stop_reason": "failed",
+        "retryable": true
+      }
+    },
+    {
+      "seq": 34,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3346,
+        "completion_tokens": 49,
+        "total_tokens": 3552,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 35,
+      "ts": "2026-07-15T20:39:21Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Requirements\\n  DL1/AC1 [open]: airframe geometry coherent (verify_battery PASS)\\n  DL1/AC2 [open]: payload bay volume fits flight-computer board envelope\\n  DL2/AC3 [open]: no solid interference between board and airframe\\n  DL3/AC4 [open]: schematic + board DRC/ERC clean (errors==0)\\n  DL3/AC5 [open]: SPICE OP 3V3 rail within 5%\\n  DL3/AC6 [open]: antenna design produced (openE…"
+      }
+    },
+    {
+      "seq": 36,
+      "ts": "2026-07-15T20:39:22Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6717,
+        "completion_tokens": 56,
+        "total_tokens": 6935,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 37,
+      "ts": "2026-07-15T20:39:22Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Requirements\\n  DL1/AC1 [open]: airframe geometry coherent (verify_battery PASS)\\n  DL1/AC2 [open]: payload bay volume fits flight-computer board envelope\\n  DL2/AC3 [open]: no solid interference between board and airframe\\n  DL3/AC4 [open]: schematic + board DRC/ERC clean (errors==0)\\n  DL3/AC5 [open]: SPICE OP 3V3 rail within 5%\\n  DL3/AC6 [open]: antenna design produced (openE…"
+      }
+    },
+    {
+      "seq": 38,
+      "ts": "2026-07-15T20:39:23Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3456,
+        "completion_tokens": 55,
+        "total_tokens": 3651,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 39,
+      "ts": "2026-07-15T20:39:23Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1200
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Requirements\\n  DL1/AC1 [open]: airframe geometry coherent (verify_battery PASS)\\n  DL1/AC2 [open]: payload bay volume fits flight-computer board envelope\\n  DL2/AC3 [open]: no solid interference between board and airframe\\n  DL3/AC4 [open]: schematic + board DRC/ERC clean (errors==0)\\n  DL3/AC5 [open]: SPICE OP 3V3 rail within 5%\\n  DL3/AC6 [open]: antenna design produced (openE…"
+      }
+    },
+    {
+      "seq": 40,
+      "ts": "2026-07-15T20:39:24Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3909,
+        "completion_tokens": 143,
+        "total_tokens": 4081,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 41,
+      "ts": "2026-07-15T20:39:24Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "decisions",
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"decisions\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 42,
+      "ts": "2026-07-15T20:39:27Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4025,
+        "completion_tokens": 49,
+        "total_tokens": 4158,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 43,
+      "ts": "2026-07-15T20:39:27Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "decisions",
+          "budget_tokens": 800
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"decisions\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 44,
+      "ts": "2026-07-15T20:39:32Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4097,
+        "completion_tokens": 179,
+        "total_tokens": 4566,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 45,
+      "ts": "2026-07-15T20:39:32Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "model rocket plane airframe with integrated payload bay for flight computer PCB mounting",
+          "material": "PLA or PETG or light plywood/composite",
+          "quantity": 1
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"fdm\",\n  \"confidence\": 0.9,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [\n    \"process FDM/PLA assumed (default)\"\n  ],\n  \"why\": \"explicit plastic material with no non-FDM cues\"\n}"
+      }
+    },
+    {
+      "seq": 46,
+      "ts": "2026-07-15T20:39:40Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4122,
+        "completion_tokens": 92,
+        "total_tokens": 4765,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 47,
+      "ts": "2026-07-15T20:39:40Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "2-layer FR4 PCB for model rocket flight computer with STM32F4, sensors, GPS, 3V3 buck; small production prototype quantity",
+          "material": "FR4",
+          "quantity": 5
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"fdm\",\n  \"confidence\": 0.86,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [\n    \"process FDM/PLA assumed (default)\"\n  ],\n  \"why\": \"no non-FDM cues; FDM is the default prior\"\n}"
+      }
+    },
+    {
+      "seq": 48,
+      "ts": "2026-07-15T20:39:40Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7287,
+        "completion_tokens": 2048,
+        "total_tokens": 9513,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 49,
+      "ts": "2026-07-15T20:39:40Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fw_status",
+        "args": {},
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"tools\": {\n    \"cmake\": {\n      \"found\": true,\n      \"path\": \"/usr/bin/cmake\",\n      \"version\": \"4.3.0\",\n      \"install_hint\": \"Install CMake: `sudo dnf install cmake` (or `sudo apt install cmake`).\",\n      \"unlocks\": [\n        \"build:cortex-m\"\n      ]\n    },\n    \"ninja\": {\n      \"found\": true,\n      \"path\": \"/usr/bin/ninja\",\n      \"version\": \"1.13.2\",\n      \"install_hint\": \"Install Ninja: `sudo dnf install ninja-build` (or `sudo apt install ninja-build`).\",\n      \"unlocks\": [\n        \"build:cortex-m (faster generator; optional)\"\n      ]\n    },\n    \"arm-none-eabi-gcc\": {\n      \"found\": true,\n      \"path\": \"/usr/lib64/ccache/arm-none-eabi-gcc\",\n      \"version\": \"15.2.0-4.fc44\",\n      \"install_hint\": \"Install the ARM cross-toolchain: `sudo dnf install arm-none-eabi-gcc-cs arm-none-eabi-newlib` (or `sudo apt install gcc-arm-none-eabi`).\",\n      \"unlocks\": [\n        \"build:cortex-m\"\n      ]\n    },\n    \"renode\": {\n      \"found\": true,\n      \"path\": \"/home/hunter/.local/bin…"
+      }
+    },
+    {
+      "seq": 50,
+      "ts": "2026-07-15T20:39:42Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4317,
+        "completion_tokens": 82,
+        "total_tokens": 4428,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 51,
+      "ts": "2026-07-15T20:39:42Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "fabricate 2-layer FR4 printed circuit board (PCB) with SMT assembly, HASL finish, for avionics flight computer prototype",
+          "material": "FR4",
+          "quantity": 5
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"fdm\",\n  \"confidence\": 0.95,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [],\n  \"why\": \"explicit 'fdm' process cue in the request\"\n}"
+      }
+    },
+    {
+      "seq": 52,
+      "ts": "2026-07-15T20:39:44Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3943,
+        "completion_tokens": 2048,
+        "total_tokens": 6436,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 53,
+      "ts": "2026-07-15T20:39:44Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "resolve_process",
+        "args": {
+          "request": "model rocket plane boost-glide airframe body tube fins wing payload bay, hobby scale single prototype, light weight rigid structure",
+          "material": "PLA",
+          "quantity": 1
+        },
+        "ok": true,
+        "result": "{\n  \"chosen\": \"fdm\",\n  \"confidence\": 0.9,\n  \"runner_up\": null,\n  \"ambiguous\": false,\n  \"must_block\": false,\n  \"clarification\": null,\n  \"assumptions\": [\n    \"process FDM/PLA assumed (default)\"\n  ],\n  \"why\": \"explicit plastic material with no non-FDM cues\"\n}"
+      }
+    },
+    {
+      "seq": 54,
+      "ts": "2026-07-15T20:39:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4376,
+        "completion_tokens": 186,
+        "total_tokens": 4591,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 55,
+      "ts": "2026-07-15T20:39:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "PLA"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": \"PLA plastic (plastic): E_mpa=3500, yield_mpa=50, ultimate_mpa=50, density_g_cm3=1.24\",\n  \"units\": null,\n  \"source_url\": null,\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T20:39:44Z\",\n  \"confidence\": \"bundled\",\n  \"cached\": false,\n  \"material\": \"pla\",\n  \"properties\": {\n    \"E_mpa\": 3500,\n    \"nu\": 0.36,\n    \"density_g_cm3\": 1.24,\n    \"yield_mpa\": 50,\n    \"ultimate_mpa\": 50,\n    \"endurance_mpa\": 18\n  },\n  \"provenance\": {\n    \"source\": \"Manufacturer public datasheet nominal (first-party compilation)\",\n    \"source_type\": \"first_party\",\n    \"license\": \"first-party compilation\",\n    \"url\": null\n  },\n  \"citation\": \"Manufacturer public datasheet nominal (first-party compilation)\"\n}"
+      }
+    },
+    {
+      "seq": 56,
+      "ts": "2026-07-15T20:39:48Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4485,
+        "completion_tokens": 52,
+        "total_tokens": 4755,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 57,
+      "ts": "2026-07-15T20:39:49Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "FR4"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": null,\n  \"units\": null,\n  \"source_url\": \"https://sqpcb.com/fr4-material-datasheet/\",\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T20:39:49Z\",\n  \"confidence\": \"limited\",\n  \"cached\": false,\n  \"query\": \"FR4 material mechanical properties\",\n  \"provider\": \"ddg\",\n  \"results\": [\n    {\n      \"title\": \"FR4 Material Datasheet: Properties, Applications, and Specifications\",\n      \"url\": \"https://sqpcb.com/fr4-material-datasheet/\",\n      \"snippet\": \"Explore FR4 material Datasheet, its electrical, thermal, and mechanical properties, and why it's the industry standard for PCB manufacturing. Learn about high-Tg, halogen-free FR4, applications in electronics, automotive, aerospace, and best practices for PCB design.\"\n    },\n    {\n      \"title\": \"FR4 Properties & Datasheet \\u2014 Mechanical, Thermal, Electrical\",\n      \"url\": \"https://www.readyplastics.com/resources/materials/fr4/properties\",\n      \"snippet\": \"FR4 Properties & Datasheet \\u2014 Mechanical, Thermal, Electrical …"
+      }
+    },
+    {
+      "seq": 58,
+      "ts": "2026-07-15T20:40:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6091,
+        "completion_tokens": 2048,
+        "total_tokens": 8173,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 59,
+      "ts": "2026-07-15T20:40:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "PLA"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": \"PLA plastic (plastic): E_mpa=3500, yield_mpa=50, ultimate_mpa=50, density_g_cm3=1.24\",\n  \"units\": null,\n  \"source_url\": null,\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T20:40:00Z\",\n  \"confidence\": \"bundled\",\n  \"cached\": false,\n  \"material\": \"pla\",\n  \"properties\": {\n    \"E_mpa\": 3500,\n    \"nu\": 0.36,\n    \"density_g_cm3\": 1.24,\n    \"yield_mpa\": 50,\n    \"ultimate_mpa\": 50,\n    \"endurance_mpa\": 18\n  },\n  \"provenance\": {\n    \"source\": \"Manufacturer public datasheet nominal (first-party compilation)\",\n    \"source_type\": \"first_party\",\n    \"license\": \"first-party compilation\",\n    \"url\": null\n  },\n  \"citation\": \"Manufacturer public datasheet nominal (first-party compilation)\"\n}"
+      }
+    },
+    {
+      "seq": 60,
+      "ts": "2026-07-15T20:40:01Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4839,
+        "completion_tokens": 311,
+        "total_tokens": 5740,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 61,
+      "ts": "2026-07-15T20:40:02Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5059,
+        "completion_tokens": 59,
+        "total_tokens": 5151,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 62,
+      "ts": "2026-07-15T20:40:02Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "standoff M3",
+          "limit": 15,
+          "domain": "fastener"
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 6, \"has_live\": false, \"results\": [{\"part_id\": \"fastener:ISO 7089:M3\", \"title\": \"Flat Washer M3 flat washer washer\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 4032:M3\", \"title\": \"Hex Nut M3 hex nut nut\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 4017:M3\", \"title\": \"Hex Head Bolt M3 hex head bolt hex bolt hhcs hex head\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M3\", \"title\": \"Button Head Cap Screw M3 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 10642:M3\", \"title\": \"Flat Head Cap Screw M3 flat head cap screw flat head fhcs countersunk\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"faste…"
+      }
+    },
+    {
+      "seq": 63,
+      "ts": "2026-07-15T20:40:03Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "research_material_lookup",
+        "args": {
+          "material": "FR4",
+          "property": "thickness dielectric constant Tg"
+        },
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"answer\": null,\n  \"units\": null,\n  \"source_url\": \"https://resources.altium.com/p/fr4\",\n  \"quote\": null,\n  \"fetched_ts\": \"2026-07-15T20:40:03Z\",\n  \"confidence\": \"limited\",\n  \"cached\": false,\n  \"query\": \"FR4 thickness dielectric constant Tg\",\n  \"provider\": \"ddg\",\n  \"results\": [\n    {\n      \"title\": \"FR4 Dielectric Constant and Material Properties - Altium\",\n      \"url\": \"https://resources.altium.com/p/fr4\",\n      \"snippet\": \"The dielectric constant of FR4 ranges from 3.8 to 4.8, depending on the glass weave style, thickness, resin content, and copper foil roughness. In addition to the dielectric constant of FR4 materials, the arrangement of traces and planes on a PCB laminate determine the effective dielectric constant for signals traveling in an interconnect.\"\n    },\n    {\n      \"title\": \"FR-4 PCB Material Guide: The Complete Engineer's Handbook to Tg, Dk, Df ...\",\n      \"url\": \"https://pcbsync.com/fr-4-pcb-material-guide/\",\n      \"snippet\": \"Explore the ultimate engin…"
+      }
+    },
+    {
+      "seq": 64,
+      "ts": "2026-07-15T20:40:04Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10030,
+        "completion_tokens": 2048,
+        "total_tokens": 12415,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 65,
+      "ts": "2026-07-15T20:40:04Z",
+      "actor": "agent",
+      "kind": "decision",
+      "payload": {
+        "name": "fw_mcu_target",
+        "value": "STM32F4-class (Cortex-M4F)",
+        "driver": "Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4",
+        "provenance": "mission_brief + fw_status",
+        "needs_confirm": false,
+        "id": "fw_mcu_target",
+        "stage": "verify",
+        "text": "STM32F4-class (Cortex-M4F)",
+        "rationale": "Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4"
+      }
+    },
+    {
+      "seq": 66,
+      "ts": "2026-07-15T20:40:04Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "decision",
+          "payload": {
+            "name": "fw_mcu_target",
+            "value": "STM32F4-class (Cortex-M4F)",
+            "driver": "Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4",
+            "provenance": "mission_brief + fw_status",
+            "needs_confirm": false
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 65, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"decision\", \"ts\": \"2026-07-15T20:40:04Z\"}"
+      }
+    },
+    {
+      "seq": 67,
+      "ts": "2026-07-15T20:40:06Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5686,
+        "completion_tokens": 63,
+        "total_tokens": 5778,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 68,
+      "ts": "2026-07-15T20:40:06Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "STM32F4 microcontroller",
+          "domain": "electronics",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"STM32F4 microcontroller\", \"domain\": \"electronics\", \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 69,
+      "ts": "2026-07-15T20:40:20Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8416,
+        "completion_tokens": 2048,
+        "total_tokens": 10555,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 70,
+      "ts": "2026-07-15T20:40:20Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "recommend_fit",
+        "args": {
+          "function": "locational clearance for removable bay cover on cylindrical rocket body tube"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"recommend_fit\",\n  \"answer\": [\n    {\n      \"id\": \"location_clearance\",\n      \"recommended_classes\": [\n        \"H7/h6\",\n        \"H6/h5\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Precise location with minimum clearance. Allows assembly/disassembly without press.\",\n      \"applications\": [\n        \"hubs on shafts\",\n        \"precision locating pins\",\n        \"gauges\",\n        \"master gears\"\n      ],\n      \"notes\": \"Tightest reliable clearance. H7/h6 is the most common precision-location class.\",\n      \"typical_clearance_range_um\": [\n        0,\n        21\n      ]\n    }\n  ],\n  \"units\": null,\n  \"equation\": \"keyword match against fit_recommendations.json\",\n  \"inputs\": {\n    \"function\": \"locational clearance for removable bay cover on cylindrical rocket body tube\"\n  },\n  \"source\": {\n    \"kind\": \"table\",\n    \"citation\": \"ISO 286-2:2010; Shigley's Mechanical Engineering Design 10th ed.\"\n  },\n  \"notes\": [\n    \"Matched 1 fit cl…"
+      }
+    },
+    {
+      "seq": 71,
+      "ts": "2026-07-15T20:40:22Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5852,
+        "completion_tokens": 49,
+        "total_tokens": 5934,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 72,
+      "ts": "2026-07-15T20:40:26Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "STM32",
+          "limit": 15
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [{\"site\": \"amazon\", \"reason\": \"timeout\", \"hint\": \"live vendor 'amazon' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"3dcontentcentral\", \"reason\": \"timeout\", \"hint\": \"live vendor '3dcontentcentral' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"digikey\", \"reason\": \"timeout\", \"hint\": \"live vendor 'digikey' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"grabcad\", \"reason\": \"timeout\", \"hint\": \"live vendor 'grabcad' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"jlcpcb\", \"reason\": \"timeout\", \"hint\": \"live vendor 'jlcpcb' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"lcsc\", \"reason\": \"timeout\", \"hint\": \"live vendor 'lcsc' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"mcmaster\", \"reason\": \"timeout\", \"hint\": \"live vendor 'mcmaster' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"misumi\", \"reason\": \"timeout\", \"hint\": \"live vend…"
+      }
+    },
+    {
+      "seq": 73,
+      "ts": "2026-07-15T20:40:33Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 12145,
+        "completion_tokens": 2048,
+        "total_tokens": 14569,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 74,
+      "ts": "2026-07-15T20:40:33Z",
+      "actor": "agent",
+      "kind": "decision",
+      "payload": {
+        "name": "fw_sensor_bus_architecture",
+        "value": "I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug",
+        "driver": "Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all",
+        "provenance": "mission_brief sensor list (MPU6050, BMP280, LIS3MDL, NEO-6M)",
+        "needs_confirm": false,
+        "id": "fw_sensor_bus_architecture",
+        "stage": "verify",
+        "text": "I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug",
+        "rationale": "Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all"
+      }
+    },
+    {
+      "seq": 75,
+      "ts": "2026-07-15T20:40:33Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "decision",
+          "payload": {
+            "name": "fw_sensor_bus_architecture",
+            "value": "I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug",
+            "driver": "Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all",
+            "provenance": "mission_brief sensor list (MPU6050, BMP280, LIS3MDL, NEO-6M)",
+            "needs_confirm": false
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 74, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"decision\", \"ts\": \"2026-07-15T20:40:33Z\"}"
+      }
+    },
+    {
+      "seq": 76,
+      "ts": "2026-07-15T20:40:36Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6626,
+        "completion_tokens": 40,
+        "total_tokens": 6728,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 77,
+      "ts": "2026-07-15T20:40:36Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "em_status",
+        "args": {},
+        "ok": true,
+        "result": "{\n  \"ok\": true,\n  \"warnings\": [],\n  \"hint\": \"Call em_eigenmode(standard='WR-90') for a validated TE10 cutoff, or em_driven(standard='WR-90', length_mm=50) for analytic S-params.\",\n  \"next_actions\": [\n    \"em_eigenmode(standard='WR-90', n_modes=3)\",\n    \"em_driven(standard='WR-90', length_mm=50, n_freq=21)\",\n    \"em_timedomain(standard='WR-90', length_mm=80)\"\n  ],\n  \"solvers\": [\n    {\n      \"name\": \"openems\",\n      \"kind\": \"fdtd\",\n      \"license\": \"GPLv3 (python module in separate sim-worker process; never linked into core)\",\n      \"linkage\": \"python-module\",\n      \"capabilities\": [\n        \"driven\",\n        \"timedomain\"\n      ],\n      \"installed\": true,\n      \"version\": \"0.37.0\",\n      \"detail\": \"openEMS + CSXCAD python modules importable\",\n      \"install\": \"no PyPI wheel \\u2014 build from source: https://docs.openems.de/install (Fedora: dnf install cmake gcc-c++ tinyxml-devel hdf5-devel vtk-devel boost-devel CGAL-devel, then `pip install .` in CSXCAD/python and openEMS/python), or use…"
+      }
+    },
+    {
+      "seq": 78,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5631,
+        "completion_tokens": 856,
+        "total_tokens": 8945,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 79,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 3.2,
+          "fit": "H11/h11"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.073\n    ],\n    \"shaft\": [\n      -0.073,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.146\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      3.2,\n      3.273\n    ],\n    \"shaft_absolute\": [\n      3.127,\n      3.2\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=3.2mm, H11/h11\",\n  \"inputs\": {\n    \"nominal\": 3.2,\n    \"fit\": \"H11/h11\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 80,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.073",
+        "rationale": "fit_calc → clearance 0.073",
+        "actor": "SPECIFY DL2: avionics_integration",
+        "ts": "2026-07-15T20:40:38Z"
+      }
+    },
+    {
+      "seq": 81,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.073",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.073,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 82,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10792,
+        "completion_tokens": 2048,
+        "total_tokens": 12886,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 83,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 46,
+          "fit": "H7/h6"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.025\n    ],\n    \"shaft\": [\n      -0.016,\n      0.0\n    ],\n    \"clearance\": [\n      0.0,\n      0.041\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      46.0,\n      46.025\n    ],\n    \"shaft_absolute\": [\n      45.984,\n      46.0\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=46mm, H7/h6\",\n  \"inputs\": {\n    \"nominal\": 46,\n    \"fit\": \"H7/h6\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 84,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.0205",
+        "rationale": "fit_calc → clearance 0.0205",
+        "actor": "SPECIFY DL1: rocket_plane_airframe",
+        "ts": "2026-07-15T20:40:38Z"
+      }
+    },
+    {
+      "seq": 85,
+      "ts": "2026-07-15T20:40:38Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.0205",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.0205,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 86,
+      "ts": "2026-07-15T20:40:44Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7304,
+        "completion_tokens": 63,
+        "total_tokens": 7678,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 87,
+      "ts": "2026-07-15T20:40:44Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "MPU6050",
+          "limit": 10,
+          "in_stock": false
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 1, \"has_live\": false, \"results\": [{\"part_id\": \"ecad:Sensor_Motion:MPU6050\", \"title\": \"MPU6050 KiCad symbol (25 pins) \\u2014 MPU-6050 class 6-axis IMU (accel+gyro, I2C+SPI, QFN-24)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Sensor_Motion:MPU6050\", \"score\": null}], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"MPU6050\", \"domain\": null, \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 88,
+      "ts": "2026-07-15T20:40:58Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 14260,
+        "completion_tokens": 2048,
+        "total_tokens": 16461,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 89,
+      "ts": "2026-07-15T20:40:58Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 90,
+      "ts": "2026-07-15T20:40:58Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 91,
+      "ts": "2026-07-15T20:40:58Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 92,
+      "ts": "2026-07-15T20:41:00Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7561,
+        "completion_tokens": 46,
+        "total_tokens": 7620,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 93,
+      "ts": "2026-07-15T20:41:00Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "BMP280",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 2, \"has_live\": false, \"results\": [{\"part_id\": \"ecad:Sensor_Pressure:BMP280\", \"title\": \"BMP280 KiCad symbol (8 pins) \\u2014 BMP280 class barometric pressure sensor (I2C/SPI, LGA-8)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Sensor_Pressure:BMP280\", \"score\": null}, {\"part_id\": \"ecad:Package_LGA:LGA-8_2x2.5mm\", \"title\": \"Package_LGA:LGA-8_2x2.5mm KiCad footprint \\u2014 LGA-8 2.0x2.5 mm (BMP280-class)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Package_LGA:LGA-8_2x2.5mm\", \"score\": null}], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"BMP280\", \"domain\": null, \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 94,
+      "ts": "2026-07-15T20:41:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 13103,
+        "completion_tokens": 2048,
+        "total_tokens": 15282,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 95,
+      "ts": "2026-07-15T20:41:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "recommend_fit",
+        "args": {
+          "function": "loose running clearance for easy assembly of plastic parts"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"recommend_fit\",\n  \"answer\": [\n    {\n      \"id\": \"easy_running\",\n      \"recommended_classes\": [\n        \"H9/f9\",\n        \"H8/f7\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Moderate clearance for rotating parts that need lubrication. Good general-purpose running fit.\",\n      \"applications\": [\n        \"general shaft bearings\",\n        \"journal bearings\",\n        \"gear shafts\",\n        \"pump shafts\"\n      ],\n      \"notes\": \"H8/f7 is widely used for precision running fits. Requires lubrication.\",\n      \"typical_clearance_range_um\": [\n        10,\n        100\n      ]\n    },\n    {\n      \"id\": \"free_running\",\n      \"recommended_classes\": [\n        \"H11/d11\",\n        \"H9/d9\"\n      ],\n      \"character\": \"clearance\",\n      \"rationale\": \"Large clearance for freely rotating parts in poor alignment or temperature variation. Not intended for precision bearing surfaces.\",\n      \"applications\": [\n        \"loose pulleys\",\n        \"a…"
+      }
+    },
+    {
+      "seq": 96,
+      "ts": "2026-07-15T20:41:02Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7905,
+        "completion_tokens": 30,
+        "total_tokens": 7943,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 97,
+      "ts": "2026-07-15T20:41:02Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "LIS3MDL",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 2, \"has_live\": false, \"results\": [{\"part_id\": \"ecad:Sensor_Magnetic:LIS3MDL\", \"title\": \"LIS3MDL KiCad symbol (12 pins) \\u2014 LIS3MDL class 3-axis magnetometer (I2C/SPI, LGA-12)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Sensor_Magnetic:LIS3MDL\", \"score\": null}, {\"part_id\": \"ecad:Package_LGA:LGA-12_2x2mm\", \"title\": \"Package_LGA:LGA-12_2x2mm KiCad footprint \\u2014 LGA-12 2x2 mm (LIS3MDL-class magnetometer)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Package_LGA:LGA-12_2x2mm\", \"score\": null}], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"LIS3MDL\", \"domain\": null, \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 98,
+      "ts": "2026-07-15T20:41:04Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8233,
+        "completion_tokens": 33,
+        "total_tokens": 8289,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 99,
+      "ts": "2026-07-15T20:41:04Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "NEO-6M GPS",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 2, \"has_live\": false, \"results\": [{\"part_id\": \"ecad:RF_Module:GPS_Castellated_1x6\", \"title\": \"RF_Module:GPS_Castellated_1x6 KiCad footprint \\u2014 Castellated GNSS/GPS module 1x6 edge pads\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"RF_Module:GPS_Castellated_1x6\", \"score\": null}, {\"part_id\": \"ecad:RF_GPS:NEO6M\", \"title\": \"NEO6M KiCad symbol (6 pins) \\u2014 GNSS/GPS UART module (castellated breakout class)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"RF_GPS:NEO6M\", \"score\": null}], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"NEO-6M GPS\", \"domain\": null, \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 100,
+      "ts": "2026-07-15T20:41:06Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 6754,
+        "completion_tokens": 2048,
+        "total_tokens": 9420,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 101,
+      "ts": "2026-07-15T20:41:06Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "body_tube_od",
+        "value": "Ø50 ±0.5 mm",
+        "driver": "mission OD 40–60 mm; mid-range for board 35 mm width + walls + clearance",
+        "provenance": "mission brief body tube ~OD 40-60mm; design choice mid-range",
+        "id": "body_tube_od"
+      }
+    },
+    {
+      "seq": 102,
+      "ts": "2026-07-15T20:41:06Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "body_tube_od",
+            "value": "Ø50 ±0.5 mm",
+            "driver": "mission OD 40–60 mm; mid-range for board 35 mm width + walls + clearance",
+            "provenance": "mission brief body tube ~OD 40-60mm; design choice mid-range"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 101, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T20:41:06Z\"}"
+      }
+    },
+    {
+      "seq": 103,
+      "ts": "2026-07-15T20:41:16Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 15722,
+        "completion_tokens": 2048,
+        "total_tokens": 17818,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 104,
+      "ts": "2026-07-15T20:41:16Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "fit_calc",
+        "args": {
+          "nominal": 46,
+          "fit": "H11/d11"
+        },
+        "ok": true,
+        "result": "{\n  \"schema\": \"aicad.calc/1\",\n  \"ok\": true,\n  \"calc\": \"fit_calc\",\n  \"answer\": {\n    \"hole\": [\n      0.0,\n      0.156\n    ],\n    \"shaft\": [\n      -0.236,\n      -0.08\n    ],\n    \"clearance\": [\n      0.08,\n      0.392\n    ],\n    \"fit_character\": \"clearance\",\n    \"hole_absolute\": [\n      46.0,\n      46.156\n    ],\n    \"shaft_absolute\": [\n      45.764,\n      45.92\n    ]\n  },\n  \"units\": \"mm\",\n  \"equation\": \"ISO 286-2, nominal=46mm, H11/d11\",\n  \"inputs\": {\n    \"nominal\": 46,\n    \"fit\": \"H11/d11\"\n  },\n  \"source\": {\n    \"kind\": \"closed_form\",\n    \"citation\": \"ISO 286-2:2010\"\n  },\n  \"notes\": []\n}"
+      }
+    },
+    {
+      "seq": 105,
+      "ts": "2026-07-15T20:41:16Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.23600000000000002",
+        "rationale": "fit_calc → clearance 0.23600000000000002",
+        "actor": "SPECIFY DL1: rocket_plane_airframe",
+        "ts": "2026-07-15T20:41:16Z"
+      }
+    },
+    {
+      "seq": 106,
+      "ts": "2026-07-15T20:41:16Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "decision",
+      "payload": {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.23600000000000002",
+        "rationale": "fit_calc mean/interval clearance",
+        "clearance": 0.23600000000000002,
+        "source_tool": "fit_calc"
+      }
+    },
+    {
+      "seq": 107,
+      "ts": "2026-07-15T20:41:26Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8869,
+        "completion_tokens": 2048,
+        "total_tokens": 10957,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 108,
+      "ts": "2026-07-15T20:41:26Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "interference_min_gap",
+        "value": "≥ 0.5 mm designed gap all solid-solid board-to-airframe pairs after mate",
+        "driver": "AC3 no solid interference; FDM tolerance buffer beyond zero-touch",
+        "provenance": "AC3 check_interference pass rule interferences empty or volume==0",
+        "id": "interference_min_gap"
+      }
+    },
+    {
+      "seq": 109,
+      "ts": "2026-07-15T20:41:26Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "interference_min_gap",
+            "value": "≥ 0.5 mm designed gap all solid-solid board-to-airframe pairs after mate",
+            "driver": "AC3 no solid interference; FDM tolerance buffer beyond zero-touch",
+            "provenance": "AC3 check_interference pass rule interferences empty or volume==0"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 108, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T20:41:26Z\"}"
+      }
+    },
+    {
+      "seq": 110,
+      "ts": "2026-07-15T20:41:31Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 18033,
+        "completion_tokens": 2048,
+        "total_tokens": 20246,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 111,
+      "ts": "2026-07-15T20:41:31Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "body_tube_OD",
+        "value": "50 mm ±0.5 (FDM)",
+        "driver": "AC body OD 40–60 mm mid-range for stability and bay width",
+        "provenance": "mission AC range midpoint",
+        "id": "body_tube_OD"
+      }
+    },
+    {
+      "seq": 112,
+      "ts": "2026-07-15T20:41:31Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "body_tube_OD",
+            "value": "50 mm ±0.5 (FDM)",
+            "driver": "AC body OD 40–60 mm mid-range for stability and bay width",
+            "provenance": "mission AC range midpoint"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 111, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T20:41:31Z\"}"
+      }
+    },
+    {
+      "seq": 113,
+      "ts": "2026-07-15T20:41:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10984,
+        "completion_tokens": 2048,
+        "total_tokens": 13082,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 114,
+      "ts": "2026-07-15T20:41:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 115,
+      "ts": "2026-07-15T20:41:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 116,
+      "ts": "2026-07-15T20:41:44Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 117,
+      "ts": "2026-07-15T20:41:46Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 20148,
+        "completion_tokens": 2048,
+        "total_tokens": 22223,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 118,
+      "ts": "2026-07-15T20:41:46Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "M3 heat set insert",
+          "limit": 5
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 5, \"has_live\": false, \"results\": [{\"part_id\": \"fastener:ISO 7089:M3\", \"title\": \"Flat Washer M3 flat washer washer\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 4032:M3\", \"title\": \"Hex Nut M3 hex nut nut\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 4017:M3\", \"title\": \"Hex Head Bolt M3 hex head bolt hex bolt hhcs hex head\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M3\", \"title\": \"Button Head Cap Screw M3 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"ecad:MountingHole:MountingHole_3.2mm_M3\", \"title\": \"MountingHole:MountingHole_3.2mm_M3 KiCad footprint \\u2014 Mounting hole 3.2 mm for M3 screw (NPTH, no copper)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"…"
+      }
+    },
+    {
+      "seq": 119,
+      "ts": "2026-07-15T20:42:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 22656,
+        "completion_tokens": 2048,
+        "total_tokens": 24742,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 120,
+      "ts": "2026-07-15T20:42:00Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "button head cap screw M3",
+          "domain": "fastener",
+          "limit": 5
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 5, \"has_live\": false, \"results\": [{\"part_id\": \"fastener:ISO 7380:M3\", \"title\": \"Button Head Cap Screw M3 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M3\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M2\", \"title\": \"Button Head Cap Screw M2 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M2\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M4\", \"title\": \"Button Head Cap Screw M4 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M4\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M5\", \"title\": \"Button Head Cap Screw M5 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": \"\", \"price\": null, \"designation\": \"M5\", \"score\": null}, {\"part_id\": \"fastener:ISO 7380:M6\", \"title\": \"Button Head Cap Screw M6 button head cap screw button head bhcs\", \"domain\": \"fastener\", \"vendor\": …"
+      }
+    },
+    {
+      "seq": 121,
+      "ts": "2026-07-15T20:42:14Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 25133,
+        "completion_tokens": 2048,
+        "total_tokens": 27415,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 122,
+      "ts": "2026-07-15T20:42:14Z",
+      "actor": "agent",
+      "kind": "decision",
+      "payload": {
+        "name": "board_fastener_primary",
+        "value": "fastener:ISO 7380:M3 (BHCS) + fastener:ISO 4032:M3 (hex nut) + fastener:ISO 7089:M3 (washer)",
+        "driver": "library-resolved M3 board mount hardware; heat-set insert not in library — use nut traps in printed bosses",
+        "provenance": "part_search ISO 7380:M3, ISO 4032:M3, ISO 7089:M3",
+        "needs_confirm": false,
+        "id": "board_fastener_primary",
+        "stage": "verify",
+        "text": "fastener:ISO 7380:M3 (BHCS) + fastener:ISO 4032:M3 (hex nut) + fastener:ISO 7089:M3 (washer)",
+        "rationale": "library-resolved M3 board mount hardware; heat-set insert not in library — use nut traps in printed bosses"
+      }
+    },
+    {
+      "seq": 123,
+      "ts": "2026-07-15T20:42:14Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "decision",
+          "payload": {
+            "name": "board_fastener_primary",
+            "value": "fastener:ISO 7380:M3 (BHCS) + fastener:ISO 4032:M3 (hex nut) + fastener:ISO 7089:M3 (washer)",
+            "driver": "library-resolved M3 board mount hardware; heat-set insert not in library — use nut traps in printed bosses",
+            "provenance": "part_search ISO 7380:M3, ISO 4032:M3, ISO 7089:M3",
+            "needs_confirm": false
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 122, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"decision\", \"ts\": \"2026-07-15T20:42:14Z\"}"
+      }
+    },
+    {
+      "seq": 124,
+      "ts": "2026-07-15T20:42:14Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 8553,
+        "completion_tokens": 2048,
+        "total_tokens": 14022,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 125,
+      "ts": "2026-07-15T20:42:18Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "STM32F405",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [{\"site\": \"\", \"reason\": \"profile_busy\", \"hint\": \"site profile 'onlinemetals' is open in the embedded browser \\u2014 close that session (or finish the login wizard) and retry\"}, {\"site\": \"amazon\", \"reason\": \"timeout\", \"hint\": \"live vendor 'amazon' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"3dcontentcentral\", \"reason\": \"timeout\", \"hint\": \"live vendor '3dcontentcentral' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"digikey\", \"reason\": \"timeout\", \"hint\": \"live vendor 'digikey' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"grabcad\", \"reason\": \"timeout\", \"hint\": \"live vendor 'grabcad' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"jlcpcb\", \"reason\": \"timeout\", \"hint\": \"live vendor 'jlcpcb' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\": \"lcsc\", \"reason\": \"timeout\", \"hint\": \"live vendor 'lcsc' exceeded 4s budget (AI_CAD_PARTS_LIVE_BUDGET_S)\"}, {\"site\"…"
+      }
+    },
+    {
+      "seq": 126,
+      "ts": "2026-07-15T20:42:21Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 11276,
+        "completion_tokens": 55,
+        "total_tokens": 11390,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 127,
+      "ts": "2026-07-15T20:42:22Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "STM32F405",
+          "domain": "ecad",
+          "limit": 10
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 0, \"has_live\": false, \"results\": [], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"STM32F405\", \"domain\": \"ecad\", \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 128,
+      "ts": "2026-07-15T20:42:24Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 11434,
+        "completion_tokens": 35,
+        "total_tokens": 11502,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 129,
+      "ts": "2026-07-15T20:42:24Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "part_search",
+        "args": {
+          "query": "MCU",
+          "domain": "ecad",
+          "limit": 20
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"count\": 2, \"has_live\": false, \"results\": [{\"part_id\": \"ecad:MCU:Generic_QFP48\", \"title\": \"Generic_QFP48 KiCad symbol (48 pins) \\u2014 Generic 48-pin MCU (QFP-48 / STM32F0-class simplified)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"MCU:Generic_QFP48\", \"score\": null}, {\"part_id\": \"ecad:Device:Crystal_HSE\", \"title\": \"Crystal_HSE KiCad symbol (2 pins) \\u2014 HSE high-speed crystal (2-pin, MCU external clock)\", \"domain\": \"ecad\", \"vendor\": \"\", \"price\": null, \"designation\": \"Device:Crystal_HSE\", \"score\": null}], \"notices\": [], \"facet_summary\": {}, \"applied\": {\"query\": \"MCU\", \"domain\": \"ecad\", \"category_id\": \"\", \"facets\": {}, \"price_max\": 0.0, \"vendors\": [], \"in_stock\": false, \"sites\": []}}"
+      }
+    },
+    {
+      "seq": 130,
+      "ts": "2026-07-15T20:42:26Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 11742,
+        "completion_tokens": 57,
+        "total_tokens": 11864,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 131,
+      "ts": "2026-07-15T20:42:27Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 27248,
+        "completion_tokens": 2048,
+        "total_tokens": 29334,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 132,
+      "ts": "2026-07-15T20:42:27Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "fillet_min_external",
+        "value": "1.0 mm min on external edges where printable",
+        "driver": "FDM stress relief; avoid zero-thickness edges",
+        "provenance": "FDM DFM / AC avoid zero-thickness",
+        "id": "fillet_min_external"
+      }
+    },
+    {
+      "seq": 133,
+      "ts": "2026-07-15T20:42:27Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "fillet_min_external",
+            "value": "1.0 mm min on external edges where printable",
+            "driver": "FDM stress relief; avoid zero-thickness edges",
+            "provenance": "FDM DFM / AC avoid zero-thickness"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 132, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T20:42:27Z\"}"
+      }
+    },
+    {
+      "seq": 134,
+      "ts": "2026-07-15T20:42:41Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 29363,
+        "completion_tokens": 2048,
+        "total_tokens": 31453,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 135,
+      "ts": "2026-07-15T20:42:41Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1200
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Dimensions\\n  body_tube_OD body_tube_OD: 50 mm \\u00b10.5 (FDM)  [?]\\n    driver: AC body OD 40\\u201360 mm mid-range for stability and bay width\\n  body_tube_od body_tube_od: \\u00d850 \\u00b10.5 mm  [?]\\n    driver: mission OD 40\\u201360 mm; mid-range for board 35 mm width + walls + clearance\\n  fillet_min_external fillet_min_external: 1.0 mm min on external edges where printable  …"
+      }
+    },
+    {
+      "seq": 136,
+      "ts": "2026-07-15T20:42:55Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 32105,
+        "completion_tokens": 2048,
+        "total_tokens": 34227,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 137,
+      "ts": "2026-07-15T20:42:55Z",
+      "actor": "agent",
+      "kind": "dimension",
+      "payload": {
+        "name": "body_tube_length",
+        "value": "320 mm ±1 (FDM)",
+        "driver": "AC length ≥300 mm; bay + fin can + CG margin",
+        "provenance": "mission AC + 20 mm design margin",
+        "id": "body_tube_length"
+      }
+    },
+    {
+      "seq": 138,
+      "ts": "2026-07-15T20:42:55Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "body_tube_length",
+            "value": "320 mm ±1 (FDM)",
+            "driver": "AC length ≥300 mm; bay + fin can + CG margin",
+            "provenance": "mission AC + 20 mm design margin"
+          }
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 137, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"dimension\", \"ts\": \"2026-07-15T20:42:55Z\"}"
+      }
+    },
+    {
+      "seq": 139,
+      "ts": "2026-07-15T20:43:09Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 34220,
+        "completion_tokens": 2048,
+        "total_tokens": 36300,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 140,
+      "ts": "2026-07-15T20:43:09Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "verify_battery",
+        "outcome": "passed",
+        "reason": "no mutating tool this turn; battery not required"
+      }
+    },
+    {
+      "seq": 141,
+      "ts": "2026-07-15T20:43:09Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "check_interference",
+        "outcome": "passed",
+        "reason": "not assembly/multi-body"
+      }
+    },
+    {
+      "seq": 142,
+      "ts": "2026-07-15T20:43:09Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "hard_guardrail",
+      "payload": {
+        "name": "orphan_sketch",
+        "outcome": "passed",
+        "reason": "no orphan sketches"
+      }
+    },
+    {
+      "seq": 143,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 144,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 145,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "overseer"
+      }
+    },
+    {
+      "seq": 146,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 147,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "deliver",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 148,
+      "ts": "2026-07-15T20:43:11Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "simple_part",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=simple_part depth=0 risk=low",
+        "role": "reviewer"
+      }
+    },
+    {
+      "seq": 149,
+      "ts": "2026-07-15T20:43:14Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": true,
+        "n_ops": 0
+      }
+    },
+    {
+      "seq": 150,
+      "ts": "2026-07-15T20:43:14Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_miss",
+        "errors": [
+          "leaf_envelope: require non-empty ops[] OR (no_op=true + reason)"
+        ],
+        "task_class": "simple_part",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "reply_head": "{\"goal\": \"Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS.\", \"ops\": [], \"no_op\": false, \"reason\": \"\", \"artifact"
+      }
+    },
+    {
+      "seq": 151,
+      "ts": "2026-07-15T20:43:14Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 152,
+      "ts": "2026-07-15T20:43:15Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 404 - {'error': {'message': 'No endpoints found for mistralai/mistral-small:free.', 'code': 404}, 'user_id': 'user_3GUzQRB7dvnjsaqiK0TORh4O7eJ'}",
+        "stop_reason": "failed",
+        "retryable": true
+      }
+    },
+    {
+      "seq": 153,
+      "ts": "2026-07-15T20:43:21Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "leaf",
+        "min_rank": 1,
+        "picked_model": "llama3.2:latest",
+        "picked_provider": "ollama",
+        "cost_tier": 0,
+        "mode": "auto",
+        "rank": 1,
+        "reason": "min_rank=1 task_class=leaf depth=0 risk=none",
+        "role": "department_manager"
+      }
+    },
+    {
+      "seq": 154,
+      "ts": "2026-07-15T20:43:22Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "leaf_oneshot_ok",
+        "task_class": "leaf",
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "no_op": false,
+        "n_ops": 2
+      }
+    },
+    {
+      "seq": 155,
+      "ts": "2026-07-15T20:43:25Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "note",
+      "payload": {
+        "event": "model_assignment",
+        "depth": 0,
+        "task_class": "assembly",
+        "min_rank": 4,
+        "picked_model": "grok-4.5",
+        "picked_provider": "xai-sub",
+        "cost_tier": 2,
+        "mode": "auto",
+        "rank": 5,
+        "reason": "min_rank=4 task_class=assembly depth=0 risk=none",
+        "role": "layout_engineer"
+      }
+    },
+    {
+      "seq": 156,
+      "ts": "2026-07-15T20:43:25Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 546,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "describe_part",
+          "describe_scene",
+          "measure_part",
+          "measure_between",
+          "query_geometry",
+          "part_search",
+          "parts_taxonomy",
+          "part_source",
+          "delegate"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 157,
+      "ts": "2026-07-15T20:43:26Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 2580,
+        "completion_tokens": 40,
+        "total_tokens": 2684,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 158,
+      "ts": "2026-07-15T20:43:26Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 1500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Dimensions\\n  body_tube_OD body_tube_OD: 50 mm \\u00b10.5 (FDM)  [?]\\n    driver: AC body OD 40\\u201360 mm mid-range for stability and bay width\\n  body_tube_length body_tube_length: 320 mm \\u00b11 (FDM)  [?]\\n    driver: AC length \\u2265300 mm; bay + fin can + CG margin\\n  body_tube_od body_tube_od: \\u00d850 \\u00b10.5 mm  [?]\\n    driver: mission OD 40\\u201360 mm; mid-range for b…"
+      }
+    },
+    {
+      "seq": 159,
+      "ts": "2026-07-15T20:43:28Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 3314,
+        "completion_tokens": 51,
+        "total_tokens": 3390,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 160,
+      "ts": "2026-07-15T20:43:28Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "budget_tokens": 2500,
+          "section": null
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"rendered\": \"[LEDGER schema=aicad.ledger/1 run_id=mega-22-fc-rocket-20260715]\\n\\n## Mission Brief\\nTitle: Mission mega-22-fc-rocket-20260715\\nSummary: Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\\n\\n## Dimensions\\n  body_tube_OD body_tube_OD: 50 mm \\u00b10.5 (FDM)  [?]\\n    driver: AC body OD 40\\u201360 mm mid-range for stability and bay width\\n  body_tube_length body_tube_length: 320 mm \\u00b11 (FDM)  [?]\\n    driver: AC length \\u2265300 mm; bay + fin can + CG margin\\n  body_tube_od body_tube_od: \\u00d850 \\u00b10.5 mm  [?]\\n    driver: mission OD 40\\u201360 mm; mid-range for b…"
+      }
+    },
+    {
+      "seq": 161,
+      "ts": "2026-07-15T20:43:31Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4059,
+        "completion_tokens": 43,
+        "total_tokens": 4133,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 162,
+      "ts": "2026-07-15T20:43:31Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "Dimensions",
+          "budget_tokens": 2000
+        },
+        "ok": false,
+        "result": "{\"ok\": false, \"error\": \"unknown section 'Dimensions'\", \"allowed\": [\"artifacts\", \"brief\", \"build_nodes\", \"criterion_results\", \"decisions\", \"dimensions\", \"events\", \"features\", \"geometry_specs\", \"linkages\", \"manifest\", \"questions\", \"requirements\", \"stage_log\", \"all\"], \"aliases\": {\"interfaces\": \"dimensions\", \"interface\": \"dimensions\", \"fits\": \"dimensions\", \"results\": \"artifacts\", \"result\": \"artifacts\", \"outcomes\": \"artifacts\", \"notes\": \"stage_log\", \"note\": \"stage_log\", \"log\": \"stage_log\", \"plan\": \"build_nodes\", \"acceptance\": \"artifacts\", \"acceptance_criteria\": \"artifacts\", \"ac\": \"artifacts\", \"mission_brief\": \"brief\", \"criterion_result\": \"criterion_results\", \"criterion_results\": \"criterion_results\", \"ac_results\": \"criterion_results\", \"verification\": \"criterion_results\", \"verifications\": \"criterion_results\"}}"
+      }
+    },
+    {
+      "seq": 163,
+      "ts": "2026-07-15T20:43:32Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4334,
+        "completion_tokens": 31,
+        "total_tokens": 4378,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 164,
+      "ts": "2026-07-15T20:43:32Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "brief",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"brief\", \"data\": {\"title\": \"Mission mega-22-fc-rocket-20260715\", \"summary\": \"Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro\", \"success_criteria\": []}}"
+      }
+    },
+    {
+      "seq": 165,
+      "ts": "2026-07-15T20:43:43Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 4560,
+        "completion_tokens": 182,
+        "total_tokens": 4766,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 166,
+      "ts": "2026-07-15T20:43:43Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "dimensions",
+          "budget_tokens": 2500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"dimensions\", \"data\": [{\"name\": \"body_tube_od\", \"value\": \"\\u00d850 \\u00b10.5 mm\", \"driver\": \"mission OD 40\\u201360 mm; mid-range for board 35 mm width + walls + clearance\", \"id\": \"body_tube_od\"}, {\"name\": \"interference_min_gap\", \"value\": \"\\u2265 0.5 mm designed gap all solid-solid board-to-airframe pairs after mate\", \"driver\": \"AC3 no solid interference; FDM tolerance buffer beyond zero-touch\", \"id\": \"interference_min_gap\"}, {\"name\": \"body_tube_OD\", \"value\": \"50 mm \\u00b10.5 (FDM)\", \"driver\": \"AC body OD 40\\u201360 mm mid-range for stability and bay width\", \"id\": \"body_tube_OD\"}, {\"name\": \"fillet_min_external\", \"value\": \"1.0 mm min on external edges where printable\", \"driver\": \"FDM stress relief; avoid zero-thickness edges\", \"id\": \"fillet_min_external\"}, {\"name\": \"body_tube_length\", \"value\": \"320 mm \\u00b11 (FDM)\", \"driver\": \"AC length \\u2265300 mm; bay + fin can + CG margin\", \"id\": \"body_tube_length\"}]}"
+      }
+    },
+    {
+      "seq": 167,
+      "ts": "2026-07-15T20:44:05Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 5090,
+        "completion_tokens": 2048,
+        "total_tokens": 7185,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 168,
+      "ts": "2026-07-15T20:44:05Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "requirements",
+          "budget_tokens": 2500
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"requirements\", \"data\": [{\"req_id\": \"DL1/AC1\", \"text\": \"airframe geometry coherent (verify_battery PASS)\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL1/AC2\", \"text\": \"payload bay volume fits flight-computer board envelope\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL2/AC3\", \"text\": \"no solid interference between board and airframe\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL3/AC4\", \"text\": \"schematic + board DRC/ERC clean (errors==0)\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL3/AC5\", \"text\": \"SPICE OP 3V3 rail within 5%\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL3/AC6\", \"text\": \"antenna design produced (openEMS or analytic degrade documented)\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL4/AC7\", \"text\": \"fw_build succeeds (ELF produced)\", \"source\": \"manifest\", \"status\": \"open\"}, {\"req_id\": \"DL4/AC8\", \"text\": \"Renode sensor loop PASS or honest SKIP …"
+      }
+    },
+    {
+      "seq": 169,
+      "ts": "2026-07-15T20:44:21Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 7531,
+        "completion_tokens": 2048,
+        "total_tokens": 9678,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 170,
+      "ts": "2026-07-15T20:44:21Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "decisions",
+          "budget_tokens": 3000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"decisions\", \"data\": [{\"name\": \"fw_mcu_target\", \"value\": \"STM32F4-class (Cortex-M4F)\", \"driver\": \"Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4\", \"provenance\": \"mission_brief + fw_status\", \"needs_confirm\": false, \"id\": \"fw_mcu_target\", \"stage\": \"verify\", \"text\": \"STM32F4-class (Cortex-M4F)\", \"rationale\": \"Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4\"}, {\"name\": \"fw_sensor_bus_architecture\", \"value\": \"I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug\", \"driver\": \"Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all\", \"provenance\": \"mission_brief sensor list (MPU6050, BMP280, LIS3MDL, NEO-6M)\", \"needs_confirm\": false, \"id\": \"fw_sensor_bus_architecture\", \"stage\": \"verify\", \"text\": \"I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NM…"
+      }
+    },
+    {
+      "seq": 171,
+      "ts": "2026-07-15T20:44:37Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 10323,
+        "completion_tokens": 2048,
+        "total_tokens": 12405,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 172,
+      "ts": "2026-07-15T20:44:37Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "decisions",
+          "budget_tokens": 4000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"decisions\", \"data\": [{\"name\": \"fw_mcu_target\", \"value\": \"STM32F4-class (Cortex-M4F)\", \"driver\": \"Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4\", \"provenance\": \"mission_brief + fw_status\", \"needs_confirm\": false, \"id\": \"fw_mcu_target\", \"stage\": \"verify\", \"text\": \"STM32F4-class (Cortex-M4F)\", \"rationale\": \"Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4\"}, {\"name\": \"fw_sensor_bus_architecture\", \"value\": \"I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug\", \"driver\": \"Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all\", \"provenance\": \"mission_brief sensor list (MPU6050, BMP280, LIS3MDL, NEO-6M)\", \"needs_confirm\": false, \"id\": \"fw_sensor_bus_architecture\", \"stage\": \"verify\", \"text\": \"I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NM…"
+      }
+    },
+    {
+      "seq": 173,
+      "ts": "2026-07-15T20:44:56Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 13115,
+        "completion_tokens": 2048,
+        "total_tokens": 15538,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 174,
+      "ts": "2026-07-15T20:44:56Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "describe_scene",
+        "args": {},
+        "ok": false,
+        "result": "{\n  \"ok\": false,\n  \"error\": \"No current part. Call new_part(...) first (or pass doc_id=).\"\n}"
+      }
+    },
+    {
+      "seq": 175,
+      "ts": "2026-07-15T20:45:12Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 15209,
+        "completion_tokens": 2048,
+        "total_tokens": 17360,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 176,
+      "ts": "2026-07-15T20:45:12Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "geometry_specs",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"geometry_specs\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 177,
+      "ts": "2026-07-15T20:45:26Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 17306,
+        "completion_tokens": 2048,
+        "total_tokens": 19396,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 178,
+      "ts": "2026-07-15T20:45:26Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "build_nodes",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"build_nodes\", \"data\": []}"
+      }
+    },
+    {
+      "seq": 179,
+      "ts": "2026-07-15T20:45:44Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 19403,
+        "completion_tokens": 2048,
+        "total_tokens": 21744,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 180,
+      "ts": "2026-07-15T20:45:44Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "manifest",
+          "budget_tokens": 2000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"manifest\", \"data\": {\"schema\": \"aicad.deliverables/1\", \"request_verbatim\": \"Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\\n3) SCHEMATIC \\u2014 ecad_new_schematic / place / WIRE nets (ecad_connect / net tools) so the netlist has simulatable devices before SPICE.\\n4) SPICE \\u2014 ecad_simulate OP on the wired 3V3 front-end; measure V(3V3).\\n5) PCB LAYOUT + TRACE OPT \\u2014 REQUIRED chain: board_from_schematic \\u2192 ecad_optimize_traces \\u2192 ecad_run_drc (errors==0 or honest FAIL).\\n6) ANTENNA/RF \\u2014 ecad_antenna_design + analyze for 2.4 GHz IFA and GPS pat…"
+      }
+    },
+    {
+      "seq": 181,
+      "ts": "2026-07-15T20:46:01Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 22084,
+        "completion_tokens": 2048,
+        "total_tokens": 24357,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 182,
+      "ts": "2026-07-15T20:46:01Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_get",
+        "args": {
+          "section": "manifest",
+          "budget_tokens": 3000
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"run_id\": \"mega-22-fc-rocket-20260715\", \"section\": \"manifest\", \"data\": {\"schema\": \"aicad.deliverables/1\", \"request_verbatim\": \"Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\\n2) PART SOURCING \\u2014 resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\\n3) SCHEMATIC \\u2014 ecad_new_schematic / place / WIRE nets (ecad_connect / net tools) so the netlist has simulatable devices before SPICE.\\n4) SPICE \\u2014 ecad_simulate OP on the wired 3V3 front-end; measure V(3V3).\\n5) PCB LAYOUT + TRACE OPT \\u2014 REQUIRED chain: board_from_schematic \\u2192 ecad_optimize_traces \\u2192 ecad_run_drc (errors==0 or honest FAIL).\\n6) ANTENNA/RF \\u2014 ecad_antenna_design + analyze for 2.4 GHz IFA and GPS pat…"
+      }
+    },
+    {
+      "seq": 183,
+      "ts": "2026-07-15T20:46:17Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 24765,
+        "completion_tokens": 2048,
+        "total_tokens": 26904,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 184,
+      "ts": "2026-07-15T20:46:17Z",
+      "actor": "layout_engineer",
+      "kind": "note",
+      "payload": {
+        "title": "layout_skeleton_plan",
+        "phase": "skeleton",
+        "summary": "LAYOUT ENGINEER for mega-22-fc-rocket boost-glide + central FC. Empty scene. Envelopes from ledger: body OD50xL320; motor 24mm-class D26xL70; bay Z180-260 36x36x80; fc_board 35x60x12 gap>=0.5mm; wings mid-body; nose L80. Interfaces: body_axis, board_mount_plane, bay_hatch_plane, board_fastener_pattern 4xM3 28x44, wing_root L/R, fin roots. Clearance budgets: board-bay 0.5mm, motor-body 0.236mm fit_bore. Delegating airframe + avionics envelope slices."
+      }
+    },
+    {
+      "seq": 185,
+      "ts": "2026-07-15T20:46:17Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "note",
+          "payload": {
+            "title": "layout_skeleton_plan",
+            "phase": "skeleton",
+            "summary": "LAYOUT ENGINEER for mega-22-fc-rocket boost-glide + central FC. Empty scene. Envelopes from ledger: body OD50xL320; motor 24mm-class D26xL70; bay Z180-260 36x36x80; fc_board 35x60x12 gap>=0.5mm; wings mid-body; nose L80. Interfaces: body_axis, board_mount_plane, bay_hatch_plane, board_fastener_pattern 4xM3 28x44, wing_root L/R, fin roots. Clearance budgets: board-bay 0.5mm, motor-body 0.236mm fit_bore. Delegating airframe + avionics envelope slices."
+          },
+          "actor": "layout_engineer"
+        },
+        "ok": true,
+        "result": "{\"ok\": true, \"seq\": 184, \"run_id\": \"mega-22-fc-rocket-20260715\", \"kind\": \"note\", \"ts\": \"2026-07-15T20:46:17Z\"}"
+      }
+    },
+    {
+      "seq": 186,
+      "ts": "2026-07-15T20:46:30Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 26880,
+        "completion_tokens": 2048,
+        "total_tokens": 28982,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 187,
+      "ts": "2026-07-15T20:46:30Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "interface",
+          "payload": {
+            "name": "body_axis",
+            "type": "axis",
+            "origin_mm": [
+              0,
+              0,
+              0
+            ],
+            "direction": [
+              0,
+              0,
+              1
+            ],
+            "driver": "coaxial body tube + motor + bay; Z=0 at aft motor end, +Z toward nose",
+            "also_named": [
+              "motor_axis"
+            ]
+          },
+          "actor": "layout_engineer"
+        },
+        "ok": false,
+        "result": "{\"ok\": false, \"error\": \"unknown kind 'interface'\", \"valid_kinds\": [\"ac_result\", \"acceptance\", \"artifact\", \"assumption\", \"audit\", \"battery\", \"brief\", \"build_node\", \"confirm\", \"confirmation\", \"criterion\", \"criterion_result\", \"decision\", \"deliverables_manifest\", \"dimension\", \"feature\", \"geometry_spec\", \"linkage\", \"manifest\", \"manifest_confirm\", \"note\", \"question\", \"report\", \"requirement\", \"review_verdict\", \"ruling\", \"spec\", \"stage\", \"verdict\", \"verification\", \"verification_result\"], \"aliased_to\": {\"verdict\": \"decision\", \"review_verdict\": \"decision\", \"audit\": \"decision\", \"ruling\": \"decision\", \"spec\": \"decision\", \"manifest_confirm\": \"decision\", \"confirm\": \"decision\", \"confirmation\": \"decision\", \"deliverables_manifest\": \"artifact\", \"manifest\": \"artifact\", \"report\": \"artifact\", \"battery\": \"artifact\", \"criterion\": \"criterion_result\", \"ac_result\": \"criterion_result\", \"acceptance\": \"criterion_result\", \"assumption\": \"decision\", \"verification\": \"artifact\", \"verification_result\": \"artifact\"}}"
+      }
+    },
+    {
+      "seq": 188,
+      "ts": "2026-07-15T20:46:46Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 29206,
+        "completion_tokens": 2048,
+        "total_tokens": 31306,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 189,
+      "ts": "2026-07-15T20:46:46Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tool_call",
+        "tool": "ledger_note",
+        "args": {
+          "kind": "dimension",
+          "payload": {
+            "name": "body_axis",
+            "type": "axis",
+            "origin_mm": [
+              0,
+              0,
+              0
+            ],
+            "direction": [
+              0,
+              0,
+              1
+            ],
+            "value": "Z-axis centerline",
+            "driver": "coaxial body tube + motor + bay; Z=0 at aft motor end, +Z toward nose; also_named motor_axis"
+          },
+          "actor": "layout_engineer"
+        },
+        "ok": false,
+        "result": "{\"ok\": false, \"error\": \"dimension events require a 'provenance' field (tool result / calc / table / user answer)\"}"
+      }
+    },
+    {
+      "seq": 190,
+      "ts": "2026-07-15T20:47:02Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_usage",
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "prompt_tokens": 31297,
+        "completion_tokens": 2048,
+        "total_tokens": 33369,
+        "source": "api",
+        "provider_usage_recorded": true
+      }
+    },
+    {
+      "seq": 191,
+      "ts": "2026-07-15T20:47:02Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "turn",
+        "kind": "done",
+        "handoff": {
+          "status": "done",
+          "summary": "auto-completed after 16 tool calls (budget=16, reason=max_iters); model did not emit a formal handoff envelope",
+          "outputs": {
+            "auto_complete": true,
+            "tool_calls": 16,
+            "wrote_ledger": true,
+            "productive_tools": [
+              "ledger_note"
+            ],
+            "reasoning_summary": "Turn ended without a formal handoff after productive tool work; synthesised a done handoff so the phase can exit."
+          }
+        },
+        "auto": true
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "mega-22-fc-rocket-20260715",
+    "brief": {
+      "title": "Mission mega-22-fc-rocket-20260715",
+      "summary": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro",
+      "success_criteria": []
+    },
+    "requirements": [
+      {
+        "req_id": "DL1/AC1",
+        "text": "airframe geometry coherent (verify_battery PASS)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL1/AC2",
+        "text": "payload bay volume fits flight-computer board envelope",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL2/AC3",
+        "text": "no solid interference between board and airframe",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC4",
+        "text": "schematic + board DRC/ERC clean (errors==0)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC5",
+        "text": "SPICE OP 3V3 rail within 5%",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC6",
+        "text": "antenna design produced (openEMS or analytic degrade documented)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL4/AC7",
+        "text": "fw_build succeeds (ELF produced)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL4/AC8",
+        "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL5/AC9",
+        "text": "report lists every leg with a verdict",
+        "source": "manifest",
+        "status": "open"
+      }
+    ],
+    "decisions": [
+      {
+        "name": "fw_mcu_target",
+        "value": "STM32F4-class (Cortex-M4F)",
+        "driver": "Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4",
+        "provenance": "mission_brief + fw_status",
+        "needs_confirm": false,
+        "id": "fw_mcu_target",
+        "stage": "verify",
+        "text": "STM32F4-class (Cortex-M4F)",
+        "rationale": "Mission brief: MCU STM32F4-class; fw_new_project(stm32f4); Renode unlocks emulate:cortex-m stm32f4"
+      },
+      {
+        "name": "fw_sensor_bus_architecture",
+        "value": "I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug",
+        "driver": "Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all",
+        "provenance": "mission_brief sensor list (MPU6050, BMP280, LIS3MDL, NEO-6M)",
+        "needs_confirm": false,
+        "id": "fw_sensor_bus_architecture",
+        "stage": "verify",
+        "text": "I2C1 shared: MPU6050 + BMP280 + LIS3MDL; USART for NEO-6M GPS NMEA; SWD debug",
+        "rationale": "Mission avionics: IMU/baro/mag are I2C-class sensors; NEO-6M is UART GPS; STM32F4-class MCU hosts all"
+      },
+      {
+        "id": "fit_bore",
+        "stage": "specify",
+        "text": "fit from fit_calc: clearance≈0.23600000000000002",
+        "rationale": "fit_calc mean/interval clearance",
+        "actor": "SPECIFY DL1: rocket_plane_airframe",
+        "ts": "2026-07-15T20:41:16Z",
+        "clearance": 0.23600000000000002,
+        "source_tool": "fit_calc"
+      },
+      {
+        "name": "board_fastener_primary",
+        "value": "fastener:ISO 7380:M3 (BHCS) + fastener:ISO 4032:M3 (hex nut) + fastener:ISO 7089:M3 (washer)",
+        "driver": "library-resolved M3 board mount hardware; heat-set insert not in library — use nut traps in printed bosses",
+        "provenance": "part_search ISO 7380:M3, ISO 4032:M3, ISO 7089:M3",
+        "needs_confirm": false,
+        "id": "board_fastener_primary",
+        "stage": "verify",
+        "text": "fastener:ISO 7380:M3 (BHCS) + fastener:ISO 4032:M3 (hex nut) + fastener:ISO 7089:M3 (washer)",
+        "rationale": "library-resolved M3 board mount hardware; heat-set insert not in library — use nut traps in printed bosses"
+      }
+    ],
+    "dimensions": [
+      {
+        "name": "body_tube_od",
+        "value": "Ø50 ±0.5 mm",
+        "driver": "mission OD 40–60 mm; mid-range for board 35 mm width + walls + clearance",
+        "id": "body_tube_od"
+      },
+      {
+        "name": "interference_min_gap",
+        "value": "≥ 0.5 mm designed gap all solid-solid board-to-airframe pairs after mate",
+        "driver": "AC3 no solid interference; FDM tolerance buffer beyond zero-touch",
+        "id": "interference_min_gap"
+      },
+      {
+        "name": "body_tube_OD",
+        "value": "50 mm ±0.5 (FDM)",
+        "driver": "AC body OD 40–60 mm mid-range for stability and bay width",
+        "id": "body_tube_OD"
+      },
+      {
+        "name": "fillet_min_external",
+        "value": "1.0 mm min on external edges where printable",
+        "driver": "FDM stress relief; avoid zero-thickness edges",
+        "id": "fillet_min_external"
+      },
+      {
+        "name": "body_tube_length",
+        "value": "320 mm ±1 (FDM)",
+        "driver": "AC length ≥300 mm; bay + fin can + CG margin",
+        "id": "body_tube_length"
+      }
+    ],
+    "questions": [],
+    "stage_log": [
+      {
+        "stage": "intake",
+        "entered": "2026-07-15T20:39:09Z",
+        "exited": "2026-07-15T20:39:09Z",
+        "exit_gate": "manifest_valid"
+      },
+      {
+        "stage": "specify",
+        "entered": "2026-07-15T20:39:19Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "plan",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "build",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "verify",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "deliver",
+        "entered": "2026-07-15T20:43:11Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "5 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\n3) SCHEMATIC — ecad_new_schematic / place / WIRE nets (ecad_connect / net tools) so the netlist has simulatable devices before SPICE.\n4) SPICE — ecad_simulate OP on the wired 3V3 front-end; measure V(3V3).\n5) PCB LAYOUT + TRACE OPT — REQUIRED chain: board_from_schematic → ecad_optimize_traces → ecad_run_drc (errors==0 or honest FAIL).\n6) ANTENNA/RF — ecad_antenna_design + analyze for 2.4 GHz IFA and GPS patch; use openEMS path when provisioned, else document honest degrade/SKIP.\n7) FIRMWARE — fw_new_project(stm32f4) + pinmap from netlist + fw_build.\n8) RENODE SENSOR-IN-THE-LOOP — climb_turn_profile → fw_sensor_scenario → fw_sim_run + fw_verify_board; SKIP honestly if Renode absent.\n9) MECHANICAL — model the rocket-plane airframe as editable CAD with verify_battery PASS: body tube ~OD 40–60mm length ≥300mm, 3–4 fins, wing/glide surface, closed payload bay volume ≥ board envelope; use sketch+extrude/revolve + fillets; avoid zero-thickness and open shells.\n10) Deliver a consolidated mission report card (PASS/WARN/FAIL/SKIP per leg) and power_budget rollup.\nUse subagent delegation freely (infinitely-branching, spawn-depth policy active) to parallelize mechanical vs ECAD vs firmware vs RF workstreams. Autonomy: auto.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "rocket_plane_airframe",
+              "description": "Boost-glide model rocket plane airframe: body, fins, wing, payload bay sized for the flight-computer board.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "airframe geometry coherent (verify_battery PASS)",
+                  "check": {
+                    "tool": "verify_battery",
+                    "params_hint": {},
+                    "pass_rule": "PASS"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "payload bay volume fits flight-computer board envelope",
+                  "check": {
+                    "tool": "measure_part",
+                    "params_hint": {
+                      "feature": "payload_bay",
+                      "bay_length": "payload_bay_length",
+                      "board_length": "fc_board_length"
+                    },
+                    "pass_rule": "bay envelope >= board outline"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL2",
+              "kind": "assembly",
+              "name": "avionics_integration",
+              "description": "Airframe + flight-computer board integration; no interference; sensor FOV / antenna keepouts respected.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC3",
+                  "text": "no solid interference between board and airframe",
+                  "check": {
+                    "tool": "check_interference",
+                    "params_hint": {},
+                    "pass_rule": "interferences empty or volume==0"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL3",
+              "kind": "analysis",
+              "name": "flight_computer_ecad",
+              "description": "Flight-computer E2E: part sourcing, schematic, SPICE OP, PCB place/route/trace-opt, antenna/RF, DRC/DFM/PDN checks.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC4",
+                  "text": "schematic + board DRC/ERC clean (errors==0)",
+                  "check": {
+                    "tool": "ecad_run_drc+ecad_run_erc",
+                    "tools": [
+                      "ecad_run_drc",
+                      "ecad_run_erc"
+                    ],
+                    "params_hint": {
+                      "legs": [
+                        "parts",
+                        "schematic",
+                        "board",
+                        "trace_opt",
+                        "checks"
+                      ]
+                    },
+                    "pass_rule": "errors==0"
+                  }
+                },
+                {
+                  "id": "AC5",
+                  "text": "SPICE OP 3V3 rail within 5%",
+                  "check": {
+                    "tool": "ecad_simulate",
+                    "params_hint": {
+                      "analysis": "op",
+                      "probes": [
+                        "V(3V3)"
+                      ],
+                      "leg": "sim"
+                    },
+                    "pass_rule": "V(3V3) in [3.135, 3.465]"
+                  }
+                },
+                {
+                  "id": "AC6",
+                  "text": "antenna design produced (openEMS or analytic degrade documented)",
+                  "check": {
+                    "tool": "ecad_antenna_analyze",
+                    "params_hint": {
+                      "kind": "ifa",
+                      "freq_hz": 2400000000.0,
+                      "leg": "antenna"
+                    },
+                    "pass_rule": "PASS|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL4",
+              "kind": "analysis",
+              "name": "firmware_sensor_loop",
+              "description": "STM32F4 firmware project from pinmap, build, Renode sensor-in-the-loop climb_turn_profile scenario.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC7",
+                  "text": "fw_build succeeds (ELF produced)",
+                  "check": {
+                    "tool": "fw_build",
+                    "params_hint": {
+                      "leg": "firmware"
+                    },
+                    "pass_rule": "returncode==0"
+                  }
+                },
+                {
+                  "id": "AC8",
+                  "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+                  "check": {
+                    "tool": "fw_sim_run",
+                    "params_hint": {
+                      "leg": "sensor_loop"
+                    },
+                    "pass_rule": "PASS|SKIP(renode)"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL5",
+              "kind": "report",
+              "name": "mission_report_card",
+              "description": "Consolidated PASS/WARN/FAIL/SKIP card for all legs + power_budget rollup.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC9",
+                  "text": "report lists every leg with a verdict",
+                  "check": {
+                    "tool": "report_card",
+                    "params_hint": {
+                      "legs": [
+                        "plan",
+                        "parts",
+                        "schematic",
+                        "sim",
+                        "board",
+                        "trace_opt",
+                        "antenna",
+                        "checks",
+                        "firmware",
+                        "sensor_loop",
+                        "power",
+                        "airframe"
+                      ]
+                    },
+                    "pass_rule": "all legs have PASS|WARN|FAIL|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL2",
+                "DL3",
+                "DL4"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "MCU family STM32F4; sensors I2C MPU6050@0x68, BMP280@0x76, LIS3MDL, UART GPS",
+              "basis": "B1 flight-computer benchmark BOM",
+              "needs_confirm": false
+            },
+            {
+              "text": "openEMS/Renode may be absent — degrade with SKIP, never fabricate results",
+              "basis": "contracts honesty rule",
+              "needs_confirm": false
+            },
+            {
+              "text": "AC2/AC4–AC9 are evidence-graded from named tools (measure_part, ecad_run_drc+erc, ecad_simulate, ecad_antenna_analyze, fw_build, fw_sim_run, report_card). Honest SKIP only with provision-absence evidence (Renode/openEMS/toolchain).",
+              "basis": "mega-11 gradeability (reports/runs/mega-10/fixes.md)",
+              "needs_confirm": false
+            }
+          ]
+        }
+      }
+    ],
+    "criterion_results": [],
+    "features": [],
+    "geometry_specs": [],
+    "linkages": [],
+    "build_nodes": []
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "status": "error",
+  "phase": "unknown",
+  "stop_reason": "process_died_without_terminal_status",
+  "error": "primary process exited without writing mission.json (a4)",
+  "wall_s": 597.82,
+  "run_id": "mega-22-fc-rocket-20260715",
+  "mode": "real",
+  "conservation": true,
+  "baseline_commit": "0f43d126"
+}

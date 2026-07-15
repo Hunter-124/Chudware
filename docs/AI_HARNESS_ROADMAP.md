@@ -397,17 +397,14 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   `reports/runs/mega-21/findings.md`.
 
 - 2026-07-15 mega-22 (WS5): close mega-21 AC1/AC4/AC5 residuals under
-  `reports/runs/mega-22/` (primary `mega-22-fc-rocket-20260715`). Baseline
-  `0f43d126`. Fixer22 (GrossShark) bound P22 driven SPICE rail + Q22
-  board→optimize_traces→drc + R22 measure_between faces (158p); a1 rebind
-  mech soft_refusal + ecad_product_gate (162p). Preflight PASS: account
-  `06dc3359` ACTIVE, hard→xai-sub grok-4.5 EXACT, mid openrouter deepseek,
-  leaf ollama; hostd `night2-3075-gb0e66f3d-dirty` matches disk.
-  **a1** 657s blocked mech force (live 4/9; archived). **a2** wall **676s**
-  terminal `done`/`deliver_partial` live AC PASS **7**/9 (AC2/3/4/6/7/8/9).
-  Axes a2: **Q22 PASS** (DRC errors=0 via optimize chain — mega-21 clearance×31
-  closed), **P22 PARTIAL** (device_count=2; V(3V3)=null), **R22 PARTIAL**
-  (no `'top face'`; soft_zero mb remains), M21/N21/B20/C19/D19/Z1–Z4/Y/W/X/
-  Fix8/G18/A PASS; A20 PARTIAL. Residuals: finite non-null V on 3V3; mb real
-  score or honest SKIP. Findings: `reports/runs/mega-22/findings.md`.
+  `reports/runs/mega-22/` (primary `mega-22-fc-rocket-20260715` **a2**).
+  Baseline `0f43d126`. Fixer22 (GrossShark) P22/Q22/R22 (158p) + rebinds
+  (mech soft_refusal, ecad_product_gate, V_source GND, side-only measure; 163p).
+  Preflight PASS: account `06dc3359`, hard→xai-sub grok-4.5, mid deepseek, leaf
+  ollama. **a1** blocked live 4/9. **a2** wall **676s** `done`/`deliver_partial`
+  live AC **7**/9 (AC2/3/4/6/7/8/9). **Q22 PASS** (DRC errors=0 — clearance×31
+  closed). **P22 PARTIAL** (V(3V3)=null). **R22 PARTIAL** (mb soft zero).
+  M21/N21/B20/Z*/G18/Y/W/X/Fix8 PASS. a3 checkpoint_blob + a4 process death
+  archived (infra). Residuals: finite V on 3V3; mb real score/SKIP. Findings:
+  `reports/runs/mega-22/findings.md`.
 

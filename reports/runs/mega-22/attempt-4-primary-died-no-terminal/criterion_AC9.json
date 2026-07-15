@@ -1,0 +1,7 @@
+{
+  "id": "AC9",
+  "result": "SKIP",
+  "detail": "post-hoc: no criterion_result in ledger for AC9 at terminal error/process_died_without_terminal_status",
+  "source": "grade_run_posthoc_z1",
+  "honest": true
+}

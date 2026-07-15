@@ -633,7 +633,10 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         _add(str(cfg["provider"]), str(cfg["model"]))
 
     lcfg = cfg.get("llamacpp") or {}
-    if isinstance(lcfg, Mapping):
+    if isinstance(lcfg, Mapping) and (
+        lcfg.get("base_url") or lcfg.get("model") or lcfg.get("models")
+        or lcfg.get("host") or lcfg.get("port")
+    ):
         base = str(lcfg.get("base_url") or "http://127.0.0.1:1234/v1")
         for mid in (lcfg.get("models") or []):
             _add("llamacpp", str(mid), base)
@@ -642,10 +645,28 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         for mid in ("qwen3-4b", "gemma3-4b-qat", "gemma4-e4b"):
             _add("llamacpp", mid, base)
 
+    # Live local Ollama (OpenAI-compatible) — prefer when reachable / configured.
+    ocfg = cfg.get("ollama") or {}
+    if isinstance(ocfg, Mapping) or True:
+        obase = ""
+        if isinstance(ocfg, Mapping):
+            obase = str(ocfg.get("base_url") or "")
+            for mid in (ocfg.get("models") or []):
+                _add("ollama", str(mid), obase or "http://127.0.0.1:11434/v1")
+            if ocfg.get("model"):
+                _add(
+                    "ollama",
+                    str(ocfg["model"]),
+                    obase or "http://127.0.0.1:11434/v1",
+                )
+        # Default small local when Ollama is the common workstation backend.
+        _add("ollama", "llama3.2:latest", "http://127.0.0.1:11434/v1")
+
     or_cfg = cfg.get("openrouter") or {}
     if isinstance(or_cfg, Mapping):
         for mid in (or_cfg.get("models") or []):
             _add("openrouter", str(mid))
+    # Free-tier OpenRouter candidates (auto_pick ranks them; construction needs key).
     for mid in (
         "nvidia/nemotron-ultra:free",
         "mistralai/mistral-small:free",
@@ -679,8 +700,14 @@ def _cost_key(provider: str, model: str) -> tuple[int, int, str]:
     p = (provider or "").lower()
     cost = _COST_CLASS.get(p, 9)
     if p == "openrouter" and (":free" in (model or "") or model.endswith(":free")):
-        cost = 3
+        cost = 1  # free tier beats subscription for leaf auto_pick
     return (cost, 0, f"{p}/{model}")
+
+
+def cost_tier_for(provider: str, model: str = "") -> int:
+    """Public cost class for assignment telemetry (lower = cheaper)."""
+    return int(_cost_key(provider, model)[0])
+
 
 
 def auto_pick_model(

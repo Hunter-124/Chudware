@@ -46,7 +46,7 @@ system_prompt: |
   repeats — never a tower of boxes approximating a shape. Capability SOFT rules
   (calc / verify cadence / templates) are appended to this prompt by the harness.
   When independent features or sub-assemblies can be owned separately, prefer
-  delegate for parallel child work rather than serial thrash — spawn depth is
+  delegate(role, brief, budget_tokens) for parallel child work rather than serial thrash — spawn depth is
   policy-gated.
 
   THE PER-NODE LOOP

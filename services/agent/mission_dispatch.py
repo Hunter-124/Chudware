@@ -538,11 +538,20 @@ class MissionDispatch:
                         max_calls = max(4, min(12, derived))
                 except Exception:  # noqa: BLE001
                     pass
-            # WS2: per-node model pick when ai_roles is set / auto.
+            # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
+            # depth-aware min_rank. resolve_for_node returns None when ai_roles
+            # is unset (legacy path) — fall through to resolve_role_model so
+            # mega/gym missions still emit assignment audit rows and respect
+            # decreasing difficulty on deeper spawns.
             provider = self.provider
             try:
-                from services.agent.role_models import resolve_for_node  # noqa: PLC0415
+                from services.agent.role_models import (  # noqa: PLC0415
+                    cost_tier_for,
+                    resolve_for_node,
+                    resolve_role_model,
+                )
                 from services.agent import config as agent_config  # noqa: PLC0415
+                from services.agent import agent_events as _ae  # noqa: PLC0415
                 depth = 0
                 try:
                     depth = int((node.get("depth") if isinstance(node, dict)
@@ -550,10 +559,11 @@ class MissionDispatch:
                 except (TypeError, ValueError):
                     depth = 0
                 policy = getattr(self, "_last_spawn_policy", None) or {}
+                risk = "low" if str(node.get("kind") or "") == "ponder" else None
                 ctx = {
                     "task_class": self.task_class,
                     "depth": depth,
-                    "risk": "low" if str(node.get("kind") or "") == "ponder" else None,
+                    "risk": risk,
                     "node_inputs": {"task_class": self.task_class, "depth": depth},
                 }
                 # Map harness roles: subagent worker → task; planner-ish → planning.
@@ -562,27 +572,102 @@ class MissionDispatch:
                     harness_role = "planning"
                 elif role in ("advisor", "reviewer"):
                     harness_role = "advisor"
-                assignment = resolve_for_node(harness_role, ctx)
-                if assignment is not None and policy.get("min_rank") is not None:
-                    # Re-resolve with depth-aware min_rank (decreasing difficulty).
-                    from services.agent.role_models import resolve_role_model  # noqa: PLC0415
-                    assignment = resolve_role_model(
-                        harness_role,
-                        agent_config.load_config(),
-                        task_class=self.task_class,
-                        node_depth=depth,
-                        min_rank=int(policy["min_rank"]),
-                    )
-                if assignment is not None:
-                    cfg = dict(agent_config.load_config())
-                    cfg["model"] = assignment.model
+                cfg = dict(agent_config.load_config() or {})
+                min_rank = policy.get("min_rank")
+                try:
+                    min_rank_i = int(min_rank) if min_rank is not None else None
+                except (TypeError, ValueError):
+                    min_rank_i = None
+                assignment = resolve_for_node(harness_role, ctx, cfg=cfg)
+                if assignment is None or min_rank_i is not None:
+                    # Prefer depth-aware resolve; also covers missing ai_roles.
                     try:
+                        assignment = resolve_role_model(
+                            harness_role,
+                            cfg,
+                            task_class=self.task_class,
+                            node_depth=depth,
+                            risk=risk,
+                            min_rank=min_rank_i,
+                        )
+                    except Exception:  # noqa: BLE001
+                        if assignment is None:
+                            raise
+                if assignment is not None:
+                    cfg_pick = dict(cfg)
+                    cfg_pick["model"] = assignment.model
+                    rank = int(assignment.rank or (min_rank_i or 3))
+                    if rank <= 2:
+                        cfg_pick["reasoning_effort"] = "low"
+                    elif rank <= 3:
+                        cfg_pick["reasoning_effort"] = "medium"
+                    if assignment.provider == "ollama":
+                        ocfg = dict(cfg_pick.get("ollama") or {})
+                        ocfg.setdefault(
+                            "base_url", "http://127.0.0.1:11434/v1")
+                        cfg_pick["ollama"] = ocfg
+                        oai = dict(cfg_pick.get("openai") or {})
+                        oai["base_url"] = ocfg.get("base_url") or (
+                            "http://127.0.0.1:11434/v1")
+                        oai.setdefault("api_key", "ollama")
+                        cfg_pick["openai"] = oai
+                    try:
+                        prov_name = assignment.provider
+                        if prov_name == "ollama":
+                            prov_name = "openai"
+                            cfg_pick.setdefault("api_key", "ollama")
                         provider = agent_config.get_provider(
-                            name=assignment.provider, cfg=cfg)
-                        if isinstance(node, dict):
-                            node["role_model"] = assignment.to_dict()
+                            name=prov_name, cfg=cfg_pick)
                     except Exception:  # noqa: BLE001 — keep mission provider
                         provider = self.provider
+                    if isinstance(node, dict):
+                        node["role_model"] = {
+                            **assignment.to_dict(),
+                            "min_rank": min_rank_i,
+                            "cost_tier": cost_tier_for(
+                                assignment.provider, assignment.model),
+                            "reasoning_effort": cfg_pick.get(
+                                "reasoning_effort"),
+                        }
+                    # Emit assignment audit even when provider rebuild falls back.
+                    try:
+                        emit_min = min_rank_i if min_rank_i is not None else assignment.rank
+                        _k, _p = _ae.model_assignment_event(
+                            node_id or role,
+                            depth=depth,
+                            task_class=self.task_class,
+                            min_rank=int(emit_min) if emit_min is not None else None,
+                            picked_model=assignment.model,
+                            picked_provider=assignment.provider,
+                            cost_tier=cost_tier_for(
+                                assignment.provider, assignment.model),
+                            mode=assignment.mode,
+                            rank=assignment.rank,
+                            reason=assignment.reason,
+                            subagent_id=node_id or None,
+                            role=role,
+                            span_id=node_id or None,
+                            parent_id=(node.get("parent")
+                                       if isinstance(node, dict) else None),
+                            actor=role,
+                        )
+                        _ae.emit_event(
+                            _k, _p, live=self.on_event, journal=None)
+                        if self.ledger is not None:
+                            try:
+                                self.ledger.append("agent", "note", {
+                                    "event": "model_assignment",
+                                    **{k: _p.get(k) for k in (
+                                        "depth", "task_class", "min_rank",
+                                        "picked_model", "picked_provider",
+                                        "cost_tier", "mode", "rank", "reason",
+                                        "role", "subagent_id",
+                                    )},
+                                })
+                            except Exception:  # noqa: BLE001
+                                pass
+                    except Exception:  # noqa: BLE001 — never block on telemetry
+                        pass
             except Exception:  # noqa: BLE001 — never block subagent on role_models
                 provider = self.provider
             result = _at.run_turn(
@@ -597,6 +682,9 @@ class MissionDispatch:
                 capability=_cap, tier=self.tier, phase=_phase,
                 task_class=self.task_class)
             tokens = 0  # provider seam exposes no usage here; accrual stays honest at 0
+            role_model = None
+            if isinstance(node, dict):
+                role_model = node.get("role_model")
             if result.stop_reason == "terminated_by_user":
                 try:
                     self.delegation_tree.fail(node_id, reason="terminated by user")
@@ -607,22 +695,31 @@ class MissionDispatch:
                                      note="terminated by user at turn boundary")
                 except Exception:  # noqa: BLE001
                     pass
-                return {"ok": False, "subagent_status": "terminated",
+                out = {"ok": False, "subagent_status": "terminated",
                         "result": result.result}
+                if role_model is not None:
+                    out["role_model"] = role_model
+                return out
             if result.success:
                 try:
                     self.delegation_tree.complete(node_id, tokens_used=tokens)
                 except Exception:  # noqa: BLE001
                     pass
-                return {"ok": True, "subagent_status": "done",
+                out = {"ok": True, "subagent_status": "done",
                         "handoff": result.result.get("handoff"),
                         "result": result.result}
+                if role_model is not None:
+                    out["role_model"] = role_model
+                return out
             try:
                 self.delegation_tree.fail(node_id, reason=result.stop_reason)
             except Exception:  # noqa: BLE001
                 pass
-            return {"ok": False, "subagent_status": "failed",
+            out = {"ok": False, "subagent_status": "failed",
                     "stop_reason": result.stop_reason, "result": result.result}
+            if role_model is not None:
+                out["role_model"] = role_model
+            return out
         except Exception as exc:  # noqa: BLE001 — execution error is data
             try:
                 self.delegation_tree.fail(node_id, reason=str(exc))

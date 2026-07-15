@@ -115,3 +115,20 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   correctness still fails. Provider usage tokens/cost and semaphore occupancy
   remain unobserved. Explicit verdicts, latency metrics, live Fixer4 fingerprints,
   and TOP5 are in `reports/runs/mega-4/findings.md`.
+- 2026-07-14/15 mega-5 (WS5): fresh process on commit `4f98f625` under
+  `reports/runs/mega-5/` (`mega-5-fc-rocket-20260714`) so all Fixer4 fixes bind.
+  Preflight PASS: delegate on `spec_writer`/`layout_engineer`/`feature_modeler`
+  and RENDERED tool schemas include `budget_tokens`. Wall **1,438.65s**, mission
+  `blocked`/`deliver_incomplete`, `phases_completed=["intake"]` only. DAG 19/19
+  (8 done, 11 failed). **Actual delegation partial flip:** 2 `delegate` calls,
+  1 depth-1 `part_fixer` spawn (brief≤500 + `budget_tokens=8000`), join
+  `executed=true` but 0 tokens spent / null handoff / no CAD. Auto assignment
+  still unexercised — all 19 tools_slots frontier SuperGrok (owner quota:
+  VERIFY/DELIVER/INTAKE leaves should have been cheap). BUILD still 0
+  parts/boards/firmware. Phase gate no longer false-completes PLAN/BUILD
+  (honesty fix held) but live stage_log stayed intake-only until terminal.
+  **7×** xAI read timeouts under fan-out; SPECIFY slots were 41 tools/2284 tok.
+  Fixer5 mid-run Fixes 1–7 (prompt contract, model_assignment, xAI retry,
+  auto_pick-first SuperGrok quota, live phase cursor, tools_slot cap≤14) need
+  fresh process. Findings + SuperGrok spend section + TOP5:
+  `reports/runs/mega-5/findings.md`.

@@ -1,0 +1,16 @@
+{
+  "state": "finished",
+  "run_id": "mega-5-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 1785399,
+  "started_wall": 1784072271.448184,
+  "cycle": "mega-5",
+  "finished_wall": 1784073710.0977943,
+  "wall_s": 1438.65,
+  "result": {
+    "status": "blocked",
+    "phase": "deliver",
+    "stop_reason": "deliver_incomplete",
+    "error": null
+  }
+}

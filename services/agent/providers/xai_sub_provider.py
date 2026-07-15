@@ -60,10 +60,20 @@ REFRESH_SKEW_MS = 60 * 60 * 1000
 # 5-way SPECIFY fan-out + later pairs hammered xAI with parallel long reads →
 # "The read operation timed out" classified as budget death. Bound sibling
 # complete_ex calls process-wide. Override via AICAD_XAI_MAX_CONCURRENT (int ≥1).
-_DEFAULT_MAX_CONCURRENT = 2
+# mega-5: default raised to 3 so serialization under fan-out is less likely to
+# starve long PLAN/BUILD reads; occupancy + queue_wait telemetry is emitted so
+# we can tell serialization vs load-induced timeouts.
+_DEFAULT_MAX_CONCURRENT = 3
 _DEFAULT_READ_TIMEOUT_S = 180.0
+# One bounded in-provider retry for retryable read timeouts (mega-4/5 watch-list).
+_DEFAULT_READ_TIMEOUT_RETRIES = 1
 _sem_lock = threading.Lock()
 _request_sem: threading.Semaphore | None = None
+_sem_capacity: int = 0
+_sem_in_flight: int = 0
+_sem_peak_in_flight: int = 0
+_sem_wait_count: int = 0
+_sem_total_wait_ms: float = 0.0
 
 
 def _max_concurrent_requests() -> int:
@@ -94,20 +104,63 @@ def _read_timeout_s() -> float:
     return _DEFAULT_READ_TIMEOUT_S
 
 
+def _read_timeout_retries() -> int:
+    raw = (
+        os.environ.get("AICAD_XAI_READ_TIMEOUT_RETRIES")
+        or os.environ.get("AI_CAD_XAI_READ_TIMEOUT_RETRIES")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, min(3, int(raw)))
+        except ValueError:
+            pass
+    return _DEFAULT_READ_TIMEOUT_RETRIES
+
+
 def _request_semaphore() -> threading.Semaphore:
     """Process-wide semaphore shared by every XAISubProvider instance."""
-    global _request_sem
+    global _request_sem, _sem_capacity
     with _sem_lock:
         if _request_sem is None:
-            _request_sem = threading.Semaphore(_max_concurrent_requests())
+            _sem_capacity = _max_concurrent_requests()
+            _request_sem = threading.Semaphore(_sem_capacity)
         return _request_sem
 
 
 def _reset_request_semaphore_for_tests() -> None:
     """Test hook: drop the cached semaphore so env changes take effect."""
-    global _request_sem
+    global _request_sem, _sem_capacity, _sem_in_flight, _sem_peak_in_flight
+    global _sem_wait_count, _sem_total_wait_ms
     with _sem_lock:
         _request_sem = None
+        _sem_capacity = 0
+        _sem_in_flight = 0
+        _sem_peak_in_flight = 0
+        _sem_wait_count = 0
+        _sem_total_wait_ms = 0.0
+
+
+def semaphore_stats() -> dict:
+    """Snapshot occupancy / queue telemetry for tests and live audit."""
+    with _sem_lock:
+        return {
+            "capacity": int(_sem_capacity or _max_concurrent_requests()),
+            "in_flight": int(_sem_in_flight),
+            "peak_in_flight": int(_sem_peak_in_flight),
+            "wait_count": int(_sem_wait_count),
+            "total_wait_ms": float(_sem_total_wait_ms),
+        }
+
+
+def _is_read_timeout(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "timed out" in text
+        or "timeout" in text
+        or "read operation timed out" in text
+        or isinstance(exc, TimeoutError)
+    )
 
 # Contract-shaped message for the Heavy-only OAuth API gate (issue #26847).
 TIER_DENIED_REASON = (
@@ -595,25 +648,80 @@ class XAISubProvider(Provider):
             "max_tokens": max_tokens,
         }
         # Bound concurrent sibling DL calls (mega-2 timeout storm under fan-out).
+        # mega-5: record queue_wait + occupancy so timeouts can be attributed to
+        # serialization vs remote load; one bounded retry on read timeout.
         sem = _request_semaphore()
-        acquired = sem.acquire()
-        try:
+        attempts = 1 + _read_timeout_retries()
+        last_exc: BaseException | None = None
+        resp: dict | None = None
+        for attempt in range(attempts):
+            wait_t0 = time.monotonic()
+            acquired = sem.acquire()
+            wait_ms = (time.monotonic() - wait_t0) * 1000.0
+            global _sem_in_flight, _sem_peak_in_flight, _sem_wait_count, _sem_total_wait_ms
+            with _sem_lock:
+                if wait_ms > 1.0:
+                    _sem_wait_count += 1
+                    _sem_total_wait_ms += wait_ms
+                if acquired:
+                    _sem_in_flight += 1
+                    if _sem_in_flight > _sem_peak_in_flight:
+                        _sem_peak_in_flight = _sem_in_flight
             try:
-                resp = self._post_once(body)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 401:
-                    body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
-                    if exc.code == 403:
-                        raise XaiTierDeniedError(body_excerpt) from exc
-                    raise RuntimeError(
-                        f"POST {CHAT_COMPLETIONS_URL} returned HTTP {exc.code}: "
-                        f"{body_excerpt}"
-                    ) from exc
-                self.refresh()
-                resp = self._post_once(body)
-        finally:
-            if acquired:
-                sem.release()
+                if wait_ms > 1.0:
+                    log.info(
+                        "xai_sub semaphore queue_wait_ms=%.1f attempt=%d "
+                        "in_flight=%d capacity=%d",
+                        wait_ms, attempt + 1,
+                        semaphore_stats()["in_flight"],
+                        semaphore_stats()["capacity"],
+                    )
+                try:
+                    resp = self._post_once(body)
+                    last_exc = None
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 401:
+                        body_excerpt = exc.read().decode(
+                            "utf-8", errors="replace")[:400]
+                        if exc.code == 403:
+                            raise XaiTierDeniedError(body_excerpt) from exc
+                        raise RuntimeError(
+                            f"POST {CHAT_COMPLETIONS_URL} returned HTTP "
+                            f"{exc.code}: {body_excerpt}"
+                        ) from exc
+                    self.refresh()
+                    try:
+                        resp = self._post_once(body)
+                        last_exc = None
+                        break
+                    except Exception as exc2:  # noqa: BLE001
+                        last_exc = exc2
+                        if not _is_read_timeout(exc2) or attempt + 1 >= attempts:
+                            raise
+                        log.warning(
+                            "xai_sub read timeout after refresh; retry %d/%d",
+                            attempt + 1, attempts - 1,
+                        )
+                        continue
+                except Exception as exc:  # noqa: BLE001 — retry only read timeouts
+                    last_exc = exc
+                    if not _is_read_timeout(exc) or attempt + 1 >= attempts:
+                        raise
+                    log.warning(
+                        "xai_sub read timeout; retry %d/%d (queue_wait_ms=%.1f)",
+                        attempt + 1, attempts - 1, wait_ms,
+                    )
+                    continue
+            finally:
+                if acquired:
+                    with _sem_lock:
+                        _sem_in_flight = max(0, _sem_in_flight - 1)
+                    sem.release()
+        if last_exc is not None:
+            raise last_exc
+        if resp is None:
+            raise RuntimeError("xAI complete_ex produced no response")
 
         choices = resp.get("choices") or []
         if not choices:

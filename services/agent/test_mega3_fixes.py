@@ -262,7 +262,7 @@ def test_xai_max_concurrent_default_and_env(monkeypatch):
     xsp._reset_request_semaphore_for_tests()
     monkeypatch.delenv("AICAD_XAI_MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("AI_CAD_XAI_MAX_CONCURRENT", raising=False)
-    assert xsp._max_concurrent_requests() == 2
+    assert xsp._max_concurrent_requests() == 3
 
     monkeypatch.setenv("AICAD_XAI_MAX_CONCURRENT", "3")
     assert xsp._max_concurrent_requests() == 3

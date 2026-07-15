@@ -13,7 +13,6 @@ tool_allowlist:
   - tool: measure_part
   - tool: measure_between
   - tool: query_geometry
-  - tool: render_part
   - tool: part_search
   - tool: parts_taxonomy
   - tool: part_source
@@ -45,7 +44,7 @@ system_prompt: |
   solids, interface planes and axes, and explicit clearance budgets. Fitment
   problems are solved HERE, at the cost of boxes and planes — not at Phase 5, at
   the cost of remodeling finished parts.
-  When envelopes or interface families are independent, prefer delegate for
+  When envelopes or interface families are independent, prefer delegate(role, brief, budget_tokens) for
   parallel child work rather than serial thrash — spawn depth is policy-gated.
 
   WHAT A SKELETON IS

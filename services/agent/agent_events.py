@@ -210,6 +210,40 @@ def spawn_event(
     return "agent.spawn", payload
 
 
+def model_assignment_event(
+    node_id: str, *, depth: int = 0, task_class: str | None = None,
+    min_rank: int | None = None, picked_model: str = "",
+    picked_provider: str = "", cost_tier: int | None = None,
+    mode: str = "", rank: int | None = None, reason: str = "",
+    subagent_id: str | None = None, role: str = "",
+    span_id: str | None = None, parent_id: str | None = None,
+    actor: str | None = None,
+) -> tuple[str, dict]:
+    """Emit auto/fixed model assignment audit for a spawn (mega-5 watch-list).
+
+    Payload is the assignment table row: depth, task_class, min_rank,
+    picked_model, cost_tier (+ provider/mode/rank/reason for grading).
+    """
+    payload = _linkage(node_id, span_id=span_id or new_span_id(),
+                       parent_id=parent_id, actor=actor)
+    payload.update({
+        "depth": int(depth),
+        "task_class": (task_class or "") or "unknown",
+        "min_rank": int(min_rank) if min_rank is not None else None,
+        "picked_model": picked_model or "",
+        "picked_provider": picked_provider or "",
+        "cost_tier": int(cost_tier) if cost_tier is not None else None,
+        "mode": mode or "",
+        "rank": int(rank) if rank is not None else None,
+        "reason": _cap(reason, 160),
+        "role": role or "",
+    })
+    if subagent_id:
+        payload["subagent_id"] = subagent_id
+    return "agent.model_assignment", payload
+
+
+
 def advisor_event(
     node_id: str, kind: str, verdict_summary: str = "", *,
     span_id: str | None = None, parent_id: str | None = None,

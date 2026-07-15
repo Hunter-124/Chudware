@@ -1999,8 +1999,38 @@ def run_mission(
                         delegation_tree=delegation_tree, on_event=on_event)
                 except Exception:  # noqa: BLE001 — fall back to executor default
                     effective_agent_fn = None
+            # mega-5: advance stage_log cursor as DAG nodes start/finish so the
+            # mission does not look stuck at INTAKE for the whole run.
+            _live_phase_state: dict = {"cursor": "intake"}
+
+            def _dag_emit(kind, payload=None, **_kw):  # noqa: ANN001
+                # Executor always uses emit(kind: str, payload: dict).
+                try:
+                    if on_event is not None:
+                        on_event(kind, payload if payload is not None else {})
+                except TypeError:
+                    # loop.py live convention: sink(data) with kind inside.
+                    try:
+                        if on_event is not None:
+                            data = dict(payload or {})
+                            data.setdefault("kind", kind)
+                            on_event(data)
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    _live_phase_cursor_on_dag_event(
+                        str(kind),
+                        payload if isinstance(payload, dict) else {},
+                        ledger=ledger, on_event=on_event, run_id=run_id,
+                        state=_live_phase_state,
+                    )
+                except Exception:  # noqa: BLE001 — never block DAG on cursor
+                    pass
+
             dag_result = _dag_exec.run(
-                graph, run_id=run_id, emit=on_event, agent_fn=effective_agent_fn,
+                graph, run_id=run_id, emit=_dag_emit, agent_fn=effective_agent_fn,
                 autonomy_default=autonomy_default)
         except Exception as exc:  # noqa: BLE001
             # DAG execution failure does not corrupt the mission record; report it.
@@ -2038,6 +2068,73 @@ def run_mission(
         ledger_path=str(ledger.path) if ledger else None,
         phases_completed=completed, dag_run=dag_result, stop_reason=stop_reason,
         findings=[str(f) for f in findings])
+
+
+
+def _phase_for_node_id(node_id: str) -> str | None:
+    """Map a mission DAG node id onto its phase name (or None)."""
+    nid = str(node_id or "")
+    if not nid:
+        return None
+    if nid == "n_intake" or nid.startswith("n_intake"):
+        return "intake"
+    for phase_name, prefixes in _PHASE_NODE_PREFIXES:
+        if any(nid.startswith(p) for p in prefixes):
+            return phase_name
+    return None
+
+
+def _live_phase_cursor_on_dag_event(
+    kind: str,
+    payload: dict | None,
+    *,
+    ledger=None,
+    on_event: "EventFn | None" = None,
+    run_id: str | None = None,
+    state: dict | None = None,
+) -> None:
+    """Mid-run stage_log cursor: enter the furthest phase the DAG has started.
+
+    mega-5 fingerprint: stage_log stayed INTAKE-only for the whole multi-node
+    DAG; reconciliation only ran after ``dag.run.done``. This is cursor-only
+    (enter / mission_phase emit) — never invents exit gates or
+    phases_completed. Soft / false-completion rules stay in
+    ``_drive_phases_from_dag``.
+    """
+    if kind not in ("dag.node.started", "dag.node.done", "dag.node.failed",
+                    "dag.node.paused"):
+        return
+    if not isinstance(payload, dict):
+        return
+    phase_name = _phase_for_node_id(str(payload.get("node_id") or ""))
+    if not phase_name or phase_name == "intake":
+        return
+    order = [p for p, _ in _PHASE_NODE_PREFIXES]
+    try:
+        idx = order.index(phase_name)
+    except ValueError:
+        return
+    st = state if isinstance(state, dict) else {}
+    last = st.get("cursor")
+    last_i = -1
+    if last in order:
+        last_i = order.index(last)
+    if idx <= last_i:
+        return
+    # Enter every skipped intermediate so stage_log is contiguous.
+    for name in order[last_i + 1 : idx + 1]:
+        if ledger is not None:
+            try:
+                ledger.log_stage("pipeline", name)
+            except Exception:  # noqa: BLE001
+                pass
+        if on_event is not None:
+            try:
+                _emit(on_event, kind="mission_phase", run_id=run_id,
+                      phase=name, text=f"Phase {name} (live DAG cursor)")
+            except Exception:  # noqa: BLE001
+                pass
+    st["cursor"] = phase_name
 
 
 # The mission-template phase order the machine walks after INTAKE (CLARIFY is

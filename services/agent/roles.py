@@ -209,14 +209,22 @@ class RoleCard:
         when populated; falls back to a curated seed list for families the
         catalog has not registered yet (e.g. firmware tools registered without
         a family view). Order preserves allowlist order; de-duped.
+
+        mega-5: family expansion must NOT blow past ``MAX_TOOLS_PER_ROLE``.
+        Live SPECIFY slots rendered 41 tools / ~2284 tokens under 5-way fan-out
+        and timed out on xAI; the contract cap is 14. Explicit ``tool:`` entries
+        always win a seat; family expansions fill remaining slots only.
         """
-        out: list[str] = []
+        explicit: list[str] = []
+        # Per-family expansion queues (round-robin fill so one huge family cannot
+        # monopolize the remaining seats — mega-5 SPECIFY need ecad+fw+em).
+        family_queues: list[list[str]] = []
         seen: set[str] = set()
 
-        def _add(name: str) -> None:
+        def _add(dest: list[str], name: str) -> None:
             if name and name not in seen:
                 seen.add(name)
-                out.append(name)
+                dest.append(name)
 
         catalog: dict[str, dict] = {}
         try:
@@ -227,20 +235,42 @@ class RoleCard:
 
         for ref in self.tool_allowlist:
             if ref.tool:
-                _add(ref.tool)
+                _add(explicit, ref.tool)
                 continue
             if not ref.family:
                 continue
             fam = ref.family
-            # Catalog expansion (preferred — real registered names).
-            for name, meta in catalog.items():
-                if (meta or {}).get("family") == fam:
-                    _add(name)
-            # Seed fallbacks when the catalog is empty (headless / pre-register).
-            if not any((meta or {}).get("family") == fam for meta in catalog.values()):
-                for name in _FAMILY_SEED_TOOLS.get(fam, ()):
-                    _add(name)
-        return out
+            fam_names = [
+                name for name, meta in catalog.items()
+                if (meta or {}).get("family") == fam
+            ]
+            if not fam_names:
+                fam_names = list(_FAMILY_SEED_TOOLS.get(fam, ()))
+            q: list[str] = []
+            for name in fam_names:
+                if name and name not in seen and name not in q:
+                    q.append(name)
+            if q:
+                family_queues.append(q)
+
+        out = list(explicit)
+        # Round-robin one tool per family until cap or queues empty.
+        while len(out) < MAX_TOOLS_PER_ROLE and any(family_queues):
+            progressed = False
+            for q in family_queues:
+                if len(out) >= MAX_TOOLS_PER_ROLE:
+                    break
+                while q:
+                    name = q.pop(0)
+                    if name not in seen:
+                        seen.add(name)
+                        out.append(name)
+                        progressed = True
+                        break
+            if not progressed:
+                break
+        # Absolute ceiling for tools_slot prompt size (contract max_tools_per_role).
+        return out[:MAX_TOOLS_PER_ROLE]
 
     def apply_tool_policy(self, registry: Any) -> list[str]:
         """Bind this role's allowlist into the MCP tool_registry — the ONE dispatch

@@ -154,32 +154,26 @@ def make_default_agent_fn(ledger=None,
 def _resolve_provider(context_pack: dict[str, Any], provider=None):
     """Resolve the provider for one node's agent turn.
 
-    Priority (highest first):
-      1. *provider* — injected by the caller (``make_default_agent_fn(provider=...)``,
-         which ``loop.run_mission`` uses to thread its OWN already-resolved provider
-         into every internal node — the direct fix for a mission started on a
-         local tier leaking internal nodes to the ambient cloud default).
-      2. A ``tier`` recorded on this node (``node_inputs['tier']``, set by
-         ``mission_template.build_mission_graph(tier=...)`` when a caller compiles
-         the graph with a tier but has no Provider object in hand — e.g.
-         ``mission_start(tier=...)`` over MCP followed by ``dag_run``) or on the
-         context pack directly. Resolved via the single shared
-         ``services.agent.tiers.provider_for_tier`` seam (also used by the gym).
-      3. WS2 ``ai_roles`` / auto ranking pick via ``role_models.resolve_for_node``
-         when config.json has an ``ai_roles`` block (or role is redaction).
-      4. The ambient ``config.get_provider()`` default — UNCHANGED behaviour for
-         any node whose graph/caller specifies neither a provider nor a tier.
+    Priority (highest first) — mega-5 SuperGrok quota fix:
+      1. Difficulty-aware auto / ai_roles pick via ``role_models`` (full enabled
+         provider set). Leaf / low min_rank work must NOT inherit the mission's
+         frontier xAI binding.
+      2. *provider* injected by the caller — fallback when auto-pick fails
+         (keeps gym local-tier missions from crashing; never overrides a
+         successful cheaper auto pick).
+      3. A ``tier`` recorded on this node / context pack via
+         ``services.agent.tiers.provider_for_tier``.
+      4. Ambient ``config.get_provider()`` default.
     """
-    if provider is not None:
-        return provider
     node_inputs = context_pack.get("node_inputs") or {}
-    tier = node_inputs.get("tier") or context_pack.get("tier")
-    if tier:
-        from services.agent.tiers import provider_for_tier  # noqa: PLC0415
-        return provider_for_tier(tier)
-    # WS2: per-role / auto model assignment when ai_roles is configured.
+    # WS2/WS4 + mega-5: difficulty-aware pick first (even without ai_roles).
     try:
-        from services.agent.role_models import resolve_for_node  # noqa: PLC0415
+        from services.agent.role_models import (  # noqa: PLC0415
+            cost_tier_for,
+            min_rank_for_difficulty,
+            resolve_for_node,
+            resolve_role_model,
+        )
         from services.agent import config as agent_config  # noqa: PLC0415
         role = (
             context_pack.get("role_id")
@@ -187,18 +181,114 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
             or context_pack.get("role")
             or "default"
         )
-        assignment = resolve_for_node(str(role), context_pack)
-        if assignment is not None:
-            cfg = dict(agent_config.load_config())
-            cfg["model"] = assignment.model
-            # Stash the pick for observability (ledger / HUD consumers).
+        # Map DAG/mission roles onto harness ai_roles keys.
+        role_s = str(role).strip().lower()
+        harness_role = "task"
+        if role_s in ("overseer", "orchestrator", "department_manager", "planning"):
+            harness_role = "planning"
+        elif role_s in ("advisor", "reviewer"):
+            harness_role = "advisor"
+        elif role_s in ("default", "intake", "intake_analyst"):
+            harness_role = "default"
+
+        try:
+            depth = int(
+                context_pack.get("depth")
+                or node_inputs.get("depth")
+                or 0
+            )
+        except (TypeError, ValueError):
+            depth = 0
+        task_class = (
+            context_pack.get("task_class")
+            or node_inputs.get("task_class")
+            or context_pack.get("taskClass")
+        )
+        risk = context_pack.get("risk") or node_inputs.get("risk")
+        min_rank = min_rank_for_difficulty(
+            task_class=str(task_class) if task_class else None,
+            node_depth=depth,
+            risk=str(risk) if risk else None,
+        )
+        cfg = dict(agent_config.load_config() or {})
+        assignment = resolve_for_node(harness_role, context_pack, cfg=cfg)
+        if assignment is None or (
+            assignment.mode == "fixed"
+            and str(assignment.provider).startswith("xai")
+            and min_rank < 5
+            and depth > 0
+        ):
             try:
-                context_pack["role_model"] = assignment.to_dict()
+                assignment = resolve_role_model(
+                    harness_role,
+                    cfg,
+                    task_class=str(task_class) if task_class else None,
+                    node_depth=depth,
+                    risk=str(risk) if risk else None,
+                    min_rank=min_rank,
+                )
+            except Exception:  # noqa: BLE001
+                if assignment is None:
+                    raise
+        if assignment is not None:
+            cfg_pick = dict(cfg)
+            cfg_pick["model"] = assignment.model
+            # Cap reasoning effort for non-frontier ranks (quota + cost).
+            rank = int(assignment.rank or min_rank or 3)
+            if rank <= 2:
+                cfg_pick["reasoning_effort"] = "low"
+            elif rank <= 3:
+                cfg_pick["reasoning_effort"] = "medium"
+            # Retries are cheaper: drop one effort band.
+            try:
+                retry_rem = int(context_pack.get("retry_remaining") or 0)
+            except (TypeError, ValueError):
+                retry_rem = 0
+            # Heuristic: if already retried (retry_remaining small relative to
+            # typical budget 2+), force low effort.
+            if retry_rem == 1 or context_pack.get("retry_cheap"):
+                cfg_pick["reasoning_effort"] = "low"
+            if assignment.provider == "ollama":
+                # OpenAI-compatible local Ollama endpoint.
+                ocfg = dict(cfg_pick.get("ollama") or {})
+                ocfg.setdefault("base_url", "http://127.0.0.1:11434/v1")
+                cfg_pick["ollama"] = ocfg
+                oai = dict(cfg_pick.get("openai") or {})
+                oai["base_url"] = ocfg.get("base_url") or "http://127.0.0.1:11434/v1"
+                oai.setdefault("api_key", "ollama")
+                cfg_pick["openai"] = oai
+            try:
+                context_pack["role_model"] = {
+                    **assignment.to_dict(),
+                    "min_rank": min_rank,
+                    "cost_tier": cost_tier_for(
+                        assignment.provider, assignment.model),
+                    "depth": depth,
+                    "task_class": task_class or "unknown",
+                    "reasoning_effort": cfg_pick.get("reasoning_effort"),
+                }
             except Exception:  # noqa: BLE001
                 pass
-            return agent_config.get_provider(name=assignment.provider, cfg=cfg)
+            prov_name = assignment.provider
+            if prov_name == "ollama":
+                prov_name = "openai"
+                cfg_pick.setdefault(
+                    "api_key",
+                    (cfg_pick.get("openai") or {}).get("api_key") or "ollama",
+                )
+            try:
+                return agent_config.get_provider(name=prov_name, cfg=cfg_pick)
+            except Exception:  # noqa: BLE001 — try next priority
+                pass
     except Exception:  # noqa: BLE001 — never block node on role_models
         pass
+
+    if provider is not None:
+        return provider
+    tier = node_inputs.get("tier") or context_pack.get("tier")
+    if tier:
+        from services.agent.tiers import provider_for_tier  # noqa: PLC0415
+        return provider_for_tier(tier)
     from services.agent import config  # noqa: PLC0415 — real import, no wrong name
     return config.get_provider()
 
@@ -453,6 +543,22 @@ def run(
     success: bool = bool(getattr(agent_result, "success", False))
 
     verdict = _map_verdict(stop_reason, success)
+    # mega-5: a single retryable provider read-timeout must not exhaust the
+    # node — honor agent_result.result["retryable"] when stop_reason=failed.
+    if (
+        verdict == VERDICT_ESCALATE
+        and not success
+        and stop_reason == "failed"
+    ):
+        agent_result_dict_probe = getattr(agent_result, "result", None) or {}
+        if isinstance(agent_result_dict_probe, dict) and agent_result_dict_probe.get("retryable") is True:
+            verdict = VERDICT_RETRY
+            # Next attempt should prefer cheaper effort/provider band.
+            try:
+                context_pack["retry_cheap"] = True
+            except Exception:  # noqa: BLE001
+                pass
+
 
     # Consume retry budget when the verdict is retry.
     new_retry_remaining = retry_remaining

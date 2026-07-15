@@ -129,3 +129,13 @@ models:
     rank: 1
     source: shipped
     notes: "public evals 2026-07 local utility, replace with measured"
+  - id: llama3.2:latest
+    provider: ollama
+    rank: 1
+    source: shipped
+    notes: "local ollama utility, mega-5 quota routing"
+  - id: llama3.2
+    provider: ollama
+    rank: 1
+    source: shipped
+    notes: "local ollama utility alias"

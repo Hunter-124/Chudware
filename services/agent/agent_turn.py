@@ -1091,6 +1091,22 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     "(errors==0 or honest FAIL with named residuals). Call it NOW."
                 )})
 
+            # mega-15: after DRC (or board+wire), re-run ERC so AC4 grades
+            # post-wire power topology — not the pre-wire place-only state.
+            if (
+                ok
+                and tool in ("ecad_run_drc", "board_from_schematic", "ecad_make_board",
+                             "ecad_wire", "ecad_add_power")
+                and "ecad_run_erc" in _allow_s
+                and "ecad_run_erc" not in _ok_tools
+                and (_has_wire or _ecad_has_real_wire(calls))
+            ):
+                messages.append({"role": "user", "content": _parts(
+                    "[ECAD enablement] Nets present — re-run ecad_run_erc NOW so "
+                    "AC4 grades post-wire power (power_not_driven must clear). "
+                    "Do not hand off until ERC re-runs after wire/power."
+                )})
+
             # Soft-block empty-netlist SPICE: after simulate attempt without wire, re-nudge.
             if (
                 tool == "ecad_simulate"
@@ -1526,6 +1542,59 @@ def _ecad_last_place_refs(calls: list) -> list[str]:
     return out
 
 
+def _ecad_parse_result(result: Any) -> dict:
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            obj = json.loads(result)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _ecad_place_pin_records(calls: list) -> list[dict]:
+    """Flatten pin records from successful ecad_place_symbol results.
+
+    Each record: {ref, pin, name, type, x, y} — used for concrete force-inject
+    wire/power args (mega-15: model never supplies these unaided).
+    """
+    out: list[dict] = []
+    for c in calls or []:
+        if not (c.get("ok") and c.get("tool") == "ecad_place_symbol"):
+            continue
+        res = _ecad_parse_result(c.get("result"))
+        ref = res.get("ref") or (c.get("args") or {}).get("ref")
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        ref = ref.strip()
+        pins = res.get("pins")
+        if not isinstance(pins, list):
+            continue
+        for p in pins:
+            if not isinstance(p, dict):
+                continue
+            num = p.get("number") or p.get("pin") or p.get("name")
+            if num is None:
+                continue
+            xy = p.get("xy") or p.get("pos") or [0.0, 0.0]
+            try:
+                x = float(xy[0]) if isinstance(xy, (list, tuple)) and xy else 0.0
+                y = float(xy[1]) if isinstance(xy, (list, tuple)) and len(xy) > 1 else 0.0
+            except (TypeError, ValueError, IndexError):
+                x, y = 0.0, 0.0
+            out.append({
+                "ref": ref,
+                "pin": str(num),
+                "name": str(p.get("name") or ""),
+                "type": str(p.get("type") or "passive").lower(),
+                "x": x,
+                "y": y,
+            })
+    return out
+
+
 def _ecad_place_is_passive(call: dict) -> bool:
     """True when a place_symbol call looks like R/C/L/V/I with a VALUE."""
     blob = json.dumps(
@@ -1610,6 +1679,16 @@ def _ecad_chain_need(
         return "ecad_wire"
     if has_board and not has_drc and "ecad_run_drc" in allow_set:
         return "ecad_run_drc"
+    # mega-15: re-run ERC after wire/board so AC4 grades post-wire power state.
+    has_erc = "ecad_run_erc" in ok_tools
+    if (
+        has_wire
+        and has_board
+        and has_drc
+        and not has_erc
+        and "ecad_run_erc" in allow_set
+    ):
+        return "ecad_run_erc"
     return None
 
 
@@ -1652,7 +1731,15 @@ def _ecad_has_real_wire(calls: list) -> bool:
 
 
 def _ecad_forced_tool_args(need: str, calls: list) -> dict:
-    """Minimal honest args for a forced chain step (never invents success)."""
+    """Minimal honest args for a forced chain step (never invents success).
+
+    mega-15: derive CONCRETE pin/net/xy from placed-symbol results so force-
+    injected ecad_wire / ecad_add_power actually bond nets (AC4 power_not_driven
+    + AC5 empty netlist residuals). Orphan power at (0,0) does not drive pins.
+    """
+    pins = _ecad_place_pin_records(calls)
+    refs = _ecad_last_place_refs(calls)
+
     if need == "ecad_place_symbol":
         # SPICE-capable passive — AC5 residual was IC-only (no sim models).
         return {
@@ -1661,39 +1748,117 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
             "x": 20.0,
             "y": 20.0,
         }
+
     if need == "ecad_add_power":
-        # Alternate rails if GND already present.
-        if any(
+        # Prefer bonding onto a real pin xy (power_in / GND / VCC / passive).
+        gnd_pins = [
+            p for p in pins
+            if (
+                "gnd" in p["name"].lower()
+                or p["name"].upper() in ("0", "VSS", "AGND", "DGND")
+                or (
+                    p["type"] in ("power_in", "power_out", "power")
+                    and (
+                        "gnd" in p["name"].lower()
+                        or "vss" in p["name"].lower()
+                    )
+                )
+            )
+        ]
+        pwr_pins = [
+            p for p in pins
+            if p["type"] in ("power_in", "power_out", "power")
+            or any(
+                tok in p["name"].upper()
+                for tok in ("VCC", "VDD", "3V3", "3.3", "5V", "+3", "+5", "VIN")
+            )
+        ]
+        has_gnd = any(
             c.get("ok") and c.get("tool") == "ecad_add_power"
             and "GND" in json.dumps(c.get("args") or {}, default=str)
             for c in calls
-        ):
-            return {"net": "3V3"}
-        return {"net": "GND"}
+        )
+        if has_gnd:
+            target = next(
+                (p for p in pwr_pins if "gnd" not in p["name"].lower()),
+                (pwr_pins[0] if pwr_pins else None),
+            )
+            if target is None and pins:
+                target = pins[0]
+            if target is not None:
+                return {
+                    "net": "3V3",
+                    "x": float(target["x"]),
+                    "y": float(target["y"]),
+                }
+            return {"net": "3V3", "x": 0.0, "y": 10.0}
+        # First power port: bond GND onto a GND-like pin if possible.
+        target = gnd_pins[0] if gnd_pins else (
+            next(
+                (
+                    p for p in pins
+                    if p["ref"].upper().startswith(("R", "C", "L"))
+                    and p["pin"] in ("1", "2")
+                ),
+                pins[0] if pins else None,
+            )
+        )
+        if target is not None:
+            return {
+                "net": "GND",
+                "x": float(target["x"]),
+                "y": float(target["y"]),
+            }
+        return {"net": "GND", "x": 0.0, "y": 0.0}
+
     if need == "ecad_wire":
-        refs = _ecad_last_place_refs(calls)
-        # Prefer wire passive R* to an IC pin when both exist.
+        # Prefer pin records with real numbers from place results.
+        by_ref: dict[str, list[dict]] = {}
+        for p in pins:
+            by_ref.setdefault(p["ref"], []).append(p)
         passive_refs = [
             r for r in refs
             if r.upper().startswith(("R", "C", "L", "V", "I"))
         ]
         ic_refs = [r for r in refs if r not in passive_refs]
+
+        def _pin_of(ref: str, prefer: str | None = None) -> str:
+            plist = by_ref.get(ref) or []
+            if prefer:
+                for p in plist:
+                    if p["pin"] == prefer:
+                        return p["pin"]
+            if plist:
+                return plist[0]["pin"]
+            return prefer or "1"
+
         if passive_refs and ic_refs:
+            a, b = passive_refs[0], ic_refs[0]
             return {
-                "from_ref": passive_refs[0], "from_pin": "1",
-                "to_ref": ic_refs[0], "to_pin": "1",
+                "from_ref": a, "from_pin": _pin_of(a, "1"),
+                "to_ref": b, "to_pin": _pin_of(b, "1"),
+            }
+        if len(refs) >= 2:
+            a, b = refs[0], refs[1]
+            return {
+                "from_ref": a, "from_pin": _pin_of(a, "1"),
+                "to_ref": b, "to_pin": _pin_of(b, "1"),
             }
         a = refs[0] if refs else "R1"
-        b = refs[1] if len(refs) > 1 else None
-        if b and b != a:
-            return {
-                "from_ref": a, "from_pin": "1",
-                "to_ref": b, "to_pin": "1",
-            }
+        # Single ref: wire pin1→pin2 on same device (R/C) for a net.
+        pin_a = _pin_of(a, "1")
+        pin_b = "2"
+        if by_ref.get(a):
+            nums = [p["pin"] for p in by_ref[a]]
+            if len(nums) >= 2:
+                pin_a, pin_b = nums[0], nums[1]
         return {
-            "from_ref": a, "from_pin": "1",
-            "to_ref": a, "to_pin": "2",
+            "from_ref": a, "from_pin": pin_a,
+            "to_ref": a, "to_pin": pin_b,
         }
+
+    if need == "ecad_run_erc":
+        return {}
     return {}
 
 

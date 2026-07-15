@@ -285,3 +285,26 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   typed-refusal live; phase cursor honesty.
   Findings: `reports/runs/mega-14/findings.md`.
 
+- 2026-07-15 mega-15 (WS5): schematic wire+power force-inject + battery
+  invocation fixes under `reports/runs/mega-15/` (primary graded
+  `mega-15-fc-rocket-20260715-a3`). Baseline `17b05635`. Fixer15
+  (CloseLynx) bound battery arg adapters + honest SKIP + pin-aware
+  `ecad_wire`/`ecad_add_power` force-inject + ERC-after-DRC (128p).
+  Preflight PASS (hostd match; Fix8+Fix-wire gates; auto_pick).
+  **a1** archived (`attempt-1-xai-quota-blocked/`): both SuperGrok
+  accounts `personal-team-blocked:spending-limit`, wall 22s.
+  **a2** archived (`attempt-2-openrouter-daily-cap/`): free frontier
+  `nvidia/nemotron-3-ultra-550b-a55b:free` wall 240s; **V PASS**, **W
+  FAIL** (OpenRouter free-models-per-day 429 on BUILD; force_inject=0),
+  **X PASS**, live AC PASS=1 (AC6).
+  **a3 LOCAL-ONLY** offline `local-24k-gemma3-qat` (llama-server :1234)
+  wall **73.73s**, terminal `needs_correction`/`verify_failed:
+  [AC1,AC2,AC4,AC5]` (**AC3+AC6+AC7+AC8+AC9 PASS** = 5 live). Scoreboard:
+  **V PASS**, **W UNTESTABLE** (schematic open only; ctx slot 4096
+  overflow before place thrash — force_inject never fired; inject still
+  unit-bound), **X PASS**, **U PASS**, **N PASS**, live AC PASS=5
+  (target ≥8 miss). Full quota story: xai both accounts + openrouter
+  daily + local ctx. **grok-4.5 revalidation deferred**.
+  Findings: `reports/runs/mega-15/findings.md`.
+
+

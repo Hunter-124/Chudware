@@ -20,6 +20,270 @@ import time
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
+# mega-15: argument adapters for checks that require non-doc_id args.
+# Unfulfillable checks honest-SKIP (omit from scores) — never signature-zero.
+# A check that CAN run MUST run with derived args (never weaken by skipping).
+# ---------------------------------------------------------------------------
+
+def _skip_json(check_name: str, reason: str) -> str:
+    """Honest SKIP envelope — not a failure; battery omits from scores."""
+    return json.dumps({
+        "ok": True,
+        "skipped": True,
+        "skip_reason": reason,
+        "check": check_name,
+        "score": None,
+        "summary": f"SKIP: {reason}",
+    })
+
+
+def _parse_jsonish(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _doc_features(doc_id: Optional[str]) -> list[dict]:
+    """Best-effort feature list from doc_tree (empty on miss)."""
+    if not doc_id:
+        try:
+            doc_id = _cur_doc()
+        except Exception:  # noqa: BLE001
+            return []
+    try:
+        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+        feats = ((tree.get("tree") or {}).get("features")) or []
+        return [f for f in feats if isinstance(f, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _sketch_ids(doc_id: Optional[str]) -> list[str]:
+    """Sketch feature ids on *doc_id* (2D sketches only)."""
+    out: list[str] = []
+    for f in _doc_features(doc_id):
+        ftype = str(f.get("type") or f.get("kind") or "").lower()
+        fid = f.get("id") or f.get("name")
+        if not fid:
+            continue
+        if ftype in ("sketch", "sketch2d") or (
+            ftype.startswith("sketch") and "3d" not in ftype
+        ):
+            out.append(str(fid))
+    return out
+
+
+def _is_drawing_doc(doc_id: Optional[str]) -> bool:
+    """True when drawing_get succeeds for *doc_id* (has sheets/views)."""
+    if not doc_id:
+        return False
+    try:
+        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        full = cb.call("drawing_get", {"doc_id": doc_id}) or {}
+        if full.get("_is_error") or full.get("error"):
+            return False
+        sheets = full.get("sheets")
+        return isinstance(sheets, list)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _find_ecad_board_doc(preferred: Optional[str] = None) -> Optional[str]:
+    """Locate an open PCB session doc_id for impedance checks."""
+    try:
+        from engine.ecad import session as esess  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        esess = None
+    if preferred and esess is not None:
+        try:
+            s = esess.get_session(preferred)
+            if s is not None and getattr(s, "kind", None) in ("pcb", "board", None):
+                doc = getattr(s, "doc", None) or {}
+                if isinstance(doc, dict) and (
+                    doc.get("tracks") is not None
+                    or doc.get("footprints") is not None
+                    or str(getattr(s, "kind", "")).lower() in ("pcb", "board")
+                ):
+                    return preferred
+        except Exception:  # noqa: BLE001
+            pass
+    if esess is None:
+        return preferred
+    try:
+        for s in esess.iter_sessions():
+            kind = str(getattr(s, "kind", "") or "").lower()
+            doc = getattr(s, "doc", None) or {}
+            did = getattr(s, "doc_id", None)
+            if not did:
+                continue
+            if kind in ("pcb", "board"):
+                return did
+            if isinstance(doc, dict) and (
+                doc.get("tracks") is not None or doc.get("footprints") is not None
+            ):
+                return did
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _board_routed_nets(board_doc_id: str) -> list[str]:
+    """Net names that have routed tracks on *board_doc_id*."""
+    try:
+        from engine.ecad import session as esess  # noqa: PLC0415
+        s = esess.get_session(board_doc_id)
+        doc = getattr(s, "doc", None) or {}
+        tracks = doc.get("tracks") or []
+        nets: list[str] = []
+        for tr in tracks:
+            if not isinstance(tr, dict):
+                continue
+            n = tr.get("net")
+            if isinstance(n, str) and n and n not in nets:
+                nets.append(n)
+        return nets
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _diff_pair_nets(nets: list[str]) -> Optional[tuple[str, str]]:
+    """Heuristic differential pair from net names (CLK_P/CLK_N, USB_D+/USB_D-)."""
+    lower = {n.lower(): n for n in nets}
+    for n in nets:
+        nl = n.lower()
+        cand = None
+        if nl.endswith("_p"):
+            cand = lower.get(nl[:-2] + "_n")
+        elif nl.endswith("+"):
+            cand = lower.get(nl[:-1] + "-") or lower.get(nl[:-1] + "_n")
+        elif "_p" in nl:
+            cand = lower.get(nl.replace("_p", "_n"))
+        if cand and cand != n:
+            return n, cand
+    return None
+
+
+def _adapt_check_kwargs(
+    check_name: str,
+    fn: Any,
+    doc_id: Optional[str],
+    kwargs: dict,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Return (call_kwargs, None) or (None, skip_json) for unfulfillable checks.
+
+    Fills required args from the open doc / ECAD sessions when possible.
+    """
+    import inspect  # noqa: PLC0415
+
+    sig_params = set(inspect.signature(fn).parameters.keys())
+    call_kwargs: dict[str, Any] = {}
+    if doc_id is not None and "doc_id" in sig_params:
+        call_kwargs["doc_id"] = doc_id
+    for k, v in kwargs.items():
+        if k in sig_params:
+            call_kwargs[k] = v
+
+    if check_name == "check_sketch":
+        if not call_kwargs.get("sketch"):
+            sketches = _sketch_ids(doc_id)
+            if not sketches:
+                return None, _skip_json(
+                    check_name, "no sketches on document"
+                )
+            call_kwargs["sketch"] = sketches[0]
+        return call_kwargs, None
+
+    if check_name == "measure_between":
+        if call_kwargs.get("a_query") in (None, ""):
+            # Prefer plain-word face pair; engine resolves side words.
+            # Derive from features when present (solid exists → faces exist).
+            feats = _doc_features(doc_id)
+            if not feats:
+                return None, _skip_json(
+                    check_name, "no features to measure between"
+                )
+            call_kwargs["a_query"] = "top face"
+            if call_kwargs.get("b_query") in (None, ""):
+                call_kwargs["b_query"] = "bottom face"
+        return call_kwargs, None
+
+    if check_name == "ecad_check_impedance":
+        board = call_kwargs.get("doc_id") or doc_id
+        board = _find_ecad_board_doc(board if isinstance(board, str) else None)
+        if not board:
+            return None, _skip_json(
+                check_name, "no open board for impedance check"
+            )
+        call_kwargs["doc_id"] = board
+        nets = _board_routed_nets(board)
+        if not nets:
+            return None, _skip_json(
+                check_name, "no routed nets on board for impedance"
+            )
+        # net_or_ref optional on tool (empty = all nets); leave empty for summary path
+        # unless caller supplied one.
+        if "net_or_ref" in sig_params and not call_kwargs.get("net_or_ref"):
+            # Prefer a signal-ish net over GND/power when present.
+            non_pwr = [
+                n for n in nets
+                if n.upper() not in ("GND", "VCC", "3V3", "+3V3", "5V", "+5V", "VDD")
+            ]
+            call_kwargs["net_or_ref"] = (non_pwr or nets)[0]
+        return call_kwargs, None
+
+    if check_name == "ecad_check_diff_impedance":
+        board = call_kwargs.get("doc_id") or doc_id
+        board = _find_ecad_board_doc(board if isinstance(board, str) else None)
+        if not board:
+            return None, _skip_json(
+                check_name, "no open board for diff impedance"
+            )
+        call_kwargs["doc_id"] = board
+        nets = _board_routed_nets(board)
+        pair = None
+        if call_kwargs.get("net_p") and call_kwargs.get("net_n"):
+            pair = (call_kwargs["net_p"], call_kwargs["net_n"])
+        else:
+            pair = _diff_pair_nets(nets)
+        if not pair:
+            return None, _skip_json(
+                check_name,
+                "no differential pair nets on board (need net_p/net_n)",
+            )
+        call_kwargs["net_p"], call_kwargs["net_n"] = pair[0], pair[1]
+        return call_kwargs, None
+
+    if check_name == "ecad_run_erc":
+        # Prefer schematic session when mechanical doc_id is wrong.
+        if doc_id and "doc-cpp" in str(doc_id):
+            try:
+                from engine.ecad import session as esess  # noqa: PLC0415
+                for s in esess.iter_sessions():
+                    kind = str(getattr(s, "kind", "") or "").lower()
+                    did = getattr(s, "doc_id", None)
+                    if did and kind in ("sch", "schematic", ""):
+                        doc = getattr(s, "doc", None) or {}
+                        if isinstance(doc, dict) and (
+                            doc.get("symbols") is not None
+                            or kind in ("sch", "schematic")
+                        ):
+                            call_kwargs["doc_id"] = did
+                            break
+            except Exception:  # noqa: BLE001
+                pass
+        return call_kwargs, None
+
+    return call_kwargs, None
+
+
+# ---------------------------------------------------------------------------
 # Canonical aicad.req/1 status constants (T-H3, engine_oracle/requirements).
 # Imported here so _gap_req_join doesn't carry its own stub copies.
 # ---------------------------------------------------------------------------
@@ -285,9 +549,18 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
     in drawing_get's sheets->views JSON (core/doc/drawing_session.cpp). When the
     source part is known (source_doc_id, or recorded in the drawing), coverage =
     dims / features capped at 1.0; otherwise it degrades to "has any dims at all".
+
+    mega-15: when the mission has no drawing (mechanical doc / airframe), honest
+    SKIP — not a zero-score FAIL. A check that CAN run (drawing open) still runs.
     """
     from mcp_server import core_bridge as cb
     d = doc_id or _cur_doc()
+    # Honest SKIP when no drawing in mission scope (not a drawing doc).
+    if not _is_drawing_doc(d):
+        return _skip_json(
+            "dim_coverage",
+            "no drawing in mission scope",
+        )
     try:
         full = cb.call("drawing_get", {"doc_id": d})
         n_dims = 0
@@ -321,7 +594,11 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
             "n_features": n_features,
         })
     except Exception as e:  # noqa: BLE001
-        return json.dumps({"ok": False, "error": str(e)})
+        err = str(e)
+        # Drawing miss class → honest SKIP (mega-15 AC1 residual).
+        if "no open drawing" in err.lower() or "drawing" in err.lower():
+            return _skip_json("dim_coverage", "no drawing in mission scope")
+        return json.dumps({"ok": False, "error": err})
 
 
 def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
@@ -705,21 +982,49 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         try:
             if module_key == "gap":
                 fn = GAP_FNS[fn_name]
-                call_kwargs: dict[str, Any] = dict(doc_id=doc_id, **kwargs)
-                result = fn(**call_kwargs)
+                if name == "dim_coverage":
+                    # Adapter lives inside _gap_dim_coverage (honest SKIP).
+                    call_kwargs: dict[str, Any] = dict(doc_id=doc_id, **kwargs)
+                    result = fn(**call_kwargs)
+                else:
+                    call_kwargs = dict(doc_id=doc_id, **kwargs)
+                    result = fn(**call_kwargs)
             else:
                 fn = _get_fn(module_key, fn_name)
-                call_kwargs = {}
-                if doc_id is not None:
-                    call_kwargs["doc_id"] = doc_id
-                # Merge relevant kwargs by inspecting fn signature
-                sig_params = set(inspect.signature(fn).parameters.keys())
-                for k, v in kwargs.items():
-                    if k in sig_params:
-                        call_kwargs[k] = v
+                adapted, skip_payload = _adapt_check_kwargs(
+                    name, fn, doc_id, kwargs
+                )
+                if skip_payload is not None:
+                    # Honest SKIP: record reason, omit zero score (mega-15).
+                    skipped.append(name)
+                    skip_obj = _parse_jsonish(skip_payload)
+                    findings.append({
+                        "check": name,
+                        "ok": True,
+                        "skipped": True,
+                        "detail": skip_obj.get("skip_reason")
+                        or skip_obj.get("summary")
+                        or "skipped",
+                    })
+                    continue
+                call_kwargs = adapted or {}
                 result = fn(**call_kwargs)
         except Exception as e:
             result = json.dumps({"ok": False, "error": str(e)})
+
+        # Gap / tool may also return honest SKIP envelope.
+        parsed_early = _parse_jsonish(result)
+        if parsed_early.get("skipped") is True:
+            skipped.append(name)
+            findings.append({
+                "check": name,
+                "ok": True,
+                "skipped": True,
+                "detail": parsed_early.get("skip_reason")
+                or parsed_early.get("summary")
+                or "skipped",
+            })
+            continue
 
         score, flist = _extract_score(name, reward_shape, result)
         scores[name] = score

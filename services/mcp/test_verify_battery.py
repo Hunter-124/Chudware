@@ -467,3 +467,267 @@ def test_gap_eval_check_direct_no_issues_scalar_fallback_not_ok(monkeypatch):
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
     assert r["ok"] is False
+
+
+# ── mega-15: battery argument adapters + honest SKIP ────────────────────────
+
+def test_adapt_check_sketch_skip_when_no_sketches(monkeypatch):
+    """check_sketch with no sketches → honest SKIP, not signature zero."""
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_sketch_ids", lambda doc_id: [])
+    monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: (lambda sketch, doc_id=None: __import__("json").dumps({"ok": True, "dof": 0})))
+
+    r = bat.verify("doc-mech", ["check_sketch"])
+    assert "check_sketch" in r["skipped"]
+    assert "check_sketch" not in r["scores"]
+    assert any(f.get("skipped") and f.get("check") == "check_sketch" for f in r["findings"])
+    assert any("no sketches" in (f.get("detail") or "") for f in r["findings"])
+
+
+def test_adapt_check_sketch_runs_with_derived_id(monkeypatch):
+    """check_sketch derives sketch id from doc and scores real path."""
+    from services.verify import battery as bat
+    import json
+
+    seen = {}
+
+    def _fn(sketch, doc_id=None):
+        seen["sketch"] = sketch
+        seen["doc_id"] = doc_id
+        return json.dumps({"ok": True, "dof": 0, "status": "full"})
+
+    monkeypatch.setattr(bat, "_sketch_ids", lambda doc_id: ["s1", "s2"])
+    monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
+
+    r = bat.verify("doc-mech", ["check_sketch"])
+    assert "check_sketch" not in r["skipped"]
+    assert r["scores"]["check_sketch"] == 1.0
+    assert seen["sketch"] == "s1"
+    assert seen["doc_id"] == "doc-mech"
+
+
+def test_adapt_measure_between_skip_no_features(monkeypatch):
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_doc_features", lambda doc_id: [])
+    monkeypatch.setattr(
+        bat, "_get_fn",
+        lambda mk, fn: (lambda a_query, b_query=None, doc_id=None: __import__("json").dumps({"ok": True})),
+    )
+    r = bat.verify("doc-mech", ["measure_between"])
+    assert "measure_between" in r["skipped"]
+    assert "measure_between" not in r["scores"]
+    assert any("no features" in (f.get("detail") or "") for f in r["findings"])
+
+
+def test_adapt_measure_between_runs_with_derived_queries(monkeypatch):
+    from services.verify import battery as bat
+    import json
+
+    seen = {}
+
+    def _fn(a_query, b_query=None, doc_id=None):
+        seen["a"] = a_query
+        seen["b"] = b_query
+        return json.dumps({"ok": True, "distance": 10.0})
+
+    monkeypatch.setattr(
+        bat, "_doc_features",
+        lambda doc_id: [{"id": "f1", "type": "box"}, {"id": "f2", "type": "fillet"}],
+    )
+    monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
+    r = bat.verify("doc-mech", ["measure_between"])
+    assert r["scores"]["measure_between"] == 1.0
+    assert seen["a"] == "top face"
+    assert seen["b"] == "bottom face"
+
+
+def test_adapt_dim_coverage_skip_no_drawing(monkeypatch):
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_is_drawing_doc", lambda doc_id: False)
+    r = bat.verify("doc-mech", ["dim_coverage"])
+    assert "dim_coverage" in r["skipped"]
+    assert "dim_coverage" not in r["scores"]
+    assert any(
+        "no drawing" in (f.get("detail") or "").lower()
+        for f in r["findings"]
+    )
+
+
+def test_adapt_dim_coverage_runs_on_drawing(monkeypatch):
+    from services.verify import battery as bat
+    import json
+
+    monkeypatch.setattr(bat, "_is_drawing_doc", lambda doc_id: True)
+
+    class _CB:
+        @staticmethod
+        def call(method, params):
+            if method == "drawing_get":
+                return {
+                    "sheets": [{
+                        "views": [{"annotations": [{"t": "d1"}, {"t": "d2"}]}],
+                    }],
+                    "source_doc_id": "part1",
+                }
+            if method == "doc_tree":
+                return {"tree": {"features": [{"id": "f1"}, {"id": "f2"}, {"id": "f3"}, {"id": "f4"}]}}
+            raise AssertionError(method)
+
+    import sys
+    monkeypatch.setitem(sys.modules, "mcp_server.core_bridge", _CB)
+    # also patch import path used inside gap fn
+    monkeypatch.setattr(
+        "mcp_server.core_bridge.call", _CB.call, raising=False
+    )
+
+    # Re-bind via battery's import site: inject into the module used by gap.
+    import mcp_server.core_bridge as cb_mod
+    monkeypatch.setattr(cb_mod, "call", _CB.call)
+
+    r = bat.verify("drw-1", ["dim_coverage"])
+    assert "dim_coverage" not in r["skipped"]
+    assert r["scores"]["dim_coverage"] == pytest.approx(0.5)
+
+
+def test_adapt_impedance_skip_no_board(monkeypatch):
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_find_ecad_board_doc", lambda preferred=None: None)
+    monkeypatch.setattr(
+        bat, "_get_fn",
+        lambda mk, fn: (lambda net_or_ref="", target=50.0, doc_id="": __import__("json").dumps({"ok": True})),
+    )
+    r = bat.verify("doc-mech", ["ecad_check_impedance"])
+    assert "ecad_check_impedance" in r["skipped"]
+    assert any("no open board" in (f.get("detail") or "") for f in r["findings"])
+
+
+def test_adapt_impedance_runs_with_board_net(monkeypatch):
+    from services.verify import battery as bat
+    import json
+
+    seen = {}
+
+    def _fn(net_or_ref="", target=50.0, doc_id=""):
+        seen["net"] = net_or_ref
+        seen["doc_id"] = doc_id
+        return json.dumps({"ok": True, "z0": 50.0, "score": 1.0})
+
+    monkeypatch.setattr(bat, "_find_ecad_board_doc", lambda preferred=None: "pcb-1")
+    monkeypatch.setattr(bat, "_board_routed_nets", lambda bid: ["GND", "CLK"])
+    monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
+    r = bat.verify("doc-mech", ["ecad_check_impedance"])
+    assert r["scores"]["ecad_check_impedance"] == 1.0
+    assert seen["doc_id"] == "pcb-1"
+    assert seen["net"] == "CLK"  # prefers non-power
+
+
+def test_adapt_diff_impedance_skip_no_pair(monkeypatch):
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_find_ecad_board_doc", lambda preferred=None: "pcb-1")
+    monkeypatch.setattr(bat, "_board_routed_nets", lambda bid: ["GND", "CLK"])
+    monkeypatch.setattr(bat, "_diff_pair_nets", lambda nets: None)
+    monkeypatch.setattr(
+        bat, "_get_fn",
+        lambda mk, fn: (lambda net_p, net_n, target=100.0, doc_id="": __import__("json").dumps({"ok": True})),
+    )
+    r = bat.verify("doc-mech", ["ecad_check_diff_impedance"])
+    assert "ecad_check_diff_impedance" in r["skipped"]
+    assert any("differential pair" in (f.get("detail") or "") for f in r["findings"])
+
+
+def test_adapt_diff_impedance_runs_with_pair(monkeypatch):
+    from services.verify import battery as bat
+    import json
+
+    seen = {}
+
+    def _fn(net_p, net_n, target=100.0, doc_id=""):
+        seen["net_p"] = net_p
+        seen["net_n"] = net_n
+        seen["doc_id"] = doc_id
+        return json.dumps({"ok": True, "z_diff": 100.0, "score": 1.0})
+
+    monkeypatch.setattr(bat, "_find_ecad_board_doc", lambda preferred=None: "pcb-1")
+    monkeypatch.setattr(bat, "_board_routed_nets", lambda bid: ["USB_DP", "USB_DN"])
+    monkeypatch.setattr(bat, "_diff_pair_nets", lambda nets: ("USB_DP", "USB_DN"))
+    monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
+    r = bat.verify("doc-mech", ["ecad_check_diff_impedance"])
+    assert r["scores"]["ecad_check_diff_impedance"] == 1.0
+    assert seen == {"net_p": "USB_DP", "net_n": "USB_DN", "doc_id": "pcb-1"}
+
+
+def test_forced_power_args_use_pin_xy():
+    """mega-15: force-inject power bonds to pin world xy, not orphan (0,0)."""
+    from services.agent.agent_turn import _ecad_forced_tool_args
+
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True, "result": {"doc_id": "s"}},
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "Device:R", "value": "1k"},
+            "result": {
+                "ref": "R1",
+                "pins": [
+                    {"number": "1", "name": "1", "type": "passive", "xy": [12.5, -3.0]},
+                    {"number": "2", "name": "2", "type": "passive", "xy": [12.5, 5.0]},
+                ],
+            },
+        },
+    ]
+    args = _ecad_forced_tool_args("ecad_add_power", calls)
+    assert args["net"] == "GND"
+    assert args["x"] == 12.5
+    assert args["y"] in (-3.0, 5.0)
+
+
+def test_forced_wire_args_use_place_refs_and_pins():
+    from services.agent.agent_turn import _ecad_forced_tool_args
+
+    calls = [
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "result": {
+                "ref": "U1",
+                "pins": [{"number": "3", "name": "VCC", "type": "power_in", "xy": [0, 0]}],
+            },
+        },
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "Device:R", "value": "1k"},
+            "result": {
+                "ref": "R1",
+                "pins": [
+                    {"number": "1", "name": "1", "type": "passive", "xy": [1, 1]},
+                    {"number": "2", "name": "2", "type": "passive", "xy": [1, 2]},
+                ],
+            },
+        },
+    ]
+    args = _ecad_forced_tool_args("ecad_wire", calls)
+    assert args["from_ref"] == "R1"
+    assert args["to_ref"] == "U1"
+    assert args["from_pin"] == "1"
+    assert args["to_pin"] == "3"
+
+
+def test_chain_need_forces_erc_after_drc():
+    from services.agent.agent_turn import _ecad_chain_need
+
+    allow = {
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+        "ecad_add_power", "board_from_schematic", "ecad_run_drc", "ecad_run_erc",
+    }
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True},
+        {"tool": "ecad_place_symbol", "ok": True, "args": {"libid": "Device:R", "value": "1k"},
+         "result": {"ref": "R1"}},
+        {"tool": "ecad_wire", "ok": True, "result": {"net": "N1", "net_size": 2}},
+        {"tool": "board_from_schematic", "ok": True, "result": {"doc_id": "b"}},
+        {"tool": "ecad_run_drc", "ok": True, "result": {"errors": 0}},
+    ]
+    assert _ecad_chain_need(calls, allow) == "ecad_run_erc"

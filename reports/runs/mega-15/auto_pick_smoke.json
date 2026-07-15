@@ -1,0 +1,79 @@
+{
+  "generated_at": "2026-07-15T05:17:48Z",
+  "enabled_providers": [
+    {
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "base_url": "http://127.0.0.1:1234/v1"
+    },
+    {
+      "provider": "ollama",
+      "model": "llama3.2:latest",
+      "base_url": "http://127.0.0.1:11434/v1"
+    }
+  ],
+  "cases": [
+    {
+      "depth": 2,
+      "task_class": "simple",
+      "risk": null,
+      "min_rank": 1,
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "rank": 5,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=simple depth=2 risk=none",
+      "is_xai": false
+    },
+    {
+      "depth": 2,
+      "task_class": "leaf",
+      "risk": null,
+      "min_rank": 1,
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "rank": 5,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=leaf depth=2 risk=none",
+      "is_xai": false
+    },
+    {
+      "depth": 2,
+      "task_class": null,
+      "risk": "low",
+      "min_rank": 1,
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "rank": 5,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=unknown depth=2 risk=low",
+      "is_xai": false
+    },
+    {
+      "depth": 0,
+      "task_class": "architecture",
+      "risk": "high",
+      "min_rank": 4,
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "rank": 5,
+      "cost_tier": 0,
+      "reason": "min_rank=4 task_class=architecture depth=0 risk=high",
+      "is_xai": false
+    },
+    {
+      "depth": 0,
+      "task_class": null,
+      "risk": null,
+      "min_rank": 3,
+      "provider": "llamacpp",
+      "model": "gemma3-4b-qat",
+      "rank": 5,
+      "cost_tier": 0,
+      "reason": "min_rank=3 task_class=unknown depth=0 risk=none",
+      "is_xai": false
+    }
+  ],
+  "leaf_depth2_non_xai": true,
+  "verdict": "PASS"
+}

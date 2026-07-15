@@ -1,0 +1,4 @@
+Attempt-2: openrouter free frontier hit free-models-per-day 429 on BUILD.
+Wall 240.41s; V/U/X PASS; W FAIL (force_inject never reached).
+Archived 2026-07-15T05:17:38Z
+Files: ['mission_meta.json', 'manifest.json', 'request.txt', 'events.jsonl', 'status.json', 'ledger.json', 'mission.json', 'criterion_BATTERY.json', 'criterion_AC1.json', 'criterion_AC2.json', 'criterion_AC3.json', 'criterion_AC4.json', 'criterion_AC5.json', 'criterion_AC6.json', 'criterion_AC7.json', 'criterion_AC8.json', 'criterion_AC9.json', 'battery_result.json', 'fw_artifact.json', 'grade_summary.json']

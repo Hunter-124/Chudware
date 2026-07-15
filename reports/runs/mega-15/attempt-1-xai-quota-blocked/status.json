@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-15-fc-rocket-20260715",
+  "tier": "xai:grok-4.5",
+  "pid": 3694795,
+  "started_wall": 1784092049.7996013,
+  "cycle": "mega-15",
+  "conservation": true,
+  "baseline_commit": "17b05635",
+  "finished_wall": 1784092072.1194263,
+  "wall_s": 22.32,
+  "result": {
+    "status": "done",
+    "phase": "deliver",
+    "stop_reason": "deliver_partial",
+    "error": null
+  }
+}

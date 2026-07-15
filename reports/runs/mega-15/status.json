@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-15-fc-rocket-20260715-a3",
+  "tier": "local-24k-gemma3-qat",
+  "pid": 3750135,
+  "started_wall": 1784092667.4686248,
+  "cycle": "mega-15",
+  "conservation": true,
+  "baseline_commit": "17b05635",
+  "finished_wall": 1784092741.197046,
+  "wall_s": 73.73,
+  "result": {
+    "status": "needs_correction",
+    "phase": "correct",
+    "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5']",
+    "error": null
+  }
+}

@@ -941,5 +941,11 @@ def test_ecad_chain_need_helpers():
         "tool": "board_from_schematic", "ok": True, "result": {"doc_id": "b"},
     }]
     assert _ecad_chain_need(calls_b, allow) == "ecad_run_drc"
+    # mega-15: after DRC, force ERC re-run for AC4 post-wire grade.
+    allow_erc = set(allow) | {"ecad_run_erc"}
+    calls_d = calls_b + [{
+        "tool": "ecad_run_drc", "ok": True, "result": {"errors": 0},
+    }]
+    assert _ecad_chain_need(calls_d, allow_erc) == "ecad_run_erc"
 
 

@@ -1,0 +1,17 @@
+{
+  "id": "AC3",
+  "result": "PASS",
+  "check_tool": "check_interference",
+  "pass_rule": "interferences empty or volume==0",
+  "detail": "interferences empty",
+  "evidence": {
+    "ok": true,
+    "doc_id": "doc-cpp0000004a",
+    "clearances": [],
+    "contacts": [],
+    "interferences": [],
+    "parts": [],
+    "summary": "No interference detected.",
+    "source": "live"
+  }
+}

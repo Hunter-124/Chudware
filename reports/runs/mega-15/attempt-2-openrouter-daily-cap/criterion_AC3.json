@@ -1,0 +1,12 @@
+{
+  "id": "AC3",
+  "result": "FAIL",
+  "check_tool": "check_interference",
+  "pass_rule": "interferences empty or volume==0",
+  "detail": "check tool reported error: No current part. Call new_part(...) first (or pass doc_id=).",
+  "evidence": {
+    "ok": false,
+    "error": "No current part. Call new_part(...) first (or pass doc_id=).",
+    "source": "live"
+  }
+}

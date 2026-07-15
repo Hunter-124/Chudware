@@ -1,0 +1,5 @@
+Attempt-1 aborted: both SuperGrok accounts personal-team-blocked:spending-limit.
+Wall 22.32s, stop=deliver_partial, zero product tool_calls, all xai nodes provider_error.
+Plan B: relaunch with openrouter free frontier (nvidia/nemotron-3-ultra-550b:free).
+Archived at 2026-07-15T05:09:13Z
+Files: ['mission_meta.json', 'manifest.json', 'request.txt', 'events.jsonl', 'status.json', 'ledger.json', 'mission.json', 'fw_artifact.json', 'grade_summary.json']

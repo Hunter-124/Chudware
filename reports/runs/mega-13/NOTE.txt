@@ -1,0 +1,3 @@
+Attempt-3 primary graded before Fix8 HARD pre-dispatch chain gate.
+Q PASS (6 AC); P FAIL (board_from_schematic=0); R FAIL (empty netlist).
+Copied here before attempt-4 relaunch.

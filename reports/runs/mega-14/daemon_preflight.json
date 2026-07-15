@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-07-15T04:44:52Z",
+  "hostd_bin": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/aicad-hostd",
+  "disk_build_id": "night2-3054-gcb65bfd9-dirty",
+  "running_git_rev": "night2-3054-gcb65bfd9-dirty",
+  "running_matches_disk_binary": true,
+  "repo_git_describe": "7a1e1e5d-dirty",
+  "repo_git_short": "7a1e1e5d",
+  "repo_git_full": "7a1e1e5d71b507f54ab86eef78254587e67c7c58",
+  "baseline_commit": "7a1e1e5d",
+  "baseline_matches_repo": true,
+  "daemon_pid": 2980908,
+  "server_info": {
+    "abi": "1",
+    "daemon_pid": 2980908,
+    "engine_build_id": "night2-3054-gcb65bfd9-dirty",
+    "git_rev": "night2-3054-gcb65bfd9-dirty",
+    "id_remap": {},
+    "proto": 1,
+    "recovery_pending": 50,
+    "state": "ready"
+  },
+  "note": "hostd disk=night2-3054-gcb65bfd9-dirty; running=night2-3054-gcb65bfd9-dirty; repo=7a1e1e5d. Python-side mega-14 grading/legs bind without hostd rebuild."
+}

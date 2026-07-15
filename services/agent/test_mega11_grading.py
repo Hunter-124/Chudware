@@ -1088,3 +1088,98 @@ def test_ac9_mega12_residual_legs_grade_from_live_shaped_ledger():
         "all legs have PASS|WARN|FAIL|SKIP", evidence,
     )
     assert v == re.PASS, (v, d, evidence["leg_verdicts"])
+
+
+def test_ac1_per_check_diagnosis_on_battery_payload():
+    """mega-14 U: AC1 evidence includes per_check / zero_checks / brief_hints."""
+    from services.agent import reviewer_exec as re
+
+    class _Led:
+        def __init__(self):
+            self.events = []
+
+        def add_criterion_result(self, actor, ac_id, result, **kw):
+            self.events.append({
+                "kind": "criterion_result",
+                "actor": actor,
+                "payload": {
+                    "id": ac_id, "result": result,
+                    "check_tool": kw.get("check_tool"),
+                    "pass_rule": kw.get("pass_rule"),
+                    "detail": kw.get("detail"),
+                    "evidence": kw.get("evidence") or {},
+                },
+            })
+            return self.events[-1]
+
+    bat = {
+        "verdict": "FAIL",
+        "ok": False,
+        "doc_id": "doc-airframe",
+        "detail": "soft zeros",
+        "checks": [
+            {"name": "is_manifold", "verdict": "PASS", "score": 1.0},
+            {"name": "measure_part", "verdict": "PASS", "score": 1.0},
+            {"name": "check_sketch", "verdict": "FAIL", "score": 0.0},
+            {"name": "dim_coverage", "verdict": "FAIL", "score": 0.0},
+            {"name": "ecad_run_erc", "verdict": "FAIL", "score": 0.0},
+            {"name": "measure_between", "verdict": "FAIL", "score": 0.0},
+        ],
+        "evidence": {
+            "scores": {
+                "is_manifold": 1.0,
+                "measure_part": 1.0,
+                "check_sketch": 0.0,
+                "dim_coverage": 0.0,
+                "ecad_run_erc": 0.0,
+                "measure_between": 0.0,
+            },
+            "findings": [
+                {
+                    "name": "check_sketch",
+                    "message": "missing 1 required positional argument: 'sketch'",
+                },
+                {
+                    "name": "ecad_run_erc",
+                    "message": "no open ECAD document 'doc-airframe'",
+                },
+            ],
+        },
+    }
+    # Direct diagnosis helper.
+    diag = re._battery_per_check_diagnosis(
+        re._battery_evidence_for_ac(bat), bat)
+    assert "check_sketch" in diag["zero_checks"]
+    assert "ecad_run_erc" in diag["zero_checks"]
+    assert any(r["name"] == "is_manifold" and r["verdict"] == "PASS"
+               for r in diag["per_check"])
+    assert diag["geometry_evidence"].get("is_manifold") == 1.0
+    assert any("ECAD-on-CAD" in h or "sketch" in h.lower()
+               for h in diag["brief_hints"])
+
+    # End-to-end AC1 criterion_result carries diagnosis fields.
+    manifest = {
+        "deliverables": [{
+            "id": "airframe",
+            "acceptance_criteria": [{
+                "id": "AC1",
+                "text": "battery",
+                "check": {"tool": "verify_battery", "pass_rule": "PASS"},
+            }],
+        }],
+    }
+    led = _Led()
+    results = re.run_acceptance_checks(
+        manifest, led, doc_id="doc-airframe", battery_payload=bat)
+    assert results["AC1"] in (re.FAIL, "WARN", re.PASS)
+    ac1 = next(
+        e["payload"] for e in led.events
+        if e["payload"].get("id") == "AC1"
+    )
+    ev = ac1.get("evidence") or {}
+    assert ev.get("zero_checks"), ev
+    assert ev.get("per_check"), ev
+    assert "check_sketch" in ev["zero_checks"]
+    assert isinstance(ev.get("brief_hints"), list) and ev["brief_hints"]
+    assert ev.get("geometry_evidence", {}).get("is_manifold") == 1.0
+

@@ -1,0 +1,15 @@
+{
+  "account_active": "17d17fb1-247a-4800-ba97-e7b5150bc53a",
+  "account_target_prefix": "17d17fb1",
+  "account_matches_target": true,
+  "spawn_probe": "PASS",
+  "auto_pick_smoke": "PASS",
+  "fix8_hard_gate": "PASS",
+  "fix8_detail": {
+    "source_gate_present": true,
+    "unit_test_present": true,
+    "ecad_engineer_has_chain": true,
+    "verdict": "PASS"
+  },
+  "preflight_ready_for_launch": true
+}

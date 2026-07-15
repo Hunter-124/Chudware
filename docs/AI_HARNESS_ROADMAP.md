@@ -267,3 +267,21 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   `3c1ef7a802cd`, AC9 all 12 legs, battery doc_id). Residuals: live force-chain
   injection; wire-before-sim; AC1 soft zeros; auto_pick model-id/rank floor.
   Findings: `reports/runs/mega-13/findings.md`.
+
+- 2026-07-15 mega-14 (WS5): hard ECAD chain + remaining AC gaps under
+  `reports/runs/mega-14/` (`mega-14-fc-rocket-20260715`). Baseline `7a1e1e5d`.
+  Fixer14 (ExceptionalYak) bound Fix8 force-inject after denial cap + AC1
+  per-check diagnosis + frontier measured rank floor 5 (77p). Preflight PASS:
+  hostd running==disk (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`;
+  spawn_probe incl Fix8 gate wiring; auto_pick leaves→ollama, analysis→
+  xai-sub/`grok-4.5` EXACT. Primary pid 3590131 wall **797.46s**, terminal
+  `needs_correction`/`verify_failed: [AC1,AC4,AC5]` (**AC2+AC3+AC6+AC7+AC8+AC9
+  PASS**). Scoreboard: **S PASS** (board_from_schematic + DRC errors=0 via
+  hard gate + force_inject; P/O upgraded), **T FAIL** (AC5 still empty-netlist
+  class — no `ecad_wire`, U* ICs lack sim models), **U PASS** (AC1 FAIL with
+  per_check/zero_checks/brief_hints in criterion_AC1), **Q PASS** (6 live;
+  ≥7 miss), **A–N/K–M regression PASS** (B/G/J live residual). Residuals:
+  SPICE sim-model passives + wire; ERC power_not_driven; AC1 soft zeros;
+  typed-refusal live; phase cursor honesty.
+  Findings: `reports/runs/mega-14/findings.md`.
+

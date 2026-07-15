@@ -890,6 +890,10 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
                 evidence = _battery_evidence_for_ac(bat)
                 verdict, detail = evaluate_pass_rule(pass_rule, evidence)
                 results[ac_id] = verdict
+                # mega-14 U: emit per-check diagnosis so AC1 is gradeable from
+                # criterion_AC1.json (which checks zero: volume? shell? thin-wall?
+                # sketch/dim/ECAD-on-CAD?) without re-running the battery.
+                diagnosis = _battery_per_check_diagnosis(evidence, bat)
                 if ledger is not None:
                     try:
                         ledger.add_criterion_result(
@@ -901,6 +905,11 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
                                 **{k: evidence.get(k) for k in (
                                     "verdict", "ok", "scores", "findings", "checks"
                                 ) if k in evidence},
+                                "per_check": diagnosis.get("per_check") or [],
+                                "zero_checks": diagnosis.get("zero_checks") or [],
+                                "geometry_evidence": diagnosis.get(
+                                    "geometry_evidence") or {},
+                                "brief_hints": diagnosis.get("brief_hints") or [],
                             })
                     except Exception:  # noqa: BLE001
                         pass
@@ -993,6 +1002,162 @@ def _battery_evidence_for_ac(bat: dict) -> dict:
         if findings and "findings" not in out:
             out["findings"] = findings
     return out
+
+
+def _battery_per_check_diagnosis(
+    evidence: dict,
+    bat: dict | None = None,
+) -> dict[str, Any]:
+    """mega-14 AC1/U: structured per-check verdicts + geometry brief hints.
+
+    Surfaces which battery checks zero out (volume/shell/thin-wall/sketch/…)
+    with finding messages so the U axis is gradeable from criterion_AC1.json.
+    Does NOT weaken the battery — diagnosis only.
+    """
+    scores: dict[str, float] = {}
+    if isinstance(evidence.get("scores"), dict):
+        for k, v in evidence["scores"].items():
+            try:
+                scores[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    findings_by: dict[str, dict] = {}
+    findings = evidence.get("findings")
+    if isinstance(findings, list):
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("check") or f.get("name") or f.get("id") or "")
+            if name:
+                findings_by[name] = f
+    checks_in = evidence.get("checks")
+    if not isinstance(checks_in, list) and isinstance(bat, dict):
+        checks_in = bat.get("checks")
+    per_check: list[dict[str, Any]] = []
+    zero_checks: list[str] = []
+    if isinstance(checks_in, list) and checks_in:
+        for c in checks_in:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or c.get("check") or "?")
+            sc = c.get("score")
+            if not isinstance(sc, (int, float)) or isinstance(sc, bool):
+                sc = scores.get(name)
+            verdict = str(c.get("verdict") or c.get("status") or "").upper()
+            if not verdict or verdict == "?":
+                if isinstance(sc, (int, float)):
+                    verdict = "PASS" if float(sc) > 0.0 else "FAIL"
+                else:
+                    verdict = "UNKNOWN"
+            row: dict[str, Any] = {
+                "name": name,
+                "verdict": verdict,
+                "score": float(sc) if isinstance(sc, (int, float))
+                and not isinstance(sc, bool) else scores.get(name),
+            }
+            f = findings_by.get(name)
+            if f:
+                row["message"] = (
+                    f.get("message") or f.get("detail") or f.get("error") or ""
+                )
+                if f.get("severity") is not None:
+                    row["severity"] = f.get("severity")
+            per_check.append(row)
+            if (isinstance(row.get("score"), (int, float))
+                    and float(row["score"]) <= 0.0) or verdict in (
+                        "FAIL", "ERROR", "0", "0.0"):
+                zero_checks.append(name)
+    else:
+        for name, sc in scores.items():
+            verdict = "PASS" if sc > 0.0 else "FAIL"
+            row = {"name": name, "verdict": verdict, "score": sc}
+            f = findings_by.get(name)
+            if f:
+                row["message"] = (
+                    f.get("message") or f.get("detail") or f.get("error") or ""
+                )
+            per_check.append(row)
+            if sc <= 0.0:
+                zero_checks.append(name)
+
+    # Geometry class flags for AC1 brief diagnosis (not battery weaken).
+    geom: dict[str, Any] = {
+        "is_manifold": scores.get("is_manifold"),
+        "eval_check": scores.get("eval_check"),
+        "measure_part": scores.get("measure_part"),
+        "query_geometry": scores.get("query_geometry"),
+        "layout_coverage": scores.get("layout_coverage"),
+        "check_sketch": scores.get("check_sketch"),
+        "dim_coverage": scores.get("dim_coverage"),
+        "unit_sanity": scores.get("unit_sanity"),
+        "power_budget": scores.get("power_budget"),
+    }
+    # Classify residual for next brief change (honest labels only).
+    hints: list[str] = []
+    zero_l = {z.lower() for z in zero_checks}
+    if "is_manifold" in zero_l or "eval_check" in zero_l:
+        hints.append(
+            "CRITICAL solid integrity failed — ensure closed manifold solid "
+            "(no open shells / zero-thickness sheets); revolve/extrude closed "
+            "profiles with wall≥1.5 mm."
+        )
+    if "measure_part" in zero_l:
+        hints.append(
+            "measure_part zero — geometry may be empty/degenerate; build "
+            "payload bay ≥56×86×20 mm and body tube OD≈60 wall≥1.5."
+        )
+    if "check_sketch" in zero_l:
+        msg = ""
+        f = findings_by.get("check_sketch") or {}
+        msg = str(f.get("message") or f.get("detail") or "")
+        if "missing" in msg.lower() and "sketch" in msg.lower():
+            hints.append(
+                "check_sketch arg miss (no active sketch id) — prefer "
+                "feature-solid path (box/revolve) over free sketches, or "
+                "keep sketch constrained DOF0 before extrude."
+            )
+        else:
+            hints.append(
+                "check_sketch FAIL — close profiles, add dimensions/"
+                "relations until sketch_health DOF0."
+            )
+    if "dim_coverage" in zero_l:
+        hints.append(
+            "dim_coverage zero (often no open drawing) — optional for airframe "
+            "solid PASS; add make_drawing only if drawing deliverable required."
+        )
+    if any("ecad_" in z or z == "ecad_run_erc" for z in zero_l):
+        hints.append(
+            "ECAD-on-CAD checks zero (wrong doc class for airframe part) — "
+            "expected when battery runs on mechanical doc; do not treat as "
+            "airframe geometry FAIL. Keep mechanical doc_id for AC1."
+        )
+    if "measure_between" in zero_l:
+        hints.append(
+            "measure_between arg miss — not a hollow-solid signal; geometry "
+            "volume/manifold scores are the airframe product signal."
+        )
+    # Thin-wall / shell heuristic labels when scores exist under those names.
+    for key in ("wall_thickness", "thin_wall", "shell", "volume"):
+        if key in zero_l or any(key in z for z in zero_l):
+            hints.append(
+                f"{key} zero — thicken walls (≥1.5 mm), avoid open shells; "
+                "target bay-class volume ~1e5 mm³."
+            )
+    if not zero_checks and scores:
+        hints.append("all scored checks >0 — AC1 battery shape is clean.")
+    if not hints and zero_checks:
+        hints.append(
+            "zeros=" + ",".join(zero_checks[:8])
+            + " — inspect findings messages; strengthen BUILD brief dims."
+        )
+    return {
+        "per_check": per_check,
+        "zero_checks": zero_checks,
+        "geometry_evidence": geom,
+        "brief_hints": hints,
+    }
+
 
 
 

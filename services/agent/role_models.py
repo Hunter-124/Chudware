@@ -207,12 +207,18 @@ def _measured_rank_from_pass_rate(pass_rate: float) -> int:
 # mission auto_pick to ollama (mega-13: grok-4.5 pass_rate=0 → rank 1 → all
 # BUILD nodes fell back to llama3.2). Keep a floor so subscription/API frontier
 # remains eligible for min_rank≥3/4 analysis/assembly work.
+# mega-14: floor raised 4→5. Evidence: mega-13 attempt-1 measured rank=1 wiped
+# all nodes to ollama; floor=4 still required harness user override rank=5 for
+# analysis min_rank paths that pick frontier only; residual "rank floor ≥5"
+# noted in mega-13 findings TOP residual #4. Rationale: frontier API ids must
+# remain rank 5 so min_rank=4/5 analysis nodes select xai-sub/grok-4.5 without
+# per-run user_rankings pins. Leaves (min_rank=1) still prefer ollama.
 _FRONTIER_RANK_FLOOR_IDS = frozenset({
     "grok-4.5", "grok-4-5", "grok-4.20", "grok-4",
     "claude-4", "claude-sonnet-4", "claude-opus-4",
     "gpt-5", "gemini-2.5-pro",
 })
-_FRONTIER_MEASURED_FLOOR = 4
+_FRONTIER_MEASURED_FLOOR = 5
 
 
 def _load_measured_rankings(
@@ -303,8 +309,9 @@ def load_rankings(
             base = merged.get(mid)
             notes = mr.notes
             rank = int(mr.rank)
-            # mega-13: do not let zero-pass gym rows demote frontier models below
-            # the tool-capable band (analysis/assembly min_rank 3–4).
+            # mega-13/14: do not let zero-pass gym rows demote frontier models
+            # below the frontier band (floor=5). analysis min_rank 4–5 must still
+            # select xai-sub/grok-4.5 without per-run user pins.
             mid_l = str(mid).strip().lower()
             if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
                 mid_l.startswith(stem) for stem in (
@@ -315,7 +322,7 @@ def load_rankings(
                 if rank < _FRONTIER_MEASURED_FLOOR:
                     notes = (
                         f"{notes}; frontier floor rank>={_FRONTIER_MEASURED_FLOOR} "
-                        f"(was measured {rank}; mega-13 auto_pick)"
+                        f"(was measured {rank}; mega-14 auto_pick)"
                     )
                     rank = _FRONTIER_MEASURED_FLOOR
             if base is not None and base.source == "shipped":

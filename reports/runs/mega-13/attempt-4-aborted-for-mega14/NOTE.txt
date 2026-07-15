@@ -1,0 +1,2 @@
+Attempt-4 aborted mid-flight (~1m) after Main opened mega-14 (no other xai consumer).
+Graded primary remains attempt-3 (pre-Fix8). Fix8 bound for mega-14 cycle.

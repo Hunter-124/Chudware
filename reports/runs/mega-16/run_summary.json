@@ -1,0 +1,73 @@
+{
+  "run_id": "mega-16-fc-rocket-20260715",
+  "wall_s": 316.73,
+  "terminal": "done",
+  "stop_reason": "deliver_partial",
+  "baseline_commit": "c269e326",
+  "tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "live_pass_ids": [],
+  "live_pass_count": 0,
+  "axes": {
+    "W": "PARTIAL",
+    "X": "FAIL",
+    "Y": "PASS",
+    "V": "UNTESTABLE",
+    "A": "PASS",
+    "B": "PASS",
+    "C": "PASS",
+    "D": "PASS",
+    "Fix8_live": "PASS"
+  },
+  "spend_before_usd": 5.42e-06,
+  "spend_after_usd": 0.1601995,
+  "spend_delta_usd": 0.160194,
+  "spend_guard_usd": 8.0,
+  "residuals": [
+    "verify_skipped_on_deliver_partial_zero_criterion_results",
+    "ecad_wire_failed_missing_power_symbol_ref_#PWR1",
+    "force_inject_fired_place_symbol_not_wire",
+    "no_ecad_simulate_AC5",
+    "live_AC_pass_0_of_9_target_ge_8",
+    "V_untestable_no_battery_this_run",
+    "grok-4.5_revalidation_deferred_xai_spending_limit"
+  ],
+  "preflight": {
+    "daemon_match": true,
+    "spawn_probe": "PASS",
+    "auto_pick_Y": "PASS",
+    "fixer16_bound": true
+  },
+  "model_assignment_live": {
+    "ollama": 13,
+    "openrouter": 11
+  },
+  "board_path": {
+    "board_from_schematic": 1,
+    "ecad_run_drc": 0,
+    "ecad_run_erc": 1,
+    "ecad_new_schematic": 2,
+    "ecad_place_symbol": 7,
+    "ecad_simulate": 0,
+    "ecad_connect": 0,
+    "ecad_add_net": 0,
+    "ecad_wire": 2,
+    "ecad_add_power": 2,
+    "fw_build": 0,
+    "fw_new_project": 4,
+    "new_part": 5,
+    "add_features": 51,
+    "delegate": 12,
+    "check_interference": 0,
+    "measure_part": 0,
+    "verify_battery": 0,
+    "ecad_antenna_analyze": 0,
+    "ecad_antenna_design": 0,
+    "make_report": 0,
+    "report_card": 0,
+    "ecad_place_wire": 0
+  },
+  "findings": "reports/runs/mega-16/findings.md",
+  "axes_note": {
+    "V": "no battery_result this run; mega-15 held; not a live fail"
+  }
+}

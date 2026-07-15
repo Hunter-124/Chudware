@@ -46,6 +46,17 @@ models:
     rank: 5
     source: shipped
     notes: "public evals 2026-07, replace with measured"
+  - id: deepseek/deepseek-chat-v3.1
+    provider: openrouter
+    rank: 5
+    source: shipped
+    notes: "mega-16 paid openrouter frontier (no :free); public evals 2026-07"
+  - id: deepseek-chat-v3.1
+    provider: openrouter
+    rank: 5
+    source: shipped
+    notes: "mega-16 paid openrouter frontier alias (stem)"
+
 
   # Rank 4 — strong mid / free strong
   - id: gemini-2.5-flash

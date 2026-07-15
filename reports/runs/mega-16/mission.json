@@ -1,0 +1,22 @@
+{
+  "status": "done",
+  "phase": "deliver",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "plan",
+    "deliver"
+  ],
+  "stop_reason": "deliver_partial",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-16-fc-rocket-20260715/ledger.json",
+  "run_id": "mega-16-fc-rocket-20260715",
+  "mode": "real",
+  "wall_s": 316.73,
+  "conservation": true,
+  "baseline_commit": "c269e326",
+  "spend_before_usd": 5.42e-06,
+  "spend_after_usd": 0.1601995,
+  "spend_delta_usd": 0.160194,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-16-fc-rocket-20260715/ledger.json"
+}

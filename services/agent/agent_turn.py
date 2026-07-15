@@ -52,6 +52,10 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     are NON-RETRYABLE → ``provider_auth`` so the mission aborts instead of burning
     escalate/budget as ``failed``/``budget exhausted`` (mega-1 TOP-4).
 
+    mega-16: spending-limit / SuperGrok tier-denied is ``provider_unavailable``
+    (non-retryable) so callers mark the provider dead and auto_pick falls through
+    rather than retry-looping xai on every hard node.
+
     Rate limits (429) and 5xx remain retryable (map to ``failed`` so the node can
     still escalate, but callers that inspect ``retryable`` may back off).
     """
@@ -64,6 +68,29 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
         status_i = int(status) if status is not None else None
     except (TypeError, ValueError):
         status_i = None
+
+    # mega-16: spending-limit BEFORE generic 403→provider_auth so auto_pick can
+    # fall through to openrouter paid instead of fatal-auth aborting the mission.
+    try:
+        from services.agent.role_models import (  # noqa: PLC0415
+            is_provider_unavailable_error,
+        )
+        if is_provider_unavailable_error(exc):
+            return "provider_unavailable", False
+    except Exception:  # noqa: BLE001
+        pass
+    spending_markers = (
+        "spending-limit",
+        "spending limit",
+        "personal-team-blocked",
+        "run out of credits",
+        "out of credits",
+        "xaitierdenied",
+        "tier not api-enabled",
+        "subscription tier not api-enabled",
+    )
+    if any(m in text for m in spending_markers):
+        return "provider_unavailable", False
 
     auth_markers = (
         "incorrect api key",
@@ -371,6 +398,27 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     pass
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
             stop, retryable = classify_provider_error(exc)
+            # mega-16: spending-limit / tier-denied → mark provider unavailable so
+            # subsequent auto_pick falls through (no xai retry loop).
+            if stop == "provider_unavailable":
+                try:
+                    from services.agent.role_models import (  # noqa: PLC0415
+                        mark_provider_unavailable,
+                    )
+                    pname = (
+                        getattr(provider, "name", None)
+                        or getattr(provider, "provider", None)
+                        or "xai-sub"
+                    )
+                    mark_provider_unavailable(str(pname), reason=str(exc)[:300])
+                    _log(ledger, actor, {
+                        "event": "provider_unavailable",
+                        "provider": str(pname),
+                        "error": str(exc)[:300],
+                        "stop_reason": stop,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
             # mega-6: ollama/local leaf failures must not block — one-shot degrade
             # to openrouter free when keyed, else report retryable failed.
             err_l = f"{type(exc).__name__}: {exc}".lower()

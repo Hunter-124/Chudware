@@ -462,13 +462,16 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
     if name == "openrouter":
         # OpenAI-compatible endpoint pinned to OpenRouter. Key is BYO (OPENROUTER_API_KEY)
         # or minted by the blessed PKCE login and stored as api_key (contract §4.1).
+        # mega-16: also honour config.keys.openrouter (GUI keys map).
         from .providers.openrouter_provider import OpenRouterProvider, DEFAULT_MODEL
 
         oc = cfg.get("openrouter", {}) or {}
+        keys_map = cfg.get("keys") or {}
         key = (
             (oc.get("api_key") if isinstance(oc, dict) else None)
             or cfg.get("api_key")
             or cfg.get("openrouter_api_key")
+            or (keys_map.get("openrouter") if isinstance(keys_map, dict) else None)
             or os.environ.get("OPENROUTER_API_KEY")
         )
         if not key:
@@ -476,7 +479,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             # 401 as provider_auth and kill every depth-0 auto_pick free leaf.
             raise ValueError(
                 "openrouter provider requires an API key "
-                "(config openrouter.api_key / OPENROUTER_API_KEY); "
+                "(config openrouter.api_key / keys.openrouter / OPENROUTER_API_KEY); "
                 "auto_pick must skip keyless openrouter"
             )
         model = cfg.get("model", DEFAULT_MODEL)

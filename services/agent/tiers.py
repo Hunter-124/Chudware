@@ -407,14 +407,24 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     or_model = parse_openrouter_tier(tier) if tier else None
     if or_model is not None:
         merged_cfg = dict(cfg or {})
-        # Prefer openrouter-scoped key, then top-level api_key, then env.
+        # Prefer openrouter-scoped key, then keys map, then top-level, then env.
         oc = dict(merged_cfg.get("openrouter") or {})
-        key = (oc.get("api_key")
-               or merged_cfg.get("api_key")
-               or os.environ.get("OPENROUTER_API_KEY"))
+        keys_map = merged_cfg.get("keys") or {}
+        key = (
+            oc.get("api_key")
+            or (keys_map.get("openrouter") if isinstance(keys_map, dict) else None)
+            or merged_cfg.get("api_key")
+            or merged_cfg.get("openrouter_api_key")
+            or os.environ.get("OPENROUTER_API_KEY")
+        )
+        # Mirror key into openrouter.api_key so get_provider finds it.
+        if key and not oc.get("api_key"):
+            oc["api_key"] = key
         merged_cfg["api_key"] = key
         merged_cfg["model"] = or_model
-        merged_cfg.setdefault("openrouter", oc)
+        # Always write oc back — setdefault would keep an empty openrouter:{}
+        # and drop the mirrored api_key (mega-16 keys.openrouter path).
+        merged_cfg["openrouter"] = oc
         return _config.get_provider("openrouter", cfg=merged_cfg)
 
     # Parameterized xAI paid tiers: xai:<model-id>

@@ -307,4 +307,18 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   daily + local ctx. **grok-4.5 revalidation deferred**.
   Findings: `reports/runs/mega-15/findings.md`.
 
+- 2026-07-15 mega-16 (WS5): quota-unblock validation under
+  `reports/runs/mega-16/` (primary `mega-16-fc-rocket-20260715`).
+  Baseline `c269e326`. Fixer16 (BoldSilverfish) bound deepseek paid
+  rank-5 + `keys.openrouter` provider wiring + xai spending-limit →
+  `provider_unavailable` fallthrough (80p). Preflight PASS (hostd match;
+  Fix8+Fix-wire; auto_pick axis Y). Frontier
+  `openrouter:deepseek/deepseek-chat-v3.1` PAID; spend Δ **$0.16** / guard $8.
+  Wall **316.73s**, terminal `deliver_partial`. Scoreboard: **Y PASS**
+  (hard→openrouter paid×11, leaf→ollama×13, xai×0), **W PARTIAL**
+  (`ecad_add_power` ok; `ecad_wire` fail `#PWR1`; force_inject place_symbol;
+  AC4 ungraded), **X FAIL** (no SPICE), **V UNTESTABLE** (verify skipped),
+  live AC PASS=**0** (criterion_result absent — deliver without AC grading).
+  Target ≥8 miss. **grok-4.5 revalidation deferred**.
+  Findings: `reports/runs/mega-16/findings.md`.
 

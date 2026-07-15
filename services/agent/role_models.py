@@ -213,12 +213,120 @@ def _measured_rank_from_pass_rate(pass_rate: float) -> int:
 # noted in mega-13 findings TOP residual #4. Rationale: frontier API ids must
 # remain rank 5 so min_rank=4/5 analysis nodes select xai-sub/grok-4.5 without
 # per-run user_rankings pins. Leaves (min_rank=1) still prefer ollama.
+# mega-16: openrouter paid deepseek/deepseek-chat-v3.1 is the live frontier when
+# xAI is spending-limit-blocked — floor it so analysis min_rank does not collapse
+# to ollama-all (axis Y).
 _FRONTIER_RANK_FLOOR_IDS = frozenset({
     "grok-4.5", "grok-4-5", "grok-4.20", "grok-4",
     "claude-4", "claude-sonnet-4", "claude-opus-4",
     "gpt-5", "gemini-2.5-pro",
+    "deepseek/deepseek-chat-v3.1", "deepseek-chat-v3.1",
+    "deepseek/deepseek-chat-v3", "deepseek-chat-v3",
 })
 _FRONTIER_MEASURED_FLOOR = 5
+
+# Process-local provider unavailability (mega-16): spending-limit / tier-denied
+# marks xai-sub so auto_pick falls through instead of retry-looping SuperGrok.
+_UNAVAILABLE_PROVIDERS: set[str] = set()
+_UNAVAILABLE_PROVIDER_REASONS: dict[str, str] = {}
+
+
+def mark_provider_unavailable(provider: str, reason: str = "") -> None:
+    """Mark *provider* unavailable for the rest of this process (mega-16).
+
+    Used when xAI returns spending-limit / tier-denied so subsequent
+    ``auto_pick_model`` calls fall through to the next ranked enabled provider
+    instead of retry-looping SuperGrok on every hard node.
+    """
+    p = (provider or "").strip().lower()
+    if not p:
+        return
+    _UNAVAILABLE_PROVIDERS.add(p)
+    if reason:
+        _UNAVAILABLE_PROVIDER_REASONS[p] = str(reason)[:300]
+    # Spending-limit on either xai path blocks both classic and subscription.
+    if p in ("xai", "xai-sub"):
+        _UNAVAILABLE_PROVIDERS.add("xai")
+        _UNAVAILABLE_PROVIDERS.add("xai-sub")
+        if reason:
+            _UNAVAILABLE_PROVIDER_REASONS.setdefault("xai", str(reason)[:300])
+            _UNAVAILABLE_PROVIDER_REASONS.setdefault("xai-sub", str(reason)[:300])
+    log.info("role_models: provider %s marked unavailable (%s)", p, reason or "no reason")
+
+
+def clear_unavailable_providers() -> None:
+    """Test helper — clear process-local unavailable set."""
+    _UNAVAILABLE_PROVIDERS.clear()
+    _UNAVAILABLE_PROVIDER_REASONS.clear()
+
+
+def is_provider_unavailable(provider: str | None) -> bool:
+    """True when *provider* was marked unavailable this process."""
+    p = (provider or "").strip().lower()
+    return bool(p) and p in _UNAVAILABLE_PROVIDERS
+
+
+def unavailable_providers() -> dict[str, str]:
+    """Snapshot of unavailable providers → reason (for harness telemetry)."""
+    return {p: _UNAVAILABLE_PROVIDER_REASONS.get(p, "") for p in sorted(_UNAVAILABLE_PROVIDERS)}
+
+
+def is_provider_unavailable_error(exc: BaseException | str | None) -> bool:
+    """True when *exc* is a spending-limit / tier-denied / credits-exhausted class.
+
+    mega-16: SuperGrok returns ``personal-team-blocked:spending-limit`` as
+    XaiTierDeniedError (HTTP 403). Treat as provider-unavailable for auto_pick
+    fall-through — do NOT retry-loop xai.
+    """
+    if exc is None:
+        return False
+    text = f"{type(exc).__name__}: {exc}".lower() if not isinstance(exc, str) else exc.lower()
+    markers = (
+        "spending-limit",
+        "spending limit",
+        "personal-team-blocked",
+        "run out of credits",
+        "out of credits",
+        "credits exhausted",
+        "tier not api-enabled",
+        "tier_denied",
+        "xaitierdenied",
+        "subscription tier not api-enabled",
+        "need a grok subscription",
+        "resource_exhausted",
+        "quota exceeded",
+        "insufficient credits",
+        "payment required",
+    )
+    if any(m in text for m in markers):
+        return True
+    # Structured type without relying on import at call sites.
+    name = type(exc).__name__ if not isinstance(exc, str) else ""
+    if name in ("XaiTierDeniedError",):
+        return True
+    return False
+
+
+def _openrouter_key_present(cfg: Mapping[str, Any] | None) -> bool:
+    """True when an OpenRouter API key is configured (any supported location).
+
+    mega-16: keys are commonly stored under ``config.keys.openrouter`` (GUI
+    keys map) rather than ``openrouter.api_key`` — honour both so paid frontier
+    auto_pick works without a harness-only env pin.
+    """
+    cfg = cfg or {}
+    or_cfg = cfg.get("openrouter") or {}
+    if isinstance(or_cfg, Mapping) and or_cfg.get("api_key"):
+        return True
+    if cfg.get("openrouter_api_key"):
+        return True
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return True
+    keys = cfg.get("keys") or {}
+    if isinstance(keys, Mapping) and keys.get("openrouter"):
+        return True
+    return False
+
 
 
 def _load_measured_rankings(
@@ -312,11 +420,12 @@ def load_rankings(
             # mega-13/14: do not let zero-pass gym rows demote frontier models
             # below the frontier band (floor=5). analysis min_rank 4–5 must still
             # select xai-sub/grok-4.5 without per-run user pins.
+            # mega-16: same floor for openrouter paid deepseek frontier.
             mid_l = str(mid).strip().lower()
             if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
                 mid_l.startswith(stem) for stem in (
                     "grok-4", "claude-sonnet-4", "claude-opus-4", "gpt-5",
-                    "gemini-2.5-pro",
+                    "gemini-2.5-pro", "deepseek/deepseek-chat", "deepseek-chat",
                 )
             ):
                 if rank < _FRONTIER_MEASURED_FLOOR:
@@ -666,14 +775,13 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
                     str(item.get("base_url") or ""),
                 )
         # Drop keyless openrouter even from explicit lists (mega-6 401 wipe).
-        or_cfg = cfg.get("openrouter") or {}
-        has_or_key = bool(
-            (isinstance(or_cfg, Mapping) and or_cfg.get("api_key"))
-            or cfg.get("openrouter_api_key")
-            or os.environ.get("OPENROUTER_API_KEY")
-        )
-        if not has_or_key:
+        # Also drop process-local unavailable providers (mega-16 spending-limit).
+        if not _openrouter_key_present(cfg):
             out[:] = [e for e in out if e.get("provider") != "openrouter"]
+        out[:] = [
+            e for e in out
+            if not is_provider_unavailable(str(e.get("provider") or ""))
+        ]
         return out
 
     if cfg.get("provider") and cfg.get("model"):
@@ -712,16 +820,19 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
     or_cfg = cfg.get("openrouter") or {}
     # mega-6: only offer OpenRouter when a real key exists. Keyless free models
     # auto-picked at min_rank≥3 and died as HTTP 401 provider_auth (19/19 nodes).
-    has_or_key = bool(
-        (isinstance(or_cfg, Mapping) and or_cfg.get("api_key"))
-        or cfg.get("openrouter_api_key")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
+    # mega-16: also honour config.keys.openrouter (GUI keys map).
+    has_or_key = _openrouter_key_present(cfg)
     if has_or_key:
         if isinstance(or_cfg, Mapping):
             for mid in (or_cfg.get("models") or []):
                 _add("openrouter", str(mid))
-        # Free-tier OpenRouter candidates (auto_pick ranks them).
+        # mega-16 paid frontier first (no :free — free pool is 429/day-capped).
+        for mid in (
+            "deepseek/deepseek-chat-v3.1",
+            "qwen/qwen3-coder-30b-a3b-instruct",
+        ):
+            _add("openrouter", mid)
+        # Free-tier OpenRouter candidates (auto_pick ranks them; cost class 1).
         for mid in (
             "nvidia/nemotron-ultra:free",
             "mistralai/mistral-small:free",
@@ -750,6 +861,11 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         if "codex-sub" in sub or "codex" in sub:
             _add("codex-sub", "gpt-5")
 
+    # mega-16: drop process-local unavailable providers (spending-limit etc.)
+    out[:] = [
+        e for e in out
+        if not is_provider_unavailable(str(e.get("provider") or ""))
+    ]
     return out
 
 
@@ -1311,6 +1427,9 @@ def auto_pick_model(
         model = str(c.get("model") or "").strip()
         if not prov or not model:
             continue
+        # mega-16: skip providers marked unavailable (xai spending-limit etc.)
+        if is_provider_unavailable(prov):
+            continue
         if require_loopback and not provider_is_loopback(
             prov, base_url=c.get("base_url"), cfg=cfg
         ):
@@ -1318,7 +1437,15 @@ def auto_pick_model(
         mr = ranks.get(model)
         if mr is None and "/" in model:
             mr = ranks.get(model.split("/", 1)[-1])
+        # Paid openrouter frontier ids get floor rank even if unranked.
         model_rank = mr.rank if mr is not None else 2
+        mid_l = model.strip().lower()
+        if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
+            mid_l.startswith(stem) for stem in (
+                "deepseek/deepseek-chat", "deepseek-chat",
+            )
+        ):
+            model_rank = max(model_rank, _FRONTIER_MEASURED_FLOOR)
         if model_rank < threshold:
             continue
         sort_key = (
@@ -1332,6 +1459,7 @@ def auto_pick_model(
         fallback = [
             c for c in candidates_raw
             if c.get("provider") and c.get("model")
+            and not is_provider_unavailable(str(c.get("provider") or ""))
             and (
                 not require_loopback
                 or provider_is_loopback(

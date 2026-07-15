@@ -952,13 +952,18 @@ def run(
     agent_result_dict: dict | None = getattr(agent_result, "result", None)
     doc_id = node_inputs.get("doc_id")
 
+    # mega-8 a4: SqliteSaver raised "string or blob too big" when node_states
+    # accumulated full tool results / handoffs. Keep a compact agent_result for
+    # checkpointing (ledger already has full tool_call trails).
+    compact_ar = _compact_agent_result(agent_result_dict)
+
     output_state: dict[str, Any] = {
         "status": _verdict_to_node_status(verdict),
         "summary": _build_summary(node_name, verdict, stop_reason, elapsed_ms),
         "data": {
             "stop_reason": stop_reason,
             "final_code": final_code,
-            "agent_result": agent_result_dict,
+            "agent_result": compact_ar,
             "elapsed_ms": round(elapsed_ms, 1),
         },
         "retry_remaining": new_retry_remaining,
@@ -1173,6 +1178,67 @@ def _synthesise_request(node_type: str, node_inputs: dict[str, Any]) -> str:
     if node_type == "plan":
         return "Decompose the project brief into a list of capability tasks."
     return f"Execute the {node_type} node{doc_ref}."
+
+
+def _compact_agent_result(agent_result_dict: Any) -> Any:
+    """Shrink agent_result for SqliteSaver node_states (mega-8 a4 blob crash).
+
+    Keep stop/handoff summary + tool names/ok flags; drop large result bodies.
+    """
+    if not isinstance(agent_result_dict, dict):
+        return agent_result_dict
+    out: dict[str, Any] = {}
+    for k in (
+        "stop_reason", "one_shot", "leaf_envelope", "delegate_gate",
+        "typed_refusal", "success", "auto_complete",
+    ):
+        if k in agent_result_dict:
+            out[k] = agent_result_dict[k]
+    handoff = agent_result_dict.get("handoff")
+    if isinstance(handoff, dict):
+        out["handoff"] = {
+            "status": handoff.get("status"),
+            "summary": str(handoff.get("summary") or "")[:600],
+        }
+        outs = handoff.get("outputs")
+        if isinstance(outs, dict):
+            slim = {}
+            for ok, ov in outs.items():
+                if ok in ("typed_refusal", "leaf_envelope", "one_shot",
+                          "auto_complete", "productive_tools", "wrote_ledger",
+                          "no_op", "reason"):
+                    slim[ok] = ov
+                elif isinstance(ov, str):
+                    slim[ok] = ov[:400]
+                elif isinstance(ov, (int, float, bool)) or ov is None:
+                    slim[ok] = ov
+            if slim:
+                out["handoff"]["outputs"] = slim
+    calls = agent_result_dict.get("calls")
+    if isinstance(calls, list):
+        out["calls"] = [
+            {"tool": c.get("tool"), "ok": c.get("ok")}
+            for c in calls[:40]
+            if isinstance(c, dict)
+        ]
+        out["tool_calls"] = len(calls)
+    elif "tool_calls" in agent_result_dict:
+        out["tool_calls"] = agent_result_dict.get("tool_calls")
+    # Cap overall JSON size hard.
+    try:
+        import json as _json  # noqa: PLC0415
+        blob = _json.dumps(out, default=str)
+        if len(blob) > 12000:
+            out = {
+                "stop_reason": out.get("stop_reason"),
+                "handoff": out.get("handoff"),
+                "tool_calls": out.get("tool_calls"),
+                "calls": out.get("calls", [])[:20],
+                "truncated": True,
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _map_verdict(stop_reason: str, success: bool) -> str:

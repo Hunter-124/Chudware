@@ -178,17 +178,13 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   (op-vocab registry + capability separation + cheap-leaf oneshot +
   `deliver_partial` terminal). Preflight PASS: account `17d17fb1-…` active;
   PLAN/layout tools_slot has delegate and **no** add_features/new_part;
-  auto_pick depth-2 → ollama. Three processes: attempt-1 archived pre-Fixer8
-  rebind; attempt-2 (Fix 1–3, wall **926s**) and attempt-3 (Fix 4–5, wall
-  **1003.84s**). Axis scoreboard: **A FAIL** (0 accepted add_features ops;
-  a2 `unknown op 'cylinder'` without observed once-per-mission cheatsheet;
-  a3 new_part without add_features). **B PASS** (delegate×1 + depth-1 spawn
-  on BUILD DL2; layout/plan `delegate_or_typed_refusal_required` gate; SPECIFY
-  no longer false-gated). **C PASS** (`leaf_oneshot_ok`×3 + miss×8 telemetry
-  both a2/a3 after OpenAI string-content fix). **D PASS** (terminal
-  `needs_correction` / `verify_failed: [AC1…AC9]` — not running+empty;
-  `deliver_partial` not selected because VERIFY→CORRECT won). Fixer8 Fixes
-  1–6 in `fixes.md` (oneshot string crash, run_id pack seed, gate narrow,
-  JSON salvage, payload ok:false, null-reason normalize). Open defects:
-  thin unknown-op errors, cheatsheet inject not ledger-visible, typed-refusal
-  success path unused. Findings: `reports/runs/mega-8/findings.md`.
+  auto_pick depth-2 → ollama. Attempts 1–3 against **stale engine daemon**
+  (pre-cycle-8 registry) → A FAIL. Main rebuilt OCCT daemon ~22:20; **attempt-4**
+  (pid 2668492, wall **693.46s**, Fixer8 1–10 bound) reconnected mid-run and
+  **flipped A**: `new_part`×2 + **`add_features` accepted ×5** (real
+  `add_feature`+cylinder/shell/cone solids on doc-cpp…). Full scoreboard:
+  **A PASS**, **B PASS** (delegate×1 + spawn; layout/plan typed-refusal gate;
+  SPECIFY not false-gated), **C PASS** (`leaf_oneshot_ok`×10 / miss×1),
+  **D PASS** (explicit `failed`/`dag_error: string or blob too big` — not
+  running+empty; Fix11 compact node_states residual). Fixer8 Fixes 1–11 in
+  `fixes.md`. Findings: `reports/runs/mega-8/findings.md`.

@@ -307,3 +307,33 @@ example; re-nudge on every subsequent ledger/describe/preflight until
 python3 -m pytest services/agent/test_mega8_op_vocab.py \
   services/agent/test_mega8_rolesurface.py -q
 ```
+
+---
+
+## Fix 11 — SqliteSaver `string or blob too big` (attempt-4 crash)
+
+**Fingerprint:** attempt-4 wall 693s, mission `failed` /
+`dag_error: string or blob too big` during phase reconcile after DAG work.
+Axis A already had **accepted add_features** (volume_mm3 solids) + delegate×1
++ oneshot_ok×10 before crash.
+
+**Root cause:** LangGraph `SqliteSaver` checkpoints full `node_states` including
+fat `agent_result` (tool result bodies / handoffs). Default SQLite string limit
+is 1GB but some builds/bindings surface "string or blob too big" earlier, or
+the cumulative checkpoint row exceeded the limit.
+
+**Fix:** `node_runner._compact_agent_result` — store only summary/handoff head,
+tool name+ok list, gate/oneshot flags; drop raw tool result payloads (ledger
+already has full `tool_call` trails).
+
+**Evidence:** `services/dag/node_runner.py` compact helper + output_state path;
+a4 mission stop_reason `dag_error: string or blob too big`.
+
+### Attempt-4 live axes (pre-crash product)
+
+| Axis | Evidence |
+|---|---|
+| A | new_part×2; add_features×6 with **≥5 ok:true** + real volume_mm3 (solids) |
+| B | delegate×1 BUILD DL2; layout/plan still gate-killed |
+| C | leaf_oneshot_ok×10, miss×1 |
+| D | crash path — not clean terminal (Fix11 for next process) |

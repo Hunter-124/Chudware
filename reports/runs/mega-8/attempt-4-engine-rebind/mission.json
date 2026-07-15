@@ -1,0 +1,16 @@
+{
+  "status": "failed",
+  "phase": "plan",
+  "phases_completed": [
+    "intake"
+  ],
+  "stop_reason": "dag_error: string or blob too big",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-8-fc-rocket-20260714/ledger.json",
+  "run_id": "mega-8-fc-rocket-20260714",
+  "mode": "real",
+  "wall_s": 693.46,
+  "conservation": true,
+  "baseline_commit": "7ef7b577",
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-8-fc-rocket-20260714/ledger.json"
+}

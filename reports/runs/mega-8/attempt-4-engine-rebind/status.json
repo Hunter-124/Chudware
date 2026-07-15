@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-8-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 2668492,
+  "started_wall": 1784081592.3591921,
+  "cycle": "mega-8",
+  "conservation": true,
+  "baseline_commit": "7ef7b577",
+  "finished_wall": 1784082285.822054,
+  "wall_s": 693.46,
+  "result": {
+    "status": "failed",
+    "phase": "plan",
+    "stop_reason": "dag_error: string or blob too big",
+    "error": null
+  }
+}

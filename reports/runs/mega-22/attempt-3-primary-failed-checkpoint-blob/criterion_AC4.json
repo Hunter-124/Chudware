@@ -1,0 +1,7 @@
+{
+  "id": "AC4",
+  "result": "FAIL",
+  "detail": "post-hoc: mission terminal without criterion_result for AC4; artifacts present but grading never ran",
+  "source": "grade_run_posthoc_z1",
+  "honest": true
+}

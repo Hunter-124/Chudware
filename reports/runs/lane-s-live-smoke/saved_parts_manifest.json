@@ -1,0 +1,32 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "lane-s-live-smoke",
+  "status": "done",
+  "stop_reason": "mission_complete",
+  "saved": [
+    {
+      "doc_id": "doc-cpp0000000e",
+      "name": "lane_s_smoke_part",
+      "origin_kind": "mcp",
+      "paths": [
+        "reports/runs/lane-s-live-smoke/parts/lane_s_smoke_part_-cpp0000000e.step+",
+        "/tmp/lane_s_ws_6wdcy548/lane_s_smoke_part_-cpp0000000e.step+"
+      ],
+      "bytes": [
+        4661,
+        4661
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp0000000e",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [],
+  "errors": [],
+  "parts_dir": "reports/runs/lane-s-live-smoke/parts",
+  "workspace_dir": "/tmp/lane_s_ws_6wdcy548"
+}

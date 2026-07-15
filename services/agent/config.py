@@ -51,6 +51,38 @@ def save_config(cfg: dict) -> None:
     paths.CONFIG.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
 
+def workspace_dir(cfg: dict | None = None) -> "Path":
+    """Resolve the GUI workspace directory (Settings ``workspace_dir``).
+
+    Mirrors host ``defaultWorkspaceDir`` / ``AppState::workspaceDir``:
+      1. config.json ``workspace_dir`` when set (absolute or ~-expanded)
+      2. existing ``~/Documents/AI-CAD`` (legacy alias wins)
+      3. else ``~/Documents/Billet``
+
+    Always returns a Path; creates the directory when missing (best-effort).
+    """
+    from pathlib import Path  # noqa: PLC0415 — keep module import surface small
+
+    cfg = cfg if cfg is not None else load_config()
+    raw = (cfg or {}).get("workspace_dir") or ""
+    if isinstance(raw, str) and raw.strip():
+        d = Path(os.path.expanduser(raw.strip())).expanduser()
+    else:
+        home = Path(os.path.expanduser("~"))
+        docs = home / "Documents"
+        legacy = docs / "AI-CAD"
+        if legacy.is_dir():
+            d = legacy
+        else:
+            d = docs / "Billet"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+
 DEFAULT_LOCAL_MODEL = "gemma-4-e4b"
 DEFAULT_LOCAL_BASE_URL = "http://localhost:1234/v1"
 

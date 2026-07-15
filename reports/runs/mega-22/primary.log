@@ -1,0 +1,175 @@
+[mega-22] openrouter usage_before=$0.223708 remaining=9.77629216
+[mega-22] preflight: subscription_accounts (pin 06dc3359 for G18)
+[mega-22] xai-sub accounts=3 active=06dc3359-2d20-4cd7-bd84-8c8db560cd4e switched=False target_active=True
+[mega-22] preflight: spawn_probe + auto_pick_smoke
+[mega-22] spawn_probe verdict=PASS budget_rendered_ok=True fix8=PASS fix_wire=PASS
+[mega-22] auto_pick_smoke verdict=PASS axis_G18=PASS axis_Y=PASS hard_xai_grok45=True leaf_local=True
+[mega-22] ambient_provider=XAISubProvider model=grok-4.5 run_id=mega-22-fc-rocket-20260715 conservation=auto_pick_first frontier=xai-sub/grok-4.5 fallback=openrouter:deepseek/deepseek-chat-v3.1
+[07/15/26 16:39:19] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:39:20] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:39:21] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1664.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=655.1                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:22] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=178.9                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:23] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=911.9                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:24] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1299.0                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:27] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2434.5                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:32] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=5118.8                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:40] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=8148.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=13.9                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:42] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1555.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:44] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1619.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=82.0                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:48] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=4288.5                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:39:49] INFO     HTTP Request: POST                  _client.py:1025
+                             https://html.duckduckgo.com/html/                  
+                             "HTTP/1.1 200 OK"                                  
+[07/15/26 16:40:00] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=10726.9                              
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:01] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1841.3                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:03] INFO     HTTP Request: POST                  _client.py:1025
+                             https://html.duckduckgo.com/html/                  
+                             "HTTP/1.1 200 OK"                                  
+[07/15/26 16:40:04] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1086.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:06] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1768.2                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:20] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=14345.7                              
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:22] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1459.6                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:23] INFO     provider nexar declined      parts_providers.py:811
+                             'STM32': Nexar returned no                         
+                             supply results for MPN                             
+                             'STM32'                                            
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'STM32': Digi-Key provider                         
+                             is not configured. Add                             
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'STM32': Mouser provider is                        
+                             not configured. Add                                
+                             'parts_providers.mouser'                           
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 16:40:33] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=7005.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:36] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2586.5                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:38] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1814.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=135.6                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:44] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=5870.4                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:40:58] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=14743.0                              
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         

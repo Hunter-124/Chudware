@@ -1,0 +1,237 @@
+[mega-22] openrouter usage_before=$0.223708 remaining=9.77629216
+[mega-22] preflight: subscription_accounts (pin 06dc3359 for G18)
+[mega-22] xai-sub accounts=3 active=06dc3359-2d20-4cd7-bd84-8c8db560cd4e switched=False target_active=True
+[mega-22] preflight: spawn_probe + auto_pick_smoke
+[mega-22] spawn_probe verdict=PASS budget_rendered_ok=True fix8=PASS fix_wire=PASS
+[mega-22] auto_pick_smoke verdict=PASS axis_G18=PASS axis_Y=PASS hard_xai_grok45=True leaf_local=True
+[mega-22] ambient_provider=XAISubProvider model=grok-4.5 run_id=mega-22-fc-rocket-20260715 conservation=auto_pick_first frontier=xai-sub/grok-4.5 fallback=openrouter:deepseek/deepseek-chat-v3.1
+[07/15/26 15:50:56] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 15:50:57] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+[07/15/26 15:50:58] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1707.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=4.3 attempt=1                        
+                             in_flight=3 capacity=3                             
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=230.2                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 15:51:00] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1877.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=154.4                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 15:51:53] INFO     provider nexar declined      parts_providers.py:811
+                             'STM32F4': Nexar returned no                       
+                             supply results for MPN                             
+                             'STM32F4'                                          
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'STM32F4': Digi-Key provider                       
+                             is not configured. Add                             
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'STM32F4': Mouser provider                         
+                             is not configured. Add                             
+                             'parts_providers.mouser'                           
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 15:52:07] INFO     provider nexar declined      parts_providers.py:811
+                             'STM32': Nexar returned no                         
+                             supply results for MPN                             
+                             'STM32'                                            
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'STM32': Digi-Key provider                         
+                             is not configured. Add                             
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'STM32': Mouser provider is                        
+                             not configured. Add                                
+                             'parts_providers.mouser'                           
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 15:55:49] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 15:55:51] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+[07/15/26 15:55:52] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+[07/15/26 15:58:43] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1703.2                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 15:58:44] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=760.5                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 16:01:23] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:01:24] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:01:25] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:01:27] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+[07/15/26 16:01:28] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:01:29] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 16:01:31] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+ ---------------------------------------------------------------------- 
+ | openEMS 64bit -- version v0.37.0-rc1-2-g7b051bb
+ | (C) 2010-2026 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license
+ ---------------------------------------------------------------------- 
+	Used external libraries:
+		CSXCAD -- Version: v0.7.0-rc1-1-g5115701
+		hdf5   -- Version: 1.14.6
+		          compiled against: HDF5 library version: 1.14.6
+		tinyxml -- compiled against: 2.6.2
+		fparser
+		boost  -- compiled against: 1_90
+		vtk -- Version: 9.5.2
+		       compiled against: 9.5.2
+
+Create FDTD operator (compressed SSE + multi-threading)
+FDTD simulation size: 36x34x21 --> 25704 FDTD cells 
+FDTD timestep is: 3.83493e-13 s; Nyquist rate: 417 timesteps @3.12663e+09 Hz
+Excitation signal length is: 10376 timesteps (3.97912e-09s)
+Max. number of timesteps: 40000 ( --> 3.85505 * Excitation signal length)
+Create FDTD engine (compressed SSE + multi-threading)
+Running FDTD engine... this may take a while... grab a cup of coffee?!?
+[@        4s] Timestep:        28392 || Speed:  182.2 MC/s (1.411e-04 s/TS) || Energy: ~3.27e-22 (-76.35dB)
+Time for 28392 iterations with 25704.00 cells : 4.01 sec
+Speed: 182.20 MCells/s 
+[mega-22] openrouter usage_after=$0.223708 delta=$0.000000 remaining=9.77629216
+{
+  "status": "blocked",
+  "phase": "deliver",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "deliver"
+  ],
+  "stop_reason": "mech_force_add_features_failed: airframe features did not land (result={'ok': False, 'doc_id': 'doc-cpp00000002', 'rolled_back': True, 'error': 'batch rejected \u2014 no features were kept; fix and resend', 'failed_features': [{'id': 'f5', 'error': 'box bo)",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-22-fc-rocket-20260715/ledger.json",
+  "run_id": "mega-22-fc-rocket-20260715",
+  "mode": "real",
+  "wall_s": 657.2,
+  "conservation": true,
+  "baseline_commit": "0f43d126",
+  "spend_before_usd": 0.22370784,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-22-fc-rocket-20260715/ledger.json"
+}

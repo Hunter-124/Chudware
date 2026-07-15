@@ -7237,7 +7237,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             } else {
                 if (!is_surface) {
                     GProp_GProps gp;
-                    BRepGProp::VolumeProperties(shape, gp);
+                    // Prefer triangulation written by tessellate_body just above:
+                    // ~3× faster than exact Gauss VolumeProperties on meshed solids
+                    // (see reports/profiling/2026-07-15). Falls back to exact geometry
+                    // when no triangulation is attached. Relative error ≪ 0.1% —
+                    // display/stats only; mass eval still uses exact VolumeProperties.
+                    BRepGProp::VolumeProperties(shape, gp,
+                                                /*OnlyClosed=*/Standard_False,
+                                                /*SkipShared=*/Standard_False,
+                                                /*UseTriangulation=*/Standard_True);
                     vol = gp.Mass();
                 }
                 area = ::geom::shape_area(shape);

@@ -65,6 +65,191 @@ def _doc_features(doc_id: Optional[str]) -> list[dict]:
         return []
 
 
+_VALID_SIDE_WORDS = frozenset({
+    "top", "bottom", "left", "right", "front", "back",
+    "+x", "-x", "+y", "-y", "+z", "-z",
+})
+
+
+def _normalize_side_query(q: Any) -> Any:
+    """Map invalid plain words like 'top face' → valid side word 'top'."""
+    if not isinstance(q, str):
+        return q
+    s = q.strip()
+    if not s:
+        return q
+    low = s.lower()
+    if low in _VALID_SIDE_WORDS:
+        return low
+    # Strip trailing ' face' / ' faces' / ' side'.
+    for suf in (" faces", " face", " side", " surface"):
+        if low.endswith(suf):
+            base = low[: -len(suf)].strip()
+            if base in _VALID_SIDE_WORDS:
+                return base
+    # Leading side token: "top of body", "bottom planar".
+    first = low.split()[0] if low.split() else low
+    if first in _VALID_SIDE_WORDS:
+        return first
+    return q
+
+
+def _query_geometry_faces(doc_id: Optional[str]) -> list[dict]:
+    """Best-effort face list via query_geometry / bbox (empty on miss)."""
+    if not doc_id:
+        try:
+            doc_id = _cur_doc()
+        except Exception:  # noqa: BLE001
+            return []
+    faces: list[dict] = []
+    # Prefer planar faces via engine query.
+    try:
+        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        for q in (
+            {"of": "face", "surf": "plane"},
+            {"of": "face"},
+        ):
+            raw = cb.call("doc_query", {"doc_id": doc_id, "query": q}) or {}
+            matches = (
+                raw.get("matches")
+                or raw.get("faces")
+                or raw.get("results")
+                or raw.get("items")
+                or []
+            )
+            if isinstance(matches, list) and matches:
+                for m in matches:
+                    if isinstance(m, dict):
+                        faces.append(m)
+                if faces:
+                    break
+    except Exception:  # noqa: BLE001
+        faces = []
+    return faces
+
+
+def _bbox_extents(doc_id: Optional[str]) -> Optional[dict]:
+    """Return axis-aligned bbox dict {xmin,xmax,ymin,ymax,zmin,zmax} if known."""
+    if not doc_id:
+        return None
+    try:
+        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        mass = cb.call("eval_mass", {"doc_id": doc_id}) or {}
+        bb = (
+            mass.get("bbox")
+            or mass.get("bounding_box")
+            or (mass.get("mass") or {}).get("bbox")
+            if isinstance(mass.get("mass"), dict)
+            else None
+        )
+        if isinstance(bb, dict) and bb:
+            return bb
+        if isinstance(bb, (list, tuple)) and len(bb) >= 6:
+            return {
+                "xmin": float(bb[0]), "ymin": float(bb[1]), "zmin": float(bb[2]),
+                "xmax": float(bb[3]), "ymax": float(bb[4]), "zmax": float(bb[5]),
+            }
+        # Some payloads nest under aabb / box.
+        for key in ("aabb", "box", "bounds"):
+            b2 = mass.get(key)
+            if isinstance(b2, dict) and b2:
+                return b2
+    except Exception:  # noqa: BLE001
+        pass
+    # query_geometry fallback for whole body.
+    try:
+        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        raw = cb.call("doc_query", {
+            "doc_id": doc_id,
+            "query": {"of": "body"},
+        }) or {}
+        bb = raw.get("bbox") or raw.get("bounding_box")
+        if isinstance(bb, dict):
+            return bb
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _derive_measure_face_pair(doc_id: Optional[str]) -> Optional[tuple[Any, Any]]:
+    """Derive two geometrically valid measure endpoints (mega-22 R22).
+
+    Prefer largest planar face pair from query_geometry; else bbox extent sides
+    (top/bottom). NEVER invent multi-word names like 'top face' that the geom
+    query rejects. Returns (a_query, b_query) or None.
+    """
+    faces = _query_geometry_faces(doc_id)
+    if len(faces) >= 2:
+        def _area(f: dict) -> float:
+            for k in ("area", "size", "area_mm2"):
+                v = f.get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+            # bbox diagonal proxy
+            bb = f.get("bbox") or f.get("centroid")
+            if isinstance(bb, (list, tuple)) and len(bb) >= 3:
+                return abs(float(bb[0])) + abs(float(bb[1])) + abs(float(bb[2]))
+            return 0.0
+
+        ranked = sorted(faces, key=_area, reverse=True)
+        # Prefer opposite sides when annotated.
+        by_side: dict[str, dict] = {}
+        for f in ranked:
+            side = str(f.get("side") or f.get("normal_side") or "").lower()
+            if side in _VALID_SIDE_WORDS and side not in by_side:
+                by_side[side] = f
+        for a_s, b_s in (
+            ("top", "bottom"), ("+z", "-z"), ("front", "back"),
+            ("left", "right"), ("+x", "-x"), ("+y", "-y"),
+        ):
+            if a_s in by_side and b_s in by_side:
+                return a_s, b_s
+        # Fall back to two largest faces via full query dicts if they carry refs.
+        a_f, b_f = ranked[0], ranked[1]
+        def _as_q(f: dict) -> Any:
+            side = str(f.get("side") or "").lower()
+            if side in _VALID_SIDE_WORDS:
+                return side
+            # Engine face id / selector.
+            for k in ("id", "ref", "face_id", "name", "selector"):
+                if f.get(k):
+                    return str(f[k])
+            if f.get("query"):
+                return f["query"]
+            # Construct pick-largest planar query for the first, second-largest next.
+            return {"of": "face", "surf": "plane", "pick": "largest"}
+
+        qa, qb = _as_q(a_f), _as_q(b_f)
+        if qa == qb and isinstance(qa, dict):
+            qb = {"of": "face", "surf": "plane", "pick": "smallest"}
+        if qa != qb:
+            return qa, qb
+
+    # Bbox extents → opposite axis sides (valid side words only).
+    bb = _bbox_extents(doc_id)
+    if isinstance(bb, dict) and bb:
+        def _span(lo: str, hi: str) -> float:
+            try:
+                return abs(float(bb.get(hi, 0)) - float(bb.get(lo, 0)))
+            except (TypeError, ValueError):
+                return 0.0
+        spans = [
+            (_span("zmin", "zmax"), "top", "bottom"),
+            (_span("ymin", "ymax"), "front", "back"),
+            (_span("xmin", "xmax"), "right", "left"),
+        ]
+        spans.sort(key=lambda t: t[0], reverse=True)
+        if spans[0][0] > 0:
+            return spans[0][1], spans[0][2]
+
+    # Solid features present → valid side words (NOT 'top face').
+    feats = _doc_features(doc_id)
+    if feats:
+        return "top", "bottom"
+    return None
+
+
+
 def _sketch_ids(doc_id: Optional[str]) -> list[str]:
     """Sketch feature ids on *doc_id* (2D sketches only)."""
     out: list[str] = []
@@ -201,59 +386,61 @@ def _adapt_check_kwargs(
         return call_kwargs, None
 
     if check_name == "measure_between":
-        # mega-19 C/AC1: derive two real feature refs from the doc, or honest SKIP.
-        # Never leave a_query empty (signature-zero) and never invent face words
-        # that score 0 when no solid faces exist.
+        # mega-22 R22 / a2 residual: feature ids (f1) and free-text
+        # ("outer cylindrical face") are NOT valid measure queries — the
+        # engine treats bare strings as side words (top/bottom/±x/…).
+        # Always derive geometrically valid face endpoints from
+        # query_geometry / bbox; rewrite bad caller strings.
         a_q = call_kwargs.get("a_query")
         b_q = call_kwargs.get("b_query")
-        feats = _doc_features(doc_id)
-        feat_ids = []
-        for f in feats:
-            fid = f.get("id") or f.get("name") or f.get("feature_id")
-            if fid:
-                feat_ids.append(str(fid))
-        if a_q in (None, "") or b_q in (None, ""):
-            if len(feat_ids) >= 2:
-                if a_q in (None, ""):
-                    call_kwargs["a_query"] = feat_ids[0]
-                if b_q in (None, ""):
-                    call_kwargs["b_query"] = feat_ids[1]
-            elif len(feat_ids) == 1 and feats:
-                # One feature: measure between its top/bottom faces if solid-ish.
-                f0 = feats[0]
-                ftype = str(f0.get("type") or f0.get("kind") or "").lower()
-                if ftype in (
-                    "box", "extrude", "revolve", "cylinder", "pad", "boss",
-                    "solid", "body",
-                ) or "extrud" in ftype or "revolv" in ftype:
-                    if a_q in (None, ""):
-                        call_kwargs["a_query"] = "top face"
-                    if b_q in (None, ""):
-                        call_kwargs["b_query"] = "bottom face"
-                else:
-                    return None, _skip_json(
-                        check_name,
-                        "need two feature refs for measure_between; only one feature",
-                    )
-            else:
-                # Try plain-word faces when features exist but lack ids.
-                if feats:
-                    if a_q in (None, ""):
-                        call_kwargs["a_query"] = "top face"
-                    if b_q in (None, ""):
-                        call_kwargs["b_query"] = "bottom face"
-                else:
-                    return None, _skip_json(
-                        check_name,
-                        "no features to measure between (honest SKIP)",
-                    )
-        # Final guard: still missing either endpoint → SKIP not zero-score.
-        if call_kwargs.get("a_query") in (None, "") or call_kwargs.get(
-            "b_query"
-        ) in (None, ""):
-            return None, _skip_json(
-                check_name, "could not derive two measure endpoints",
+        if isinstance(a_q, str):
+            a_q = _normalize_side_query(a_q)
+            call_kwargs["a_query"] = a_q
+        if isinstance(b_q, str):
+            b_q = _normalize_side_query(b_q)
+            call_kwargs["b_query"] = b_q
+
+        def _valid_endpoint(q) -> bool:
+            if q in (None, ""):
+                return False
+            if isinstance(q, dict):
+                return bool(q.get("of") or q.get("side") or q.get("pick"))
+            if not isinstance(q, str):
+                return False
+            s = q.strip().lower()
+            if s in _VALID_SIDE_WORDS:
+                return True
+            # Feature ids like f1/feat_box are NOT face queries.
+            return False
+
+        if not _valid_endpoint(a_q) or not _valid_endpoint(b_q):
+            pair = _derive_measure_face_pair(
+                call_kwargs.get("doc_id") or doc_id
             )
+            if pair is None:
+                # Last resort: valid opposite sides if any solid features exist.
+                feats = _doc_features(doc_id)
+                if feats:
+                    pair = ("top", "bottom")
+                else:
+                    return None, _skip_json(
+                        check_name,
+                        "no geometrically valid measure endpoints (honest SKIP)",
+                    )
+            if not _valid_endpoint(call_kwargs.get("a_query")):
+                call_kwargs["a_query"] = pair[0]
+            if not _valid_endpoint(call_kwargs.get("b_query")):
+                call_kwargs["b_query"] = pair[1]
+
+        # Final normalize + guard.
+        for key in ("a_query", "b_query"):
+            call_kwargs[key] = _normalize_side_query(call_kwargs.get(key))
+            if not _valid_endpoint(call_kwargs.get(key)):
+                return None, _skip_json(
+                    check_name,
+                    f"invalid measure endpoint {call_kwargs.get(key)!r} "
+                    "(need side word or face query dict; honest SKIP)",
+                )
         return call_kwargs, None
 
     if check_name == "ecad_check_impedance":

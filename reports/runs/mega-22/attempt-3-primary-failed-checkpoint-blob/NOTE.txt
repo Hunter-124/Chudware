@@ -1,0 +1,3 @@
+a3 primary failed: terminal failed/dag_error:checkpoint_blob at plan phase;
+wall 697s; infrastructure fail not P22/Q22 residual. Archived before a4 relaunch.
+Best graded remains a2 (live 7/9) in attempt-2-primary-graded-live7/.

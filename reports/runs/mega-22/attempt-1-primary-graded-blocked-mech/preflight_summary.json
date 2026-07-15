@@ -1,0 +1,51 @@
+{
+  "account_active": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "account_target": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "account_matches_target": true,
+  "target_is_active": true,
+  "spawn_probe": "PASS",
+  "auto_pick_smoke": "PASS",
+  "fix8_hard_gate": "PASS",
+  "fix8_detail": {
+    "source_gate_present": true,
+    "unit_test_present": true,
+    "ecad_engineer_has_chain": true,
+    "verdict": "PASS"
+  },
+  "fix_wire_gate": "PASS",
+  "fix_wire_detail": {
+    "source_has_real_wire": true,
+    "source_force_wire_order": true,
+    "unit_test_wire_before_board": true,
+    "ecad_engineer_has_wire_power": true,
+    "verdict": "PASS"
+  },
+  "fix_mega22": {
+    "verdict": "PASS",
+    "p22_source": true,
+    "q22_source": true,
+    "r22_source": true,
+    "unit_test_present": true,
+    "mega22_bound": true,
+    "detail": {
+      "has_optimize_traces": true,
+      "has_spice_markers": true,
+      "battery_path": "services/verify/battery.py",
+      "battery_has_measure": true,
+      "battery_has_geom_derive": true,
+      "test_p22": true,
+      "test_q22": true,
+      "test_r22": true
+    }
+  },
+  "axis_Y": "PASS",
+  "axis_G18": "PASS",
+  "hard_xai_grok45": true,
+  "hard_openrouter_paid": false,
+  "leaf_local": true,
+  "live_mega_processes": [],
+  "other_xai_consumers": [],
+  "no_other_xai_consumer": true,
+  "preflight_ready_for_launch": true,
+  "mega22_fixes_bound_probe": true
+}

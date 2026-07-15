@@ -389,10 +389,17 @@ def test_force_cascade_injects_v_source_before_simulate():
         dispatched.append((tool, dict(args or {})))
         if tool == "ecad_place_symbol":
             lib = str((args or {}).get("libid") or "")
-            if "Device:V" in lib or lib.endswith(":V"):
+            if (
+                "Device:V" in lib or lib.endswith(":V")
+                or "V_source" in lib or "Simulation_SPICE" in lib
+            ):
                 return {
                     "ok": True, "ref": "V1", "libid": lib,
                     "value": (args or {}).get("value") or "DC 3.3",
+                    "pins": [
+                        {"number": "+", "xy": [0, 2.54]},
+                        {"number": "-", "xy": [0, -2.54]},
+                    ],
                 }
             return {"ok": True, "ref": "R9", "libid": lib}
         if tool == "ecad_simulate":
@@ -423,6 +430,8 @@ def test_force_cascade_injects_v_source_before_simulate():
     ]
     assert any(
         "Device:V" in str((c.get("args") or {}).get("libid") or "")
+        or "V_source" in str((c.get("args") or {}).get("libid") or "")
+        or "Simulation_SPICE" in str((c.get("args") or {}).get("libid") or "")
         or str((c.get("result") or {}).get("ref") or "").startswith("V")
         for c in places
     ), (places, dispatched)
@@ -452,6 +461,7 @@ def test_measure_between_honest_skip_without_features(monkeypatch):
 
 
 def test_measure_between_derives_two_feature_refs(monkeypatch):
+    """mega-22 R22: feature ids are not face queries — derive valid sides."""
     from services.verify import battery as bat
 
     monkeypatch.setattr(
@@ -460,6 +470,14 @@ def test_measure_between_derives_two_feature_refs(monkeypatch):
             {"id": "feat_box", "type": "box"},
             {"id": "feat_cut", "type": "extrude"},
         ],
+    )
+    monkeypatch.setattr(bat, "_query_geometry_faces", lambda doc_id: [])
+    monkeypatch.setattr(
+        bat, "_bbox_extents",
+        lambda doc_id: {
+            "xmin": 0, "xmax": 10, "ymin": 0, "ymax": 10,
+            "zmin": 0, "zmax": 40,
+        },
     )
 
     def _fn(doc_id=None, a_query=None, b_query=None):
@@ -470,8 +488,9 @@ def test_measure_between_derives_two_feature_refs(monkeypatch):
     )
     assert skip is None
     assert adapted is not None
-    assert adapted.get("a_query") == "feat_box"
-    assert adapted.get("b_query") == "feat_cut"
+    assert adapted.get("a_query") in bat._VALID_SIDE_WORDS
+    assert adapted.get("b_query") in bat._VALID_SIDE_WORDS
+    assert adapted.get("a_query") != adapted.get("b_query")
 
 
 def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):

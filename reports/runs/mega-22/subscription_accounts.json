@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-07-15T20:39:08Z",
+  "provider": "xai-sub",
+  "accounts": [
+    {
+      "account_id": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+      "email": null,
+      "label": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+      "active": true,
+      "connected": true,
+      "expires_at_ms": 1784158929959.3677
+    },
+    {
+      "account_id": "17d17fb1-247a-4800-ba97-e7b5150bc53a",
+      "email": null,
+      "label": "17d17fb1-247a-4800-ba97-e7b5150bc53a",
+      "active": false,
+      "connected": true,
+      "expires_at_ms": 1784157432006.0625
+    },
+    {
+      "account_id": "79066dcc-36d8-44c3-8561-cc8b6a58e19d",
+      "email": null,
+      "label": "79066dcc-36d8-44c3-8561-cc8b6a58e19d",
+      "active": false,
+      "connected": true,
+      "expires_at_ms": 1784157432358.2473
+    }
+  ],
+  "accounts_xai_alias": [],
+  "active_before_or_after": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "chosen_account_id": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "target_account_id": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "target_present": true,
+  "target_is_active": true,
+  "switched": false,
+  "n_accounts": 3,
+  "note": "mega-22 pins xai-sub active to 06dc3359-2d20-4cd7-bd84-8c8db560cd4e when present; else newest by expires_at_ms"
+}

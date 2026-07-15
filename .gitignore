@@ -102,3 +102,7 @@ extern/cef/
 
 # simsuite baseline output (transient)
 benchmarks/simsuite/results/
+
+# never commit credentials
+Webservice/Cloudflare-info.txt
+Webservice/secrets/

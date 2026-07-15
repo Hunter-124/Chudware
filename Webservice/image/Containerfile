@@ -28,8 +28,11 @@ RUN dnf -y install \
         mesa-libGL \
         mesa-libEGL \
         mesa-libgbm \
+        libglvnd \
         libglvnd-glx \
         libglvnd-egl \
+        libglvnd-opengl \
+        libglvnd-gles \
         libX11 \
         libXext \
         libXrender \
@@ -68,6 +71,7 @@ RUN dnf -y install \
         cairo \
         procps-ng \
         which \
+        hostname \
         xprop \
         xdpyinfo \
         ImageMagick \

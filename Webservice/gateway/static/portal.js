@@ -103,10 +103,14 @@
 
   function streamUrl(sess) {
     if (!sess) return null;
-    if (sess.stream_url) return sess.stream_url;
-    if (sess.stream_path) return sess.stream_path;
-    if (sess.sid) return "/stream/" + encodeURIComponent(sess.sid) + "/";
-    return null;
+    var base = sess.stream_url || sess.stream_path ||
+      (sess.sid ? "/stream/" + encodeURIComponent(sess.sid) + "/" : null);
+    if (!base) return null;
+    if (base.charAt(base.length - 1) !== "/") base += "/";
+    // noVNC resolves its websocket `path` against the host root, not the page
+    // directory — pass the proxied prefix explicitly and autoconnect.
+    return base + "vnc.html?autoconnect=1&resize=scale&reconnect=1&path=" +
+      encodeURIComponent(base.slice(1) + "websockify");
   }
 
   function isLive(status) {

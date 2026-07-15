@@ -60,6 +60,7 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
 | `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
 | `tools/`, `benchmarks/`, `training/`, `dag/`, `deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
+| `Webservice/` | billet-web: self-hosted multi-user streamed sessions — `gateway/` (FastAPI portal+auth+session mgr+chat), `image/` (Fedora 44 session container), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
 Env/naming compat: `SHOPCRAFT_*` env vars canonical, `AI_CAD_*` honored; MCP id `shopcraft`

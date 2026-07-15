@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -262,13 +263,23 @@ class SessionManager:
             else:
                 sess.status = "error"
                 sess.error = "stream port did not become healthy in time"
-                log.error("session %s healthcheck failed", sid)
+                log.error("session %s healthcheck failed; cleaning up", sid)
+                await self._podman_stop(sess.container)
+                async with self._lock:
+                    self._ports_in_use.discard(host_port)
+                    if self._by_email.get(email) == sid:
+                        del self._by_email[email]
+                    self._sessions.pop(sid, None)
         except Exception as exc:  # noqa: BLE001
             sess.status = "error"
-            sess.error = str(exc)
+            sess.error = str(exc) or type(exc).__name__
             log.exception("session start failed for %s", email)
+            await self._podman_stop(sess.container)
             async with self._lock:
                 self._ports_in_use.discard(host_port)
+                if self._by_email.get(email) == sid:
+                    del self._by_email[email]
+                self._sessions.pop(sid, None)
             raise
         return sess
 
@@ -304,22 +315,34 @@ class SessionManager:
         return await self.stop(sess.sid, email=email)
 
     async def run_podman(self, args: list[str], *, timeout: float = 120.0) -> tuple[int, str, str]:
-        """Execute podman; returns (rc, stdout, stderr). Monkeypatch this in tests."""
-        proc = await asyncio.create_subprocess_exec(
-            self.podman_bin,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.communicate()
-            raise PodmanError(f"podman timed out: {' '.join(args[:4])}") from exc
-        out = (out_b or b"").decode("utf-8", errors="replace")
-        err = (err_b or b"").decode("utf-8", errors="replace")
-        return proc.returncode or 0, out, err
+        """Execute podman; returns (rc, stdout, stderr). Monkeypatch this in tests.
+
+        Output goes to temp FILES, not pipes: `podman run -d` hands its stdio fds
+        to conmon, which keeps them open for the container's whole lifetime, so a
+        pipe-based communicate() never sees EOF and hangs until timeout.
+        """
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            proc = await asyncio.create_subprocess_exec(
+                self.podman_bin,
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=out_f,
+                stderr=err_f,
+            )
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                raise PodmanError(f"podman timed out: {' '.join(args[:4])}") from exc
+            out_f.seek(0)
+            err_f.seek(0)
+            out = out_f.read().decode("utf-8", errors="replace")
+            err = err_f.read().decode("utf-8", errors="replace")
+        return rc, out, err
 
     async def _ensure_no_stale_container(self, name: str) -> None:
         rc, out, _ = await self.run_podman(
@@ -329,6 +352,59 @@ class SessionManager:
         if rc == 0 and out.strip():
             log.info("removing stale container %s", name)
             await self.run_podman(["rm", "-f", name], timeout=60)
+
+    async def adopt_running(self) -> int:
+        """Rebuild session records from live billet-sess-* containers.
+
+        Session state is in-memory; after a gateway restart (systemd
+        Restart=on-failure) running seats would otherwise be orphaned —
+        unreachable, unreaped, and double-started on the next login.
+        """
+        rc, out, _ = await self.run_podman(
+            [
+                "ps",
+                "--filter", "name=^billet-sess-",
+                "--filter", "status=running",
+                "--format",
+                '{{.ID}}\t{{index .Labels "billet.sid"}}\t{{index .Labels "billet.email"}}\t'
+                '{{index .Labels "billet.display"}}\t{{index .Labels "billet.slug"}}\t'
+                '{{index .Labels "billet.port"}}\t{{index .Labels "billet.heavy"}}\t{{.Names}}',
+            ],
+            timeout=30,
+        )
+        if rc != 0:
+            log.warning("adopt_running: podman ps failed rc=%s", rc)
+            return 0
+        adopted = 0
+        async with self._lock:
+            for line in out.strip().splitlines():
+                parts = line.split("\t")
+                if len(parts) != 8:
+                    continue
+                cid, sid, email, display, slug, port_s, heavy_s, name = parts
+                if not sid or not email or sid in self._sessions:
+                    continue
+                try:
+                    port = int(port_s)
+                except ValueError:
+                    continue
+                self._sessions[sid] = Session(
+                    sid=sid,
+                    email=email,
+                    display=display or email,
+                    slug=slug or email_slug(email),
+                    container=name,
+                    host_port=port,
+                    heavy=heavy_s == "1",
+                    status="ready",
+                    container_id=cid,
+                )
+                self._by_email[email] = sid
+                self._ports_in_use.add(port)
+                adopted += 1
+        if adopted:
+            log.info("adopted %d running session container(s)", adopted)
+        return adopted
 
     async def _podman_run(self, sess: Session, user: User, home: Path) -> str:
         encoder = "nvh264enc" if sess.heavy else "x264enc"
@@ -357,6 +433,18 @@ class SessionManager:
             str(self.cfg.session_cpus),
             "--pids-limit",
             str(self.cfg.session_pids_limit),
+            "--label",
+            f"billet.sid={sess.sid}",
+            "--label",
+            f"billet.email={sess.email}",
+            "--label",
+            f"billet.display={sess.display}",
+            "--label",
+            f"billet.slug={sess.slug}",
+            "--label",
+            f"billet.port={sess.host_port}",
+            "--label",
+            f"billet.heavy={'1' if sess.heavy else '0'}",
             "-p",
             f"127.0.0.1:{sess.host_port}:8080",
             "-v",

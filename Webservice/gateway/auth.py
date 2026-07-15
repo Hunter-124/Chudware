@@ -235,7 +235,7 @@ class AuthMiddleware:
 
     def _authenticate(self, headers: dict[str, str], cookies: dict[str, str]) -> User | None:
         if self.cfg.dev_mode:
-            email = headers.get("x-dev-user")
+            email = headers.get("x-dev-user") or cookies.get("dev_user")
             if not email:
                 raise AuthError(
                     "dev mode requires X-Dev-User header",

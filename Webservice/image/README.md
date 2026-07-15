@@ -60,13 +60,14 @@ to the repo `.gitignore`.
 | `BILLET_HEAVY` | `1` → try VirtualGL EGL when NVIDIA devices present |
 | `DISPLAY` | `:0` |
 | `BILLET_PLM_DIR` | `/plm` (shared bare repos mount) |
+| `AI_CAD_LIBAICAD` | `/opt/billet/bin/libaicad.so` (set in image) |
 
 Volumes: private `…/homes/<slug>:/home/user`, shared `…/plm:/plm`.
 
-## Smoke
+## Smoke (verified 2026-07-14)
 
 ```bash
-TMPHOME=$(mktemp -d)
+TMPHOME=$(mktemp -d); chmod 777 "$TMPHOME"
 CID=$(podman run --rm -d \
   -p 127.0.0.1:8480:8080 \
   -v "$TMPHOME:/home/user:Z" \
@@ -77,27 +78,34 @@ CID=$(podman run --rm -d \
   -e STREAM_BACKEND=novnc \
   localhost/billet-session:latest)
 
-# Stream UI HTML within ~60s
 for i in $(seq 1 60); do
   curl -fsS http://127.0.0.1:8480/ >/tmp/novnc.html && break
   sleep 1
 done
-head -c 200 /tmp/novnc.html
+grep -ioE '<title>[^<]+</title>' /tmp/novnc.html   # → <title>noVNC</title>
 
-# Billet drawing on the X display
 podman exec "$CID" bash -c \
-  'xwd -display :0 -root -out /tmp/root.xwd && convert /tmp/root.xwd /tmp/root.png && ls -la /tmp/root.png'
+  'xwd -display :0 -root -out /tmp/root.xwd && magick /tmp/root.xwd /tmp/root.png && ls -la /tmp/root.png'
 
 podman stop "$CID"
 rm -rf "$TMPHOME"
 ```
 
+Observed: HTTP 200 from websockify, noVNC HTML, Billet + aicad-hostd running,
+`[engine] daemon mode: connected to aicad-hostd (state=ready)`, 1920×1080 PNG
+with Model ribbon + origin planes, status bar **Ready.**
+
 ## Selkies status
 
-`pip install selkies==1.6.1` installs the legacy **GStreamer** WebRTC frontend
-(`selkies-gstreamer`). It is **not** the modern pixelflux stack used by the
-official Selkies desktop images, and on Fedora it often lacks a complete capture
-pipeline without extra GStreamer plugins. The image records
-`/opt/billet-selkies.status` and **defaults to novnc**, which is verified
-working. Prefer `STREAM_BACKEND=novnc` for demos until a Fedora-native Selkies
-path is proven.
+`pip install selkies==1.6.1` **fails** on Fedora 44 without kernel headers
+(`evdev` needs `linux/input.h`). Even when installed, that wheel is the legacy
+**GStreamer** WebRTC frontend (`selkies-gstreamer`), not modern pixelflux. The
+image records `/opt/billet-selkies.status` and **defaults to novnc** (verified).
+
+## Open issues / notes
+
+- HOME volume: host dir must be writable by uid 1000 (`chmod 777` or `:U`).
+- Optional Python worker features (e.g. `fw_projects`) may toast "worker not
+  started" — CAD path uses libaicad/hostd; full Python app payload not in v1.
+- Missing `hostname` binary → harmless `novnc_proxy` warning.
+- Image ~4.1 GB (CEF stripped + OCCT + Mesa + VirtualGL).

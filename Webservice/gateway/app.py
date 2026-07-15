@@ -41,6 +41,7 @@ sessions_router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 @app.on_event("startup")
 async def _startup() -> None:
     settings.ensure_data_dirs()
+    await manager.adopt_running()
     await manager.start_reaper()
     log.info(
         "gateway up data_root=%s max_sessions=%s max_heavy=%s dev=%s",

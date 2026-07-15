@@ -83,31 +83,61 @@ fi
 log "Xvfb ready"
 
 # ---- GL path: VirtualGL EGL for heavy+GPU, else llvmpipe --------------------
+# VirtualGL's libvglfaker.so leaves eglGetProcAddress / glXGetProcAddressARB
+# undefined (resolved from already-loaded libEGL/libGL). Preload those with
+# RTLD_GLOBAL semantics via LD_PRELOAD so vglrun -d egl can start.
 BILLET_PREFIX=()
+USE_VGL=0
 HAS_NVIDIA=0
-if [ -e /dev/nvidia0 ] || [ -e /dev/nvidiactl ] || ls /dev/dri/card* >/dev/null 2>&1; then
-    # nvidia device nodes present via CDI
-    if [ -e /dev/nvidia0 ] || [ -e /dev/nvidiactl ]; then
-        HAS_NVIDIA=1
-    fi
+if [ -e /dev/nvidia0 ] || [ -e /dev/nvidiactl ]; then
+    HAS_NVIDIA=1
 fi
+
+enable_llvmpipe() {
+    unset LD_PRELOAD 2>/dev/null || true
+    # Drop any leftover VGL preloads; force software Mesa.
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    unset VGL_DISPLAY 2>/dev/null || true
+    BILLET_PREFIX=()
+    USE_VGL=0
+}
 
 if [ "$BILLET_HEAVY" = "1" ] && [ "$HAS_NVIDIA" = "1" ]; then
     if command -v vglrun >/dev/null 2>&1; then
         log "BILLET_HEAVY=1 + NVIDIA — using VirtualGL (vglrun -d egl)"
         export VGL_DISPLAY="${VGL_DISPLAY:-egl}"
         export VGL_LOGO=0
+        # Preload dispatch + EGL + GL so libvglfaker resolves GetProcAddress symbols.
+        _vgl_preload=""
+        for _lib in \
+            /usr/lib64/libGLdispatch.so.0 \
+            /usr/lib64/libOpenGL.so.0 \
+            /usr/lib64/libEGL.so.1 \
+            /usr/lib64/libGL.so.1
+        do
+            if [ -e "$_lib" ]; then
+                _vgl_preload="${_vgl_preload:+$_vgl_preload:}$_lib"
+            fi
+        done
+        if [ -n "$_vgl_preload" ]; then
+            export LD_PRELOAD="${_vgl_preload}${LD_PRELOAD:+:$LD_PRELOAD}"
+            log "VGL LD_PRELOAD=$LD_PRELOAD"
+        fi
+        # Don't force software GL under VGL.
+        unset LIBGL_ALWAYS_SOFTWARE 2>/dev/null || true
+        unset GALLIUM_DRIVER 2>/dev/null || true
         BILLET_PREFIX=(vglrun -d egl)
+        USE_VGL=1
     else
         log "WARNING: BILLET_HEAVY=1 but VirtualGL/vglrun missing — falling back to llvmpipe"
+        enable_llvmpipe
     fi
 else
     if [ "$BILLET_HEAVY" = "1" ] && [ "$HAS_NVIDIA" != "1" ]; then
         log "BILLET_HEAVY=1 but no NVIDIA devices — llvmpipe"
     fi
-    # Force software GL when not using VirtualGL so Mesa doesn't probe missing DRM.
-    export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
-    export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+    enable_llvmpipe
 fi
 
 # ---- Stream backend first (so /health of stream is up while Billet boots) ----
@@ -178,17 +208,50 @@ if [ ! -x "$BILLET_BIN" ]; then
     exit 1
 fi
 
-log "launching Billet as ${BILLET_USER_EMAIL:-?} / ${AICAD_USER_DISPLAY}"
-log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$BILLET_HEAVY"
-log "  prefix=${BILLET_PREFIX[*]:-(none)}"
+launch_billet() {
+    log "launching Billet as ${BILLET_USER_EMAIL:-?} / ${AICAD_USER_DISPLAY}"
+    log "  DISPLAY=$DISPLAY STREAM_BACKEND=$STREAM_BACKEND HEAVY=$BILLET_HEAVY USE_VGL=$USE_VGL"
+    log "  prefix=${BILLET_PREFIX[*]:-(none)}"
+    if [ ${#BILLET_PREFIX[@]} -gt 0 ]; then
+        "${BILLET_PREFIX[@]}" "$BILLET_BIN" &
+    else
+        "$BILLET_BIN" &
+    fi
+    BILLET_PID=$!
+    # Replace any previous Billet pid in PIDS with the live one.
+    local cleaned=()
+    local p
+    for p in "${PIDS[@]:-}"; do
+        [ "$p" = "${PREV_BILLET_PID:-}" ] && continue
+        cleaned+=("$p")
+    done
+    PIDS=("${cleaned[@]}")
+    PIDS+=("$BILLET_PID")
+    PREV_BILLET_PID=$BILLET_PID
+    log "Billet pid=$BILLET_PID"
+}
 
-# Run under the session user identity (container USER is already 'user').
-"${BILLET_PREFIX[@]}" "$BILLET_BIN" &
-BILLET_PID=$!
-PIDS+=($BILLET_PID)
-log "Billet pid=$BILLET_PID"
+launch_billet
 
-# Wait on Billet; if it dies, tear everything down.
+# If VirtualGL fails (missing EGL symbols, bad CDI libs, …) Billet dies immediately.
+# Detect early exit and relaunch under llvmpipe so the seat stays usable.
+if [ "$USE_VGL" = "1" ]; then
+    set +e
+    for _i in 1 2 3 4 5 6 7 8; do
+        if ! kill -0 "$BILLET_PID" 2>/dev/null; then
+            wait "$BILLET_PID" 2>/dev/null
+            _rc=$?
+            log "WARNING: Billet under VirtualGL exited within ${_i}s (rc=${_rc}) — falling back to llvmpipe"
+            enable_llvmpipe
+            launch_billet
+            break
+        fi
+        sleep 1
+    done
+    set -e
+fi
+
+# Wait on Billet; if it dies later, tear everything down.
 set +e
 wait "$BILLET_PID"
 rc=$?

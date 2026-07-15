@@ -2,7 +2,7 @@
 # role: admin | user
 # heavy: true reserves a GPU seat when available (≤ max_heavy concurrent).
 users:
-  - email: hunter@example.com
+  - email: haedmonds69@gmail.com
     display: Hunter
     role: admin
     heavy: true

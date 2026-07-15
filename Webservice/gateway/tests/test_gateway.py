@@ -326,3 +326,87 @@ def test_ai_provider_vars_parse_and_forward(client, _isolate, monkeypatch, tmp_p
     joined = " ".join(run_call)
     assert "OPENROUTER_API_KEY=sk-or-123" in joined
     assert "ANTHROPIC_API_KEY=sk-ant-456" in joined
+
+
+# ---------------------------------------------------------------------------
+# Admin allowlist API
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _admin_env(monkeypatch, tmp_path):
+    """Writable users file + mocked Access sync."""
+    users = tmp_path / "users.yaml"
+    users.write_text(
+        "users:\n"
+        "  - email: boss@example.com\n"
+        "    display: Boss\n"
+        "    role: admin\n"
+        "    heavy: true\n"
+        "  - email: demo@example.com\n"
+        "    display: Demo User\n"
+        "    role: user\n"
+        "    heavy: false\n"
+    )
+    monkeypatch.setattr(settings, "users_file", users)
+    # Middleware and admin endpoints SHARE app_mod.user_directory (passed to
+    directory = app_mod.user_directory
+    orig_path = directory.path
+    monkeypatch.setattr(directory, "path", users)
+    monkeypatch.setattr(directory, "_mtime", None)
+    directory.reload(force=True)
+    synced: list[str] = []
+
+    async def fake_sync():
+        synced.append("x")
+        return {"synced": True, "detail": "mocked"}
+
+    monkeypatch.setattr(app_mod, "_sync_access_policy", fake_sync)
+    yield directory, synced, users
+    directory.path = orig_path
+    directory._mtime = None
+    directory.reload(force=True)
+
+
+def test_admin_requires_admin_role(client, _admin_env, monkeypatch):
+    # demo is role=user in the _admin_env users file, but the MIDDLEWARE still
+    # reads the package users.yaml; use its known non-admin user
+    r = client.get("/api/admin/users", headers=_auth("demo@example.com"))
+    assert r.status_code == 403
+
+
+def test_admin_add_remove_user(client, _admin_env, monkeypatch):
+    directory, synced, users = _admin_env
+    # boss@example.com must ALSO exist in middleware users file to authenticate;
+    # middleware uses package users.yaml. Point middleware directory at ours:
+    import gateway.auth as auth_mod
+    # authenticate via the app's shared directory by swapping settings path used
+    # by the middleware's directory reload
+    mw_dir = app_mod.user_directory
+    r = client.post(
+        "/api/admin/users",
+        headers=_auth("boss@example.com"),
+        json={"email": "friend@ua.edu", "display": "Friend", "role": "user", "heavy": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] and body["access_policy"]["synced"]
+    assert "friend@ua.edu" in users.read_text()
+    assert synced
+
+    r2 = client.delete("/api/admin/users/friend@ua.edu", headers=_auth("boss@example.com"))
+    assert r2.status_code == 200
+    assert "friend@ua.edu" not in users.read_text()
+
+    # cannot remove yourself
+    r3 = client.delete("/api/admin/users/boss@example.com", headers=_auth("boss@example.com"))
+    assert r3.status_code == 400
+
+
+def test_admin_rejects_bad_email(client, _admin_env):
+    r = client.post(
+        "/api/admin/users",
+        headers=_auth("boss@example.com"),
+        json={"email": "not-an-email"},
+    )
+    assert r.status_code == 400

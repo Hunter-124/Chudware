@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -35,10 +37,107 @@ logging.basicConfig(
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+try:
+    from .auth import UserDirectory
+except ImportError:
+    from auth import UserDirectory
+
+settings.ensure_data_dirs()  # users_file must exist before the directory loads
+user_directory = UserDirectory(settings.users_file)
+
 app = FastAPI(title="billet-web", version="1.0.0")
-app.add_middleware(AuthMiddleware)
+app.add_middleware(AuthMiddleware, directory=user_directory)
 
 sessions_router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+def _require_admin(request: Request) -> User:
+    user = get_current_user(request)
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    return user
+
+
+@app.get("/api/me")
+async def whoami(request: Request) -> dict[str, Any]:
+    user = get_current_user(request)
+    return {"email": user.email, "display": user.display,
+            "role": user.role, "heavy": user.heavy}
+
+
+async def _sync_access_policy() -> dict[str, Any]:
+    """Push the current users file into the Cloudflare Access policy.
+
+    Reuses deploy/cf_provision.py --sync-users (single tested code path).
+    Best-effort: a CF failure must not lose the local allowlist edit.
+    """
+    script = Path(__file__).resolve().parents[1] / "deploy" / "cf_provision.py"
+    env = dict(os.environ, BILLET_WEB_USERS_FILE=str(settings.users_file))
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), "--sync-users",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+    )
+    try:
+        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return {"synced": False, "detail": "cloudflare sync timed out"}
+    out = (out_b or b"").decode("utf-8", errors="replace").strip()
+    ok = proc.returncode == 0
+    if not ok:
+        log.warning("Access policy sync failed: %s", out)
+    return {"synced": ok, "detail": out[-500:]}
+
+
+@admin_router.get("/users")
+async def admin_list_users(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    return {"users": [
+        {"email": u.email, "display": u.display, "role": u.role, "heavy": u.heavy}
+        for u in sorted(user_directory.all(), key=lambda u: u.email)
+    ]}
+
+
+@admin_router.post("/users")
+async def admin_add_user(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    _require_admin(request)
+    email = str(body.get("email", "")).strip().lower()
+    if "@" not in email or " " in email or len(email) > 254:
+        raise HTTPException(status_code=400, detail="invalid email")
+    role = str(body.get("role", "user"))
+    if role not in {"admin", "user"}:
+        raise HTTPException(status_code=400, detail="role must be admin or user")
+    user = User(
+        email=email,
+        display=str(body.get("display") or email.split("@")[0]),
+        role=role,
+        heavy=bool(body.get("heavy", False)),
+    )
+    user_directory.upsert(user)
+    sync = await _sync_access_policy()
+    return {"ok": True, "user": {"email": user.email, "display": user.display,
+                                 "role": user.role, "heavy": user.heavy},
+            "access_policy": sync}
+
+
+@admin_router.delete("/users/{email}")
+async def admin_remove_user(email: str, request: Request) -> dict[str, Any]:
+    admin = _require_admin(request)
+    email = email.strip().lower()
+    if email == admin.email:
+        raise HTTPException(status_code=400, detail="cannot remove yourself")
+    if not user_directory.remove(email):
+        raise HTTPException(status_code=404, detail="no such user")
+    sync = await _sync_access_policy()
+    return {"ok": True, "removed": email, "access_policy": sync}
+
+
+@app.get("/admin")
+async def admin_page(request: Request) -> HTMLResponse:
+    _require_admin(request)
+    return HTMLResponse((STATIC_DIR / "admin.html").read_text())
 
 
 @app.on_event("startup")
@@ -286,6 +385,7 @@ async def healthz() -> dict[str, Any]:
 app.include_router(sessions_router)
 app.include_router(proxy_router)
 app.include_router(chat_router)
+app.include_router(admin_router)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

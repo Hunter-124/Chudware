@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Billet — Admin</title>
+<link rel="stylesheet" href="/static/portal.css">
+<style>
+  .admin-wrap { max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  .admin-card { background: var(--panel, #16181d); border: 1px solid var(--border, #2a2e36);
+                border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
+  .admin-card h2 { margin: 0 0 14px; font-size: 1.05rem; }
+  table.users { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  table.users th, table.users td { text-align: left; padding: 8px 10px;
+                border-bottom: 1px solid var(--border, #2a2e36); }
+  table.users th { color: var(--muted, #8b93a3); font-weight: 500; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: .78rem; }
+  .pill.admin { background: #3d2f10; color: #eeba4a; }
+  .pill.user { background: #14301f; color: #55d98a; }
+  .pill.heavy { background: #17253d; color: #6aa8ff; margin-left: 6px; }
+  .rm-btn { background: none; border: 1px solid #55303a; color: #e07a8a;
+            border-radius: 8px; padding: 3px 10px; cursor: pointer; }
+  .rm-btn:hover { background: #2a1a20; }
+  form.add-user { display: grid; grid-template-columns: 2fr 1.4fr auto auto auto; gap: 10px;
+                  align-items: center; }
+  form.add-user input[type=text], form.add-user input[type=email] {
+      background: var(--bg, #0e1013); color: inherit; border: 1px solid var(--border, #2a2e36);
+      border-radius: 8px; padding: 8px 10px; }
+  form.add-user label { font-size: .85rem; color: var(--muted, #8b93a3); white-space: nowrap; }
+  form.add-user button { padding: 8px 18px; }
+  #admin-status { margin-top: 12px; font-size: .85rem; color: var(--muted, #8b93a3);
+                  white-space: pre-wrap; }
+  #admin-status.err { color: #e07a8a; }
+  .back { color: var(--muted, #8b93a3); text-decoration: none; font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="admin-wrap">
+  <p><a class="back" href="/">&larr; back to portal</a></p>
+  <div class="admin-card">
+    <h2>Allowlist — who can log in</h2>
+    <p style="font-size:.85rem;color:var(--muted,#8b93a3)">
+      Adding an email updates the gateway allowlist <em>and</em> the Cloudflare Access
+      policy, so new people can log in immediately (email OTP or Google).
+      <code>example.com</code> entries are dev-only and never pushed to Access.
+    </p>
+    <table class="users">
+      <thead><tr><th>Email</th><th>Name</th><th>Role</th><th></th></tr></thead>
+      <tbody id="user-rows"></tbody>
+    </table>
+  </div>
+  <div class="admin-card">
+    <h2>Add someone</h2>
+    <form class="add-user" id="add-form">
+      <input type="email" id="f-email" placeholder="email@example.edu" required>
+      <input type="text" id="f-display" placeholder="Display name">
+      <label><input type="checkbox" id="f-admin"> admin</label>
+      <label><input type="checkbox" id="f-heavy"> GPU seat</label>
+      <button type="submit" class="primary">Add</button>
+    </form>
+    <div id="admin-status"></div>
+  </div>
+</div>
+<script src="/static/admin.js"></script>
+</body>
+</html>

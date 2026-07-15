@@ -75,8 +75,17 @@ def upsert_env(updates: dict[str, str]) -> None:
 
 
 def _users_yaml_emails() -> list[str]:
-    """Read the gateway allowlist (single source of truth for people)."""
-    users_file = Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"
+    """Read the gateway allowlist (single source of truth for people).
+
+    Prefers the runtime file ($BILLET_WEB_USERS_FILE, or the data-root copy the
+    /admin page edits) over the repo template.
+    """
+    candidates = [
+        os.environ.get("BILLET_WEB_USERS_FILE"),
+        str(Path.home() / "billet-web-data" / "users.yaml"),
+        str(Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"),
+    ]
+    users_file = next(Path(c) for c in candidates if c and Path(c).is_file())
     emails: list[str] = []
     for line in users_file.read_text().splitlines():
         line = line.strip()

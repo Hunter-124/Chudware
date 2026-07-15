@@ -5,6 +5,10 @@
 #   python3 Webservice/deploy/cf_provision.py --sync-users
 # (example.com entries are dev-only and never synced to Access)
 users:
+  - email: haedmonds@crimson.ua.edu
+    display: Hunter
+    role: admin
+    heavy: true
   - email: haedmonds69@gmail.com
     display: Hunter
     role: admin

@@ -367,6 +367,16 @@
         state.user.email = me.email || me.user_email || state.user.email;
         state.user.display = me.display || me.user_display || me.name || state.user.display;
         renderUser();
+        if (me.role === "admin" && !document.getElementById("admin-link")) {
+          var chip = document.getElementById("user-chip");
+          var a = document.createElement("a");
+          a.id = "admin-link";
+          a.href = "/admin";
+          a.textContent = "Admin";
+          a.className = "btn ghost";
+          a.style.marginRight = "8px";
+          chip.parentNode.insertBefore(a, chip);
+        }
         return;
       }
     } catch (_) { /* optional */ }

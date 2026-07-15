@@ -41,12 +41,12 @@
       {
         "name": "eval_check",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "is_manifold",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "measure_between",
@@ -56,7 +56,7 @@
       {
         "name": "measure_part",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       }
     ],
     "checks": [
@@ -131,7 +131,7 @@
         "name": "eval_check",
         "verdict": "FAIL",
         "score": 0.0,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "groundedness",
@@ -142,7 +142,7 @@
         "name": "is_manifold",
         "verdict": "FAIL",
         "score": 0.0,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "layout_coverage",
@@ -153,7 +153,7 @@
         "name": "measure_part",
         "verdict": "FAIL",
         "score": 0.0,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "power_budget",

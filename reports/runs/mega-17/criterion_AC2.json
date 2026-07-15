@@ -3,11 +3,11 @@
   "result": "FAIL",
   "check_tool": "measure_part",
   "pass_rule": "bay envelope >= board outline",
-  "detail": "check tool reported error: document has no bodies to evaluate",
+  "detail": "check tool reported error: no such document: doc-cpp00000019",
   "evidence": {
     "ok": false,
-    "error": "document has no bodies to evaluate",
-    "code": "invalid_op",
+    "error": "no such document: doc-cpp00000019",
+    "code": "unknown_doc",
     "detail": {
       "doc_id": "doc-cpp00000019"
     },

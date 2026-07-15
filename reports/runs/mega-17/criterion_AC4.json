@@ -1,9 +1,9 @@
 {
   "id": "AC4",
-  "result": "FAIL",
+  "result": "PASS",
   "check_tool": "ecad_run_drc+ecad_run_erc",
   "pass_rule": "errors==0",
-  "detail": "errors=4 (drc.errors=0, erc.errors=4)",
+  "detail": "errors==0 (drc.errors=0, erc.errors=0)",
   "evidence": {
     "ok": true,
     "tools": [
@@ -12,7 +12,7 @@
     ],
     "drc": {
       "ok": true,
-      "doc_id": "117e8de610b2",
+      "doc_id": "3640bb200542",
       "revision": 5,
       "errors": 0,
       "warnings": [],
@@ -27,7 +27,7 @@
     },
     "ecad_run_drc": {
       "ok": true,
-      "doc_id": "117e8de610b2",
+      "doc_id": "3640bb200542",
       "revision": 5,
       "errors": 0,
       "warnings": [],
@@ -42,335 +42,61 @@
     },
     "erc": {
       "ok": true,
-      "doc_id": "fb6e6e4b586d",
-      "revision": 3,
-      "errors": 4,
-      "warnings": 24,
-      "verdict": "4 error(s), 24 warning(s). fix errors first: net N$3 has power_in pin(s) but no power_out or power port to drive it; net N$4 has power_in pin(s) but no power_out or power port to drive it; net N$7 has power_in pin(s) but no power_out or power port to drive it",
+      "doc_id": "d0cdccc65c7f",
+      "revision": 6,
+      "errors": 0,
+      "warnings": 1,
+      "verdict": "0 error(s), 1 warning(s). No errors.",
       "violations": [
-        "[ERROR] power_not_driven: net N$3 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$4 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$7 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$8 has power_in pin(s) but no power_out or power port to drive it",
-        "[WARNING] floating_net_single_pin: net N$1 has a single pin (s1.4) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$2 has a single pin (s1.3) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$3 has a single pin (s1.2) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$4 has a single pin (s1.1) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$5 has a single pin (s1.5) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$6 has a single pin (s1.6) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$7 has a single pin (s1.7) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$8 has a single pin (s1.8) \u2014 likely a wiring slip",
-        "[WARNING] missing_footprint: on-board symbol s1 (U1) has no footprint assigned",
-        "[WARNING] missing_footprint: on-board symbol s2 (R1) has no footprint assigned",
-        "[WARNING] no_driver: net N$1 has only sink pins (input) \u2014 no driver",
-        "[WARNING] no_driver: net N$3 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$4 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$6 has only sink pins (input) \u2014 no driver",
-        "[WARNING] no_driver: net N$7 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$8 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] pin_not_connected: pin s1.4 (input) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.3 (bidirectional) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.2 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.1 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.5 (bidirectional) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.6 (input) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.7 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.8 (power_in) is not connected to any net"
+        "[WARNING] missing_footprint: on-board symbol s1 (R1) has no footprint assigned"
       ],
       "by_rule": [
         {
-          "rule": "power_not_driven",
-          "severity": "error",
-          "count": 4,
-          "pins": [
-            "s1.2",
-            "s1.1",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$3",
-            "N$4",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$3 has power_in pin(s) but no power_out or power port to drive it",
-            "net N$4 has power_in pin(s) but no power_out or power port to drive it",
-            "net N$7 has power_in pin(s) but no power_out or power port to drive it"
-          ]
-        },
-        {
-          "rule": "floating_net_single_pin",
-          "severity": "warning",
-          "count": 8,
-          "pins": [
-            "s1.4",
-            "s1.3",
-            "s1.2",
-            "s1.1",
-            "s1.5",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$2",
-            "N$3",
-            "N$4",
-            "N$5",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$1 has a single pin (s1.4) \u2014 likely a wiring slip",
-            "net N$2 has a single pin (s1.3) \u2014 likely a wiring slip",
-            "net N$3 has a single pin (s1.2) \u2014 likely a wiring slip"
-          ]
-        },
-        {
           "rule": "missing_footprint",
           "severity": "warning",
-          "count": 2,
+          "count": 1,
           "pins": [
-            "s1",
-            "s2"
+            "s1"
           ],
           "nets": [],
           "messages": [
-            "on-board symbol s1 (U1) has no footprint assigned",
-            "on-board symbol s2 (R1) has no footprint assigned"
-          ]
-        },
-        {
-          "rule": "no_driver",
-          "severity": "warning",
-          "count": 6,
-          "pins": [
-            "s1.4",
-            "s1.2",
-            "s1.1",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$3",
-            "N$4",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$1 has only sink pins (input) \u2014 no driver",
-            "net N$3 has only sink pins (power_in) \u2014 no driver",
-            "net N$4 has only sink pins (power_in) \u2014 no driver"
-          ]
-        },
-        {
-          "rule": "pin_not_connected",
-          "severity": "warning",
-          "count": 8,
-          "pins": [
-            "s1.4",
-            "s1.3",
-            "s1.2",
-            "s1.1",
-            "s1.5",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$2",
-            "N$3",
-            "N$4",
-            "N$5",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "pin s1.4 (input) is not connected to any net",
-            "pin s1.3 (bidirectional) is not connected to any net",
-            "pin s1.2 (power_in) is not connected to any net"
+            "on-board symbol s1 (R1) has no footprint assigned"
           ]
         }
       ],
-      "hint": "4 error(s), 24 warning(s). fix errors first: net N$3 has power_in pin(s) but no power_out or power port to drive it; net N$4 has power_in pin(s) but no power_out or power port to drive it; net N$7 has power_in pin(s) but no power_out or power port to drive it",
+      "hint": "0 error(s), 1 warning(s). No errors.",
       "next_actions": [
-        "Address power_not_driven: net N$3 has power_in pin(s) but no power_out or power port to drive it"
+        "ecad_simulate('op')  # ERC is clean enough to solve the circuit"
       ],
       "source": "live"
     },
     "ecad_run_erc": {
       "ok": true,
-      "doc_id": "fb6e6e4b586d",
-      "revision": 3,
-      "errors": 4,
-      "warnings": 24,
-      "verdict": "4 error(s), 24 warning(s). fix errors first: net N$3 has power_in pin(s) but no power_out or power port to drive it; net N$4 has power_in pin(s) but no power_out or power port to drive it; net N$7 has power_in pin(s) but no power_out or power port to drive it",
+      "doc_id": "d0cdccc65c7f",
+      "revision": 6,
+      "errors": 0,
+      "warnings": 1,
+      "verdict": "0 error(s), 1 warning(s). No errors.",
       "violations": [
-        "[ERROR] power_not_driven: net N$3 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$4 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$7 has power_in pin(s) but no power_out or power port to drive it",
-        "[ERROR] power_not_driven: net N$8 has power_in pin(s) but no power_out or power port to drive it",
-        "[WARNING] floating_net_single_pin: net N$1 has a single pin (s1.4) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$2 has a single pin (s1.3) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$3 has a single pin (s1.2) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$4 has a single pin (s1.1) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$5 has a single pin (s1.5) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$6 has a single pin (s1.6) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$7 has a single pin (s1.7) \u2014 likely a wiring slip",
-        "[WARNING] floating_net_single_pin: net N$8 has a single pin (s1.8) \u2014 likely a wiring slip",
-        "[WARNING] missing_footprint: on-board symbol s1 (U1) has no footprint assigned",
-        "[WARNING] missing_footprint: on-board symbol s2 (R1) has no footprint assigned",
-        "[WARNING] no_driver: net N$1 has only sink pins (input) \u2014 no driver",
-        "[WARNING] no_driver: net N$3 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$4 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$6 has only sink pins (input) \u2014 no driver",
-        "[WARNING] no_driver: net N$7 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] no_driver: net N$8 has only sink pins (power_in) \u2014 no driver",
-        "[WARNING] pin_not_connected: pin s1.4 (input) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.3 (bidirectional) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.2 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.1 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.5 (bidirectional) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.6 (input) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.7 (power_in) is not connected to any net",
-        "[WARNING] pin_not_connected: pin s1.8 (power_in) is not connected to any net"
+        "[WARNING] missing_footprint: on-board symbol s1 (R1) has no footprint assigned"
       ],
       "by_rule": [
         {
-          "rule": "power_not_driven",
-          "severity": "error",
-          "count": 4,
-          "pins": [
-            "s1.2",
-            "s1.1",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$3",
-            "N$4",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$3 has power_in pin(s) but no power_out or power port to drive it",
-            "net N$4 has power_in pin(s) but no power_out or power port to drive it",
-            "net N$7 has power_in pin(s) but no power_out or power port to drive it"
-          ]
-        },
-        {
-          "rule": "floating_net_single_pin",
-          "severity": "warning",
-          "count": 8,
-          "pins": [
-            "s1.4",
-            "s1.3",
-            "s1.2",
-            "s1.1",
-            "s1.5",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$2",
-            "N$3",
-            "N$4",
-            "N$5",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$1 has a single pin (s1.4) \u2014 likely a wiring slip",
-            "net N$2 has a single pin (s1.3) \u2014 likely a wiring slip",
-            "net N$3 has a single pin (s1.2) \u2014 likely a wiring slip"
-          ]
-        },
-        {
           "rule": "missing_footprint",
           "severity": "warning",
-          "count": 2,
+          "count": 1,
           "pins": [
-            "s1",
-            "s2"
+            "s1"
           ],
           "nets": [],
           "messages": [
-            "on-board symbol s1 (U1) has no footprint assigned",
-            "on-board symbol s2 (R1) has no footprint assigned"
-          ]
-        },
-        {
-          "rule": "no_driver",
-          "severity": "warning",
-          "count": 6,
-          "pins": [
-            "s1.4",
-            "s1.2",
-            "s1.1",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$3",
-            "N$4",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "net N$1 has only sink pins (input) \u2014 no driver",
-            "net N$3 has only sink pins (power_in) \u2014 no driver",
-            "net N$4 has only sink pins (power_in) \u2014 no driver"
-          ]
-        },
-        {
-          "rule": "pin_not_connected",
-          "severity": "warning",
-          "count": 8,
-          "pins": [
-            "s1.4",
-            "s1.3",
-            "s1.2",
-            "s1.1",
-            "s1.5",
-            "s1.6",
-            "s1.7",
-            "s1.8"
-          ],
-          "nets": [
-            "N$1",
-            "N$2",
-            "N$3",
-            "N$4",
-            "N$5",
-            "N$6",
-            "N$7",
-            "N$8"
-          ],
-          "messages": [
-            "pin s1.4 (input) is not connected to any net",
-            "pin s1.3 (bidirectional) is not connected to any net",
-            "pin s1.2 (power_in) is not connected to any net"
+            "on-board symbol s1 (R1) has no footprint assigned"
           ]
         }
       ],
-      "hint": "4 error(s), 24 warning(s). fix errors first: net N$3 has power_in pin(s) but no power_out or power port to drive it; net N$4 has power_in pin(s) but no power_out or power port to drive it; net N$7 has power_in pin(s) but no power_out or power port to drive it",
+      "hint": "0 error(s), 1 warning(s). No errors.",
       "next_actions": [
-        "Address power_not_driven: net N$3 has power_in pin(s) but no power_out or power port to drive it"
+        "ecad_simulate('op')  # ERC is clean enough to solve the circuit"
       ],
       "source": "live"
     }

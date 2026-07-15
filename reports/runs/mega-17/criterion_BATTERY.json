@@ -24,12 +24,12 @@
       {
         "name": "eval_check",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "is_manifold",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       },
       {
         "name": "measure_between",
@@ -39,7 +39,7 @@
       {
         "name": "measure_part",
         "severity": null,
-        "message": "document has no bodies to evaluate"
+        "message": "no such document: doc-cpp00000019"
       }
     ],
     "scores": {

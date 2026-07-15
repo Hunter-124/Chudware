@@ -1,0 +1,495 @@
+[mega-18] openrouter usage_before=$0.223708 remaining=9.77629216
+[mega-18] preflight: subscription_accounts (pin 06dc3359 for G18)
+[mega-18] xai-sub accounts=3 active=06dc3359-2d20-4cd7-bd84-8c8db560cd4e switched=False target_active=True
+[mega-18] preflight: spawn_probe + auto_pick_smoke
+[mega-18] spawn_probe verdict=PASS budget_rendered_ok=True fix8=PASS fix_wire=PASS
+[mega-18] auto_pick_smoke verdict=PASS axis_G18=PASS axis_Y=PASS hard_xai_grok45=True leaf_local=True
+[mega-18] ambient_provider=XAISubProvider model=grok-4.5 run_id=mega-18-fc-rocket-20260715 conservation=auto_pick_first frontier=xai-sub/grok-4.5 fallback=openrouter:deepseek/deepseek-chat-v3.1
+[07/15/26 13:54:30] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 13:54:31] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 13:54:32] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2263.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=83.1                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 13:54:33] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=252.7                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 13:55:08] INFO     provider nexar declined      parts_providers.py:811
+                             'STM32F4': Nexar returned no                       
+                             supply results for MPN                             
+                             'STM32F4'                                          
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'STM32F4': Digi-Key provider                       
+                             is not configured. Add                             
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'STM32F4': Mouser provider                         
+                             is not configured. Add                             
+                             'parts_providers.mouser'                           
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 13:56:50] INFO     HTTP Request: POST                  _client.py:1025
+                             https://html.duckduckgo.com/html/                  
+                             "HTTP/1.1 200 OK"                                  
+[07/15/26 13:57:03] INFO     provider nexar declined      parts_providers.py:811
+                             'STM32F405RGTx': Nexar                             
+                             returned no supply results                         
+                             for MPN 'STM32F405RGTx'                            
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'STM32F405RGTx': Digi-Key                          
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'STM32F405RGTx': Mouser                            
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 13:57:17] INFO     provider nexar declined      parts_providers.py:811
+                             'MCU_ST_STM32F4': Nexar                            
+                             returned no supply results                         
+                             for MPN 'MCU_ST_STM32F4'                           
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'MCU_ST_STM32F4': Digi-Key                         
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'MCU_ST_STM32F4': Mouser                           
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 13:57:31] INFO     provider nexar declined      parts_providers.py:811
+                             'standoff': Nexar returned                         
+                             no supply results for MPN                          
+                             'standoff'                                         
+                    WARNING  DigiKeyProvider: Digi-Key    parts_providers.py:591
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider digikey declined    parts_providers.py:811
+                             'standoff': Digi-Key                               
+                             provider is not configured.                        
+                             Add                                                
+                             'parts_providers.digikey'                          
+                             with 'client_id' and                               
+                             'client_secret' to                                 
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set DIGIKEY_CLIENT_ID /                        
+                             DIGIKEY_CLIENT_SECRET).                            
+                             AI-CAD does NOT scrape                             
+                             digikey.com; it uses the                           
+                             approved Product Information                       
+                             API v4. See                                        
+                             docs/PARTS_LIBRARY.md.                             
+                    WARNING  MouserProvider: Mouser       parts_providers.py:785
+                             provider is not configured.                        
+                             Add 'parts_providers.mouser'                       
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+                    INFO     provider mouser declined     parts_providers.py:811
+                             'standoff': Mouser provider                        
+                             is not configured. Add                             
+                             'parts_providers.mouser'                           
+                             with 'api_key' to                                  
+                             %APPDATA%/AI-CAD/config.json                       
+                             (or set MOUSER_API_KEY).                           
+                             AI-CAD does NOT scrape                             
+                             mouser.com; it uses the                            
+                             approved Search API v2. See                        
+                             docs/PARTS_LIBRARY.md.                             
+[07/15/26 13:58:43] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 13:58:45] INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+[07/15/26 13:58:46] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:00:02] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1742.6                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=37.3                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:05] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2836.8                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:06] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=208.5                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:13] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=7612.2                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:14] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1339.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:16] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1983.2                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:17] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=667.3                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:18] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1025.0                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:22] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=4062.6                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=182.6                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:24] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=721.4                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:26] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2500.5                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:27] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=764.1                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=459.0                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:28] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1131.3                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:30] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1815.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:33] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2459.3                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=80.2                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:34] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1416.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:37] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2241.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:38] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1851.4                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:39] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=216.8                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:40] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1780.8                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:42] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1475.5                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:44] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1787.7                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:46] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2537.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=76.9                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:48] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1650.8                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=462.0                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:49] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=871.6                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:50] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=233.9                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:51] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1212.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:52] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1019.1                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:53] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=737.9                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=832.5                                
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:55] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1205.9                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+                    INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=30.9                                 
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:56] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1758.4                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:00:59] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1959.0                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:01:01] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=2403.0                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:01:02] INFO     xai_sub semaphore           xai_sub_provider.py:672
+                             queue_wait_ms=1240.2                               
+                             attempt=1 in_flight=3                              
+                             capacity=3                                         
+[07/15/26 14:03:26] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:27] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:28] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:29] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:30] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:31] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:32] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+[07/15/26 14:03:33] INFO     HTTP Request: POST                  _client.py:1025
+                             http://127.0.0.1:11434/v1/chat/comp                
+                             letions "HTTP/1.1 200 OK"                          
+                    INFO     HTTP Request: POST                  _client.py:1025
+                             https://openrouter.ai/api/v1/chat/c                
+                             ompletions "HTTP/1.1 404 Not Found"                
+ ---------------------------------------------------------------------- 
+ | openEMS 64bit -- version v0.37.0-rc1-2-g7b051bb
+ | (C) 2010-2026 Thorsten Liebig <thorsten.liebig@gmx.de>  GPL license
+ ---------------------------------------------------------------------- 
+	Used external libraries:
+		CSXCAD -- Version: v0.7.0-rc1-1-g5115701
+		hdf5   -- Version: 1.14.6
+		          compiled against: HDF5 library version: 1.14.6
+		tinyxml -- compiled against: 2.6.2
+		fparser
+		boost  -- compiled against: 1_90
+		vtk -- Version: 9.5.2
+		       compiled against: 9.5.2
+
+Create FDTD operator (compressed SSE + multi-threading)
+FDTD simulation size: 36x34x21 --> 25704 FDTD cells 
+FDTD timestep is: 3.83493e-13 s; Nyquist rate: 417 timesteps @3.12663e+09 Hz
+Excitation signal length is: 10376 timesteps (3.97912e-09s)
+Max. number of timesteps: 40000 ( --> 3.85505 * Excitation signal length)
+Create FDTD engine (compressed SSE + multi-threading)
+Running FDTD engine... this may take a while... grab a cup of coffee?!?
+[@        4s] Timestep:        28912 || Speed:  185.2 MC/s (1.388e-04 s/TS) || Energy: ~3.31e-22 (-76.29dB)
+Time for 28912 iterations with 25704.00 cells : 4.01 sec
+Speed: 185.18 MCells/s 
+[mega-18] openrouter usage_after=$0.223708 delta=$0.000000 remaining=9.77629216
+{
+  "status": "needs_correction",
+  "phase": "correct",
+  "phases_completed": [
+    "intake",
+    "build"
+  ],
+  "stop_reason": "verify_failed: ['AC1', 'AC4', 'AC5']",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-18-fc-rocket-20260715/ledger.json",
+  "run_id": "mega-18-fc-rocket-20260715",
+  "mode": "real",
+  "wall_s": 551.01,
+  "conservation": true,
+  "baseline_commit": "769f92c6",
+  "spend_before_usd": 0.22370784,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-18-fc-rocket-20260715/ledger.json"
+}

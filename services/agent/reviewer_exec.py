@@ -245,6 +245,117 @@ def _flatten_numbers(obj: Any, prefix: str = "") -> dict[str, float]:
     return out
 
 
+def _probe_net_name(interval_name: str) -> str:
+    """Extract net token from interval name like 'v(3v3)' → '3V3'."""
+    token = (interval_name or "").strip()
+    m = re.match(r"[vi]\(([^)]+)\)", token, re.I)
+    if m:
+        return m.group(1).upper()
+    bare = re.sub(r"[^\w]", "", token)
+    return bare.upper() if bare else token.upper()
+
+
+def _spice_tool_ran(result: Any) -> bool:
+    """True when payload looks like a completed ecad_simulate OP/MNA run."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is True:
+        return True
+    if result.get("converged") is True:
+        return True
+    if result.get("analysis") in ("op", "dc", "tran", "ac", "OP", "DC"):
+        return True
+    if result.get("backend") in ("mna", "ngspice", "xyce", "spice"):
+        return True
+    if isinstance(result.get("op"), dict) or isinstance(result.get("probes"), list):
+        return True
+    if "device_count" in result or "sim_log" in result:
+        return True
+    return False
+
+
+def _interval_null_probe_detail(name: str, result: Any) -> str | None:
+    """If probe key exists but value is null/non-numeric, return FAIL detail.
+
+    mega-18 Z4 live shape:
+      {ok:true, op:{"V(3V3)": null}, probes:["V(3V3)"], reading:"no finite…"}
+    → FAIL naming missing net (never NOT-CHECKED when tool ran).
+    """
+    if not isinstance(result, dict):
+        return None
+    token = (name or "").strip().lower()
+    bare = re.sub(r"[^\w]", "", token)
+    inner_m = re.match(r"[vi]\(([^)]+)\)", token, re.I)
+    candidates = {token, bare}
+    if inner_m:
+        candidates.add(inner_m.group(1).lower())
+        candidates.add(re.sub(r"[^\w]", "", inner_m.group(1).lower()))
+    # Also accept V(3V3) / v(3v3) exact keys.
+    net = _probe_net_name(name)
+
+    def _is_nullish(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip().lower() in (
+            "null", "none", "nan", "", "n/a",
+        ):
+            return True
+        if isinstance(v, float):
+            try:
+                import math  # noqa: PLC0415
+                if math.isnan(v):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    def _scan(obj: Any, path: str = "") -> str | None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                kk = re.sub(r"[^\w]", "", kl)
+                key_hit = (
+                    kl in candidates
+                    or kk in candidates
+                    or any(c and (c in kk or kk in c) for c in candidates if c)
+                )
+                if key_hit and _is_nullish(v):
+                    return (
+                        f"probe {name!r} is null in ecad_simulate payload "
+                        f"(net {net!r} not driven / no finite value)"
+                    )
+                if key_hit and isinstance(v, (int, float)) and not isinstance(
+                    v, bool
+                ):
+                    return None  # numeric present — let interval path grade
+                hit = _scan(v, f"{path}.{k}" if path else str(k))
+                if hit:
+                    return hit
+        elif isinstance(obj, list):
+            for item in obj:
+                hit = _scan(item, path)
+                if hit:
+                    return hit
+        return None
+
+    # Explicit reading/hint about no finite probes also FAIL when tool ran.
+    detail = _scan(result)
+    if detail:
+        return detail
+    reading = str(result.get("reading") or result.get("hint") or "").lower()
+    if _spice_tool_ran(result) and (
+        "no finite probe" in reading
+        or "no finite" in reading
+        or "check connectivity" in reading
+    ):
+        return (
+            f"probe {name!r} not finite after ecad_simulate "
+            f"(net {net!r} missing or undriven)"
+        )
+    return None
+
+
+
 def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     """Derive (verdict, detail) from a mechanical read of *result* against *pass_rule*.
 
@@ -340,6 +451,12 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     if m:
         name = m.group("name").strip().lower()
         lo, hi = float(m.group("lo")), float(m.group("hi"))
+        # mega-18 Z4: SPICE payloads often nest probe values under op/readings
+        # with explicit null (tool ran, net missing). Treat null as honest FAIL
+        # naming the missing net — never NOT-CHECKED when the tool executed.
+        null_probe = _interval_null_probe_detail(name, result)
+        if null_probe is not None:
+            return FAIL, null_probe
         nums = _flatten_numbers(result)
         # exact field, else a field whose name contains the rule's leading token.
         val = nums.get(name)
@@ -358,6 +475,15 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
                     val = v
                     break
         if val is None:
+            # Tool ran (ok/converged) but probe absent → FAIL missing net, not
+            # NOT-CHECKED (mega-18 Z4 residual: device_count only fields).
+            if _spice_tool_ran(result):
+                net = _probe_net_name(name)
+                return FAIL, (
+                    f"probe {name!r} missing from ecad_simulate payload "
+                    f"(net {net!r} not driven / no finite value; "
+                    f"fields: {sorted(nums)[:8]})"
+                )
             return NOT_CHECKED, (
                 f"tool output has no numeric field matching {name!r} "
                 f"(fields: {sorted(nums)[:8]})")
@@ -1481,12 +1607,31 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
         res = p.get("result")
         if res is None and isinstance(p.get("doc_id"), str):
             res = p
+        # mega-18 AC4: board_from_schematic result often truncated JSON string
+        # (ledger digest) — still harvest board_doc_id / doc_id via regex.
+        if isinstance(res, str):
+            recovered: dict[str, Any] = {}
+            for key in ("board_doc_id", "sch_doc_id", "doc_id"):
+                m = re.search(
+                    rf'["\']{key}["\']\s*:\s*["\']([^"\']+)["\']', res,
+                )
+                if m:
+                    recovered[key] = m.group(1)
+            if recovered:
+                # Prefer structured parse; fall back to regex harvest.
+                parsed = _try_parse_json_object(res)
+                if isinstance(parsed, dict):
+                    for k, v in recovered.items():
+                        parsed.setdefault(k, v)
+                    res = parsed
+                else:
+                    res = recovered
         norm = _normalize_result(_as_dict(res) if res is not None else {})
         args = p.get("args") if isinstance(p.get("args"), dict) else {}
         did = (
-            norm.get("doc_id")
+            norm.get("board_doc_id")
+            or norm.get("doc_id")
             or norm.get("sch_doc_id")
-            or norm.get("board_doc_id")
             or args.get("doc_id")
         )
         if not did:
@@ -1502,6 +1647,12 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
             or "drc" in tn
             or tn == "board_from_schematic"
             or bool(norm.get("board_doc_id"))
+            # mega-18: board tool result doc_id is the board even when sch_doc
+            # is also present.
+            or (
+                tn == "board_from_schematic"
+                and bool(norm.get("doc_id") or norm.get("board_doc_id"))
+            )
         )
         is_sch = (
             kind_field in ("sch", "schematic")
@@ -1512,10 +1663,22 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
             or "simulate" in tn
             or bool(norm.get("sch_doc_id"))
         )
+        # Prefer explicit board_doc_id field over sch when both present.
+        board_field = norm.get("board_doc_id")
+        if board_field and not _is_mechanical_cad_doc_id(str(board_field)):
+            if board_id is None:
+                board_id = str(board_field).strip()
         if is_board and board_id is None:
             board_id = did_s
         if is_sch and sch_id is None:
-            sch_id = did_s
+            # Don't treat board_doc_id as sch.
+            sch_candidate = norm.get("sch_doc_id") or (
+                did_s if not board_field else None
+            )
+            if sch_candidate and not (
+                board_id and str(sch_candidate) == board_id
+            ):
+                sch_id = str(sch_candidate).strip()
         # Generic ECAD tool with doc_id: treat as schematic unless board-ish.
         if not is_board and not is_sch and tn.startswith("ecad_") and sch_id is None:
             sch_id = did_s
@@ -1529,7 +1692,6 @@ def _resolve_domain_doc_id(tool: str, ledger) -> str | None:
     if prefer_board:
         return board_id or sch_id
     return sch_id or board_id
-
 
 def _resolve_fw_project_id(ledger) -> str | None:
     """Newest firmware project_id from ledger tool_calls / artifacts (mega-12 AC7)."""

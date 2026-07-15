@@ -323,19 +323,30 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   Findings: `reports/runs/mega-16/findings.md`.
 
 - 2026-07-15 mega-17 (WS5): terminal grading + power-then-wire under
-  `reports/runs/mega-17/` (primary `mega-17-fc-rocket-20260715`).
+  `reports/runs/mega-17/` (primary graded **a3** `mega-17-fc-rocket-20260715`).
   Baseline `cd764e92`. Fixer17 (AlrightMosquito) bound Z1 VERIFY/terminal
-  criterion_AC1–AC9 always, Z2 live-ref wire sanitize (no `#PWR1`) +
-  power-before-wire, Z3 chain-need `ecad_simulate` (91p). Preflight PASS
-  (hostd match; Fix8+Fix-wire; auto_pick axis Y). Frontier
-  `openrouter:deepseek/deepseek-chat-v3.1` PAID; spend Δ **$0.055** / guard $8.
-  Wall **145.86s**, terminal `needs_correction`/`verify_failed:
-  [AC1,AC2,AC4,AC5,AC9]` (**AC3+AC6+AC7+AC8 PASS** = 4 live). Scoreboard:
-  **Z1 PASS** (9/9 criterion files; mega-16 0/9 closed), **Z2 FAIL**
-  (`ecad_add_power`=0; force_inject still place_symbol; wire self-loop R1;
-  no `#PWR1`), **Z3 PASS** (OP/mna simulate evidence; V(3V3) null → AC5
-  NOT-CHECKED), **Y PASS** (openrouter×10/ollama×19), **S/Fix8 PASS**,
-  live AC PASS=**4** (target ≥8 miss). Attempt-1 double-launch archived.
-  **grok-4.5 revalidation deferred**.
+  criterion_AC1–AC9 always, Z2 live-ref wire (no `#PWR1`) + power-before-wire,
+  Z3 chain-need `ecad_simulate` (91p) then Z2 residual rebind (self-loop no
+  board unlock; force prefers add_power→cross-ref wire; 94p). Preflight PASS.
+  Frontier `openrouter:deepseek/deepseek-chat-v3.1` PAID; spend guard $8 held
+  (a2 Δ~$0.055; a3 usage poll flat). **a2** wall 145.9s Z1 PASS / Z2 FAIL /
+  Z3 PASS / live 4 (archived). **a3** wall **150.7s**, terminal
+  `needs_correction`/`verify_failed:[AC1,AC2,AC3,AC5,AC7,AC9]` (**AC4+AC6
+  PASS** = 2 live). Scoreboard a3: **Z1 PASS**, **Z2 PASS** (add_power×8
+  before wire; AC4 ERC clean), **Z3 PASS** (OP/mna; V(3V3) null), **Y PASS**,
+  **W/S/Fix8 PASS**, live ≥8 miss. **grok-4.5 deferred**.
   Findings: `reports/runs/mega-17/findings.md`.
+
+- 2026-07-15 mega-18 (WS5): Z2r rework + grok-4.5 revalidation under
+  `reports/runs/mega-18/` (primary `mega-18-fc-rocket-20260715`).
+  Baseline `769f92c6`. Fixer18 (PlainLizard) bound Z2r cascade force-EXECUTE
+  `ecad_add_power`→cross-ref wire + self-loop guard, Z4 AC5 null `V(3V3)`→FAIL
+  (105p). Preflight PASS: account `06dc3359` ACTIVE, hard→xai-sub grok-4.5,
+  mid openrouter deepseek enabled, leaf ollama. Primary wall ~551s terminal
+  `needs_correction` live AC PASS **6**/9 (AC2/3/6/7/8/9). Axes: Z1 PASS,
+  Z2r PARTIAL (power×2 live; force wire U1↔R1 not rail; ERC still dirty),
+  Z3 PASS, **Z4 PASS** (NOT-CHECKED residual closed), G18 PARTIAL (6<7),
+  Y PASS. Residuals: power-pin→rail force wire; AC4 DRC on sch not board;
+  AC5 finite V(3V3); ≥8 live AC. Findings: `reports/runs/mega-18/findings.md`.
+
 

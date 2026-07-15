@@ -1,0 +1,120 @@
+{
+  "actor": "reviewer",
+  "kind": "battery_result",
+  "payload": {
+    "verdict": "FAIL",
+    "ok": false,
+    "detail": "failing findings=['eval_check', 'is_manifold', 'measure_part']; critical_scores_zero=['eval_check', 'is_manifold', 'measure_part']",
+    "checks": [
+      {
+        "name": "ecad_check_impedance",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "ecad_run_erc",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "eval_check",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "groundedness",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "is_manifold",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "layout_coverage",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "measure_part",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "power_budget",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "query_geometry",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "req_join",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "unit_sanity",
+        "verdict": "PASS",
+        "score": 1.0
+      }
+    ],
+    "doc_id": "doc-cpp00000019",
+    "source": "run_verify_battery",
+    "evidence": {
+      "findings": [
+        {
+          "name": "check_sketch",
+          "severity": null,
+          "message": "no sketches on document"
+        },
+        {
+          "name": "dim_coverage",
+          "severity": null,
+          "message": "no drawing in mission scope"
+        },
+        {
+          "name": "ecad_check_diff_impedance",
+          "severity": null,
+          "message": "no differential pair nets on board (need net_p/net_n)"
+        },
+        {
+          "name": "eval_check",
+          "severity": null,
+          "message": "document has no bodies to evaluate"
+        },
+        {
+          "name": "is_manifold",
+          "severity": null,
+          "message": "document has no bodies to evaluate"
+        },
+        {
+          "name": "measure_between",
+          "severity": null,
+          "message": "no features to measure between"
+        },
+        {
+          "name": "measure_part",
+          "severity": null,
+          "message": "document has no bodies to evaluate"
+        }
+      ],
+      "scores": {
+        "ecad_check_impedance": 1.0,
+        "ecad_run_erc": 1.0,
+        "eval_check": 0.0,
+        "groundedness": 1.0,
+        "is_manifold": 0.0,
+        "layout_coverage": 1.0,
+        "measure_part": 0.0,
+        "power_budget": 1.0,
+        "query_geometry": 1.0,
+        "req_join": 1.0,
+        "unit_sanity": 1.0
+      }
+    }
+  }
+}

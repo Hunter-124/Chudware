@@ -1,0 +1,350 @@
+wrote BATTERY FAIL
+wrote AC1 FAIL
+wrote AC2 FAIL
+wrote AC3 PASS
+wrote AC4 FAIL
+wrote AC5 NOT-CHECKED
+wrote AC6 PASS
+wrote AC7 PASS
+wrote AC8 PASS
+wrote AC9 FAIL
+battery FAIL doc doc-cpp00000019 nchecks 11
+fw_artifact written
+live results {'AC1': 'FAIL', 'AC2': 'FAIL', 'AC3': 'PASS', 'AC4': 'FAIL', 'AC5': 'NOT-CHECKED', 'AC6': 'PASS', 'AC7': 'PASS', 'AC8': 'PASS', 'AC9': 'FAIL'}
+PASS ['AC3', 'AC6', 'AC7', 'AC8'] count 4
+SKIP []
+{
+  "N_live_ac_pass_ge_4": {
+    "verdict": "PARTIAL",
+    "pass_count": 4,
+    "held_AC3_AC6": true,
+    "AC7": true,
+    "one_of_AC2_4_5": false,
+    "contract": "AC3+AC6 held + AC7 + one of AC2/AC4/AC5 + count>=4"
+  },
+  "O_ecad_board_drc": {
+    "verdict": "PASS",
+    "detail": "board_from_schematic + ecad_run_drc errors==None",
+    "counts": {
+      "ecad_new_schematic": 4,
+      "ecad_place_symbol": 8,
+      "board_from_schematic": 2,
+      "ecad_run_drc": 2,
+      "ecad_run_erc": 0,
+      "ecad_simulate": 1
+    },
+    "drc_errors": null
+  },
+  "P_board_from_schematic_and_drc": {
+    "verdict": "PASS",
+    "executed": true,
+    "board_from_schematic": 2,
+    "ecad_run_drc": 2,
+    "drc_errors": null,
+    "board_drc_ok": true,
+    "board_drc_honest_fail": false,
+    "contract": "both tools executed live; DRC errors==0 or honest FAIL"
+  },
+  "Q_live_ac_pass_ge_6": {
+    "verdict": "FAIL",
+    "pass_count": 4,
+    "pass_ids": [
+      "AC3",
+      "AC6",
+      "AC7",
+      "AC8"
+    ],
+    "contract": "live AC PASS count >= 6"
+  },
+  "R_AC5_SPICE_wired_netlist": {
+    "verdict": "FAIL",
+    "ac5_result": "NOT-CHECKED",
+    "empty_netlist_error": false,
+    "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+    "contract": "V(3V3) measured PASS or honest FAIL (not empty-netlist)"
+  },
+  "S_board_from_schematic_and_drc": {
+    "verdict": "PASS",
+    "executed": true,
+    "board_from_schematic": 2,
+    "ecad_run_drc": 2,
+    "drc_errors": null,
+    "board_drc_ok": true,
+    "board_drc_honest_fail": false,
+    "upgrades": "P",
+    "contract": "both tools executed live; DRC errors==0 or honest FAIL (P upgrade)"
+  },
+  "T_AC5_SPICE_wired_netlist": {
+    "verdict": "FAIL",
+    "ac5_result": "NOT-CHECKED",
+    "empty_netlist_error": false,
+    "wire_tools": {
+      "ecad_wire": 10,
+      "ecad_add_power": 0,
+      "ecad_connect": 0,
+      "ecad_add_net": 0
+    },
+    "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+    "upgrades": "R",
+    "contract": "V(3V3) measured PASS or honest FAIL (not empty-netlist) \u2014 R upgrade"
+  },
+  "U_AC1_battery_or_diagnosis": {
+    "verdict": "PASS",
+    "ac1_pass": false,
+    "diagnosis": {
+      "ac1_result": "FAIL",
+      "battery_verdict": "FAIL",
+      "battery_doc_id": "doc-cpp00000019",
+      "n_checks": 11,
+      "failing_or_soft_checks": [
+        {
+          "name": "eval_check",
+          "verdict": "FAIL",
+          "detail": "",
+          "evidence": ""
+        },
+        {
+          "name": "is_manifold",
+          "verdict": "FAIL",
+          "detail": "",
+          "evidence": ""
+        },
+        {
+          "name": "measure_part",
+          "verdict": "FAIL",
+          "detail": "",
+          "evidence": ""
+        }
+      ],
+      "ac1_detail_snip": "critical_scores_zero=['eval_check', 'is_manifold', 'measure_part'] {'source': 'battery_result', 'doc_id': 'doc-cpp00000019', 'verdict': 'FAIL', 'ok': False, 'scores': {'ecad_check_impedance': 1.0, 'ecad_run_erc': 1.0, 'eval_check': 0.0, 'groundedness': 1.0, 'is_manifold': 0.0, 'layout_coverage': 1.0, 'measure_part': 0.0, 'power_budget': 1.0, 'query_geometry': 1.0, 'req_join': 1.0, 'unit_sanity': 1.0}, 'findings': [{'name': 'check_sketch', 'severity': None, 'message': 'no sketches on document'}, ",
+      "contract": "AC1 PASS, or FAIL with per-check diagnosis (which checks, geometry evidence, brief next-step)"
+    },
+    "contract": "AC1 PASS, or FAIL with per-check diagnosis in findings"
+  },
+  "V_battery_invocation_bugs_fixed": {
+    "verdict": "PASS",
+    "detail": {
+      "signature_errors": [],
+      "honest_skips": [],
+      "other_zero_scores": [
+        {
+          "name": "eval_check",
+          "score": 0.0,
+          "verdict": "FAIL",
+          "msg": ""
+        },
+        {
+          "name": "is_manifold",
+          "score": 0.0,
+          "verdict": "FAIL",
+          "msg": ""
+        },
+        {
+          "name": "measure_part",
+          "score": 0.0,
+          "verdict": "FAIL",
+          "msg": ""
+        }
+      ],
+      "n_checks": 11,
+      "contract": "zero checks from signature errors; each formerly-broken check scores real or honest-SKIPs"
+    },
+    "contract": "zero checks from signature errors eliminated"
+  },
+  "W_ecad_wire_and_power_ERC_clean": {
+    "verdict": "FAIL",
+    "ecad_wire": 10,
+    "ecad_add_power": 0,
+    "ac4_result": "FAIL",
+    "power_not_driven_n": 3,
+    "erc_errors": 0,
+    "force_inject_wire": 0,
+    "force_inject_power": 0,
+    "force_inject_n": 1,
+    "contract": "ecad_wire + ecad_add_power executed live; ERC power_not_driven->0; AC4 PASS"
+  },
+  "X_AC5_SPICE_wired_netlist": {
+    "verdict": "FAIL",
+    "ac5_result": "NOT-CHECKED",
+    "empty_netlist_error": false,
+    "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+    "upgrades": "T/R",
+    "contract": "V(3V3) measured PASS or honest numeric FAIL (not empty-netlist)"
+  },
+  "Y_auto_pick_openrouter_paid_when_xai_blocked": {
+    "verdict": "PASS",
+    "detail": {
+      "preflight_axis_Y": "PASS",
+      "hard_openrouter_paid": true,
+      "leaf_local": true,
+      "no_free": true,
+      "model_assignment": {
+        "ollama": 19,
+        "openrouter": 10
+      },
+      "openrouter_assignments": 10,
+      "ollama_assignments": 19,
+      "xai_assignments": 0,
+      "free_model_hits": 0,
+      "contract": "auto_pick routes frontier/hard nodes to openrouter paid tier when xai blocked; leaves ollama; no refusal loops; no ollama-all collapse"
+    },
+    "contract": "auto_pick routes frontier/hard nodes to openrouter paid tier when xai blocked; leaves ollama; no refusal loops; no ollama-all collapse"
+  },
+  "Z1_terminal_grading_unconditional": {
+    "verdict": "PASS",
+    "detail": {
+      "graded_ids": [
+        "AC1",
+        "AC2",
+        "AC3",
+        "AC4",
+        "AC5",
+        "AC6",
+        "AC7",
+        "AC8",
+        "AC9"
+      ],
+      "missing_ids": [],
+      "n_graded": 9,
+      "terminal_status": "needs_correction",
+      "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']",
+      "contract": "every mission terminal (done/deliver_partial/needs_correction) produces criterion_ACn.json for ALL 9 ACs"
+    },
+    "contract": "every mission terminal (done/deliver_partial/needs_correction) produces criterion_ACn.json for ALL 9 ACs"
+  },
+  "Z2_power_then_wire_refs_live": {
+    "verdict": "FAIL",
+    "detail": {
+      "ecad_add_power": 0,
+      "ecad_wire": 10,
+      "power_ok_n": 0,
+      "wire_ok_n": 2,
+      "power_before_wire": false,
+      "wire_fail_missing_pwr": 0,
+      "power_not_driven_n": 3,
+      "force_inject_power": 0,
+      "force_inject_wire": 0,
+      "force_inject_place": 1,
+      "force_inject_events": [
+        {
+          "tool": "ecad_place_symbol",
+          "event": "ecad_chain_force_inject"
+        }
+      ],
+      "seq_sample": [
+        {
+          "tool": "ecad_wire",
+          "ok": false
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": true
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false,
+          "src": "ledger"
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false,
+          "src": "ledger"
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false,
+          "src": "ledger"
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": false,
+          "src": "ledger"
+        },
+        {
+          "tool": "ecad_wire",
+          "ok": true,
+          "src": "ledger"
+        }
+      ],
+      "contract": "ecad_add_power executes before wire injects; wire args derive refs from live add_power/place results; ERC power_not_driven -> 0"
+    },
+    "contract": "ecad_add_power executes before wire injects; wire args derive refs from live add_power/place results; ERC power_not_driven -> 0"
+  },
+  "Z3_AC5_SPICE_on_wired_netlist": {
+    "verdict": "PASS",
+    "detail": {
+      "ecad_simulate": 1,
+      "ac5_result": "NOT-CHECKED",
+      "empty_netlist_error": false,
+      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+      "contract": "ecad_simulate executes on wired netlist (AC5 not empty-netlist class)"
+    },
+    "contract": "ecad_simulate executes on wired netlist (AC5 not empty-netlist class)"
+  },
+  "Fix8_hard_ecad_chain_gate_live": {
+    "verdict": "PASS",
+    "ecad_chain_gate_events": 2,
+    "tool_denied_ecad": 2,
+    "contract": "live ecad_chain_gate deny events OR wire+board path advanced past place thrash"
+  },
+  "K_gradeable": {
+    "verdict": "PASS",
+    "n_results": 9
+  },
+  "L_live_pass_ge_2": {
+    "verdict": "PASS",
+    "pass_count": 4
+  },
+  "M_non_cad_artifact": {
+    "verdict": "PASS",
+    "fw": true,
+    "fw_build_calls": 2,
+    "schematic_calls": 4
+  },
+  "A_accepted_ops": {
+    "verdict": "PASS",
+    "new_part_ok": 10,
+    "add_features_ok": 7,
+    "add_features_fail": 23
+  },
+  "B_delegate": {
+    "verdict": "PASS",
+    "delegate": 12,
+    "spawn": 12
+  },
+  "C_oneshot": {
+    "verdict": "PASS",
+    "oneshot_ok": 10,
+    "oneshot_miss": 3
+  },
+  "D_terminal": {
+    "verdict": "PASS",
+    "status": "needs_correction",
+    "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']"
+  },
+  "E_battery": {
+    "verdict": "PASS",
+    "doc_id": "doc-cpp00000019",
+    "verdict_batt": "FAIL"
+  },
+  "F_clean_stop": {
+    "verdict": "PASS",
+    "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']"
+  },
+  "I_battery_doc_id": {
+    "verdict": "PASS",
+    "doc_id": "doc-cpp00000019"
+  }
+}

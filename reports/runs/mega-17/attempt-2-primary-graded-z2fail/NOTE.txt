@@ -1,0 +1,4 @@
+Attempt-2 primary (first graded): wall 145.86s, needs_correction, live AC PASS 4/9.
+Z1 PASS, Z2 FAIL (no add_power; force_inject place_symbol), Z3 PASS, Y PASS.
+Archived so attempt-3 can re-validate Fixer17 Z2 residual rebound
+(self-loop no longer unlocks board; force inject prefers add_power then cross-ref wire; 94 tests).

@@ -1,23 +1,24 @@
 {
   "run_id": "mega-17-fc-rocket-20260715",
-  "wall_s": 145.86,
+  "attempt": "a3",
+  "wall_s": 150.69,
   "terminal": "needs_correction",
-  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']",
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']",
   "baseline_commit": "cd764e92",
   "tier": "openrouter:deepseek/deepseek-chat-v3.1",
-  "live_pass_ids": ["AC3", "AC6", "AC7", "AC8"],
-  "live_pass_count": 4,
+  "live_pass_ids": ["AC4", "AC6"],
+  "live_pass_count": 2,
   "axes": {
     "Z1": "PASS",
-    "Z2": "FAIL",
+    "Z2": "PASS",
     "Z3": "PASS",
     "Y": "PASS",
-    "W": "FAIL",
+    "W": "PASS",
     "X": "FAIL",
     "V": "PASS",
     "A": "PASS",
     "B": "PASS",
-    "C": "PASS",
+    "C": "UNKNOWN",
     "D": "PASS",
     "E": "PASS",
     "F": "PASS",
@@ -25,51 +26,59 @@
     "S": "PASS",
     "Fix8_live": "PASS"
   },
-  "spend_before_usd": 0.16898296,
+  "spend_before_usd": 0.22370784,
   "spend_after_usd": 0.22370784,
-  "spend_delta_usd": 0.054725,
+  "spend_delta_usd": 0.0,
   "spend_guard_usd": 8.0,
+  "spend_note": "OpenRouter usage poll flat across a3 (openrouter×4 assignments; API usage counter lag or free-tier billing delay). Cumulative key usage $0.2237 since mega-16.",
   "residuals": [
-    "Z2_no_ecad_add_power_force_inject_still_place_symbol",
-    "wire_passive_self_loop_R1_not_power_nets",
-    "ERC_power_not_driven_AC4_errors_4",
+    "live_AC_pass_2_of_9_target_ge_8",
     "AC5_V3V3_null_NOT-CHECKED_despite_simulate",
-    "live_AC_pass_4_of_9_target_ge_8",
-    "AC1_AC2_geometry_hollow_or_no_bodies",
-    "openrouter_midrun_http_404_watch",
+    "AC1_AC2_AC3_geometry_or_interference_fail",
+    "AC7_fw_NOT-CHECKED_AC9_legs_missing_sim",
+    "power_ports_orphan_until_wire_R1_self_loop_residual",
+    "openrouter_usage_poll_delta_zero_a3",
     "grok-4.5_revalidation_deferred_xai_spending_limit"
   ],
   "preflight": {
     "daemon_match": true,
     "spawn_probe": "PASS",
     "auto_pick_Y": "PASS",
-    "fixer17_bound": true
+    "fixer17_bound": true,
+    "fixer17_z2_rebind": true
   },
   "model_assignment_live": {
-    "ollama": 19,
-    "openrouter": 10
+    "ollama": 20,
+    "openrouter": 4
   },
   "board_path": {
     "board_from_schematic": 2,
     "ecad_run_drc": 2,
     "ecad_run_erc": 0,
-    "ecad_new_schematic": 4,
-    "ecad_place_symbol": 8,
+    "ecad_new_schematic": 1,
+    "ecad_place_symbol": 5,
     "ecad_simulate": 1,
-    "ecad_wire": 10,
-    "ecad_add_power": 0,
-    "fw_build": 2,
-    "new_part": 11,
-    "add_features": 30,
-    "delegate": 12
+    "ecad_wire": 2,
+    "ecad_add_power": 8,
+    "fw_build": 0,
+    "new_part": 1,
+    "add_features": 1,
+    "delegate": 1
   },
   "findings": "reports/runs/mega-17/findings.md",
   "axes_note": {
-    "Z1": "9/9 criterion_ACn.json at needs_correction terminal (mega-16 0/9 closed)",
-    "Z2": "no #PWR1; still no add_power; force_inject place_symbol only",
-    "Z3": "simulate OP executed (AC5 evidence); V(3V3) not finite"
+    "Z1": "9/9 criterion files at needs_correction (held a2→a3)",
+    "Z2": "a3 PASS after rebind: add_power×8 before wire×2; power_not_driven=0; AC4 PASS",
+    "Z3": "simulate OP executed; V(3V3) still null"
   },
   "attempt_archive": [
-    "attempt-1-aborted-double-launch/"
-  ]
+    "attempt-1-aborted-double-launch/",
+    "attempt-2-primary-graded-z2fail/"
+  ],
+  "prior_a2": {
+    "wall_s": 145.86,
+    "live_pass_count": 4,
+    "Z2": "FAIL",
+    "note": "pre-rebind; archived"
+  }
 }

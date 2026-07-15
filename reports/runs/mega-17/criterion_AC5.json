@@ -6,20 +6,18 @@
   "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count'])",
   "evidence": {
     "ok": true,
-    "doc_id": "fb6e6e4b586d",
+    "doc_id": "d0cdccc65c7f",
     "analysis": "op",
     "backend": "mna",
     "converged": true,
     "device_count": 1,
     "nodes": [
-      "N$9"
+      "N$1"
     ],
     "probes": [
       "V(3V3)"
     ],
-    "warnings": [
-      "U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped"
-    ],
+    "warnings": [],
     "sim_log": [
       "op: converged in 1 iters"
     ],

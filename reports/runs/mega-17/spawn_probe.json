@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-15T17:39:10Z",
+  "generated_at": "2026-07-15T17:48:10Z",
   "run_id": "mega-17-fc-rocket-20260715",
   "baseline_commit": "cd764e92",
   "roles": {
@@ -960,7 +960,7 @@
   },
   "capability_separation_ok": true,
   "leaf_feature_modeler_keeps_exec": true,
-  "verdict": "PASS",
+  "verdict": "FAIL",
   "budget_tokens_preflight": {
     "required_roles_rendered_schema_has_budget_tokens": {
       "feature_modeler": true,
@@ -1391,7 +1391,7 @@
       "tool_denied"
     ],
     "detail": {
-      "has_wire_block": true,
+      "has_wire_block": false,
       "has_board_block": true,
       "has_tool_denied": true
     },
@@ -1415,7 +1415,7 @@
     "verdict": "PASS"
   },
   "fix_wire_ecad_wire_power": {
-    "source_has_real_wire": true,
+    "source_has_real_wire": false,
     "source_force_wire_order": true,
     "unit_test_wire_before_board": true,
     "ecad_engineer_has_wire_power": true,
@@ -1441,7 +1441,7 @@
       "ledger_get",
       "ledger_note"
     ],
-    "verdict": "PASS"
+    "verdict": "FAIL"
   },
   "verdict_note": "cap-sep + Fix8 gate wiring OK"
 }

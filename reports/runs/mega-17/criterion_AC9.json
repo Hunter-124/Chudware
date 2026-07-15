@@ -3,7 +3,7 @@
   "result": "FAIL",
   "check_tool": "report_card",
   "pass_rule": "all legs have PASS|WARN|FAIL|SKIP",
-  "detail": "legs missing verdicts: ['sim']",
+  "detail": "legs missing verdicts: ['firmware']",
   "evidence": {
     "ok": true,
     "source": "ledger_report_card",
@@ -22,30 +22,30 @@
       "airframe"
     ],
     "leg_verdicts": {
-      "airframe": "PASS",
+      "airframe": "FAIL",
       "board": "PASS",
       "antenna": "PASS",
-      "firmware": "PASS",
-      "sensor_loop": "PASS",
-      "parts": "FAIL",
-      "schematic": "PASS",
+      "sensor_loop": "SKIP",
       "plan": "WARN",
+      "parts": "SKIP",
+      "schematic": "PASS",
+      "sim": "FAIL",
       "trace_opt": "WARN",
       "power": "PASS",
-      "checks": "FAIL"
+      "checks": "PASS"
     },
     "legs": {
-      "airframe": "PASS",
+      "airframe": "FAIL",
       "board": "PASS",
       "antenna": "PASS",
-      "firmware": "PASS",
-      "sensor_loop": "PASS",
-      "parts": "FAIL",
-      "schematic": "PASS",
+      "sensor_loop": "SKIP",
       "plan": "WARN",
+      "parts": "SKIP",
+      "schematic": "PASS",
+      "sim": "FAIL",
       "trace_opt": "WARN",
       "power": "PASS",
-      "checks": "FAIL"
+      "checks": "PASS"
     }
   }
 }

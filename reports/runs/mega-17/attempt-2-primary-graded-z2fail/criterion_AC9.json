@@ -1,0 +1,51 @@
+{
+  "id": "AC9",
+  "result": "FAIL",
+  "check_tool": "report_card",
+  "pass_rule": "all legs have PASS|WARN|FAIL|SKIP",
+  "detail": "legs missing verdicts: ['sim']",
+  "evidence": {
+    "ok": true,
+    "source": "ledger_report_card",
+    "legs_required": [
+      "plan",
+      "parts",
+      "schematic",
+      "sim",
+      "board",
+      "trace_opt",
+      "antenna",
+      "checks",
+      "firmware",
+      "sensor_loop",
+      "power",
+      "airframe"
+    ],
+    "leg_verdicts": {
+      "airframe": "PASS",
+      "board": "PASS",
+      "antenna": "PASS",
+      "firmware": "PASS",
+      "sensor_loop": "PASS",
+      "parts": "FAIL",
+      "schematic": "PASS",
+      "plan": "WARN",
+      "trace_opt": "WARN",
+      "power": "PASS",
+      "checks": "FAIL"
+    },
+    "legs": {
+      "airframe": "PASS",
+      "board": "PASS",
+      "antenna": "PASS",
+      "firmware": "PASS",
+      "sensor_loop": "PASS",
+      "parts": "FAIL",
+      "schematic": "PASS",
+      "plan": "WARN",
+      "trace_opt": "WARN",
+      "power": "PASS",
+      "checks": "FAIL"
+    }
+  }
+}

@@ -2,19 +2,18 @@
   "status": "needs_correction",
   "phase": "correct",
   "phases_completed": [
-    "intake",
-    "specify"
+    "intake"
   ],
-  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']",
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']",
   "findings": [],
   "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-17-fc-rocket-20260715/ledger.json",
   "run_id": "mega-17-fc-rocket-20260715",
   "mode": "real",
-  "wall_s": 145.86,
+  "wall_s": 150.69,
   "conservation": true,
   "baseline_commit": "cd764e92",
-  "spend_before_usd": 0.16898296,
+  "spend_before_usd": 0.22370784,
   "spend_after_usd": 0.22370784,
-  "spend_delta_usd": 0.054725,
+  "spend_delta_usd": 0.0,
   "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-17-fc-rocket-20260715/ledger.json"
 }

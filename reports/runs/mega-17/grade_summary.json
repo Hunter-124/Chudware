@@ -1,37 +1,34 @@
 {
   "run_id": "mega-17-fc-rocket-20260715",
-  "wall_s": 145.86,
+  "wall_s": 150.69,
   "terminal_status": "needs_correction",
-  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']",
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']",
   "phases_completed": [
-    "intake",
-    "specify"
+    "intake"
   ],
   "live_ac": {
     "AC1": "FAIL",
     "AC2": "FAIL",
-    "AC3": "PASS",
-    "AC4": "FAIL",
+    "AC3": "FAIL",
+    "AC4": "PASS",
     "AC5": "NOT-CHECKED",
     "AC6": "PASS",
-    "AC7": "PASS",
-    "AC8": "PASS",
+    "AC7": "NOT-CHECKED",
+    "AC8": "SKIP",
     "AC9": "FAIL"
   },
   "pass_ids": [
-    "AC3",
-    "AC6",
-    "AC7",
-    "AC8"
+    "AC4",
+    "AC6"
   ],
-  "pass_count": 4,
+  "pass_count": 2,
   "axes": {
     "N_live_ac_pass_ge_4": {
-      "verdict": "PARTIAL",
-      "pass_count": 4,
-      "held_AC3_AC6": true,
-      "AC7": true,
-      "one_of_AC2_4_5": false,
+      "verdict": "FAIL",
+      "pass_count": 2,
+      "held_AC3_AC6": false,
+      "AC7": false,
+      "one_of_AC2_4_5": true,
       "contract": "AC3+AC6 held + AC7 + one of AC2/AC4/AC5 + count>=4"
     },
     "O_ecad_board_drc": {
@@ -39,7 +36,7 @@
       "detail": "board_from_schematic + ecad_run_drc errors==None",
       "counts": {
         "ecad_new_schematic": 4,
-        "ecad_place_symbol": 8,
+        "ecad_place_symbol": 5,
         "board_from_schematic": 2,
         "ecad_run_drc": 2,
         "ecad_run_erc": 0,
@@ -59,12 +56,10 @@
     },
     "Q_live_ac_pass_ge_6": {
       "verdict": "FAIL",
-      "pass_count": 4,
+      "pass_count": 2,
       "pass_ids": [
-        "AC3",
-        "AC6",
-        "AC7",
-        "AC8"
+        "AC4",
+        "AC6"
       ],
       "contract": "live AC PASS count >= 6"
     },
@@ -72,7 +67,7 @@
       "verdict": "FAIL",
       "ac5_result": "NOT-CHECKED",
       "empty_netlist_error": false,
-      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'd0cdccc65c7f', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$1'], 'probes': ['V(3V3)'], 'warnings': [], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values \u2014 check connectivity / source values', 'hint': 'OP so",
       "contract": "V(3V3) measured PASS or honest FAIL (not empty-netlist)"
     },
     "S_board_from_schematic_and_drc": {
@@ -91,12 +86,12 @@
       "ac5_result": "NOT-CHECKED",
       "empty_netlist_error": false,
       "wire_tools": {
-        "ecad_wire": 10,
-        "ecad_add_power": 0,
+        "ecad_wire": 2,
+        "ecad_add_power": 8,
         "ecad_connect": 0,
         "ecad_add_net": 0
       },
-      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'd0cdccc65c7f', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$1'], 'probes': ['V(3V3)'], 'warnings': [], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values \u2014 check connectivity / source values', 'hint': 'OP so",
       "upgrades": "R",
       "contract": "V(3V3) measured PASS or honest FAIL (not empty-netlist) \u2014 R upgrade"
     },
@@ -164,22 +159,22 @@
       "contract": "zero checks from signature errors eliminated"
     },
     "W_ecad_wire_and_power_ERC_clean": {
-      "verdict": "FAIL",
-      "ecad_wire": 10,
-      "ecad_add_power": 0,
-      "ac4_result": "FAIL",
-      "power_not_driven_n": 3,
-      "erc_errors": 0,
+      "verdict": "PASS",
+      "ecad_wire": 2,
+      "ecad_add_power": 8,
+      "ac4_result": "PASS",
+      "power_not_driven_n": 0,
+      "erc_errors": null,
       "force_inject_wire": 0,
       "force_inject_power": 0,
-      "force_inject_n": 1,
+      "force_inject_n": 0,
       "contract": "ecad_wire + ecad_add_power executed live; ERC power_not_driven->0; AC4 PASS"
     },
     "X_AC5_SPICE_wired_netlist": {
       "verdict": "FAIL",
       "ac5_result": "NOT-CHECKED",
       "empty_netlist_error": false,
-      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+      "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'd0cdccc65c7f', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$1'], 'probes': ['V(3V3)'], 'warnings': [], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values \u2014 check connectivity / source values', 'hint': 'OP so",
       "upgrades": "T/R",
       "contract": "V(3V3) measured PASS or honest numeric FAIL (not empty-netlist)"
     },
@@ -191,11 +186,11 @@
         "leaf_local": true,
         "no_free": true,
         "model_assignment": {
-          "ollama": 19,
-          "openrouter": 10
+          "ollama": 20,
+          "openrouter": 4
         },
-        "openrouter_assignments": 10,
-        "ollama_assignments": 19,
+        "openrouter_assignments": 4,
+        "ollama_assignments": 20,
         "xai_assignments": 0,
         "free_model_hits": 0,
         "contract": "auto_pick routes frontier/hard nodes to openrouter paid tier when xai blocked; leaves ollama; no refusal loops; no ollama-all collapse"
@@ -219,69 +214,64 @@
         "missing_ids": [],
         "n_graded": 9,
         "terminal_status": "needs_correction",
-        "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']",
+        "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']",
         "contract": "every mission terminal (done/deliver_partial/needs_correction) produces criterion_ACn.json for ALL 9 ACs"
       },
       "contract": "every mission terminal (done/deliver_partial/needs_correction) produces criterion_ACn.json for ALL 9 ACs"
     },
     "Z2_power_then_wire_refs_live": {
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "detail": {
-        "ecad_add_power": 0,
-        "ecad_wire": 10,
-        "power_ok_n": 0,
+        "ecad_add_power": 8,
+        "ecad_wire": 2,
+        "power_ok_n": 8,
         "wire_ok_n": 2,
-        "power_before_wire": false,
+        "power_before_wire": true,
         "wire_fail_missing_pwr": 0,
-        "power_not_driven_n": 3,
+        "power_not_driven_n": 0,
         "force_inject_power": 0,
         "force_inject_wire": 0,
-        "force_inject_place": 1,
-        "force_inject_events": [
-          {
-            "tool": "ecad_place_symbol",
-            "event": "ecad_chain_force_inject"
-          }
-        ],
+        "force_inject_place": 0,
+        "force_inject_events": [],
         "seq_sample": [
           {
-            "tool": "ecad_wire",
-            "ok": false
+            "tool": "ecad_add_power",
+            "ok": true
           },
           {
-            "tool": "ecad_wire",
-            "ok": false
+            "tool": "ecad_add_power",
+            "ok": true
           },
           {
-            "tool": "ecad_wire",
-            "ok": false
+            "tool": "ecad_add_power",
+            "ok": true
           },
           {
-            "tool": "ecad_wire",
-            "ok": false
+            "tool": "ecad_add_power",
+            "ok": true
           },
           {
             "tool": "ecad_wire",
             "ok": true
           },
           {
-            "tool": "ecad_wire",
-            "ok": false,
+            "tool": "ecad_add_power",
+            "ok": true,
             "src": "ledger"
           },
           {
-            "tool": "ecad_wire",
-            "ok": false,
+            "tool": "ecad_add_power",
+            "ok": true,
             "src": "ledger"
           },
           {
-            "tool": "ecad_wire",
-            "ok": false,
+            "tool": "ecad_add_power",
+            "ok": true,
             "src": "ledger"
           },
           {
-            "tool": "ecad_wire",
-            "ok": false,
+            "tool": "ecad_add_power",
+            "ok": true,
             "src": "ledger"
           },
           {
@@ -300,15 +290,15 @@
         "ecad_simulate": 1,
         "ac5_result": "NOT-CHECKED",
         "empty_netlist_error": false,
-        "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'fb6e6e4b586d', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$9'], 'probes': ['V(3V3)'], 'warnings': ['U1 (Sensor_Pressure:BMP280): no sim model \u2014 skipped'], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values ",
+        "detail": "tool output has no numeric field matching 'v(3v3)' (fields: ['device_count']) {'ok': True, 'doc_id': 'd0cdccc65c7f', 'analysis': 'op', 'backend': 'mna', 'converged': True, 'device_count': 1, 'nodes': ['N$1'], 'probes': ['V(3V3)'], 'warnings': [], 'sim_log': ['op: converged in 1 iters'], 'op': {'V(3V3)': None}, 'reading': 'no finite probe values \u2014 check connectivity / source values', 'hint': 'OP so",
         "contract": "ecad_simulate executes on wired netlist (AC5 not empty-netlist class)"
       },
       "contract": "ecad_simulate executes on wired netlist (AC5 not empty-netlist class)"
     },
     "Fix8_hard_ecad_chain_gate_live": {
       "verdict": "PASS",
-      "ecad_chain_gate_events": 2,
-      "tool_denied_ecad": 2,
+      "ecad_chain_gate_events": 1,
+      "tool_denied_ecad": 4,
       "contract": "live ecad_chain_gate deny events OR wire+board path advanced past place thrash"
     },
     "K_gradeable": {
@@ -317,24 +307,24 @@
     },
     "L_live_pass_ge_2": {
       "verdict": "PASS",
-      "pass_count": 4
+      "pass_count": 2
     },
     "M_non_cad_artifact": {
       "verdict": "PASS",
       "fw": true,
-      "fw_build_calls": 2,
+      "fw_build_calls": 0,
       "schematic_calls": 4
     },
     "A_accepted_ops": {
       "verdict": "PASS",
-      "new_part_ok": 10,
-      "add_features_ok": 7,
-      "add_features_fail": 23
+      "new_part_ok": 5,
+      "add_features_ok": 3,
+      "add_features_fail": 12
     },
     "B_delegate": {
       "verdict": "PASS",
-      "delegate": 12,
-      "spawn": 12
+      "delegate": 2,
+      "spawn": 2
     },
     "C_oneshot": {
       "verdict": "PASS",
@@ -344,7 +334,7 @@
     "D_terminal": {
       "verdict": "PASS",
       "status": "needs_correction",
-      "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']"
+      "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']"
     },
     "E_battery": {
       "verdict": "PASS",
@@ -353,7 +343,7 @@
     },
     "F_clean_stop": {
       "verdict": "PASS",
-      "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC4', 'AC5', 'AC9']"
+      "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC5', 'AC7', 'AC9']"
     },
     "I_battery_doc_id": {
       "verdict": "PASS",
@@ -363,55 +353,43 @@
   "tool_counts_top": [
     [
       "add_features",
-      30
+      17
     ],
     [
-      "ledger_note",
-      20
-    ],
-    [
-      "ledger_get",
-      12
-    ],
-    [
-      "part_search",
-      12
-    ],
-    [
-      "delegate",
-      12
-    ],
-    [
-      "research_eng_calc",
-      12
-    ],
-    [
-      "new_part",
-      11
-    ],
-    [
-      "ecad_wire",
-      10
-    ],
-    [
-      "cad_guide",
-      8
-    ],
-    [
-      "ecad_place_symbol",
-      8
-    ],
-    [
-      "fw_status",
-      6
-    ],
-    [
-      "fw_sensor_scenario",
-      6
+      "part_place",
+      15
     ],
     [
       "ecad_find_part",
+      11
+    ],
+    [
+      "ecad_add_power",
+      8
+    ],
+    [
+      "new_part",
+      7
+    ],
+    [
+      "ledger_note",
+      6
+    ],
+    [
+      "query_geometry",
+      6
+    ],
+    [
+      "ledger_get",
+      6
+    ],
+    [
+      "ecad_place_symbol",
       5
+    ],
+    [
+      "describe_part",
+      4
     ],
     [
       "measure_part",
@@ -422,43 +400,39 @@
       4
     ],
     [
-      "research_material_lookup",
+      "search_parts",
       4
     ],
     [
-      "resolve_process",
-      4
-    ],
-    [
-      "part_source",
+      "new_assembly",
       2
     ],
     [
-      "vendors_health",
+      "delegate",
       2
     ],
     [
-      "parts_taxonomy",
+      "measure_between",
       2
     ],
     [
-      "em_status",
+      "describe_scene",
       2
     ],
     [
-      "fw_new_project",
+      "buildgraph_plan",
       2
     ],
     [
-      "check_feature_overlap",
+      "buildgraph_status",
       2
     ],
     [
-      "fw_sim_run",
+      "list_world_bodies",
       2
     ],
     [
-      "fw_build",
+      "ecad_wire",
       2
     ],
     [
@@ -470,15 +444,19 @@
       2
     ],
     [
-      "addFeatures",
+      "parts.add",
       1
     ],
     [
-      "ac4_get_summary",
+      "verify_battery",
       1
     ],
     [
-      "ac4_run",
+      "part_search",
+      1
+    ],
+    [
+      "ecad_simulate",
       1
     ]
   ],
@@ -487,20 +465,20 @@
     "ecad_run_drc": 2,
     "ecad_run_erc": 0,
     "ecad_new_schematic": 4,
-    "ecad_place_symbol": 8,
+    "ecad_place_symbol": 5,
     "ecad_simulate": 1,
     "ecad_connect": 0,
     "ecad_add_net": 0,
-    "ecad_wire": 10,
-    "ecad_add_power": 0,
-    "fw_build": 2,
-    "fw_new_project": 2,
-    "new_part": 11,
-    "add_features": 30,
-    "delegate": 12,
+    "ecad_wire": 2,
+    "ecad_add_power": 8,
+    "fw_build": 0,
+    "fw_new_project": 0,
+    "new_part": 7,
+    "add_features": 17,
+    "delegate": 2,
     "check_interference": 0,
     "measure_part": 4,
-    "verify_battery": 0,
+    "verify_battery": 1,
     "ecad_antenna_analyze": 0,
     "ecad_antenna_design": 0,
     "make_report": 0,
@@ -508,7 +486,7 @@
     "ecad_place_wire": 0
   },
   "model_assignment": {
-    "ollama": 19,
-    "openrouter": 10
+    "ollama": 20,
+    "openrouter": 4
   }
 }

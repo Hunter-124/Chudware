@@ -1,21 +1,19 @@
 # Mega-17 progress
 
 - **Peers:** Fixer17=`AlrightMosquito`, MegaRun17=`RequiredWoodpecker`
-- **Engine:** hostd `night2-3054-gcb65bfd9-dirty` (running git_rev matches disk binary)
+- **Engine:** hostd `night2-3054-gcb65bfd9-dirty`
 - **Baseline:** `cd764e92`
 - **Frontier:** `openrouter:deepseek/deepseek-chat-v3.1` PAID
-- **Axes:** Z1/Z2/Z3 + A–Y regression; target ≥8 live AC PASS
+- **Axes:** Z1/Z2/Z3 + A–Y; target ≥8 live AC PASS
 
 ## Status
 
-- [x] Pairing confirmed (Main: Fixer17=AlrightMosquito, MegaRun17=RequiredWoodpecker)
-- [x] Daemon preflight: running == disk hostd
-- [x] spawn_probe PASS + auto_pick_smoke PASS (axis Y)
-- [x] Spend snapshot before primary
-- [x] Fixer17 **fixes bound** DM (Z1/Z2/Z3; 91 tests)
-- [x] Attempt-1 aborted double-launch archived
-- [x] Primary a2 finished wall **145.86s** terminal `needs_correction`
-- [x] Graded: live AC PASS **4**/9; Z1 **PASS**, Z2 **FAIL**, Z3 **PASS**, Y **PASS**
-- [x] findings.md + run_summary.json + roadmap append
-- [x] DM Fixer17 live residuals
+- [x] Pairing + daemon + spawn_probe + auto_pick Y
+- [x] Fixer17 fixes bound (Z1/Z2/Z3; 91p)
+- [x] a1 aborted double-launch archived
+- [x] a2 primary graded: Z1 PASS, Z2 FAIL, Z3 PASS, Y PASS, live 4/9
+- [x] Fixer17 Z2 residual rebind (94p)
+- [x] a3 re-run graded: **Z1/Z2/Z3/Y/W PASS**, live **2**/9, AC4 PASS
+- [x] findings + run_summary + roadmap updated
+- [x] DM Fixer17 Z2 live PASS
 - [ ] Live PASS ≥8 (missed)

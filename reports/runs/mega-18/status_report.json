@@ -1,0 +1,54 @@
+{
+  "run_id": "mega-18-fc-rocket-20260715",
+  "wall_s": 551.01,
+  "terminal": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1', 'AC4', 'AC5']",
+  "live_pass_ids": [
+    "AC2",
+    "AC3",
+    "AC6",
+    "AC7",
+    "AC8",
+    "AC9"
+  ],
+  "live_pass_count": 6,
+  "axes": {
+    "Z1": "PASS",
+    "Z2": "PARTIAL",
+    "Z2r": "PARTIAL",
+    "Z3": "PASS",
+    "Z4": "PASS",
+    "G18": "PARTIAL",
+    "Y": "PASS",
+    "W": "PARTIAL",
+    "X": "PASS",
+    "S": "FAIL",
+    "P": "FAIL",
+    "V": "PASS",
+    "A": "PASS",
+    "B": "PASS",
+    "C": "PASS",
+    "D": "PASS",
+    "Fix8": "PASS"
+  },
+  "xai_token_usage": null,
+  "model_assignment": {
+    "ollama": 13,
+    "xai-sub": 11
+  },
+  "xai_account": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "spend_delta_usd": 0.0,
+  "residuals": [
+    "Z2r_PARTIAL_power_ok_but_wire_not_to_rail_force_inject_place_then_U1R1_not_power_pin",
+    "G18_live_pass_6_lt_7",
+    "W_ERC_power_not_driven_or_AC4_sch_not_board",
+    "S_DRC_ran_on_sch_doc_not_board",
+    "live_AC_pass_6_of_9_target_ge_8",
+    "AC1_soft_scores_zero_measure_between",
+    "AC5_V3V3_null_honest_FAIL_IC_only_no_sim_source"
+  ],
+  "baseline_commit": "769f92c6",
+  "preflight_ready": true,
+  "fixer": "PlainLizard",
+  "harness": "ValidBovid"
+}

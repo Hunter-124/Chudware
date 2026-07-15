@@ -527,138 +527,27 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     )})
                     last_reason = _RETRY
                     _ecad_bootstrap_nudge += 1
-                    # mega-14: after 2 incomplete nudges, force next ECAD chain tool
-                    # so bare-text thrash cannot burn budget without wire/board.
+                    # mega-14/18 Z2r: after incomplete nudges, force-EXECUTE
+                    # the next chain (add_power → wire → …) so power is not
+                    # merely scheduled.
                     if (
                         _ecad_bootstrap_nudge >= _ECAD_GATE_FORCE_AFTER
                         and tool_calls_made < budget
                     ):
                         _need = _ecad_chain_need(calls, allow)
                         if _need and _need in (allow or set()):
-                            tool = _need
-                            args = _ecad_forced_tool_args(_need, calls)
-                            try:
-                                _log(ledger, actor or "agent_turn", {
-                                    "event": "ecad_chain_force_inject",
-                                    "tool": tool,
-                                    "args": args,
-                                    "after_nudges": _ecad_bootstrap_nudge,
-                                    "reason": "bootstrap_incomplete_cap",
-                                })
-                            except Exception:  # noqa: BLE001
-                                pass
-                            messages.append({"role": "user", "content": _parts(
-                                "[ECAD enablement] FORCE-INJECT " + tool
-                                + " after incomplete bootstrap. Harness is "
-                                "executing the next chain step now."
-                            )})
+                            calls, tool_calls_made = _ecad_force_chain_cascade(
+                                calls=calls,
+                                allow=allow,
+                                dispatch=dispatch,
+                                ledger=ledger,
+                                actor=actor,
+                                messages=messages,
+                                tool_calls_made=tool_calls_made,
+                                budget=budget,
+                                reason="bootstrap_incomplete_cap",
+                            )
                             _ecad_bootstrap_nudge = 0
-                            # Jump into normal dispatch path (reuse budget).
-                            if tool_calls_made >= budget:
-                                last_reason = (
-                                    "phase_step_cap" if _capped else _RETRY
-                                )
-                                break
-                            tool_calls_made += 1
-                            import time as _time  # noqa: PLC0415
-                            _t0 = _time.monotonic()
-                            if tool == "ecad_wire":
-                                try:
-                                    args = _ecad_sanitize_wire_args(
-                                        args or {}, calls)
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            try:
-                                result = dispatch(tool, args)
-                                ok = True
-                                payload = result
-                                if isinstance(result, str):
-                                    try:
-                                        payload = json.loads(result)
-                                    except Exception:  # noqa: BLE001
-                                        payload = None
-                                if isinstance(payload, dict) and "ok" in payload:
-                                    ok = bool(payload.get("ok"))
-                            except Exception as exc:  # noqa: BLE001
-                                result = {"ok": False, "error": str(exc)}
-                                ok = False
-                            call_rec = {
-                                "tool": tool, "args": args, "ok": ok,
-                                "result": _truncate(result),
-                                "forced": True,
-                            }
-                            calls.append(call_rec)
-                            _log(ledger, actor, {
-                                "event": "tool_call", **call_rec
-                            })
-                            # mega-17 Z2: forced wire missing-ref → re-derive once
-                            if (
-                                tool == "ecad_wire"
-                                and not ok
-                                and tool_calls_made < budget
-                            ):
-                                try:
-                                    missing = _ecad_wire_missing_ref_error(
-                                        result)
-                                    if missing is not None:
-                                        prior = [
-                                            c for c in calls if c is not call_rec
-                                        ]
-                                        new_args = _ecad_rewrite_wire_args_live(
-                                            args or {}, prior)
-                                        if new_args and new_args != args:
-                                            tool_calls_made += 1
-                                            try:
-                                                result2 = dispatch(
-                                                    tool, new_args)
-                                                ok2 = True
-                                                payload2 = result2
-                                                if isinstance(result2, str):
-                                                    try:
-                                                        payload2 = json.loads(
-                                                            result2)
-                                                    except Exception:  # noqa: BLE001
-                                                        payload2 = None
-                                                if (
-                                                    isinstance(payload2, dict)
-                                                    and "ok" in payload2
-                                                ):
-                                                    ok2 = bool(
-                                                        payload2.get("ok"))
-                                            except Exception as exc2:  # noqa: BLE001
-                                                result2 = {
-                                                    "ok": False,
-                                                    "error": str(exc2),
-                                                }
-                                                ok2 = False
-                                            call_rec2 = {
-                                                "tool": tool,
-                                                "args": new_args,
-                                                "ok": ok2,
-                                                "result": _truncate(result2),
-                                                "forced": True,
-                                                "wire_ref_retry": True,
-                                                "retried_missing_ref": missing,
-                                            }
-                                            calls.append(call_rec2)
-                                            _log(ledger, actor, {
-                                                "event": "tool_call",
-                                                **call_rec2,
-                                            })
-                                            messages.append({
-                                                "role": "user",
-                                                "content": _parts(
-                                                    f"Result of {tool} "
-                                                    f"(forced, ref-retry):\n"
-                                                    f"{_as_text(result2)}"
-                                                ),
-                                            })
-                                            continue
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            messages.append({"role": "user", "content": _parts(
-                                f"Result of {tool} (forced):\n{_as_text(result)}"
-                            )})
                             continue
                     continue
                 bare_handoff = {
@@ -890,34 +779,27 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     })
                 except Exception:  # noqa: BLE001
                     pass
-                # mega-14: after denial cap, force-dispatch next chain tool
-                # instead of letting thrash burn the whole budget.
+                # mega-14/18 Z2r: after denial cap, force-EXECUTE the full next
+                # chain (add_power → wire → …) so power is never only scheduled.
                 if (
                     _ecad_gate_denials >= _ECAD_GATE_FORCE_AFTER
                     and tool_calls_made < budget
                 ):
                     _need = _ecad_chain_need(calls, allow)
                     if _need and _need in _allow_now:
-                        tool = _need
-                        args = _ecad_forced_tool_args(_need, calls)
-                        try:
-                            _log(ledger, actor or "agent_turn", {
-                                "event": "ecad_chain_force_inject",
-                                "tool": tool,
-                                "args": args,
-                                "after_denials": _ecad_gate_denials,
-                                "reason": "hard_gate_cap",
-                            })
-                        except Exception:  # noqa: BLE001
-                            pass
-                        messages.append({"role": "user", "content": _parts(
-                            "[ECAD enablement] FORCE-INJECT " + tool
-                            + " after " + str(_ecad_gate_denials)
-                            + " blocked thrash calls. Harness is executing "
-                            + "the next chain step now."
-                        )})
+                        calls, tool_calls_made = _ecad_force_chain_cascade(
+                            calls=calls,
+                            allow=allow,
+                            dispatch=dispatch,
+                            ledger=ledger,
+                            actor=actor,
+                            messages=messages,
+                            tool_calls_made=tool_calls_made,
+                            budget=budget,
+                            reason="hard_gate_cap",
+                        )
                         _ecad_gate_denials = 0
-                        # fall through to normal dispatch with forced tool
+                        continue
                     else:
                         continue
                 else:
@@ -971,11 +853,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 )
             except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
                 pass
-        # mega-17 Z2: sanitize ecad_wire endpoints against live place/power refs
-        # BEFORE dispatch (model often invents #PWR1).
+        # mega-17/18 Z2: sanitize ecad_wire endpoints against live place/power
+        # refs BEFORE dispatch (model invents #PWR1 or R1↔R1 self-loops).
         if tool == "ecad_wire":
             try:
                 args = _ecad_sanitize_wire_args(args or {}, calls)
+                args = _ecad_reject_self_loop_args(args or {}, calls)
             except Exception:  # noqa: BLE001
                 pass
         if _blocked is not None:
@@ -1700,6 +1583,11 @@ _ECAD_PRODUCT_TOOLS = frozenset({
 # reads or emit bare text forever. Cap denials, then force-dispatch the next
 # chain tool so board_from_schematic / wire actually execute live.
 _ECAD_GATE_FORCE_AFTER = 2
+# mega-18 Z2r: after a forced chain step succeeds, keep executing the next
+# need(s) in-process (add_power → cross wire → board) so power is never
+# merely "scheduled". Cap cascades to avoid burning the whole budget.
+_ECAD_FORCE_CASCADE_MAX = 4
+
 _ECAD_THRASH_TOOLS = frozenset({
     "ecad_place_symbol", "ecad_find_part", "part_search",
     "ledger_get", "ledger_note", "ecad_simulate", "ecad_run_erc",
@@ -1712,7 +1600,11 @@ _ECAD_THRASH_TOOLS = frozenset({
 
 
 def _ecad_last_place_refs(calls: list) -> list[str]:
-    """Collect placed symbol refs from successful place results (best-effort)."""
+    """Collect placed symbol refs from successful place results (best-effort).
+
+    mega-18: ledger may store truncated JSON strings for place results — still
+    harvest ``"ref":"U1"`` via regex so multi-symbol detection works.
+    """
     refs: list[str] = []
     for c in calls or []:
         if not (c.get("ok") and c.get("tool") == "ecad_place_symbol"):
@@ -1722,21 +1614,39 @@ def _ecad_last_place_refs(calls: list) -> list[str]:
             try:
                 res = json.loads(res)
             except Exception:  # noqa: BLE001
+                # Truncated JSON — regex harvest ref.
+                m = re.search(
+                    r'["\']ref["\']\s*:\s*["\']([#A-Za-z][\w#-]*)["\']',
+                    c.get("result") if isinstance(c.get("result"), str) else "",
+                )
+                if m:
+                    refs.append(m.group(1))
                 res = None
-        if not isinstance(res, dict):
-            continue
-        for key in ("ref", "reference", "designator", "name"):
-            v = res.get(key)
-            if isinstance(v, str) and v.strip():
-                refs.append(v.strip())
-                break
-        nested = res.get("result") if isinstance(res.get("result"), dict) else None
-        if nested:
+        if isinstance(res, dict):
             for key in ("ref", "reference", "designator", "name"):
-                v = nested.get(key)
-                if isinstance(v, str) and v.strip():
+                v = res.get(key)
+                if (
+                    isinstance(v, str)
+                    and v.strip()
+                    and len(v.strip()) < 32
+                    and re.match(r"^[#A-Za-z][\w#-]*$", v.strip())
+                ):
                     refs.append(v.strip())
                     break
+            nested = (
+                res.get("result") if isinstance(res.get("result"), dict) else None
+            )
+            if nested:
+                for key in ("ref", "reference", "designator", "name"):
+                    v = nested.get(key)
+                    if (
+                        isinstance(v, str)
+                        and v.strip()
+                        and len(v.strip()) < 32
+                        and re.match(r"^[#A-Za-z][\w#-]*$", v.strip())
+                    ):
+                        refs.append(v.strip())
+                        break
     # de-dupe preserve order
     out: list[str] = []
     for r in refs:
@@ -1830,6 +1740,15 @@ def _ecad_place_pin_records(calls: list) -> list[dict]:
         res = _ecad_parse_result(c.get("result"))
         ref = res.get("ref") or (c.get("args") or {}).get("ref")
         if not isinstance(ref, str) or not ref.strip():
+            # mega-18: truncated ledger JSON may still carry "ref":"U1"
+            raw = c.get("result")
+            if isinstance(raw, str):
+                m = re.search(
+                    r'["\']ref["\']\s*:\s*["\']([#A-Za-z][\w#-]*)["\']', raw,
+                )
+                if m:
+                    ref = m.group(1)
+        if not isinstance(ref, str) or not ref.strip():
             continue
         ref = ref.strip()
         pins = res.get("pins")
@@ -1895,6 +1814,12 @@ def _ecad_chain_need(
     mega-17 residual: passive self-loop (R1.1↔R1.2) unlocked board without
     ecad_add_power → ERC power_not_driven. Require add_power when allowed, and
     a cross-ref wire (not same-ref self-loop) before board.
+
+    mega-18 residual: model placed orphan power (net_size=0) then cascade
+    forced Device:R + U1↔R1 and unlocked board — power_not_driven remained.
+    Require *bonded* power (port on pin xy / net_size≥1) before board; re-force
+    add_power at pin xy when only orphans exist; never place passive before
+    bonded power when add_power is allowed.
     """
     allow_set = allow or set()
     ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
@@ -1904,31 +1829,39 @@ def _ecad_chain_need(
         1 for c in calls
         if c.get("ok") and c.get("tool") == "ecad_place_symbol"
     )
-    has_power = "ecad_add_power" in ok_tools
+    has_power_any = "ecad_add_power" in ok_tools
+    has_bonded = _ecad_has_bonded_power(calls)
     has_cross = _ecad_has_cross_wire(calls)
     has_board = bool(ok_tools & {"board_from_schematic", "ecad_make_board"})
     has_drc = "ecad_run_drc" in ok_tools
-    # mega-14 AC5: IC-only places have no sim models — need Device:R/C VALUES.
     has_passive = any(
         c.get("ok") and c.get("tool") == "ecad_place_symbol"
         and _ecad_place_is_passive(c)
         for c in calls
     )
-    if n_place >= 1 and not has_passive and "ecad_place_symbol" in allow_set:
-        return "ecad_place_symbol"
-    # mega-17 Z2 residual: power port REQUIRED before board when tool allowed,
-    # even if a passive self-loop already "wired" a net.
+    # 1) Bonded power first (re-force at pin xy when only orphans exist).
     if (
         n_place >= 1
         and "ecad_add_power" in allow_set
-        and not has_power
+        and not has_bonded
+        and _ecad_should_retry_add_power(calls)
     ):
         return "ecad_add_power"
+    # 2) SPICE-capable passive after power bonded (or when power not allowed).
+    if (
+        n_place >= 1
+        and not has_passive
+        and "ecad_place_symbol" in allow_set
+        and (has_bonded or "ecad_add_power" not in allow_set)
+    ):
+        return "ecad_place_symbol"
+    # 3) Cross-ref wire (never self-loop as product).
     if n_place >= 1 and not has_cross and "ecad_wire" in allow_set:
         return "ecad_wire"
+    # 4) Board only after bonded power (when allowed) + cross wire.
     if (
         has_cross
-        and (has_power or "ecad_add_power" not in allow_set)
+        and (has_bonded or "ecad_add_power" not in allow_set)
         and not has_board
         and (_ECAD_PRODUCT_TOOLS & allow_set)
     ):
@@ -1936,7 +1869,6 @@ def _ecad_chain_need(
             return "board_from_schematic"
         if "ecad_make_board" in allow_set:
             return "ecad_make_board"
-    # Place saturation with zero cross-wire: still force wire, not board.
     if (
         n_place >= 2
         and not has_cross
@@ -1946,7 +1878,6 @@ def _ecad_chain_need(
         return "ecad_wire"
     if has_board and not has_drc and "ecad_run_drc" in allow_set:
         return "ecad_run_drc"
-    # mega-15: re-run ERC after wire/board so AC4 grades post-wire power state.
     has_erc = "ecad_run_erc" in ok_tools
     if (
         has_cross
@@ -1956,8 +1887,6 @@ def _ecad_chain_need(
         and "ecad_run_erc" in allow_set
     ):
         return "ecad_run_erc"
-    # mega-17 Z3: after ERC (or when ERC not allowed but wire+board exist),
-    # force ecad_simulate so AC5 has a chance on the wired netlist.
     has_sim = "ecad_simulate" in ok_tools
     if (
         has_cross
@@ -2010,9 +1939,16 @@ def _ecad_has_cross_wire(calls: list) -> bool:
     mega-17 residual: R1.1↔R1.2 self-loop is NOT product wiring when ≥2
     symbols are placed (must bond passive↔IC). With only one placed ref,
     a self-loop is the only possible pin-to-pin net and counts.
+
+    mega-18: count successful place calls as well as harvested refs — ledger
+    truncation can drop U1's ref string while place still succeeded.
     """
     place_refs = _ecad_last_place_refs(calls)
-    multi = len(place_refs) >= 2
+    n_place = sum(
+        1 for c in (calls or [])
+        if c.get("ok") and c.get("tool") == "ecad_place_symbol"
+    )
+    multi = len(place_refs) >= 2 or n_place >= 2
     for c in calls or []:
         if not c.get("ok"):
             continue
@@ -2046,15 +1982,77 @@ def _ecad_has_real_wire(calls: list) -> bool:
     return False
 
 
+def _ecad_has_bonded_power(calls: list) -> bool:
+    """True when at least one ecad_add_power bonded a pin (net_size≥1).
+
+    mega-18 residual: orphan ports (net_size=0) satisfied has_power and unlocked
+    board while ERC power_not_driven remained.
+    """
+    for c in calls or []:
+        if not (c.get("ok") and c.get("tool") == "ecad_add_power"):
+            continue
+        if _ecad_result_net_connected(c.get("result")):
+            return True
+    return False
+
+
+def _ecad_power_xy_on_pin(calls: list, tol: float = 0.6) -> bool:
+    """True if some successful add_power xy is near a placed pin (esp power_in)."""
+    pins = _ecad_place_pin_records(calls)
+    if not pins:
+        return False
+    for c in calls or []:
+        if not (c.get("ok") and c.get("tool") == "ecad_add_power"):
+            continue
+        res = _ecad_parse_result(c.get("result"))
+        args = c.get("args") if isinstance(c.get("args"), dict) else {}
+        pos = res.get("pos") or [args.get("x"), args.get("y")]
+        try:
+            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                x, y = float(pos[0]), float(pos[1])
+            else:
+                x = float(args.get("x") or 0.0)
+                y = float(args.get("y") or 0.0)
+        except (TypeError, ValueError, IndexError):
+            continue
+        for p in pins:
+            try:
+                if abs(float(p["x"]) - x) <= tol and abs(float(p["y"]) - y) <= tol:
+                    return True
+            except (TypeError, ValueError, KeyError):
+                continue
+    return False
+
+
+def _ecad_should_retry_add_power(calls: list) -> bool:
+    """Whether to force another add_power (missing, orphan, or not on pin xy)."""
+    if _ecad_has_bonded_power(calls):
+        return False
+    n_power = sum(
+        1 for c in (calls or [])
+        if c.get("ok") and c.get("tool") == "ecad_add_power"
+    )
+    # Cap retries: GND + 3V3 + one rebond each ≈ 4; avoid infinite cascade.
+    if n_power >= 4:
+        return False
+    if n_power == 0:
+        return True
+    # Orphans only: re-force until a port lands on a pin xy (or bonded).
+    if not _ecad_power_xy_on_pin(calls):
+        return True
+    # On-pin but still net_size=0 — one more try then stop.
+    return n_power < 3
+
+
 def _ecad_nets_ready_for_board(
     calls: list, allow: set[str] | None = None,
 ) -> bool:
-    """Board may open only after power (when allowed) + product wire."""
+    """Board may open only after *bonded* power (when allowed) + product wire.
+
+    mega-18: orphan add_power (net_size=0) must NOT unlock board.
+    """
     allow_set = allow or set()
-    has_power = any(
-        c.get("ok") and c.get("tool") == "ecad_add_power" for c in (calls or [])
-    )
-    if "ecad_add_power" in allow_set and not has_power:
+    if "ecad_add_power" in allow_set and not _ecad_has_bonded_power(calls):
         return False
     return _ecad_has_cross_wire(calls)
 
@@ -2079,7 +2077,8 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         }
 
     if need == "ecad_add_power":
-        # Prefer bonding onto a real pin xy (power_in / GND / VCC / passive).
+        # mega-18 Z2r residual: bond onto a real power_in pin xy so net_size≥1.
+        # Orphan power at arbitrary (10,80) does not drive pins.
         gnd_pins = [
             p for p in pins
             if (
@@ -2099,21 +2098,44 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
             if p["type"] in ("power_in", "power_out", "power")
             or any(
                 tok in p["name"].upper()
-                for tok in ("VCC", "VDD", "3V3", "3.3", "5V", "+3", "+5", "VIN")
+                for tok in ("VCC", "VDD", "3V3", "3.3", "5V", "+3", "+5", "VIN",
+                            "VBAT", "VDDIO", "VDDA")
             )
         ]
+        # Prefer pins not already targeted by a prior add_power xy.
+        used_xy: set[tuple[float, float]] = set()
+        for c in calls or []:
+            if not (c.get("ok") and c.get("tool") == "ecad_add_power"):
+                continue
+            a = c.get("args") if isinstance(c.get("args"), dict) else {}
+            res = _ecad_parse_result(c.get("result"))
+            pos = res.get("pos") or [a.get("x"), a.get("y")]
+            try:
+                if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                    used_xy.add((round(float(pos[0]), 2), round(float(pos[1]), 2)))
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        def _unused(plist: list[dict]) -> list[dict]:
+            out = []
+            for p in plist:
+                key = (round(float(p["x"]), 2), round(float(p["y"]), 2))
+                if key not in used_xy:
+                    out.append(p)
+            return out or list(plist)
+
         has_gnd = any(
             c.get("ok") and c.get("tool") == "ecad_add_power"
-            and "GND" in json.dumps(c.get("args") or {}, default=str)
+            and "GND" in json.dumps(
+                {"a": c.get("args"), "r": c.get("result")}, default=str,
+            )
             for c in calls
         )
         if has_gnd:
-            target = next(
-                (p for p in pwr_pins if "gnd" not in p["name"].lower()),
-                (pwr_pins[0] if pwr_pins else None),
-            )
-            if target is None and pins:
-                target = pins[0]
+            cand = _unused([
+                p for p in pwr_pins if "gnd" not in p["name"].lower()
+            ] or pwr_pins or pins)
+            target = cand[0] if cand else None
             if target is not None:
                 return {
                     "net": "3V3",
@@ -2121,17 +2143,12 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
                     "y": float(target["y"]),
                 }
             return {"net": "3V3", "x": 0.0, "y": 10.0}
-        # First power port: bond GND onto a GND-like pin if possible.
-        target = gnd_pins[0] if gnd_pins else (
-            next(
-                (
-                    p for p in pins
-                    if p["ref"].upper().startswith(("R", "C", "L"))
-                    and p["pin"] in ("1", "2")
-                ),
-                pins[0] if pins else None,
-            )
-        )
+        cand = _unused(gnd_pins or [
+            p for p in pins
+            if p["ref"].upper().startswith(("R", "C", "L"))
+            and p["pin"] in ("1", "2")
+        ] or pins)
+        target = cand[0] if cand else None
         if target is not None:
             return {
                 "net": "GND",
@@ -2141,69 +2158,10 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         return {"net": "GND", "x": 0.0, "y": 0.0}
 
     if need == "ecad_wire":
-        # mega-17 Z2: derive endpoints ONLY from live place/add_power results.
-        # Never hardcode #PWR1. Prefer passive/IC cross-ref; never self-loop
-        # when ≥2 live refs exist (mega-17 residual R1.1↔R1.2 unlocked board).
-        by_ref: dict[str, list[dict]] = {}
-        for p in pins:
-            by_ref.setdefault(p["ref"], []).append(p)
-        place_refs = _ecad_last_place_refs(calls)
-        power_recs = _ecad_power_refs(calls)
-        live_power_refs = [p["ref"] for p in power_recs if p.get("ref")]
-        passive_refs = [
-            r for r in place_refs
-            if r.upper().startswith(("R", "C", "L", "V", "I"))
-        ]
-        ic_refs = [
-            r for r in place_refs
-            if r not in passive_refs and r not in live_power_refs
-        ]
-
-        def _pin_of(ref: str, prefer: str | None = None) -> str:
-            plist = by_ref.get(ref) or []
-            if prefer:
-                for p in plist:
-                    if p["pin"] == prefer:
-                        return p["pin"]
-            if plist:
-                return plist[0]["pin"]
-            return prefer or "1"
-
-        # Prefer: passive/IC → live power ref (if engine exposed one).
-        if live_power_refs and (passive_refs or ic_refs):
-            a = (passive_refs or ic_refs)[0]
-            pwr = power_recs[0]
-            return {
-                "from_ref": a,
-                "from_pin": _pin_of(a, "1"),
-                "to_ref": pwr["ref"],
-                "to_pin": str(pwr.get("pin") or pwr.get("net") or "1"),
-            }
-        # Next: passive ↔ IC among real placed refs (product cross-wire).
-        if passive_refs and ic_refs:
-            a, b = passive_refs[0], ic_refs[0]
-            return {
-                "from_ref": a, "from_pin": _pin_of(a, "1"),
-                "to_ref": b, "to_pin": _pin_of(b, "1"),
-            }
-        if len(place_refs) >= 2:
-            a, b = place_refs[0], place_refs[1]
-            return {
-                "from_ref": a, "from_pin": _pin_of(a, "1"),
-                "to_ref": b, "to_pin": _pin_of(b, "1"),
-            }
-        # Single ref only: self-loop is last resort (still better than empty).
-        a = place_refs[0] if place_refs else "R1"
-        pin_a = _pin_of(a, "1")
-        pin_b = "2"
-        if by_ref.get(a):
-            nums = [p["pin"] for p in by_ref[a]]
-            if len(nums) >= 2:
-                pin_a, pin_b = nums[0], nums[1]
-        return {
-            "from_ref": a, "from_pin": pin_a,
-            "to_ref": a, "to_pin": pin_b,
-        }
+        # mega-17/18 Z2r: derive endpoints ONLY from live place/add_power.
+        # Never hardcode #PWR1. Prefer power-pin → rail; never self-loop when
+        # ≥2 live refs exist (mega-17 residual R1.1↔R1.2 unlocked board).
+        return _ecad_derive_wire_args(calls, pins=pins, refs=refs)
 
     if need == "ecad_run_erc":
         return {}
@@ -2211,6 +2169,298 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         # mega-17 Z3: OP analysis on 3V3 for AC5.
         return {"analysis": "op", "probes": ["V(3V3)"]}
     return {}
+
+
+def _ecad_derive_wire_args(
+    calls: list,
+    pins: list[dict] | None = None,
+    refs: list[str] | None = None,
+) -> dict:
+    """Derive net-aware ecad_wire args; never same-ref when multi-ref exists.
+
+    mega-18 Z2r: map power pins (VDD/GND/…) toward rail/power symbols when
+    add_power returned a ref; otherwise passive↔IC. Self-loop is last resort
+    only for single-ref schematics.
+    """
+    pins = pins if pins is not None else _ecad_place_pin_records(calls)
+    place_refs = refs if refs is not None else _ecad_last_place_refs(calls)
+    by_ref: dict[str, list[dict]] = {}
+    for p in pins:
+        by_ref.setdefault(p["ref"], []).append(p)
+    power_recs = _ecad_power_refs(calls)
+    live_power_refs = [p["ref"] for p in power_recs if p.get("ref")]
+    passive_refs = [
+        r for r in place_refs
+        if r.upper().startswith(("R", "C", "L", "V", "I"))
+    ]
+    ic_refs = [
+        r for r in place_refs
+        if r not in passive_refs and r not in live_power_refs
+    ]
+
+    def _pin_of(ref: str, prefer: str | None = None) -> str:
+        plist = by_ref.get(ref) or []
+        if prefer:
+            for p in plist:
+                if p["pin"] == prefer:
+                    return p["pin"]
+        if plist:
+            return plist[0]["pin"]
+        return prefer or "1"
+
+    def _power_pin_of(ref: str) -> str | None:
+        """Prefer a power_in / VDD / GND pin on *ref* for rail bonding."""
+        for p in by_ref.get(ref) or []:
+            nm = (p.get("name") or "").upper()
+            typ = (p.get("type") or "").lower()
+            if typ in ("power_in", "power_out", "power") or any(
+                tok in nm for tok in (
+                    "VDD", "VCC", "3V3", "3.3", "5V", "GND", "VSS", "VIN",
+                )
+            ):
+                return p["pin"]
+        return None
+
+    # Prefer: power pin on IC/passive → live power-symbol ref (engine ref).
+    if live_power_refs and (passive_refs or ic_refs):
+        a = (ic_refs or passive_refs)[0]
+        pwr = next((p for p in power_recs if p.get("ref")), power_recs[0])
+        a_pin = _power_pin_of(a) or _pin_of(a, "1")
+        return {
+            "from_ref": a,
+            "from_pin": a_pin,
+            "to_ref": pwr["ref"],
+            "to_pin": str(pwr.get("pin") or pwr.get("net") or "1"),
+        }
+    # Bond a power pin on an IC to a passive pin when no power-symbol ref.
+    if passive_refs and ic_refs:
+        a, b = ic_refs[0], passive_refs[0]
+        a_pin = _power_pin_of(a) or _pin_of(a, "1")
+        return {
+            "from_ref": a, "from_pin": a_pin,
+            "to_ref": b, "to_pin": _pin_of(b, "1"),
+        }
+    if len(place_refs) >= 2:
+        a, b = place_refs[0], place_refs[1]
+        return {
+            "from_ref": a, "from_pin": _power_pin_of(a) or _pin_of(a, "1"),
+            "to_ref": b, "to_pin": _pin_of(b, "1"),
+        }
+    # Single ref only: self-loop is last resort (still better than empty).
+    a = place_refs[0] if place_refs else "R1"
+    pin_a = _pin_of(a, "1")
+    pin_b = "2"
+    if by_ref.get(a):
+        nums = [p["pin"] for p in by_ref[a]]
+        if len(nums) >= 2:
+            pin_a, pin_b = nums[0], nums[1]
+    return {
+        "from_ref": a, "from_pin": pin_a,
+        "to_ref": a, "to_pin": pin_b,
+    }
+
+
+def _ecad_reject_self_loop_args(args: dict, calls: list) -> dict:
+    """If wire args same-ref while ≥2 live refs, re-derive (mega-18 Z2r)."""
+    if not isinstance(args, dict):
+        return _ecad_derive_wire_args(calls)
+    fr = str(args.get("from_ref") or "").strip()
+    tr = str(args.get("to_ref") or "").strip()
+    live = _ecad_all_live_refs(calls)
+    if fr and tr and fr == tr and len(live) >= 2:
+        fresh = _ecad_derive_wire_args(calls)
+        if isinstance(args, dict) and args.get("doc_id") and not fresh.get(
+            "doc_id"
+        ):
+            fresh["doc_id"] = args["doc_id"]
+        # Only accept if re-derive actually broke the self-loop.
+        if fresh.get("from_ref") != fresh.get("to_ref"):
+            return fresh
+    return dict(args)
+
+
+def _ecad_dispatch_forced_step(
+    *,
+    tool: str,
+    args: dict,
+    calls: list,
+    dispatch: Callable,
+    ledger,
+    actor: str | None,
+    messages: list,
+    reason: str,
+    tool_calls_made: int,
+    budget: int,
+) -> tuple[list, int, dict | None, bool]:
+    """Force-EXECUTE one chain tool (mega-14 board inject path).
+
+    Returns (calls, tool_calls_made, call_rec, ok). Does not cascade.
+    """
+    if tool_calls_made >= budget:
+        return calls, tool_calls_made, None, False
+    if tool == "ecad_wire":
+        try:
+            args = _ecad_sanitize_wire_args(args or {}, calls)
+            args = _ecad_reject_self_loop_args(args or {}, calls)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _log(ledger, actor or "agent_turn", {
+            "event": "ecad_chain_force_inject",
+            "tool": tool,
+            "args": args,
+            "reason": reason,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    messages.append({"role": "user", "content": _parts(
+        "[ECAD enablement] FORCE-INJECT " + tool
+        + " (" + reason + "). Harness is executing the next chain step now."
+    )})
+    tool_calls_made += 1
+    try:
+        result = dispatch(tool, args)
+        ok = True
+        payload = result
+        if isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except Exception:  # noqa: BLE001
+                payload = None
+        if isinstance(payload, dict) and "ok" in payload:
+            ok = bool(payload.get("ok"))
+    except Exception as exc:  # noqa: BLE001
+        result = {"ok": False, "error": str(exc)}
+        ok = False
+    call_rec = {
+        "tool": tool, "args": args, "ok": ok,
+        "result": _truncate(result),
+        "forced": True,
+        "force_reason": reason,
+    }
+    calls.append(call_rec)
+    try:
+        _log(ledger, actor, {"event": "tool_call", **call_rec})
+    except Exception:  # noqa: BLE001
+        pass
+    # Wire missing-ref → re-derive once from live (incl. just-added power).
+    if (
+        tool == "ecad_wire"
+        and not ok
+        and tool_calls_made < budget
+    ):
+        try:
+            missing = _ecad_wire_missing_ref_error(result)
+            if missing is not None or (
+                isinstance(args, dict)
+                and (
+                    str(args.get("from_ref") or "").startswith("#")
+                    or str(args.get("to_ref") or "").startswith("#")
+                    or (
+                        args.get("from_ref")
+                        and args.get("from_ref") == args.get("to_ref")
+                        and len(_ecad_all_live_refs(calls[:-1])) >= 2
+                    )
+                )
+            ):
+                prior = [c for c in calls if c is not call_rec]
+                new_args = _ecad_rewrite_wire_args_live(args or {}, prior)
+                new_args = _ecad_reject_self_loop_args(new_args, prior)
+                if new_args and new_args != args:
+                    tool_calls_made += 1
+                    try:
+                        result2 = dispatch(tool, new_args)
+                        ok2 = True
+                        payload2 = result2
+                        if isinstance(result2, str):
+                            try:
+                                payload2 = json.loads(result2)
+                            except Exception:  # noqa: BLE001
+                                payload2 = None
+                        if isinstance(payload2, dict) and "ok" in payload2:
+                            ok2 = bool(payload2.get("ok"))
+                    except Exception as exc2:  # noqa: BLE001
+                        result2 = {"ok": False, "error": str(exc2)}
+                        ok2 = False
+                    call_rec2 = {
+                        "tool": tool, "args": new_args, "ok": ok2,
+                        "result": _truncate(result2),
+                        "forced": True,
+                        "wire_ref_retry": True,
+                        "force_reason": reason + "+ref_retry",
+                        "retried_missing_ref": missing,
+                    }
+                    calls.append(call_rec2)
+                    try:
+                        _log(ledger, actor, {
+                            "event": "tool_call", **call_rec2,
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                    messages.append({"role": "user", "content": _parts(
+                        f"Result of {tool} (forced, ref-retry):\n"
+                        f"{_as_text(result2)}"
+                    )})
+                    return calls, tool_calls_made, call_rec2, ok2
+        except Exception:  # noqa: BLE001
+            pass
+    messages.append({"role": "user", "content": _parts(
+        f"Result of {tool} (forced):\n{_as_text(result)}"
+    )})
+    return calls, tool_calls_made, call_rec, ok
+
+
+def _ecad_force_chain_cascade(
+    *,
+    calls: list,
+    allow: set[str] | None,
+    dispatch: Callable,
+    ledger,
+    actor: str | None,
+    messages: list,
+    tool_calls_made: int,
+    budget: int,
+    reason: str,
+    max_steps: int = _ECAD_FORCE_CASCADE_MAX,
+) -> tuple[list, int]:
+    """Force-EXECUTE successive chain needs until nets/board ready or cap.
+
+    mega-18 Z2r: parts placed + no power must EXECUTE ecad_add_power (not just
+    schedule it), then feed returned refs into derived ecad_wire pairs.
+    """
+    allow_set = allow or set()
+    steps = 0
+    while steps < max_steps and tool_calls_made < budget:
+        need = _ecad_chain_need(calls, allow)
+        if not need or need not in allow_set:
+            break
+        # Cascade only product-chain steps (power/wire/board/drc/erc/sim).
+        if need not in (
+            "ecad_add_power", "ecad_wire", "ecad_place_symbol",
+            "board_from_schematic", "ecad_make_board", "ecad_run_drc",
+            "ecad_run_erc", "ecad_simulate",
+        ):
+            break
+        args = _ecad_forced_tool_args(need, calls)
+        calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
+            tool=need,
+            args=args,
+            calls=calls,
+            dispatch=dispatch,
+            ledger=ledger,
+            actor=actor,
+            messages=messages,
+            reason=f"{reason}:{need}",
+            tool_calls_made=tool_calls_made,
+            budget=budget,
+        )
+        steps += 1
+        # Stop cascading after board product tools if we only needed power+wire
+        # for Z2r — still allow full chain when reason is hard_gate.
+        if need in ("ecad_run_drc", "ecad_simulate") and "z2r" in reason:
+            break
+    return calls, tool_calls_made
+
 
 
 def _ecad_wire_missing_ref_error(result: Any) -> str | None:
@@ -2262,6 +2512,7 @@ def _ecad_sanitize_wire_args(args: dict, calls: list) -> dict:
 
     mega-17 Z2: model (or stale inject) often emits to_ref='#PWR1' which was
     never placed. Prefer live place/add_power refs only.
+    mega-18 Z2r: also reject same-ref self-loops when ≥2 live refs exist.
     """
     if not isinstance(args, dict):
         return _ecad_forced_tool_args("ecad_wire", calls)
@@ -2272,6 +2523,9 @@ def _ecad_sanitize_wire_args(args: dict, calls: list) -> dict:
     tr = str(args.get("to_ref") or "")
     if (fr and fr not in live) or (tr and tr not in live):
         return _ecad_rewrite_wire_args_live(args, calls)
+    # Self-loop guard: re-derive when multi-ref schematic.
+    if fr and tr and fr == tr and len(live) >= 2:
+        return _ecad_reject_self_loop_args(args, calls)
     return dict(args)
 
 

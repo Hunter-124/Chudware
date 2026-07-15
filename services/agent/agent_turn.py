@@ -2498,7 +2498,8 @@ def _ecad_has_sim_source(calls: list) -> bool:
             tok in lib
             for tok in (
                 "device:v", "device:i", "simulator_spice:v", "spice:v",
-                "vsource", "isource",
+                "vsource", "isource", "simulation_spice:v", "v_source",
+                "i_source",
             )
         ):
             return True
@@ -2715,6 +2716,8 @@ def _ecad_source_on_rail(calls: list, rail: str) -> bool:
             ref = str(res.get("ref") or args.get("ref") or "")
             is_v = (
                 "device:v" in lib
+                or "simulation_spice:v" in lib
+                or "v_source" in lib
                 or lib.endswith(":v")
                 or ref.upper().startswith("V")
             )
@@ -2816,7 +2819,12 @@ def _ecad_find_ref(calls: list, prefix: str) -> str | None:
         if ref.upper().startswith(pref):
             found = ref
             continue
-        if pref == "V" and ("device:v" in lib or lib.endswith(":v")):
+        if pref == "V" and (
+            "device:v" in lib
+            or lib.endswith(":v")
+            or "v_source" in lib
+            or "simulation_spice:v" in lib
+        ):
             found = ref
         if pref == "R" and ("device:r" in lib or lib.endswith(":r")):
             found = ref
@@ -2921,15 +2929,19 @@ def _ecad_ensure_driven_rail(
     allow_set = allow or set()
     topo = _ecad_sim_topology(calls=calls)
     rail = topo.get("rail") or "3V3"
-    if topo.get("driven") and not (
+    # mega-23: even when source+load appear present (device_count>=2), still
+    # enforce V- → GND return. a2 residual shorted V- onto the rail → singular
+    # matrix / V(3V3)=null. Only skip place when fully driven AND GND return
+    # already bonded; still fall through to GND wire steps below.
+    skip_place = bool(topo.get("driven")) and not (
         topo.get("device_count") is not None and int(topo["device_count"]) <= 1
         and not (topo.get("has_source") and topo.get("has_load"))
-    ):
-        return calls, tool_calls_made, steps, False
+    )
 
     # --- place Device:V if missing ---
     if (
-        (not _ecad_has_sim_source(calls) or not topo.get("has_source"))
+        (not skip_place)
+        and (not _ecad_has_sim_source(calls) or not topo.get("has_source"))
         and "ecad_place_symbol" in allow_set
         and tool_calls_made < budget
         and steps < max_steps
@@ -2957,11 +2969,11 @@ def _ecad_ensure_driven_rail(
             budget=budget,
         )
         steps += 1
-
     # --- place Device:R load if missing on rail ---
     has_r = _ecad_find_ref(calls, "R") is not None
     if (
-        (not has_r or not topo.get("has_load"))
+        (not skip_place)
+        and (not has_r or not topo.get("has_load"))
         and "ecad_place_symbol" in allow_set
         and tool_calls_made < budget
         and steps < max_steps
@@ -3061,20 +3073,48 @@ def _ecad_ensure_driven_rail(
             _wire(rref, r_pin, anchor[0], anchor[1], "wire_load_to_rail")
 
     # Return pin of V and R to GND for a real DC path (V+ → load → GND).
-    # mega-22 a2: singular matrix when V- also landed on the rail net.
+    # mega-22 a2 / mega-23: singular matrix when V- also landed on the rail net.
+    # Force a GND power flag first when no GND member exists so the return has a
+    # real 0 V node (not another floating N$).
     gnd_anchor = _ecad_rail_member_endpoint(calls, "GND")
+    if (
+        gnd_anchor is None
+        and "ecad_add_power" in allow_set
+        and tool_calls_made < budget
+        and steps < max_steps
+    ):
+        g_args = {"net": "GND", "x": 40.0, "y": -20.0}
+        if sch:
+            g_args["doc_id"] = sch
+        calls, tool_calls_made, _gprec, _gpok = _ecad_dispatch_forced_step(
+            tool="ecad_add_power",
+            args=g_args,
+            calls=calls,
+            dispatch=dispatch,
+            ledger=ledger,
+            actor=actor,
+            messages=messages,
+            reason=f"{reason}:gnd_power_flag",
+            tool_calls_made=tool_calls_made,
+            budget=budget,
+        )
+        steps += 1
+        gnd_anchor = _ecad_rail_member_endpoint(calls, "GND")
     if vref:
+        # Prefer library pin names for Simulation_SPICE:V_source (+/-).
         v_minus = _ecad_passive_pin(calls, vref, prefer="-")
-        if v_minus in ("-", "2"):
-            if gnd_anchor:
-                _wire(
-                    vref, v_minus, gnd_anchor[0], gnd_anchor[1],
-                    "wire_v_gnd", net="GND",
-                )
-            elif rref:
-                # No GND pin known — use load return as 0V node via power flag.
-                other = "2"
-                _wire(vref, v_minus, rref, other, "wire_v_to_load_return", net="GND")
+        if v_minus not in ("-", "2", "−"):
+            # Place result may only expose numbered pins; treat second pin as minus.
+            v_minus = "-"
+        if gnd_anchor:
+            _wire(
+                vref, v_minus, gnd_anchor[0], gnd_anchor[1],
+                "wire_v_gnd", net="GND",
+            )
+        elif rref:
+            # No GND pin known — use load return as 0V node via power flag.
+            other = "2"
+            _wire(vref, v_minus, rref, other, "wire_v_to_load_return", net="GND")
     if rref and gnd_anchor:
         # Other resistor pin to GND so current can flow.
         r_on = _ecad_passive_pin(calls, rref, prefer="1")

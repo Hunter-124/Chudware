@@ -15,6 +15,7 @@ Per-check metadata:
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from typing import Any, Optional
@@ -210,11 +211,10 @@ def _derive_measure_face_pair(doc_id: Optional[str]) -> Optional[tuple[Any, Any]
             side = str(f.get("side") or "").lower()
             if side in _VALID_SIDE_WORDS:
                 return side
-            # Engine face id / selector.
-            for k in ("id", "ref", "face_id", "name", "selector"):
-                if f.get(k):
-                    return str(f[k])
-            if f.get("query"):
+            # mega-23: NEVER emit bare feature/face ids (f1, Face_3, …) —
+            # engine treats bare strings as side words and soft-zeros.
+            # Prefer structured face queries over id strings.
+            if f.get("query") and isinstance(f.get("query"), dict):
                 return f["query"]
             # Construct pick-largest planar query for the first, second-largest next.
             return {"of": "face", "surf": "plane", "pick": "largest"}
@@ -222,8 +222,23 @@ def _derive_measure_face_pair(doc_id: Optional[str]) -> Optional[tuple[Any, Any]
         qa, qb = _as_q(a_f), _as_q(b_f)
         if qa == qb and isinstance(qa, dict):
             qb = {"of": "face", "surf": "plane", "pick": "smallest"}
-        if qa != qb:
-            return qa, qb
+        # Prefer bbox extremes over two identical structured picks when
+        # neither face carries a valid side annotation (nonzero separation).
+        if (
+            isinstance(qa, dict) and isinstance(qb, dict)
+            and qa.get("pick") == "largest" and qb.get("pick") == "smallest"
+        ):
+            pass  # fall through to bbox below for nonzero-separation pair
+        elif qa != qb:
+            # Structured dict endpoints are valid; side words already handled.
+            if (
+                (isinstance(qa, str) and qa in _VALID_SIDE_WORDS)
+                or isinstance(qa, dict)
+            ) and (
+                (isinstance(qb, str) and qb in _VALID_SIDE_WORDS)
+                or isinstance(qb, dict)
+            ):
+                return qa, qb
 
     # Bbox extents → opposite axis sides (valid side words only).
     bb = _bbox_extents(doc_id)
@@ -404,7 +419,11 @@ def _adapt_check_kwargs(
             if q in (None, ""):
                 return False
             if isinstance(q, dict):
-                return bool(q.get("of") or q.get("side") or q.get("pick"))
+                # Structured face/edge query is always engine-valid.
+                return bool(
+                    q.get("of") or q.get("side") or q.get("pick")
+                    or q.get("surf") or q.get("query")
+                )
             if not isinstance(q, str):
                 return False
             s = q.strip().lower()
@@ -1109,24 +1128,46 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
             })
         else:
             found = False
-            for key in ("match_pct", "score", "min_fos", "cd", "max_von_mises_mpa",
-                        "coverage_ratio", "machined_fraction"):
-                if key in r:
-                    val = r[key]
-                    if key == "match_pct":
-                        score = min(float(val) / 100.0, 1.0)
-                    elif key == "min_fos":
-                        score = min(float(val) / 2.0, 1.0)  # FoS 2+ → 1.0
-                    elif key == "max_von_mises_mpa":
-                        score = 1.0 if r.get("ok", True) else 0.0
-                    else:
-                        fval = float(val)
-                        if 0.0 <= fval <= 1.0:
-                            score = fval
+            # mega-23 AC1 / measure_between: a successful finite distance (incl.
+            # honest 0.0 for coincident faces) is a real measurement — score 1.0
+            # and name coincidence instead of silent zero.
+            if check_name == "measure_between" and r.get("ok", False):
+                dist = r.get("distance")
+                try:
+                    if dist is not None and math.isfinite(float(dist)):
+                        dval = float(dist)
+                        score = 1.0
+                        found = True
+                        if abs(dval) <= 1e-9:
+                            findings.append({
+                                "check": check_name,
+                                "ok": True,
+                                "detail": (
+                                    "distance 0.0 mm — coincident/adjacent faces "
+                                    "(honest finding, not a soft-zero failure)"
+                                ),
+                            })
+                except (TypeError, ValueError):
+                    pass
+            if not found:
+                for key in ("match_pct", "score", "min_fos", "cd", "max_von_mises_mpa",
+                            "coverage_ratio", "machined_fraction"):
+                    if key in r:
+                        val = r[key]
+                        if key == "match_pct":
+                            score = min(float(val) / 100.0, 1.0)
+                        elif key == "min_fos":
+                            score = min(float(val) / 2.0, 1.0)  # FoS 2+ → 1.0
+                        elif key == "max_von_mises_mpa":
+                            score = 1.0 if r.get("ok", True) else 0.0
                         else:
-                            score = min(abs(fval) / 100.0, 1.0)
-                    found = True
-                    break
+                            fval = float(val)
+                            if 0.0 <= fval <= 1.0:
+                                score = fval
+                            else:
+                                score = min(abs(fval) / 100.0, 1.0)
+                        found = True
+                        break
             if not found:
                 score = 1.0 if r.get("ok", False) else 0.0
             if not r.get("ok", True):

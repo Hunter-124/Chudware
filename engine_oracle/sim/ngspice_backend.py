@@ -244,20 +244,33 @@ def _parse_rawfile(text: str) -> dict:
 
 
 def _lookup(raw: dict, probe: str) -> Optional[list]:
-    """Map a study probe ('V(OUT)', 'I(V1)') onto rawfile vector names."""
+    """Map a study probe ('V(OUT)', 'I(V1)') onto rawfile vector names.
+
+    mega-23 AC5: tolerate case / format variants (v(3v3) vs V(3V3) vs bare 3v3).
+    """
     data = raw["data"]
     p = probe.strip()
     m = re.match(r"^([VvIi])\((.+)\)$", p)
     cands: list[str] = [p.lower()]
     if m:
         kind, arg = m.group(1).upper(), m.group(2).strip().lower()
+        bare = arg.lstrip("+")
         if kind == "V":
-            cands = [f"v({arg})", arg]
+            cands = [
+                f"v({arg})", arg, bare, f"v({bare})",
+                f"v(+{bare})", f"+{bare}",
+            ]
         else:
-            cands = [f"i({arg})", f"{arg}#branch"]
+            cands = [f"i({arg})", f"{arg}#branch", f"i({bare})", f"{bare}#branch"]
+    # Also try casefold match against all vectors when exact miss.
     for c in cands:
         if c in data:
             return data[c]
+    low_map = {str(k).lower(): k for k in data.keys()}
+    for c in cands:
+        k = low_map.get(c.lower())
+        if k is not None:
+            return data[k]
     return None
 
 

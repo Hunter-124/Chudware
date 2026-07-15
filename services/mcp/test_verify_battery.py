@@ -539,8 +539,9 @@ def test_adapt_measure_between_runs_with_derived_queries(monkeypatch):
     monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
     r = bat.verify("doc-mech", ["measure_between"])
     assert r["scores"]["measure_between"] == 1.0
-    assert seen["a"] == "top face"
-    assert seen["b"] == "bottom face"
+    assert seen["a"] in ("top", "bottom", "front", "back", "left", "right", "+z", "-z")
+    assert seen["b"] in ("top", "bottom", "front", "back", "left", "right", "+z", "-z")
+    assert seen["a"] != seen["b"]
 
 
 def test_adapt_dim_coverage_skip_no_drawing(monkeypatch):

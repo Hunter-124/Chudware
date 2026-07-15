@@ -1,0 +1,222 @@
+{
+  "id": "AC1",
+  "result": "FAIL",
+  "check_tool": "verify_battery",
+  "pass_rule": "PASS",
+  "detail": "critical_scores_zero=['eval_check', 'is_manifold', 'measure_part']",
+  "evidence": {
+    "source": "battery_result",
+    "doc_id": null,
+    "verdict": "FAIL",
+    "ok": false,
+    "scores": {
+      "dim_coverage": 0.0,
+      "ecad_run_erc": 1.0,
+      "eval_check": 0.0,
+      "groundedness": 0.0,
+      "is_manifold": 0.0,
+      "layout_coverage": 0.0,
+      "measure_part": 0.0,
+      "power_budget": 1.0,
+      "query_geometry": 1.0,
+      "req_join": 1.0,
+      "unit_sanity": 1.0
+    },
+    "findings": [
+      {
+        "name": "check_sketch",
+        "severity": null,
+        "message": "no sketches on document"
+      },
+      {
+        "name": "dim_coverage",
+        "severity": null,
+        "message": "No current document"
+      },
+      {
+        "name": "ecad_check_diff_impedance",
+        "severity": null,
+        "message": "no open board for diff impedance"
+      },
+      {
+        "name": "ecad_check_impedance",
+        "severity": null,
+        "message": "no open board for impedance check"
+      },
+      {
+        "name": "eval_check",
+        "severity": null,
+        "message": "No current document"
+      },
+      {
+        "name": "groundedness",
+        "severity": null,
+        "message": "No current document"
+      },
+      {
+        "name": "is_manifold",
+        "severity": null,
+        "message": "No current document"
+      },
+      {
+        "name": "layout_coverage",
+        "severity": null,
+        "message": "No current document"
+      },
+      {
+        "name": "measure_between",
+        "severity": null,
+        "message": "no geometrically valid measure endpoints (honest SKIP)"
+      },
+      {
+        "name": "measure_part",
+        "severity": null,
+        "message": "No current part. Call new_part(...) first (or pass doc_id=)."
+      }
+    ],
+    "checks": [
+      {
+        "name": "dim_coverage",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "ecad_run_erc",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "eval_check",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "groundedness",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "is_manifold",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "layout_coverage",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "measure_part",
+        "verdict": "FAIL",
+        "score": 0.0
+      },
+      {
+        "name": "power_budget",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "query_geometry",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "req_join",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "unit_sanity",
+        "verdict": "PASS",
+        "score": 1.0
+      }
+    ],
+    "per_check": [
+      {
+        "name": "dim_coverage",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current document"
+      },
+      {
+        "name": "ecad_run_erc",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "eval_check",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current document"
+      },
+      {
+        "name": "groundedness",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current document"
+      },
+      {
+        "name": "is_manifold",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current document"
+      },
+      {
+        "name": "layout_coverage",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current document"
+      },
+      {
+        "name": "measure_part",
+        "verdict": "FAIL",
+        "score": 0.0,
+        "message": "No current part. Call new_part(...) first (or pass doc_id=)."
+      },
+      {
+        "name": "power_budget",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "query_geometry",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "req_join",
+        "verdict": "PASS",
+        "score": 1.0
+      },
+      {
+        "name": "unit_sanity",
+        "verdict": "PASS",
+        "score": 1.0
+      }
+    ],
+    "zero_checks": [
+      "dim_coverage",
+      "eval_check",
+      "groundedness",
+      "is_manifold",
+      "layout_coverage",
+      "measure_part"
+    ],
+    "geometry_evidence": {
+      "is_manifold": 0.0,
+      "eval_check": 0.0,
+      "measure_part": 0.0,
+      "query_geometry": 1.0,
+      "layout_coverage": 0.0,
+      "check_sketch": null,
+      "dim_coverage": 0.0,
+      "unit_sanity": 1.0,
+      "power_budget": 1.0
+    },
+    "brief_hints": [
+      "CRITICAL solid integrity failed \u2014 ensure closed manifold solid (no open shells / zero-thickness sheets); revolve/extrude closed profiles with wall\u22651.5 mm.",
+      "measure_part zero \u2014 geometry may be empty/degenerate; build payload bay \u226556\u00d786\u00d720 mm and body tube OD\u224860 wall\u22651.5.",
+      "dim_coverage zero (often no open drawing) \u2014 optional for airframe solid PASS; add make_drawing only if drawing deliverable required."
+    ]
+  }
+}

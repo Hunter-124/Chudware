@@ -200,16 +200,23 @@ class _Sim:
         if "0" not in raw_nodes:
             raw_nodes.insert(0, "0")
         self.node_index: dict[str, int] = {}
+        # Case-insensitive aliases: SPICE / ngspice often emit lower-case
+        # vectors (v(3v3)) while schematic nets keep human case (3V3).
+        self._node_aliases: dict[str, str] = {}
         idx = 0
         for nm in raw_nodes:
-            if str(nm) in ("0", "gnd", "GND"):
-                self.node_index[str(nm)] = -1
+            key = str(nm)
+            if key in ("0", "gnd", "GND") or key.lower() in ("0", "gnd"):
+                self.node_index[key] = -1
+                self._node_aliases[key.lower()] = key
             else:
-                self.node_index[str(nm)] = idx
+                self.node_index[key] = idx
+                self._node_aliases[key.lower()] = key
                 idx += 1
         # Map common ground aliases to ground.
         for alias in ("0", "gnd", "GND"):
             self.node_index.setdefault(alias, -1)
+            self._node_aliases.setdefault(alias.lower(), alias)
 
         self.gmin = float(options.get("gmin", 1e-12))
         self.reltol = float(options.get("reltol", 1e-3))
@@ -233,6 +240,35 @@ class _Sim:
 
         # A template MnaSystem to pin branch-row allocation (so indices are stable).
         self.node_count = idx
+
+    def resolve_node(self, name: str):
+        """Case/format-tolerant node → index. None only when truly unknown.
+
+        mega-23 AC5: accept v(3v3)/V(3V3)/+3V3 aliases against schematic nets.
+        """
+        if name is None:
+            return None
+        key = str(name).strip()
+        if key in self.node_index:
+            return self.node_index[key]
+        low = key.lower()
+        if low in ("0", "gnd", "ground", "vss", "vssa", "agnd", "dgnd"):
+            return -1
+        orig = getattr(self, "_node_aliases", {}).get(low)
+        if orig is not None and orig in self.node_index:
+            return self.node_index[orig]
+        bare = low.lstrip("+").replace("net_", "").replace("n$", "")
+        for cand in (bare, bare.upper()):
+            if cand in self.node_index:
+                return self.node_index[cand]
+            o2 = getattr(self, "_node_aliases", {}).get(str(cand).lower())
+            if o2 is not None and o2 in self.node_index:
+                return self.node_index[o2]
+        for k, v in self.node_index.items():
+            kl = str(k).lower()
+            if kl == low or kl.lstrip("+") == bare:
+                return v
+        return None
 
     def new_system(self, complex_mode: bool = False) -> MnaSystem:
         mna = MnaSystem(self.node_index, complex_mode=complex_mode)
@@ -387,15 +423,25 @@ def _parse_probe(probe: str) -> tuple[str, list[str]]:
 
 def _eval_probe(sim: _Sim, mna: MnaSystem, x: np.ndarray, probe: str):
     kind, args = _parse_probe(probe)
+    resolve = getattr(sim, "resolve_node", None)
+
+    def _node(name: str, default=None):
+        if resolve is not None:
+            v = resolve(name)
+            if v is not None:
+                return v
+            return default
+        return sim.node_index.get(name, default)
+
     if kind == "V":
         if len(args) == 1:
-            i = sim.node_index.get(args[0], None)
+            i = _node(args[0], None)
             if i is None:
                 return None
             return _val(x, i)
         elif len(args) == 2:
-            i = sim.node_index.get(args[0], -1)
-            j = sim.node_index.get(args[1], -1)
+            i = _node(args[0], -1)
+            j = _node(args[1], -1)
             return _val(x, i) - _val(x, j)
     elif kind == "I":
         # Branch current through a source (V/L/E/H/OPAMP) — its MNA branch row.
@@ -407,8 +453,8 @@ def _eval_probe(sim: _Sim, mna: MnaSystem, x: np.ndarray, probe: str):
         # Resistor current: I(R1) = (V(a)-V(b))/R.
         for d in sim.devices:
             if d.name == name and d.kind == "R":
-                a = sim.node_index.get(d.node_names[0], -1)
-                b = sim.node_index.get(d.node_names[1], -1)
+                a = _node(d.node_names[0], -1)
+                b = _node(d.node_names[1], -1)
                 r = float(d.value) if d.value else 1e-9
                 return (_val(x, a) - _val(x, b)) / r
         # Two-terminal nonlinear device current: I(D1)/I(LED1) = the junction current at the

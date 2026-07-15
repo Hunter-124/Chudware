@@ -79,6 +79,40 @@ class UserDirectory:
         self.reload()
         return list(self._by_email.values())
 
+    def upsert(self, user: User) -> None:
+        """Add or update a user and persist to users.yaml (atomic write)."""
+        self.reload()
+        self._by_email[user.email.strip().lower()] = user
+        self._write()
+
+    def remove(self, email: str) -> bool:
+        self.reload()
+        removed = self._by_email.pop(email.strip().lower(), None) is not None
+        if removed:
+            self._write()
+        return removed
+
+    def _write(self) -> None:
+        payload = {
+            "users": [
+                {
+                    "email": u.email,
+                    "display": u.display,
+                    "role": u.role,
+                    "heavy": u.heavy,
+                }
+                for u in sorted(self._by_email.values(), key=lambda u: u.email)
+            ]
+        }
+        tmp = self.path.with_suffix(".yaml.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write("# billet-web allowlist — managed via /admin; edits here are fine too.\n")
+            fh.write("# After manual edits run: python3 Webservice/deploy/cf_provision.py --sync-users\n")
+            yaml.safe_dump(payload, fh, sort_keys=False)
+        tmp.replace(self.path)
+        self._mtime = self.path.stat().st_mtime
+        log.info("wrote %d users to %s", len(self._by_email), self.path)
+
 
 class JWKSCache:
     """Cached Cloudflare Access JWKS (15 min TTL)."""

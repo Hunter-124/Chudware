@@ -42,6 +42,20 @@ build_app()  {
     ninja -C "$ROOT/host/build-linux" Billet
 }
 
+# Full-engine OCCT tree (libaicad.so + aicad-hostd) — the binaries the LIVE
+# daemon actually serves. Not covered by `core` (slim linux-core preset) or
+# `app`: engine-behavior changes MUST rebuild this (then restart/drain hostd)
+# or the running daemon keeps executing old code — mega-8 F7/F8 root cause.
+# The tree is configured once by hand (OCCT/Netgen cache); this only runs the
+# incremental build.
+build_daemon() {
+    if [ ! -f "$ROOT/core/build-occt-linux/CMakeCache.txt" ]; then
+        echo "[build] ERROR: core/build-occt-linux is not configured (OCCT tree; see docs/HOSTD.md)"
+        return 1
+    fi
+    cmake --build "$ROOT/core/build-occt-linux" --target aicad aicad-hostd
+}
+
 # Stage the engine + hostd daemon into services/dist/AI-CAD (the $AI_CAD_DIST
 # dir that core_bridge's _lib_candidates and daemon_bridge's resolve_hostd_bin
 # try FIRST). Every file is deployed copy-to-temp + atomic `mv` in the target
@@ -95,10 +109,11 @@ esac
 case "$MODE" in
   core)         build_core ;;
   app|default)  build_app ;;
-  all)          build_core; build_app ;;
+  daemon)       build_daemon ;;
+  all)          build_core; build_app; build_daemon ;;
   stage)        stage_dist; echo ""; echo "[build] DONE (stage)."; exit 0 ;;
   *)
-    echo "[build] ERROR: unknown mode '$MODE' (use: default|app|core|all|stage|clean)"
+    echo "[build] ERROR: unknown mode '$MODE' (use: default|app|core|daemon|all|stage|clean)"
     exit 1
     ;;
 esac

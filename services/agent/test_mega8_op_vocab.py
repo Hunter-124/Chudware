@@ -233,3 +233,31 @@ def test_dispatch_ok_false_when_payload_rejects_ops():
         c.get("ok") and c.get("tool") == "add_features" for c in calls
     )
     assert productive is False
+
+
+def test_enrich_unknown_op_error_adds_closest_and_cad_guide():
+    """F7: thin engine error must gain closest: + cad_guide()."""
+    from services.mcp import op_vocab as ov
+
+    thin = {"ok": False, "error": "op[0]: unknown op 'cylinder'"}
+    rich = ov.enrich_unknown_op_error(thin)
+    assert isinstance(rich, dict)
+    err = rich["error"].lower()
+    assert "unknown op" in err
+    assert "add_feature" in err or "closest" in err
+    assert "cad_guide" in err
+    assert rich.get("op_vocab_enriched") is True
+    # Idempotent when already rich.
+    again = ov.enrich_unknown_op_error(rich)
+    assert again["error"] == rich["error"]
+
+
+def test_enrich_unknown_op_string_json():
+    from services.mcp import op_vocab as ov
+    import json
+
+    raw = json.dumps({"ok": False, "error": "op[0]: unknown op 'box'"})
+    out = ov.enrich_unknown_op_error(raw)
+    if isinstance(out, str):
+        out = json.loads(out)
+    assert "closest" in out["error"].lower() or "add_feature" in out["error"].lower()

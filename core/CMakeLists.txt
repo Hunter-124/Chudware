@@ -1508,9 +1508,12 @@ if(AICAD_WITH_OCCT)
   # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libaicad.cpp are
   # compiled out unless AICAD_WITH_NETGEN, so the lib builds without the mesher (geometry,
   # sketch, features, STEP/IGES/STL still work — those need only OCCT).
-  # Build id (git describe), captured at CONFIGURE time and configured into ONE
-  # header shared by libaicad (aicad_build_id export) and aicad-hostd, so a
-  # matched-build engine + daemon report the SAME id (version drain-replace).
+  # Build id (git describe) shared by libaicad (aicad_build_id export) and
+  # aicad-hostd, so a matched-build engine + daemon report the SAME id (version
+  # drain-replace). Seeded at configure time so the header always exists, then
+  # REFRESHED at build time by the aicad_version_info target below — a
+  # configure-time-only stamp goes stale on dev rebuilds and blinds the
+  # daemon_bridge staleness check (mega-8 F7/F8 root cause).
   execute_process(COMMAND git describe --tags --always --dirty
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     OUTPUT_VARIABLE AICAD_HOSTD_BUILD_ID
@@ -1519,11 +1522,19 @@ if(AICAD_WITH_OCCT)
     set(AICAD_HOSTD_BUILD_ID "unknown")
   endif()
   configure_file(hostd/version_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h @ONLY)
+  add_custom_target(aicad_version_info
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DOUT_HEADER=${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_version_info.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen/version_info.h
+    COMMENT "Refreshing build id (git describe)")
 
   add_library(aicad SHARED
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(aicad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+  add_dependencies(aicad aicad_version_info)
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
   target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_prof)
   if(AICAD_WITH_NETGEN)

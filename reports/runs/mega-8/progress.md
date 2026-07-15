@@ -19,6 +19,7 @@
 - [x] Mission attempt-3 (pid 2544922, wall 1003.84s, Fix 1–5) — primary OUT + `attempt-3-fix4-5/`
 - [x] Graded A–D + findings.md + roadmap append
 
+- [x] Mission attempt-4 relaunch (Fixer8 F7–F10 bound) — starting
 ## Axis verdicts (honest)
 
 | Axis | Verdict | One-liner |

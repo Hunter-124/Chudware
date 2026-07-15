@@ -256,3 +256,54 @@ python3 -m pytest services/agent/test_mega8_op_vocab.py \
 | `services/agent/role_models.py` | Fix3 gate narrow; Fix4/6 leaf parse+normalize |
 | `services/agent/agent_turn.py` | Fix5 payload ok:false |
 | `services/agent/test_mega8_*.py` | regressions |
+
+---
+
+## Fix 7–10 — Graded OPEN defects (post attempt-3)
+
+MegaRun8 findings F7–F10 after a3 grade. Source landed; needs next relaunch.
+
+### Fix 7 — `UNKNOWN_OP_THIN_ERROR` (rich closest + cad_guide)
+
+**Fingerprint:** a2 `add_features` returned only `op[0]: unknown op 'cylinder'`
+(no closest, no cad_guide). Python twin `unknown_doc_op_message` already rich.
+
+**Fix:** `services/mcp/op_vocab.enrich_unknown_op_error` + wire in
+`add_features` return path. Rewrites thin errors with feature-type hint,
+`closest:`, and `see cad_guide()`.
+
+**Regression:** `test_enrich_unknown_op_error_adds_closest_and_cad_guide`
+
+### Fix 8 — `OP_VOCAB_CHEATSHEET_NOT_OBSERVED`
+
+**Fingerprint:** inject only mutated ephemeral messages; mega grading grepped
+ledger/events → 0 hits.
+
+**Fix:** on inject, `_log` ledger event `op_vocab_cheatsheet_inject` with head
+snippet (once-per-mission still holds).
+
+### Fix 9 — typed-refusal success path unused
+
+**Fingerprint:** layout/plan die `delegate_or_typed_refusal_required` without
+ever seeing a typed-refusal template.
+
+**Fix:** `_build_request` appends CAPABILITY/DELEGATION GATE scaffold with
+exact `typed_refusal` JSON shape when multi-domain PLAN/BUILD; retry path
+includes prior `delegate_gate` blocked hint on context_pack.
+
+**Regression:** `test_multi_domain_request_includes_typed_refusal_scaffold`
+
+### Fix 10 — a3 new_part then 0 add_features
+
+**Fingerprint:** BUILD thrash ledger_get after new_part; soft nudge only once.
+
+**Fix:** stronger post-`new_part` message with concrete `add_feature`+box
+example; re-nudge on every subsequent ledger/describe/preflight until
+`add_features` ok:true.
+
+### Tests
+
+```text
+python3 -m pytest services/agent/test_mega8_op_vocab.py \
+  services/agent/test_mega8_rolesurface.py -q
+```

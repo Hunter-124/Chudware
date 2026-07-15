@@ -151,6 +151,13 @@ class Settings:
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.homes_dir.mkdir(parents=True, exist_ok=True)
         self.plm_dir.mkdir(parents=True, exist_ok=True)
+        # Seed a runtime users file from the repo template when the configured
+        # path lives outside the package and doesn't exist yet (/admin edits it).
+        template = Path(__file__).resolve().parent / "users.yaml"
+        if self.users_file != template and not self.users_file.exists():
+            self.users_file.parent.mkdir(parents=True, exist_ok=True)
+            if template.exists():
+                self.users_file.write_text(template.read_text())
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
 

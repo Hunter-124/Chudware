@@ -648,30 +648,62 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 tool, result, run_id=run_id)
             if _ov_block:
                 messages.append({"role": "user", "content": _parts(_ov_block)})
+                # F8: ledger-visible trail so mega grading can observe inject.
+                if ledger is not None:
+                    try:
+                        _log(ledger, actor or "agent_turn", {
+                            "event": "op_vocab_cheatsheet_inject",
+                            "tool": tool,
+                            "run_id": run_id,
+                            "head": str(_ov_block)[:240],
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception:  # noqa: BLE001 — inject never breaks the turn
             pass
 
-        # mega-6/7 BUILD mortality: after new_part the model thrash-preflights
-        # without ever calling add_features (live: new_part + preflight×7 → empty solid).
-        # Hard nudge after bootstrap; refuse further preflight thrash.
+        # mega-6/7/8 BUILD mortality: after new_part the model thrash-preflights
+        # or ledger-gets without ever calling add_features (live a3: new_part
+        # then no mutator). Hard nudge after bootstrap; refuse preflight thrash.
         if ok and tool == "new_part" and "add_features" in (allow or set()):
             try:
                 doc = None
                 if isinstance(result, dict):
                     doc = result.get("doc_id") or (result.get("result") or {}).get("doc_id")
+                elif isinstance(result, str) and "doc_id" in result:
+                    try:
+                        import json as _json  # noqa: PLC0415
+                        doc = (_json.loads(result) or {}).get("doc_id")
+                    except Exception:  # noqa: BLE001
+                        doc = None
                 messages.append({"role": "user", "content": _parts(
                     "[BUILD enablement] Part doc bootstrapped"
                     + (f" (doc_id={doc})" if doc else "")
                     + ". Next tool MUST be add_features with at least one solid "
-                    "feature (box/sketch+extrude/revolve/…) using this doc_id. "
+                    "feature using op=add_feature (NOT op=box/cylinder/sketch). "
+                    "Example: {\"op\":\"add_feature\",\"feature\":{\"type\":\"box\","
+                    "\"name\":\"Body\",\"params\":{\"length\":{\"value\":40,\"expr\":null},"
+                    "\"width\":{\"value\":30,\"expr\":null},\"height\":{\"value\":20,\"expr\":null}}}}. "
                     "Do NOT call preflight_ops, ledger_get, or describe_part "
-                    "until add_features has succeeded once."
+                    "until add_features has succeeded once (ok:true)."
                 )})
             except Exception:  # noqa: BLE001
                 pass
+        # Re-nudge every non-mutator call after new_part until add_features ok (F10).
+        if (
+            tool != "add_features"
+            and "add_features" in (allow or set())
+            and any(c.get("ok") and c.get("tool") == "new_part" for c in calls)
+            and not any(c.get("ok") and c.get("tool") == "add_features" for c in calls)
+            and tool in ("ledger_get", "ledger_note", "describe_part", "describe_scene",
+                         "measure_part", "query_geometry", "preflight_ops", "part_search")
+        ):
+            messages.append({"role": "user", "content": _parts(
+                "[BUILD enablement] Still waiting for a successful add_features "
+                "after new_part. Stop thrashing; call add_features NOW with "
+                "op=add_feature + feature.type (box|cylinder|sketch+extrude|…)."
+            )})
         # Same class: preflight thrash without a mutation after new_part.
-        # mega-7: block further preflight_ops once thrash is detected so the
-        # model cannot burn the tool budget on empty solids.
         if ok and tool == "preflight_ops":
             n_new = sum(1 for c in calls if c.get("ok") and c.get("tool") == "new_part")
             n_add = sum(1 for c in calls if c.get("ok") and c.get("tool") == "add_features")

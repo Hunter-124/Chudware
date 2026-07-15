@@ -4140,7 +4140,19 @@ def register_cad_tools(mcp: FastMCP) -> None:
             # Run on a worker thread with auto-handoff: a fast batch returns inline exactly as
             # before; a heavy one that overruns the budget keeps running and returns a job_id so
             # the transport call returns in time and the session survives.
-            return _dumps(_solve_sync_or_handoff("add_features", _apply))
+            raw = _solve_sync_or_handoff("add_features", _apply)
+            # mega-8 F7: enrich thin unknown-op errors with closest + cad_guide
+            # (C++ path sometimes returns only "unknown op 'cylinder'").
+            try:
+                from services.mcp import op_vocab as _ov  # noqa: PLC0415
+                enriched = _ov.enrich_unknown_op_error(raw)
+                if isinstance(enriched, dict):
+                    return _dumps(enriched)
+                if isinstance(enriched, str):
+                    return enriched
+            except Exception:  # noqa: BLE001
+                pass
+            return _dumps(raw) if not isinstance(raw, str) else raw
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

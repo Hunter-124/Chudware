@@ -153,3 +153,60 @@ def extract_unknown_op_name(result: Any) -> Optional[str]:
         text = str(result or "")
     m = re.search(r"unknown op '([^']+)'", text)
     return m.group(1) if m else None
+
+
+def unknown_op_help(kind: str, index: int = 0) -> str:
+    """Rich unknown-op message (closest + feature-type hint + cad_guide)."""
+    try:
+        return _fallback().unknown_doc_op_message(index, kind)
+    except Exception:  # noqa: BLE001
+        return (
+            f"op[{index}]: unknown op '{kind}'. "
+            "Feature types (box/cylinder/sketch/…) are NOT ops — wrap with "
+            '{"op":"add_feature","feature":{"type":"…",…}}. '
+            "See cad_guide()."
+        )
+
+
+def enrich_unknown_op_error(result: Any) -> Any:
+    """If *result* is a thin unknown-op error, rewrite with closest/cad_guide text.
+
+    Live mega-8: C++ path returned only ``op[0]: unknown op 'cylinder'`` without
+    closest suggestions. MCP/agent teaching depends on the rich form.
+    """
+    if not is_unknown_op_error(result):
+        return result
+    unknown = extract_unknown_op_name(result) or "?"
+    # Already rich?
+    text = ""
+    if isinstance(result, dict):
+        text = str(result.get("error") or result.get("message") or "")
+    else:
+        text = str(result or "")
+    if "closest:" in text.lower() or "cad_guide" in text.lower():
+        return result
+    # Extract op index if present.
+    import re
+    m = re.search(r"op\[(\d+)\]", text)
+    idx = int(m.group(1)) if m else 0
+    rich = unknown_op_help(unknown, idx)
+    if isinstance(result, dict):
+        out = dict(result)
+        out["error"] = rich
+        out["unknown_op"] = unknown
+        out["op_vocab_enriched"] = True
+        return out
+    if isinstance(result, str):
+        # Replace thin JSON error field if present.
+        try:
+            import json as _json
+            obj = _json.loads(result)
+            if isinstance(obj, dict):
+                obj["error"] = rich
+                obj["unknown_op"] = unknown
+                obj["op_vocab_enriched"] = True
+                return _json.dumps(obj)
+        except Exception:  # noqa: BLE001
+            pass
+        return rich
+    return result

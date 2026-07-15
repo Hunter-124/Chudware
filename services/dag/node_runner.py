@@ -920,7 +920,7 @@ def run(
             verdict = VERDICT_RETRY
             stop_reason = "delegate_or_typed_refusal_required"
             success = False
-            # Stash gate info on the result for output_state / tests.
+            # Stash gate info on the result for output_state / tests / retry request.
             try:
                 rd = getattr(agent_result, "result", None)
                 if isinstance(rd, dict):
@@ -930,6 +930,10 @@ def run(
                         "delegate_gate": gate_info,
                         "handoff": rd,
                     }
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                context_pack["delegate_gate"] = gate_info
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1103,6 +1107,49 @@ def _build_request(
     allowed = context_pack.get("allowed_tools")
     if allowed is not None:
         parts.append(f"\nAvailable tools (only): {', '.join(allowed)}")
+
+    # mega-8 F9: multi-domain PLAN/BUILD must see the typed-refusal escape
+    # hatch in the request (gate kills free-form auto-complete otherwise).
+    try:
+        from services.agent.role_models import (  # noqa: PLC0415
+            domain_tags_from_context,
+            is_multi_domain_plan_or_build,
+        )
+        role_id = (
+            context_pack.get("role_id")
+            or node_inputs.get("role")
+            or ""
+        )
+        tags = domain_tags_from_context(context_pack, node_inputs)
+        if is_multi_domain_plan_or_build(
+            role_id=str(role_id) if role_id else None,
+            node_type=str(node_type or ""),
+            domain_tags=tags,
+            task_class=str(
+                context_pack.get("task_class")
+                or node_inputs.get("task_class")
+                or ""
+            ) or None,
+        ):
+            parts.append(
+                "\n[CAPABILITY / DELEGATION GATE] Multi-domain PLAN/BUILD: "
+                "before you finish you MUST either (1) call delegate(role, brief, "
+                "budget_tokens) for ≥1 independent slice, OR (2) emit a typed "
+                "refusal object in your handoff outputs:\n"
+                '  "typed_refusal": {"reason": "...", "domains_considered": '
+                '["geometry","assembly",…], "why_flat": "..."}\n'
+                "Free-form ledger_note alone does NOT satisfy this gate."
+            )
+            # Retry path: prior gate failure hint.
+            prev = context_pack.get("delegate_gate") or node_inputs.get("delegate_gate")
+            if isinstance(prev, dict) and prev.get("blocked"):
+                parts.append(
+                    "\n[GATE RETRY] Previous turn was blocked: "
+                    f"{prev.get('reason') or 'missing_delegate_or_typed_refusal'}. "
+                    "Call delegate(...) now OR return typed_refusal — do not free-form complete."
+                )
+    except Exception:  # noqa: BLE001
+        pass
 
     return "\n".join(parts)
 

@@ -149,6 +149,29 @@ def test_typed_refusal_gate_blocks_free_form():
     assert gate.get("blocked") is True
     assert gate.get("reason") == "missing_delegate_or_typed_refusal"
 
+
+def test_multi_domain_request_includes_typed_refusal_scaffold():
+    """F9: layout/plan request must teach typed_refusal escape hatch."""
+    from services.dag import node_runner as nr
+
+    req = nr._build_request(
+        "design",
+        {
+            "role": "layout_engineer",
+            "task_class": "assembly",
+            "request": "Build the layout skeleton for the rocket plane.",
+        },
+        {
+            "role_id": "layout_engineer",
+            "task_class": "assembly",
+            "domain_tags": ["plan", "layout", "assembly"],
+            "allowed_tools": ["ledger_get", "ledger_note", "delegate"],
+        },
+    )
+    assert "typed_refusal" in req
+    assert "domains_considered" in req
+    assert "delegate" in req.lower()
+
 def test_typed_refusal_gate_skips_specify_workers():
     """Live mega-8: n_spec_* are type=design + multi_feature/assembly — must NOT gate."""
     from services.dag import node_runner as nr

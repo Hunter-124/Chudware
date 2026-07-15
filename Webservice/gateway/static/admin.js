@@ -146,12 +146,35 @@
       tr.innerHTML =
         "<td>" + esc(u.email) + "</td>" +
         "<td>" + esc(u.display) + "</td>" +
-        "<td><span class='pill " + (u.role === "admin" ? "admin" : "user") + "'>" + esc(u.role) + "</span>" +
-        (u.heavy ? "<span class='pill heavy'>GPU</span>" : "") + "</td>" +
-        "<td>" + (u.project ? esc(baseName(u.project))
+        "<td><span class='pill " + (u.role === "admin" ? "admin" : "user") + " edit-role' style='cursor:pointer' title='Click to toggle admin/user'>" + esc(u.role) + "</span>" +
+        "<span class='pill heavy edit-heavy' style='cursor:pointer" + (u.heavy ? "" : ";opacity:.35") + "' title='Click to toggle the GPU seat'>GPU</span></td>" +
+        "<td class='edit-project' style='cursor:pointer' title='Click to change their project'>" +
+        (u.project ? esc(baseName(u.project))
                  : state.defaultProject ? "<span style='opacity:.6'>" + esc(baseName(state.defaultProject)) + " (default)</span>"
                  : "—") + "</td>" +
         "<td></td>";
+      async function patch(fields, label) {
+        setStatus("Updating " + u.email + "…");
+        try {
+          await api("/api/admin/users/" + encodeURIComponent(u.email),
+                    { method: "PATCH", body: JSON.stringify(fields) });
+          setStatus(label + " Applies on their next session start.");
+          refresh();
+        } catch (e) { setStatus(String(e.message || e), true); }
+      }
+      tr.querySelector(".edit-role").addEventListener("click", function () {
+        var to = u.role === "admin" ? "user" : "admin";
+        if (confirm("Make " + u.email + " " + (to === "admin" ? "an ADMIN (full ops + allowlist control)?" : "a regular user?")))
+          patch({ role: to }, u.email + " is now " + to + ".");
+      });
+      tr.querySelector(".edit-heavy").addEventListener("click", function () {
+        patch({ heavy: !u.heavy }, u.email + (u.heavy ? " lost" : " got") + " the GPU seat.");
+      });
+      tr.querySelector(".edit-project").addEventListener("click", function () {
+        var v = prompt("Project for " + u.email + " (PLM name or host folder path; empty = inherit site default):",
+                       u.project || "");
+        if (v !== null) patch({ project: v.trim() }, "Project updated.");
+      });
       var btn = document.createElement("button");
       btn.className = "rm-btn";
       btn.textContent = "remove";
@@ -233,7 +256,7 @@
         row.id = "ops-" + s.sid;
         row.style.cssText = "display:flex;gap:14px;align-items:flex-start;border:1px solid var(--border,#2a2e36);border-radius:10px;padding:10px";
         row.innerHTML =
-          "<img class='shot' width='224' style='border-radius:6px;background:#000;flex:none' alt=''>" +
+          "<img class='shot' width='224' style='border-radius:6px;background:#000;flex:none;cursor:pointer' alt='' title='Click to watch this seat live (view-only)'>" +
           "<div style='flex:1;min-width:0'><div class='who' style='font-weight:600'></div>" +
           "<div class='meta' style='font-size:.82rem;color:var(--muted,#8b93a3);margin-top:4px'></div></div>" +
           "<button type='button' class='rm-btn stop' style='flex:none'>Stop</button>";
@@ -241,6 +264,14 @@
           if (!confirm("Stop " + s.email + "'s session? Unsaved work in their seat is lost.")) return;
           try { await api("/api/admin/sessions/" + s.sid + "/stop", { method: "POST" }); refreshOps(); }
           catch (e) { setStatus(String(e.message || e), true); }
+        });
+        row.querySelector(".shot").addEventListener("click", function () {
+          // View-only noVNC spectate through the same authenticated proxy the
+          // owner uses — admins pass the proxy's owner check.
+          var base = "/stream/" + s.sid + "/";
+          window.open(base + "vnc.html?autoconnect=1&resize=scale&view_only=1&path=" +
+                      encodeURIComponent(base.slice(1) + "websockify"),
+                      "_blank", "noopener");
         });
         opsRows.appendChild(row);
       }

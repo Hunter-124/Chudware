@@ -586,3 +586,36 @@ def test_security_headers(client, _isolate):
     r = client.get("/healthz")
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-frame-options"] == "SAMEORIGIN"
+
+
+def test_admin_patch_user(client, _admin_env):
+    directory, synced, users = _admin_env
+    # non-admin blocked
+    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("demo@example.com"),
+                        json={"heavy": True}).status_code == 403
+    # toggle heavy + role
+    r = client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
+                     json={"heavy": True, "role": "admin", "display": "Demo Admin"})
+    assert r.status_code == 200, r.text
+    u = r.json()["user"]
+    assert u["heavy"] is True and u["role"] == "admin" and u["display"] == "Demo Admin"
+    # self-demotion blocked
+    assert client.patch("/api/admin/users/boss@example.com", headers=_auth("boss@example.com"),
+                        json={"role": "user"}).status_code == 400
+    # bad role / bogus project / empty body
+    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
+                        json={"role": "supreme"}).status_code == 400
+    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
+                        json={"project": "/nope/missing"}).status_code == 400
+    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
+                        json={}).status_code == 400
+    assert client.patch("/api/admin/users/ghost@example.com", headers=_auth("boss@example.com"),
+                        json={"heavy": True}).status_code == 404
+
+
+def test_admin_spectates_stream(client, _admin_env, _isolate):
+    _seed_session(_isolate, "demo@example.com")
+    # owner and admin reach the proxy (502: no upstream in tests); others 403
+    assert client.get("/stream/livesid/", headers=_auth("demo@example.com")).status_code == 502
+    assert client.get("/stream/livesid/", headers=_auth("boss@example.com")).status_code == 502
+    assert client.get("/stream/livesid/", headers=_auth("alice@ua.edu")).status_code == 403

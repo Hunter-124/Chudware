@@ -53,7 +53,9 @@ async def proxy_http(sid: str, request: Request, path: str = "") -> Response:
     if sess is None or sess.status not in {"starting", "ready"}:
         return Response("session not found", status_code=404)
     user = getattr(request.state, "user", None)
-    if user is not None and sess.email != getattr(user, "email", None):
+    # Owner or admin (spectate/assist from /admin thumbnails).
+    if user is not None and sess.email != getattr(user, "email", None) \
+            and getattr(user, "role", "") != "admin":
         return Response("forbidden", status_code=403)
 
     manager.touch(sid)
@@ -122,7 +124,8 @@ async def proxy_ws(websocket: WebSocket, sid: str, path: str = "ws") -> None:
         return
 
     user = getattr(websocket.state, "user", None)
-    if user is not None and sess.email != getattr(user, "email", None):
+    if user is not None and sess.email != getattr(user, "email", None) \
+            and getattr(user, "role", "") != "admin":
         await websocket.close(code=4403)
         return
 

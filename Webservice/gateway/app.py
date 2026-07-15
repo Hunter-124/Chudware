@@ -281,6 +281,44 @@ async def admin_stop_session(sid: str, request: Request) -> dict[str, Any]:
     return {"ok": True, "sid": sid, "email": sess.email}
 
 
+@admin_router.patch("/users/{email}")
+async def admin_edit_user(email: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Edit display/role/heavy/project/doc in place (no remove+re-add dance).
+
+    Email itself is immutable — it is the Access identity; add a new entry
+    instead. Live sessions keep their current seat; changes apply next start.
+    """
+    admin = _require_admin(request)
+    email = email.strip().lower()
+    user = user_directory.get(email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="no such user")
+    fields: dict[str, Any] = {}
+    if "display" in body:
+        fields["display"] = str(body.get("display") or "").strip() or user.display
+    if "role" in body:
+        role = str(body.get("role") or "").strip()
+        if role not in {"admin", "user"}:
+            raise HTTPException(status_code=400, detail="role must be admin or user")
+        if email == admin.email and role != "admin":
+            raise HTTPException(status_code=400, detail="cannot demote yourself")
+        fields["role"] = role
+    if "heavy" in body:
+        fields["heavy"] = bool(body.get("heavy"))
+    if "project" in body:
+        project = str(body.get("project") or "").strip()
+        if project and not _valid_project(project):
+            raise HTTPException(status_code=400,
+                detail="project must be a PLM project name or an existing host folder path")
+        fields["project"] = project
+    if "doc" in body:
+        fields["doc"] = str(body.get("doc") or "").strip()
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    user_directory.upsert(replace(user, **fields))
+    return {"ok": True, "user": _user_dict(user_directory.get(email))}
+
+
 @admin_router.get("/screenshot/{sid}")
 async def admin_screenshot(sid: str, request: Request) -> Response:
     _require_admin(request)

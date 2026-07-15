@@ -1386,3 +1386,13 @@ setup.sh; RUNBOOK section (f). Gateway tests 24/24; live-verified: ops JSON,
 560px PNG thumbnail, paste typed into seat prompt, dashboard rendered, backup
 tarball restored listing. Gotcha: host tar cannot read :U-chowned homes -
 anything touching them must run inside podman unshare.
+
+## 2026-07-15 - billet-web ops wave 2
+Admin spectate: stream proxy (HTTP+WS) now admits role=admin alongside the
+owner; /admin thumbnails open view-only noVNC popouts of any live seat.
+PATCH /api/admin/users/{email} edits display/role/heavy/project/doc in place
+(email immutable, self-demotion blocked); admin table pills are click-to-toggle
+(role, GPU seat) and project cell is click-to-edit. Tests 26/26; live-verified
+spectate popup ("Connected", 1920x1080 canvas) + PATCH round-trip. Note: dev
+gateway upsert rewrites the repo users.yaml template - restored via checkout;
+prod uses ~/billet-web-data/users.yaml so this only affects dev smoke.

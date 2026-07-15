@@ -24,7 +24,7 @@
     "xai_429_fallback_ok": true
   },
   "request_preview": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avio",
-  "started_at": "2026-07-15T18:19:22Z",
+  "started_at": "2026-07-15T18:44:06Z",
   "known_gaps": [
     "A19_wire_pairs_rail_correct",
     "B19_board_doc_id_threading",

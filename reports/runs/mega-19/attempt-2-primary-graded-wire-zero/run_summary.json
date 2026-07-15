@@ -1,0 +1,111 @@
+{
+  "run_id": "mega-19-fc-rocket-20260715",
+  "attempt": "a2",
+  "wall_s": 594.81,
+  "terminal": "done",
+  "stop_reason": "deliver_partial",
+  "baseline_commit": "6d11238b",
+  "frontier": "xai-sub:grok-4.5",
+  "fallback_tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "xai_account": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+  "live_pass_ids": [
+    "AC2",
+    "AC3",
+    "AC6",
+    "AC7",
+    "AC8",
+    "AC9"
+  ],
+  "live_pass_count": 6,
+  "axes": {
+    "A19": "FAIL",
+    "B19": "FAIL",
+    "C19": "PASS",
+    "D19": "PASS",
+    "Z1": "PASS",
+    "Z2": "FAIL",
+    "Z2r": "FAIL",
+    "Z3": "PASS",
+    "Z4": "PASS",
+    "G18": "PARTIAL",
+    "Y": "PASS",
+    "W": "FAIL",
+    "X": "PASS",
+    "S": "FAIL",
+    "P": "FAIL",
+    "V": "PASS",
+    "A": "PASS",
+    "B": "FAIL",
+    "C": "PASS",
+    "D": "PASS",
+    "Fix8": "PASS"
+  },
+  "model_assignment": {
+    "ollama": 13,
+    "xai-sub": 10
+  },
+  "board_path": {
+    "board_from_schematic": 0,
+    "ecad_run_drc": 0,
+    "ecad_run_erc": 0,
+    "ecad_new_schematic": 2,
+    "ecad_place_symbol": 7,
+    "ecad_simulate": 1,
+    "ecad_connect": 0,
+    "ecad_add_net": 0,
+    "ecad_wire": 0,
+    "ecad_add_power": 8,
+    "fw_build": 2,
+    "fw_new_project": 2,
+    "new_part": 2,
+    "add_features": 43,
+    "delegate": 0,
+    "check_interference": 0,
+    "measure_part": 0,
+    "verify_battery": 0,
+    "ecad_antenna_analyze": 0,
+    "ecad_antenna_design": 0,
+    "make_report": 0,
+    "report_card": 0,
+    "ecad_place_wire": 0
+  },
+  "spend_before_usd": 0.22370784,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "xai_token_usage": null,
+  "residuals": [
+    "A19_no_wire_live_force_cascade_idle_power_not_driven",
+    "B19_DRC_on_sch_board_from_schematic_zero",
+    "Z2r_force_wire_not_live",
+    "live_AC_pass_6_of_9_target_ge_8",
+    "G18_live_pass_lt_7"
+  ],
+  "notes": {
+    "A19": "ecad_add_power\u00d78; ecad_wire=0; force_inject events=0 despite rebind unit green; ERC dirty; AC4 FAIL",
+    "B19": "AC4 still sch-not-board class: check tool reported error: ok=false; board_from_schematic=0",
+    "C19": "AC5 now probe null (not empty-netlist); simulate path graded; C19 PASS; AC1 still measure_between soft zero",
+    "D19": "PASS unit/structural",
+    "Z3": "PASS \u2014 AC5 not empty-netlist; simulate evidence present",
+    "Z4": "PASS \u2014 AC5 FAIL with null V(3V3) honest",
+    "progress_vs_a1": "Z3 FAIL\u2192PASS; X FAIL\u2192PASS; C19 FAIL\u2192PASS; AC5 empty-netlist\u2192null V(3V3); wire/force still idle"
+  },
+  "attempt_archive": [
+    {
+      "id": "a1",
+      "path": "attempt-1-primary-graded-a19-fail",
+      "live_pass_count": 6,
+      "terminal": "done",
+      "note": "force cascade idle; A19/B19/C19 FAIL; Z3 FAIL"
+    },
+    {
+      "id": "a2",
+      "path": ".",
+      "live_pass_count": 6,
+      "terminal": "done",
+      "note": "rebind; Z3/X/C19 PASS; A19/B19 still FAIL; wire=0"
+    }
+  ],
+  "fixer": "ColdMuskox",
+  "harness": "UnemployedTuna",
+  "preflight_ready": true
+}

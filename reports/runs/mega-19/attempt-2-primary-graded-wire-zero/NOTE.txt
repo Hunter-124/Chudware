@@ -1,0 +1,4 @@
+a2 primary after rebind1 (force after power).
+Live 6/9. C19/Z3/X PASS vs a1. A19/B19 FAIL: wire=0 force_inject events not observed;
+later diagnosis: cascade budget-starved mid-force before wire.
+Archived for a3 rebind2 (cascade_budget extends past thrash).

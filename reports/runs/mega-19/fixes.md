@@ -124,3 +124,50 @@ python3 -m pytest \
 5. Frontier: xai-sub grok-4.5 on account `06dc3359`; conservation auto_pick.
 
 No push (Main gates). Ready for primary after this bind.
+
+---
+
+## Residual rebind (post a1 primary)
+
+**Live a1 fingerprint:** model executed `ecad_add_power`×2 then left ECAD
+(wire=0, board=0, force_inject=0). Gate only logged denials=1 — cascade never
+armed. Soft enablement inject only.
+
+**Additional fix:**
+1. **Post-success cascade** after `ecad_add_power` / wire / board / DRC / ERC —
+   force-EXECUTE remaining chain need in-process (reason
+   `post_success_cascade:*`). Does **not** cascade after `place_symbol` so
+   thrash hard-gate denial tests still see blocked place.
+2. **Done incomplete force** — when status=done with bootstrap incomplete,
+   force cascade (`done_incomplete_force`) before accepting handoff.
+3. **Hard-gate force-after=1** when power already satisfied and need is
+   wire/board/drc (live only hit denials=1 then switched domains).
+4. `_ECAD_FORCE_CASCADE_MAX` 4→8 so power→wire→board→drc→erc→V→sim fits.
+5. Regression test `test_post_power_success_force_cascades_wire` replays a1
+   residual (sch→place→power→power→done) and asserts forced wire + board +
+   DRC with board doc_id.
+
+**Gate after rebind:** **118 passed**, 0 failed.
+
+---
+
+## Residual rebind 2 (post a2 primary)
+
+**Live a2 fingerprint:** hard_gate_cap DID fire (`ecad_chain_force_inject`×3)
+but cascade only completed add_power×2 + Device:R place — **stopped before
+wire** because turn budget was already ~13/16. Forced wire/board never ran.
+U1 place result truncated at 1000 chars so pin xy harvest failed → rebond
+args landed at (0,10) not U1 power pins.
+
+**Additional fix:**
+1. `_ecad_force_chain_cascade` uses `cascade_budget =
+   max(budget, tool_calls_made + max_steps + 2)` so product chain finishes
+   even after model thrash burned the turn budget.
+2. In-process `calls[]` keep **full** tool results (ledger still truncated)
+   so pin lists survive for rail wire derivation.
+3. `_ecad_place_pin_records` regex-harvests pin xy from truncated JSON
+   strings when parse fails.
+4. Regression: `test_cascade_extends_budget_to_finish_wire_board` (budget
+   13/16 residual → wire + board + DRC with board doc_id).
+
+**Gate after rebind2:** **119 passed**, 0 failed.

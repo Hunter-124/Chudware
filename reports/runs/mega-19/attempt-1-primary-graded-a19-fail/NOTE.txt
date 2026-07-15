@@ -1,0 +1,7 @@
+a1 primary mega-19-fc-rocket-20260715 graded.
+Live AC PASS 6/9 (AC1/AC4/AC5 FAIL).
+A19 FAIL: add_power×4 live but wire=0; force cascade never armed after power success.
+B19 FAIL: DRC on sch 9b66592e2b7a; board_from_schematic=0.
+C19 FAIL: AC5 empty-netlist; Device:V inject idle; measure_between soft zero.
+D19 PASS (unit). Z1/Z4/Y/Fix8 PASS; Z3 FAIL.
+Archived for a2 after Fixer19 rebind (force cascade arms after add_power success).

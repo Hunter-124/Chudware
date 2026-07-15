@@ -931,10 +931,21 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 result = {"ok": False, "error": str(exc)}
                 ok = False
         _latency_ms = (_time.monotonic() - _t0) * 1000.0
-        call_rec = {"tool": tool, "args": args, "ok": ok,
-                    "result": _truncate(result)}
+        # mega-19: keep full result in-process so place pin lists survive for
+        # force wire/power derivation; ledger still gets a truncated digest.
+        call_rec = {"tool": tool, "args": args, "ok": ok, "result": result}
         calls.append(call_rec)
-        _log(ledger, actor, {"event": "tool_call", **call_rec})
+        try:
+            _log(ledger, actor, {
+                "event": "tool_call",
+                "tool": tool, "args": args, "ok": ok,
+                "result": _truncate(result),
+                **({"forced": call_rec["forced"]} if call_rec.get("forced") else {}),
+            })
+        except Exception:  # noqa: BLE001
+            _log(ledger, actor, {"event": "tool_call", **{
+                k: call_rec[k] for k in ("tool", "args", "ok")
+            }, "result": _truncate(result)})
         # mega-17 Z2: denial→reinject once when wire fails on missing ref.
         # Re-derive from live ledger (place + add_power refs) and retry.
         if (
@@ -1248,8 +1259,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             if (
                 ok
                 and tool in (
-                    "ecad_add_power", "ecad_place_symbol", "ecad_wire",
-                    "ecad_label", "board_from_schematic", "ecad_make_board",
+                    "ecad_add_power", "ecad_wire", "ecad_label",
+                    "board_from_schematic", "ecad_make_board",
                     "ecad_run_drc", "ecad_run_erc",
                 )
                 and tool_calls_made < budget
@@ -1266,31 +1277,19 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
                     )
                 ):
-                    # After power: always cascade into wire (live mega-19 miss).
-                    # After place with power already satisfied: cascade into wire.
-                    # After wire: cascade into board/drc/…
+                    # After power: cascade wire/board (mega-19 a1 residual).
+                    # Do NOT cascade after place_symbol — preserves thrash gate.
                     _should = False
                     if tool == "ecad_add_power" and _need_now in (
                         "ecad_wire", "ecad_place_symbol", "ecad_add_power",
                         "board_from_schematic", "ecad_make_board",
+                        "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
                     ):
                         _should = True
-                    elif tool == "ecad_place_symbol" and _need_now in (
-                        "ecad_add_power", "ecad_wire", "ecad_place_symbol",
-                    ):
-                        # Only auto-cascade place→power/wire when at least one
-                        # place already succeeded (avoid pre-sch noise).
-                        _should = _ecad_power_satisfied(calls) or (
-                            sum(
-                                1 for c in calls
-                                if c.get("ok")
-                                and c.get("tool") == "ecad_place_symbol"
-                            ) >= 1
-                        )
                     elif tool in ("ecad_wire", "ecad_label") and _need_now in (
                         "board_from_schematic", "ecad_make_board",
                         "ecad_run_drc", "ecad_add_power", "ecad_wire",
-                        "ecad_place_symbol",
+                        "ecad_place_symbol", "ecad_run_erc", "ecad_simulate",
                     ):
                         _should = True
                     elif tool in (
@@ -1698,7 +1697,7 @@ _ECAD_GATE_FORCE_AFTER = 2
 # mega-18 Z2r: after a forced chain step succeeds, keep executing the next
 # need(s) in-process (add_power → cross wire → board) so power is never
 # merely "scheduled". Cap cascades to avoid burning the whole budget.
-_ECAD_FORCE_CASCADE_MAX = 4
+_ECAD_FORCE_CASCADE_MAX = 8  # mega-19: power→wire→board→drc→erc→V→sim
 
 _ECAD_THRASH_TOOLS = frozenset({
     "ecad_place_symbol", "ecad_find_part", "part_search",
@@ -1865,7 +1864,24 @@ def _ecad_place_pin_records(calls: list) -> list[dict]:
         ref = ref.strip()
         pins = res.get("pins")
         if not isinstance(pins, list):
-            continue
+            # mega-19 a2: truncated ledger/result JSON still has pin fragments.
+            raw = c.get("result")
+            pins = []
+            if isinstance(raw, str) and "pins" in raw:
+                for m_pin in re.finditer(
+                    r'\{\s*"number"\s*:\s*"([^"]+)"\s*,\s*"name"\s*:\s*"([^"]*)"'
+                    r'\s*,\s*"type"\s*:\s*"([^"]*)"\s*,\s*"xy"\s*:\s*'
+                    r'\[\s*([\d.+-eE]+)\s*,\s*([\d.+-eE]+)\s*\]',
+                    raw,
+                ):
+                    pins.append({
+                        "number": m_pin.group(1),
+                        "name": m_pin.group(2),
+                        "type": m_pin.group(3),
+                        "xy": [float(m_pin.group(4)), float(m_pin.group(5))],
+                    })
+            if not pins:
+                continue
         for p in pins:
             if not isinstance(p, dict):
                 continue
@@ -2731,13 +2747,19 @@ def _ecad_dispatch_forced_step(
         ok = False
     call_rec = {
         "tool": tool, "args": args, "ok": ok,
-        "result": _truncate(result),
+        "result": result,  # full — pin harvest needs untruncated place results
         "forced": True,
         "force_reason": reason,
     }
     calls.append(call_rec)
     try:
-        _log(ledger, actor, {"event": "tool_call", **call_rec})
+        _log(ledger, actor, {
+            "event": "tool_call",
+            "tool": tool, "args": args, "ok": ok,
+            "result": _truncate(result),
+            "forced": True,
+            "force_reason": reason,
+        })
     except Exception:  # noqa: BLE001
         pass
     # Wire missing-ref → re-derive once from live (incl. just-added power).
@@ -2781,7 +2803,7 @@ def _ecad_dispatch_forced_step(
                         ok2 = False
                     call_rec2 = {
                         "tool": tool, "args": new_args, "ok": ok2,
-                        "result": _truncate(result2),
+                        "result": result2,
                         "forced": True,
                         "wire_ref_retry": True,
                         "force_reason": reason + "+ref_retry",
@@ -2790,7 +2812,13 @@ def _ecad_dispatch_forced_step(
                     calls.append(call_rec2)
                     try:
                         _log(ledger, actor, {
-                            "event": "tool_call", **call_rec2,
+                            "event": "tool_call",
+                            "tool": tool, "args": new_args, "ok": ok2,
+                            "result": _truncate(result2),
+                            "forced": True,
+                            "wire_ref_retry": True,
+                            "force_reason": reason + "+ref_retry",
+                            "retried_missing_ref": missing,
                         })
                     except Exception:  # noqa: BLE001
                         pass
@@ -2824,10 +2852,14 @@ def _ecad_force_chain_cascade(
 
     mega-18 Z2r: parts placed + no power must EXECUTE ecad_add_power (not just
     schedule it), then feed returned refs into derived ecad_wire pairs.
+    mega-19 a2 residual: model thrash burned the turn budget before cascade
+    could wire/board — reserve room for max_steps forced product tools.
     """
     allow_set = allow or set()
+    # Guarantee cascade can run even when model already near budget.
+    cascade_budget = max(int(budget or 0), int(tool_calls_made) + int(max_steps) + 2)
     steps = 0
-    while steps < max_steps and tool_calls_made < budget:
+    while steps < max_steps and tool_calls_made < cascade_budget:
         need = _ecad_chain_need(calls, allow)
         if not need or need not in allow_set:
             break
@@ -2868,10 +2900,10 @@ def _ecad_force_chain_cascade(
                 messages=messages,
                 reason=f"{reason}:inject_v_source",
                 tool_calls_made=tool_calls_made,
-                budget=budget,
+                budget=cascade_budget,
             )
             steps += 1
-            if tool_calls_made >= budget or steps >= max_steps:
+            if tool_calls_made >= cascade_budget or steps >= max_steps:
                 break
         args = _ecad_forced_tool_args(need, calls)
         calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
@@ -2884,7 +2916,7 @@ def _ecad_force_chain_cascade(
             messages=messages,
             reason=f"{reason}:{need}",
             tool_calls_made=tool_calls_made,
-            budget=budget,
+            budget=cascade_budget,
         )
         steps += 1
         # Stop cascading after board product tools if we only needed power+wire

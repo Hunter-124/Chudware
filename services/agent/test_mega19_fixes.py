@@ -609,3 +609,110 @@ def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):
         if c.get("tool") == "ecad_run_drc" and c.get("ok")
     ]
     assert drcs and (drcs[0].get("args") or {}).get("doc_id") == "board99"
+
+
+def test_cascade_extends_budget_to_finish_wire_board():
+    """mega-19 a2 residual: cascade near turn budget still wires+boards+DRC."""
+    from services.agent.agent_turn import _ecad_force_chain_cascade
+
+    allow = {
+        "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",
+        "ecad_add_power", "board_from_schematic", "ecad_run_drc",
+        "ecad_run_erc", "ecad_simulate",
+    }
+    calls = [
+        {"tool": "ecad_new_schematic", "ok": True,
+         "result": {"doc_id": "cd7516e36580"}},
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "MCU:Generic_QFP48"},
+            "result": {
+                "ref": "U1",
+                "pins": [
+                    {"number": "1", "name": "VBAT", "type": "power_in",
+                     "xy": [84.76, 93.97]},
+                    {"number": "2", "name": "GND", "type": "power_in",
+                     "xy": [84.76, 40.0]},
+                ],
+            },
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "GND", "x": 20.0, "y": 120.0},
+            "result": {"ok": True, "net": "GND", "net_size": 0,
+                       "pos": [20.0, 120.0]},
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "3V3", "x": 20.0, "y": 40.0},
+            "result": {"ok": True, "net": "3V3", "net_size": 0,
+                       "pos": [20.0, 40.0]},
+        },
+    ]
+    dispatched = []
+
+    def _dispatch(tool, args):
+        dispatched.append((tool, dict(args or {})))
+        if tool == "ecad_add_power":
+            net = (args or {}).get("net") or "GND"
+            return {
+                "ok": True, "net": net, "ref": f"#PWR{net}",
+                "net_size": 2, "pos": [
+                    (args or {}).get("x"), (args or {}).get("y"),
+                ],
+                "net_members": ["U1.1"],
+            }
+        if tool == "ecad_place_symbol":
+            lib = str((args or {}).get("libid") or "")
+            if "Device:V" in lib:
+                return {"ok": True, "ref": "V1", "libid": lib,
+                        "value": "DC 3.3"}
+            return {
+                "ok": True, "ref": "R1", "libid": "Device:R", "value": "1k",
+                "pins": [
+                    {"number": "1", "xy": [20, 20]},
+                    {"number": "2", "xy": [30, 20]},
+                ],
+            }
+        if tool == "ecad_wire":
+            return {"ok": True, "net": "N1", "net_size": 2}
+        if tool == "board_from_schematic":
+            return {
+                "ok": True, "doc_id": "board99",
+                "board_doc_id": "board99",
+                "sch_doc_id": "cd7516e36580",
+            }
+        if tool == "ecad_run_drc":
+            assert (args or {}).get("doc_id") == "board99", args
+            return {"ok": True, "errors": 0}
+        if tool == "ecad_run_erc":
+            return {"ok": True, "errors": 0}
+        if tool == "ecad_simulate":
+            return {
+                "ok": True, "analysis": "op", "device_count": 2,
+                "op": {"V(3V3)": 3.3},
+            }
+        return {"ok": True}
+
+    # Live a2: thrash had already spent ~13 of a small budget when force fired.
+    _new, made = _ecad_force_chain_cascade(
+        calls=list(calls),
+        allow=allow,
+        dispatch=_dispatch,
+        ledger=None,
+        actor="t",
+        messages=[],
+        tool_calls_made=13,
+        budget=16,
+        reason="hard_gate_cap",
+    )
+    tools = [t for t, _ in dispatched]
+    assert "ecad_wire" in tools, dispatched
+    assert "board_from_schematic" in tools, dispatched
+    assert "ecad_run_drc" in tools, dispatched
+    wires = [a for t, a in dispatched if t == "ecad_wire"]
+    assert wires, dispatched
+    ends = {wires[0].get("from_ref"), wires[0].get("to_ref")}
+    # Prefer rail ref returned by forced add_power when present.
+    assert ends & {"#PWR3V3", "#PWRGND", "U1", "R1"}, wires[0]
+    assert made > 16  # cascade extended past original budget

@@ -25,12 +25,10 @@
   "hard_xai_grok45": true,
   "hard_openrouter_paid": false,
   "leaf_local": true,
-  "live_mega_processes": [],
+  "live_mega_processes": [
+    "667023 /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python reports/runs/mega-19/run_mega.py"
+  ],
   "other_xai_consumers": [],
   "no_other_xai_consumer": true,
-  "preflight_ready_for_launch": true,
-  "daemon_running_matches_disk": true,
-  "daemon_git_rev": "night2-3054-gcb65bfd9-dirty",
-  "baseline_matches_repo": true,
-  "repo_git_short": "6d11238b"
+  "preflight_ready_for_launch": true
 }

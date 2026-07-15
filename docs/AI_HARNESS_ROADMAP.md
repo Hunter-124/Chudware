@@ -352,16 +352,17 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   `reports/runs/mega-19/` (primary `mega-19-fc-rocket-20260715`).
   Baseline `6d11238b`. Fixer19 (ColdMuskox) bound D19 power-satisfied
   (add_power OR existing power symbols/nets), A19 rail wire prefs, B19 board
-  doc_id threading, C19 Device:V pre-sim + measure_between (117p; 6 reds
-  green). Preflight PASS: account `06dc3359` ACTIVE, hard→xai-sub grok-4.5
-  EXACT, mid openrouter deepseek, leaf ollama; hostd matches disk; probe
-  `pong`. Primary wall **459.4s** terminal `done`/`deliver_partial` live AC
-  PASS **6**/9 (AC2/3/6/7/8/9). Axes: **D19 PASS**, A19/B19/C19 FAIL (power×4
-  but wire=0 + force cascade idle; DRC still on sch `9b66592e2b7a`; AC5
-  empty-netlist / no Device:V inject; AC1 measure_between soft zero), Z1 PASS,
-  Z3 FAIL (no live simulate), **Z4 PASS**, G18 PARTIAL (6<7), Y PASS, Fix8
-  PASS. Residuals: force wire after power stall; board_doc_id→DRC; V-source
-  inject; ≥8 live AC. Findings: `reports/runs/mega-19/findings.md`.
+  doc_id threading, C19 Device:V pre-sim + measure_between; post-a1 rebind
+  force cascade after power success (118p; 6 reds green). Preflight PASS:
+  account `06dc3359` ACTIVE, hard→xai-sub grok-4.5 EXACT, mid openrouter
+  deepseek, leaf ollama; hostd matches disk. **a1** wall 459s live 6/9
+  (archived `attempt-1-…`). **a2** wall **595s** terminal `done`/
+  `deliver_partial` live AC PASS **6**/9. Axes a2: **D19 PASS**, **C19 PASS**,
+  A19/B19 FAIL (power×8 but wire=0; force_inject still 0 live; DRC sch;
+  board_from_schematic=0), Z1 PASS, **Z3 PASS** (empty-netlist residual
+  closed), **Z4 PASS**, G18 PARTIAL (6<7), Y PASS, Fix8 PASS, X PASS.
+  Residuals: live force cascade after power; board_doc_id→DRC; finite V(3V3);
+  ≥8 live AC. Findings: `reports/runs/mega-19/findings.md`.
 
 
 

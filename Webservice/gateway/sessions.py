@@ -549,6 +549,73 @@ class SessionManager:
             log.warning("podman stop %s rc=%s err=%s", name, rc, err or out)
         await self.run_podman(["rm", "-f", name], timeout=30)
 
+    # ---- ops surface (admin dashboard) ------------------------------------
+
+    async def container_stats(self) -> dict[str, dict[str, str]]:
+        """One `podman stats` snapshot for all live session containers.
+
+        Returns {container_name: {"cpu": "3.1%", "mem": "1.2GB / 5GB"}}.
+        Text template instead of --format json: the JSON key casing changed
+        across podman 4→5, the Go template names did not.
+        """
+        rc, out, _ = await self.run_podman(
+            ["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"],
+            timeout=20,
+        )
+        stats: dict[str, dict[str, str]] = {}
+        if rc != 0:
+            return stats
+        for line in out.splitlines():
+            parts = line.strip().split("|")
+            if len(parts) == 3 and parts[0]:
+                stats[parts[0]] = {"cpu": parts[1], "mem": parts[2]}
+        return stats
+
+    async def podman_bytes(self, args: list[str], *, timeout: float = 30.0) -> tuple[int, bytes]:
+        """run_podman variant for binary stdout (screenshots)."""
+        with tempfile.TemporaryFile() as out_f:
+            proc = await asyncio.create_subprocess_exec(
+                self.podman_bin,
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=out_f,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                proc.kill()
+                raise PodmanError(f"podman timed out: {' '.join(args[:4])}") from exc
+            out_f.seek(0)
+            data = out_f.read()
+        return rc, data
+
+    async def screenshot_png(self, sess: Session, *, width: int = 560) -> bytes | None:
+        """Downscaled PNG of the session's X display (admin thumbnails)."""
+        rc, data = await self.podman_bytes(
+            ["exec", sess.container, "sh", "-c",
+             f"DISPLAY=:0 xwd -root -silent | magick xwd:- -resize {int(width)}x png:-"],
+            timeout=25,
+        )
+        if rc != 0 or not data.startswith(b"\x89PNG"):
+            return None
+        return data
+
+    async def paste_text(self, sess: Session, text: str) -> tuple[bool, str]:
+        """Type text into the session's focused widget via xdotool.
+
+        argv-passed (no shell), so arbitrary user text is inert.
+        """
+        rc, _, err = await self.run_podman(
+            ["exec", "-e", "DISPLAY=:0", sess.container,
+             "xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
+            timeout=max(30.0, len(text) * 0.05),
+        )
+        if rc != 0:
+            return False, (err or "xdotool failed").strip()[:200]
+        sess.touch()
+        return True, "ok"
+
     async def _wait_ready(self, sess: Session) -> bool:
         url = f"http://127.0.0.1:{sess.host_port}/"
         deadline = time.time() + self.cfg.healthcheck_timeout_sec

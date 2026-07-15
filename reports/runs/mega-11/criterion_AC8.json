@@ -1,0 +1,13 @@
+{
+  "id": "AC8",
+  "result": "SKIP",
+  "check_tool": "fw_sim_run",
+  "pass_rule": "PASS|SKIP(renode)",
+  "detail": "check tool 'fw_sim_run' could not be resolved (backend absent?)",
+  "evidence": {
+    "ok": false,
+    "skipped": true,
+    "provision_note": "check tool 'fw_sim_run' could not be resolved (backend absent?)",
+    "source": "unresolved"
+  }
+}

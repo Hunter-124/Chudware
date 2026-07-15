@@ -366,13 +366,14 @@ def aggregate(
 
         # Drop mock paid models from a real store.
         if not force_mock and meta.get("kind") == "paid":
-            has_real_openrouter_cell = any(
-                c.get("tier", "").startswith("openrouter:")
+            has_real_paid_cell = any(
+                (c.get("tier", "").startswith("openrouter:")
+                 or c.get("tier", "").startswith("xai:"))
                 and str(c.get("cycle") or "") in real_cycle_names
                 for c in mcells
             )
             has_real_diag = mid in diag_model_ids
-            if not (has_real_openrouter_cell or has_real_diag):
+            if not (has_real_paid_cell or has_real_diag):
                 continue
         n_total = len(mcells)
         n_passed = sum(1 for c in mcells if c.get("passed"))

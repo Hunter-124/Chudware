@@ -785,7 +785,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     # Geometry/ECAD/FW mutators are the real product signal; new_part is bootstrap.
     _PRODUCTIVE_TOOLS = frozenset({
         "ledger_note", "buildgraph_plan", "dag_plan", "add_features",
-        "ecad_new_schematic", "fw_new_project", "fw_build",
+        "ecad_new_schematic", "board_from_schematic", "ecad_run_drc",
+        "ecad_run_erc", "ecad_simulate", "ecad_antenna_design",
+        "fw_new_project", "fw_build",
         "verify_battery",
     })
     _BOOTSTRAP_ONLY = frozenset({"new_part"})

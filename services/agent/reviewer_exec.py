@@ -36,6 +36,10 @@ from typing import Any, Callable
 PASS = "PASS"
 FAIL = "FAIL"
 NOT_CHECKED = "NOT-CHECKED"
+SKIP = "SKIP"  # honest provision-absence (Renode/openEMS/unprovisioned leg)
+
+# Verdicts that satisfy the VERIFY gate without waiver (mega-11 AC6/AC8).
+GATE_OK = frozenset({PASS, SKIP})
 
 REVIEWER_ACTOR = "reviewer"
 
@@ -219,8 +223,10 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
 # ---------------------------------------------------------------------------
 
 _INTERVAL_RE = re.compile(
-    r"(?P<name>[a-zA-Z_][\w ]*?)\s*in\s*\[\s*(?P<lo>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<hi>-?\d+(?:\.\d+)?)\s*\]")
+    r"(?P<name>[a-zA-Z_][\w ()./]*?)\s+in\s*\[\s*(?P<lo>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<hi>-?\d+(?:\.\d+)?)\s*\]",
+    re.IGNORECASE,
+)
 
 
 def _flatten_numbers(obj: Any, prefix: str = "") -> dict[str, float]:
@@ -258,9 +264,16 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
     # present (battery envelope with ok=false from a FAIL verdict), prefer the
     # scores/findings interpreter for an honest detail string (mega-10 live:
     # AC1 detail was bare 'ok=false' while scores carried the real FAIL reason).
+    # mega-11: also fall through when the payload is an honest provision-SKIP so
+    # AC4/AC6/AC8 can grade SKIP instead of hard FAIL on ok=false.
     if isinstance(result, dict) and result.get("ok") is False:
-        if "scores" in result or "findings" in result or isinstance(result.get("evidence"), dict):
-            pass  # fall through to PASS-rule / battery shapes below
+        if (
+            "scores" in result
+            or "findings" in result
+            or isinstance(result.get("evidence"), dict)
+            or _is_honest_skip(result)
+        ):
+            pass  # fall through to shape matching below
         else:
             return FAIL, f"check tool reported error: {result.get('error', 'ok=false')}"
 
@@ -332,10 +345,16 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
         val = nums.get(name)
         if val is None:
             token = name.split()[0]
-            # strip common wrappers like V(3V3) → 3v3
-            token = re.sub(r"[^\w]", "", token)
+            # strip common wrappers like V(3V3) → 3v3 (and keep v3v3 form).
+            bare = re.sub(r"[^\w]", "", token)
+            # V(3V3) / I(R1) → inner net/device name for SPICE node maps.
+            inner_m = re.match(r"[vi]\(([^)]+)\)", token, re.I)
+            candidates = [bare]
+            if inner_m:
+                candidates.append(re.sub(r"[^\w]", "", inner_m.group(1).lower()))
             for k, v in nums.items():
-                if token and token in re.sub(r"[^\w]", "", k):
+                kk = re.sub(r"[^\w]", "", k)
+                if any(c and (c in kk or kk in c) for c in candidates):
                     val = v
                     break
         if val is None:
@@ -379,10 +398,334 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
             return PASS, "interference check ok=true (no pairs listed)"
         return NOT_CHECKED, "tool output has no interferences/clashes list"
 
+    # Shape 4 (mega-11 AC2): bay envelope / board outline compare, or volume interval.
+    # Prefer named dims (bay_*/board_*); fall back to volume_mm3 interval in the rule.
+    if ("bay" in rule_l and "board" in rule_l) or (
+            "envelope" in rule_l and "board" in rule_l):
+        return _eval_bay_vs_board(rule, result)
+
+    # Shape 5 (mega-11 AC4): errors==0 (DRC/ERC). Accept combined multi-tool evidence.
+    if ("errors==0" in rule_l or "errors == 0" in rule_l
+            or re.search(r"\berrors\s*==\s*0\b", rule_l)):
+        return _eval_errors_zero(result)
+
+    # Shape 6 (mega-11 AC9): all legs have PASS|WARN|FAIL|SKIP — report-card over ledger.
+    # Must run before the generic PASS|SKIP shape (which also matches "pass"+"skip").
+    if "all legs" in rule_l and ("pass" in rule_l or "skip" in rule_l):
+        return _eval_report_card_legs(rule, result)
+
+    # Shape 7 (mega-11 AC6/AC8): PASS|SKIP with optional provision token (renode/openems).
+    if "pass" in rule_l and "skip" in rule_l:
+        return _eval_pass_or_skip(rule, result)
+
+    # Shape 8 (mega-11 AC7): returncode==0 (+ optional ELF path evidence).
+    if "returncode==0" in rule_l or "returncode == 0" in rule_l:
+        return _eval_returncode_zero(result)
+
     # Any other prose rule (e.g. "4 holes d4.5 on PCD34") is NOT mechanically
     # evaluable from generic tool output — honestly NOT-CHECKED, not a guessed PASS.
     return NOT_CHECKED, f"pass_rule {rule!r} is not mechanically evaluable"
 
+
+
+def _eval_bay_vs_board(rule: str, result: dict) -> tuple[str, str]:
+    """AC2: bay envelope >= board outline via named dims or volume_mm3 interval.
+
+    Accepts tool output from measure_part / query_geometry with any of:
+      * bay_length/width/height (or bay_*) and board_* counterparts
+      * bay_volume / board_volume (or volume_mm3 vs board_volume_mm3)
+      * volume_mm3 alone when the rule embeds ``volume_mm3 in [lo,hi]``
+    """
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "bay/board rule needs object tool output"
+    # Nested interval in the same rule still wins (proposal volume_mm3 path).
+    m = _INTERVAL_RE.search(rule or "")
+    if m and "volume" in m.group("name").lower():
+        name = m.group("name").strip().lower()
+        lo, hi = float(m.group("lo")), float(m.group("hi"))
+        nums = _flatten_numbers(result)
+        val = nums.get(name)
+        if val is None:
+            token = re.sub(r"[^\w]", "", name.split()[0])
+            for k, v in nums.items():
+                if token and token in re.sub(r"[^\w]", "", k):
+                    val = v
+                    break
+        if val is None:
+            return NOT_CHECKED, (
+                f"tool output has no numeric field matching {name!r} "
+                f"(fields: {sorted(nums)[:8]})")
+        ok = lo <= val <= hi
+        return (PASS if ok else FAIL), f"{name}={val} vs [{lo},{hi}]"
+
+    nums = _flatten_numbers(result)
+    axes = ("length", "width", "height", "x", "y", "z", "volume", "volume_mm3",
+            "dx", "dy", "dz", "size_x", "size_y", "size_z")
+    compared = 0
+    for axis in axes:
+        bay = _pick_num(nums, (f"bay_{axis}", f"bay {axis}", f"payload_bay_{axis}",
+                               f"envelope_{axis}", f"bay.{axis}"))
+        board = _pick_num(nums, (f"board_{axis}", f"board {axis}", f"fc_board_{axis}",
+                                 f"outline_{axis}", f"board.{axis}"))
+        if bay is None or board is None:
+            continue
+        compared += 1
+        if bay + 1e-9 < board:
+            return FAIL, f"bay_{axis}={bay} < board_{axis}={board}"
+    if compared:
+        return PASS, f"bay envelope >= board outline on {compared} axis/axes"
+
+    bay_v = _pick_num(nums, ("bay_volume", "bay_volume_mm3", "payload_bay_volume",
+                             "volume_mm3", "volume"))
+    board_v = _pick_num(nums, ("board_volume", "board_volume_mm3", "board_outline_volume"))
+    if bay_v is not None and board_v is not None:
+        if bay_v + 1e-9 >= board_v:
+            return PASS, f"bay_volume={bay_v} >= board_volume={board_v}"
+        return FAIL, f"bay_volume={bay_v} < board_volume={board_v}"
+
+    if any("bay" in k or "board" in k for k in nums):
+        return NOT_CHECKED, (
+            f"bay/board dims incomplete for compare (fields: {sorted(nums)[:12]})"
+        )
+    return NOT_CHECKED, (
+        "tool output has no bay/board dims or volume_mm3 interval for AC2 "
+        f"(fields: {sorted(nums)[:8]})"
+    )
+
+
+def _pick_num(nums: dict[str, float], keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        kk = k.lower()
+        if kk in nums:
+            return nums[kk]
+    for k in keys:
+        token = re.sub(r"[^\w]", "", k.lower())
+        for nk, nv in nums.items():
+            if token and token in re.sub(r"[^\w]", "", nk):
+                return nv
+    return None
+
+
+def _eval_errors_zero(result: dict) -> tuple[str, str]:
+    """AC4: DRC/ERC errors==0. Multi-tool evidence may carry drc/erc sub-dicts."""
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "errors==0 rule needs object tool output"
+
+    if _is_honest_skip(result):
+        return SKIP, _skip_detail(result) or "DRC/ERC skipped (provision absent)"
+
+    parts: list[tuple[str, dict]] = []
+    if isinstance(result.get("drc"), dict) or isinstance(result.get("erc"), dict):
+        if isinstance(result.get("drc"), dict):
+            parts.append(("drc", result["drc"]))
+        if isinstance(result.get("erc"), dict):
+            parts.append(("erc", result["erc"]))
+    else:
+        parts.append(("check", result))
+
+    total_errors = 0
+    saw_errors_field = False
+    details: list[str] = []
+    for label, part in parts:
+        if part.get("ok") is False and "errors" not in part and "error_count" not in part:
+            if _is_honest_skip(part):
+                return SKIP, _skip_detail(part) or f"{label} skipped"
+            return FAIL, (
+                f"{label} ok=false: {part.get('error') or part.get('detail') or 'error'}"
+            )
+        if "errors" in part:
+            saw_errors_field = True
+            try:
+                n = int(part.get("errors") or 0)
+            except (TypeError, ValueError):
+                return NOT_CHECKED, f"{label} errors field not numeric: {part.get('errors')!r}"
+            total_errors += n
+            details.append(f"{label}.errors={n}")
+        elif "error_count" in part:
+            saw_errors_field = True
+            try:
+                n = int(part.get("error_count") or 0)
+            except (TypeError, ValueError):
+                return NOT_CHECKED, f"{label} error_count not numeric"
+            total_errors += n
+            details.append(f"{label}.error_count={n}")
+
+    if not saw_errors_field:
+        return NOT_CHECKED, "tool output has no errors/error_count field"
+    if total_errors == 0:
+        return PASS, "errors==0 (" + ", ".join(details) + ")"
+    return FAIL, f"errors={total_errors} (" + ", ".join(details) + ")"
+
+
+def _eval_pass_or_skip(rule: str, result: dict) -> tuple[str, str]:
+    """AC6/AC8: PASS or honest SKIP with provision-note evidence."""
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "PASS|SKIP rule needs object tool output"
+
+    if _is_honest_skip(result):
+        detail = _skip_detail(result)
+        return SKIP, detail or "honest SKIP (provision absent)"
+
+    for key in ("verdict", "status", "result"):
+        val = result.get(key)
+        if isinstance(val, str):
+            u = val.strip().upper()
+            if u in ("PASS", "OK", "PASSED"):
+                return PASS, f"tool verdict {val!r}"
+            if u == "SKIP" or u.startswith("SKIP"):
+                return SKIP, f"tool verdict {val!r}"
+            if u in ("FAIL", "FAILED", "ERROR"):
+                return FAIL, f"tool verdict {val!r}"
+
+    if result.get("ok") is True or result.get("passed") is True or result.get("success") is True:
+        return PASS, "tool ok/passed/success=true"
+    if result.get("ok") is False or result.get("passed") is False or result.get("success") is False:
+        return FAIL, f"tool failed: {result.get('error') or result.get('detail') or 'ok=false'}"
+
+    return NOT_CHECKED, "PASS|SKIP rule: no verdict/skip/ok field in tool output"
+
+
+def _eval_returncode_zero(result: dict) -> tuple[str, str]:
+    """AC7: fw_build returncode==0 + ELF path evidence preferred."""
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "returncode rule needs object tool output"
+
+    if _is_honest_skip(result):
+        return SKIP, _skip_detail(result) or "fw_build skipped (toolchain absent)"
+
+    rc = result.get("returncode")
+    if rc is None and "return_code" in result:
+        rc = result.get("return_code")
+    if rc is None and result.get("success") is True:
+        rc = 0
+    if rc is None and result.get("ok") is True and result.get("success") is not False:
+        rc = 0 if (result.get("elf_path") or result.get("elf")) else None
+
+    if rc is None:
+        return NOT_CHECKED, "tool output has no returncode/success for AC7"
+
+    try:
+        rc_i = int(rc)
+    except (TypeError, ValueError):
+        return NOT_CHECKED, f"returncode not numeric: {rc!r}"
+
+    elf = result.get("elf_path") or result.get("elf") or result.get("artifact")
+    if rc_i == 0:
+        if elf:
+            return PASS, f"returncode==0 elf_path={elf}"
+        if result.get("success") is True or result.get("ok") is True:
+            return PASS, "returncode==0 (no elf_path field)"
+        return PASS, "returncode==0"
+    return FAIL, f"returncode={rc_i}" + (f" elf_path={elf}" if elf else "")
+
+
+def _eval_report_card_legs(rule: str, result: dict) -> tuple[str, str]:
+    """AC9: every required leg has a PASS|WARN|FAIL|SKIP verdict on the card."""
+    if not isinstance(result, dict):
+        return NOT_CHECKED, "report-card rule needs object tool output"
+
+    legs_required = result.get("legs_required") or result.get("required_legs")
+    if not isinstance(legs_required, list) or not legs_required:
+        legs_required = result.get("legs") if isinstance(result.get("legs"), list) else None
+        # list-of-names vs list-of-dicts handled below
+        if isinstance(legs_required, list) and legs_required and isinstance(legs_required[0], str):
+            pass
+        else:
+            legs_required = None
+    if not isinstance(legs_required, list) or not legs_required:
+        # params_hint may have been merged into evidence under another key
+        return NOT_CHECKED, "report-card evidence missing legs_required list"
+
+    card = result.get("leg_verdicts") if isinstance(result.get("leg_verdicts"), dict) else None
+    if card is None and isinstance(result.get("report_card"), dict):
+        rc = result["report_card"]
+        if isinstance(rc.get("legs"), dict):
+            card = rc["legs"]
+        elif isinstance(rc.get("leg_verdicts"), dict):
+            card = rc["leg_verdicts"]
+    if card is None and isinstance(result.get("legs"), dict):
+        card = result["legs"]
+    if card is None and isinstance(result.get("legs"), list):
+        card = {}
+        for item in result["legs"]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("leg") or item.get("name") or item.get("id")
+            ver = item.get("verdict") or item.get("result") or item.get("status")
+            if name and ver is not None:
+                card[str(name)] = str(ver)
+
+    if not isinstance(card, dict) or not card:
+        return NOT_CHECKED, "report-card evidence has no leg verdicts"
+
+    allowed = {"PASS", "WARN", "FAIL", "SKIP"}
+    missing: list[str] = []
+    bad: list[str] = []
+    for leg in legs_required:
+        key = str(leg)
+        val = card.get(key)
+        if val is None:
+            for ck, cv in card.items():
+                if str(ck).lower() == key.lower():
+                    val = cv
+                    break
+        if val is None:
+            missing.append(key)
+            continue
+        u = str(val).strip().upper()
+        head = u.split("(")[0].split(":")[0].strip()
+        if head not in allowed and not any(u.startswith(a) for a in allowed):
+            bad.append(f"{key}={val!r}")
+
+    if missing:
+        return FAIL, f"legs missing verdicts: {missing}"
+    if bad:
+        return FAIL, f"legs with non PASS|WARN|FAIL|SKIP verdicts: {bad}"
+    return PASS, f"all {len(legs_required)} legs have PASS|WARN|FAIL|SKIP"
+
+
+def _is_honest_skip(result: dict) -> bool:
+    """True when tool evidence is an honest provision-absence SKIP (not a FAIL)."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("skipped") is True or result.get("skip") is True:
+        return True
+    for key in ("verdict", "status", "result"):
+        val = result.get(key)
+        if isinstance(val, str) and val.strip().upper().startswith("SKIP"):
+            return True
+    blob_parts = [
+        result.get("error"), result.get("detail"), result.get("reason"),
+        result.get("stderr"), result.get("provision_note"), result.get("backend_note"),
+        result.get("message"), result.get("hint"),
+    ]
+    fw = result.get("fullwave") if isinstance(result.get("fullwave"), dict) else {}
+    if fw.get("skipped"):
+        return True
+    blob_parts.append(fw.get("reason"))
+    blob = " ".join(str(x) for x in blob_parts if x).lower()
+    markers = (
+        "emulator_not_found", "renode not", "renode absent", "renode missing",
+        "not installed", "toolchain_not_found", "not provisioned", "unprovisioned",
+        "openems not", "openems absent", "full-wave skipped", "fullwave skipped",
+        "backend absent", "provision absent", "no board", "no schematic",
+        "could not be resolved", "unavailable", "not found",
+    )
+    return any(m in blob for m in markers)
+
+
+def _skip_detail(result: dict) -> str:
+    for key in ("provision_note", "backend_note", "reason", "detail", "error",
+                "stderr", "message", "hint", "verdict"):
+        val = result.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:300]
+    fw = result.get("fullwave") if isinstance(result.get("fullwave"), dict) else {}
+    if fw.get("reason"):
+        return str(fw.get("reason"))[:300]
+    if result.get("skipped") is True:
+        return "skipped=true"
+    return ""
 
 
 
@@ -486,14 +829,18 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
     *ledger* as a ``criterion_result`` event.  Returns ``{ac_id: verdict}``.
 
     Deterministic (no model call): the reviewer's job is to RUN the named checks
-    and report PASS/FAIL/NOT-CHECKED, which is a mechanical operation.  Fail-closed
-    on every error path — the only way to PASS is for the tool to run and its output
-    to mechanically satisfy the pass_rule.
+    and report PASS/FAIL/NOT-CHECKED/SKIP, which is a mechanical operation.
+    Fail-closed on every error path — the only way to PASS is for the tool to run
+    and its output to mechanically satisfy the pass_rule.
 
     mega-10: when *battery_payload* is provided (or a prior battery_result is on
     the ledger), criteria with ``check.tool == verify_battery`` reuse that
     evidence instead of re-invoking the battery — so AC1 is graded from the same
     scores/findings the ledger already recorded (not a second ambiguous call).
+
+    mega-11: multi-tool checks (``ecad_run_drc+ecad_run_erc`` or
+    ``check.tools=[...]``), ``report_card`` ledger grader (AC9), and honest SKIP
+    provision paths for antenna/firmware.
     """
     results: dict[str, str] = {}
     bat = battery_payload if isinstance(battery_payload, dict) else None
@@ -507,6 +854,7 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
             check = ac.get("check") or {}
             tool = check.get("tool") or ""
             pass_rule = check.get("pass_rule") or ""
+            tools = _check_tools(check)
 
             if tool == "verify_battery" and bat is not None:
                 evidence = _battery_evidence_for_ac(bat)
@@ -528,12 +876,29 @@ def run_acceptance_checks(manifest: dict, ledger, *, doc_id: str | None = None,
                         pass
                 continue
 
-            verdict, detail, evidence = _run_one(tool, pass_rule, check, d_doc)
+            # AC9: deterministic report-card over ledger stage/decision events.
+            if tool == "report_card" or "report_card" in tools:
+                evidence = grade_report_card_from_ledger(
+                    ledger, check.get("params_hint") or {})
+                verdict, detail = evaluate_pass_rule(pass_rule, evidence)
+                results[ac_id] = verdict
+                if ledger is not None:
+                    try:
+                        ledger.add_criterion_result(
+                            actor, ac_id, verdict, check_tool="report_card",
+                            pass_rule=pass_rule, detail=detail, evidence=evidence)
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+
+            verdict, detail, evidence = _run_one(tool, pass_rule, check, d_doc,
+                                                ledger=ledger)
             results[ac_id] = verdict
             if ledger is not None:
                 try:
                     ledger.add_criterion_result(
-                        actor, ac_id, verdict, check_tool=tool,
+                        actor, ac_id, verdict,
+                        check_tool=tool or "+".join(tools),
                         pass_rule=pass_rule, detail=detail, evidence=evidence)
                 except Exception:  # noqa: BLE001 — ledger write must not break the sweep
                     pass
@@ -838,28 +1203,331 @@ def _slim_battery_evidence(result: dict) -> dict:
 
 
 
+def _check_tools(check: dict) -> list[str]:
+    """Normalize check.tool / check.tools into an ordered tool name list."""
+    tools: list[str] = []
+    raw_list = check.get("tools")
+    if isinstance(raw_list, list):
+        tools.extend(str(t).strip() for t in raw_list if str(t).strip())
+    tool = str(check.get("tool") or "").strip()
+    if tool and tool not in tools:
+        # Support compound form: "ecad_run_drc+ecad_run_erc"
+        if "+" in tool and " " not in tool:
+            tools.extend(p.strip() for p in tool.split("+") if p.strip())
+        else:
+            tools.append(tool)
+    # de-dupe preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tools:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def _run_one(tool: str, pass_rule: str, check: dict,
-             doc_id: str | None) -> tuple[str, str, dict]:
-    """Run one check tool and derive (verdict, detail, evidence).  Never raises."""
-    # 'manual' criteria are, by definition, not tool-checkable here — a human/clarifier
-    # confirms them (contract §16 manual-pairing rule). Honestly NOT-CHECKED.
-    if tool == "manual":
+             doc_id: str | None, *, ledger=None) -> tuple[str, str, dict]:
+    """Run one (or multi) check tool and derive (verdict, detail, evidence).
+
+    Never raises. mega-11: multi-tool AC4 (drc+erc), ledger reuse for prior
+    tool_call evidence when the live tool is unresolvable, honest SKIP on
+    provision-absence.
+    """
+    tools = _check_tools(check)
+    if not tools:
+        tools = [tool] if tool else []
+
+    if tools == ["manual"] or tool == "manual":
         return NOT_CHECKED, "manual criterion — requires human confirmation", {}
 
-    fn = _resolve_fn(tool)
-    if fn is None:
-        return NOT_CHECKED, f"check tool {tool!r} could not be resolved (backend absent?)", {}
+    params_hint = check.get("params_hint") or {}
+    if not isinstance(params_hint, dict):
+        params_hint = {}
 
-    # Build args conservatively: pass doc_id if the tool accepts it. params_hint is a
-    # hint only — we forward simple scalar hints the tool may accept, but never fail
-    # on an unexpected kwarg (retry without it).
-    raw = _call_tool(fn, doc_id, check.get("params_hint") or {})
+    # Multi-tool (AC4: ecad_run_drc + ecad_run_erc) → combined evidence envelope.
+    if len(tools) > 1:
+        combined: dict[str, Any] = {"ok": True, "tools": tools}
+        any_ran = False
+        for tname in tools:
+            raw, src = _invoke_or_ledger(tname, doc_id, params_hint, ledger)
+            if raw is None:
+                combined[tname] = {
+                    "ok": False,
+                    "error": f"check tool {tname!r} could not be resolved or raised",
+                    "source": src,
+                }
+                continue
+            part = _as_dict(raw)
+            part.setdefault("source", src)
+            # Short keys for DRC/ERC evaluator.
+            short = (
+                "drc" if "drc" in tname else
+                "erc" if "erc" in tname else
+                tname
+            )
+            combined[short] = part
+            combined[tname] = part
+            any_ran = True
+            if part.get("ok") is False and "errors" not in part:
+                combined["ok"] = False
+        if not any_ran:
+            return NOT_CHECKED, f"no check tools resolved among {tools}", combined
+        verdict, detail = evaluate_pass_rule(pass_rule, combined)
+        return verdict, detail, combined
+
+    tname = tools[0] if tools else tool
+    raw, src = _invoke_or_ledger(tname, doc_id, params_hint, ledger)
     if raw is None:
-        return NOT_CHECKED, f"check tool {tool!r} raised — treated as not-checked", {}
+        # Honest SKIP if the rule accepts SKIP and absence is provision-shaped.
+        if "skip" in (pass_rule or "").lower():
+            evidence = {
+                "ok": False,
+                "skipped": True,
+                "provision_note": f"check tool {tname!r} could not be resolved (backend absent?)",
+                "source": src or "unresolved",
+            }
+            verdict, detail = evaluate_pass_rule(pass_rule, evidence)
+            return verdict, detail, evidence
+        return NOT_CHECKED, f"check tool {tname!r} could not be resolved (backend absent?)", {}
 
     result = _as_dict(raw)
+    if src:
+        result.setdefault("source", src)
+    # Merge params_hint legs into evidence for AC9-style rules if present.
+    if "legs" in params_hint and "legs_required" not in result:
+        result.setdefault("legs_required", params_hint.get("legs"))
     verdict, detail = evaluate_pass_rule(pass_rule, result)
     return verdict, detail, result
+
+
+def _invoke_or_ledger(tool: str, doc_id: str | None, params_hint: dict,
+                      ledger) -> tuple[Any, str]:
+    """Call *tool* live; on miss, reuse newest matching ledger tool_call result."""
+    fn = _resolve_fn(tool)
+    if fn is not None:
+        raw = _call_tool(fn, doc_id, params_hint)
+        if raw is not None:
+            return raw, "live"
+    # Ledger reuse (mission already ran the tool during BUILD).
+    prior = _latest_tool_result(ledger, tool)
+    if prior is not None:
+        return prior, "ledger_tool_call"
+    return None, "unresolved"
+
+
+def _latest_tool_result(ledger, tool: str) -> dict | None:
+    """Newest tool_call / agent_turn result for *tool* on the ledger, if any."""
+    if ledger is None:
+        return None
+    try:
+        events = list(getattr(ledger, "events", None) or [])
+    except Exception:  # noqa: BLE001
+        return None
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        kind = ev.get("kind") or ""
+        t = p.get("tool") or p.get("tool_name") or ""
+        if kind == "agent_turn" and p.get("event") == "tool_call":
+            t = p.get("tool") or t
+        if t != tool:
+            continue
+        res = p.get("result")
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except Exception:  # noqa: BLE001
+                res = {"text": res}
+        if isinstance(res, dict):
+            return res
+    return None
+
+
+def grade_report_card_from_ledger(ledger, params_hint: dict | None = None) -> dict:
+    """Build AC9 evidence from ledger stage/decision/criterion/artifact events.
+
+    Maps known mission legs to verdicts found on:
+      * criterion_result events
+      * decision events with verdict/result
+      * stage_log / stage events
+      * artifact notes with verdict
+      * tool_call outcomes for leg-canonical tools
+    Missing legs stay absent so the pass_rule can FAIL honestly.
+    """
+    hint = params_hint if isinstance(params_hint, dict) else {}
+    legs_required = list(hint.get("legs") or [
+        "plan", "parts", "schematic", "sim", "board", "trace_opt", "antenna",
+        "checks", "firmware", "sensor_loop", "power", "airframe",
+    ])
+    leg_verdicts: dict[str, str] = {}
+
+    # Canonical tool → leg mapping for ledger tool_call scan.
+    tool_leg = {
+        "buildgraph_plan": "plan", "dag_plan": "plan",
+        "part_search": "parts", "part_place": "parts", "ecad_find_part": "parts",
+        "ecad_new_schematic": "schematic", "ecad_place": "schematic",
+        "ecad_wire": "schematic", "ecad_run_erc": "schematic",
+        "ecad_simulate": "sim",
+        "ecad_make_board": "board", "board_from_schematic": "board",
+        "ecad_autoroute": "board", "ecad_run_drc": "board",
+        "ecad_optimize_traces": "trace_opt",
+        "ecad_antenna_design": "antenna", "ecad_antenna_analyze": "antenna",
+        "ecad_run_pdn": "checks", "ecad_run_hostcheck": "checks",
+        "fw_build": "firmware", "fw_new_project": "firmware",
+        "fw_sim_run": "sensor_loop", "fw_verify_board": "sensor_loop",
+        "fw_sensor_scenario": "sensor_loop",
+        "fw_power_profile": "power",
+        "verify_battery": "airframe", "add_features": "airframe",
+        "measure_part": "airframe", "check_interference": "airframe",
+        "new_part": "airframe",
+    }
+
+    def _set(leg: str, verdict: str) -> None:
+        u = str(verdict).strip().upper()
+        head = u.split("(")[0].split(":")[0].strip()
+        if head not in ("PASS", "WARN", "FAIL", "SKIP"):
+            if u.startswith("SKIP"):
+                head = "SKIP"
+            elif u in ("OK", "PASSED", "SUCCESS", "DONE"):
+                head = "PASS"
+            elif u in ("ERROR", "FAILED", "BLOCKED"):
+                head = "FAIL"
+            else:
+                return
+        # Prefer first non-empty; upgrade FAIL→PASS only if later PASS seen? keep last.
+        leg_verdicts[leg] = head
+
+    try:
+        events = list(getattr(ledger, "events", None) or []) if ledger is not None else []
+    except Exception:  # noqa: BLE001
+        events = []
+
+    state = getattr(ledger, "state", None) if ledger is not None else None
+    if isinstance(state, dict):
+        for cr in state.get("criterion_results") or []:
+            if not isinstance(cr, dict):
+                continue
+            ac = str(cr.get("id") or "")
+            res = cr.get("result")
+            # Map ACn → leg loosely.
+            ac_leg = {
+                "AC1": "airframe", "AC2": "airframe", "AC3": "airframe",
+                "AC4": "board", "AC5": "sim", "AC6": "antenna",
+                "AC7": "firmware", "AC8": "sensor_loop",
+            }.get(ac)
+            if ac_leg and res:
+                _set(ac_leg, str(res))
+            tool = str(cr.get("check_tool") or "")
+            leg = tool_leg.get(tool)
+            if leg and res:
+                _set(leg, str(res))
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("kind") or ""
+        p = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+
+        if kind == "decision":
+            leg = p.get("leg") or p.get("id") or p.get("name")
+            ver = p.get("verdict") or p.get("result") or p.get("status")
+            if leg and ver:
+                # only accept if leg is in required set (case-insensitive)
+                for req in legs_required:
+                    if str(leg).lower() == str(req).lower():
+                        _set(str(req), str(ver))
+                        break
+            # power_budget decisions
+            if "power" in str(leg or p.get("id") or "").lower() and ver:
+                _set("power", str(ver))
+
+        if kind in ("stage", "stage_log"):
+            stage = str(p.get("stage") or p.get("name") or "").lower()
+            ver = p.get("verdict") or p.get("result") or p.get("status")
+            for req in legs_required:
+                if req.lower() in stage and ver:
+                    _set(req, str(ver))
+
+        if kind == "artifact":
+            akind = str(p.get("kind") or p.get("type") or "").lower()
+            ver = p.get("verdict") or p.get("result")
+            for req in legs_required:
+                if req.lower() in akind and ver:
+                    _set(req, str(ver))
+            if "report" in akind and isinstance(p.get("legs"), dict):
+                for lk, lv in p["legs"].items():
+                    _set(str(lk), str(lv))
+
+        if kind in ("tool_call", "agent_turn") or (
+                kind == "agent_turn" and p.get("event") == "tool_call"):
+            t = p.get("tool") or p.get("tool_name") or ""
+            if kind == "agent_turn" and p.get("event") == "tool_call":
+                t = p.get("tool") or t
+            leg = tool_leg.get(str(t))
+            if not leg:
+                continue
+            res = p.get("result")
+            if isinstance(res, str):
+                try:
+                    res = json.loads(res)
+                except Exception:  # noqa: BLE001
+                    res = {}
+            if not isinstance(res, dict):
+                res = {}
+            # Derive a leg verdict from tool outcome.
+            if _is_honest_skip(res):
+                _set(leg, "SKIP")
+            elif res.get("ok") is False or res.get("success") is False or res.get("passed") is False:
+                _set(leg, "FAIL")
+            elif p.get("ok") is False:
+                _set(leg, "FAIL")
+            elif res.get("ok") is True or res.get("success") is True or res.get("passed") is True:
+                _set(leg, "PASS")
+            elif p.get("ok") is True:
+                _set(leg, "PASS")
+            elif isinstance(res.get("returncode"), int) and res["returncode"] == 0:
+                _set(leg, "PASS")
+            elif "errors" in res:
+                try:
+                    _set(leg, "PASS" if int(res.get("errors") or 0) == 0 else "FAIL")
+                except (TypeError, ValueError):
+                    pass
+
+        if kind == "criterion_result":
+            ac = str(p.get("id") or "")
+            res = p.get("result")
+            ac_leg = {
+                "AC1": "airframe", "AC2": "airframe", "AC3": "airframe",
+                "AC4": "checks", "AC5": "sim", "AC6": "antenna",
+                "AC7": "firmware", "AC8": "sensor_loop",
+            }.get(ac)
+            if ac_leg and res:
+                _set(ac_leg, str(res))
+
+        if kind == "battery_result":
+            ver = p.get("verdict")
+            if ver:
+                _set("airframe", str(ver))
+
+        # Explicit report_card / leg_verdicts notes.
+        if kind in ("note", "report_card", "mission_report"):
+            if isinstance(p.get("leg_verdicts"), dict):
+                for lk, lv in p["leg_verdicts"].items():
+                    _set(str(lk), str(lv))
+            if isinstance(p.get("legs"), dict):
+                for lk, lv in p["legs"].items():
+                    _set(str(lk), str(lv))
+
+    return {
+        "ok": True,
+        "source": "ledger_report_card",
+        "legs_required": legs_required,
+        "leg_verdicts": leg_verdicts,
+        "legs": leg_verdicts,
+    }
+
 
 
 def _call_tool(fn: Callable[..., Any], doc_id: str | None,

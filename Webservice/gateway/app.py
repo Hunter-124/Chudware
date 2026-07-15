@@ -9,11 +9,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -48,6 +49,18 @@ user_directory = UserDirectory(settings.users_file)
 
 app = FastAPI(title="billet-web", version="1.0.0")
 app.add_middleware(AuthMiddleware, directory=user_directory)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    h = resp.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("Referrer-Policy", "same-origin")
+    # Stream iframe and popout are same-origin; nothing embeds us cross-site.
+    h.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return resp
+
 
 sessions_router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -212,6 +225,91 @@ async def admin_remove_user(email: str, request: Request) -> dict[str, Any]:
     return {"ok": True, "removed": email, "access_policy": sync}
 
 
+def _gpu_info() -> dict[str, Any] | None:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()
+        if not out:
+            return None
+        used, total, util = (int(x.strip()) for x in out[0].split(","))
+        return {"vram_used_mib": used, "vram_total_mib": total, "util_pct": util}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+@admin_router.get("/ops")
+async def admin_ops(request: Request) -> dict[str, Any]:
+    """Live sessions + host health for the admin dashboard."""
+    _require_admin(request)
+    stats = await manager.container_stats()
+    now = time.time()
+    sessions = []
+    for s in manager.list_sessions():
+        st = stats.get(s.container, {})
+        sessions.append({
+            "sid": s.sid, "email": s.email, "display": s.display,
+            "heavy": s.heavy, "status": s.portal_status(),
+            "uptime_sec": int(now - s.created_at),
+            "idle_sec": int(now - s.last_activity),
+            "cpu": st.get("cpu"), "mem": st.get("mem"),
+        })
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        load = None
+    return {
+        "sessions": sessions,
+        "host": {
+            "mem_available_gib": mem_available_gib(),
+            "load1": load,
+            "gpu": _gpu_info(),
+        },
+        "limits": {"max_sessions": settings.max_sessions, "max_heavy": settings.max_heavy,
+                   "idle_timeout_sec": settings.idle_timeout_sec},
+    }
+
+
+@admin_router.post("/sessions/{sid}/stop")
+async def admin_stop_session(sid: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    sess = await manager.stop(sid)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    return {"ok": True, "sid": sid, "email": sess.email}
+
+
+@admin_router.get("/screenshot/{sid}")
+async def admin_screenshot(sid: str, request: Request) -> Response:
+    _require_admin(request)
+    sess = manager.get(sid)
+    if sess is None or sess.status not in {"ready", "starting"}:
+        raise HTTPException(status_code=404, detail="no such session")
+    png = await manager.screenshot_png(sess)
+    if png is None:
+        raise HTTPException(status_code=503, detail="screenshot unavailable")
+    return Response(png, media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+@admin_router.get("/logs")
+async def admin_logs(request: Request, lines: int = 200) -> PlainTextResponse:
+    """Tail the gateway journal — remote debugging without SSH."""
+    _require_admin(request)
+    lines = max(10, min(int(lines), 2000))
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", "billet-gateway", "-n", str(lines),
+             "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail=f"journalctl failed: {exc}") from exc
+    return PlainTextResponse(out or "(empty)")
+
+
 @app.get("/admin")
 async def admin_page(request: Request) -> HTMLResponse:
     _require_admin(request)
@@ -281,6 +379,28 @@ async def sessions_stop(request: Request) -> dict[str, Any]:
         "error": None,
         "message": "stopped",
     }
+
+
+@sessions_router.post("/paste")
+async def sessions_paste(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Type clipboard text into the caller's running session (xdotool).
+
+    The stream iframe can't reach the container's X clipboard from the
+    browser, so this is the paste path for AI keys, dimensions, chat text.
+    """
+    user = get_current_user(request)
+    sess = manager.get_for_user(user.email)
+    if sess is None or sess.status != "ready":
+        raise HTTPException(status_code=409, detail="no running session")
+    text = str(body.get("text") or "")
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if len(text) > 20000:
+        raise HTTPException(status_code=413, detail="text too large (20k max)")
+    ok, msg = await manager.paste_text(sess, text)
+    if not ok:
+        raise HTTPException(status_code=503, detail=f"paste failed: {msg}")
+    return {"ok": True, "chars": len(text)}
 
 
 @sessions_router.get("/{sid}")

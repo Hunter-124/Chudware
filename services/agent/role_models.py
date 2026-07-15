@@ -990,11 +990,16 @@ def domain_tags_from_context(
         _add("fit")
     if role in ("sim_engineer",):
         _add("analysis")
+    if role in ("ecad_engineer",):
+        _add("ecad")
+        _add("analysis")
+    if role in ("firmware_engineer",):
+        _add("firmware")
+        _add("analysis")
     if role in ("cam_programmer",):
         _add("cam")
     if role in ("spec_writer",):
         _add("spec")
-
     # Task class / deliverable kind.
     if tc in ("assembly",) or kind == "assembly":
         _add("assembly")
@@ -1042,10 +1047,12 @@ def is_multi_domain_plan_or_build(
     tags = list(domain_tags or [])
     tc = (task_class or "").strip().lower()
 
-    # Never gate SPECIFY / report / intake workers.
+    # Never gate SPECIFY / report / intake workers, nor single-domain producing
+    # ECAD/firmware BUILD legs (mega-11) — they execute tools flat, not spawn.
     if role in (
         "spec_writer", "reviewer", "intake_analyst", "clarifier",
         "overseer",  # join/audit — not a multi-domain coordinator
+        "ecad_engineer", "firmware_engineer",
     ):
         return False
     # Leaf report/verify classes never hit this gate.

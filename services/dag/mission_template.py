@@ -47,12 +47,15 @@ _TYPE_VERIFY = "verify"
 _TYPE_DELIVER = "report"
 
 # Role assignment by deliverable kind (BUILD + DELIVER phases).
+# mega-11: analysis deliverables split into producing ECAD/firmware roles
+# (name-keyed) so they leave sim_engineer (FEA-only) and stop dying as one-shot
+# ollama DELIVER leaves with zero schematic/board/fw artifacts.
 _BUILD_ROLE_BY_KIND = {
     "part": "feature_modeler",
     "assembly": "assembly_fit_engineer",
     "drawing": "feature_modeler",       # drawing build handled at deliver
     "cam_program": "feature_modeler",
-    "analysis": "sim_engineer",
+    "analysis": "sim_engineer",         # default; overridden by name heuristics
     "report": "reviewer",
     "modification": "feature_modeler",
 }
@@ -79,6 +82,11 @@ _KIND_TASK_CLASS = {
 # Phase/role leaf classes (low difficulty) — conservation routing targets.
 _LEAF_TASK_CLASS = "leaf"
 _REPORT_TASK_CLASS = "simple_part"
+
+# Kinds that get a real BUILD + VERIFY node (not only SPECIFY → DELIVER leaf).
+_BUILDABLE_KINDS = frozenset({
+    "part", "assembly", "modification", "analysis",
+})
 
 
 def _role_prompt(role_id: str) -> str:
@@ -125,6 +133,92 @@ def _deliverable_request(manifest: dict[str, Any], d: dict[str, Any],
                          f" pass rule: {check.get('pass_rule', '?')}]")
     lines.append(f"Your job on this node: {job}")
     return "\n".join(lines)
+
+
+def _deliverable_blob(d: dict[str, Any]) -> str:
+    """Lowercased name+description for leg-routing heuristics."""
+    parts = [
+        str(d.get("name") or ""),
+        str(d.get("description") or ""),
+        str(d.get("id") or ""),
+    ]
+    return " ".join(parts).lower()
+
+
+def _resolve_build_role(d: dict[str, Any]) -> str:
+    """Pick the BUILD worker role for a deliverable.
+
+    mega-11: analysis kinds named for ECAD/board/schematic/antenna →
+    ``ecad_engineer``; firmware/sensor_loop → ``firmware_engineer``; else
+    kind table (sim_engineer for generic analysis).
+    """
+    kind = d.get("kind") or ""
+    role = _BUILD_ROLE_BY_KIND.get(kind, "feature_modeler")
+    if kind != "analysis":
+        return role
+    blob = _deliverable_blob(d)
+    fw_keys = (
+        "firmware", "sensor_loop", "sensor-loop", "renode", "fw_build",
+        "mcu firmware", "embedded",
+    )
+    if any(k in blob for k in fw_keys):
+        return "firmware_engineer"
+    ecad_keys = (
+        "ecad", "schematic", "pcb", "board", "antenna", "rf", "spice",
+        "flight_computer", "flight-computer", "avionics board",
+    )
+    if any(k in blob for k in ecad_keys):
+        return "ecad_engineer"
+    return role
+
+
+def _resolve_deliver_role(d: dict[str, Any]) -> str:
+    """DELIVER role by kind. Producing happens on BUILD (mega-11); DELIVER
+    stays a cheap report/reviewer so one-shot leaves do not re-invent tools."""
+    kind = d.get("kind") or ""
+    return _DELIVER_ROLE_BY_KIND.get(kind, "reviewer")
+
+
+def _build_job_for(d: dict[str, Any], role: str) -> str:
+    """Concrete BUILD job text naming deliverable + entry tools (mega-11 legs)."""
+    if role == "ecad_engineer":
+        return (
+            "PRODUCE this deliverable's ECAD artifacts with the engine tools — "
+            "not prose. Entry path: ecad_new_schematic → place/wire parts "
+            "(ecad_find_part / part_search + ecad_place_symbol + ecad_wire) → "
+            "ecad_run_erc → ecad_simulate (3V3 OP when in scope) → "
+            "board_from_schematic → ecad_run_drc. Antenna/RF when required: "
+            "ecad_antenna_design + ecad_antenna_analyze (honest SKIP with "
+            "provision note if backend absent). ledger_note every artifact "
+            "(sch/board doc_id). Do not declare done without schematic + board "
+            "tool evidence (or a blocked handoff naming the tool failure)."
+        )
+    if role == "firmware_engineer":
+        return (
+            "PRODUCE this deliverable's firmware with the engine tools — not "
+            "prose. Entry path: fw_status → fw_new_project(mcu_family=stm32f4, "
+            "board_doc_ref from ECAD when present) → fw_sources as needed → "
+            "fw_build (returncode==0 + ELF). Sensor-loop when required: "
+            "fw_sensor_scenario → fw_sim_run → fw_verify_board; honest SKIP "
+            "when Renode/QEMU absent (ledger_note the provision absence). "
+            "Do not declare done without fw_build tool evidence (or blocked "
+            "with toolchain_not_found)."
+        )
+    if role == "sim_engineer":
+        return (
+            "run the named simulation studies that prove this deliverable's "
+            "criteria (anchor first, then solve, then compare). Record "
+            "verdicts with numbers — do not invent outcomes."
+        )
+    # Mechanical / default BUILD
+    return (
+        "build this deliverable's geometry with the engine tools so every "
+        "acceptance criterion can pass. After the solid exists, run "
+        "verify_battery(doc_id) (or check_feature_overlap) and record the "
+        "honest PASS/WARN/FAIL — do not declare done without a battery or "
+        "check tool run."
+    )
+
 
 
 def _node(
@@ -300,29 +394,42 @@ def build_mission_graph(
     edges.append({"from": tail, "to": plan_id})
 
     # --- Phase 4: BUILD (fan-out per buildable deliverable) ----------------
+    # mega-11: analysis (ECAD/firmware) is buildable so legs get tool-capable
+    # nodes instead of jumping SPECIFY → one-shot DELIVER with zero artifacts.
     build_ids: dict[str, str] = {}
-    buildable = [d for d in deliverables
-                 if d.get("kind") in ("part", "assembly", "modification")]
+    buildable = [d for d in deliverables if d.get("kind") in _BUILDABLE_KINDS]
     for d in buildable:
         did = d["id"]
         bid = f"n_build_{did}"
         build_ids[did] = bid
-        role = _BUILD_ROLE_BY_KIND.get(d.get("kind"), "feature_modeler")
+        role = _resolve_build_role(d)
         tc = _KIND_TASK_CLASS.get(d.get("kind"), "multi_feature_part")
+        # Domain tags help auto_pick / multi-domain gate classify producing legs.
+        domain_tags: list[str] = []
+        if role == "ecad_engineer":
+            domain_tags = ["ecad", "analysis"]
+        elif role == "firmware_engineer":
+            domain_tags = ["firmware", "analysis"]
+        elif role == "sim_engineer":
+            domain_tags = ["analysis"]
+        elif d.get("kind") == "assembly":
+            domain_tags = ["assembly", "geometry"]
+        elif d.get("kind") in ("part", "modification"):
+            domain_tags = ["geometry"]
         # BUILD depends on PLAN (build graphs) + this deliverable's SPEC. Independent
         # parts share no edge → the executor ready-set runs them in parallel.
+        build_inputs: dict[str, Any] = {
+            "deliverable": did,
+            "task_class": tc,
+            "kind": d.get("kind"),
+            "request": _deliverable_request(
+                manifest, d, _build_job_for(d, role)),
+        }
+        if domain_tags:
+            build_inputs["domain_tags"] = domain_tags
         nodes.append(_node(bid, _TYPE_BUILD, f"BUILD {did}: {d.get('name', '')}",
                            role,
-                           inputs={"deliverable": did,
-                                   "task_class": tc,
-                                   "request": _deliverable_request(
-                                       manifest, d,
-                                       "build this deliverable's geometry with the "
-                                       "engine tools so every acceptance criterion "
-                                       "can pass. After the solid exists, run "
-                                       "verify_battery(doc_id) (or check_feature_overlap) "
-                                       "and record the honest PASS/WARN/FAIL — do not "
-                                       "declare done without a battery or check tool run.")},
+                           inputs=build_inputs,
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": plan_id, "to": bid})
 
@@ -352,7 +459,9 @@ def build_mission_graph(
         did = d["id"]
         kind = d.get("kind")
         del_id = f"n_deliver_{did}"
-        role = _DELIVER_ROLE_BY_KIND.get(kind, "reviewer")
+        role = _resolve_deliver_role(d)
+        # Producing analysis legs already ran tools on BUILD; DELIVER stays a
+        # cheap report class so conservation routing does not re-inflate.
         nodes.append(_node(del_id, _TYPE_DELIVER, f"DELIVER {did}: {kind}",
                            role,
                            inputs={"deliverable": did,

@@ -46,9 +46,16 @@ VALID_KINDS = frozenset({
 # triggers the pairing rule.
 KNOWN_CHECK_TOOLS = frozenset({
     "fit_report", "verify_battery", "measure_part", "measure_between",
-    "cam_simulate", "run_fea_static", "run_fea_modal", "run_cfd_flow",
-    "review_drawing", "check_interference", "wall_thickness", "design_review",
-    "manual",
+    "query_geometry", "cam_simulate", "run_fea_static", "run_fea_modal",
+    "run_cfd_flow", "review_drawing", "check_interference", "wall_thickness",
+    "design_review", "manual",
+    # mega-11: ECAD / firmware / antenna / report-card gradeable tools
+    "ecad_run_drc", "ecad_run_erc", "ecad_simulate",
+    "ecad_antenna_design", "ecad_antenna_analyze",
+    "fw_build", "fw_sim_run", "fw_verify_board",
+    "report_card",
+    # compound multi-tool form used by AC4
+    "ecad_run_drc+ecad_run_erc",
 })
 
 

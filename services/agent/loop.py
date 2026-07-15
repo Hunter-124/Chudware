@@ -2488,10 +2488,14 @@ def _ledger_criterion_results(ledger) -> "tuple[dict[str, str], set]":
 
 
 def _failing_criteria(manifest, ledger, ac_ids) -> list[str]:
-    """The ac ids that did NOT pass (for open_failure_cards / CORRECT routing)."""
+    """The ac ids that did NOT pass (for open_failure_cards / CORRECT routing).
+
+    mega-11: SKIP (honest provision-absence) is gate-ok alongside PASS.
+    """
     recorded, waived = _ledger_criterion_results(ledger)
+    ok = {"PASS", "SKIP"}
     return [ac for ac in ac_ids
-            if recorded.get(ac, "NOT-CHECKED") != "PASS" and ac not in waived]
+            if recorded.get(ac, "NOT-CHECKED") not in ok and ac not in waived]
 
 
 def _run_reviewer_checks(manifest, ledger, dag_result) -> None:

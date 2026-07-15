@@ -217,3 +217,20 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   (add_features ok×4, delegate+spawn, oneshot_ok×11, clean stop, battery 15
   checks honest FAIL). Fixer10 `fixes.md`. Findings:
   `reports/runs/mega-10/findings.md`.
+
+- 2026-07-14/15 mega-11 (WS5): multi-leg closure under
+  `reports/runs/mega-11/` (`mega-11-fc-rocket-20260714`). Baseline `ea37fb68`.
+  GradingPaths (LegitimateHeron) + LegProduction (LazyVulture) bound pre-launch
+  (grading 29p + legs 14p). Preflight PASS: hostd running==disk
+  (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`; spawn_probe with
+  `ecad_engineer`/`firmware_engineer` domain tools; auto_pick depth-2→ollama.
+  Primary pid 3075330 wall **795.82s**, terminal
+  `needs_correction`/`verify_failed: [AC1,AC2,AC4,AC5,AC7,AC9]` (**AC3+AC6 PASS;
+  AC8 honest SKIP**). Scoreboard: **K PASS** (9/9 AC tool-mapped via
+  `mission_criteria` + `evaluate_pass_rule`), **L PASS** (AC3 interference +
+  AC6 antenna analyze), **M PASS** (fw_build ELF ledger artifact + ECAD
+  schematic/places), **A–J regression PASS** (add_features ok×2, delegate+spawn,
+  oneshot_ok×9, battery doc_id, clean stop). Residuals: AC7 grader missed
+  success/elf evidence; AC2 bay dims; AC5 doc routing; board DRC path incomplete.
+  Findings: `reports/runs/mega-11/findings.md`.
+

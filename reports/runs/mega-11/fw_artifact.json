@@ -1,0 +1,12 @@
+{
+  "deliverable": "DL4",
+  "ac": "AC7",
+  "verdict": "PASS",
+  "project_id": "bc70b9ea15b4",
+  "elf_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.elf",
+  "map_path": "/tmp/AI-CAD/firmware/bc70b9ea15b4/build/firmware.map",
+  "mcu_family": "stm32f4",
+  "success": true,
+  "why": "fw_build returncode==0 / success true \u2014 STM32F4 flight-computer ELF produced for rocket-plane FC",
+  "id": "DL4"
+}

@@ -39,6 +39,13 @@
 <div class="admin-wrap">
   <p><a class="back" href="/">&larr; back to portal</a></p>
   <div class="admin-card">
+    <h2>Live sessions</h2>
+    <div id="host-bar" style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 12px">loading…</div>
+    <div id="ops-rows" style="display:flex;flex-direction:column;gap:12px"></div>
+    <div id="ops-empty" style="font-size:.88rem;color:var(--muted,#8b93a3);display:none">
+      Nobody is connected right now.</div>
+  </div>
+  <div class="admin-card">
     <h2>Allowlist — who can log in</h2>
     <p style="font-size:.85rem;color:var(--muted,#8b93a3)">
       Adding an email updates the gateway allowlist <em>and</em> the Cloudflare Access
@@ -70,6 +77,15 @@
     </form>
     <div id="admin-status"></div>
   </div>
+  <div class="admin-card">
+    <h2>Gateway log</h2>
+    <div style="display:flex;gap:10px;margin:0 0 10px">
+      <button type="button" id="log-refresh" class="btn ghost">Refresh</button>
+      <label style="font-size:.85rem;color:var(--muted,#8b93a3);align-self:center">
+        <input type="checkbox" id="log-follow"> follow</label>
+    </div>
+    <pre id="log-pre" style="max-height:320px;overflow:auto;font-size:.75rem;background:var(--bg,#0e1013);border:1px solid var(--border,#2a2e36);border-radius:8px;padding:10px;white-space:pre-wrap;margin:0">(press Refresh)</pre>
+  </div>
 </div>
 <div id="browse-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50">
   <div style="max-width:640px;margin:8vh auto;background:var(--panel,#16181d);border:1px solid var(--border,#2a2e36);border-radius:12px;padding:18px 22px;max-height:78vh;display:flex;flex-direction:column">
@@ -86,6 +102,6 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=2"></script>
+<script src="/static/admin.js?v=3"></script>
 </body>
 </html>

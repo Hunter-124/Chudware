@@ -495,11 +495,12 @@ def _gate_build(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 
 
 def _gate_verify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
-    """All acceptance criteria PASS, or the failing ones are waived-by-name.
+    """All acceptance criteria PASS/SKIP, or the failing ones are waived-by-name.
 
-    ``criterion_results`` is ``{ac_id: "PASS"|"FAIL"}``; ``waived`` is the set of
-    ac_ids the user waived via ask_user.  A FAIL that is not waived blocks VERIFY
-    (routes to CORRECT via ``next_phase`` because it populates open_failure_cards).
+    ``criterion_results`` is ``{ac_id: "PASS"|"FAIL"|"SKIP"|...}``; ``waived`` is the
+    set of ac_ids the user waived via ask_user.  A FAIL/NOT-CHECKED that is not
+    waived blocks VERIFY (routes to CORRECT via ``next_phase`` because it populates
+    open_failure_cards). mega-11: honest SKIP (provision-absence) is gate-ok.
 
     WI-11: missing verify_battery is FAIL not silent when the mission context
     indicates geometry was built (``geometry_built`` / ``mutating_tools_ran`` /
@@ -507,8 +508,9 @@ def _gate_verify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     """
     results = ctx.get("criterion_results") or {}
     waived = set(ctx.get("waived_criteria") or [])
+    ok = {"PASS", "SKIP"}
     failing = [ac for ac, res in results.items()
-               if res != "PASS" and ac not in waived]
+               if res not in ok and ac not in waived]
     if failing:
         return GateResult(False, "criteria_pass_or_waived",
                           [f"acceptance criteria failed and not waived: {failing}"])

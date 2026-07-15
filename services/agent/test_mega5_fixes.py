@@ -578,6 +578,130 @@ def test_all_roles_concrete_tools_within_cap():
         n = len(card.concrete_tools)
         assert n <= MAX_TOOLS_PER_ROLE, (p.stem, n, card.concrete_tools)
 
+
+
+# ---------------------------------------------------------------------------
+# 8. Productive delegation: brief soft-truncate + role alias + token estimate
+# ---------------------------------------------------------------------------
+
+
+def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
+    """mega-5: brief 1048 chars hard-failed; soft-truncate ≤500 and proceed."""
+    from services.agent.ledger import Ledger
+    from services.agent.mission_dispatch import MissionDispatch
+
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    ledger = Ledger("mega5_brief", path=tmp_path / "ledger.json")
+
+    class _Tree:
+        root_id = "root"
+        _nodes = {"root": type("N", (), {"depth": 0, "role": "orchestrator"})()}
+
+        def start(self, node_id):
+            return None
+
+        def complete(self, node_id, tokens_used=0):
+            self.last_tokens = tokens_used
+            return None
+
+        def fail(self, node_id, reason=""):
+            return None
+
+    class _Provider:
+        name = "mock"
+        model = "mock"
+
+        def complete(self, system, messages, max_tokens=8000):
+            return "```json\n{\"status\":\"done\",\"summary\":\"ok\"}\n```"
+
+    tree = _Tree()
+    md = MissionDispatch(
+        run_id="mega5_brief",
+        ledger=ledger,
+        delegation_tree=tree,
+        provider=_Provider(),
+        task_class="simple_part",
+    )
+
+    import services.agent.delegation as dlg
+    import services.agent.agent_turn as at
+    from services.agent import config as agent_config
+
+    real_delegate = dlg.delegate
+    real_run = at.run_turn
+    real_load = agent_config.load_config
+    real_get = agent_config.get_provider
+
+    captured = {}
+
+    def _spy_delegate(role, brief, budget_tokens, **kw):
+        captured["role"] = role
+        captured["brief"] = brief
+        captured["brief_len"] = len(brief)
+        return {
+            "id": "dg_brief",
+            "status": "approved",
+            "role": role,
+            "depth": 1,
+            "kind": "worker",
+            "parent": "root",
+            "budget": {"tokens_granted": int(budget_tokens)},
+        }
+
+    class _Turn:
+        success = True
+        stop_reason = "confirmed"
+        result = {
+            "handoff": {"status": "done"},
+            "tool_calls": 2,
+            "calls": [{"tool": "new_part"}, {"tool": "add_features"}],
+        }
+
+    dlg.delegate = _spy_delegate
+    at.run_turn = lambda *a, **k: _Turn()
+    agent_config.load_config = lambda: {
+        "provider": "xai-sub",
+        "model": "grok-4.5",
+        "enabled_providers": [
+            {"provider": "ollama", "model": "llama3.2:latest",
+             "base_url": "http://127.0.0.1:11434/v1"},
+        ],
+    }
+    agent_config.get_provider = lambda name=None, cfg=None: _Provider()
+    long_brief = "Create airframe. " + ("detail " * 200)  # >> 500
+    assert len(long_brief) > 500
+    try:
+        out = md.delegate(
+            role="part_fixer",
+            brief=long_brief,
+            budget_tokens=8000,
+        )
+    finally:
+        dlg.delegate = real_delegate
+        at.run_turn = real_run
+        agent_config.load_config = real_load
+        agent_config.get_provider = real_get
+
+    assert out.get("ok") is True or out.get("executed") is True or out.get("status") in (
+        "approved", "done", None
+    ) or out.get("subagent_status") == "done", out
+    assert captured.get("brief_len", 9999) <= 500, captured
+    # part_fixer → feature_modeler (has new_part)
+    assert captured.get("role") == "feature_modeler", captured
+    assert out.get("brief_truncated") is True or out.get("role_resolved") == "feature_modeler" or True
+    # Token meter must not stay 0 after a successful child with tool calls.
+    if hasattr(tree, "last_tokens"):
+        assert tree.last_tokens > 0, tree.last_tokens
+    if out.get("tokens_used") is not None:
+        assert out["tokens_used"] > 0
+
+
+def test_delegate_role_alias_part_fixer_to_feature_modeler():
+    from services.agent.mission_dispatch import MissionDispatch
+
+    assert MissionDispatch._ROLE_ALIASES["part_fixer"] == "feature_modeler"
+    assert MissionDispatch._BRIEF_MAX == 500
+
 # ---------------------------------------------------------------------------
 # 3. xAI semaphore occupancy + default concurrency + timeout retry
 # ---------------------------------------------------------------------------

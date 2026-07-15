@@ -48,9 +48,9 @@ DELIVER DL2 each failed after ~180s with
 `provider_error: The read operation timed out`, `retryable=true`. Default
 semaphore was 2 with no occupancy/queue events, so the run could not prove
 serialization vs remote load. A single timeout escalated the whole node
-(`stop_reason=failed` → escalate). Mega-5 live: DL1/DL2/DL4/DELIVER DL3 /
-n_spec_done same `provider_error` + `budget exhausted` escalate on the
-pre-fix process (5 rows by t+~15m).
+(`stop_reason=failed` → escalate). Mega-5 live: **7×** read-timeout
+`provider_error` rows (SPECIFY DL1/2/4, DELIVER DL3, n_spec_done, PLAN layout,
+PLAN mission) escalated budget exhausted on the pre-fix process.
 
 **Fix:**
 - Default `AICAD_XAI_MAX_CONCURRENT` raised 2 → 3 (still env-overridable).
@@ -90,10 +90,8 @@ Telemetry emission is unchanged from Fix 2.
 driver injects frontier `xai:grok-4.5` and `node_runner._resolve_provider`
 returned the injected provider **first**, so every DAG node + most work burned
 SuperGrok. Auto_pick min_rank thresholds already encode leaf→cheap /
-frontier→hard, but the run config overrode per node. Host config also had no
-live ollama candidates in the default enabled set (only dead llamacpp defaults
-+ openrouter free without preferencing). Mega-5 ~10m: all tools_slots
-`tier=frontier`.
+frontier→hard, but the run config overrode per node. Mega-5: all 19 tools_slots
+`tier=frontier`; SuperGrok wall 1438.65s.
 
 **Fix:**
 - `_resolve_provider` priority is now: **difficulty-aware auto_pick first**
@@ -113,11 +111,10 @@ must not resolve to xai when a cheaper enabled provider meets min_rank),
 
 ## Fix 6 — live phase cursor during DAG execution
 
-**Fingerprint / ledger evidence:** mega-5 ~10m progress — ledger `stage_log`
-remained **INTAKE-only** (`manifest_valid`) while the DAG was deep into
-SPECIFY/DELIVER (10+ nodes started). Phase reconciliation only ran after
-`dag.run.done` via `_drive_phases_from_dag`, so mission control looked stuck
-for the whole multi-node run.
+**Fingerprint / ledger evidence:** mega-5 live run stage_log stayed
+**INTAKE-only** until post-`dag.run.done` reconciliation entered
+specify/plan/build/verify/deliver with null exit gates.
+`phases_completed=["intake"]` only (honest — no false PLAN/BUILD complete).
 
 **Fix:** `run_mission` wraps the DAG `emit` with
 `_live_phase_cursor_on_dag_event`. On `dag.node.started|done|failed|paused` it
@@ -135,7 +132,7 @@ rendered **41 tools / 2284 tokens** (`budget_tokens=10000`, `trimmed=false`)
 because `family:ecad` + `family:em` + `family:fw` expanded unconstrained in
 `RoleCard.concrete_tools` while contract `MAX_TOOLS_PER_ROLE=14`. Five-way
 SPECIFY fan-out with ~2.3k-token tool schemas is a strong root cause for the
-xAI 180s read timeouts under load (PLAN timeout / BUILD timeout watch-list).
+xAI 180s read timeouts under load.
 
 **Fix:**
 - `concrete_tools` always returns ≤ `MAX_TOOLS_PER_ROLE`.
@@ -148,25 +145,46 @@ xAI 180s read timeouts under load (PLAN timeout / BUILD timeout watch-list).
 `test_all_roles_concrete_tools_within_cap` (mega-1 domain-family test still
 passes with interleaved ecad/em/fw).
 
+## Fix 8 — productive delegation: brief soft-truncate + role alias + token spend
+
+**Fingerprint / ledger evidence (mega-5 findings §1):** first real spawns —
+(1) `delegate(role=part_fixer, brief_len=1048, budget_tokens=8000)` → hard
+`brief must be ≤500 chars` (correct contract, wasted BUILD turn);
+(2) shortened brief → spawn `part_fixer` depth-1 `executed=true` /
+`subagent_status=done` but **unknown role** (no card → bare sub-agent, no
+`new_part`), **tokens_spent=0**, empty model fields, child tools
+`skill_activate`/`list_tools` unresolved, only `cad_guide`.
+
+**Fix:**
+- Soft-truncate briefs to 500 chars (ellipsis) with `brief_truncated` /
+  `brief_len_original` on the result instead of hard-failing the spawn.
+- Role aliases: `part_fixer` / `geometry_fixer` / `cad_fixer` /
+  `part_modeler` → `feature_modeler` (has `new_part`); `mech_fixer` /
+  `feature_fixer` → `fixer`.
+- After a successful child turn, accrue a lower-bound `tokens_used`
+  estimate (`1000 + 200×tool_calls`) flagged `tokens_used_estimate=true` so
+  the tree meter is not stuck at 0 when providers omit usage.
+
+**Regression:** `test_delegate_soft_truncates_overlong_brief`,
+`test_delegate_role_alias_part_fixer_to_feature_modeler`.
+
 ## Verification
 
 ```text
 python3 -m pytest services/agent/test_mega5_fixes.py \
   services/agent/test_mega4_fixes.py services/agent/test_mega3_fixes.py \
   services/agent/test_mega1_top5.py services/agent/test_role_models.py -q
-84 passed in 1.71s
+86 passed in 1.78s
 ```
 
 ## Live-run notes
 
-- MegaRun5 process (pid 1785399) launched before Fixer5 Python binds; YAML
-  prompt edits may rebind on later `load_role`. **Re-launch required** for
-  Fix 2–7 (assignment events, xAI retry, quota auto_pick, live phase cursor,
-  tools_slot cap).
-- Live mega-5 fingerprints: 0 delegate, 0 model_assignment, all tools_slots
-  frontier, stage_log intake-only, ≥5× read-timeout provider_errors
-  (SPECIFY DL1/2/4, DELIVER DL3, n_spec_done) escalated budget exhausted on
-  old process, BUILD not started; SPECIFY slots 41 tools / 2284 tokens.
-- Watch-list for next process: ≤14 tools on SPECIFY slots, ≥1 `delegate`,
-  ≥1 non-xai leaf `model_assignment`, live stage_log advance during SPECIFY,
-  retryable timeouts → DAG retry, BUILD `new_part`/`add_features` (or ECAD/FW).
+- MegaRun5 finished wall **1438.65s**, `blocked/deliver_incomplete`,
+  `phases_completed=[intake]`, 2 delegate calls / 1 depth-1 spawn, 0
+  model_assignment, 7× read timeouts, 0 BUILD features. Process
+  (pid 1785399) predated Python Fix 2–8.
+- **Re-launch required** to bind Fix 2–8. YAML Fix 1/7 rebind on `load_role`.
+- Watch-list for next process: ≤14 tools on SPECIFY; soft-truncated briefs +
+  `feature_modeler` child with `new_part`; non-xai leaf `model_assignment`;
+  live stage_log mid-run; retryable timeouts → DAG retry; tokens_used > 0 on
+  child complete; BUILD geometry evidence.

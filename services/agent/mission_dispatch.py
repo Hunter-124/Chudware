@@ -368,6 +368,17 @@ class MissionDispatch:
                          "suggested defaults applied (source per answer)")}
 
     # ------------------------------------------------------------------ delegate
+    # Model-facing role aliases → loadable role cards (mega-5: part_fixer invented).
+    _ROLE_ALIASES = {
+        "part_fixer": "feature_modeler",
+        "geometry_fixer": "feature_modeler",
+        "cad_fixer": "feature_modeler",
+        "part_modeler": "feature_modeler",
+        "mech_fixer": "fixer",
+        "feature_fixer": "fixer",
+    }
+    _BRIEF_MAX = 500  # contract §12
+
     def delegate(self, role: str = "", brief: str = "", budget_tokens: int = 0,
                  kind: str = "worker", parent_id: str | None = None,
                  docs: list | None = None, **_ignored: Any) -> dict:
@@ -380,13 +391,30 @@ class MissionDispatch:
         WS4: spawn-depth policy (max_spawn_depth from capability / config) is
         checked before the tree spawn; deeper spawns require decreasing
         difficulty for auto model assignment.
+
+        mega-5: overlong briefs are soft-truncated to ≤500 chars (contract §12)
+        with an explicit note instead of burning a turn on a hard reject;
+        invented role names (part_fixer, …) map onto loadable cards so the
+        child is not a bare sub-agent without new_part/add_features.
         """
+        role_raw = str(role or "").strip()
+        role_key = role_raw.lower()
+        role_resolved = self._ROLE_ALIASES.get(role_key, role_raw)
+        brief_raw = str(brief or "")
+        brief_truncated = False
+        if len(brief_raw) > self._BRIEF_MAX:
+            brief = brief_raw[: self._BRIEF_MAX - 1].rstrip() + "…"
+            brief_truncated = True
+        else:
+            brief = brief_raw
+
         if self.delegation_tree is None:
             if self.ledger is not None:
                 try:
                     self.ledger.append("agent", "note", {
-                        "event": "delegation_request", "role": role,
-                        "brief": str(brief)[:500], "budget_tokens": budget_tokens,
+                        "event": "delegation_request", "role": role_resolved,
+                        "role_requested": role_raw,
+                        "brief": brief[:500], "budget_tokens": budget_tokens,
                         "status": "unavailable"})
                 except Exception:  # noqa: BLE001
                     pass
@@ -429,15 +457,29 @@ class MissionDispatch:
 
         try:
             from services.agent.delegation import delegate as _delegate
-            node = _delegate(role, brief, budget_tokens, tree=self.delegation_tree,
-                             parent_id=parent_id, kind=kind, docs=docs)
+            node = _delegate(
+                role_resolved, brief, budget_tokens,
+                tree=self.delegation_tree,
+                parent_id=parent_id, kind=kind, docs=docs)
         except Exception as exc:  # noqa: BLE001 — error is data for the model
-            return {"ok": False, "status": "failed", "error": f"delegate failed: {exc}"}
+            return {"ok": False, "status": "failed",
+                    "error": f"delegate failed: {exc}",
+                    "role_requested": role_raw,
+                    "role_resolved": role_resolved,
+                    "brief_len": len(brief_raw),
+                    "brief_truncated": brief_truncated}
 
         # Phase 4 (M11): run the approved sub-agent NOW (synchronous, bounded).
         # HONESTY: without a bound provider nothing executes — the node is returned
         # spawned-but-not-run with an explicit note (never a fabricated result).
         if not isinstance(node, dict) or node.get("status") != "approved":
+            if isinstance(node, dict):
+                if role_raw and role_resolved != role_raw:
+                    node["role_requested"] = role_raw
+                    node["role_resolved"] = role_resolved
+                if brief_truncated:
+                    node["brief_truncated"] = True
+                    node["brief_len_original"] = len(brief_raw)
             return node
         if self.provider is None:
             node["executed"] = False
@@ -445,6 +487,13 @@ class MissionDispatch:
                             "executed: no provider bound to this mission dispatch")
             return node
         node["executed"] = True
+        if role_raw and role_resolved != role_raw:
+            node["role_requested"] = role_raw
+            node["role_resolved"] = role_resolved
+        if brief_truncated:
+            node["brief_truncated"] = True
+            node["brief_len_original"] = len(brief_raw)
+            node["brief"] = brief
         node.update(self._run_subagent(node, brief))
         return node
 
@@ -503,6 +552,17 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     system_prompt = card.system_prompt
             allowed = card.concrete_tools if card is not None else None
+            # mega-6: if a geometry role card somehow lost mutators, re-seed them
+            # so the first mutating call is always enableable.
+            if allowed is not None:
+                _need = ("new_part", "add_features")
+                if role in (
+                    "feature_modeler", "geometry_designer", "sketcher",
+                    "assembly_fit_engineer",
+                ) or any(t in allowed for t in _need):
+                    for t in _need:
+                        if t not in allowed:
+                            allowed = list(allowed) + [t]
             tools_text = None
             if allowed:
                 try:
@@ -527,6 +587,17 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     _cap = None
             _phase = self.phase or str(node.get("phase") or node.get("stage") or "") or None
+            # mega-6 BUILD mortality: geometry workers need enough tool steps to
+            # reach new_part/add_features (read ledger → new_part → add_features
+            # → measure is ≥4). Raise the floor for feature-class roles.
+            _BUILD_ROLES = {
+                "feature_modeler", "geometry_designer", "sketcher",
+                "assembly_fit_engineer", "layout_engineer",
+            }
+            if role in _BUILD_ROLES or str(_phase or "").lower() in (
+                "build", "feature", "geometry", "layout", "assembly",
+            ):
+                max_calls = max(max_calls, 8)
             if _cap is not None:
                 try:
                     from services.agent import scaffolds as _sc  # noqa: PLC0415
@@ -536,6 +607,12 @@ class MissionDispatch:
                     )
                     if max_calls is None:
                         max_calls = max(4, min(12, derived))
+                    # Re-assert BUILD floor after phase cap so A/B caps don't
+                    # starve geometry mutators below enablement threshold.
+                    if role in _BUILD_ROLES or str(_phase or "").lower() in (
+                        "build", "feature", "geometry", "layout", "assembly",
+                    ):
+                        max_calls = max(int(max_calls or 0), 8)
                 except Exception:  # noqa: BLE001
                     pass
             # WS2/WS4 + mega-5: always attempt per-spawn model assignment with
@@ -681,7 +758,65 @@ class MissionDispatch:
                 node_id=node_id, subagent_id=node_id,
                 capability=_cap, tier=self.tier, phase=_phase,
                 task_class=self.task_class)
-            tokens = 0  # provider seam exposes no usage here; accrual stays honest at 0
+            # mega-6: prefer real provider usage tokens over the tool-count estimate.
+            # Join must never surface handoff=null when the child produced calls or
+            # a partial finish (mega-5: executed=true, spent=0, handoff=null).
+            res_dict = result.result if isinstance(result.result, dict) else {}
+            n_tool = 0
+            try:
+                n_tool = int(res_dict.get("tool_calls")
+                             or len(res_dict.get("calls") or [])
+                             or 0)
+            except (TypeError, ValueError):
+                n_tool = 0
+            usage = res_dict.get("usage") if isinstance(res_dict.get("usage"), dict) else {}
+            real_tokens = 0
+            try:
+                real_tokens = int(
+                    res_dict.get("tokens_used")
+                    or usage.get("total_tokens")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                real_tokens = 0
+            tokens_used_estimate = real_tokens <= 0
+            if real_tokens > 0:
+                tokens = real_tokens
+            elif n_tool > 0 or result.success:
+                # ~1k turn overhead + ~200/call — floor, never fabricated usage.
+                tokens = 1000 + 200 * max(n_tool, 1 if result.success else 0)
+            else:
+                tokens = 0
+
+            handoff = res_dict.get("handoff")
+            if not isinstance(handoff, dict) or not handoff:
+                # Synthesise join handoff from calls so parent is not blind.
+                calls = res_dict.get("calls") if isinstance(res_dict.get("calls"), list) else []
+                if calls or result.success:
+                    handoff = {
+                        "status": "done" if result.success else "blocked",
+                        "summary": (
+                            f"subagent {role} finished "
+                            f"stop_reason={result.stop_reason} "
+                            f"tool_calls={n_tool}"
+                        )[:600],
+                        "outputs": {
+                            "tool_calls": n_tool,
+                            "calls": [
+                                {"tool": c.get("tool"), "ok": c.get("ok")}
+                                for c in calls[:20]
+                                if isinstance(c, dict)
+                            ],
+                            "stop_reason": result.stop_reason,
+                            "reasoning_summary": (
+                                "Join synthesised handoff from child result "
+                                "(child omitted formal envelope; mega-6)."
+                            ),
+                        },
+                    }
+                else:
+                    handoff = None
+
             role_model = None
             if isinstance(node, dict):
                 role_model = node.get("role_model")
@@ -696,7 +831,11 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     pass
                 out = {"ok": False, "subagent_status": "terminated",
-                        "result": result.result}
+                        "result": result.result, "tokens_used": tokens,
+                        "tokens_used_estimate": tokens_used_estimate,
+                        "handoff": handoff,
+                        "provider_usage_recorded": bool(
+                            res_dict.get("provider_usage_recorded"))}
                 if role_model is not None:
                     out["role_model"] = role_model
                 return out
@@ -706,8 +845,12 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     pass
                 out = {"ok": True, "subagent_status": "done",
-                        "handoff": result.result.get("handoff"),
-                        "result": result.result}
+                        "handoff": handoff,
+                        "result": result.result,
+                        "tokens_used": tokens,
+                        "tokens_used_estimate": tokens_used_estimate,
+                        "provider_usage_recorded": bool(
+                            res_dict.get("provider_usage_recorded"))}
                 if role_model is not None:
                     out["role_model"] = role_model
                 return out
@@ -716,7 +859,12 @@ class MissionDispatch:
             except Exception:  # noqa: BLE001
                 pass
             out = {"ok": False, "subagent_status": "failed",
-                    "stop_reason": result.stop_reason, "result": result.result}
+                    "stop_reason": result.stop_reason, "result": result.result,
+                    "handoff": handoff,
+                    "tokens_used": tokens,
+                    "tokens_used_estimate": tokens_used_estimate,
+                    "provider_usage_recorded": bool(
+                        res_dict.get("provider_usage_recorded"))}
             if role_model is not None:
                 out["role_model"] = role_model
             return out

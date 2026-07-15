@@ -1,0 +1,18 @@
+{
+  "state": "finished",
+  "run_id": "mega-6-fc-rocket-20260714",
+  "tier": "xai:grok-4-5",
+  "pid": 1954469,
+  "started_wall": 1784074090.8704143,
+  "cycle": "mega-6",
+  "conservation": true,
+  "baseline_commit": "563fb2c0",
+  "finished_wall": 1784074979.549699,
+  "wall_s": 888.68,
+  "result": {
+    "status": "blocked",
+    "phase": "deliver",
+    "stop_reason": "deliver_incomplete",
+    "error": null
+  }
+}

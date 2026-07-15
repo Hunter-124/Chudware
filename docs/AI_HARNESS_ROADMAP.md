@@ -132,3 +132,23 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   auto_pick-first SuperGrok quota, live phase cursor, tools_slot cap≤14) need
   fresh process. Findings + SuperGrok spend section + TOP5:
   `reports/runs/mega-5/findings.md`.
+- 2026-07-14/15 mega-6 (WS5): conservation relaunch on commit `563fb2c0` under
+  `reports/runs/mega-6/` (`mega-6-fc-rocket-20260714`) — first process with full
+  Fixer5 wave bound and **no per-node frontier injection** (auto_pick-first).
+  Preflight PASS: `budget_tokens` on rendered delegate schemas; auto_pick smoke
+  depth-2 low-difficulty → `ollama/llama3.2` (non-xai). Attempt-1 died 19/19
+  `provider_auth` (~4s) when keyless openrouter free was auto-picked at
+  min_rank≥3 (archived `attempt-1-openrouter-auth-wipe/`); Fixer6 Fix1 key-gate
+  + driver `enabled_providers=[ollama,xai-sub]`. Attempt-2 wall **888.68s**
+  (−38% vs mega-5 1438s), mission `blocked`/`deliver_incomplete`,
+  `phases_completed=["intake","specify","plan"]`. DAG 19/19 (**17 done, 2 failed**).
+  **xAI timeouts 0** under semaphore=3 (mega-5 had 7); SPECIFY slots **14 tools /
+  601 tok** (was 41/2284). First auditable SuperGrok spend: **192**
+  `provider_usage` rows / **2.55M** total tokens (all xai-sub — depth-0 min_rank=3
+  filters ollama rank1; cheap leaves need depth≥2 delegate, of which **0** fired —
+  delegation regressed from mega-5's 2 calls/1 spawn). BUILD partial flip:
+  **`new_part`×2** (empty solids) but **0 `add_features`/board/fw**. Live stage
+  cursor advanced mid-run. Fixer6 Fixes 1–7 (keyless openrouter, join handoff,
+  provider_usage, BUILD floor, ollama degrade, model_assignment on node resolve,
+  add_features nudge) — Fix6–7 need relaunch. Findings + grok delta + TOP5:
+  `reports/runs/mega-6/findings.md`.

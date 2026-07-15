@@ -1,0 +1,2182 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Mission mega-6-fc-rocket-20260714",
+        "summary": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "harness",
+      "kind": "effort_profile",
+      "payload": {
+        "schema": "aicad.effort/1",
+        "active_tier": null,
+        "tiers": {
+          "local-24k": {
+            "tier": "local-24k",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 8000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "local-48k": {
+            "tier": "local-48k",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 16000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "mid": {
+            "tier": "mid",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 3,
+              "worker_fan_out": 0,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 32000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "preset:maximum",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "preset:maximum",
+              "worker_fan_out": "shipped",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": []
+          },
+          "frontier": {
+            "tier": "frontier",
+            "level": "maximum",
+            "values": {
+              "deliberation": "full",
+              "ladder": "mandatory",
+              "ladder_max_bounces": 2,
+              "council": "always",
+              "council_seats": 4,
+              "council_feature_threshold": 5,
+              "ponder_round1_tokens": 1500,
+              "ponder_round2_tokens": 1500,
+              "delegation_depth": 8,
+              "worker_fan_out": 4,
+              "multi_doc_parallel": true,
+              "preflight": true,
+              "overseer_cadence": "every_trigger",
+              "failure_max_attempts": {
+                "rebuild": 3,
+                "solver": 3,
+                "interference": 3,
+                "overlap": 3,
+                "dfm": 3,
+                "sim": 2,
+                "cam": 3,
+                "export": 2
+              },
+              "history_budget_tokens": 80000,
+              "trigger_injection": true,
+              "trigger_cooldown_scale": 1.0,
+              "context_pack_verbosity": "full"
+            },
+            "sources": {
+              "deliberation": "override",
+              "ladder": "preset:maximum",
+              "ladder_max_bounces": "shipped",
+              "council": "preset:maximum",
+              "council_seats": "shipped",
+              "council_feature_threshold": "shipped",
+              "ponder_round1_tokens": "shipped",
+              "ponder_round2_tokens": "preset:maximum",
+              "delegation_depth": "override",
+              "worker_fan_out": "override",
+              "multi_doc_parallel": "shipped",
+              "preflight": "shipped",
+              "overseer_cadence": "preset:maximum",
+              "failure_max_attempts": "shipped",
+              "history_budget_tokens": "shipped",
+              "trigger_injection": "preset:maximum",
+              "trigger_cooldown_scale": "shipped",
+              "context_pack_verbosity": "preset:maximum"
+            },
+            "warnings": [
+              "delegation depth 8 exceeds the contract §12 hard cap (3) - the runtime will still enforce the cap; the extra depth buys nothing",
+              "Maximum effort on the frontier tier runs councils, ponders and full context packs on paid tokens - expect the highest possible per-mission cost"
+            ]
+          }
+        },
+        "level": "maximum"
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T00:06:00Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "5 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\n3) SCHEMATIC — ecad_new_schematic / place / wire the flight computer.\n4) SPICE — ecad_simulate OP on the 3V3 front-end; confirm rails.\n5) PCB LAYOUT + TRACE OPT — board_from_schematic, ecad_optimize_traces, DRC/DFM.\n6) ANTENNA/RF — ecad_antenna_design + analyze for 2.4 GHz IFA and GPS patch; use openEMS path when provisioned, else document honest degrade/SKIP.\n7) FIRMWARE — fw_new_project(stm32f4) + pinmap from netlist + fw_build.\n8) RENODE SENSOR-IN-THE-LOOP — climb_turn_profile → fw_sensor_scenario → fw_sim_run + fw_verify_board; SKIP honestly if Renode absent.\n9) MECHANICAL — model the rocket-plane airframe (body tube, fins, wing/glide surface, payload bay for the FC) as editable CAD with verify_battery PASS.\n10) Deliver a consolidated mission report card (PASS/WARN/FAIL/SKIP per leg) and power_budget rollup.\nUse subagent delegation freely (infinitely-branching, spawn-depth policy active) to parallelize mechanical vs ECAD vs firmware vs RF workstreams. Autonomy: auto.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "rocket_plane_airframe",
+              "description": "Boost-glide model rocket plane airframe: body, fins, wing, payload bay sized for the flight-computer board.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "airframe geometry coherent (verify_battery PASS)",
+                  "check": {
+                    "tool": "verify_battery",
+                    "params_hint": {},
+                    "pass_rule": "PASS"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "payload bay volume fits flight-computer board envelope",
+                  "check": {
+                    "tool": "measure_part",
+                    "params_hint": {
+                      "feature": "payload_bay"
+                    },
+                    "pass_rule": "bay envelope >= board outline"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL2",
+              "kind": "assembly",
+              "name": "avionics_integration",
+              "description": "Airframe + flight-computer board integration; no interference; sensor FOV / antenna keepouts respected.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC3",
+                  "text": "no solid interference between board and airframe",
+                  "check": {
+                    "tool": "check_interference",
+                    "params_hint": {},
+                    "pass_rule": "interferences empty or volume==0"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL3",
+              "kind": "analysis",
+              "name": "flight_computer_ecad",
+              "description": "Flight-computer E2E: part sourcing, schematic, SPICE OP, PCB place/route/trace-opt, antenna/RF, DRC/DFM/PDN checks.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC4",
+                  "text": "schematic + board artifacts exist with DRC clean or WARN-only",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "legs": [
+                        "parts",
+                        "schematic",
+                        "board",
+                        "trace_opt",
+                        "checks"
+                      ]
+                    },
+                    "pass_rule": "legs parts/schematic/board not FAIL"
+                  }
+                },
+                {
+                  "id": "AC5",
+                  "text": "SPICE OP 3V3 rail within 5%",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "sim"
+                    },
+                    "pass_rule": "V(3V3) in [3.135, 3.465]"
+                  }
+                },
+                {
+                  "id": "AC6",
+                  "text": "antenna design produced (openEMS or analytic degrade documented)",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "antenna"
+                    },
+                    "pass_rule": "PASS or SKIP with provision note"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL4",
+              "kind": "analysis",
+              "name": "firmware_sensor_loop",
+              "description": "STM32F4 firmware project from pinmap, build, Renode sensor-in-the-loop climb_turn_profile scenario.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC7",
+                  "text": "fw_build succeeds (ELF produced)",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "firmware"
+                    },
+                    "pass_rule": "fw_build returncode==0"
+                  }
+                },
+                {
+                  "id": "AC8",
+                  "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "sensor_loop"
+                    },
+                    "pass_rule": "PASS|SKIP(renode)"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL5",
+              "kind": "report",
+              "name": "mission_report_card",
+              "description": "Consolidated PASS/WARN/FAIL/SKIP card for all legs + power_budget rollup.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC9",
+                  "text": "report lists every leg with a verdict",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "legs": [
+                        "plan",
+                        "parts",
+                        "schematic",
+                        "sim",
+                        "board",
+                        "trace_opt",
+                        "antenna",
+                        "checks",
+                        "firmware",
+                        "sensor_loop",
+                        "power",
+                        "airframe"
+                      ]
+                    },
+                    "pass_rule": "all legs have PASS|WARN|FAIL|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL2",
+                "DL3",
+                "DL4"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "Manual acceptance criteria (AC4–AC9) are satisfied when the corresponding MCP leg tools return non-FAIL results or honest SKIP with provision notes; reviewer confirms from ledger artifacts.",
+              "basis": "flight_computer E2E bench protocol (benchmarks/flight_computer)",
+              "needs_confirm": true
+            },
+            {
+              "text": "MCU family STM32F4; sensors I2C MPU6050@0x68, BMP280@0x76, LIS3MDL, UART GPS",
+              "basis": "B1 flight-computer benchmark BOM",
+              "needs_confirm": false
+            },
+            {
+              "text": "openEMS/Renode may be absent — degrade with SKIP, never fabricate results",
+              "basis": "contracts honesty rule",
+              "needs_confirm": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC1",
+        "text": "airframe geometry coherent (verify_battery PASS)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL1/AC2",
+        "text": "payload bay volume fits flight-computer board envelope",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL2/AC3",
+        "text": "no solid interference between board and airframe",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC4",
+        "text": "schematic + board artifacts exist with DRC clean or WARN-only",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC5",
+        "text": "SPICE OP 3V3 rail within 5%",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 9,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL3/AC6",
+        "text": "antenna design produced (openEMS or analytic degrade documented)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 10,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL4/AC7",
+        "text": "fw_build succeeds (ELF produced)",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 11,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL4/AC8",
+        "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 12,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "intake_analyst",
+      "kind": "requirement",
+      "payload": {
+        "req_id": "DL5/AC9",
+        "text": "report lists every leg with a verdict",
+        "source": "manifest",
+        "status": "open"
+      }
+    },
+    {
+      "seq": 13,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "intake",
+        "entered": "2026-07-15T00:06:00Z",
+        "exited": "2026-07-15T00:06:00Z",
+        "exit_gate": "manifest_valid"
+      }
+    },
+    {
+      "seq": 14,
+      "ts": "2026-07-15T00:06:00Z",
+      "actor": "orchestrator",
+      "kind": "delegation",
+      "payload": {
+        "schema": "aicad.delegation/1",
+        "node_id": "dg_78ad1d592943",
+        "role": "orchestrator",
+        "status": "approved",
+        "depth": 0,
+        "kind": "worker",
+        "model": {
+          "provider": "",
+          "id": "",
+          "tier": ""
+        },
+        "budget": {
+          "tokens_granted": 50000,
+          "tokens_spent": 0,
+          "attempts": 0
+        },
+        "note": "root node auto-approved at init"
+      }
+    },
+    {
+      "seq": 15,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 322,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "describe_project",
+          "describe_part",
+          "list_parts",
+          "part_search",
+          "req_create",
+          "research_web_search"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 16,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 17,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "INTAKE: build manifest",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 20,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 21,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 22,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 23,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 24,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 25,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 26,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 601,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "research_material_lookup",
+          "research_eng_calc",
+          "fit_calc",
+          "recommend_fit",
+          "resolve_process",
+          "part_search",
+          "delegate",
+          "describe_part",
+          "board_from_schematic",
+          "ecad_new_schematic",
+          "em_status",
+          "fw_status"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 27,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 28,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL5: mission_report_card",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 29,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 30,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 31,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 32,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL4: firmware_sensor_loop",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 33,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 34,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 35,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 36,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY DL3: flight_computer_ecad",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 37,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 38,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 39,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 40,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 41,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "plan",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 42,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "deliver",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 43,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 44,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "build",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 45,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 46,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 263,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "buildgraph_status",
+          "workspace_status",
+          "describe_project",
+          "describe_part",
+          "ask_user"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "dag_status"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 47,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "verify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 48,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "deliver",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 49,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "deliver",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    },
+    {
+      "seq": 50,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 51,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "DELIVER DL4: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 563,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "set_material",
+          "run_fea_static",
+          "run_fea_modal",
+          "run_cfd_flow",
+          "describe_results",
+          "describe_part",
+          "measure_part",
+          "research_material_lookup",
+          "research_eng_calc",
+          "struct_analyze"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 52,
+      "ts": "2026-07-15T00:06:01Z",
+      "actor": "DELIVER DL3: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 563,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "set_material",
+          "run_fea_static",
+          "run_fea_modal",
+          "run_cfd_flow",
+          "describe_results",
+          "describe_part",
+          "measure_part",
+          "research_material_lookup",
+          "research_eng_calc",
+          "struct_analyze"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 53,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL4: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 54,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL4: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 55,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 56,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL5: report",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 57,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 58,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "SPECIFY complete (overseer audit point)",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 59,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL3: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 60,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "DELIVER DL3: analysis",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 61,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 273,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "buildgraph_status",
+          "delegate",
+          "describe_part",
+          "workspace_status"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "channel_send",
+          "request_resolve",
+          "council_convene"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 62,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 63,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "ORGANIZE: instantiate departments",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 64,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 650,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "new_part",
+          "add_features",
+          "describe_part",
+          "describe_scene",
+          "measure_part",
+          "measure_between",
+          "query_geometry",
+          "part_search",
+          "parts_taxonomy",
+          "part_source",
+          "preflight_ops",
+          "delegate"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 65,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 66,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: layout skeleton",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 67,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 367,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "dag_plan",
+          "buildgraph_plan",
+          "buildgraph_status",
+          "workspace_status",
+          "delegate",
+          "ask_user",
+          "describe_project"
+        ],
+        "omitted": [],
+        "unresolved": [
+          "dag_run",
+          "dag_status",
+          "dag_replan"
+        ],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 68,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 69,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "PLAN: mission DAG + build graphs",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 70,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 640,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "part_place",
+          "solve_mates",
+          "check_interference",
+          "measure_between",
+          "fit_report",
+          "describe_assembly",
+          "describe_scene",
+          "list_world_bodies",
+          "fit_calc",
+          "render_part",
+          "delegate"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 71,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 590,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "new_part",
+          "add_features",
+          "preflight_ops",
+          "describe_part",
+          "measure_part",
+          "query_geometry",
+          "check_feature_overlap",
+          "regen_diagnose",
+          "part_search",
+          "part_place",
+          "undo",
+          "delegate"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 72,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 73,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL2: avionics_integration",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 74,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 75,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "BUILD DL1: rocket_plane_airframe",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 76,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "VERIFY DL1: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 77,
+      "ts": "2026-07-15T00:06:02Z",
+      "actor": "VERIFY DL2: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 78,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "VERIFY DL1: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 79,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "VERIFY DL1: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 80,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "VERIFY DL2: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 81,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "VERIFY DL2: run acceptance checks",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 82,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL2: assembly",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 83,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL1: part",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "tools_slot",
+        "tier": null,
+        "tokens": 766,
+        "budget_tokens": 2500,
+        "rendered": [
+          "ledger_get",
+          "ledger_note",
+          "verify_battery",
+          "design_review",
+          "dfm_check",
+          "check_interference",
+          "check_feature_overlap",
+          "fit_report",
+          "measure_part",
+          "measure_between",
+          "describe_part",
+          "describe_assembly",
+          "render_part",
+          "review_drawing"
+        ],
+        "omitted": [],
+        "unresolved": [],
+        "trimmed": true
+      }
+    },
+    {
+      "seq": 84,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL2: assembly",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 85,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL2: assembly",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 86,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL1: part",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_error",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth",
+        "retryable": false
+      }
+    },
+    {
+      "seq": 87,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "DELIVER DL1: part",
+      "kind": "agent_turn",
+      "payload": {
+        "event": "provider_fatal",
+        "error": "Error code: 401 - {'error': {'message': 'Missing Authentication header', 'code': 401}}",
+        "stop_reason": "provider_auth"
+      }
+    },
+    {
+      "seq": 88,
+      "ts": "2026-07-15T00:06:03Z",
+      "actor": "pipeline",
+      "kind": "stage",
+      "payload": {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:03Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "mega-6-fc-rocket-20260714",
+    "brief": {
+      "title": "Mission mega-6-fc-rocket-20260714",
+      "summary": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with pro",
+      "success_criteria": []
+    },
+    "requirements": [
+      {
+        "req_id": "DL1/AC1",
+        "text": "airframe geometry coherent (verify_battery PASS)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL1/AC2",
+        "text": "payload bay volume fits flight-computer board envelope",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL2/AC3",
+        "text": "no solid interference between board and airframe",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC4",
+        "text": "schematic + board artifacts exist with DRC clean or WARN-only",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC5",
+        "text": "SPICE OP 3V3 rail within 5%",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL3/AC6",
+        "text": "antenna design produced (openEMS or analytic degrade documented)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL4/AC7",
+        "text": "fw_build succeeds (ELF produced)",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL4/AC8",
+        "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+        "source": "manifest",
+        "status": "open"
+      },
+      {
+        "req_id": "DL5/AC9",
+        "text": "report lists every leg with a verdict",
+        "source": "manifest",
+        "status": "open"
+      }
+    ],
+    "decisions": [],
+    "dimensions": [],
+    "questions": [],
+    "stage_log": [
+      {
+        "stage": "intake",
+        "entered": "2026-07-15T00:06:00Z",
+        "exited": "2026-07-15T00:06:00Z",
+        "exit_gate": "manifest_valid"
+      },
+      {
+        "stage": "specify",
+        "entered": "2026-07-15T00:06:03Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "plan",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "build",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "verify",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      },
+      {
+        "stage": "deliver",
+        "entered": "2026-07-15T00:06:01Z",
+        "exited": null,
+        "exit_gate": null
+      }
+    ],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "path": "",
+        "stage": "intake",
+        "note": "5 deliverables",
+        "manifest": {
+          "schema": "aicad.deliverables/1",
+          "request_verbatim": "Design a model rocket plane (boost-glide airframe) with an integrated central flight computer: MCU (STM32F4-class) + 3V3 buck, MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GPS. Full multi-domain mission:\n1) PLAN the system (airframe + avionics architecture, interfaces, budgets).\n2) PART SOURCING — resolve every IC/connector/fastener via the parts library and/or ecad_find_part; record BOM with provenance.\n3) SCHEMATIC — ecad_new_schematic / place / wire the flight computer.\n4) SPICE — ecad_simulate OP on the 3V3 front-end; confirm rails.\n5) PCB LAYOUT + TRACE OPT — board_from_schematic, ecad_optimize_traces, DRC/DFM.\n6) ANTENNA/RF — ecad_antenna_design + analyze for 2.4 GHz IFA and GPS patch; use openEMS path when provisioned, else document honest degrade/SKIP.\n7) FIRMWARE — fw_new_project(stm32f4) + pinmap from netlist + fw_build.\n8) RENODE SENSOR-IN-THE-LOOP — climb_turn_profile → fw_sensor_scenario → fw_sim_run + fw_verify_board; SKIP honestly if Renode absent.\n9) MECHANICAL — model the rocket-plane airframe (body tube, fins, wing/glide surface, payload bay for the FC) as editable CAD with verify_battery PASS.\n10) Deliver a consolidated mission report card (PASS/WARN/FAIL/SKIP per leg) and power_budget rollup.\nUse subagent delegation freely (infinitely-branching, spawn-depth policy active) to parallelize mechanical vs ECAD vs firmware vs RF workstreams. Autonomy: auto.",
+          "deliverables": [
+            {
+              "id": "DL1",
+              "kind": "part",
+              "name": "rocket_plane_airframe",
+              "description": "Boost-glide model rocket plane airframe: body, fins, wing, payload bay sized for the flight-computer board.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC1",
+                  "text": "airframe geometry coherent (verify_battery PASS)",
+                  "check": {
+                    "tool": "verify_battery",
+                    "params_hint": {},
+                    "pass_rule": "PASS"
+                  }
+                },
+                {
+                  "id": "AC2",
+                  "text": "payload bay volume fits flight-computer board envelope",
+                  "check": {
+                    "tool": "measure_part",
+                    "params_hint": {
+                      "feature": "payload_bay"
+                    },
+                    "pass_rule": "bay envelope >= board outline"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL2",
+              "kind": "assembly",
+              "name": "avionics_integration",
+              "description": "Airframe + flight-computer board integration; no interference; sensor FOV / antenna keepouts respected.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC3",
+                  "text": "no solid interference between board and airframe",
+                  "check": {
+                    "tool": "check_interference",
+                    "params_hint": {},
+                    "pass_rule": "interferences empty or volume==0"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL3",
+              "kind": "analysis",
+              "name": "flight_computer_ecad",
+              "description": "Flight-computer E2E: part sourcing, schematic, SPICE OP, PCB place/route/trace-opt, antenna/RF, DRC/DFM/PDN checks.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC4",
+                  "text": "schematic + board artifacts exist with DRC clean or WARN-only",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "legs": [
+                        "parts",
+                        "schematic",
+                        "board",
+                        "trace_opt",
+                        "checks"
+                      ]
+                    },
+                    "pass_rule": "legs parts/schematic/board not FAIL"
+                  }
+                },
+                {
+                  "id": "AC5",
+                  "text": "SPICE OP 3V3 rail within 5%",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "sim"
+                    },
+                    "pass_rule": "V(3V3) in [3.135, 3.465]"
+                  }
+                },
+                {
+                  "id": "AC6",
+                  "text": "antenna design produced (openEMS or analytic degrade documented)",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "antenna"
+                    },
+                    "pass_rule": "PASS or SKIP with provision note"
+                  }
+                }
+              ],
+              "depends_on": [],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL4",
+              "kind": "analysis",
+              "name": "firmware_sensor_loop",
+              "description": "STM32F4 firmware project from pinmap, build, Renode sensor-in-the-loop climb_turn_profile scenario.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC7",
+                  "text": "fw_build succeeds (ELF produced)",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "firmware"
+                    },
+                    "pass_rule": "fw_build returncode==0"
+                  }
+                },
+                {
+                  "id": "AC8",
+                  "text": "Renode sensor loop PASS or honest SKIP if unprovisioned",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "leg": "sensor_loop"
+                    },
+                    "pass_rule": "PASS|SKIP(renode)"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL3"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            },
+            {
+              "id": "DL5",
+              "kind": "report",
+              "name": "mission_report_card",
+              "description": "Consolidated PASS/WARN/FAIL/SKIP card for all legs + power_budget rollup.",
+              "acceptance_criteria": [
+                {
+                  "id": "AC9",
+                  "text": "report lists every leg with a verdict",
+                  "check": {
+                    "tool": "manual",
+                    "params_hint": {
+                      "legs": [
+                        "plan",
+                        "parts",
+                        "schematic",
+                        "sim",
+                        "board",
+                        "trace_opt",
+                        "antenna",
+                        "checks",
+                        "firmware",
+                        "sensor_loop",
+                        "power",
+                        "airframe"
+                      ]
+                    },
+                    "pass_rule": "all legs have PASS|WARN|FAIL|SKIP"
+                  }
+                }
+              ],
+              "depends_on": [
+                "DL1",
+                "DL2",
+                "DL3",
+                "DL4"
+              ],
+              "target_refs": {
+                "doc_id": null,
+                "features": []
+              },
+              "status": "pending"
+            }
+          ],
+          "ambiguities": [],
+          "assumptions": [
+            {
+              "text": "Manual acceptance criteria (AC4–AC9) are satisfied when the corresponding MCP leg tools return non-FAIL results or honest SKIP with provision notes; reviewer confirms from ledger artifacts.",
+              "basis": "flight_computer E2E bench protocol (benchmarks/flight_computer)",
+              "needs_confirm": true
+            },
+            {
+              "text": "MCU family STM32F4; sensors I2C MPU6050@0x68, BMP280@0x76, LIS3MDL, UART GPS",
+              "basis": "B1 flight-computer benchmark BOM",
+              "needs_confirm": false
+            },
+            {
+              "text": "openEMS/Renode may be absent — degrade with SKIP, never fabricate results",
+              "basis": "contracts honesty rule",
+              "needs_confirm": false
+            }
+          ]
+        }
+      }
+    ],
+    "criterion_results": [],
+    "features": [],
+    "geometry_specs": [],
+    "linkages": [],
+    "build_nodes": []
+  }
+}

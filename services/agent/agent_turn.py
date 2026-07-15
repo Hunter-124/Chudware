@@ -102,6 +102,27 @@ class TurnResult:
         self.result = result
 
 
+
+def _with_usage(result: dict, tu_mod: Any = None) -> dict:
+    """Attach turn token usage onto a TurnResult.result dict (mega-6)."""
+    if not isinstance(result, dict):
+        return result
+    if tu_mod is None:
+        return result
+    try:
+        usage = tu_mod.get_turn_usage()
+    except Exception:  # noqa: BLE001
+        return result
+    if not usage or int(usage.get("total_tokens") or 0) <= 0:
+        # Still stamp recorded=false so graders can see the gap.
+        result.setdefault("usage", usage or {})
+        result.setdefault("provider_usage_recorded", False)
+        return result
+    result["usage"] = usage
+    result["provider_usage_recorded"] = True
+    result["tokens_used"] = int(usage.get("total_tokens") or 0)
+    return result
+
 _SYSTEM_BASE = (
     "You are an AI-CAD role agent executing one node of a mission. You may call "
     "tools to inspect and modify the engine. To call a tool, reply with a single "
@@ -267,6 +288,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     tool_calls_made = 0
     last_reason = _NOCODE
     _prev_stage: str | None = None
+    # mega-6: accumulate provider token usage across complete() calls.
+    try:
+        from services.agent.providers import token_usage as _tu  # noqa: PLC0415
+        _tu.begin_turn_usage()
+    except Exception:  # noqa: BLE001
+        _tu = None  # type: ignore
 
     # AI-VC v2: checkpoint BEFORE the user prompt turn (kind=prompt).
     # msg_idx is the GUI chat message ordinal; optional, default None.
@@ -322,25 +349,110 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 pass
         try:
             reply = provider.complete(system, messages, max_tokens=completion_cap)
+            # mega-6: drain last-call usage into ledger so spend is auditable.
+            if _tu is not None and ledger is not None:
+                try:
+                    last_u = _tu.get_last_usage()
+                    if last_u and int(last_u.get("total_tokens") or 0) > 0:
+                        ledger.append(actor or name, "agent_turn", {
+                            "event": "provider_usage",
+                            "provider": last_u.get("provider"),
+                            "model": last_u.get("model"),
+                            "prompt_tokens": last_u.get("prompt_tokens"),
+                            "completion_tokens": last_u.get("completion_tokens"),
+                            "total_tokens": last_u.get("total_tokens"),
+                            "source": last_u.get("source") or "api",
+                            "provider_usage_recorded": True,
+                        })
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
             stop, retryable = classify_provider_error(exc)
-            _log(ledger, actor, {
-                "event": "provider_error",
-                "error": str(exc),
-                "stop_reason": stop,
-                "retryable": retryable,
-            })
-            if stop == _PROVIDER_AUTH:
+            # mega-6: ollama/local leaf failures must not block — one-shot degrade
+            # to openrouter free when keyed, else report retryable failed.
+            err_l = f"{type(exc).__name__}: {exc}".lower()
+            localish = any(
+                m in err_l for m in (
+                    "connection refused", "could not reach", "model not found",
+                    "not found", "failed to load", "no such model",
+                    "11434", "ollama",
+                )
+            )
+            recovered = False
+            if localish and not getattr(provider, "_mega6_degraded", False):
+                try:
+                    from services.agent import config as agent_config  # noqa: PLC0415
+                    import os as _os  # noqa: PLC0415
+                    cfg = dict(agent_config.load_config() or {})
+                    or_cfg = dict(cfg.get("openrouter") or {})
+                    or_key = (
+                        or_cfg.get("api_key")
+                        or cfg.get("openrouter_api_key")
+                        or _os.environ.get("OPENROUTER_API_KEY")
+                    )
+                    if or_key:
+                        cfg_or = dict(cfg)
+                        cfg_or["api_key"] = or_key
+                        cfg_or["model"] = "mistralai/mistral-small:free"
+                        cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
+                        alt = agent_config.get_provider(
+                            name="openrouter", cfg=cfg_or)
+                        setattr(alt, "_mega6_degraded", True)
+                        provider = alt
+                        _log(ledger, actor, {
+                            "event": "provider_degrade",
+                            "to": "openrouter",
+                            "model": cfg_or["model"],
+                            "error": str(exc)[:200],
+                        })
+                        reply = provider.complete(
+                            system, messages, max_tokens=completion_cap)
+                        if _tu is not None and ledger is not None:
+                            try:
+                                last_u = _tu.get_last_usage()
+                                if last_u and int(
+                                        last_u.get("total_tokens") or 0) > 0:
+                                    ledger.append(
+                                        actor or name, "agent_turn", {
+                                            "event": "provider_usage",
+                                            "provider": last_u.get("provider"),
+                                            "model": last_u.get("model"),
+                                            "prompt_tokens": last_u.get(
+                                                "prompt_tokens"),
+                                            "completion_tokens": last_u.get(
+                                                "completion_tokens"),
+                                            "total_tokens": last_u.get(
+                                                "total_tokens"),
+                                            "source": last_u.get("source")
+                                            or "api",
+                                            "provider_usage_recorded": True,
+                                            "degraded": True,
+                                        })
+                            except Exception:  # noqa: BLE001
+                                pass
+                        recovered = True
+                except Exception:  # noqa: BLE001
+                    recovered = False
+            if not recovered:
                 _log(ledger, actor, {
-                    "event": "provider_fatal",
+                    "event": "provider_error",
                     "error": str(exc),
                     "stop_reason": stop,
+                    "retryable": retryable,
                 })
-            return TurnResult(False, stop,
-                              {"error": f"provider error: {exc}",
-                               "calls": calls,
-                               "retryable": retryable,
-                               "stop_reason": stop})
+                if stop == _PROVIDER_AUTH:
+                    _log(ledger, actor, {
+                        "event": "provider_fatal",
+                        "error": str(exc),
+                        "stop_reason": stop,
+                    })
+                return TurnResult(False, stop,
+                                  {"error": f"provider error: {exc}",
+                                   "calls": calls,
+                                   "retryable": retryable,
+                                   "stop_reason": stop,
+                                   "usage": (_tu.get_turn_usage()
+                                             if _tu else None)})
 
         messages.append({"role": "assistant", "content": _parts(reply)})
         # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer
@@ -376,7 +488,9 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     messages.append({"role": "user", "content": _parts(block)})
                     continue
                 return TurnResult(True, _DONE,
-                                  {"handoff": bare_handoff, "calls": calls})
+                                  _with_usage(
+                                      {"handoff": bare_handoff, "calls": calls},
+                                      _tu))
             last_reason = _NOCODE
             break
 
@@ -409,7 +523,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 messages.append({"role": "user", "content": _parts(block)})
                 continue
             _log(ledger, actor, {"event": "turn", "kind": "done", "handoff": handoff})
-            return TurnResult(True, _DONE, {"handoff": handoff, "calls": calls})
+            return TurnResult(True, _DONE,
+                              _with_usage({"handoff": handoff, "calls": calls}, _tu))
 
         tool = parsed.get("tool")
         args = parsed.get("args") or {}
@@ -498,6 +613,36 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 
+        # mega-6 BUILD mortality: after new_part the model often thrash-preflights
+        # without ever calling add_features (live: new_part + preflight×7 → empty solid).
+        # One explicit nudge after a successful bootstrap; never invent geometry.
+        if ok and tool == "new_part" and "add_features" in (allow or set()):
+            try:
+                doc = None
+                if isinstance(result, dict):
+                    doc = result.get("doc_id") or (result.get("result") or {}).get("doc_id")
+                messages.append({"role": "user", "content": _parts(
+                    "[BUILD enablement] Part doc bootstrapped"
+                    + (f" (doc_id={doc})" if doc else "")
+                    + ". Next you MUST call add_features with at least one solid "
+                    "feature (box/sketch+extrude/revolve/…) using this doc_id. "
+                    "Do NOT spend the remaining tool budget on more ledger_get or "
+                    "preflight_ops until add_features has succeeded once."
+                )})
+            except Exception:  # noqa: BLE001
+                pass
+        # Same class: preflight thrash without a mutation after new_part.
+        if ok and tool == "preflight_ops":
+            n_new = sum(1 for c in calls if c.get("ok") and c.get("tool") == "new_part")
+            n_add = sum(1 for c in calls if c.get("ok") and c.get("tool") == "add_features")
+            n_pf = sum(1 for c in calls if c.get("tool") == "preflight_ops")
+            if n_new > 0 and n_add == 0 and n_pf >= 2 and "add_features" in (allow or set()):
+                messages.append({"role": "user", "content": _parts(
+                    "[BUILD enablement] preflight_ops has run without add_features. "
+                    "STOP preflight thrash. Call add_features NOW with a concrete "
+                    "first feature (e.g. box or sketch+extrude) on the active doc_id."
+                )})
+
         # AI-VC: post-success path retains create tools (doc_id only after call)
         # and stamps provenance. Pre-tool checkpoint (above) is the v2 primary.
         if ok:
@@ -562,14 +707,33 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     # return max_iters so pure thrash is visible.
     # mega-2: also accept buildgraph_plan / new_part / fw_new_project so
     # PLAN/BUILD handoffs of the same class complete (plan_incomplete class).
+    # mega-6: new_part alone is NOT product success — live BUILD DL1 auto-completed
+    # after new_part + preflight thrash with zero add_features (empty solid).
+    # Geometry/ECAD/FW mutators are the real product signal; new_part is bootstrap.
     _PRODUCTIVE_TOOLS = frozenset({
         "ledger_note", "buildgraph_plan", "dag_plan", "add_features",
-        "new_part", "ecad_new_schematic", "fw_new_project", "fw_build",
+        "ecad_new_schematic", "fw_new_project", "fw_build",
         "verify_battery",
     })
+    _BOOTSTRAP_ONLY = frozenset({"new_part"})
     wrote = any(
         c.get("ok") and c.get("tool") in _PRODUCTIVE_TOOLS for c in calls
     )
+    bootstrapped_only = (
+        not wrote
+        and any(c.get("ok") and c.get("tool") in _BOOTSTRAP_ONLY for c in calls)
+    )
+    # If the role can mutate geometry and did new_part, require add_features
+    # before treating the turn as productively complete.
+    if (
+        any(c.get("ok") and c.get("tool") == "new_part" for c in calls)
+        and "add_features" in (allow or set())
+        and not any(
+            c.get("ok") and c.get("tool") == "add_features" for c in calls
+        )
+    ):
+        wrote = False
+        bootstrapped_only = True
     if (tool_calls_made > 0
             and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
             and wrote):
@@ -599,14 +763,48 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         _log(ledger, actor, {"event": "turn", "kind": "done",
                              "handoff": synth, "auto": True})
         return TurnResult(True, _DONE,
-                          {"handoff": synth, "calls": calls,
-                           "tool_calls": tool_calls_made,
-                           "auto_complete": True})
+                          _with_usage(
+                              {"handoff": synth, "calls": calls,
+                               "tool_calls": tool_calls_made,
+                               "auto_complete": True},
+                              _tu))
     if tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"):
-        return TurnResult(True, last_reason, {"calls": calls,
-                                              "tool_calls": tool_calls_made})
-    return TurnResult(False, last_reason, {"calls": calls,
-                                           "tool_calls": tool_calls_made})
+        # mega-6: still surface a structured handoff so parent join is not null.
+        # Empty bootstrap (new_part without add_features) is NOT product success —
+        # return non-success so the node can retry instead of auto-done.
+        status = "blocked" if bootstrapped_only else "done"
+        ok_turn = not bootstrapped_only
+        synth_partial = {
+            "status": status,
+            "summary": (
+                f"turn ended with {tool_calls_made} tool calls "
+                f"(reason={last_reason})"
+                + ("; new_part without add_features — empty solid"
+                   if bootstrapped_only else
+                   "; no formal handoff envelope")
+            ),
+            "outputs": {
+                "tool_calls": tool_calls_made,
+                "calls": [
+                    {"tool": c.get("tool"), "ok": c.get("ok")}
+                    for c in calls[:20]
+                ],
+                "bootstrapped_only": bootstrapped_only,
+                "reasoning_summary": (
+                    "new_part ran but add_features never did; empty solid is "
+                    "not BUILD product success (mega-6)."
+                    if bootstrapped_only else
+                    "Partial turn completed with tools; synthesised handoff "
+                    "for parent join plumbing (mega-6)."
+                ),
+            },
+        }
+        return TurnResult(ok_turn, last_reason, _with_usage(
+            {"handoff": synth_partial, "calls": calls,
+             "tool_calls": tool_calls_made,
+             "bootstrapped_only": bootstrapped_only}, _tu))
+    return TurnResult(False, last_reason, _with_usage(
+        {"calls": calls, "tool_calls": tool_calls_made}, _tu))
 
 
 # ---------------------------------------------------------------------------

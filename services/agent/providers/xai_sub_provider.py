@@ -741,6 +741,20 @@ class XAISubProvider(Provider):
         thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
         if thinking == content:
             thinking = ""
+        # mega-6: capture token usage from OpenAI-shaped response body.
+        try:
+            from . import token_usage as _tu  # noqa: PLC0415
+            u = _tu.extract_openai_usage(resp)
+            _tu.record_usage(
+                provider=self.name,
+                model=str(self.model or ""),
+                prompt_tokens=u.get("prompt_tokens"),
+                completion_tokens=u.get("completion_tokens"),
+                total_tokens=u.get("total_tokens"),
+                source="api",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return content, thinking
 
     def complete(

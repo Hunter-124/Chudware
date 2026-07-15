@@ -1,0 +1,16 @@
+{
+  "status": "blocked",
+  "phase": "specify",
+  "phases_completed": [
+    "intake"
+  ],
+  "stop_reason": "specify_incomplete",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-6-fc-rocket-20260714/ledger.json",
+  "run_id": "mega-6-fc-rocket-20260714",
+  "mode": "real",
+  "wall_s": 3.91,
+  "conservation": true,
+  "baseline_commit": "563fb2c0",
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-6-fc-rocket-20260714/ledger.json"
+}

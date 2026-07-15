@@ -464,14 +464,31 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         # or minted by the blessed PKCE login and stored as api_key (contract §4.1).
         from .providers.openrouter_provider import OpenRouterProvider, DEFAULT_MODEL
 
-        key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
         oc = cfg.get("openrouter", {}) or {}
+        key = (
+            (oc.get("api_key") if isinstance(oc, dict) else None)
+            or cfg.get("api_key")
+            or cfg.get("openrouter_api_key")
+            or os.environ.get("OPENROUTER_API_KEY")
+        )
+        if not key:
+            # mega-6: never construct a keyless OpenRouter client — complete would
+            # 401 as provider_auth and kill every depth-0 auto_pick free leaf.
+            raise ValueError(
+                "openrouter provider requires an API key "
+                "(config openrouter.api_key / OPENROUTER_API_KEY); "
+                "auto_pick must skip keyless openrouter"
+            )
         model = cfg.get("model", DEFAULT_MODEL)
         caps = _catalog_caps("openrouter", model, cfg)
-        vision = oc["vision"] if "vision" in oc else caps.get("vision", True)
+        vision = (
+            oc["vision"] if isinstance(oc, dict) and "vision" in oc
+            else caps.get("vision", True)
+        )
+        timeout = float(oc.get("timeout", 120.0)) if isinstance(oc, dict) else 120.0
         prov = OpenRouterProvider(api_key=key, model=model,
                                   supports_vision=bool(vision),
-                                  timeout=float(oc.get("timeout", 120.0)))
+                                  timeout=timeout)
         return _attach_catalog_meta(prov, caps)
 
     if name == "xai":

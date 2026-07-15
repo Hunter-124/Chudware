@@ -15,6 +15,7 @@ Settings RPCs. It does NOT construct Provider objects and does NOT own
 """
 from __future__ import annotations
 
+import os
 import json
 import logging
 from dataclasses import dataclass
@@ -627,6 +628,15 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
                     str(item.get("model") or ""),
                     str(item.get("base_url") or ""),
                 )
+        # Drop keyless openrouter even from explicit lists (mega-6 401 wipe).
+        or_cfg = cfg.get("openrouter") or {}
+        has_or_key = bool(
+            (isinstance(or_cfg, Mapping) and or_cfg.get("api_key"))
+            or cfg.get("openrouter_api_key")
+            or os.environ.get("OPENROUTER_API_KEY")
+        )
+        if not has_or_key:
+            out[:] = [e for e in out if e.get("provider") != "openrouter"]
         return out
 
     if cfg.get("provider") and cfg.get("model"):
@@ -663,16 +673,24 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         _add("ollama", "llama3.2:latest", "http://127.0.0.1:11434/v1")
 
     or_cfg = cfg.get("openrouter") or {}
-    if isinstance(or_cfg, Mapping):
-        for mid in (or_cfg.get("models") or []):
-            _add("openrouter", str(mid))
-    # Free-tier OpenRouter candidates (auto_pick ranks them; construction needs key).
-    for mid in (
-        "nvidia/nemotron-ultra:free",
-        "mistralai/mistral-small:free",
-        "google/gemma-3-27b-it:free",
-    ):
-        _add("openrouter", mid)
+    # mega-6: only offer OpenRouter when a real key exists. Keyless free models
+    # auto-picked at min_rank≥3 and died as HTTP 401 provider_auth (19/19 nodes).
+    has_or_key = bool(
+        (isinstance(or_cfg, Mapping) and or_cfg.get("api_key"))
+        or cfg.get("openrouter_api_key")
+        or os.environ.get("OPENROUTER_API_KEY")
+    )
+    if has_or_key:
+        if isinstance(or_cfg, Mapping):
+            for mid in (or_cfg.get("models") or []):
+                _add("openrouter", str(mid))
+        # Free-tier OpenRouter candidates (auto_pick ranks them).
+        for mid in (
+            "nvidia/nemotron-ultra:free",
+            "mistralai/mistral-small:free",
+            "google/gemma-3-27b-it:free",
+        ):
+            _add("openrouter", mid)
 
     if cfg.get("api_key") or (cfg.get("anthropic") or {}).get("api_key"):
         _add("anthropic", str((cfg.get("anthropic") or {}).get("model") or "claude-sonnet-4"))

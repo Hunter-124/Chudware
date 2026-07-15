@@ -269,6 +269,57 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                 }
             except Exception:  # noqa: BLE001
                 pass
+            # mega-6: emit model_assignment for EVERY DAG node resolve, not only
+            # delegate spawns — live mega-6 had 0 assignment rows despite auto_pick.
+            try:
+                from services.agent import agent_events as _ae  # noqa: PLC0415
+                node_id = str(
+                    context_pack.get("node_id")
+                    or node_inputs.get("id")
+                    or role_s
+                    or "node"
+                )
+                _k, _p = _ae.model_assignment_event(
+                    node_id,
+                    depth=depth,
+                    task_class=str(task_class) if task_class else "unknown",
+                    min_rank=min_rank,
+                    picked_model=assignment.model,
+                    picked_provider=assignment.provider,
+                    cost_tier=cost_tier_for(
+                        assignment.provider, assignment.model),
+                    mode=assignment.mode,
+                    rank=assignment.rank,
+                    reason=assignment.reason,
+                    role=str(role),
+                    actor=str(
+                        context_pack.get("node_name")
+                        or context_pack.get("role_id")
+                        or role
+                    ),
+                )
+                sink = context_pack.get("_event_sink")
+                _ae.emit_event(_k, _p, live=sink, journal=None)
+                ledger = context_pack.get("ledger")
+                if ledger is not None:
+                    try:
+                        ledger.append(
+                            str(context_pack.get("node_name") or role or "agent"),
+                            "note",
+                            {
+                                "event": "model_assignment",
+                                **{k: _p.get(k) for k in (
+                                    "depth", "task_class", "min_rank",
+                                    "picked_model", "picked_provider",
+                                    "cost_tier", "mode", "rank", "reason",
+                                    "role",
+                                )},
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001 — never block on telemetry
+                pass
             prov_name = assignment.provider
             if prov_name == "ollama":
                 prov_name = "openai"
@@ -278,8 +329,52 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                 )
             try:
                 return agent_config.get_provider(name=prov_name, cfg=cfg_pick)
-            except Exception:  # noqa: BLE001 — try next priority
-                pass
+            except Exception as exc:  # noqa: BLE001 — try degrade chain
+                # mega-6: local leaf may need pull / not running — never block.
+                # Prefer openrouter free when keyed, else fall through to injected.
+                try:
+                    from services.agent.providers import token_usage as _tu  # noqa: PLC0415
+                    _ = _tu  # silence unused when import works
+                except Exception:  # noqa: BLE001
+                    pass
+                err_s = f"{type(exc).__name__}: {exc}".lower()
+                local_fail = (
+                    assignment.provider in ("ollama", "llamacpp", "lmstudio", "openai")
+                    or "connection" in err_s
+                    or "not found" in err_s
+                    or "model" in err_s and "load" in err_s
+                )
+                if local_fail:
+                    or_cfg = dict(cfg.get("openrouter") or {})
+                    or_key = (
+                        or_cfg.get("api_key")
+                        or cfg.get("openrouter_api_key")
+                        or cfg.get("api_key")
+                    )
+                    import os as _os  # noqa: PLC0415
+                    or_key = or_key or _os.environ.get("OPENROUTER_API_KEY")
+                    if or_key:
+                        try:
+                            cfg_or = dict(cfg)
+                            cfg_or["api_key"] = or_key
+                            cfg_or["model"] = "mistralai/mistral-small:free"
+                            cfg_or["openrouter"] = {**or_cfg, "api_key": or_key}
+                            prov = agent_config.get_provider(
+                                name="openrouter", cfg=cfg_or)
+                            try:
+                                context_pack["role_model"] = {
+                                    **(context_pack.get("role_model") or {}),
+                                    "provider": "openrouter",
+                                    "model": cfg_or["model"],
+                                    "degraded_from": assignment.provider,
+                                    "degrade_reason": str(exc)[:200],
+                                }
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return prov
+                        except Exception:  # noqa: BLE001
+                            pass
+                # fall through to injected / tier / ambient
     except Exception:  # noqa: BLE001 — never block node on role_models
         pass
 
@@ -317,6 +412,12 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     from services.agent import agent_turn  # noqa: PLC0415
 
     node_name = context_pack.get("node_name", "dag_node")
+    # mega-6: make ledger available to _resolve_provider for model_assignment notes.
+    if ledger is not None and context_pack.get("ledger") is None:
+        try:
+            context_pack["ledger"] = ledger
+        except Exception:  # noqa: BLE001
+            pass
     try:
         resolved_provider = _resolve_provider(context_pack, provider)
     except Exception as exc:  # noqa: BLE001 — no constructible provider

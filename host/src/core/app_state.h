@@ -1029,6 +1029,10 @@ struct AppState {
     std::string setupMsg;
     std::string status;
     int statusKind = 0;  // 0 = ok (teal), 1 = build issue (amber), 2 = system error (red)
+    // H2: engine daemon socket dead / hello failed mid-session. Sticky status-bar
+    // chip ("Engine daemon unreachable — retrying"); cleared on reconnect. Never
+    // toast-spammed — one sticky notice only (see engine_events.cpp).
+    bool daemonUnreachable = false;
     bool autoSetupTried = false;    // guard so startup auto-heal runs once, not in a loop
     bool importRepairTried = false; // guard so per-job ModuleNotFoundError repair runs once
     bool starterTried = false;      // guard so the launch default-part creation runs once
@@ -1316,6 +1320,12 @@ struct AppState {
     // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body assembly + angle mate + playback).
     bool wantMotion = false;        // AI_CAD_SHOT=motion scripted motion study scenario
     bool motionShotDone = false;    // guard so the motion scenario runs exactly once
+    // H2: AI_CAD_SHOT=daemon_h2 — kill hostd mid-session, capture the sticky
+    // "Engine daemon unreachable" chip, respawn hostd, capture repopulated tabs.
+    bool wantDaemonH2 = false;
+    int  daemonH2Phase = 0;     // 0=seed 1=killed 2=notice 3=respawned 4=done
+    double daemonH2PhaseT = 0;  // ImGui time when the current phase began
+    int  daemonH2CaptureFrame = 0;  // absolute frame to take the final screenshot (0=unset)
 
     // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
     // C39: guarded by toastsMtx — the worker errorSink posts toasts from background threads

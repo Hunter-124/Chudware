@@ -350,19 +350,32 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   AC5 finite V(3V3); ≥8 live AC. Findings: `reports/runs/mega-18/findings.md`.
 - 2026-07-15 mega-19 (WS5): close mega-18 residuals under
   `reports/runs/mega-19/` (primary `mega-19-fc-rocket-20260715`).
-  Baseline `6d11238b`. Fixer19 (ColdMuskox) bound D19 power-satisfied
-  (add_power OR existing power symbols/nets), A19 rail wire prefs, B19 board
-  doc_id threading, C19 Device:V pre-sim + measure_between; post-a1 rebind
-  force cascade after power success (118p; 6 reds green). Preflight PASS:
-  account `06dc3359` ACTIVE, hard→xai-sub grok-4.5 EXACT, mid openrouter
-  deepseek, leaf ollama; hostd matches disk. **a1** wall 459s live 6/9
-  (archived `attempt-1-…`). **a2** wall **595s** terminal `done`/
-  `deliver_partial` live AC PASS **6**/9. Axes a2: **D19 PASS**, **C19 PASS**,
-  A19/B19 FAIL (power×8 but wire=0; force_inject still 0 live; DRC sch;
-  board_from_schematic=0), Z1 PASS, **Z3 PASS** (empty-netlist residual
-  closed), **Z4 PASS**, G18 PARTIAL (6<7), Y PASS, Fix8 PASS, X PASS.
-  Residuals: live force cascade after power; board_doc_id→DRC; finite V(3V3);
-  ≥8 live AC. Findings: `reports/runs/mega-19/findings.md`.
+  Baseline `6d11238b`. Fixer19 (ColdMuskox) bound D19 power-satisfied,
+  A19 rail wire prefs, B19 board doc_id, C19 V-source/measure; rebind1
+  force-after-power; rebind2 cascade budget past thrash (119p). Preflight
+  PASS: account `06dc3359`, hard→grok-4.5 EXACT, mid deepseek, leaf ollama.
+  **a1** 459s live 6 (force idle; archived). **a2** 595s live 6 (budget
+  starve pre-wire; archived). **a3** wall **510s** live AC **4**/9 (AC6–9;
+  mech AC1–3 starved). Axes a3: **D19/C19 PASS**, A19/B19 **PARTIAL**
+  (force cascade fires: power→R place→**U1↔R1 wire** not rail; board+DRC on
+  board doc `5cc769570819` clean; ERC power_not_driven remains), Z1/Z3/Z4/Y/
+  Fix8/W/X PASS, G18 PARTIAL. Residual → Fixer20 rail wire + ERC clean +
+  finite V(3V3). Findings: `reports/runs/mega-19/findings.md`.
 
 
+
+- 2026-07-15 mega-20 (WS5): close mega-19 A19/B19 live residuals under
+  `reports/runs/mega-20/` (primary `mega-20-fc-rocket-20260715`).
+  Baseline `b0e66f3d`. Fixer20 (LiberalWarbler) bound A20 power-pin rebond
+  (no #PWR ref; unbonded power_in xy) + B20 board_doc_id on forced/model DRC
+  (127p). DaemonFix (DrivingHippopotamus) H1+H3 hostd `night2-3075-gb0e66f3d-dirty`.
+  Preflight PASS: account `06dc3359` ACTIVE, hard→xai-sub grok-4.5 EXACT, mid
+  openrouter deepseek (key restored env-only), leaf ollama; hostd matches disk.
+  **a1** wall **404s** terminal `done`/`deliver_partial` live AC PASS **5**/9
+  (AC4/6/7/8/9). Axes a1: **A20 PASS** (VIN.+→R1.1 rail wire; power_not_driven=0;
+  AC4 DRC+ERC clean), **B20 PASS** (board `c01d5499cdb8` DRC errors=0; S PASS),
+  C19/D19/Z1/Z3/Z4/Y/Fix8 PASS; W/Z2/Z2r FAIL (no force/add_power — model VIN
+  path); G18 PARTIAL (5<7). Residuals: mech AC1–3 (no new_part), finite V(3V3),
+  force cascade optional when model skips add_power. Findings:
+  `reports/runs/mega-20/findings.md`.
 

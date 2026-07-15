@@ -268,8 +268,17 @@ void saveSettings(const Settings& s) {
     } catch (...) {
         j = nlohmann::json::object();  // corrupt/absent file: rebuild GUI-owned keys only
     }
+    // Capture partially-modeled maps BEFORE erase. config.json "keys" is shared with the
+    // agent harness (openrouter, etc.); "experimental" may grow fields the GUI doesn't
+    // model. Rebuild-from-struct alone wiped unknown entries on every save (same class as
+    // the 2026-07-14 subscription_auth wipe). Overlay GUI-owned slots onto the on-disk map.
+    nlohmann::json keysOut = nlohmann::json::object();
+    if (j.contains("keys") && j["keys"].is_object()) keysOut = j["keys"];
+    nlohmann::json expOut = nlohmann::json::object();
+    if (j.contains("experimental") && j["experimental"].is_object()) expOut = j["experimental"];
     // Erase GUI-owned keys that are conditionally emitted below, so stale values never linger
-    // after the user clears them or switches provider. Unknown keys survive untouched.
+    // after the user clears them or switches provider. Unknown top-level keys survive untouched.
+    // "keys" / "experimental" are re-emitted via merge-overlay (not a full replace).
     for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "keys",
                           "reasoning_effort", "max_iters", "max_output_tokens", "context_window",
                           "system_prompt", "appearance", "workspace_dir", "hidden_models",
@@ -323,10 +332,15 @@ void saveSettings(const Settings& s) {
         };
     }
     // Persist every provider's key so switching providers never loses one, and the picker
-    // can tell which providers are usable. The active provider's key is also the top-level
-    // api_key above (what resolve_provider reads).
-    j["keys"] = {{"gemini", s.geminiKey}, {"anthropic", s.anthropicKey}, {"openai", s.openaiKey},
-                 {"cloud_compat", s.cloudKey}, {"xai", s.xaiKey}};
+    // can tell which providers are usable. Overlay onto the on-disk keys map so unknown
+    // entries (e.g. keys.openrouter written by the agent harness) survive a load→save
+    // round-trip. The active provider's key is also the top-level api_key above.
+    keysOut["gemini"] = s.geminiKey;
+    keysOut["anthropic"] = s.anthropicKey;
+    keysOut["openai"] = s.openaiKey;
+    keysOut["cloud_compat"] = s.cloudKey;
+    keysOut["xai"] = s.xaiKey;
+    j["keys"] = std::move(keysOut);
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
@@ -373,22 +387,23 @@ void saveSettings(const Settings& s) {
     if (!s.disabledProviders.empty())
         j["disabled_providers"] =
             std::vector<std::string>(s.disabledProviders.begin(), s.disabledProviders.end());
-    // Experimental AI features. Only emit the block when something is enabled/customized, so a
-    // default config stays clean and the core's apply_experimental is a no-op.
-    if (s.expVisionReview || s.expCadSequenceMode) {
-        nlohmann::json exp = nlohmann::json::object();
-        if (s.expVisionReview) {
-            exp["vision_review"] = {
-                {"enabled", true},
-                {"model", s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct"},
-                {"base_url", s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
-                                                   : "http://localhost:1234/v1"},
-                {"api_key", s.expVisionKey},
-            };
-        }
-        if (s.expCadSequenceMode) exp["cad_sequence_mode"] = true;
-        j["experimental"] = exp;
+    // Experimental AI features. Merge-overlay: keep unknown fields in the on-disk
+    // experimental block; only rewrite/clear the slots the GUI models. Omit the whole
+    // block when nothing remains so a default config stays clean.
+    if (s.expVisionReview) {
+        expOut["vision_review"] = {
+            {"enabled", true},
+            {"model", s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct"},
+            {"base_url", s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
+                                               : "http://localhost:1234/v1"},
+            {"api_key", s.expVisionKey},
+        };
+    } else {
+        expOut.erase("vision_review");
     }
+    if (s.expCadSequenceMode) expOut["cad_sequence_mode"] = true;
+    else expOut.erase("cad_sequence_mode");
+    if (!expOut.empty()) j["experimental"] = std::move(expOut);
     try {
         std::filesystem::create_directories(appdataAppDir());
         // Atomic-ish write: tmp + rename, so a concurrent Python reader/writer never sees a

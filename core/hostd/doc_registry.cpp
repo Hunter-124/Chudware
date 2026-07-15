@@ -1,6 +1,7 @@
 #include "doc_registry.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 
 #include "hostd_log.h"
@@ -76,10 +77,13 @@ int DocRegistry::holdSecs() const {
     return 120;
 }
 
-// Doc-GC knobs. Grace default 90 s: long enough for the GUI to adopt a doc a
+// Doc-GC knobs. Base grace default 90 s: long enough for the GUI to adopt a doc a
 // disconnecting agent just minted (and for quick app relaunches), short enough
 // that zombie docs never pile up behind dead sessions.
-static long long gcGraceMs() {
+// Agent/mcp-origin docs get AICAD_DOC_GC_AGENT_GRACE_S (default 1800 s / 30 min)
+// so mission-built parts remain listed after the agent detaches — the GUI can
+// still open them after a run finishes.
+static long long gcGraceMsBase() {
     static const long long ms = [] {
         if (const char* v = std::getenv("AICAD_DOC_GC"); v && *v && std::atoi(v) == 0)
             return -1LL;  // disabled
@@ -90,12 +94,41 @@ static long long gcGraceMs() {
     return ms;
 }
 
+static long long gcAgentGraceMs() {
+    static const long long ms = [] {
+        if (const char* v = std::getenv("AICAD_DOC_GC"); v && *v && std::atoi(v) == 0)
+            return -1LL;
+        if (const char* v = std::getenv("AICAD_DOC_GC_AGENT_GRACE_S"); v && *v)
+            return (long long)std::max(1, std::atoi(v)) * 1000;
+        return 1'800'000LL;  // 30 min
+    }();
+    return ms;
+}
+
+static bool isAgentOrigin(const std::string& originKind) {
+    return originKind == "mcp" || originKind == "agent";
+}
+
+// Grace for an abandoned doc: agent/mcp-origin uses the longer agent grace so
+// mission-built parts survive past the default 90 s orphan window.
+static long long gcGraceMsForOrigin(const std::string& originKind) {
+    const long long base = gcGraceMsBase();
+    if (base < 0) return -1LL;
+    if (isAgentOrigin(originKind)) {
+        const long long agent = gcAgentGraceMs();
+        if (agent < 0) return -1LL;
+        // Agent grace is a floor for agent-origin docs — never shorter than base.
+        return std::max(base, agent);
+    }
+    return base;
+}
+
 void DocRegistry::updateOrphanDeadlineLocked(DocState& d) {
     if (!d.attach.empty()) {
         d.orphanDeadlineMs = 0;
         return;
     }
-    const long long grace = gcGraceMs();
+    const long long grace = gcGraceMsForOrigin(d.originKind);
     if (grace < 0) return;                                   // GC disabled
     if (d.orphanDeadlineMs == 0) d.orphanDeadlineMs = monoMs() + grace;
 }

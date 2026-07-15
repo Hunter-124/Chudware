@@ -12,7 +12,9 @@
 //   aicad-hostd --status        print daemon_status of the running instance
 //   aicad-hostd --stop          ask the running instance to drain and exit
 //                               (refused while agent children run; add --force
-//                               to stop them first)
+//                               to stop them first). If the socket is dead but
+//                               the pidfile process still lives, escalate:
+//                               SIGTERM, wait 3s, then SIGKILL.
 //   aicad-hostd --version       print build id + engine ABI
 //
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
@@ -39,6 +41,9 @@
 #else
 #include <limits.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <cstring>
 #endif
 
 #include "../../services/ipc/ipc_client.h"
@@ -93,9 +98,116 @@ static long selfPid() { return (long)::getpid(); }
 
 #endif
 
+#ifndef _WIN32
+// Read the PID recorded in the instance lock file (diagnostics written by
+// SingleInstance::acquire). Returns 0 if unreadable / not a live process.
+static long readLockPid(const std::string& lockFile) {
+    if (lockFile.empty()) return 0;
+    int fd = ::open(lockFile.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[64] = {0};
+    const ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0) return 0;
+    char* end = nullptr;
+    const long pid = std::strtol(buf, &end, 10);
+    if (pid <= 1 || end == buf) return 0;
+    // Alive?
+    if (::kill((pid_t)pid, 0) != 0) return 0;
+    return pid;
+}
+
+// True while `pid` exists and is not a zombie.
+static bool pidAlive(long pid) {
+    if (pid <= 1) return false;
+    if (::kill((pid_t)pid, 0) != 0) return false;
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return false;
+    char buf[512];
+    const bool ok = std::fgets(buf, sizeof buf, f) != nullptr;
+    std::fclose(f);
+    if (!ok) return true;
+    // Format: pid (comm) state ... — state is first token after the last ')'
+    const char* rp = std::strrchr(buf, ')');
+    if (!rp || !rp[1]) return true;
+    return rp[2] != 'Z';
+}
+
+// Socket-dead fallback for --stop: the accept loop is wedged (or the sock was
+// unlinked) while the process still holds the lock. Escalate via the pidfile.
+// Returns 0 if the process was killed (or already gone); 1 if nothing to kill.
+static int stopViaPidfile(const std::string& reason) {
+    const std::string self = selfPath();
+    const std::string key = aicad_ipc::instanceKey(self);
+    const std::string lock = aicad_ipc::lockPath(key);
+    const long pid = readLockPid(lock);
+    if (pid <= 1) {
+        std::fprintf(stderr,
+                     "aicad-hostd: no running instance (%s); no live pid in %s\n",
+                     reason.c_str(), lock.empty() ? "(no lock path)" : lock.c_str());
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "aicad-hostd: socket dead (%s); escalating --stop to pid %ld via pidfile\n",
+                 reason.c_str(), pid);
+    if (::kill((pid_t)pid, SIGTERM) != 0) {
+        if (errno == ESRCH) {
+            std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
+                        "\"signal\":\"none\",\"note\":\"already gone\"}\n",
+                        pid);
+            return 0;
+        }
+        std::fprintf(stderr, "aicad-hostd: SIGTERM pid %ld failed: %s\n", pid,
+                     std::strerror(errno));
+        return 1;
+    }
+    // Wait up to 3 s for a clean exit after TERM.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!pidAlive(pid)) {
+            std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
+                        "\"signal\":\"SIGTERM\"}\n",
+                        pid);
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::fprintf(stderr,
+                 "aicad-hostd: pid %ld still alive after SIGTERM; sending SIGKILL\n",
+                 pid);
+    if (::kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
+        std::fprintf(stderr, "aicad-hostd: SIGKILL pid %ld failed: %s\n", pid,
+                     std::strerror(errno));
+        return 1;
+    }
+    // Brief wait so callers see the process gone.
+    for (int i = 0; i < 40; ++i) {
+        if (!pidAlive(pid)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
+                "\"signal\":\"SIGKILL\"}\n",
+                pid);
+    return 0;
+}
+#else
+// Windows lock is a named mutex (no pidfile). Socket-dead escalation is a
+// no-op beyond reporting the original connect failure.
+static int stopViaPidfile(const std::string& reason) {
+    std::fprintf(stderr, "aicad-hostd: no running instance (%s)\n", reason.c_str());
+    return 1;
+}
+#endif
+
 // --status / --stop [--force]: attach-only client against the same instance key.
+// --stop falls back to pidfile SIGTERM/SIGKILL when the socket is dead but the
+// process still holds the lock (wedged accept loop / half-dead daemon).
 static int controlCommand(const char* method,
-                          const nlohmann::json& params = nlohmann::json::object()) {
+                          const nlohmann::json& params = nlohmann::json::object(),
+                          bool stopEscalation = false) {
     aicad_ipc::EngineClient cli;
     aicad_ipc::EngineClient::Options opts;
     opts.hostdBin = selfPath();
@@ -103,11 +215,20 @@ static int controlCommand(const char* method,
     opts.allowSpawn = false;
     std::string err;
     if (!cli.connectOrSpawn(opts, err)) {
+        if (stopEscalation) return stopViaPidfile(err);
         std::fprintf(stderr, "aicad-hostd: no running instance (%s)\n", err.c_str());
         return 1;
     }
     nlohmann::json result;
-    if (!cli.call(method, params, result, err)) {
+    // Bound --stop so a wedged accept loop (socket up, process frozen) cannot
+    // hang the control client forever; fall through to pidfile escalation.
+    const int callTimeoutMs = stopEscalation ? 2000 : -1;
+    if (!cli.call(method, params, result, err, callTimeoutMs)) {
+        // Connected then failed mid-call (reset / timeout) — same wedged class.
+        if (stopEscalation) {
+            cli.disconnect();
+            return stopViaPidfile(err);
+        }
         std::fprintf(stderr, "aicad-hostd: %s failed: %s\n", method, err.c_str());
         return 1;
     }
@@ -125,8 +246,10 @@ int main(int argc, char** argv) {
     if (mode == "--stop") {
         // Bare --stop is refused while agent children run (mission_active);
         // --stop --force stops the children (TERM -> grace -> KILL) first.
+        // Socket-dead + live pidfile: escalate to SIGTERM / SIGKILL.
         const bool force = argc > 2 && std::string(argv[2]) == "--force";
-        return controlCommand("daemon_drain", {{"force", force}});
+        return controlCommand("daemon_drain", {{"force", force}},
+                              /*stopEscalation=*/true);
     }
     if (!mode.empty() && mode != "--foreground") {
         std::fprintf(stderr,

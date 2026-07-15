@@ -181,13 +181,68 @@ bool call(const std::string& method, const json& params, json& result, std::stri
 }
 
 bool available() {
-    if (daemonMode()) return true;
+    if (daemonMode()) {
+        // Reflect live socket health so callers don't pretend a wedged hostd is fine.
+        return g_client && g_client->connected();
+    }
     return core::cpp_core().available();
 }
 
 bool ensureLoaded(std::string& err) {
-    if (daemonMode()) return true;
+    if (daemonMode()) {
+        if (g_client && g_client->connected()) return true;
+        err = "engine daemon unreachable";
+        return false;
+    }
     return core::cpp_core().ensureLoaded(err);
+}
+
+// Backoff schedule for proactive GUI reconnect: 1s, 2s, 5s, then every 10s.
+// First detection of a dead socket tries immediately (step 0 after a failed try
+// schedules the 1s wait).
+static int reconnectBackoffMs(int failedAttempts) {
+    static const int kMs[] = {1000, 2000, 5000, 10000};
+    if (failedAttempts <= 0) return kMs[0];
+    if (failedAttempts >= 4) return kMs[3];
+    return kMs[failedAttempts - 1];
+}
+
+DaemonConnState maintainConnection() {
+    if (!daemonMode() || !g_client) return DaemonConnState::InProc;
+    // Backoff state lives for the process lifetime; reset whenever the socket is
+    // healthy so a call()-driven reconnect doesn't leave a stale nextTry delay.
+    static int failedAttempts = 0;
+    static std::chrono::steady_clock::time_point nextTry{};
+    // pollAlive surfaces peer death (HUP/EOF) without waiting for the next RPC —
+    // connected() alone stays true until something reads the dead socket.
+    if (g_client->pollAlive()) {
+        failedAttempts = 0;
+        nextTry = {};
+        return DaemonConnState::Connected;
+    }
+    // Dead socket: bounded reconnect (connect-only; no spawn — matches EngineClient
+    // call()-driven reconnect).
+    const auto now = std::chrono::steady_clock::now();
+    if (nextTry.time_since_epoch().count() != 0 && now < nextTry)
+        return DaemonConnState::Unreachable;
+
+    std::string err;
+    if (g_client->tryReconnect(err)) {
+        failedAttempts = 0;
+        nextTry = {};
+        std::fprintf(stderr, "[engine] daemon reconnected (gen=%llu)\n",
+                     (unsigned long long)g_client->reconnectGeneration());
+        return DaemonConnState::Connected;
+    }
+    ++failedAttempts;
+    const int waitMs = reconnectBackoffMs(failedAttempts);
+    nextTry = now + std::chrono::milliseconds(waitMs);
+    if (failedAttempts == 1 || failedAttempts % 5 == 0) {
+        std::fprintf(stderr,
+                     "[engine] daemon unreachable (%s) — retry in %dms (attempt %d)\n",
+                     err.c_str(), waitMs, failedAttempts);
+    }
+    return DaemonConnState::Unreachable;
 }
 
 }  // namespace engine

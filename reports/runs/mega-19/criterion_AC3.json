@@ -1,0 +1,16 @@
+{
+  "id": "AC3",
+  "result": "FAIL",
+  "check_tool": "check_interference",
+  "pass_rule": "interferences empty or volume==0",
+  "detail": "check tool reported error: no such document: doc-cpp00000031",
+  "evidence": {
+    "ok": false,
+    "error": "no such document: doc-cpp00000031",
+    "code": "unknown_doc",
+    "detail": {
+      "doc_id": "doc-cpp00000031"
+    },
+    "source": "live"
+  }
+}

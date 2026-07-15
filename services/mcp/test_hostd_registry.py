@@ -305,6 +305,9 @@ def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path)
     entry -> the user is never nagged about already-delivered AI work), while an unsaved doc
     IS retired to the orphan tier (recoverable). Discriminates ship from regression."""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")  # reap abandoned docs fast
+    # mcp-origin docs use the longer agent grace; pin it short so this test still
+    # exercises GC retirement within a few seconds.
+    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
     keep = DaemonClient()
     keep.connect()  # stays connected so the daemon doesn't linger-exit mid-test
     scratch_daemon.append(_pid(keep))
@@ -548,6 +551,7 @@ def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
     — the work stays recoverable. (A clean app quit sends doc_discard first, so
     only crash-abandoned docs reach this path.)"""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     pid = _pid(a)
@@ -581,6 +585,7 @@ def test_doc_discard_then_gc_leaves_no_recovery(scratch_daemon, monkeypatch):
     NOT leave a recovery entry — that is what keeps a normal app quit from flooding
     the recovery prompt (contrast the crash path above)."""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -632,6 +637,7 @@ def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
     """A doc still attached by ANY client (e.g. a GUI mirror tab) is never GC'd
     when another client disconnects."""
     monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -643,6 +649,36 @@ def test_attached_doc_survives_gc(scratch_daemon, monkeypatch):
     time.sleep(3.0)  # well past the 1 s grace
     ids = [d["doc_id"] for d in b.call("doc_list", {})["docs"]]
     assert doc in ids, "GC closed a doc that still had a viewer attached"
+
+
+def test_agent_origin_survives_base_gc_grace(scratch_daemon, monkeypatch):
+    """H3: mcp/agent-origin docs use AICAD_DOC_GC_AGENT_GRACE_S (default 30 min),
+    not the 90 s base grace. A disconnecting MCP client must leave its part
+    listed past the short base window so the GUI can still open it."""
+    monkeypatch.setenv("AICAD_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("AICAD_DOC_GC_AGENT_GRACE_S", "8")  # > base, still test-fast
+    keep = DaemonClient()
+    keep.connect()
+    scratch_daemon.append(_pid(keep))
+    a = DaemonClient()
+    a.connect()  # kind=mcp
+    doc = a.call("doc_new", {"name": "agent-built"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    a.close()  # last attach gone -> orphan countdown starts with AGENT grace
+
+    time.sleep(3.0)  # well past base 1 s, well under agent 8 s
+    ids = [d["doc_id"] for d in keep.call("doc_list", {})["docs"]]
+    assert doc in ids, "agent-origin doc was GC'd at base grace instead of agent grace"
+
+    # After the agent grace expires, GC may retire it.
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        time.sleep(0.5)
+        ids = [d["doc_id"] for d in keep.call("doc_list", {})["docs"]]
+        if doc not in ids:
+            break
+    assert doc not in ids, "agent-origin doc never GC'd after agent grace"
+
 
 
 def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):

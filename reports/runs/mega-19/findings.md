@@ -2,76 +2,110 @@
 
 ## Run summary
 
-- **Primary graded run ID:** `mega-19-fc-rocket-20260715` (**a2** after Fixer19 force-cascade rebind)
-- **a1 archive:** `attempt-1-primary-graded-a19-fail/` (live 6/9; force cascade idle; Z3 FAIL)
-- **Baseline commit:** `6d11238b`
-- **Fixer peer:** Fixer19=`ColdMuskox` (D19/A19/B19/C19 + post-a1 rebind force-after power; 118p)
-- **Harness peer:** MegaRun19=`UnemployedTuna`
-- **Engine:** hostd `night2-3054-gcb65bfd9-dirty` — running matches disk
-- **Frontier:** `xai-sub:grok-4.5` EXACT on `06dc3359`
-- **Mid-fallback:** openrouter paid deepseek; **Leaves:** ollama
-- **Spend Δ:** `$0.0` (guard $8 OK; frontier xai-sub)
-- **Wall a2:** **594.81s**
-- **Terminal a2:** `done` / `deliver_partial`
+- **Primary graded run ID:** `mega-19-fc-rocket-20260715` (**a3** final; rebind2 cascade budget)
+- **Archives:** `attempt-1-primary-graded-a19-fail/` (a1), `attempt-2-primary-graded-wire-zero/` (a2)
+- **Baseline:** `6d11238b`
+- **Fixer19:** ColdMuskox (D19/A19/B19/C19 + rebind1 force-after-power + rebind2 cascade budget; 119p) — **standing down** (mega-20 wave)
+- **Harness:** MegaRun19=`UnemployedTuna`
+- **Frontier:** xai-sub `grok-4.5` @ `06dc3359`; mid openrouter deepseek; leaves ollama
+- **Spend Δ:** `$0.0` (guard OK)
+- **Wall a3:** **509.8s** terminal `done`/`deliver_partial`
+- **Hand-off residual code:** Fixer20=`LiberalWarbler` (A20/B20 vs a3 ledger)
 
-### Pre-flight: PASS (a1 + a2)
+### Pre-flight: PASS (all attempts)
 
-Account ACTIVE, hard→grok-4.5, leaf→ollama, hostd match, no other xai consumer, Fixer19 fixes bound (+ rebind).
+Daemon matches disk; account ACTIVE; hard→grok-4.5; leaf→ollama; no other xai; Fixer19 fixes bound (+ rebinds).
 
 ---
 
 ## Attempt matrix
 
-| Attempt | Wall | Terminal | Live AC | A19 | B19 | C19 | D19 | Z1 | Z3 | Z4 | Y | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| a1 | 459.4s | done/deliver_partial | 6 | FAIL | FAIL | FAIL | PASS | PASS | FAIL | PASS | PASS | power×4; wire=0; empty-netlist AC5 |
-| **a2** | **594.81s** | done/deliver_partial | **6** | **FAIL** | **FAIL** | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | power×8; wire=0 still; AC5 null V; Z3/X/C19 up |
+| Attempt | Wall | Live AC | A19 | B19 | C19 | D19 | Z1 | Z3 | Z4 | Y | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| a1 | 459s | 6 | FAIL | FAIL | FAIL | PASS | PASS | FAIL | PASS | PASS | force idle; empty-netlist |
+| a2 | 595s | 6 | FAIL | FAIL | PASS | PASS | PASS | PASS | PASS | PASS | cascade budget-starved pre-wire |
+| **a3** | **509.8s** | **4** | **PARTIAL** | **PARTIAL** | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | cascade full; U1↔R1 not rail; DRC on board |
 
 ---
 
-## Axis scoreboard (a2 primary)
+## Axis scoreboard (a3)
 
 | Axis | Verdict | Evidence |
 |---|---|---|
-| **A19** | **FAIL** | ecad_add_power×8; ecad_wire=0; force_inject events=0 despite rebind unit green; ERC dirty; AC4 FAIL |
-| **B19** | **FAIL** | AC4 still sch-not-board class: check tool reported error: ok=false; board_from_schematic=0 |
-| **C19** | **PASS** | AC5 now probe null (not empty-netlist); simulate path graded; C19 PASS; AC1 still measure_between soft zero |
-| **D19** | **PASS** | PASS unit/structural |
+| **A19** | **PARTIAL** | force cascade live: wire U1.3↔R1.1 (cross-ref, not rail); rail_wire_n=0; power_not_driven remains; AC4 FAIL |
+| **B19** | **PARTIAL** | force DRC used board doc 5cc769570819 (clean DRC errors=0); AC4 FAIL on ERC errors=1 not sch-not-board; grader board_doc_ids harvest empty → PARTIAL |
+| **C19** | **PASS** | PASS: sim_n=2; honest AC5 null V; V invocation clean |
+| **D19** | **PASS** | unit green |
 | **Z1** | **PASS** | 9/9 criteria |
-| **Z2r** | **FAIL** | power live; wire/force still 0 |
-| **Z3** | **PASS** | PASS — AC5 not empty-netlist; simulate evidence present |
-| **Z4** | **PASS** | PASS — AC5 FAIL with null V(3V3) honest |
-| **G18** | **PARTIAL** | live 6 < 7; xai-sub live |
-| **Y** | **PASS** | mid deepseek enabled; free off |
-| **W** | **FAIL** | no wire; AC4 FAIL |
-| **X** | **PASS** | honest FAIL not empty-netlist |
-| **S/P** | **FAIL/FAIL** | board_from_schematic=0 |
+| **Z2r** | **PARTIAL** | force power+wire+board; not rail; AC4 FAIL |
+| **Z3** | **PASS** | simulate live OP/mna |
+| **Z4** | **PASS** | AC5 null V honest FAIL |
+| **G18** | **PARTIAL** | live 4 < 7 |
+| **Y** | **PASS** | mid deepseek enabled |
+| **W** | **PASS** | wire+power executed (force path) |
+| **X** | **PASS** | not empty-netlist |
+| **S/P** | **PARTIAL/PARTIAL** | board+drc executed; DRC clean on board doc |
 | **V** | **PASS** | no sig errors |
-| **Fix8** | **PASS** | gate live |
+| **Fix8** | **PASS** | gate + force inject live |
 
-**Live AC PASS:** **6**/9 — AC2, AC3, AC6, AC7, AC8, AC9. FAIL: AC1, AC4, AC5.
+**Live AC PASS a3:** **4**/9 — AC6, AC7, AC8, AC9. FAIL: AC1–AC5.
 
-AC1: `soft_scores_zero=['measure_between']`
-AC4: `check tool reported error: ok=false`
+AC1: `critical_scores_zero=['eval_check', 'is_manifold', 'measure_part']`
+AC4: `errors=1 (drc.errors=0, erc.errors=1)` — DRC clean on board `5cc769570819`; ERC errors=1 (power_not_driven class)
 AC5: `probe 'v(3v3)' is null in ecad_simulate payload (net '3V3' not driven / no finite value)`
 
 ---
 
-## Progress vs a1
+## a3 cascade evidence (ledger)
 
-Z3 FAIL→PASS; X FAIL→PASS; C19 FAIL→PASS; AC5 empty-netlist→null V(3V3); wire/force still idle
+1. place U1 Buck_3V3 ok on sch `596497ba8ad5`
+2. model `ecad_add_power(GND)` ok
+3. force `ecad_add_power(3V3)` ok
+4. force place `Device:R` 1k → R1
+5. force **wire U1.3 ↔ R1.1** (cross-ref, **not** power pin→rail)
+6. force `board_from_schematic` ok
+7. force `ecad_run_drc` on board doc **`5cc769570819`** → **0 errors** (B19 path fixed vs sch-not-board)
+8. force `ecad_simulate` OP probes V(3V3) → null (device_count=1; U1 no sim model)
 
-Force cascade rebind unit (`test_post_power_success_force_cascades_wire`) green, but **live a2 still never emitted `ecad_chain_force_inject` or `ecad_wire`**. Model path: place + add_power×8 then left ECAD incomplete; thrash/force-after threshold still not crossed in production turn, or gate force path not entered after successful power.
+Force inject counts (grader): power=1 wire=1 place=1 n≈7.
 
 ---
 
-## TOP residual (next)
+## Progress
 
-1. Live force cascade must actually run after model add_power success (not only unit) — emit wire power_in→rail refs (A19).
-2. board_from_schematic + board_doc_id into DRC (B19).
-3. AC5 finite V(3V3) needs driven net (source + wire to rail).
-4. AC1 measure_between soft zero → real refs or honest SKIP.
-5. Hold D19/Z1/Z3/Z4/Y/Fix8/C19; target ≥8 live AC.
+| Residual | a1 | a2 | a3 |
+|---|---|---|---|
+| Force cascade fires | no | starved | **yes** |
+| Wire live | 0 | 0 | **2** (U1-R1) |
+| Rail wire | no | no | **no** |
+| DRC on board doc | sch error | sch | **board clean** |
+| Empty-netlist AC5 | yes | no | no |
+| Live AC ≥8 | 6 | 6 | **4** (mech AC1–3 starved) |
+
+---
+
+## TOP residual → mega-20 / Fixer20
+
+1. **A19/A20:** force wire must prefer **power_in → 3V3/GND port** refs from add_power, not U1↔R1 passive.
+2. **ERC power_not_driven→0** after rail wires (AC4 full PASS).
+3. **AC5 finite V(3V3):** Device:V + wired rail (C path partial).
+4. **Mechanical AC1–3** regression this run (new_part/add_features=0) — restore parallel CAD path.
+5. Hold **D19/C19/Z1/Z3/Z4/Y/Fix8/W**.
+
+---
+
+## Fingerprints
+
+| ID | a3 |
+|---|---|
+| D19 power detect | **PASS** |
+| C19 source/AC1 invoke | **PASS** |
+| A19 rail wire | **PARTIAL** |
+| B19 board DRC doc | **PARTIAL** (board DRC live; axis harvest/AC4 ERC) |
+| Z2r force cascade | **PARTIAL** |
+| Live ≥8 | **FAIL** (4) |
+| Account 06dc3359 | ACTIVE |
+| Spend $8 | held |
 
 ---
 
@@ -79,9 +113,9 @@ Force cascade rebind unit (`test_post_power_success_force_cascades_wire`) green,
 
 ```
 reports/runs/mega-19/
-  attempt-1-primary-graded-a19-fail/   # a1 archive + NOTE.txt
+  attempt-1-primary-graded-a19-fail/
+  attempt-2-primary-graded-wire-zero/
   run_mega.py grade_run.py _preflight.py findings.md fixes.md
-  preflight_*, spawn_probe, auto_pick_smoke, daemon_preflight
-  events.jsonl ledger.json mission.json status.json  # a2
-  criterion_AC1..AC9 grade_summary run_summary status_report
+  events.jsonl ledger.json mission.json status.json  # a3
+  criterion_AC* grade_summary run_summary status_report
 ```

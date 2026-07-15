@@ -87,7 +87,9 @@ public:
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
     // client start the doc-GC grace countdown (AICAD_DOC_GC_GRACE_S, default
-    // 90 s; AICAD_DOC_GC=0 disables) — swept by tick().
+    // 90 s; AICAD_DOC_GC=0 disables) — swept by tick(). Agent/mcp-origin docs
+    // use AICAD_DOC_GC_AGENT_GRACE_S (default 1800 s) so a just-finished
+    // mission's parts stay openable from the GUI after the agent detaches.
     void onDisconnect(int clientId, const std::string& kind);
 
     // Periodic housekeeping from the accept loop (~every 500 ms): expire stale
@@ -141,7 +143,8 @@ private:
     static long sniffRevision(const nlohmann::json& result);
     int holdSecs() const;
     // Start/refresh the GC countdown when `d` has no attachments; clear it when
-    // it does. No-op when doc-GC is disabled.
+    // it does. Agent/mcp-origin docs get a longer grace (AICAD_DOC_GC_AGENT_GRACE_S).
+    // No-op when doc-GC is disabled.
     static void updateOrphanDeadlineLocked(DocState& d);
     int rwCountLocked(const DocState& d) const;
     // Queue an event for every subscriber of `docId` except `exceptClient`.

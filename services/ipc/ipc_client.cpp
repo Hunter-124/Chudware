@@ -107,7 +107,11 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
     json result;
     // Engine may still be loading; hello is a daemon-level method and answers
     // immediately with state=loading|ready — that's fine for the handshake.
-    if (!call("hello", params, result, err)) return false;
+    // Control clients (--stop/--status) never spawn and must not hang forever
+    // on a wedged accept loop: bound their hello so --stop can escalate via
+    // the pidfile. Normal clients keep the unbounded wait.
+    const int timeoutMs = (kind == "control") ? 2000 : -1;
+    if (!call("hello", params, result, err, timeoutMs)) return false;
     serverInfo_ = result;
     return true;
 }
@@ -267,6 +271,27 @@ bool EngineClient::reconnectLocked(std::string& err) {
     // — event subscriptions above all — was just reset by this new connection.
     reconnectGen_.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+bool EngineClient::tryReconnect(std::string& err) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (conn_.valid() && !conn_.eof()) return true;
+    return reconnectLocked(err);
+}
+
+bool EngineClient::pollAlive() {
+    // try_lock: same rule as drainEvents — never block the GUI behind a long RPC.
+    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return conn_.valid() && !conn_.eof();
+    if (!conn_.valid() || conn_.eof()) return false;
+    // 0 ms poll: if the peer died, readLine sets eof_ on HUP/read-0.
+    // Any push events that arrive are queued for the next drainEvents.
+    std::string line;
+    while (conn_.readLine(line, 0)) {
+        json msg = json::parse(line, nullptr, false);
+        if (!msg.is_discarded() && msg.contains("event")) events_.push_back(std::move(msg));
+    }
+    return conn_.valid() && !conn_.eof();
 }
 
 bool EngineClient::call(const std::string& method, const json& params, json& result,

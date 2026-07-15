@@ -28,6 +28,10 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <csignal>
+#include <unistd.h>
+#endif
 
 #include "bootstrap.h"
 #include "mesh.h"
@@ -44,6 +48,7 @@
 #include "core/engine_events.h"  // Phase 4: per-frame hostd event drain (daemon mode)
 #include "engine_backend.h"      // Phase 4: engine::daemonMode() (services/worker)
 #include "ipc_client.h"          // services/ipc EngineClient (orphan recovery RPCs)
+#include "ipc_discovery.h"       // H2 shot: spawnDetached/resolveHostdBin for hostd bounce
 
 #ifdef AI_CAD_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"  // CEF process lifecycle (init/pump/shutdown)
@@ -1514,6 +1519,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // Equations editor shot — seed two globals + open the dialog once the worker is ready.
     st.wantEquations = shot && shotMode && std::strcmp(shotMode, "equations") == 0;
     if (st.wantEquations) { st.showFeatureTree = true; }  // keep the FeatureManager (Equations node) visible
+    // H2: daemon reconnect resilience — kill hostd, capture unreachable chip, restart, capture tabs.
+    st.wantDaemonH2 = shot && shotMode && std::strcmp(shotMode, "daemon_h2") == 0;
+    if (st.wantDaemonH2) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     // Multi-document mid-edit scenario: open a PM form on Part A, switch to Part B and measure,
     // switch back — assert A's form/selection/hidden-body survive and B is independent (DocSession).
@@ -2457,6 +2465,129 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             } else {
                 std::printf("tree-shot: doc_new failed: %s\n", err.c_str());
                 std::fflush(stdout);
+            }
+        }
+
+        // H2: daemon_h2 shot — seed a part, kill hostd, capture the sticky unreachable
+        // chip, respawn hostd, re-bootstrap + open a part so tabs repopulate, capture.
+        // Wall-clock phases (not frame counts): hostd kill/spawn takes real seconds.
+        if (st.wantDaemonH2 && st.workerStarted) {
+            const double now = ImGui::GetTime();
+            auto killHostd = []() {
+#ifndef _WIN32
+                // Instance-scoped hard kill. --stop drain leaves client sockets open
+                // until the process fully exits (and may refuse while busy), so the
+                // GUI never sees HUP. Kill the daemon_pid from hello for a real
+                // mid-session reset — still scoped to THIS instance (never pkill -x).
+                long pid = 0;
+                if (auto* c = engine::client()) {
+                    pid = c->serverInfo().value("daemon_pid", 0L);
+                }
+                if (pid > 0) {
+                    std::printf("[daemon_h2] SIGKILL hostd pid=%ld\n", pid);
+                    std::fflush(stdout);
+                    ::kill((pid_t)pid, SIGKILL);
+                } else {
+                    // Fallback: instance-keyed --stop --force.
+                    std::string bin = aicad_ipc::resolveHostdBin("");
+                    if (bin.empty()) bin = "core/build-occt-linux/bin/aicad-hostd";
+                    std::string cmd = "\"" + bin + "\" --stop --force 2>/dev/null";
+                    int rc = std::system(cmd.c_str());
+                    (void)rc;
+                }
+                // Drop the instance sock so reconnect doesn't race a half-dead peer.
+                std::string bin = aicad_ipc::resolveHostdBin("");
+                if (bin.empty()) bin = "core/build-occt-linux/bin/aicad-hostd";
+                const std::string sock = aicad_ipc::socketPath(aicad_ipc::instanceKey(bin));
+                if (!sock.empty()) ::unlink(sock.c_str());
+#endif
+            };
+            auto spawnHostd = []() -> bool {
+                std::string err;
+                // Prefer the same resolve path EngineClient uses so we hit the right binary.
+                std::string bin = aicad_ipc::resolveHostdBin("");
+                if (bin.empty()) {
+                    // Dev-tree fallback next to the known layout.
+                    bin = "core/build-occt-linux/bin/aicad-hostd";
+                }
+                return aicad_ipc::spawnDetached(bin, "", err);
+            };
+            if (st.daemonH2Phase == 0) {
+                // Seed a live part so the pre-kill session has a real doc tab.
+                std::string err;
+                if (st.docMirror.newPart(st.worker, err)) {
+                    nlohmann::json boxOps = nlohmann::json::array();
+                    boxOps.push_back({{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},{"params",{
+                            {"length",{{"value",40.0},{"expr",nullptr}}},
+                            {"width", {{"value",30.0},{"expr",nullptr}}},
+                            {"height",{{"value",20.0},{"expr",nullptr}}}
+                        }}}}});
+                    auto r1 = st.docMirror.applyOps(st.worker, boxOps);
+                    if (r1.ok && !r1.aicm_path.empty()) {
+                        std::string le;
+                        st.loadDocMesh(r1.aicm_path, le);
+                    }
+                    std::printf("[daemon_h2] seeded doc=%s tabs=%zu\n",
+                                st.docMirror.docId().c_str(), st.docTabs.size());
+                } else {
+                    std::printf("[daemon_h2] seed newPart failed: %s\n", err.c_str());
+                }
+                std::fflush(stdout);
+                killHostd();
+                st.daemonH2Phase = 1;
+                st.daemonH2PhaseT = now;
+                std::printf("[daemon_h2] killed hostd; waiting for unreachable notice\n");
+                std::fflush(stdout);
+            } else if (st.daemonH2Phase == 1) {
+                // Wait until the sticky flag latches, or time out after ~8s and force-capture.
+                if (st.daemonUnreachable || (now - st.daemonH2PhaseT) > 8.0) {
+                    std::printf("[daemon_h2] unreachable=%d (%.1fs) — capturing notice\n",
+                                (int)st.daemonUnreachable, now - st.daemonH2PhaseT);
+                    std::fflush(stdout);
+                    st.daemonH2Phase = 2;
+                    st.daemonH2PhaseT = now;
+                }
+            } else if (st.daemonH2Phase == 2) {
+                // Hold the unreachable chip on screen, then mark a mid-shot capture
+                // (taken after ImGui::Render where dw/dh exist) and respawn hostd.
+                if ((now - st.daemonH2PhaseT) > 1.2) {
+                    // Latch notice capture for the end of this frame (backbuffer is
+                    // fully drawn only after ImGui::Render below). -1 = write notice PNG.
+                    st.daemonH2CaptureFrame = -1;
+                    bool ok = spawnHostd();
+                    std::printf("[daemon_h2] respawn hostd ok=%d (notice capture pending)\n",
+                                (int)ok);
+                    std::fflush(stdout);
+                    st.daemonH2Phase = 3;
+                    st.daemonH2PhaseT = now;
+                }
+            } else if (st.daemonH2Phase == 3) {
+                // Wait for reconnect + bootstrap, then open a fresh part so the tab
+                // strip is visibly populated in the post-reconnect capture.
+                if (!st.daemonUnreachable && (now - st.daemonH2PhaseT) > 1.5) {
+                    std::string err;
+                    if (st.docMirror.newPart(st.worker, err)) {
+                        std::printf("[daemon_h2] post-reconnect doc=%s tabs=%zu\n",
+                                    st.docMirror.docId().c_str(), st.docTabs.size());
+                    } else {
+                        std::printf("[daemon_h2] post-reconnect newPart failed: %s\n",
+                                    err.c_str());
+                    }
+                    std::fflush(stdout);
+                    st.daemonH2Phase = 4;
+                    st.daemonH2PhaseT = now;
+                    if (st.daemonH2CaptureFrame <= 0)
+                        st.daemonH2CaptureFrame = st.frame + 8;
+                } else if ((now - st.daemonH2PhaseT) > 20.0) {
+                    std::printf("[daemon_h2] reconnect timeout unreachable=%d\n",
+                                (int)st.daemonUnreachable);
+                    std::fflush(stdout);
+                    st.daemonH2Phase = 4;
+                    st.daemonH2PhaseT = now;
+                    if (st.daemonH2CaptureFrame <= 0)
+                        st.daemonH2CaptureFrame = st.frame + 8;
+                }
             }
         }
 
@@ -3771,6 +3902,29 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in tick()) until every
         // recipe is captured, then exit promptly — the --shot backbuffer capture is a throwaway.
         if (st.wantIconPipe) shotFrame = st.iconPipeShotDone ? 3 : 99999;
+        // H2 daemon_h2: wall-clock scenario. captureFrame==-1 => write the notice PNG
+        // this frame (hostd just respawned, chip still sticky). captureFrame>0 => final
+        // post-reconnect shot at that absolute frame.
+        if (st.wantDaemonH2) {
+            if (st.daemonH2CaptureFrame == -1) {
+                const char* slash = std::strrchr(screenshotPath, '/');
+                std::string midPath = slash ? std::string(screenshotPath, slash + 1) +
+                                                  "daemon_h2_notice.png"
+                                            : std::string("daemon_h2_notice.png");
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                stbi_write_png(midPath.c_str(), dw, dh, 4, flip.data(), dw * 4);
+                std::printf("[daemon_h2] notice screenshot -> %s (unreachable=%d)\n",
+                            midPath.c_str(), (int)st.daemonUnreachable);
+                std::fflush(stdout);
+                st.daemonH2CaptureFrame = 0;  // clear sentinel; wait for phase 4 latch
+            }
+            shotFrame = (st.daemonH2CaptureFrame > 0) ? st.daemonH2CaptureFrame : 99999;
+        }
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);

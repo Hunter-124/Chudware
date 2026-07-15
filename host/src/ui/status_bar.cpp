@@ -102,6 +102,34 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
             }
         }
     }
+    // H2: sticky daemon-unreachable chip — one persistent notice while hostd is
+    // down (engine_events sets st.daemonUnreachable). Not a toast storm: the chip
+    // stays until reconnect clears the flag.
+    if (st.daemonUnreachable) {
+        ImGui::SameLine();
+        static const char* kSpin[] = {"|", "/", "-", "\\"};
+        int si = static_cast<int>(ImGui::GetTime() * 6.0) & 3;
+        std::string chip = std::string("Engine daemon unreachable \xe2\x80\x94 retrying ");
+        chip += kSpin[si];
+        ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
+        ImVec2 cp  = ImGui::GetCursorScreenPos();
+        const float px = 10.0f * dpiS, py = 2.5f * dpiS;
+        ui::glassBackground(ImGui::GetWindowDrawList(),
+                            ImVec2(cp.x - px * 0.5f, cp.y - py),
+                            ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                            (tsz.y + py * 2.0f) * 0.5f / dpiS);
+        float pulse = 0.75f + 0.25f * std::sin(static_cast<float>(ImGui::GetTime()) * 4.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.statusWarn[0] * pulse, pal.statusWarn[1] * pulse,
+                   pal.statusWarn[2] * pulse, 1.0f));
+        ImGui::TextUnformatted(chip.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "The engine host daemon (aicad-hostd) is not reachable.\n"
+                "Billet will keep retrying (1s, 2s, 5s, then every 10s).\n"
+                "Agent/shared docs reappear automatically on reconnect.");
+        ImGui::PopStyleColor();
+    }
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
         // Live-phase progress chip on a frosted-glass pill so the running-job readout matches the

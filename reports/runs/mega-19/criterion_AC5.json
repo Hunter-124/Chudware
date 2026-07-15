@@ -1,0 +1,37 @@
+{
+  "id": "AC5",
+  "result": "FAIL",
+  "check_tool": "ecad_simulate",
+  "pass_rule": "V(3V3) in [3.135, 3.465]",
+  "detail": "probe 'v(3v3)' is null in ecad_simulate payload (net '3V3' not driven / no finite value)",
+  "evidence": {
+    "ok": true,
+    "doc_id": "596497ba8ad5",
+    "analysis": "op",
+    "backend": "mna",
+    "converged": true,
+    "device_count": 1,
+    "nodes": [
+      "N$3",
+      "N$6"
+    ],
+    "probes": [
+      "V(3V3)"
+    ],
+    "warnings": [
+      "U1 (Regulator_Switching:Buck_3V3): no sim model \u2014 skipped"
+    ],
+    "sim_log": [
+      "op: converged in 1 iters"
+    ],
+    "op": {
+      "V(3V3)": null
+    },
+    "reading": "no finite probe values \u2014 check connectivity / source values",
+    "hint": "OP solved: no finite probe values \u2014 check connectivity / source values.",
+    "next_actions": [
+      "ecad_status()  # the result matches the topology you built"
+    ],
+    "source": "live"
+  }
+}

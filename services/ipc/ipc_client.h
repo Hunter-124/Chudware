@@ -64,6 +64,18 @@ public:
     // but the subscription already dropped. Safe to read from any thread.
     uint64_t reconnectGeneration() const { return reconnectGen_.load(); }
 
+    // Proactive reconnect for the GUI frame loop when the socket is dead (daemon
+    // crash, --stop, network drop). Same connect-only + hello path as the
+    // call()-driven reconnect; never spawns. False when the peer is still gone
+    // (caller applies its own backoff). Bumps reconnectGeneration() on success.
+    bool tryReconnect(std::string& err);
+
+    // Non-blocking liveness probe for the GUI frame loop. Drains any pending
+    // event lines into the queue (same as drainEvents) and surfaces peer death
+    // (HUP/EOF) so connected() becomes false without waiting for the next RPC.
+    // try_locks — never stalls the render thread behind a long call().
+    bool pollAlive();
+
 private:
     bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);

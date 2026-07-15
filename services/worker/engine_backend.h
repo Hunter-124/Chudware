@@ -54,4 +54,12 @@ bool call(const std::string& method, const nlohmann::json& params,
 bool available();
 bool ensureLoaded(std::string& err);
 
+// GUI-thread daemon liveness: probes the socket and, when dead, attempts a
+// bounded reconnect with backoff (1s → 2s → 5s → every 10s). Connect-only —
+// never spawns; the operator (or another client) must bring hostd back.
+// InProc / non-daemon → Connected (no-op). Call once per frame from
+// engineEventsTick before bootstrap/drain.
+enum class DaemonConnState { InProc, Connected, Unreachable };
+DaemonConnState maintainConnection();
+
 }  // namespace engine

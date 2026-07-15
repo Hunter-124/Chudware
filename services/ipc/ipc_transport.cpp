@@ -71,7 +71,7 @@ bool IpcConn::readLine(std::string& line, int timeoutMs) {
             wait = timeoutMs - (int)elapsed;
             if (wait < 0) return false;
         }
-        struct pollfd pfd{fd_, POLLIN, 0};
+        struct pollfd pfd{fd_, POLLIN | POLLHUP | POLLERR, 0};
         int pr = ::poll(&pfd, 1, wait);
         if (pr < 0) {
             if (errno == EINTR) continue;

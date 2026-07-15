@@ -236,6 +236,42 @@ def test_drain_refused_then_stop_force(scratch_daemon):
     assert _wait_gone(r["pid"], 2.0)  # stopped + reaped before the drain
 
 
+def test_stop_escalates_when_socket_wedged(scratch_daemon):
+    """H1: --stop with a dead/unresponsive socket but live pidfile process must
+    SIGTERM (then SIGKILL after 3s) instead of printing 'no running instance'
+    and giving up. Simulate a wedged daemon with SIGSTOP (socket may still
+    accept but the process never answers)."""
+    c = DaemonClient()
+    c.connect()
+    daemon_pid = _pid(c)
+    scratch_daemon.append(daemon_pid)
+    c.close()
+
+    # Freeze the daemon so control RPC cannot complete.
+    os.kill(daemon_pid, signal.SIGSTOP)
+    try:
+        env = dict(os.environ)
+        out = subprocess.run(
+            [str(HOSTD), "--stop"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        # If --stop failed to kill, unfreeze so teardown SIGKILL works.
+        try:
+            os.kill(daemon_pid, signal.SIGCONT)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    assert out.returncode == 0, (out.stdout, out.stderr)
+    combined = (out.stdout or "") + (out.stderr or "")
+    assert "pidfile" in combined or "SIGTERM" in combined or "SIGKILL" in combined, combined
+    assert _wait_gone(daemon_pid, 10.0), f"wedged daemon pid={daemon_pid} still alive"
+
+
+
 def test_spawner_disconnect_keeps_child(scratch_daemon):
     """GUI-close continuity: the spawner dying does not touch the mission."""
     a = DaemonClient()

@@ -383,6 +383,32 @@ void engineEventsTick(AppState& st) {
     auto* c = engine::client();
     if (!c) return;
 
+    // H2: proactive reconnect with backoff when the socket is dead (daemon crash,
+    // hostd --stop, transient EOF). Without this the GUI only reconnects on the
+    // next RPC and otherwise looks empty (no tabs, no status).
+    const engine::DaemonConnState conn = engine::maintainConnection();
+    if (conn == engine::DaemonConnState::Unreachable) {
+        if (!st.daemonUnreachable) {
+            st.daemonUnreachable = true;
+            // One sticky notice only — status-bar chip is the persistent surface;
+            // a single toast names the state without storming on every retry.
+            st.toast(ui::ToastLevel::Warn, "Engine daemon unreachable — retrying");
+            st.addLog("[daemon] unreachable — reconnecting with backoff");
+        }
+        // Do not bootstrap / drain while the socket is dead: subscribe would race
+        // the backoff and spam reconnect attempts every 500ms.
+        return;
+    }
+    if (st.daemonUnreachable) {
+        st.daemonUnreachable = false;
+        st.toast(ui::ToastLevel::Success, "Engine daemon reconnected");
+        st.addLog("[daemon] reconnected — re-bootstrapping doc list");
+        // Force bootstrap re-arm even if reconnectGeneration already advanced
+        // mid-call: the unreachable window may have missed the gen edge.
+        bootstrapped = false;
+        lastBootstrapTry = {};
+    }
+
     // A silent reconnect (new daemon clientId, subscriptions lost) re-arms the
     // one-time bootstrap so we re-subscribe and re-mirror the current doc set.
     const uint64_t gen = c->reconnectGeneration();

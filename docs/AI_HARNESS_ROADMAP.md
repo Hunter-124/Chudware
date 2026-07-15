@@ -202,3 +202,18 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   oneshot_ok×7/miss×4, explicit terminal). Fixer9 `fixes.md`. Findings:
   `reports/runs/mega-9/findings.md`.
 
+
+- 2026-07-14/15 mega-10 (WS5): AC-closure cycle under
+  `reports/runs/mega-10/` (`mega-10-fc-rocket-20260714`). Baseline `df8fb2e5`.
+  Fixer10 (ComprehensiveWhale) bound H AC grading + I battery doc_id pre-launch
+  (50 tests green). Preflight PASS: hostd running==disk
+  (`night2-3054-gcb65bfd9-dirty`); account `17d17fb1-…`; spawn_probe +
+  auto_pick depth-2→ollama. Primary pid 2996834 wall **315.96s**, terminal
+  `needs_correction`/`verify_failed: [AC1,AC2,AC4–AC9]` (**AC3 omitted — PASS**).
+  Scoreboard: **H PASS** (AC3 PASS from live `check_interference`; AC1 FAIL
+  from `battery_result` evidence — mega-9 NOT-CHECKED residual cleared),
+  **I PASS** (`battery_result.doc_id=doc-cpp00000001`), **J PASS** (harness
+  typed-refusal E2E; live envelope still 0), **A–G regression PASS**
+  (add_features ok×4, delegate+spawn, oneshot_ok×11, clean stop, battery 15
+  checks honest FAIL). Fixer10 `fixes.md`. Findings:
+  `reports/runs/mega-10/findings.md`.

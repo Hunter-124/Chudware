@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-07-15T03:09:11Z",
+  "hostd_bin": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/aicad-hostd",
+  "disk_build_id": "night2-3054-gcb65bfd9-dirty",
+  "running_git_rev": "night2-3054-gcb65bfd9-dirty",
+  "running_matches_disk_binary": true,
+  "repo_git_describe": "night2-3060-gdf8fb2e5",
+  "repo_git_short": "df8fb2e52bd9",
+  "repo_git_full": "df8fb2e52bd906bfb9cfacd3b54ec862a1b843fd",
+  "baseline_commit": "df8fb2e5",
+  "baseline_matches_repo": true,
+  "daemon_pid": 2980908,
+  "server_info": {
+    "abi": "1",
+    "daemon_pid": 2980908,
+    "engine_build_id": "night2-3054-gcb65bfd9-dirty",
+    "git_rev": "night2-3054-gcb65bfd9-dirty",
+    "id_remap": {},
+    "proto": 1,
+    "recovery_pending": 50,
+    "state": "ready"
+  },
+  "note": "hostd binary on disk is night2-3054-gcb65bfd9-dirty (built ~22:19 mega-8/9 engine); repo HEAD is night2-3060-gdf8fb2e5. Running daemon matches ON-DISK hostd binary (staleness guard hostd-vs-disk PASS). Repo Python/agent fixes bind without hostd rebuild for AC grading (Python-side)."
+}

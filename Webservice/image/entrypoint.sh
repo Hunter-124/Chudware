@@ -335,7 +335,13 @@ BILLET_OPEN_ARGS=()
 if [ -n "${BILLET_DEFAULT_PROJECT:-}" ]; then
     proj_dir="$HOME/Projects/${BILLET_DEFAULT_PROJECT}"
     if [ -d "$proj_dir" ]; then
-        doc="$(find "$proj_dir" -maxdepth 2 -name '*.step+' -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+        doc=""
+        if [ -n "${BILLET_OPEN_DOC:-}" ] && [ -f "$proj_dir/$BILLET_OPEN_DOC" ]; then
+            doc="$proj_dir/$BILLET_OPEN_DOC"
+        else
+            [ -n "${BILLET_OPEN_DOC:-}" ] && log "WARN BILLET_OPEN_DOC not found: $proj_dir/$BILLET_OPEN_DOC"
+            doc="$(find "$proj_dir" -maxdepth 2 -name '*.step+' -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+        fi
         if [ -n "$doc" ]; then
             BILLET_OPEN_ARGS=("$doc")
             log "default project '$BILLET_DEFAULT_PROJECT' — opening $(basename "$doc")"

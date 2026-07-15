@@ -446,8 +446,23 @@ class SessionManager:
             "DISPLAY": ":0",
             "BILLET_PLM_DIR": "/plm",
         }
+        shared_project_mount: str | None = None
         if user.project:
-            env["BILLET_DEFAULT_PROJECT"] = user.project
+            if user.project.startswith("/"):
+                # Absolute HOST folder — bind-mounted read-only at
+                # ~/Projects/<basename> inside the session (shared :z label; the
+                # container user can't own host files, and demo users must not be
+                # able to trash the real working tree).
+                proj = Path(user.project)
+                if proj.is_dir():
+                    shared_project_mount = str(proj)
+                    env["BILLET_DEFAULT_PROJECT"] = proj.name
+                else:
+                    log.warning("default project dir missing on host: %s", proj)
+            else:
+                env["BILLET_DEFAULT_PROJECT"] = user.project
+        if user.doc:
+            env["BILLET_OPEN_DOC"] = user.doc
         # Shared remote-model provider credentials (host-owned file); per-user
         # subscriptions live in the app's own Settings inside the HOME volume.
         provider_vars = self.cfg.ai_provider_vars()
@@ -492,6 +507,14 @@ class SessionManager:
             # :z shared relabel — /plm bare repos are used by every session.
             f"{self.cfg.plm_dir}:/plm:U,z",
         ]
+        if shared_project_mount:
+            name = Path(shared_project_mount).name
+            args.extend([
+                "-v",
+                # ro: demo seats browse/open the real working tree but can't write it;
+                # :z shared relabel — the same folder is mounted by every session.
+                f"{shared_project_mount}:/home/user/Projects/{name}:ro,z",
+            ])
         for k, v in env.items():
             args.extend(["-e", f"{k}={v}"])
         if sess.heavy:

@@ -2500,9 +2500,11 @@ def _run_reviewer_checks(manifest, ledger, dag_result) -> None:
     the criteria unrecorded → NOT-CHECKED → the gate fails closed (never a
     fabricated pass).
 
-    mega-9 axis E / a2 residual: resolve an *explicit* mission-built ``doc_id``
-    (BUILD node output or latest new_part) so battery/measure tools do not hit
-    "2 parts are open" ambiguity, then run verify_battery with honest scoring.
+    mega-9/10: resolve an *explicit* mission-built ``doc_id`` (BUILD node output
+    or latest geometry-bearing add_features) so battery/measure tools do not hit
+    "2 parts are open" ambiguity. Run verify_battery FIRST, then grade ACs —
+    verify_battery criteria (AC1) consume the battery_result evidence so they are
+    not left NOT-CHECKED when the battery already ran.
     """
     if ledger is None:
         return
@@ -2522,14 +2524,12 @@ def _run_reviewer_checks(manifest, ledger, dag_result) -> None:
             if d:
                 doc_id = d
                 break
-    try:
-        from services.agent import reviewer_exec
-        reviewer_exec.run_acceptance_checks(manifest, ledger, doc_id=doc_id)
-    except Exception:  # noqa: BLE001 — a broken reviewer must not fabricate a pass
-        pass
+
+    battery_payload = None
     try:
         from services.agent import reviewer_exec as _re
-        _re.run_verify_battery(ledger, doc_id=doc_id, actor="reviewer")
+        battery_payload = _re.run_verify_battery(
+            ledger, doc_id=doc_id, actor="reviewer")
     except Exception:  # noqa: BLE001 — battery miss is NOT a fabricated PASS
         try:
             ledger.append("reviewer", "battery_result", {
@@ -2541,6 +2541,15 @@ def _run_reviewer_checks(manifest, ledger, dag_result) -> None:
             })
         except Exception:  # noqa: BLE001
             pass
+
+    try:
+        from services.agent import reviewer_exec
+        reviewer_exec.run_acceptance_checks(
+            manifest, ledger, doc_id=doc_id,
+            battery_payload=battery_payload if isinstance(battery_payload, dict) else None)
+    except Exception:  # noqa: BLE001 — a broken reviewer must not fabricate a pass
+        pass
+
 
 
 def _run_intake(request: str, provider: Provider,

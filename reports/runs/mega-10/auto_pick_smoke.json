@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-07-15T03:12:07Z",
+  "enabled_providers": [
+    {
+      "provider": "ollama",
+      "model": "llama3.2:latest",
+      "base_url": "http://127.0.0.1:11434/v1"
+    },
+    {
+      "provider": "xai-sub",
+      "model": "grok-4.5"
+    }
+  ],
+  "cases": [
+    {
+      "depth": 2,
+      "task_class": "simple",
+      "risk": null,
+      "min_rank": 1,
+      "provider": "ollama",
+      "model": "llama3.2:latest",
+      "rank": 1,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=simple depth=2 risk=none",
+      "is_xai": false
+    },
+    {
+      "depth": 2,
+      "task_class": "leaf",
+      "risk": null,
+      "min_rank": 1,
+      "provider": "ollama",
+      "model": "llama3.2:latest",
+      "rank": 1,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=leaf depth=2 risk=none",
+      "is_xai": false
+    },
+    {
+      "depth": 2,
+      "task_class": null,
+      "risk": "low",
+      "min_rank": 1,
+      "provider": "ollama",
+      "model": "llama3.2:latest",
+      "rank": 1,
+      "cost_tier": 0,
+      "reason": "min_rank=1 task_class=unknown depth=2 risk=low",
+      "is_xai": false
+    },
+    {
+      "depth": 0,
+      "task_class": "architecture",
+      "risk": "high",
+      "min_rank": 4,
+      "provider": "xai-sub",
+      "model": "grok-4.5",
+      "rank": 5,
+      "cost_tier": 2,
+      "reason": "min_rank=4 task_class=architecture depth=0 risk=high",
+      "is_xai": true
+    },
+    {
+      "depth": 0,
+      "task_class": null,
+      "risk": null,
+      "min_rank": 3,
+      "provider": "xai-sub",
+      "model": "grok-4.5",
+      "rank": 5,
+      "cost_tier": 2,
+      "reason": "min_rank=3 task_class=unknown depth=0 risk=none",
+      "is_xai": true
+    }
+  ],
+  "leaf_depth2_non_xai": true,
+  "verdict": "PASS"
+}

@@ -1,0 +1,64 @@
+{
+  "seq": 267,
+  "ts": "2026-07-15T03:17:21Z",
+  "actor": "reviewer",
+  "kind": "criterion_result",
+  "payload": {
+    "id": "BATTERY",
+    "result": "FAIL",
+    "check_tool": "verify_battery",
+    "pass_rule": "PASS",
+    "detail": "failing findings=['check_sketch', 'dim_coverage', 'ecad_check_diff_impedance', 'ecad_check_impedance', 'ecad_run_erc', 'measure_between']",
+    "evidence": {
+      "findings": [
+        {
+          "name": "check_sketch",
+          "severity": null,
+          "message": "register_cad_tools.<locals>.check_sketch() missing 1 required positional argument: 'sketch'"
+        },
+        {
+          "name": "dim_coverage",
+          "severity": null,
+          "message": "no open drawing 'doc-cpp00000001'"
+        },
+        {
+          "name": "ecad_check_diff_impedance",
+          "severity": null,
+          "message": "register_ecad_tools.<locals>.ecad_check_diff_impedance() missing 2 required positional arguments: 'net_p' and 'net_n'"
+        },
+        {
+          "name": "ecad_check_impedance",
+          "severity": null,
+          "message": "no open ECAD document 'doc-cpp00000001'"
+        },
+        {
+          "name": "ecad_run_erc",
+          "severity": null,
+          "message": "no open ECAD document 'doc-cpp00000001'"
+        },
+        {
+          "name": "measure_between",
+          "severity": null,
+          "message": "register_cad_tools.<locals>.measure_between() missing 1 required positional argument: 'a_query'"
+        }
+      ],
+      "scores": {
+        "check_sketch": 0.0,
+        "dim_coverage": 0.0,
+        "ecad_check_diff_impedance": 0.0,
+        "ecad_check_impedance": 0.0,
+        "ecad_run_erc": 0.0,
+        "eval_check": 1.0,
+        "groundedness": 1.0,
+        "is_manifold": 1.0,
+        "layout_coverage": 1.0,
+        "measure_between": 0.0,
+        "measure_part": 1.0,
+        "power_budget": 1.0,
+        "query_geometry": 1.0,
+        "req_join": 1.0,
+        "unit_sanity": 1.0
+      }
+    }
+  }
+}

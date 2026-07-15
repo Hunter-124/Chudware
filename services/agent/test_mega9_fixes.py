@@ -303,21 +303,28 @@ def test_typed_refusal_salvaged_from_ledger_note_text():
 
 
 def test_run_reviewer_checks_invokes_battery(monkeypatch):
-    """VERIFY entry path must call run_verify_battery (axis E wiring)."""
+    """VERIFY entry path must call run_verify_battery (axis E wiring).
+
+    mega-10: battery runs BEFORE AC sweep so AC1 can consume battery_payload.
+    """
     from services.agent import loop as loop_mod
 
     calls = {"battery": 0, "acs": 0}
+    order: list[str] = []
 
-    def _acs(manifest, ledger, *, doc_id=None, actor="reviewer"):
+    def _acs(manifest, ledger, *, doc_id=None, actor="reviewer",
+             battery_payload=None):
         calls["acs"] += 1
+        order.append("acs")
         return {}
 
     def _bat(ledger, *, doc_id=None, actor="reviewer"):
         calls["battery"] += 1
+        order.append("battery")
         ledger.append(actor, "battery_result", {
             "verdict": "NOT-CHECKED", "ok": False, "checks": [], "doc_id": doc_id,
         })
-        return {"verdict": "NOT-CHECKED"}
+        return {"verdict": "NOT-CHECKED", "doc_id": doc_id}
 
     monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks", _acs)
     monkeypatch.setattr("services.agent.reviewer_exec.run_verify_battery", _bat)
@@ -331,7 +338,9 @@ def test_run_reviewer_checks_invokes_battery(monkeypatch):
     loop_mod._run_reviewer_checks({"deliverables": []}, led, dag_result)
     assert calls["acs"] == 1
     assert calls["battery"] == 1
+    assert order == ["battery", "acs"], order
     assert any(e["kind"] == "battery_result" for e in led.events)
+
 
 
 def test_feature_modeler_has_verify_battery_tool():

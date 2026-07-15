@@ -29,7 +29,10 @@ class User:
     display: str
     role: str
     heavy: bool
-    project: str = ""  # default PLM project opened at session start (/plm/<name>.git)
+    # Default project opened at session start: a PLM project name (/plm/<name>.git)
+    # or an absolute HOST directory path (bind-mounted read-only into the session).
+    project: str = ""
+    doc: str = ""  # optional part file (relative to project) auto-opened at start
 
 
 class UserDirectory:
@@ -40,6 +43,7 @@ class UserDirectory:
         self._mtime: float | None = None
         self._by_email: dict[str, User] = {}
         self.default_project: str = ""  # site-wide default; users without a project inherit it
+        self.default_doc: str = ""      # site-wide auto-open part (relative to default_project)
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -58,6 +62,7 @@ class UserDirectory:
         users = data.get("users") or data if isinstance(data, list) else data.get("users") or []
         if isinstance(data, dict):
             self.default_project = str(data.get("default_project") or "").strip()
+            self.default_doc = str(data.get("default_doc") or "").strip()
         by_email: dict[str, User] = {}
         for row in users:
             if not isinstance(row, dict):
@@ -71,6 +76,7 @@ class UserDirectory:
                 role=str(row.get("role") or "user"),
                 heavy=bool(row.get("heavy", False)),
                 project=str(row.get("project") or "").strip(),
+                doc=str(row.get("doc") or "").strip(),
             )
         self._by_email = by_email
         self._mtime = st.st_mtime
@@ -90,10 +96,11 @@ class UserDirectory:
         self._by_email[user.email.strip().lower()] = user
         self._write()
 
-    def set_default_project(self, project: str) -> None:
-        """Site-wide default project (users with no explicit project inherit it)."""
+    def set_default_project(self, project: str, doc: str = "") -> None:
+        """Site-wide default project + auto-open part (inherited by project-less users)."""
         self.reload()
         self.default_project = project.strip()
+        self.default_doc = doc.strip()
         self._write()
 
     def effective_project(self, user: User) -> str:
@@ -109,6 +116,7 @@ class UserDirectory:
     def _write(self) -> None:
         payload = {
             "default_project": self.default_project,
+            "default_doc": self.default_doc,
             "users": [
                 {
                     "email": u.email,
@@ -116,6 +124,7 @@ class UserDirectory:
                     "role": u.role,
                     "heavy": u.heavy,
                     "project": u.project,
+                    "doc": u.doc,
                 }
                 for u in sorted(self._by_email.values(), key=lambda u: u.email)
             ]

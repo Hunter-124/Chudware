@@ -94,7 +94,7 @@ async def _sync_access_policy() -> dict[str, Any]:
 
 def _user_dict(u: User) -> dict[str, Any]:
     return {"email": u.email, "display": u.display, "role": u.role,
-            "heavy": u.heavy, "project": u.project}
+            "heavy": u.heavy, "project": u.project, "doc": u.doc}
 
 
 def _available_projects() -> list[str]:
@@ -111,7 +111,53 @@ async def admin_list_users(request: Request) -> dict[str, Any]:
         "users": [_user_dict(u) for u in sorted(user_directory.all(), key=lambda u: u.email)],
         "projects": _available_projects(),
         "default_project": user_directory.default_project,
+        "default_doc": user_directory.default_doc,
     }
+
+
+_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+
+# Part files the admin browser lists / the auto-open picker accepts.
+_CAD_EXTS = {".step+", ".step", ".stp", ".stl", ".3mf", ".iges", ".igs", ".brep", ".aicm"}
+
+
+def _valid_project(p: str) -> bool:
+    """A PLM project name, or an absolute host directory (bind-mounted into sessions)."""
+    if p.startswith("/"):
+        return ".." not in p.split("/") and Path(p).is_dir()
+    return bool(_PROJECT_RE.match(p))
+
+
+def _valid_doc(d: str) -> bool:
+    return bool(d) and not d.startswith("/") and ".." not in d.split("/")
+
+
+@admin_router.get("/browse")
+async def admin_browse(request: Request, path: str = "") -> dict[str, Any]:
+    """Host-machine folder listing for the admin project picker (admin-only)."""
+    _require_admin(request)
+    base = Path(path).expanduser() if path else Path.home()
+    try:
+        base = base.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not base.is_dir():
+        raise HTTPException(status_code=400, detail="not a directory")
+    dirs: list[str] = []
+    parts: list[str] = []
+    try:
+        for entry in sorted(base.iterdir(), key=lambda e: e.name.lower()):
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                dirs.append(entry.name)
+            elif entry.suffix.lower() in _CAD_EXTS:
+                parts.append(entry.name)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"path": str(base),
+            "parent": str(base.parent) if base.parent != base else None,
+            "dirs": dirs[:500], "parts": parts[:500]}
 
 
 @admin_router.put("/default-project")
@@ -119,13 +165,14 @@ async def admin_set_default_project(request: Request, body: dict[str, Any]) -> d
     """Site-wide default project — every user without an explicit project inherits it."""
     _require_admin(request)
     project = str(body.get("project") or "").strip()
-    if project and not _PROJECT_RE.match(project):
-        raise HTTPException(status_code=400, detail="invalid project name")
-    user_directory.set_default_project(project)
-    return {"ok": True, "default_project": project}
-
-
-_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+    doc = str(body.get("doc") or "").strip()
+    if project and not _valid_project(project):
+        raise HTTPException(status_code=400,
+                            detail="project must be a PLM project name or an existing host folder path")
+    if doc and not _valid_doc(doc):
+        raise HTTPException(status_code=400, detail="invalid part path")
+    user_directory.set_default_project(project, doc)
+    return {"ok": True, "default_project": project, "default_doc": doc}
 
 
 @admin_router.post("/users")
@@ -138,8 +185,9 @@ async def admin_add_user(request: Request, body: dict[str, Any]) -> dict[str, An
     if role not in {"admin", "user"}:
         raise HTTPException(status_code=400, detail="role must be admin or user")
     project = str(body.get("project") or "").strip()
-    if project and not _PROJECT_RE.match(project):
-        raise HTTPException(status_code=400, detail="invalid project name")
+    if project and not _valid_project(project):
+        raise HTTPException(status_code=400,
+                            detail="project must be a PLM project name or an existing host folder path")
     user = User(
         email=email,
         display=str(body.get("display") or email.split("@")[0]),
@@ -199,9 +247,11 @@ async def sessions_status(request: Request) -> dict[str, Any]:
 @sessions_router.post("")
 async def sessions_start(request: Request) -> dict[str, Any]:
     user = get_current_user(request)
-    # Site-wide default project: users without an explicit project inherit it.
+    # Site-wide default project: users without an explicit project inherit it
+    # (and its auto-open part).
     if not user.project and user_directory.default_project:
-        user = replace(user, project=user_directory.default_project)
+        user = replace(user, project=user_directory.default_project,
+                       doc=user.doc or user_directory.default_doc)
     try:
         sess = await manager.start(user)
     except SessionBusy as exc:

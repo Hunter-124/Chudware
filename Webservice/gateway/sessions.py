@@ -483,9 +483,12 @@ class SessionManager:
             "-p",
             f"127.0.0.1:{sess.host_port}:8080",
             "-v",
-            f"{home}:/home/user:U",
+            # :Z private relabel — one home per container; without it SELinux
+            # blocks container_t from user_home_t and NOTHING persists.
+            f"{home}:/home/user:U,Z",
             "-v",
-            f"{self.cfg.plm_dir}:/plm:U",
+            # :z shared relabel — /plm bare repos are used by every session.
+            f"{self.cfg.plm_dir}:/plm:U,z",
         ]
         for k, v in env.items():
             args.extend(["-e", f"{k}={v}"])

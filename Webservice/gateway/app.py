@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 try:
     from .auth import AuthMiddleware, User, get_current_user
@@ -109,71 +112,108 @@ async def sessions_get(sid: str, request: Request) -> dict[str, Any]:
     return manager.portal_payload(sess)
 
 
-def _user_home(user: User) -> Path:
+async def _podman_cp(src: str, dst: str, *, timeout: float = 120.0) -> tuple[int, str]:
+    """`podman cp` into/out of the user's RUNNING session container.
+
+    HOME volumes are :U-chowned into the subuid range and keep host SELinux
+    labels, so direct host-side writes produce files the container cannot
+    read; `podman cp` handles both the userns mapping and labeling.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "podman", "cp", src, dst,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        from .sessions import email_slug
-    except ImportError:
-        from sessions import email_slug
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise HTTPException(status_code=504, detail="file operation timed out")
+    return proc.returncode or 0, (err or out or b"").decode("utf-8", errors="replace")
 
-    home = (settings.homes_dir / email_slug(user.email)).resolve()
-    home.mkdir(parents=True, exist_ok=True)
-    return home
+
+def _live_session_for(request: Request) -> tuple[User, "object"]:
+    user = get_current_user(request)
+    sess = manager.get_for_user(user.email)
+    if sess is None or sess.status not in {"starting", "ready"}:
+        raise HTTPException(
+            status_code=409,
+            detail="no running session — start your session first, then transfer files",
+        )
+    return user, sess
 
 
-def _safe_path(home: Path, rel: str) -> Path:
-    """Resolve rel under home; reject traversal."""
+def _safe_rel(rel: str) -> str:
+    """Validate a container-side relative path under /home/user."""
     rel = (rel or "").lstrip("/")
     if not rel or rel in {".", "./"}:
         raise HTTPException(status_code=400, detail="path required")
-    if "\x00" in rel or rel.startswith("/") or rel.startswith("~"):
+    if "\x00" in rel or rel.startswith("~"):
         raise HTTPException(status_code=400, detail="invalid path")
-    candidate = (home / rel).resolve()
-    try:
-        candidate.relative_to(home)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="path traversal rejected") from exc
-    return candidate
+    parts = Path(rel).parts
+    if ".." in parts:
+        raise HTTPException(status_code=400, detail="path traversal rejected")
+    return str(Path(*parts))
 
 
 @app.post("/transfer")
 async def transfer_upload(
     request: Request,
     file: UploadFile = File(...),
-    path: str = Query(default="", description="relative path under user home"),
+    path: str = Query(default="", description="relative path under the session home"),
 ) -> dict[str, Any]:
-    user = get_current_user(request)
-    home = _user_home(user)
-    rel = path or file.filename or ""
-    if not rel:
-        raise HTTPException(status_code=400, detail="path or filename required")
-    dest = _safe_path(home, rel)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    user, sess = _live_session_for(request)
+    rel = _safe_rel(path or file.filename or "")
+
+    tmp_dir = settings.data_root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     size = 0
-    with dest.open("wb") as out:
+    with tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
             size += len(chunk)
-            out.write(chunk)
-    return {
-        "ok": True,
-        "path": str(dest.relative_to(home)),
-        "bytes": size,
-    }
+            tmp.write(chunk)
+    try:
+        parent = str(Path("/home/user") / Path(rel).parent)
+        if parent not in {"/home/user", "/home/user/."}:
+            # podman cp cannot create intermediate directories
+            await manager.run_podman(
+                ["exec", sess.container, "mkdir", "-p", parent], timeout=30
+            )
+        rc, msg = await _podman_cp(str(tmp_path), f"{sess.container}:/home/user/{rel}")
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"upload failed: {msg.strip()}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return {"ok": True, "path": rel, "bytes": size}
 
 
 @app.get("/transfer")
 async def transfer_download(
     request: Request,
-    path: str = Query(..., description="relative path under user home"),
+    path: str = Query(..., description="relative path under the session home"),
 ) -> FileResponse:
-    user = get_current_user(request)
-    home = _user_home(user)
-    target = _safe_path(home, path)
-    if not target.is_file():
+    user, sess = _live_session_for(request)
+    rel = _safe_rel(path)
+
+    tmp_dir = settings.data_root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)
+    tmp.close()
+    rc, msg = await _podman_cp(f"{sess.container}:/home/user/{rel}", tmp.name)
+    if rc != 0:
+        Path(tmp.name).unlink(missing_ok=True)
         raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(target, filename=target.name)
+    return FileResponse(
+        tmp.name,
+        filename=Path(rel).name,
+        background=BackgroundTask(lambda: Path(tmp.name).unlink(missing_ok=True)),
+    )
 
 
 def _image_present() -> bool:

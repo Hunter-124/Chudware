@@ -47,6 +47,34 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions_mod, "manager", mgr)
     # ensure users file points at package users.yaml
     monkeypatch.setattr(settings, "users_file", GATEWAY_DIR / "users.yaml")
+
+    # Hermetic by default: no real podman. Startup adopt_running and /transfer's
+    # podman-cp helper would otherwise touch live containers.
+    async def _no_podman(args, timeout=120.0):
+        return 0, "", ""
+
+    monkeypatch.setattr(mgr, "run_podman", _no_podman)
+
+    fake_fs = tmp_path / "container-fs"  # emulated container /home/user
+    fake_fs.mkdir()
+
+    async def _fake_podman_cp(src, dst, timeout=120.0):
+        import shutil
+
+        def _map(p: str) -> Path:
+            if ":" in p:  # container:path form
+                inner = p.split(":", 1)[1]
+                return fake_fs / inner.lstrip("/")
+            return Path(p)
+
+        s, d = _map(src), _map(dst)
+        if not s.is_file():
+            return 1, "no such file"
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(s, d)
+        return 0, ""
+
+    monkeypatch.setattr(app_mod, "_podman_cp", _fake_podman_cp)
     yield mgr
     # cleanup any leftover
     mgr._sessions.clear()
@@ -195,7 +223,24 @@ def test_session_refuse_new_flag(client, _isolate, monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _seed_session(mgr, email="demo@example.com"):
+    sess = Session(
+        sid="livesid", email=email, display="Demo User", slug="demo",
+        container="billet-sess-demo", host_port=8460, heavy=False, status="ready",
+    )
+    mgr._sessions[sess.sid] = sess
+    mgr._by_email[email] = sess.sid
+    return sess
+
+
+def test_transfer_requires_running_session(client, _isolate):
+    files = {"file": ("x.step", io.BytesIO(b"x"), "application/octet-stream")}
+    r = client.post("/transfer", headers=_auth("demo@example.com"), files=files)
+    assert r.status_code == 409
+
+
 def test_transfer_upload_download(client, _isolate):
+    _seed_session(_isolate)
     content = b"hello billet"
     files = {"file": ("part.step", io.BytesIO(content), "application/octet-stream")}
     r = client.post(
@@ -216,6 +261,7 @@ def test_transfer_upload_download(client, _isolate):
 
 
 def test_transfer_path_traversal_rejected(client, _isolate):
+    _seed_session(_isolate)
     files = {"file": ("x", io.BytesIO(b"x"), "application/octet-stream")}
     r = client.post(
         "/transfer?path=../../etc/passwd",

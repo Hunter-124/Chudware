@@ -51,6 +51,112 @@ mkdir -p /tmp/.X11-unix 2>/dev/null || true
 chmod 1777 /tmp/.X11-unix 2>/dev/null || true
 cd "$HOME" 2>/dev/null || cd /
 
+# ---- PLM bootstrap (T-WEB2 §Q2.2): clone or start pull-only; NEVER push -----
+# Shared bare remotes live under BILLET_PLM_DIR (/plm). Private working trees
+# land in $HOME/Projects/<name>. Failures log + continue so the seat still boots.
+plm_bootstrap() {
+    local plm_root="${BILLET_PLM_DIR:-/plm}"
+    local py="${AI_CAD_PYTHON:-}"
+    local repo="${AI_CAD_REPO:-}"
+    if [ ! -d "$plm_root" ]; then
+        log "[plm] no $plm_root mount — skip bootstrap"
+        return 0
+    fi
+    if [ -z "$py" ] || [ ! -x "$py" ]; then
+        log "[plm] WARN AI_CAD_PYTHON missing/unusable — skip bootstrap"
+        return 0
+    fi
+    if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+        log "[plm] WARN AI_CAD_REPO missing — skip bootstrap"
+        return 0
+    fi
+    mkdir -p "$HOME/Projects" 2>/dev/null || true
+    local bare name dest
+    shopt -s nullglob
+    for bare in "$plm_root"/*.git; do
+        name="$(basename "$bare" .git)"
+        dest="$HOME/Projects/$name"
+        if [ ! -d "$dest/.aicadvault" ]; then
+            log "[plm] cloning $name from $bare → $dest"
+            if PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "
+import sys
+from services.plm.remote import clone_from_remote
+r = clone_from_remote(sys.argv[1], sys.argv[2])
+if not r.get('ok'):
+    print(r.get('reason','error') + ((': ' + r['hint']) if r.get('hint') else ''), file=sys.stderr)
+    sys.exit(1)
+" "$bare" "$dest" 2>&1; then
+                log "[plm] cloned $name"
+            else
+                log "[plm] WARN clone failed for $name (seat continues)"
+            fi
+        else
+            log "[plm] pull-only sync $name"
+            # Pull/FF only — never CAS-push on seat start (advisor Q2.3).
+            if PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "
+import sys
+from pathlib import Path
+from services.plm.remote import (
+    _open_vault_repo, _fetch_folder, _remote_head_from_refs, _branch_tip,
+    _is_ancestor, _ensure_branch_and_head, _materialize_working_tree,
+)
+from services.plm.vault import Vault, VaultError
+
+project = Path(sys.argv[1])
+remote_name = 'origin'
+try:
+    v = Vault.open(project)
+    try:
+        m = v.manifest()
+    finally:
+        v.close()
+    entry = None
+    for r in m.get('remotes') or []:
+        if r.get('name') == remote_name:
+            entry = r
+            break
+    if entry is None:
+        for r in m.get('remotes') or []:
+            if r.get('kind') == 'folder':
+                entry = r
+                break
+    if entry is None or not entry.get('url'):
+        print('no origin remote in manifest', file=sys.stderr)
+        sys.exit(2)
+    remote_url = entry['url']
+    repo = _open_vault_repo(project)
+    try:
+        local_head = _branch_tip(repo)
+        remote_refs = _fetch_folder(repo, remote_url, remote_name)
+        remote_head = _remote_head_from_refs(remote_refs)
+        if remote_head is None or local_head == remote_head:
+            sys.exit(0)
+        if local_head is None or _is_ancestor(repo, local_head, remote_head):
+            _ensure_branch_and_head(repo, remote_head)
+            _materialize_working_tree(project, repo, remote_head)
+            sys.exit(0)
+        # ahead or diverged: leave local alone; never push at start
+        sys.exit(0)
+    finally:
+        repo.close()
+except VaultError as e:
+    print(f'{e.reason}: {e.hint}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'{type(e).__name__}: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$dest" 2>&1; then
+                log "[plm] synced $name"
+            else
+                log "[plm] WARN sync failed for $name (seat continues)"
+            fi
+        fi
+    done
+    shopt -u nullglob
+}
+plm_bootstrap
+
+
 PIDS=()
 cleanup() {
     log "SIGTERM/EXIT — shutting down (${#PIDS[@]} children)"

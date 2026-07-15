@@ -1,6 +1,9 @@
-# billet-web allowlist — email must match Access/JWT or X-Dev-User.
-# role: admin | user
-# heavy: true reserves a GPU seat when available (≤ max_heavy concurrent).
+# billet-web allowlist — email must match Access/JWT (prod) or X-Dev-User (dev).
+# role: admin | user;  heavy: true = GPU seat when available (≤ max_heavy).
+#
+# After editing, push the same list into the Cloudflare Access policy:
+#   python3 Webservice/deploy/cf_provision.py --sync-users
+# (example.com entries are dev-only and never synced to Access)
 users:
   - email: haedmonds69@gmail.com
     display: Hunter
@@ -10,7 +13,7 @@ users:
     display: Demo User
     role: user
     heavy: false
-  - email: alice@ua.edu
-    display: Alice
-    role: user
-    heavy: false
+  # - email: friend@ua.edu
+  #   display: Friend
+  #   role: user
+  #   heavy: false

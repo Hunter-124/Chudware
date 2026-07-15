@@ -74,16 +74,60 @@ def upsert_env(updates: dict[str, str]) -> None:
     ENV_FILE.chmod(0o600)
 
 
+def _users_yaml_emails() -> list[str]:
+    """Read the gateway allowlist (single source of truth for people)."""
+    users_file = Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"
+    emails: list[str] = []
+    for line in users_file.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("- email:") or line.startswith("email:"):
+            emails.append(line.split(":", 1)[1].strip())
+    return [e for e in emails if "@" in e and not e.endswith("example.com")]
+
+
+def sync_users(host: str) -> None:
+    """Push users.yaml emails into the Access allow policy (operator one-liner).
+
+    Advisor T-WEB2 Q1: invite keys rejected; the dual-edit friction is solved
+    here instead — edit users.yaml, run `cf_provision.py --sync-users`.
+    """
+    emails = _users_yaml_emails()
+    if not emails:
+        sys.exit("users.yaml has no real emails (example.com entries are skipped)")
+    apps = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps")
+    app = find(apps, "domain", host)
+    if app is None:
+        sys.exit(f"no Access app for {host} — run full provisioning first")
+    pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
+    pol_body = {
+        "name": "billet-users", "decision": "allow", "precedence": 1,
+        "include": [{"email": {"email": e}} for e in emails],
+    }
+    pol = find(pols, "name", "billet-users")
+    if pol:
+        api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
+    else:
+        api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
+    print(f"Access policy billet-users synced from users.yaml: {len(emails)} email(s)")
+    for e in emails:
+        print(f"  - {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hostname", default="cad.scootware.us")
     ap.add_argument("--emails", default="haedmonds69@gmail.com",
                     help="comma-separated allowlist for the Access policy")
+    ap.add_argument("--sync-users", action="store_true",
+                    help="only sync gateway/users.yaml emails into the Access policy")
     args = ap.parse_args()
     host = args.hostname
     zone_name = ".".join(host.split(".")[-2:])
     emails = [e.strip() for e in args.emails.split(",") if e.strip()]
 
+    if args.sync_users:
+        sync_users(host)
+        return
     # 1. tunnel
     tunnels = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel?is_deleted=false")
     tun = find(tunnels, "name", TUNNEL_NAME) or api(

@@ -70,7 +70,9 @@ class Settings:
         or "localhost/billet-session:latest"
     )
     stream_backend: str = field(
-        default_factory=lambda: _env("BILLET_WEB_STREAM_BACKEND", "selkies") or "selkies"
+        # novnc is the VERIFIED stream path on the Fedora image; selkies pip is
+        # broken there (evdev/kernel-headers) — opt in explicitly if that changes.
+        default_factory=lambda: _env("BILLET_WEB_STREAM_BACKEND", "novnc") or "novnc"
     )
     cf_team_domain: str = field(
         default_factory=lambda: (_env("BILLET_WEB_CF_TEAM_DOMAIN", "") or "").rstrip("/")

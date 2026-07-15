@@ -29,7 +29,7 @@ therefore ships a **stripped** `libcef.so` (~417 MiB) + minimal CEF runtime.
 | `stage.sh` | Assemble `stage/` from host build + CEF + **Python app tree** |
 | `stage/` | **Build output only** — do not commit (gitignore) |
 | `Containerfile` | Fedora 44 image + `/opt/billet/runtime/venv` |
-| `entrypoint.sh` | Xvfb → Billet → novnc/selkies; exports AI_CAD_*; SIGTERM cleanup |
+| `entrypoint.sh` | Xvfb → **PLM clone/pull** → Billet → novnc/selkies; exports AI_CAD_*; SIGTERM cleanup |
 
 ## Python AI worker
 
@@ -81,6 +81,24 @@ to the repo `.gitignore`.
 | `*_API_KEY` | LLM provider keys — pass-through, never stripped |
 
 Volumes: private `…/homes/<slug>:/home/user`, shared `…/plm:/plm`.
+
+## PLM bootstrap (T-WEB2 §Q2)
+
+Host seeds bare remotes once (outside the image):
+
+```bash
+cd Webservice/gateway
+python3 -m plm_seed Demo          # → ~/billet-web-data/plm/Demo.git (real tip)
+```
+
+On seat start, `entrypoint.sh` loops `/plm/*.git`:
+
+- no `$HOME/Projects/<name>/.aicadvault` → `clone_from_remote` (log `[plm] cloned <name>`)
+- vault present → **pull/FF only** (log `[plm] synced <name>`); **never** auto-push
+
+Failures log `[plm] WARN …` and continue so the seat still boots. Publish is
+explicit user/agent `plm_sync` only — no stop-time sync.
+
 
 ## Smoke (verified 2026-07-14)
 

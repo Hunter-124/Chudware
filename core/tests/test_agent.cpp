@@ -6,6 +6,8 @@
 #include "agent/config.h"
 #include "agent/machine.h"
 #include "agent/state.h"
+#include "agent/events.h"
+
 
 using namespace aicad::agent;
 
@@ -556,4 +558,243 @@ TEST_CASE("clarify: geometry_select kind emits empty suggested + targets") {
     // Legacy list still has key/ask for old consumers.
     CHECK(result["questions"][0]["key"] == "edit_face");
     CHECK(result["questions"][0]["kind"] == "geometry_select");
+}
+
+// --------------------------------------------------------------------------- plan_state
+TEST_CASE("plan_item_title caps at 10 words") {
+    CHECK(plan_item_title("one two three") == "one two three");
+    CHECK(plan_item_title("a b c d e f g h i j k l") == "a b c d e f g h i j");
+    CHECK(plan_item_title("  spaced   words  here  ") == "spaced words here");
+}
+
+TEST_CASE("plan_state items from build_plan") {
+    json plan = {{"name", "Hex standoff"},
+                 {"summary", "extruded hex prism"},
+                 {"parts",
+                  json::array(
+                      {json{{"name", "base"},
+                            {"purpose", "main body"},
+                            {"dimensions", {{"w", 20}, {"h", 10}}},
+                            {"features", json::array({"fillet top edges", "bore M3"})}}})}};
+    json items = plan_state_items_from_build_plan(plan);
+    REQUIRE(items.size() == 1);
+    CHECK(items[0]["id"] == "base");
+    CHECK(items[0]["title"] == "base");
+    CHECK(items[0]["kind"] == "part");
+    CHECK(items[0]["status"] == "pending");
+    std::string desc = items[0]["desc"].get<std::string>();
+    CHECK(desc.find("main body") != std::string::npos);
+    CHECK(desc.find("w=") != std::string::npos);
+    CHECK(desc.find("fillet") != std::string::npos);
+
+    std::string title, summary;
+    plan_display_meta(ojson(plan), title, summary);
+    CHECK(title == "Hex standoff");
+    CHECK(summary == "extruded hex prism");
+
+    json payload = make_plan_state("build_plan", title, summary, 1, items);
+    CHECK(payload["shape"] == "build_plan");
+    CHECK(payload["revision"] == 1);
+    CHECK(payload["items"].size() == 1);
+    CHECK_FALSE(payload.contains("edges"));
+}
+
+TEST_CASE("plan_state checklist step statuses") {
+    std::vector<std::string> steps = {"Build base solid", "Cut the bore", "Add fillet"};
+    json pending = plan_state_items_from_steps(steps, -1);
+    REQUIRE(pending.size() == 3);
+    CHECK(pending[0]["status"] == "pending");
+    CHECK(pending[0]["kind"] == "step");
+    CHECK(pending[0]["id"] == "step-0");
+    CHECK(pending[0]["title"] == "Build base solid");
+
+    json running = plan_state_items_from_steps(steps, 1);
+    CHECK(running[0]["status"] == "done");
+    CHECK(running[1]["status"] == "running");
+    CHECK(running[2]["status"] == "pending");
+
+    json failed = plan_state_items_from_steps(steps, -1, false, 1);
+    CHECK(failed[0]["status"] == "done");
+    CHECK(failed[1]["status"] == "fail");
+    CHECK(failed[2]["status"] == "pending");
+
+    json done = plan_state_items_from_steps(steps, -1, true);
+    CHECK(done[0]["status"] == "done");
+    CHECK(done[2]["status"] == "done");
+}
+
+TEST_CASE("plan_state objectives extraction no-op when absent") {
+    json plan = {{"name", "x"}, {"parts", json::array({json{{"name", "a"}}})}};
+    CHECK(plan_state_items_from_objectives(plan).empty());
+
+    plan["objectives"] = json::array({"Fit M3 screw", "Wall thickness >= 2mm"});
+    json objs = plan_state_items_from_objectives(plan);
+    REQUIRE(objs.size() == 2);
+    CHECK(objs[0]["kind"] == "objective");
+    CHECK(objs[0]["status"] == "pending");
+    CHECK(objs[0]["title"] == "Fit M3 screw");
+
+    plan.erase("objectives");
+    plan["acceptance"] = json::array({json{{"title", "Pass FEA FoS>2"}, {"desc", "static load"}}});
+    objs = plan_state_items_from_objectives(plan);
+    REQUIRE(objs.size() == 1);
+    CHECK(objs[0]["desc"] == "static load");
+}
+
+TEST_CASE("plan_state mission task items") {
+    json tasks = json::array({json{{"capability", "design"}, {"title", "Build bracket"}},
+                              json{{"capability", "drawing"},
+                                   {"title", "Make drawing"},
+                                   {"status", "done"}}});
+    json items = plan_state_items_from_mission(tasks, "Mission");
+    REQUIRE(items.size() == 2);
+    CHECK(items[0]["kind"] == "task");
+    CHECK(items[0]["status"] == "pending");
+    CHECK(items[0]["phase"] == "Mission");
+    CHECK(items[0]["meta"]["capability"] == "design");
+    CHECK(items[1]["status"] == "done");
+}
+
+TEST_CASE("run_machine emits plan_state build_plan and checklist") {
+    DesignState st;
+    st.request = "hex standoff";
+    st.doc_id = "doc-test";
+
+    StageActions actions;
+    actions.intake = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "ok";
+        return o;
+    };
+    actions.plan = [](DesignState& s, int) {
+        s.plan = ojson{{"name", "Standoff"},
+                       {"summary", "hex body"},
+                       {"parts",
+                        ojson::array({ojson{{"name", "body"},
+                                            {"purpose", "main"},
+                                            {"dimensions", ojson{{"d", 10}}},
+                                            {"features", ojson::array({"bore"})}}})},
+                       {"objectives", ojson::array({"Clearance fit"})}};
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "plan parsed";
+        o.parsed_ok = true;
+        return o;
+    };
+    actions.model = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "modeled";
+        return o;
+    };
+    actions.review = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        o.reason = "ok";
+        return o;
+    };
+    actions.fix = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        return o;
+    };
+    actions.memory = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        return o;
+    };
+    actions.plan_steps = [](DesignState&) {
+        return std::vector<std::string>{"Build body base", "Refine body: bore"};
+    };
+
+    std::vector<json> seen;
+    // Unique run id so we don't clobber other tests' event files.
+    const std::string rid = "plan-state-ut";
+    RunEvents events(rid, [&](const json& ev) { seen.push_back(ev); });
+
+    json result = run_machine(st, actions, events, json{{"intake", 1},
+                                                        {"plan", 1},
+                                                        {"model", 1},
+                                                        {"review", 1},
+                                                        {"fix", 1},
+                                                        {"memory", 1}});
+    CHECK(result["status"] == "done");
+
+    int n_build = 0, n_check = 0, n_obj = 0, n_plan_steps = 0, n_model_step = 0;
+    json last_checklist;
+    for (const auto& ev : seen) {
+        const std::string kind = ev.value("kind", std::string());
+        if (kind == "plan_steps") ++n_plan_steps;
+        if (kind == "model_step") ++n_model_step;
+        if (kind != "plan_state") continue;
+        const std::string shape = ev.value("shape", std::string());
+        if (shape == "build_plan") {
+            ++n_build;
+            CHECK(ev["title"] == "Standoff");
+            CHECK(ev["summary"] == "hex body");
+            CHECK(ev["revision"] == 1);
+            REQUIRE(ev["items"].is_array());
+            CHECK(ev["items"].size() == 1);
+            CHECK(ev["items"][0]["kind"] == "part");
+            CHECK(ev["items"][0]["id"] == "body");
+        } else if (shape == "checklist") {
+            ++n_check;
+            last_checklist = ev;
+        } else if (shape == "objectives") {
+            ++n_obj;
+            CHECK(ev["items"].size() == 1);
+            CHECK(ev["items"][0]["kind"] == "objective");
+        }
+    }
+    CHECK(n_build == 1);
+    CHECK(n_obj == 1);
+    CHECK(n_plan_steps == 1);  // raw event kept
+    CHECK(n_model_step == 2);
+    CHECK(n_check >= 2);  // initial + per-step + final
+    REQUIRE(last_checklist.is_object());
+    // Final checklist should mark all done.
+    for (const auto& it : last_checklist["items"])
+        CHECK(it["status"] == "done");
+}
+
+TEST_CASE("run_machine no plan leaves plan_state absent") {
+    DesignState st;
+    st.request = "noop";
+    StageActions actions;
+    auto pass = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "pass";
+        return o;
+    };
+    actions.intake = pass;
+    // Plan fails all attempts → st.plan stays null; machine continues (plan non-fatal).
+    actions.plan = [](DesignState&, int) {
+        StageOutcome o;
+        o.verdict = "retry";
+        o.reason = "plan not parseable";
+        return o;
+    };
+    actions.model = pass;
+    actions.review = pass;
+    actions.fix = pass;
+    actions.memory = pass;
+    actions.plan_steps = [](DesignState&) { return std::vector<std::string>{""}; };
+
+    std::vector<json> seen;
+    RunEvents events("plan-state-noplan", [&](const json& ev) { seen.push_back(ev); });
+    json budgets = {{"plan", 1}, {"model", 1}, {"review", 1}, {"fix", 1}, {"memory", 1},
+                    {"intake", 1}};
+    (void)run_machine(st, actions, events, budgets);
+
+    bool has_build = false;
+    bool has_checklist = false;
+    for (const auto& ev : seen) {
+        if (ev.value("kind", "") != "plan_state") continue;
+        if (ev.value("shape", "") == "build_plan") has_build = true;
+        if (ev.value("shape", "") == "checklist") has_checklist = true;
+    }
+    CHECK_FALSE(has_build);
+    // Blank default step does not emit a plan_state checklist card (off/no-plan unchanged).
+    CHECK_FALSE(has_checklist);
 }

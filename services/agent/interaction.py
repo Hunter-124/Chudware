@@ -25,7 +25,12 @@ SCHEMA_BATCH = "aicad.interaction/1"
 SCHEMA_ANSWERS = "aicad.interaction.answers/1"
 MAX_QUESTIONS = 4  # the proven `clarify` cap
 
-KINDS = {"choice", "dimension", "text", "file_request", "approval"}
+KINDS = {"choice", "dimension", "text", "file_request", "approval", "geometry_select"}
+
+# Allowed geometry_select target tokens (contract §12).
+GEOMETRY_TARGETS = frozenset(
+    {"face", "edge", "vertex", "feature", "body", "component", "point"}
+)
 
 
 class InteractionError(ValueError):
@@ -86,12 +91,15 @@ class Question:
     # kind-specific
     family: str = "length"               # dimension
     options: list[dict] | None = None    # choice: [{value, label?}]
-    multi: bool = False                  # choice
+    multi: bool = False                  # choice | geometry_select | file_request(multiple)
     multiline: bool = False              # text
     media: str = "file"                  # file_request: file|image
     accept: list[str] | None = None      # file_request
     proposal: str | None = None          # approval
     evidence: dict | None = None         # proactive verify→ask (§9)
+    # geometry_select (contract §12)
+    targets: list[str] | None = None     # face|edge|vertex|feature|body|component|point
+    doc_id: str | None = None            # optional owning-doc hint on the question
 
     def to_dict(self) -> dict:
         d = {"id": self.id, "kind": self.kind, "prompt": self.prompt,
@@ -112,6 +120,11 @@ class Question:
             d["multiple"] = self.multi
         if self.kind == "approval":
             d["proposal"] = self.proposal or self.prompt
+        if self.kind == "geometry_select":
+            d["targets"] = list(self.targets or [])
+            d["multi"] = self.multi
+            if self.doc_id:
+                d["doc_id"] = self.doc_id
         if self.evidence:
             d["evidence"] = self.evidence
         return d
@@ -120,13 +133,34 @@ class Question:
     def from_dict(d: dict) -> "Question":
         # legacy alias: `ask` -> `prompt`
         prompt = d.get("prompt") or d.get("ask") or ""
+        kind = d.get("kind") or d.get("type") or "text"
+        # Tolerate model aliases for options / multi / targets.
+        options = d.get("options")
+        if options is None and d.get("choices") is not None:
+            raw_choices = d.get("choices") or []
+            options = []
+            for c in raw_choices:
+                if isinstance(c, dict) and "value" in c:
+                    options.append(c)
+                elif isinstance(c, str):
+                    options.append({"value": c, "label": c})
+        multi = bool(d.get("multi", d.get("multiple", False)))
+        targets = d.get("targets")
+        if targets is None and d.get("target") is not None:
+            t = d.get("target")
+            targets = t if isinstance(t, list) else [t]
+        suggested = d.get("suggested")
+        if suggested is None and "default" in d:
+            suggested = d.get("default")
         return Question(
-            id=d["id"], kind=d["kind"], prompt=prompt, suggested=d.get("suggested"),
+            id=d["id"], kind=kind, prompt=prompt, suggested=suggested,
             required=bool(d.get("required", False)), why=d.get("why"),
-            family=d.get("family", "length"), options=d.get("options"),
-            multi=bool(d.get("multi", d.get("multiple", False))),
+            family=d.get("family", "length"), options=options,
+            multi=multi,
             multiline=bool(d.get("multiline", False)), media=d.get("media", "file"),
-            accept=d.get("accept"), proposal=d.get("proposal"), evidence=d.get("evidence"))
+            accept=d.get("accept"), proposal=d.get("proposal"), evidence=d.get("evidence"),
+            targets=list(targets) if targets else None,
+            doc_id=d.get("doc_id") or d.get("geometry_doc_id"))
 
 
 @dataclass
@@ -150,6 +184,47 @@ class QuestionBatch:
         return d
 
 
+def _choice_value_map(options: list[dict] | None) -> tuple[list[Any], dict[Any, Any]]:
+    """Return (values, label_or_value → value) for a choice question."""
+    values: list[Any] = []
+    alias: dict[Any, Any] = {}
+    for o in options or []:
+        if not isinstance(o, dict) or "value" not in o:
+            continue
+        v = o["value"]
+        values.append(v)
+        alias[v] = v
+        lab = o.get("label")
+        if lab is not None and lab not in alias:
+            alias[lab] = v
+    return values, alias
+
+
+def _normalize_choice_suggested(q: "Question") -> Any:
+    """Map label-as-suggested onto option values; multi → list of values."""
+    _, alias = _choice_value_map(q.options)
+    if q.multi:
+        raw = q.suggested if isinstance(q.suggested, list) else (
+            [] if q.suggested in (None, "") else [q.suggested])
+        out = []
+        for s in raw:
+            if s in alias:
+                out.append(alias[s])
+            else:
+                raise InteractionError(
+                    f"choice {q.id!r} multi suggested {s!r} not in options")
+        return out
+    if q.suggested in alias:
+        return alias[q.suggested]
+    raise InteractionError(
+        f"choice {q.id!r} suggested {q.suggested!r} not in options")
+
+
+def _geometry_empty_default(q: "Question") -> Any:
+    """Honest empty pick when the model has no best-guess sid."""
+    return [] if q.multi else {}
+
+
 def _validate(batch: QuestionBatch) -> None:
     if not batch.questions:
         raise InteractionError("batch has no questions")
@@ -162,10 +237,34 @@ def _validate(batch: QuestionBatch) -> None:
         if not q.id or q.id in seen:
             raise InteractionError(f"question id missing or duplicated: {q.id!r}")
         seen.add(q.id)
-        if q.suggested is None:
+        # geometry_select may omit suggested (contract §12 exception); other kinds require it.
+        if q.suggested is None and q.kind != "geometry_select":
             raise InteractionError(f"question {q.id!r} has no suggested default (contract §2)")
-        if q.kind == "choice" and not q.options:
-            raise InteractionError(f"choice {q.id!r} has no options")
+        if q.kind == "choice":
+            if not q.options:
+                raise InteractionError(f"choice {q.id!r} has no options")
+            # Normalize label→value on the question so transports/defaults see canonical values.
+            q.suggested = _normalize_choice_suggested(q)
+        if q.kind == "geometry_select":
+            targets = [t for t in (q.targets or []) if t in GEOMETRY_TARGETS]
+            if not targets:
+                raise InteractionError(
+                    f"geometry_select {q.id!r} needs non-empty targets from "
+                    f"{sorted(GEOMETRY_TARGETS)}")
+            q.targets = targets
+            sug = q.suggested
+            if sug is None:
+                # Honest "no guess" — required questions must be answered by a transport.
+                q.suggested = _geometry_empty_default(q)
+            elif q.multi:
+                if not isinstance(sug, list):
+                    raise InteractionError(
+                        f"geometry_select {q.id!r} multi suggested must be a list "
+                        f"(or null/[] for no guess)")
+            elif not isinstance(sug, dict):
+                raise InteractionError(
+                    f"geometry_select {q.id!r} suggested must be a selection object "
+                    f"(or null/{{}} for no guess)")
     if batch.scope == "run" and not batch.run_id:
         raise InteractionError("run-scoped batch needs run_id")
     if batch.scope == "doc" and not batch.doc_id:
@@ -317,6 +416,11 @@ class CLITransport:
             if q.kind == "choice":
                 for i, opt in enumerate(q.options or []):
                     self._w(f"  {i + 1}. {opt.get('label', opt['value'])}\n")
+                if q.multi:
+                    self._w("  (multi: comma-separated numbers or values)\n")
+            if q.kind == "geometry_select":
+                self._w(f"  targets={list(q.targets or [])} multi={q.multi}\n")
+                self._w("  (paste selection JSON, or empty for default/no pick)\n")
             raw = self._in.readline()
             if raw == "":  # EOF
                 return None
@@ -338,9 +442,21 @@ class CLITransport:
             return {"value": val, "unit": unit}
         if q.kind == "choice":
             opts = q.options or []
+            values = [o["value"] for o in opts]
+            if q.multi:
+                parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+                out: list[Any] = []
+                for p in parts:
+                    if p.isdigit() and 1 <= int(p) <= len(opts):
+                        out.append(opts[int(p) - 1]["value"])
+                    elif p in values:
+                        out.append(p)
+                    else:
+                        raise InteractionError(
+                            f"pick numbers 1..{len(opts)} or values from {values}")
+                return out
             if raw.isdigit() and 1 <= int(raw) <= len(opts):
                 return opts[int(raw) - 1]["value"]
-            values = [o["value"] for o in opts]
             if raw in values:
                 return raw
             raise InteractionError(f"pick 1..{len(opts)} or one of {values}")
@@ -348,6 +464,15 @@ class CLITransport:
             return raw.lower() in ("y", "yes", "true", "1", "approve", "ok")
         if q.kind == "file_request":
             return {"paths": [p.strip() for p in raw.split(",") if p.strip()]}
+        if q.kind == "geometry_select":
+            data = json.loads(raw)
+            if q.multi:
+                if not isinstance(data, list):
+                    raise InteractionError("geometry_select multi expects a JSON array")
+                return data
+            if not isinstance(data, dict):
+                raise InteractionError("geometry_select expects a JSON object")
+            return data
         return raw  # text
 
 
@@ -390,14 +515,27 @@ class MCPElicitationTransport:
                 "value": {"type": "number"},
                 "unit": {"type": "string"}}, "required": ["value", "unit"]}
         if q.kind == "choice":
+            enum_vals = [o["value"] for o in (q.options or [])]
+            if q.multi:
+                # MCP elicitation is primitive-only; multi rides as a comma-joined string.
+                return {"type": "object", "properties": {
+                    "value": {"type": "string",
+                              "description": f"comma-separated values from {enum_vals}"}},
+                    "required": ["value"]}
             return {"type": "object", "properties": {
-                "value": {"type": "string", "enum": [o["value"] for o in (q.options or [])]}},
+                "value": {"type": "string", "enum": enum_vals}},
                 "required": ["value"]}
         if q.kind == "approval":
             return {"type": "object", "properties": {"value": {"type": "boolean"}},
                     "required": ["value"]}
         if q.kind == "file_request":
             return {"type": "object", "properties": {"paths": {"type": "string"}}}
+        if q.kind == "geometry_select":
+            # No viewport in pure MCP clients — free-form JSON string of a selection object.
+            return {"type": "object", "properties": {
+                "value": {"type": "string",
+                          "description": "JSON selection object or array (geometry_select)"}},
+                "required": ["value"]}
         return {"type": "object", "properties": {"value": {"type": "string"}}}
 
     def ask(self, batch: QuestionBatch) -> dict[str, Any]:
@@ -411,6 +549,21 @@ class MCPElicitationTransport:
             elif q.kind == "file_request":
                 paths = data.get("paths", "")
                 out[q.id] = {"paths": [p.strip() for p in str(paths).split(",") if p.strip()]}
+            elif q.kind == "choice" and q.multi:
+                raw = data.get("value")
+                if isinstance(raw, list):
+                    out[q.id] = raw
+                else:
+                    out[q.id] = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+            elif q.kind == "geometry_select":
+                raw = data.get("value")
+                if isinstance(raw, (dict, list)):
+                    out[q.id] = raw
+                else:
+                    try:
+                        out[q.id] = json.loads(str(raw))
+                    except json.JSONDecodeError:
+                        continue  # fall back to default / error path
             else:
                 out[q.id] = data.get("value")
         return out
@@ -425,12 +578,27 @@ def _now() -> str:
 
 
 def _finalize_answer(q: Question, raw: Any, source: str) -> dict:
-    """Build the durable answer object (contract §4), normalizing dimensions."""
-    ans: dict = {"value": raw, "source": source, "at": _now()}
+    """Build the durable answer object (contract §4), normalizing dimensions + multi-choice."""
+    value = raw
+    if q.kind == "choice" and q.multi and not isinstance(value, list):
+        value = [] if value in (None, "") else [value]
+    if q.kind == "geometry_select" and q.multi and not isinstance(value, list):
+        value = [] if value in (None, {}) else [value]
+    ans: dict = {"value": value, "source": source, "at": _now()}
     if q.kind == "dimension":
-        val, unit = raw["value"], raw["unit"]
+        val, unit = value["value"], value["unit"]
         ans["canonical"] = normalize_dimension(val, unit, q.family)
     return ans
+
+
+def _usable_default(q: Question) -> bool:
+    """False when suggested is an honest empty geometry pick and the question is required."""
+    if q.kind != "geometry_select":
+        return q.suggested is not None
+    sug = q.suggested
+    if q.multi:
+        return isinstance(sug, list) and len(sug) > 0
+    return isinstance(sug, dict) and bool(sug.get("id") or sug.get("kind") or sug.get("point"))
 
 
 def _emit(on_event, ledger, kind: str, data: dict) -> None:
@@ -513,11 +681,23 @@ def ask_user(questions, *, scope: str = "run", run_id: str | None = None,
         provided = raw.get(q.id)
         if provided is not None:
             answer = _finalize_answer(q, provided, "user")
-        elif not q.required or autonomy == "auto" or not batch.blocking:
-            answer = _finalize_answer(q, q.suggested, "default")
         else:
-            raise InteractionError(
-                f"required question {q.id!r} was not answered by the transport")
+            # Defaulting rules (contract §4 + §12):
+            # - optional always defaults (incl. empty geometry {})
+            # - non-blocking batches default (mission path records suggested/empty)
+            # - autonomy=auto defaults when suggested is usable; geometry with no
+            #   honest pick does NOT invent a sid (raises if required+blocking)
+            can_default = (
+                not q.required
+                or not batch.blocking
+                or (autonomy == "auto" and _usable_default(q))
+                or (autonomy == "auto" and q.kind != "geometry_select")
+            )
+            if can_default:
+                answer = _finalize_answer(q, q.suggested, "default")
+            else:
+                raise InteractionError(
+                    f"required question {q.id!r} was not answered by the transport")
         ledger.record_answer(q.id, answer)
         results[q.id] = answer
         _emit(on_event, ledger, "ask_answer",

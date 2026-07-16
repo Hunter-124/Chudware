@@ -1709,7 +1709,13 @@ def _normalize_questions(raw: Any) -> list[dict]:
 
     Accepts a plain string, a dict, or a list of strings/dicts.  Fills the
     required fields a small model tends to omit (id, kind, suggested) with honest
-    defaults — a text question whose default answer is empty string."""
+    defaults — a text question whose default answer is empty string.
+
+    Also accepts common aliases:
+      type→kind, ask/text→prompt, default→suggested, choices→options,
+      multiple→multi, target→targets. Maps design-decision style payloads onto
+      ``choice`` and geometry-pick payloads onto ``geometry_select``.
+    """
     if raw is None:
         return []
     items = raw if isinstance(raw, list) else [raw]
@@ -1721,12 +1727,95 @@ def _normalize_questions(raw: Any) -> list[dict]:
             q = dict(item)
         else:
             continue
+        # Field aliases
+        if "prompt" not in q:
+            q["prompt"] = q.get("text") or q.get("ask") or ""
+        if "kind" not in q and q.get("type"):
+            q["kind"] = q["type"]
+        if q.get("suggested") is None and "default" in q:
+            q["suggested"] = q.get("default")
+        if "options" not in q and q.get("choices") is not None:
+            choices = q.get("choices") or []
+            opts = []
+            for c in choices:
+                if isinstance(c, dict) and "value" in c:
+                    opts.append(c)
+                elif isinstance(c, str):
+                    opts.append({"value": c, "label": c})
+            q["options"] = opts
+        if "multi" not in q and q.get("multiple") is not None:
+            q["multi"] = bool(q.get("multiple"))
+        if "targets" not in q and q.get("target") is not None:
+            t = q.get("target")
+            q["targets"] = t if isinstance(t, list) else [t]
+
+        # Infer kind from payload shape when omitted.
+        kind = (q.get("kind") or "").strip().lower()
+        if not kind:
+            if q.get("options") or q.get("choices"):
+                kind = "choice"
+            elif q.get("targets") or q.get("target") or q.get("geometry"):
+                kind = "geometry_select"
+            elif q.get("family") in ("length", "angle", "count") or q.get("unit"):
+                kind = "dimension"
+            elif "proposal" in q or q.get("approve") is not None:
+                kind = "approval"
+            else:
+                kind = "text"
+        # Map common free-form kind aliases.
+        kind_aliases = {
+            "select": "choice", "single_choice": "choice", "multiple_choice": "choice",
+            "mc": "choice", "design": "choice", "design_choice": "choice",
+            "decision": "choice", "option": "choice", "options": "choice",
+            "number": "dimension", "dim": "dimension", "length": "dimension",
+            "string": "text", "free_text": "text", "open": "text", "open_ended": "text",
+            "file": "file_request", "image": "file_request", "upload": "file_request",
+            "confirm": "approval", "approve": "approval", "yes_no": "approval",
+            "geometry": "geometry_select", "pick": "geometry_select",
+            "select_geometry": "geometry_select", "point": "geometry_select",
+            "feature": "geometry_select", "face": "geometry_select",
+        }
+        kind = kind_aliases.get(kind, kind)
+        q["kind"] = kind
+
         q.setdefault("id", f"q{i}")
-        q.setdefault("kind", "text")
-        q.setdefault("prompt", q.get("text", "") or q.get("ask", ""))
-        if q.get("suggested") is None:
-            q["suggested"] = q.get("default", "")
         q.setdefault("required", False)
+
+        # Kind-specific suggested defaults when omitted.
+        if q.get("suggested") is None:
+            if kind == "choice":
+                opts = q.get("options") or []
+                if opts and isinstance(opts[0], dict):
+                    first = opts[0].get("value", "")
+                    q["suggested"] = [first] if q.get("multi") else first
+                else:
+                    q["suggested"] = [] if q.get("multi") else ""
+            elif kind == "dimension":
+                unit = q.get("unit") or "mm"
+                # No invented engineering number — 0.0 is a placeholder; force required
+                # so unattended auto does not ship a degenerate dim unless the model
+                # supplied a real suggested value (or required:false explicitly).
+                q["suggested"] = {"value": 0.0, "unit": unit}
+                q.setdefault("family", "length")
+                if isinstance(item, dict) and "required" not in item:
+                    q["required"] = True
+            elif kind == "approval":
+                # Safe deny — never auto-approve a gate the model forgot to default.
+                q["suggested"] = False
+            elif kind == "file_request":
+                q["suggested"] = {"paths": []}
+            elif kind == "geometry_select":
+                # Honest empty pick — do not fabricate sids (contract §12).
+                q["suggested"] = [] if q.get("multi") else {}
+                if not q.get("targets"):
+                    q["targets"] = ["face", "edge", "feature"]
+            else:
+                q["suggested"] = ""
+
+        if kind == "choice" and q.get("multi") and not isinstance(q.get("suggested"), list):
+            s = q.get("suggested")
+            q["suggested"] = [] if s in (None, "") else [s]
+
         if not q["prompt"]:
             continue
         out.append(q)

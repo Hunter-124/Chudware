@@ -407,9 +407,18 @@ enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2 };
 // Before a Design run, agent_clarify_v1 returns the build-critical questions (or ready=true).
 // One ClarifyQ per question; `answer` is the editable buffer shown in the inline clarify card,
 // seeded with `suggested` so the user can accept a default with one click.
+// Extended 2026-07-16 for interaction-contract kinds (choice multi/single, geometry_select).
 struct ClarifyQ {
     std::string key, ask, unit, suggested;
     std::vector<char> answer{std::vector<char>(256, 0)};
+    // interaction/1 kind: "text" | "dimension" | "choice" | "approval" | "geometry_select" | …
+    std::string kind = "text";
+    bool multi = false;                         // choice / geometry_select multi-select
+    std::vector<std::pair<std::string, std::string>> options;  // choice: (value, label)
+    std::vector<std::string> targets;           // geometry_select targets
+    std::vector<std::string> selectedValues;    // multi-choice selected values OR geometry ids
+    std::string selectedKind;                   // geometry: face|edge|feature|…
+    bool pickArmed = false;                     // geometry_select: context-cube armed for this Q
 };
 struct ClarifyState {
     bool awaiting = false;   // clarify RPC in flight — the turn shows "working out what I need..."
@@ -417,6 +426,7 @@ struct ClarifyState {
     std::string request;     // the original user request, launched once answered/skipped
     std::vector<ClarifyQ> questions;
     std::vector<std::string> assumptions;
+    int geometryPickQ = -1;  // index of ClarifyQ currently armed for viewport geometry pick (-1=none)
 };
 
 // ---------------- transparent activity timeline ----------------

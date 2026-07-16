@@ -1926,9 +1926,10 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
     launchMissionRun(st.worker, st.job, request, st.docMirror.docId(), payload);
 }
 
-// The inline clarify card: the build-critical questions the model asked, each with an editable
-// value field seeded with its suggested default. "Build it" folds the answers into the request
-// and launches the run; "Skip" uses the suggested defaults. Shown inside an assistant turn.
+// The inline clarify card: build-critical questions (interaction contract kinds).
+// Supports text/dimension (editable field), choice single (radio) + multi (checkbox),
+// approval (Y/N), and geometry_select (arm context-cube pick → chips). "Build it" folds
+// answers into the request; "Skip" uses suggested defaults.
 static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -1938,8 +1939,6 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::BeginChild("##clarify", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    // Value fields on glass: a wash OPPOSITE the ink tone so typed answers stay readable over
-    // any model — the theme FrameBg under the adaptive near-black ink was black-on-black.
     const ImVec4 fieldBg = surf.darkText ? ImVec4(1, 1, 1, 0.50f) : ImVec4(0, 0, 0, 0.38f);
     ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
     ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
@@ -1951,6 +1950,45 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::TextColored(accentCol, "A few details to get this right");
     ImGui::PopFont();
     dimText("Accept the suggested values or change them, then build. Skip uses the defaults.");
+
+    // Drain context-cube picks into an armed geometry_select question.
+    if (m.clarify.geometryPickQ >= 0 &&
+        m.clarify.geometryPickQ < (int)m.clarify.questions.size() &&
+        !st.pendingContextRefs.empty()) {
+        ClarifyQ& gq = m.clarify.questions[(size_t)m.clarify.geometryPickQ];
+        if (gq.kind == "geometry_select") {
+            auto targetOk = [&](const std::string& k) {
+                if (gq.targets.empty()) return true;
+                for (const auto& t : gq.targets) if (t == k) return true;
+                return false;
+            };
+            for (const auto& r : st.pendingContextRefs) {
+                if (!targetOk(r.kind)) continue;
+                if (!gq.multi) gq.selectedValues.clear();
+                bool already = false;
+                for (const auto& s : gq.selectedValues)
+                    if (s == r.id) { already = true; break; }
+                if (!already) gq.selectedValues.push_back(r.id);
+                gq.selectedKind = r.kind;
+                // Keep answer buffer in sync for Build-it fold.
+                std::string joined;
+                for (size_t i = 0; i < gq.selectedValues.size(); ++i) {
+                    if (i) joined += ", ";
+                    joined += gq.selectedValues[i];
+                }
+                std::strncpy(gq.answer.data(), joined.c_str(), gq.answer.size() - 1);
+                gq.answer[gq.answer.size() - 1] = '\0';
+                if (!gq.multi) break;
+            }
+            st.pendingContextRefs.clear();
+            if (!gq.multi) {
+                st.contextPickActive = false;
+                gq.pickArmed = false;
+                m.clarify.geometryPickQ = -1;
+            }
+        }
+    }
+
     for (size_t i = 0; i < m.clarify.questions.size(); ++i) {
         ClarifyQ& q = m.clarify.questions[i];
         ImGui::PushID((int)i);
@@ -1958,7 +1996,110 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         if (!q.unit.empty()) lbl += "  (" + q.unit + ")";
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         ImGui::TextWrapped("%s", lbl.c_str());
-        drawChatInput("##cq", q.answer, q.suggested.empty() ? "value" : q.suggested.c_str(), 2);
+
+        if (q.kind == "choice" && !q.options.empty()) {
+            if (q.multi) {
+                // Multi-select: checkbox list.
+                for (size_t oi = 0; oi < q.options.size(); ++oi) {
+                    ImGui::PushID((int)oi);
+                    const auto& opt = q.options[oi];
+                    bool on = std::find(q.selectedValues.begin(), q.selectedValues.end(),
+                                        opt.first) != q.selectedValues.end();
+                    std::string lab = opt.second.empty() ? opt.first : opt.second;
+                    if (ImGui::Checkbox(lab.c_str(), &on)) {
+                        if (on) {
+                            if (std::find(q.selectedValues.begin(), q.selectedValues.end(),
+                                          opt.first) == q.selectedValues.end())
+                                q.selectedValues.push_back(opt.first);
+                        } else {
+                            q.selectedValues.erase(
+                                std::remove(q.selectedValues.begin(), q.selectedValues.end(),
+                                            opt.first),
+                                q.selectedValues.end());
+                        }
+                        std::string joined;
+                        for (size_t j = 0; j < q.selectedValues.size(); ++j) {
+                            if (j) joined += ", ";
+                            joined += q.selectedValues[j];
+                        }
+                        std::strncpy(q.answer.data(), joined.c_str(), q.answer.size() - 1);
+                        q.answer[q.answer.size() - 1] = '\0';
+                    }
+                    ImGui::PopID();
+                }
+            } else {
+                // Single-select: radio buttons.
+                int cur = -1;
+                for (size_t oi = 0; oi < q.options.size(); ++oi) {
+                    if (std::string(q.answer.data()) == q.options[oi].first ||
+                        (!q.selectedValues.empty() &&
+                         q.selectedValues[0] == q.options[oi].first))
+                        cur = (int)oi;
+                }
+                for (size_t oi = 0; oi < q.options.size(); ++oi) {
+                    ImGui::PushID((int)oi);
+                    const auto& opt = q.options[oi];
+                    std::string lab = opt.second.empty() ? opt.first : opt.second;
+                    if (ImGui::RadioButton(lab.c_str(), cur == (int)oi)) {
+                        cur = (int)oi;
+                        std::strncpy(q.answer.data(), opt.first.c_str(), q.answer.size() - 1);
+                        q.answer[q.answer.size() - 1] = '\0';
+                        q.selectedValues = {opt.first};
+                    }
+                    ImGui::PopID();
+                }
+            }
+        } else if (q.kind == "approval") {
+            bool yes = std::string(q.answer.data()) == "true" ||
+                       std::string(q.answer.data()) == "yes" ||
+                       std::string(q.answer.data()) == "1" ||
+                       q.suggested == "true" || q.suggested == "yes";
+            // Seed once from suggested when empty.
+            if (q.answer[0] == '\0') {
+                yes = (q.suggested == "true" || q.suggested == "1" || q.suggested == "yes");
+                std::strncpy(q.answer.data(), yes ? "true" : "false", q.answer.size() - 1);
+            }
+            if (ImGui::RadioButton("Approve", yes)) {
+                std::strncpy(q.answer.data(), "true", q.answer.size() - 1);
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Reject", !yes)) {
+                std::strncpy(q.answer.data(), "false", q.answer.size() - 1);
+            }
+        } else if (q.kind == "geometry_select") {
+            if (!q.selectedValues.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                for (const auto& id : q.selectedValues) {
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(id.c_str());
+                }
+                ImGui::PopStyleColor();
+            } else {
+                dimText(q.suggested.empty() ? "No pick yet — click Pick on model."
+                                            : q.suggested.c_str());
+            }
+            const bool armed = q.pickArmed && m.clarify.geometryPickQ == (int)i;
+            if (ImGui::Button(armed ? "Picking… (click model)" : "Pick on model")) {
+                // Disarm others.
+                for (auto& oq : m.clarify.questions) oq.pickArmed = false;
+                q.pickArmed = true;
+                m.clarify.geometryPickQ = (int)i;
+                st.contextPickActive = true;
+            }
+            if (armed) {
+                ImGui::SameLine();
+                if (ImGui::Button("Done")) {
+                    q.pickArmed = false;
+                    m.clarify.geometryPickQ = -1;
+                    st.contextPickActive = false;
+                }
+            }
+        } else {
+            // text / dimension / unknown — free text field
+            drawChatInput("##cq", q.answer,
+                          q.suggested.empty() ? "value" : q.suggested.c_str(), 2);
+        }
         ImGui::PopID();
     }
     if (!m.clarify.assumptions.empty()) {
@@ -1979,19 +2120,39 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::EndChild();
     endGlassBubble(gb);
     if (build || skip) {
-        // Fold each answer (or its suggested default on Skip) into the request so the
-        // orchestrator builds with concrete numbers.
+        // Fold each answer (or its suggested default on Skip) into the request.
         std::string aug = m.clarify.request + "\n\nClarified dimensions:";
         for (auto& q : m.clarify.questions) {
-            std::string val = skip ? q.suggested : std::string(q.answer.data());
+            std::string val;
+            if (skip) {
+                val = q.suggested;
+                if (val.empty() && !q.selectedValues.empty()) {
+                    for (size_t j = 0; j < q.selectedValues.size(); ++j) {
+                        if (j) val += ", ";
+                        val += q.selectedValues[j];
+                    }
+                }
+            } else {
+                val = std::string(q.answer.data());
+                if (val.empty() && !q.selectedValues.empty()) {
+                    for (size_t j = 0; j < q.selectedValues.size(); ++j) {
+                        if (j) val += ", ";
+                        val += q.selectedValues[j];
+                    }
+                }
+            }
             if (val.empty()) val = q.suggested;
             std::string nm = q.key.empty() ? q.ask : q.key;
             aug += "\n- " + nm + ": " + val + (q.unit.empty() ? "" : " " + q.unit);
+            if (q.kind == "geometry_select" && !q.selectedKind.empty())
+                aug += " (" + q.selectedKind + ")";
         }
         for (const auto& a : m.clarify.assumptions) aug += "\n- (assumed) " + a;
         m.clarify.active = false;
         m.clarify.questions.clear();
         m.clarify.assumptions.clear();
+        m.clarify.geometryPickQ = -1;
+        st.contextPickActive = false;
         m.running = true;
         if (st.settings.model[0]) m.model = st.settings.model;
         m.liveStatus = "Building...";
@@ -7528,22 +7689,105 @@ static void submitTurn(AppState& st, const std::string& text) {
             }
             msg->clarify.awaiting = false;
             // Parse questions; on ANY error/empty -> build straight away (never block).
+            // Prefer the additive aicad.interaction/1 mirror when present (choice /
+            // geometry_select / multi); fall back to legacy {key,ask,unit,suggested}.
             bool ready = true;
             std::vector<ClarifyQ> qs;
             std::vector<std::string> assumptions;
             if (r.ok && r.result.is_object() && !r.result.contains("code")) {
                 ready = r.result.value("ready", true);
-                if (r.result.contains("questions") && r.result["questions"].is_array()) {
+                auto seedAnswer = [](ClarifyQ& cq) {
+                    std::strncpy(cq.answer.data(), cq.suggested.c_str(),
+                                 cq.answer.size() - 1);
+                    cq.answer[cq.answer.size() - 1] = '\0';
+                };
+                auto parseInteractionQ = [&](const nlohmann::json& q) -> bool {
+                    if (!q.is_object()) return false;
+                    ClarifyQ cq;
+                    cq.key = q.value("id", q.value("key", std::string()));
+                    cq.ask = q.value("prompt", q.value("ask", std::string()));
+                    cq.kind = q.value("kind", std::string("text"));
+                    cq.multi = q.value("multi", q.value("multiple", false));
+                    if (cq.ask.empty()) return false;
+                    if (q.contains("suggested")) {
+                        const auto& s = q["suggested"];
+                        if (s.is_string()) cq.suggested = s.get<std::string>();
+                        else if (s.is_boolean())
+                            cq.suggested = s.get<bool>() ? "true" : "false";
+                        else if (s.is_number())
+                            cq.suggested = std::to_string(s.get<double>());
+                        else if (s.is_array()) {
+                            for (const auto& v : s) {
+                                if (v.is_string())
+                                    cq.selectedValues.push_back(v.get<std::string>());
+                            }
+                            std::string joined;
+                            for (size_t j = 0; j < cq.selectedValues.size(); ++j) {
+                                if (j) joined += ", ";
+                                joined += cq.selectedValues[j];
+                            }
+                            cq.suggested = joined;
+                        } else if (s.is_object()) {
+                            if (s.contains("value") && s.contains("unit")) {
+                                cq.suggested = std::to_string(s.value("value", 0.0));
+                                cq.unit = s.value("unit", std::string());
+                            } else if (s.contains("id")) {
+                                cq.suggested = s.value("id", std::string());
+                                cq.selectedKind = s.value("kind", std::string());
+                                if (!cq.suggested.empty())
+                                    cq.selectedValues.push_back(cq.suggested);
+                            }
+                        }
+                    }
+                    if (q.contains("options") && q["options"].is_array()) {
+                        for (const auto& o : q["options"]) {
+                            if (!o.is_object()) continue;
+                            std::string val = o.value("value", std::string());
+                            std::string lab = o.value("label", val);
+                            if (!val.empty()) cq.options.emplace_back(val, lab);
+                        }
+                    }
+                    if (q.contains("targets") && q["targets"].is_array()) {
+                        for (const auto& t : q["targets"])
+                            if (t.is_string()) cq.targets.push_back(t.get<std::string>());
+                    }
+                    if (cq.kind == "dimension" && cq.unit.empty() &&
+                        q.contains("suggested") && q["suggested"].is_object())
+                        cq.unit = q["suggested"].value("unit", std::string());
+                    seedAnswer(cq);
+                    if (cq.kind == "choice" && !cq.multi && !cq.suggested.empty())
+                        cq.selectedValues = {cq.suggested};
+                    qs.push_back(std::move(cq));
+                    return true;
+                };
+
+                bool usedInteraction = false;
+                if (r.result.contains("interaction") &&
+                    r.result["interaction"].is_object() &&
+                    r.result["interaction"].contains("questions") &&
+                    r.result["interaction"]["questions"].is_array() &&
+                    !r.result["interaction"]["questions"].empty()) {
+                    usedInteraction = true;
+                    for (const auto& q : r.result["interaction"]["questions"])
+                        parseInteractionQ(q);
+                }
+                if (!usedInteraction && r.result.contains("questions") &&
+                    r.result["questions"].is_array()) {
                     for (const auto& q : r.result["questions"]) {
                         if (!q.is_object()) continue;
+                        if (q.contains("kind") || q.contains("options") ||
+                            q.contains("targets")) {
+                            parseInteractionQ(q);
+                            continue;
+                        }
                         ClarifyQ cq;
                         cq.key = q.value("key", std::string());
                         cq.ask = q.value("ask", std::string());
                         cq.unit = q.value("unit", std::string());
                         cq.suggested = q.value("suggested", std::string());
+                        cq.kind = cq.unit.empty() ? "text" : "dimension";
                         if (cq.ask.empty()) continue;
-                        std::strncpy(cq.answer.data(), cq.suggested.c_str(),
-                                     cq.answer.size() - 1);
+                        seedAnswer(cq);
                         qs.push_back(std::move(cq));
                     }
                 }

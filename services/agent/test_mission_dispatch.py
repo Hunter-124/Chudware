@@ -201,6 +201,37 @@ class TestAskUser:
         assert len(qs) == 4
         assert all(q["suggested"] == "" and q["kind"] == "text" for q in qs)
 
+    def test_normalize_design_choice_aliases(self):
+        qs = _normalize_questions([{
+            "id": "mat", "type": "design_choice", "prompt": "Material?",
+            "choices": ["aluminum", "steel"], "default": "aluminum",
+        }])
+        assert len(qs) == 1
+        assert qs[0]["kind"] == "choice"
+        assert qs[0]["options"][0]["value"] == "aluminum"
+        assert qs[0]["suggested"] == "aluminum"
+
+    def test_normalize_multi_choice(self):
+        qs = _normalize_questions([{
+            "prompt": "Keep?", "kind": "choice", "multi": True,
+            "options": [{"value": "a"}, {"value": "b"}],
+            "suggested": "a",
+        }])
+        assert qs[0]["suggested"] == ["a"]
+
+    def test_normalize_geometry_select(self):
+        qs = _normalize_questions([{
+            "prompt": "Which face?", "kind": "geometry",
+            "targets": ["face"],
+        }])
+        assert qs[0]["kind"] == "geometry_select"
+        assert qs[0]["suggested"] == {}
+        assert qs[0]["targets"] == ["face"]
+
+    def test_normalize_approval_defaults_false(self):
+        qs = _normalize_questions([{"prompt": "Ship it?", "kind": "approval"}])
+        assert qs[0]["suggested"] is False
+
 
 # ---------------------------------------------------------------------------
 # delegate / dag_plan / part_search

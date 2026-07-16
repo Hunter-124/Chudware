@@ -273,3 +273,106 @@ def test_events_persist_then_callback_ordering():
     assert events.index(("ask_question", "a")) < events.index(("ask_answer", "a"))
     assert events.index(("ask_question", "b")) < events.index(("ask_answer", "b"))
     assert {e for e, _ in events} == {"ask_question", "ask_answer"}
+
+
+# --------------------------------------------------------------------------- #
+# 9. choice multi-select + geometry_select (v1.1)                             #
+# --------------------------------------------------------------------------- #
+
+def test_choice_multi_user_answer_is_list():
+    q = Question(
+        id="keep", kind="choice", prompt="Keep which?",
+        options=[{"value": "rib"}, {"value": "fillet"}, {"value": "boss"}],
+        multi=True, suggested=["rib"],
+    )
+
+    def provider(_batch):
+        return {"keep": ["rib", "fillet"]}
+
+    answers = ask_user([q], run_id="r_multi", transport=InAppTransport(provider))
+    assert answers["keep"]["value"] == ["rib", "fillet"]
+    assert answers["keep"]["source"] == "user"
+
+
+def test_choice_multi_default_is_list():
+    q = Question(
+        id="keep", kind="choice", prompt="Keep which?",
+        options=[{"value": "rib"}, {"value": "fillet"}],
+        multi=True, suggested=["rib"], required=False,
+    )
+    answers = ask_user([q], run_id="r_multi_def", autonomy="auto")
+    assert answers["keep"]["value"] == ["rib"]
+    assert answers["keep"]["source"] == "default"
+
+
+def test_choice_label_as_suggested_maps_to_value():
+    q = Question(
+        id="mat", kind="choice", prompt="Material?",
+        options=[{"value": "al", "label": "Aluminum"}, {"value": "st", "label": "Steel"}],
+        suggested="Aluminum",
+    )
+    answers = ask_user([q], run_id="r_label", autonomy="auto")
+    assert answers["mat"]["value"] == "al"
+
+
+def test_geometry_select_null_suggested_optional_defaults_empty():
+    q = Question(
+        id="face", kind="geometry_select", prompt="Which face?",
+        targets=["face"], suggested=None, required=False,
+    )
+    answers = ask_user([q], run_id="r_geo_opt", autonomy="auto")
+    assert answers["face"]["value"] == {}
+    assert answers["face"]["source"] == "default"
+
+
+def test_geometry_select_user_pick_round_trip():
+    pick = {"kind": "face", "id": "Fdb31d2", "label": "top"}
+    q = Question(
+        id="face", kind="geometry_select", prompt="Which face?",
+        targets=["face"], suggested=None, required=True,
+    )
+
+    def provider(_batch):
+        return {"face": pick}
+
+    answers = ask_user([q], run_id="r_geo_user", transport=InAppTransport(provider))
+    assert answers["face"]["value"] == pick
+    assert answers["face"]["source"] == "user"
+
+
+def test_geometry_select_required_empty_blocking_raises():
+    q = Question(
+        id="face", kind="geometry_select", prompt="Which face?",
+        targets=["face"], suggested=None, required=True,
+    )
+
+    def provider(_batch):
+        return {}  # no pick
+
+    with pytest.raises(InteractionError):
+        ask_user([q], run_id="r_geo_req", transport=InAppTransport(provider),
+                 autonomy="approve", blocking=True)
+
+
+def test_geometry_select_multi_suggested_list():
+    picks = [{"kind": "feature", "id": "f1"}, {"kind": "feature", "id": "f2"}]
+    q = Question(
+        id="feats", kind="geometry_select", prompt="Which features?",
+        targets=["feature"], multi=True, suggested=picks, required=False,
+    )
+    answers = ask_user([q], run_id="r_geo_multi", autonomy="auto")
+    assert answers["feats"]["value"] == picks
+
+
+def test_cli_multi_choice_comma_separated():
+    from io import StringIO
+    q = Question(
+        id="keep", kind="choice", prompt="Keep?",
+        options=[{"value": "a"}, {"value": "b"}, {"value": "c"}],
+        multi=True, suggested=["a"],
+    )
+    answers = ask_user(
+        [q], run_id="r_cli_multi",
+        transport=CLITransport(in_stream=StringIO("1,3\n"), out_stream=StringIO()),
+    )
+    assert answers["keep"]["value"] == ["a", "c"]

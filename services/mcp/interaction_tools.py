@@ -9,6 +9,7 @@ Import-safe: no elicitation happens at import time; the whole tool body is guard
 client/API mismatch returns an error string instead of crashing the shared server.
 """
 from __future__ import annotations
+import json
 
 from typing import Any, Literal, Optional
 
@@ -35,12 +36,21 @@ def _model_for(q):
                             unit=(str, sug.get("unit", "mm")))
     if q.kind == "choice":
         values = [o["value"] for o in (q.options or [])]
+        if q.multi:
+            # Primitive-only: multi-select as comma-joined values.
+            default = ",".join(str(v) for v in (q.suggested or [])) if isinstance(
+                q.suggested, list) else str(q.suggested or "")
+            return create_model("ChoiceMultiAnswer", value=(str, default))
         typ = Literal[tuple(values)] if values else str  # type: ignore[valid-type]
         return create_model("ChoiceAnswer", value=(typ, q.suggested))
     if q.kind == "approval":
         return create_model("ApprovalAnswer", value=(bool, bool(q.suggested)))
     if q.kind == "file_request":
         return create_model("FileAnswer", paths=(str, ""))
+    if q.kind == "geometry_select":
+        # No viewport on pure MCP clients — free-form JSON of a selection object/array.
+        default = json.dumps(q.suggested) if q.suggested is not None else ("[]" if q.multi else "{}")
+        return create_model("GeometryAnswer", value=(str, default))
     return create_model("TextAnswer", value=(str, str(q.suggested or "")))
 
 
@@ -60,6 +70,19 @@ async def _elicit_raw(ctx: Context, q) -> Optional[Any]:
     if q.kind == "file_request":
         paths = getattr(data, "paths", "") or ""
         return {"paths": [p.strip() for p in str(paths).split(",") if p.strip()]}
+    if q.kind == "choice" and q.multi:
+        raw = getattr(data, "value", None)
+        if isinstance(raw, list):
+            return raw
+        return [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if q.kind == "geometry_select":
+        raw = getattr(data, "value", None)
+        if isinstance(raw, (dict, list)):
+            return raw
+        try:
+            return json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            return None
     return getattr(data, "value", None)
 
 
@@ -73,10 +96,14 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         This is the ONE interaction seam (contracts/interaction.md). Each `questions[i]` is
         `{id, kind, prompt, suggested, required?, ...}` with kind in
-        choice|dimension|text|file_request|approval; every question needs a typed `suggested`
-        default. On an MCP client the questions surface as elicitations. Answers persist to the
-        run/doc record and replay on resume — a resumed agent never re-asks. Returns
-        `{id: {value, canonical?, source, at}}` (dimension answers carry a canonical mm/deg value).
+        choice|dimension|text|file_request|approval|geometry_select. Prefer NOT asking when a
+        sensible default exists — set `required:false` + typed `suggested` and only surface
+        decisions that change the build. Design decisions use kind=choice with options (set
+        multi=true for multi-select). Geometry the model cannot see uses kind=geometry_select
+        with targets=[face|edge|vertex|feature|body|component|point] (suggested may be null/{}
+        so you do not invent sids). On an MCP client the questions surface as elicitations.
+        Answers persist to the run/doc record and replay on resume — a resumed agent never
+        re-asks. Returns `{id: {value, canonical?, source, at}}`.
         """
         try:
             from services.agent import interaction as core

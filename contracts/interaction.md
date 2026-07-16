@@ -16,12 +16,12 @@ contract (T-F4); this contract does not break them.
 
 | kind | asks for | kind-specific fields | answer value |
 |---|---|---|---|
-| `choice` | pick from options | `options: [{value, label?}]`, `multi?: bool=false` | `value` (string) or `[value]` when `multi` |
+| `choice` | pick from options (single or multi) | `options: [{value, label?}]`, `multi?: bool=false` | `value` (string) when `multi=false`; `[value,…]` when `multi=true` (order preserved; empty list only when not `required`) |
 | `dimension` | a measured quantity | `family: "length"\|"angle"\|"count"`, `min?`, `max?` | **typed** `{value: number, unit: string}` — never a bare float |
 | `text` | free text | `multiline?: bool=false` | string |
 | `file_request` | files/images from the user | `media: "file"\|"image"`, `accept?: [ext]`, `multiple?: bool=false` | `{paths: [string]}` |
 | `approval` | approve a proposed action | `proposal: string` | bool (`true` = approved) |
-
+| `geometry_select` | user picks geometry on the live model / viewport | `targets: ["face"\|"edge"\|"vertex"\|"feature"\|"body"\|"component"\|"point"]` (non-empty), `multi?: bool=false`, `doc_id?: string` (default = active doc) | single: one selection object; multi: array of selection objects (see §12) |
 ## 2. Question object
 
 ```json
@@ -184,3 +184,67 @@ batch replays for free on resume.
               "canonical":{"value":12.7,"unit":"mm"},"source":"user","at":"…"},
   "finish":{"value":"as_machined","source":"default","at":"…"}}}
 ```
+
+## 12. Geometry selection answers (`geometry_select`) — appended 2026-07-16
+
+A `geometry_select` question asks the human to point at the live CAD model (or feature tree)
+because the agent cannot see well enough to resolve plain-word geometry. Transports that cannot
+offer a pick (CLI, pure MCP clients without a viewport) MUST fall back to the typed `suggested`
+default rather than inventing a pick.
+
+**Selection object** (one answer element):
+
+```json
+{
+  "kind": "face",                 // face|edge|vertex|feature|body|component|point
+  "id": "Fdb31d2",                // stable sid / feature id / component id / body id
+  "doc_id": "doc-cpp…",           // owning doc; empty ⇒ active doc at answer time
+  "label": "top face of boss",    // optional human chip text
+  "selector": { /* selectors.md */ },  // optional full selector when the host resolved the pick
+  "point": [x, y, z]              // optional world mm; required when kind=point
+}
+```
+
+- **`suggested` exception for this kind (amends §2 / §10 for geometry only):** a real pick is
+  often unknown to the model. `suggested` MAY be `null`, `{}` (single), or `[]` (`multi=true`)
+  meaning "no best-guess pick". Do NOT invent sids. When a best-guess pick *is* known
+  (from `query_geometry` / `describe_part` / a prior user pick), put that selection object
+  (or list) in `suggested` so autonomy/auto can proceed without a human click.
+- Headless transports (CLI, MCP without a viewport) MUST NOT invent a pick: they accept a
+  non-empty `suggested` pick when present, otherwise leave the question unanswered so the
+  core defaults (`{}`/`[]` when not `required`) or errors (`required:true` with no pick).
+- `multi=false` (default) → answer value is one selection object.
+- `multi=true` → answer value is an array of selection objects (may be empty only when not
+  `required`).
+- Hosts SHOULD arm the existing context-cube / viewport pick path while the question is open,
+  filtered by `targets`. Feature-tree row clicks satisfy `feature`/`body`/`component` targets.
+
+## 13. Producer guidance — ask only when needed (appended 2026-07-16)
+
+These rules bind role prompts and `ask_user` call sites; they do not change the wire schema.
+
+1. **Do not ask by default.** Prefer a typed `suggested` + `required:false` (or skip the tool
+   entirely) when a sensible engineering default exists. Record the assumption in the ledger.
+2. **Ask only when the answer changes the build** (fit-critical dim, material/process branch,
+   which of two design options the user wants, which face/feature to edit). Cost-of-being-wrong
+   is the filter; ≤4 questions per batch remains the hard cap.
+3. **Design decisions use `choice`.** Present the design options as `options:[{value,label}]`.
+   Single-select (`multi=false`) for mutually exclusive options; multi-select (`multi=true`) when
+   the user may pick several (e.g. which of these features to keep). Put the recommended option
+   in `suggested` and set `required:false` so unattended runs accept the recommendation.
+4. **Geometry the model cannot see → `geometry_select`.** Prefer this over free-text "which
+   face?" when a viewport or feature tree is available.
+5. **Batch size is free within the cap.** One question alone is fine; grouping related questions
+   in one batch is preferred over serial rounds. Empty batches are a contract error — if there
+   is nothing to ask, do not call `ask_user`.
+6. **Autonomy still owns defaulting.** `required:false` + a usable `suggested` lets
+   `autonomy=auto` / non-blocking batches proceed without a human; `required:true` only for
+   answers that must not be guessed. `geometry_select` is the exception in §12: `suggested`
+   may be empty/`null` when the model has no honest pick.
+
+## 14. Version notes
+
+- **v1 (2026-07-02):** initial freeze — choice/dimension/text/file_request/approval.
+- **v1.1 (2026-07-16, append-only):** `geometry_select` kind (§1 + §12); producer guidance §13;
+  clarified that `choice.multi=true` answers as a JSON array of values (was already in §1);
+  geometry `suggested` may be null/empty so models do not fabricate sids.

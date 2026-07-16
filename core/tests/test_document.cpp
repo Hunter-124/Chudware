@@ -2775,3 +2775,59 @@ TEST_CASE("eval_mass on a reopened doc with a failed-rebuild feature names the c
     std::error_code ec;
     fs::remove(path, ec);  // best-effort cleanup
 }
+
+// WASHER via the DOCUMENT OP PATH (resolve_profile_faces), the path the GUI + MCP use —
+// distinct from test_profile_extrude's low-level faces_from_solved_sketch coverage. Two
+// concentric circles + extrude must yield an ANNULAR prism, both for an untargeted profile
+// (whole-sketch material faces) and for the default TARGETED selector the guide emits
+// ({"centroid":[0,0],"hint_index":0}). Regression for "washer extrudes as a solid disc"
+// through the op path (all_region_faces + centroid pick).
+TEST_CASE("op-path: two concentric circles extrude to an annular washer (untargeted + targeted)") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double R = 10.0, r = 4.0, D = 5.0;
+    const double expected = PI * (R * R - r * r) * D;   // annular ring
+    const double full_disc = PI * R * R * D;
+
+    auto build = [&](const json& profile) -> double {
+        json nr = doc_new("part", "OpWasher");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "WS"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+            json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                 {"entity", {{"type", "circle"}, {"center", json::array({0, 0})}, {"radius", R}}}},
+            json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                 {"entity", {{"type", "circle"}, {"center", json::array({0, 0})}, {"radius", r}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "WB"},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(D)}}},
+                 {"refs", {{"profile", profile}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        for (const auto& fst : resp["rebuild"]["feature_status"])
+            CHECK_MESSAGE(fst.value("ok", false), "feature " << fst.value("id", std::string())
+                          << " failed: " << fst.value("error", json(nullptr)).dump());
+        return resp.value("volume", 0.0);
+    };
+
+    // Untargeted: bare region selector (whole-sketch material faces).
+    {
+        json profile = json::array({json{{"kind", "region"}, {"sketch", "$0"}}});
+        double vol = build(profile);
+        MESSAGE("untargeted washer vol=" << vol << " (expected " << expected << ")");
+        CHECK(vol == doctest::Approx(expected).epsilon(0.02));
+        CHECK(vol < full_disc * 0.99);
+    }
+    // Targeted with the guide's default seed centroid[0,0]/hint_index 0 -> must pick the
+    // material washer (larger area), NOT the void inner disc and NOT a solid outer disc.
+    {
+        json profile = json::array({json{{"kind", "region"}, {"sketch", "$0"},
+                                         {"centroid", json::array({0, 0})}, {"hint_index", 0}}});
+        double vol = build(profile);
+        MESSAGE("targeted washer vol=" << vol << " (expected " << expected << ")");
+        CHECK(vol == doctest::Approx(expected).epsilon(0.02));
+        CHECK(vol < full_disc * 0.99);
+    }
+}

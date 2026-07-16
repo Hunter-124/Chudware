@@ -275,6 +275,9 @@ struct DocSession {
     std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
     std::unordered_set<std::string> autoHiddenPlanes; // consumed default/user datum plane fids
     std::unordered_set<std::string> datumPlanesUserToggled; // sticky user-plane eye overrides
+    // User-created points/csys whose FM eye took control (same sticky role as datumPlanesUserToggled).
+    // Auto-hide with hasSolidContent never rewrites these again.
+    std::unordered_set<std::string> refGeomUserToggled;
     // Datum visibility control state — parked per-doc so force-show/auto-show decisions never
     // leak across tabs (issue: origin force-shown in doc A stayed shown in doc B).
     bool showPlane[3] = {false, false, false};
@@ -1055,6 +1058,9 @@ struct AppState {
     // these planes again, in either direction, so force-show and force-hide both survive rebuilds
     // and tab switches. The three reserved planes use planesUserToggled/showPlane instead.
     std::unordered_set<std::string> datumPlanesUserToggled;
+    // User-created points / coordinate systems whose FM eye took control (parity with
+    // datumPlanesUserToggled). Solid-content auto-hide skips these ids so an unhide sticks.
+    std::unordered_set<std::string> refGeomUserToggled;
     // Push bodyVisible to the renderer (per-slot draw skip) and the id pass (pick skip). Call
     // after any toggle; loadDocMesh calls it after every setMeshes/setDoc.
     void applyBodyVisibility();

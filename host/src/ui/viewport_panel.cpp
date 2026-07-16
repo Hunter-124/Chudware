@@ -37,6 +37,7 @@
 #include "dragdrop.h"      // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "sim_manager.h"        // simulation fixture/load previews in the viewport
+#include "evaluate_dialogs.h"  // Measure/Mass viewport overlays + body alpha
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
@@ -2165,10 +2166,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (tfi != tree.end() && tfi->is_array()) {
                         auto isRefOnly = [](const std::string& type) {
                             return type == "sketch" || type == "sketch3d" ||
-                                   type == "plane" || type == "datum_plane" ||
-                                   type == "axis" || type == "datum_axis" ||
-                                   type == "point" || type == "datum_point" ||
-                                   type == "csys";
+                                   type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+                                   type == "axis" || type == "datum_axis" || type == "ref_axis" ||
+                                   type == "point" || type == "datum_point" || type == "ref_point" ||
+                                   type == "csys" || type == "coordinate_system" || type == "ref_csys";
                         };
                         for (const auto& f : *tfi) {
                             if (!f.is_object() || f.value("suppressed", false)) continue;
@@ -2466,6 +2467,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (!bp->plunge.empty()) st.overlays->drawSegments(renderer.camera(), bp->plunge, vpal.camPlunge, 1.6f, false);
                 if (!bp->cut.empty())    st.overlays->drawSegments(renderer.camera(), bp->cut,    vpal.camCut,    1.8f, false);
                 if (!bp->arc.empty())    st.overlays->drawSegments(renderer.camera(), bp->arc,    vpal.camArc,    1.8f, false);
+            }
+            // Evaluate Measure / Mass Properties markers (distance lines, COM cross, I/J axes).
+            if (st.evaluateDialogs) {
+                const auto& es = st.evaluateDialogs->overlaySegments();
+                if (!es.empty()) {
+                    const auto& pal = ui::palette;
+                    const float accent[4] = {pal.accent[0], pal.accent[1], pal.accent[2], 0.95f};
+                    st.overlays->drawSegments(renderer.camera(), es, accent, 2.2f, true);
+                }
+                // Whole-body translucency while mass markers are active.
+                if (st.renderer)
+                    st.renderer->setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
             }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
@@ -4199,6 +4212,37 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ui::glassPanel(vdl, ImRect(p0, p1b), ui::GlassLevel::UltraThin, 5.0f, pickSurf);
             ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                          ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), pickSurf, st.pickStatus.c_str());
+        }
+
+        // Evaluate Measure / Mass Properties labels (world → screen).
+        if (st.evaluateDialogs && !st.evaluateDialogs->overlayLabels().empty()) {
+            const float* m = renderer.camera().mvp.m;
+            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
+                float x = m[0] * wx + m[4] * wy + m[8] * wz + m[12];
+                float y = m[1] * wx + m[5] * wy + m[9] * wz + m[13];
+                float wc = m[3] * wx + m[7] * wy + m[11] * wz + m[15];
+                if (wc <= 1e-4f) return false;
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            const auto& vpal2 = ui::palette;
+            for (const auto& lab : st.evaluateDialogs->overlayLabels()) {
+                ImVec2 sp;
+                if (!project(lab.first[0], lab.first[1], lab.first[2], sp)) continue;
+                ImVec2 ts = ImGui::CalcTextSize(lab.second.c_str());
+                ImVec2 q0(sp.x - ts.x * 0.5f - 6.0f * ui::uiScale,
+                          sp.y - ts.y - 8.0f * ui::uiScale);
+                ImVec2 q1(q0.x + ts.x + 12.0f * ui::uiScale, q0.y + ts.y + 6.0f * ui::uiScale);
+                const ui::AdaptiveSurface& ls =
+                    ui::adaptivePanel(ui::panelId("vp_eval_lab"), ImRect(q0, q1),
+                                      ui::GlassGroup::Hud);
+                ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ls);
+                ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                              ImVec2(q0.x + 6.0f * ui::uiScale, q0.y + 3.0f * ui::uiScale), ls,
+                              lab.second.c_str());
+                (void)vpal2;
+            }
         }
 
         // Wave4: context-cube pick mode banner (mirrors PM selection-well language).

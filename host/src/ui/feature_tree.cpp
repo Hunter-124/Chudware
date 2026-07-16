@@ -351,11 +351,13 @@ static bool featureEyeShown(AppState& st, const std::string& fid,
 // renderer honors it).
 static void toggleFeatureEye(AppState& st, const std::string& fid,
                              const std::vector<uint32_t>& ownedBodies, bool currentlyShown,
-                             bool isDatumPlane) {
+                             bool isDatumPlane, bool isRefGeom = false) {
     if (isDatumPlane) {
         st.datumPlanesUserToggled.insert(fid);
         st.autoHiddenPlanes.erase(fid);
     }
+    // User points/csys: sticky so solid-content auto-hide never rewrites the eye choice.
+    if (isRefGeom) st.refGeomUserToggled.insert(fid);
     if (!ownedBodies.empty()) {
         for (uint32_t bid : ownedBodies) {
             int slot = slotForBodyId(st, bid);
@@ -1522,8 +1524,12 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (overEye) {
             ImGui::SetTooltip(shown ? "Hide" : "Show");
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                toggleFeatureEye(st, fid, c.ownedBodies, shown,
-                                 c.type == "plane" || c.type == "datum_plane");
+                const bool isPlane = c.type == "plane" || c.type == "datum_plane" ||
+                                     c.type == "ref_plane";
+                const bool isRefGeom = c.type == "point" || c.type == "datum_point" ||
+                                      c.type == "ref_point" || c.type == "csys" ||
+                                      c.type == "coordinate_system" || c.type == "ref_csys";
+                toggleFeatureEye(st, fid, c.ownedBodies, shown, isPlane, isRefGeom);
                 // T-BL42: un-hiding an absorbed sketch selects + highlights it so it's easy
                 // to spot in the viewport (ghost goes visible; tree row gets selection card).
                 if (c.nested && !shown && c.type == "sketch") {
@@ -3883,19 +3889,23 @@ void drawFeatureTreeBody(AppState& st,
             {
                 // Persistent origin visibility (hiddenFeatures) — NOT the viewport-published
                 // originVisEff, which lags the FM by a frame on fresh docs (same fix as planes/axes).
+                // Folder-level cascade eye: origin + every user point/csys. anyShown drives the
+                // glyph (dim when all hidden); click flips the whole set and sticks control.
                 const bool originShown = st.hiddenFeatures.count("point.origin") == 0;
+                bool anyPointShown = originShown;
+                for (const auto& up : userPoints)
+                    if (st.hiddenFeatures.count(up.id) == 0) anyPointShown = true;
                 FmRowRect originFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
-                if (!originShown)
+                if (!anyPointShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 const bool originFldOpen = ImGui::TreeNodeEx(
                     "Points##ref_points_folder",
                     ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
                     ImGuiTreeNodeFlags_FramePadding);
-                if (!originShown) ImGui::PopStyleColor();
-                // Folder-level cascade eye: single child (point.origin) show/hide.
+                if (!anyPointShown) ImGui::PopStyleColor();
                 {
                     ImVec2 oFldMin = ImGui::GetItemRectMin();
                     ImVec2 oFldMax = ImGui::GetItemRectMax();
@@ -3905,20 +3915,28 @@ void drawFeatureTreeBody(AppState& st,
                     ImVec2 oEyeMax(oEyeMin.x + oEyeSz, oEyeMin.y + oEyeSz);
                     bool   oOverEye = ImGui::IsMouseHoveringRect(oEyeMin, oEyeMax);
                     drawEyeGlyph(ImGui::GetWindowDrawList(), oEyeMin, oEyeMax,
-                                 originShown, oOverEye, fmSurf());
+                                 anyPointShown, oOverEye, fmSurf());
                     if (oOverEye) {
-                        ImGui::SetTooltip(originShown ? "Hide Origin" : "Show Origin");
+                        ImGui::SetTooltip(anyPointShown ? "Hide Points" : "Show Points");
                         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                            // Flip relative to EFFECTIVE visibility so auto-show empty parts
-                            // (drawn but still in hiddenFeatures) hide on the first click.
-                            if (originShown) {
+                            const bool show = !anyPointShown;
+                            if (show) {
+                                st.hiddenFeatures.erase("point.origin");
+                            } else {
                                 st.hiddenFeatures.insert("point.origin");
                                 if (st.selectedFeatureId == "point.origin")
                                     st.selectedFeatureId.clear();
-                            } else {
-                                st.hiddenFeatures.erase("point.origin");
                             }
-                            st.originUserToggled = true;   // issue #30: stick — stop auto-hide
+                            st.originUserToggled = true;
+                            for (const auto& up : userPoints) {
+                                if (show) st.hiddenFeatures.erase(up.id);
+                                else {
+                                    st.hiddenFeatures.insert(up.id);
+                                    if (st.selectedFeatureId == up.id)
+                                        st.selectedFeatureId.clear();
+                                }
+                                st.refGeomUserToggled.insert(up.id);
+                            }
                             st.applyDatumVisibility();
                         }
                     }
@@ -4014,6 +4032,7 @@ void drawFeatureTreeBody(AppState& st,
                                     st.hiddenFeatures.insert(up.id);
                                     if (pSel) st.selectedFeatureId.clear();
                                 }
+                                st.refGeomUserToggled.insert(up.id);
                                 st.applyDatumVisibility();
                             }
                         } else if (ImGui::IsItemClicked()) {

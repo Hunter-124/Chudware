@@ -1465,6 +1465,7 @@ void AppState::clearViewportForNewDoc() {
     hiddenFeatures.clear();
     autoHiddenPlanes.clear();
     datumPlanesUserToggled.clear();
+    refGeomUserToggled.clear();
     // W2-ref: axes start clean on tab/new-doc; refilled by inject path next rebuild.
     // Seed axisDatumIds so force-show / FM listing works pre-inject. Axes default VISIBLE
     // on an empty doc (NOT in hiddenFeatures) — matching planes/origin auto-show. Auto-hide
@@ -1535,6 +1536,7 @@ void AppState::captureDocState(DocSession& s) {
     s.hiddenFeatures = std::move(hiddenFeatures);
     s.autoHiddenPlanes = std::move(autoHiddenPlanes);
     s.datumPlanesUserToggled = std::move(datumPlanesUserToggled);
+    s.refGeomUserToggled = std::move(refGeomUserToggled);
     for (int i = 0; i < 3; ++i) s.showPlane[i] = showPlane[i];
     s.planesUserToggled = planesUserToggled;
     s.originUserToggled = originUserToggled;
@@ -1560,6 +1562,7 @@ void AppState::restoreDocState(DocSession& s) {
     hiddenFeatures = std::move(s.hiddenFeatures);
     autoHiddenPlanes = std::move(s.autoHiddenPlanes);
     datumPlanesUserToggled = std::move(s.datumPlanesUserToggled);
+    refGeomUserToggled = std::move(s.refGeomUserToggled);
     for (int i = 0; i < 3; ++i) showPlane[i] = s.showPlane[i];
     planesUserToggled = s.planesUserToggled;
     originUserToggled = s.originUserToggled;
@@ -1863,14 +1866,17 @@ static bool isDefaultPlaneFid(const std::string& fid) {
 }
 
 // Sketches and datum construction features do not consume their references by themselves. A plane
-// only becomes clutter once a downstream model feature reaches it through this dependency graph.
+// only becomes clutter once a downstream model feature reaches it through this dependency graph —
+// OR once the doc has solid content (hasSolidContent), matching default-plane/axis policy.
 static bool isDatumPlaneType(const std::string& type) {
-    return type == "plane" || type == "datum_plane";
+    return type == "plane" || type == "datum_plane" || type == "ref_plane";
 }
 
 static bool isReferenceOnlyFeature(const std::string& type) {
-    return isDatumPlaneType(type) || type == "axis" || type == "datum_axis" ||
-           type == "point" || type == "datum_point" || type == "csys" ||
+    return isDatumPlaneType(type) ||
+           type == "axis" || type == "datum_axis" || type == "ref_axis" ||
+           type == "point" || type == "datum_point" || type == "ref_point" ||
+           type == "csys" || type == "coordinate_system" || type == "ref_csys" ||
            type == "sketch" || type == "sketch3d";
 }
 
@@ -2048,7 +2054,15 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     // touches it. Default-plane eye control is the aggregate planesUserToggled/showPlane path.
     bool datumVisibilityChanged = false;
     for (auto it = autoHiddenPlanes.begin(); it != autoHiddenPlanes.end(); ) {
-        if (consumedPlanes.count(*it) && !datumPlanesUserToggled.count(*it)) {
+        // Keep entries that are still "should be auto-hidden": consumed, OR solid-content
+        // user planes that the user has not sticky-toggled. Drop everything else.
+        const bool keepUser =
+            userPlanes.count(*it) && !datumPlanesUserToggled.count(*it) &&
+            (consumedPlanes.count(*it) || hasSolidContent);
+        const bool keepDefault =
+            isDefaultPlaneFid(*it) &&
+            (consumedPlanes.count(*it) || (hasSolidContent && !planesUserToggled));
+        if (keepUser || keepDefault) {
             ++it;
             continue;
         }
@@ -2068,7 +2082,7 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     // Default planes hide whenever the open doc has SOLID content (a 3D feature or assembly
     // component), independent of consumption. Sketches alone leave planes visible. MUST run
     // AFTER the consumption erase loop above — that loop drops every autoHiddenPlanes entry
-    // not in consumedPlanes, which would undo an earlier insert for unreferenced defaults.
+    // not still needed, which would undo an earlier insert for unreferenced defaults.
     // Empty / sketch-only docs: ensure the three are NOT in autoHiddenPlanes so they stay shown.
     if (!planesUserToggled) {
         static const char* kDefaultPlanes[3] = {"plane.front", "plane.top", "plane.right"};
@@ -2079,13 +2093,47 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         }
     }
 
+    // User-created reference planes: same solid-content auto-hide as default planes / axes.
+    // Without this, offset/angle planes stay drawn on solid parts and spawn a forest of
+    // plane-intersection axes (axis.auto:*) that clutter the viewport. Sticky
+    // datumPlanesUserToggled still wins after an FM eye click.
+    for (const std::string& pid : userPlanes) {
+        if (datumPlanesUserToggled.count(pid)) continue;
+        if (hasSolidContent) {
+            autoHiddenPlanes.insert(pid);
+            if (hiddenFeatures.insert(pid).second) datumVisibilityChanged = true;
+        } else if (!consumedPlanes.count(pid)) {
+            autoHiddenPlanes.erase(pid);
+            if (hiddenFeatures.erase(pid) != 0) datumVisibilityChanged = true;
+        }
+    }
+    // User-created points / csys: same solid-content auto-hide as planes/axes. Sticky
+    // refGeomUserToggled (set by the FM eye) keeps a forced show/hide across rebuilds.
+    for (const auto& featureEntry : activeFeatures) {
+        const nlohmann::json& f = *featureEntry.second;
+        const std::string ty = f.value("type", std::string());
+        if (ty != "point" && ty != "datum_point" && ty != "ref_point" &&
+            ty != "csys" && ty != "coordinate_system" && ty != "ref_csys")
+            continue;
+        const std::string& fid = featureEntry.first;
+        if (fid.empty() || fid == "point.origin") continue;
+        if (refGeomUserToggled.count(fid)) continue;
+        if (hasSolidContent) {
+            if (hiddenFeatures.insert(fid).second) datumVisibilityChanged = true;
+        } else {
+            if (hiddenFeatures.erase(fid) != 0) datumVisibilityChanged = true;
+        }
+    }
+
     // Keep hiddenFeatures in step with hasSolidContent for axes so the FeatureManager eye
     // matches what the viewport draws. Viewport only mutates a per-frame effDatums set; the
     // FM eye reads hiddenFeatures.count(id). When the user has not taken control (axesUserToggled),
     // show axes on empty/sketch-only docs and hide them once solid content exists.
     // Defaults axis.x/y/z always tracked even before first inject fills axisDatumIds.
+    // Also covers host-only plane-intersection axes (axis.auto:<a>|<b>).
     if (!axesUserToggled) {
         auto syncAxis = [&](const std::string& id) {
+            if (id.empty()) return;
             if (hasSolidContent) {
                 if (hiddenFeatures.insert(id).second) datumVisibilityChanged = true;
             } else {

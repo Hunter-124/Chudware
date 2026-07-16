@@ -130,3 +130,17 @@ edge/strip on rows, e.g. mate rows) — very likely the SAME class M fixed in wa
 highlight/pill helper (fmRowPill / a shared vGradRounded in feature_tree.cpp or a theme
 helper) and fix the square-corner bleed; apply the identical fix to every afflicted surface.
 File: host/src/ui/feature_tree.cpp (+ shared helper if the gradient lives in ui_theme).
+
+## Session complete — commits on master
+- 0d717a1a wave1 (items 2,3,4,7,8,9,10a,10b,11,13,14 + native-format doc)
+- ba9b1f77 wave2 (5b unit defaults, 6a revolve perf, 15 startup+status, 16 glitches)
+- f18d16b1 wave3 (copilot overlay 1-10, settings sticky tabs, provider identity/usage, callback)
+- 16d3a108 wave4 (chat context-reference picker + cube icon + paperclip)
+- d4f4033f wave5 (asm tools -> PM column, popup chrome, FM row wash, settings tabs fit)
+- a94fa0eb washer op-path test + OCCT engine rebuild + stage (runtime washer/revolve fix)
+- 1f4875ef wave6 (dup-part grouping, composer polish, doc-tab edge fade)
+All gated: host+core build, profile_extrude+insert_component+op-path-washer ctests, 71 agent
+tests, theme+icon lint clean, m1 boot smoke. Only pre-existing failure: test_document.cpp:2694
+eval_mass tessellation (unrelated, fails on clean master).
+RUNTIME NOTE: washer/revolve core fixes require the daemon to reload the rebuilt libaicad
+(staged to services/dist + core/build-occt-linux). User restarts the app to pick them up.

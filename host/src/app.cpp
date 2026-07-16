@@ -1453,9 +1453,17 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights the active tab's
         // unsaved-changes marker. Tab switches / fresh-doc activation / resyncs set suppressTabDirty
         // so they don't falsely dirty a tab. Keep the cached title in step with renames, too.
+        // Also skip when the mirror has already re-pointed at a different doc than the active tab
+        // (open-second-file race: adoptOpenResponse notifies before applyOpenedDoc adds the tab).
+        // markActiveTabDirty / syncActiveTabTitle each guard on docId as well — belt and braces.
         if (!st.suppressTabDirty) {
-            st.markActiveTabDirty();
-            st.syncActiveTabTitle();
+            const bool activeMatchesMirror =
+                st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                st.docTabs[st.activeTab].docId == st.docMirror.docId();
+            if (activeMatchesMirror) {
+                st.markActiveTabDirty();
+                st.syncActiveTabTitle();
+            }
         }
     });
 

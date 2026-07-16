@@ -97,9 +97,22 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
             BRepBuilderAPI_MakeEdge mk(gp_Circ(ax, r));
             if (!mk.IsDone()) return false;
             out.edge = mk.Edge();
-            // A full circle is a single closed edge: start == end (its own loop).
-            out.p_start = c;
-            out.p_end = c;
+            // Full circle = one closed edge. Sample the boundary into the loop polygon
+            // (same N=64 ring as session.cpp::reg_build_edge) so area / nesting /
+            // containment see the real disc — a center-only degenerate square made
+            // every concentric pair look equal-area and produced a solid disc instead
+            // of a washer. p_start is the first sample (on the ring), interior the rest
+            // (mirrors the self-closing spline path below).
+            constexpr int kCircleSamples = 64;
+            out.interior.clear();
+            out.interior.reserve(static_cast<size_t>(kCircleSamples - 1));
+            for (int i = 0; i < kCircleSamples; ++i) {
+                double a = 2.0 * kPi * i / kCircleSamples;
+                Eigen::Vector2d p(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+                if (i == 0) out.p_start = p;
+                else out.interior.push_back(p);
+            }
+            out.p_end = out.p_start;
             out.closed = true;
             return true;
         }
@@ -204,24 +217,22 @@ std::vector<Loop> detect_loops(const std::vector<SketchEdge>& edges) {
     const size_t n = edges.size();
     std::vector<bool> used(n, false);
 
-    // Closed single edges (circles) -> immediate single-edge loops. The polyline
-    // is sampled coarsely (a square inscribing the circle is enough for the
-    // even-odd containment test; the centroid is the circle center either way).
+    // Closed single edges (circles / self-closing splines) -> immediate one-edge loops.
+    // Circles carry a sampled boundary ring in `interior` (see build_edge); self-closing
+    // splines carry their through-points. The polygon drives shoelace area + nesting.
     for (size_t i = 0; i < n; ++i) {
         if (!edges[i].closed) continue;
         used[i] = true;
         Loop lp;
         lp.edges.push_back(edges[i].edge);
         if (!edges[i].interior.empty()) {
-            // Self-closing spline: it carries its own ring of sample points, so the loop
-            // polygon is the real curve (start + every unique ring point). This is what
-            // gives the shoelace area its correct sign for CCW normalisation.
+            // Closed curve with samples: ring = start + interior (circle N-1 samples
+            // after the first station, or spline through-points after the first).
             lp.poly.push_back(edges[i].p_start);
             for (const auto& q : edges[i].interior) lp.poly.push_back(q);
         } else {
-            // Circle: start==end==center, radius not stored here. A centroid-only polyline
-            // (degenerate) still works because containment uses the OTHER loop's polygon;
-            // to keep the area sane we emit a tiny CCW square at the center.
+            // Degenerate closed edge with no samples — emit a tiny CCW square so the
+            // loop is still well-formed. Circles always sample now; this is a last resort.
             const Eigen::Vector2d& c = edges[i].p_start;
             const double e = kEps;
             lp.poly = {{c.x() - e, c.y() - e},
@@ -421,7 +432,6 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
         if (signed_area(lp.poly) < 0.0) w = TopoDS::Wire(w.Reversed());
         return w;
     };
-
     for (size_t i = 0; i < n; ++i) {
         if (depth[i] != 0) continue;  // only top-level loops start a region
 
@@ -440,6 +450,72 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
         faces.push_back(mf.Face());
     }
 
+    return faces;
+}
+
+std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
+    const nlohmann::json& solved_entities, const SketchPlane& plane) {
+    // Same pipeline as faces_from_solved_sketch but emit a face per loop (material +
+    // void). Duplicates the nesting walk rather than threading a flag through the
+    // public material-only entry so that entry stays byte-identical for callers.
+    std::vector<TopoDS_Face> faces;
+    if (!solved_entities.is_object()) return faces;
+
+    std::vector<SketchEdge> edges;
+    for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
+        SketchEdge se;
+        if (build_edge(it.value(), plane, se)) edges.push_back(std::move(se));
+    }
+    if (edges.empty()) return faces;
+
+    std::vector<Loop> loops = detect_loops(edges);
+    if (loops.empty()) return faces;
+
+    const size_t n = loops.size();
+    std::vector<double> area(n);
+    std::vector<Eigen::Vector2d> cent(n);
+    for (size_t i = 0; i < n; ++i) {
+        area[i] = std::abs(signed_area(loops[i].poly));
+        cent[i] = poly_centroid(loops[i].poly);
+    }
+
+    std::vector<int> parent(n, -1);
+    std::vector<int> depth(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        double best_area = 0.0;
+        int best = -1;
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j || area[j] <= area[i]) continue;
+            if (point_in_poly(cent[i], loops[j].poly)) {
+                depth[i]++;
+                if (best < 0 || area[j] < best_area) { best_area = area[j]; best = (int)j; }
+            }
+        }
+        parent[i] = best;
+    }
+
+    auto wire_ccw = [&](const Loop& lp) -> TopoDS_Wire {
+        TopoDS_Wire w = make_wire(lp.edges);
+        if (w.IsNull()) return w;
+        if (signed_area(lp.poly) < 0.0) w = TopoDS::Wire(w.Reversed());
+        return w;
+    };
+
+    // Every loop is a region face (material or void); direct children are its holes.
+    // This mirrors session.cpp::reg_region_face used by doc_sketch_regions.
+    for (size_t i = 0; i < n; ++i) {
+        TopoDS_Wire outer = wire_ccw(loops[i]);
+        if (outer.IsNull()) continue;
+        BRepBuilderAPI_MakeFace mf(outer, /*OnlyPlane=*/true);
+        for (size_t j = 0; j < n; ++j) {
+            if (parent[j] != (int)i) continue;
+            TopoDS_Wire hole = wire_ccw(loops[j]);
+            if (hole.IsNull()) continue;
+            mf.Add(TopoDS::Wire(hole.Reversed()));
+        }
+        if (!mf.IsDone()) continue;
+        faces.push_back(mf.Face());
+    }
     return faces;
 }
 

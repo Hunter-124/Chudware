@@ -1,4 +1,6 @@
 // AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
+#include <filesystem>
+
 #include <cctype>
 #include <algorithm>
 #include <cmath>
@@ -37,6 +39,7 @@
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
+#include "feature_tree.h"  // openComponentPart + featureTreeActivePath (assembly component ctx)
 #include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
 
 namespace ui {
@@ -1538,6 +1541,19 @@ static Vec3 asmComponentOrigin(AppState& st, const nlohmann::json* comp, uint32_
     return Vec3(0, 0, 0);
 }
 
+// Resolve a component source path relative to the active assembly doc (same rules as
+// feature_tree.cpp's resolveComponentPath: absolute stays absolute; relative joins the
+// assembly parent directory). assemblyDocPath is the assembly's on-disk path.
+static std::string resolveVpComponentPath(const std::string& srcPath,
+                                          const std::string& assemblyDocPath) {
+    if (srcPath.empty()) return {};
+    namespace fs = std::filesystem;
+    fs::path path(srcPath);
+    if (path.is_absolute()) return path.lexically_normal().string();
+    if (assemblyDocPath.empty()) return {};
+    return (fs::path(assemblyDocPath).parent_path() / path).lexically_normal().string();
+}
+
 // T-PERF2: latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
 static void asmDragKickAsync(AppState& st);
 
@@ -2884,13 +2900,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const float dy = io.MousePos.y - originS.y;
                     if (std::sqrt(dx * dx + dy * dy) < grabRadius) {
                         originPickHot = true;
-                        ImDrawList* wdl = ImGui::GetWindowDrawList();
-                        wdl->PushClipRect(vr0, vr1, true);
-                        float accA[4];
-                        ui::Palette::withAlpha(ui::palette.accent, accA, 0.95f);
-                        wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(accA),
-                                       24, 2.0f * ui::uiScale);
-                        wdl->PopClipRect();
+                        // Hover ring only when not selected — selected uses a distinct
+                        // constant screen-space ring drawn below (same radius family).
+                        if (st.selectedFeatureId != "point.origin") {
+                            ImDrawList* wdl = ImGui::GetWindowDrawList();
+                            wdl->PushClipRect(vr0, vr1, true);
+                            float accA[4];
+                            ui::Palette::withAlpha(ui::palette.accent, accA, 0.95f);
+                            wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(accA),
+                                           24, 2.0f * ui::uiScale);
+                            wdl->PopClipRect();
+                        }
                         st.requestCursor(ui::CursorKind::Hand);
                         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                             if (!io.KeyCtrl) st.selection.clear();
@@ -2902,6 +2922,27 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                 pm->routeDatumPoint("point.origin", "Origin");
                         }
                     }
+                }
+            }
+            // Selected-origin highlight: constant screen-space circle (grabRadius*0.8), same
+            // family as the hover ring, distinct style (soft fill + thicker accent stroke).
+            // World-space selected octa halo was removed from renderer for point.origin.
+            if (!inSketch && !inSketch3d && st.originVisEff &&
+                st.selectedFeatureId == "point.origin") {
+                const float grabRadius = 20.0f * ui::uiScale;
+                const float originW[3] = {0.0f, 0.0f, 0.0f};
+                ImVec2 originS;
+                if (ppProject(renderer, vr0, vr1, vw, vh, originW, originS)) {
+                    ImDrawList* wdl = ImGui::GetWindowDrawList();
+                    wdl->PushClipRect(vr0, vr1, true);
+                    float fillA[4];
+                    ui::Palette::withAlpha(ui::palette.selectionHighlight, fillA, 1.0f);
+                    wdl->AddCircleFilled(originS, grabRadius * 0.8f, ui::Palette::toU32(fillA), 24);
+                    float ringA[4];
+                    ui::Palette::withAlpha(ui::palette.accent, ringA, 1.0f);
+                    wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(ringA),
+                                   24, 2.5f * ui::uiScale);
+                    wdl->PopClipRect();
                 }
             }
         }
@@ -3087,8 +3128,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         static std::string s_vpKey;          // "b<ordinal>" of the body to recolor
         static bool  s_openVpPicker = false;
         // The picked body's stable appearance key (part bodies: "b<ordinal>", matching the engine).
-        // Appearance is offered for part docs only; assembly bodies key by component id, which the
-        // viewport pick alone can't resolve (deferred — see report).
+        // Appearance is offered for part docs only. Assembly component actions are handled below
+        // via body_id → asmComponentByOrdinal.
         // NOTE: tree() is null until the first ops response after doc_new — json::value()
         // on a null json THROWS (this crashed the m1 scenario); guard with is_object().
         bool vpIsPart = st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
@@ -3099,7 +3140,68 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (bid != 0) vpBodyKey = "b" + std::to_string(bid);
         }
 
+        // Assembly component under the current selection (body ordinal → component JSON).
+        const nlohmann::json* vpComp = nullptr;
+        std::string vpCompId, vpCompName, vpCompAbsPath;
+        bool vpCompHidden = false;
+        if (docIsAssembly(st) && !st.selection.empty()) {
+            uint32_t bid = st.selection.items().back().hit.body_id;
+            vpComp = asmComponentByOrdinal(st, bid);
+            if (vpComp) {
+                vpCompId = vpComp->value("id", std::string());
+                vpCompName = vpComp->value("name", std::string());
+                if (vpCompName.empty()) vpCompName = vpCompId;
+                vpCompHidden = vpComp->value("hidden", false);
+                std::string srcPath;
+                if (vpComp->contains("source") && (*vpComp)["source"].is_object())
+                    srcPath = (*vpComp)["source"].value("path", std::string());
+                // Prefer the FeatureManager's active path (same s_docPath the tree resolves
+                // against); fall back to the active tab path if the tree hasn't set it yet.
+                std::string asmPath = featureTreeActivePath();
+                if (asmPath.empty() && st.activeTab >= 0 &&
+                    st.activeTab < (int)st.docTabs.size())
+                    asmPath = st.docTabs[st.activeTab].path;
+                vpCompAbsPath = resolveVpComponentPath(srcPath, asmPath);
+            }
+        }
+
         if (ImGui::BeginPopup("##vp_ctx")) {
+            // Assembly component actions (prepended when the pick resolves to a component body).
+            if (vpComp && !vpCompId.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                           ui::palette.textDim[2], 1.0f));
+                ImGui::TextUnformatted(vpCompName.c_str());
+                ImGui::PopStyleColor();
+                const bool pathOk = !vpCompAbsPath.empty();
+                if (!pathOk) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Open Part"))
+                    openComponentPart(st, vpCompAbsPath);
+                if (ImGui::MenuItem("Edit Model"))
+                    st.enterComponentEdit(vpCompId, vpCompAbsPath);
+                if (!pathOk) ImGui::EndDisabled();
+                if (ImGui::MenuItem("Edit Mates"))
+                    st.requestEditComponentMates = vpCompId;
+                if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
+                    // Same asm_edit_component hidden op the FeatureManager eye uses. Direct
+                    // apply is safe here (not mid tree-walk) — mirrors applyAppearanceFromViewport.
+                    if (st.docMirror.hasDoc() && st.workerStarted) {
+                        nlohmann::json op = {{"op", "asm_edit_component"},
+                                             {"id", vpCompId},
+                                             {"hidden", !vpCompHidden}};
+                        auto resp = st.docMirror.applyOps(st.worker,
+                                                          nlohmann::json::array({op}));
+                        if (resp.ok && !resp.aicm_path.empty()) {
+                            std::string lerr;
+                            st.loadDocMesh(resp.aicm_path, lerr);
+                            if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+                        } else if (!resp.ok) {
+                            st.addLog("[err] asm_edit_component: " + resp.error_message);
+                        }
+                    }
+                }
+                ImGui::Separator();
+            }
             // Selection section (shown only when something is selected / hovered).
             if (!st.pickStatus.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text,

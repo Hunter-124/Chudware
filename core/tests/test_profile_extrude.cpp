@@ -276,6 +276,90 @@ TEST_CASE("circle inside square -> single washer face -> prism with a hole") {
     CHECK(vol == doctest::Approx(expected_vol).epsilon(1e-3));
 }
 
+// 3b. Two concentric circles (no square) -> ONE washer face. Regression for the
+//     detect_loops circle-polygon bug: a full circle used to contribute only a
+//     kEps-sized square at its center, so both loops had equal ~0 area, neither
+//     nested, and extruding fused two solid discs into one solid disc. Sampled
+//     boundary polygons make the outer contain the inner -> one face with a hole.
+//     Volume = pi*(R^2 - r^2)*D.
+TEST_CASE("two concentric circles -> single washer face -> annular prism") {
+    const double R = 20.0, r = 10.0, D = 5.0;
+    json s;
+    s["entities"] = json::array({
+        circle("outer", 0, 0, R),
+        circle("inner", 0, 0, r),
+    });
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"outer.center"}),
+        dim("c2", "radius", {"outer"}, R),
+        rel("c3", "concentric", {"outer", "inner"}),
+        dim("c4", "radius", {"inner"}, r),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+
+    auto faces = faces_from_solved_sketch(sol.entities, SketchPlane::top());
+    REQUIRE(faces.size() == 1);  // ONE region = outer disc minus inner hole
+
+    TopoDS_Shape solid =
+        geom::extrude_face(faces[0], Eigen::Vector3d(0, 0, 1), D, false);
+    double expected_vol = PI * (R * R - r * r) * D;
+    double vol = solid_volume(solid);
+    MESSAGE("concentric washer: faces=" << faces.size()
+            << " volume=" << vol << " (expected " << expected_vol << ")");
+    CHECK(vol == doctest::Approx(expected_vol).epsilon(1e-3));
+}
+
+// 3c. Region pick of the INNER disc of two concentric circles. all_region_faces
+//     exposes both material (washer) and void (inner disc) faces; picking the
+//     void region by its (0,0) centroid must extrude a solid cylinder of radius r.
+//     This is the kernel half of the Extrude PropertyManager region picker.
+TEST_CASE("concentric circles: all-region inner disc extrudes to solid cylinder") {
+    const double R = 20.0, r = 10.0, D = 8.0;
+    json s;
+    s["entities"] = json::array({
+        circle("outer", 0, 0, R),
+        circle("inner", 0, 0, r),
+    });
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"outer.center"}),
+        dim("c2", "radius", {"outer"}, R),
+        rel("c3", "concentric", {"outer", "inner"}),
+        dim("c4", "radius", {"inner"}, r),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+
+    auto all = aicad::geom::all_region_faces_from_solved_sketch(
+        sol.entities, SketchPlane::top());
+    // Two regions: outer-with-hole (washer) and inner solid disc.
+    REQUIRE(all.size() == 2);
+
+    // Pick the face whose area is closest to pi*r^2 (the solid inner disc).
+    TopoDS_Face inner_face;
+    double best_da = 1e300;
+    const double target_area = PI * r * r;
+    for (const TopoDS_Face& f : all) {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(f, props);
+        double da = std::abs(props.Mass() - target_area);
+        if (da < best_da) { best_da = da; inner_face = f; }
+    }
+    REQUIRE(!inner_face.IsNull());
+    {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(inner_face, props);
+        CHECK(props.Mass() == doctest::Approx(target_area).epsilon(1e-3));
+    }
+
+    TopoDS_Shape solid =
+        geom::extrude_face(inner_face, Eigen::Vector3d(0, 0, 1), D, false);
+    double expected_vol = PI * r * r * D;
+    double vol = solid_volume(solid);
+    MESSAGE("inner disc pick: volume=" << vol << " (expected " << expected_vol << ")");
+    CHECK(vol == doctest::Approx(expected_vol).epsilon(1e-3));
+}
+
 // 4. Revolve. On the FRONT plane (u=+X, v=+Z, normal=-Y) a rectangle with u in
 //    [10,20] and v in [0,30] -> a profile at radius 10..20, height 0..30 lying in
 //    the XZ plane. Revolved 360 deg about the world Z axis it sweeps a hollow

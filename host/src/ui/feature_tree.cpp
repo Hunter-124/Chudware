@@ -1655,9 +1655,18 @@ static std::string resolveComponentPath(const std::string& srcPath) {
     return (fs::path(s_docPath).parent_path() / path).lexically_normal().string();
 }
 
-// Open a referenced document in a normal tab, focusing an existing tab for the same canonical path.
-static void openComponentPart(AppState& st, const std::string& srcPath) {
-    const std::string abs = resolveComponentPath(srcPath);
+// Open a referenced document in a normal tab, focusing an existing tab for the same
+// canonical path. Accepts an absolute path or an assembly-relative source path.
+void openComponentPart(AppState& st, const std::string& absPath) {
+    // resolveComponentPath accepts absolute paths unchanged (lexically_normal) and resolves
+    // assembly-relative ones against s_docPath; callers typically pass the absolute form.
+    std::string abs = resolveComponentPath(absPath);
+    if (abs.empty() && !absPath.empty()) {
+        // Absolute-looking path that didn't need assembly resolve (or s_docPath unset).
+        namespace fs = std::filesystem;
+        fs::path p(absPath);
+        if (p.is_absolute()) abs = p.lexically_normal().string();
+    }
     if (abs.empty()) {
         st.toast(ui::ToastLevel::Warn, "Referenced file has no resolvable path");
         return;
@@ -1807,6 +1816,11 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
                feature.type == "axis" || feature.type == "point" ||
                feature.folder == "Reference";
     };
+    // Non-Reference folders (Dress-up / Patterns / Sketches / user folders) nest the same
+    // way the part-mode FeatureManager does — contiguous folder tags collapse under one header.
+    auto isFolderFeature = [&](const ui::NestedFeature& feature) {
+        return !feature.folder.empty() && feature.folder != "Reference" && !isReference(feature);
+    };
     std::unordered_set<std::string> sketchIds;
     for (const auto& feature : features)
         if (feature.type == "sketch") sketchIds.insert(feature.id);
@@ -1838,6 +1852,23 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
         return nullptr;
     };
 
+    auto drawFeatureWithSketches = [&](const ui::NestedFeature& feature) {
+        if (feature.type == "sketch" && nestedSketches.count(feature.id)) return;
+        const auto children = childrenOf.find(feature.id);
+        const bool hasChildren = children != childrenOf.end() && !children->second.empty();
+        const bool open = drawComponentFeatureRow(
+            st, idPrefix + "_" + feature.id, feature, hasChildren, false,
+            topComponentId, sourcePath, editable);
+        if (open && hasChildren) {
+            for (const std::string& sketchId : children->second) {
+                if (const ui::NestedFeature* sketch = findFeature(sketchId))
+                    drawComponentFeatureRow(st, idPrefix + "_" + sketch->id, *sketch, false,
+                                            true, topComponentId, sourcePath, editable);
+            }
+            ImGui::TreePop();
+        }
+    };
+
     std::vector<const ui::NestedFeature*> references;
     for (const auto& feature : features)
         if (isReference(feature)) references.push_back(&feature);
@@ -1857,23 +1888,33 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
         }
     }
 
+    // History walk with Dress-up/Patterns (and any other folder tag) collapsed into folders —
+    // same contiguous-folder convention the part tree uses.
+    std::string openFolder;
+    bool folderOpen = false;
     for (const auto& feature : features) {
         if (isReference(feature)) continue;
         if (feature.type == "sketch" && nestedSketches.count(feature.id)) continue;
-        const auto children = childrenOf.find(feature.id);
-        const bool hasChildren = children != childrenOf.end() && !children->second.empty();
-        const bool open = drawComponentFeatureRow(
-            st, idPrefix + "_" + feature.id, feature, hasChildren, false,
-            topComponentId, sourcePath, editable);
-        if (open && hasChildren) {
-            for (const std::string& sketchId : children->second) {
-                if (const ui::NestedFeature* sketch = findFeature(sketchId))
-                    drawComponentFeatureRow(st, idPrefix + "_" + sketch->id, *sketch, false,
-                                            true, topComponentId, sourcePath, editable);
+
+        const std::string folder = isFolderFeature(feature) ? feature.folder : std::string();
+        if (folder != openFolder) {
+            if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
+            openFolder = folder;
+            if (!folder.empty()) {
+                FmRowRect fldRect = fmRowPill();
+                treeIcon("body_folder", "[F]", 16.0f);
+                ImGui::SameLine(0, 4 * ui::uiScale);
+                folderOpen = ImGui::TreeNodeEx(
+                    (folder + "##cfld_" + idPrefix + "_" + folder).c_str(),
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                    ImGuiTreeNodeFlags_FramePadding);
+                fmRowPillEnd(fldRect);
             }
-            ImGui::TreePop();
         }
+        if (!openFolder.empty() && !folderOpen) continue;
+        drawFeatureWithSketches(feature);
     }
+    if (folderOpen) ImGui::TreePop();
 }
 
 static std::string nestedMaterialLabel(const std::string& key) {
@@ -1889,10 +1930,14 @@ static void drawNestedInfoRow(const std::string& id, const std::string& label,
                               const std::string& tooltip = {}) {
     FmRowRect rect = fmRowPill();
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
+               fmPalette().textDim[2], 0.72f));
     ImGui::TreeNodeEx((label + "##" + id).c_str(),
         ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
-    treeIconInArrowSlot(rowPos, icon, fallback);
+    ImGui::PopStyleColor();
+    treeIconInArrowSlot(rowPos, icon, fallback, 0.72f);
     fmRowPillEnd(rect);
     if (!tooltip.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip.c_str());
 }
@@ -1903,11 +1948,19 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                                        const ui::NestedDocument& document,
                                        std::unordered_set<std::string>& pathStack,
                                        int depth) {
-    drawNestedInfoRow(idPrefix + "_material", nestedMaterialLabel(document.materialKey),
-                      "material", "[M]");
-    const std::string fileLabel = document.fileName.empty()
-        ? std::string("File: <unresolved>") : "File: " + document.fileName;
-    drawNestedInfoRow(idPrefix + "_file", fileLabel, "open", "[F]", document.path);
+    // Compact Material + File into one muted info row (detail lives in the tooltip) so the
+    // nested history reads like SolidWorks FeatureManager rather than a property dump.
+    {
+        std::string mat = nestedMaterialLabel(document.materialKey);
+        // Strip the "Material: " prefix for the compact row.
+        if (mat.rfind("Material: ", 0) == 0) mat = mat.substr(10);
+        const std::string fileBit = document.fileName.empty() ? std::string("<unresolved>")
+                                                              : document.fileName;
+        const std::string compact = mat + "  ·  " + fileBit;
+        std::string tip = nestedMaterialLabel(document.materialKey);
+        if (!document.path.empty()) tip += "\n" + document.path;
+        drawNestedInfoRow(idPrefix + "_info", compact, "material", "[i]", tip);
+    }
 
     if (document.state != ui::NestedDocumentState::Ready) {
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1953,7 +2006,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
         pushTreePopupGlass();
         if (ImGui::BeginPopupContextItem(("##nested_component_" + childId).c_str())) {
             if (unavailable) ImGui::BeginDisabled();
-            if (ImGui::MenuItem("Open in new tab"))
+            if (ImGui::MenuItem("Open Part"))
                 openComponentPart(st, component.sourceAbsPath);
             if (unavailable) ImGui::EndDisabled();
             ImGui::EndPopup();
@@ -2003,133 +2056,247 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         }
     };
 
-    // ---- components ----
-    int ci = 0;
+    // ---- components (instance-grouped by resolved source path) ----
+    // Same identity key the BOM uses: absolute/canonical source.path. Empty/unresolved paths
+    // stay as ungrouped singletons. Groups of >=2 render one collapsible folder
+    // "<DisplayName> xN" (DisplayName = first instance name with trailing _<digits> stripped);
+    // children keep the existing per-instance row (eye, context menu, expansion, selection).
+    // Folder order follows the first occurrence of each source path.
+    struct AsmCompInst {
+        const nlohmann::json* node = nullptr;
+        std::string cid;
+        std::string cname;
+        std::string srcPath;
+        std::string absPath;
+        std::string groupKey;   // empty key => singleton (never groups)
+        bool fixed = false;
+        bool suppressed = false;
+        bool hidden = false;
+    };
+    auto stripInstanceSuffix = [](std::string name) {
+        // Strip a trailing "_123" instance counter so "Wheel_1"/"Wheel_2" share "Wheel".
+        if (name.size() < 3) return name;
+        size_t i = name.size();
+        while (i > 0 && name[i - 1] >= '0' && name[i - 1] <= '9') --i;
+        if (i > 0 && i < name.size() && name[i - 1] == '_' && i >= 2)
+            return name.substr(0, i - 1);
+        return name;
+    };
+    auto componentGroupKey = [](const std::string& absPath) -> std::string {
+        if (absPath.empty()) return {};   // empty => ungrouped singleton
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path want = fs::weakly_canonical(fs::path(absPath), ec);
+        if (ec) want = fs::path(absPath).lexically_normal();
+        return want.string();
+    };
+
+    std::vector<AsmCompInst> insts;
     if (tree.contains("components") && tree["components"].is_array()) {
+        insts.reserve(tree["components"].size());
         for (const auto& c : tree["components"]) {
-            if (!c.is_object()) { ++ci; continue; }
-            std::string cid   = jfld(c, "id");
-            std::string cname = jfld(c, "name");
-            if (cname.empty()) cname = cid;
-            bool fixed = jftbool(c, "fixed");
-            bool suppressed = jftbool(c, "suppressed");
-            bool hidden = jftbool(c, "hidden");
-            std::string srcPath;
+            if (!c.is_object()) continue;
+            AsmCompInst inst;
+            inst.node = &c;
+            inst.cid = jfld(c, "id");
+            inst.cname = jfld(c, "name");
+            if (inst.cname.empty()) inst.cname = inst.cid;
+            inst.fixed = jftbool(c, "fixed");
+            inst.suppressed = jftbool(c, "suppressed");
+            inst.hidden = jftbool(c, "hidden");
             if (c.contains("source") && c["source"].is_object())
-                srcPath = jfld(c["source"], "path");
-            const std::string absPath = resolveComponentPath(srcPath);
-            const ui::NestedDocument& nestedDoc = ui::featureTreeNestedDocument(absPath);
-            const bool unavailable = absPath.empty() ||
-                nestedDoc.state == ui::NestedDocumentState::Missing ||
-                nestedDoc.state == ui::NestedDocumentState::Unreadable;
-            const bool isAsm = nestedDoc.schema == "aicad.asm/1";
-            FStatus fs = getFeatureStatus(statusArr, cid);
+                inst.srcPath = jfld(c["source"], "path");
+            inst.absPath = resolveComponentPath(inst.srcPath);
+            inst.groupKey = componentGroupKey(inst.absPath);
+            insts.push_back(std::move(inst));
+        }
+    }
 
-            FmRowRect compRect = fmRowPill();
-            // SolidWorks marks fixed components with a "(f)" prefix.
-            std::string label = (fixed ? "(f) " : "") + cname;
-            if (suppressed) label += " [S]";
-            // Missing/unreadable references and hidden components are visibly dimmed. The source
-            // error stays attached to the row as a tooltip instead of masquerading as "(no features)".
-            if (hidden || unavailable) ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2],
-                       unavailable ? 0.50f : 0.55f));
-            ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_SpanFullWidth |
-                ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_OpenOnArrow;
-            treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f,
-                     hidden || unavailable ? 0.5f : 1.0f);
-            ImGui::SameLine(0, 4 * ui::uiScale);
-            ImVec2 compRowPos = ImGui::GetCursorScreenPos();
-            const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
-            if (hidden || unavailable) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) {
-                if (unavailable) {
-                    const std::string why = absPath.empty()
-                        ? "Component source path is unresolved"
-                        : nestedDoc.error;
-                    ImGui::SetTooltip("%s", why.c_str());
-                }
-                // Component double-click is the explicit pop-out action. In-context feature editing
-                // starts from a nested feature row, preserving a clear distinction between the two.
-                if (!unavailable && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-                    !ImGui::IsMouseHoveringRect(compRowPos,
-                        ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
-                               compRowPos.y + ImGui::GetFontSize() * 1.5f)))
-                    openComponentPart(st, absPath);
-            }
+    // Build ordered groups: first-seen key order; empty keys are unique per instance.
+    struct AsmCompGroup {
+        std::string key;                 // shared key, or empty for singleton
+        std::string absPath;             // shared source abs path (may be empty)
+        std::vector<size_t> indices;     // into insts
+    };
+    std::vector<AsmCompGroup> groups;
+    std::unordered_map<std::string, size_t> groupIndexByKey;
+    for (size_t i = 0; i < insts.size(); ++i) {
+        const AsmCompInst& inst = insts[i];
+        if (inst.groupKey.empty()) {
+            groups.push_back(AsmCompGroup{{}, inst.absPath, {i}});
+            continue;
+        }
+        auto it = groupIndexByKey.find(inst.groupKey);
+        if (it == groupIndexByKey.end()) {
+            groupIndexByKey[inst.groupKey] = groups.size();
+            groups.push_back(AsmCompGroup{inst.groupKey, inst.absPath, {i}});
+        } else {
+            groups[it->second].indices.push_back(i);
+        }
+    }
 
-            // ---- component visibility ---------------------------------------------------------
-            // Persisted (asm_edit_component `hidden`), so undo/save work; a hidden component still
-            // solves mates / counts in BOM (only the body draw is skipped) — unlike suppress. Route
-            // the toggle through applyTreeOps like the mate suppress; the load path re-derives the
-            // renderer body mask from the flag. Both the right-edge eye and the right-click item
-            // drive the SAME op so they stay consistent (existing feature-row idiom).
-            ImVec2 cNodeMin = ImGui::GetItemRectMin();
-            ImVec2 cNodeMax = ImGui::GetItemRectMax();
-            float  cEyeSz   = 14.0f * ui::uiScale;
-            float  cEyePad  = 6.0f  * ui::uiScale;
-            ImVec2 cEyeMin(cNodeMax.x - cEyeSz - cEyePad,
-                           cNodeMin.y + (cNodeMax.y - cNodeMin.y - cEyeSz) * 0.5f);
-            ImVec2 cEyeMax(cEyeMin.x + cEyeSz, cEyeMin.y + cEyeSz);
-            bool   overCompEye = ImGui::IsMouseHoveringRect(cEyeMin, cEyeMax);
-            drawEyeGlyph(ImGui::GetWindowDrawList(), cEyeMin, cEyeMax, !hidden, overCompEye, fmSurf());
-            auto toggleCompHidden = [&](bool newHidden) {
-                applyTreeOps(st, nlohmann::json::array({
-                    {{"op","asm_edit_component"},{"id",cid},{"hidden",newHidden}}}), "component");
-            };
-            if (overCompEye) {
-                ImGui::SetTooltip(hidden ? "Show Component" : "Hide Component");
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
-            }
-            pushTreePopupGlass();
-            if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
-                // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
-                // route through the request seam AsmPanels::draw() consumes to open + focus the Mate
-                // panel for this component. Placed first (above "Edit Model") as the default edit.
-                if (ImGui::MenuItem("Edit"))
-                    st.requestEditComponentMates = cid;
-                // Whole-model editing remains available, while an individual nested feature's
-                // Edit in Assembly action opens the real parameter form directly.
-                const bool editableModel =
-                    !unavailable && nestedDoc.state == ui::NestedDocumentState::Ready;
-                if (!editableModel) ImGui::BeginDisabled();
-                if (ImGui::MenuItem("Edit Model"))
-                    st.enterComponentEdit(cid, absPath);
-                if (!editableModel) ImGui::EndDisabled();
-                ImGui::Separator();
-                if (unavailable) ImGui::BeginDisabled();
-                if (ImGui::MenuItem("Open in new tab"))
-                    openComponentPart(st, absPath);
-                if (unavailable) ImGui::EndDisabled();
-                ImGui::Separator();
-                if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
-                    toggleCompHidden(!hidden);
-                ImGui::EndPopup();
-            }
-            popTreePopupGlass();
+    // Draw one component instance row (eye / context menu / nested expansion). Used both for
+    // ungrouped singletons and for children under an instance-group folder.
+    auto drawComponentInstance = [&](const AsmCompInst& inst) {
+        const std::string& cid = inst.cid;
+        const std::string& cname = inst.cname;
+        const std::string& absPath = inst.absPath;
+        const bool fixed = inst.fixed;
+        const bool suppressed = inst.suppressed;
+        const bool hidden = inst.hidden;
+        const ui::NestedDocument& nestedDoc = ui::featureTreeNestedDocument(absPath);
+        const bool unavailable = absPath.empty() ||
+            nestedDoc.state == ui::NestedDocumentState::Missing ||
+            nestedDoc.state == ui::NestedDocumentState::Unreadable;
+        const bool isAsm = nestedDoc.schema == "aicad.asm/1";
+        FStatus fs = getFeatureStatus(statusArr, cid);
 
-            fmRowPillEnd(compRect);
-            featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
-
-            // Cached recursive document tree: metadata, editable feature history, and nested
-            // assembly references. The cache keys on mtime+size, so a saved in-context edit is
-            // visible on the next frame without reparsing steady-state components.
-            if (compOpen) {
-                if (absPath.empty()) {
-                    drawNestedInfoRow("component_" + cid + "_material",
-                                      "Material: <unavailable>", "material", "[M]");
-                    drawNestedInfoRow("component_" + cid + "_file",
-                                      "File: <unresolved>", "open", "[F]");
-                    ImGui::TextDisabled("(component has no resolvable source path)");
-                } else {
-                    std::unordered_set<std::string> pathStack;
-                    pathStack.insert(absPath);
-                    drawNestedDocumentContents(st, "component_" + cid, cid, absPath,
-                                               nestedDoc, pathStack, 0);
-                }
-                ImGui::TreePop();
+        FmRowRect compRect = fmRowPill();
+        // SolidWorks marks fixed components with a "(f)" prefix.
+        std::string label = (fixed ? "(f) " : "") + cname;
+        if (suppressed) label += " [S]";
+        // Missing/unreadable references and hidden components are visibly dimmed. The source
+        // error stays attached to the row as a tooltip instead of masquerading as "(no features)".
+        if (hidden || unavailable) ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2],
+                   unavailable ? 0.50f : 0.55f));
+        ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_SpanFullWidth |
+            ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_OpenOnArrow;
+        treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f,
+                 hidden || unavailable ? 0.5f : 1.0f);
+        ImGui::SameLine(0, 4 * ui::uiScale);
+        ImVec2 compRowPos = ImGui::GetCursorScreenPos();
+        const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
+        if (hidden || unavailable) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            if (unavailable) {
+                const std::string why = absPath.empty()
+                    ? "Component source path is unresolved"
+                    : nestedDoc.error;
+                ImGui::SetTooltip("%s", why.c_str());
             }
-            ++ci;
+            // Component double-click is the explicit pop-out action. In-context feature editing
+            // starts from a nested feature row, preserving a clear distinction between the two.
+            if (!unavailable && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                !ImGui::IsMouseHoveringRect(compRowPos,
+                    ImVec2(compRowPos.x + ImGui::GetFontSize() * 1.5f,
+                           compRowPos.y + ImGui::GetFontSize() * 1.5f)))
+                openComponentPart(st, absPath);
+        }
+
+        // ---- component visibility ---------------------------------------------------------
+        // Persisted (asm_edit_component `hidden`), so undo/save work; a hidden component still
+        // solves mates / counts in BOM (only the body draw is skipped) — unlike suppress. Route
+        // the toggle through applyTreeOps like the mate suppress; the load path re-derives the
+        // renderer body mask from the flag. Both the right-edge eye and the right-click item
+        // drive the SAME op so they stay consistent (existing feature-row idiom).
+        ImVec2 cNodeMin = ImGui::GetItemRectMin();
+        ImVec2 cNodeMax = ImGui::GetItemRectMax();
+        float  cEyeSz   = 14.0f * ui::uiScale;
+        float  cEyePad  = 6.0f  * ui::uiScale;
+        ImVec2 cEyeMin(cNodeMax.x - cEyeSz - cEyePad,
+                       cNodeMin.y + (cNodeMax.y - cNodeMin.y - cEyeSz) * 0.5f);
+        ImVec2 cEyeMax(cEyeMin.x + cEyeSz, cEyeMin.y + cEyeSz);
+        bool   overCompEye = ImGui::IsMouseHoveringRect(cEyeMin, cEyeMax);
+        drawEyeGlyph(ImGui::GetWindowDrawList(), cEyeMin, cEyeMax, !hidden, overCompEye, fmSurf());
+        auto toggleCompHidden = [&](bool newHidden) {
+            applyTreeOps(st, nlohmann::json::array({
+                {{"op","asm_edit_component"},{"id",cid},{"hidden",newHidden}}}), "component");
+        };
+        if (overCompEye) {
+            ImGui::SetTooltip(hidden ? "Show Component" : "Hide Component");
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
+        }
+        pushTreePopupGlass();
+        if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
+            // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
+            // route through the request seam AsmPanels::draw() consumes to open + focus the Mate
+            // panel for this component. Placed first (above "Edit Model") as the default edit.
+            if (ImGui::MenuItem("Edit"))
+                st.requestEditComponentMates = cid;
+            // Whole-model editing remains available, while an individual nested feature's
+            // Edit in Assembly action opens the real parameter form directly.
+            const bool editableModel =
+                !unavailable && nestedDoc.state == ui::NestedDocumentState::Ready;
+            if (!editableModel) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Edit Model"))
+                st.enterComponentEdit(cid, absPath);
+            if (!editableModel) ImGui::EndDisabled();
+            ImGui::Separator();
+            if (unavailable) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Open Part"))
+                openComponentPart(st, absPath);
+            if (unavailable) ImGui::EndDisabled();
+            ImGui::Separator();
+            if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
+                toggleCompHidden(!hidden);
+            ImGui::EndPopup();
+        }
+        popTreePopupGlass();
+
+        fmRowPillEnd(compRect);
+        featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
+
+        // Cached recursive document tree: metadata, editable feature history, and nested
+        // assembly references. The cache keys on mtime+size, so a saved in-context edit is
+        // visible on the next frame without reparsing steady-state components.
+        if (compOpen) {
+            if (absPath.empty()) {
+                drawNestedInfoRow("component_" + cid + "_info",
+                                  "Material: <unavailable>  ·  <unresolved>",
+                                  "material", "[i]");
+                ImGui::TextDisabled("(component has no resolvable source path)");
+            } else {
+                std::unordered_set<std::string> pathStack;
+                pathStack.insert(absPath);
+                drawNestedDocumentContents(st, "component_" + cid, cid, absPath,
+                                           nestedDoc, pathStack, 0);
+            }
+            ImGui::TreePop();
+        }
+    };
+
+    for (const AsmCompGroup& group : groups) {
+        if (group.indices.size() < 2) {
+            // Singleton — render exactly as before (no folder wrapper).
+            drawComponentInstance(insts[group.indices[0]]);
+            continue;
+        }
+
+        // Multi-instance folder: "<DisplayName> xN" at the first instance's tree position.
+        const AsmCompInst& first = insts[group.indices[0]];
+        const std::string displayName = stripInstanceSuffix(first.cname);
+        const std::string folderLabel =
+            displayName + " x" + std::to_string(group.indices.size());
+        // Stable ImGui id from the group key (canonical path).
+        const std::string folderId = "asmgrp_" + group.key;
+
+        FmRowRect grpRect = fmRowPill();
+        treeIcon("body_folder", "[F]", 16.0f);
+        ImGui::SameLine(0, 4 * ui::uiScale);
+        const bool groupOpen = ImGui::TreeNodeEx(
+            (folderLabel + "##" + folderId).c_str(),
+            ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
+            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen);
+        // Group-folder context menu: Open Part once for the shared source.
+        pushTreePopupGlass();
+        if (ImGui::BeginPopupContextItem(("##gctx_" + folderId).c_str())) {
+            const bool canOpen = !group.absPath.empty();
+            if (!canOpen) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Open Part"))
+                openComponentPart(st, group.absPath);
+            if (!canOpen) ImGui::EndDisabled();
+            ImGui::EndPopup();
+        }
+        popTreePopupGlass();
+        if (ImGui::IsItemHovered() && !group.absPath.empty())
+            ImGui::SetTooltip("%s", group.absPath.c_str());
+        fmRowPillEnd(grpRect);
+
+        if (groupOpen) {
+            for (size_t idx : group.indices)
+                drawComponentInstance(insts[idx]);
+            ImGui::TreePop();
         }
     }
 

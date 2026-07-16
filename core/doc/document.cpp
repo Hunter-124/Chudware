@@ -562,6 +562,7 @@ std::string req_str(const json& feat, const char* key) {
     return it->get<std::string>();
 }
 
+
 // A reserved axis datum ("axis.x/y/z", or {"kind":"datum","feature":"axis.z"}) ->
 // (point on axis, unit direction). nullopt for anything else (a topology selector
 // axis is not yet supported here). All reserved axes pass through the world origin
@@ -640,22 +641,231 @@ std::string selector_owner_id(const json& sel) {
     return std::string();
 }
 
+// Owning sketch feature id from a (possibly already-normalized) profile ref:
+// bare string, region object, or list of either. Empty if unresolvable.
+std::string profile_sketch_id(const json& profile) {
+    if (profile.is_string()) return profile.get<std::string>();
+    if (profile.is_object()) return selector_owner_id(profile);
+    if (profile.is_array()) {
+        for (const json& s : profile) {
+            std::string id = s.is_string() ? s.get<std::string>() : selector_owner_id(s);
+            if (!id.empty()) return id;
+        }
+    }
+    return std::string();
+}
+
+// Face surface-area (mm^2) for stable region ordering (matches doc_sketch_regions'
+// area from BRepGProp::SurfaceProperties).
+double face_surface_area(const TopoDS_Face& f) {
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(f, props);
+    return props.Mass();
+}
+
+// Project a face's area-centroid into the sketch plane's (u,v) frame — same frame
+// doc_sketch_regions stamps on region descriptors (session.cpp::reg_face_descriptor).
+Eigen::Vector2d face_uv_centroid(const TopoDS_Face& f,
+                                 const aicad::geom::SketchPlane& plane) {
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(f, props);
+    gp_Pnt cm = props.CentreOfMass();
+    Eigen::Vector3d diff(cm.X() - plane.origin.x(), cm.Y() - plane.origin.y(),
+                         cm.Z() - plane.origin.z());
+    return Eigen::Vector2d(diff.dot(plane.uAxis), diff.dot(plane.vAxis));
+}
+
+// Resolve a feature's `profile` ref to the planar faces that should be extruded /
+// revolved / swept / sheetmetal-base-flanged / surfaced. Shared by every consumer
+// that previously did `req_str(profile) + require_sketch + src.faces`.
+//
+// Semantics (backward-compatible with the simplified string model):
+//   - bare string sketch id, OR region selector(s) WITHOUT index/centroid
+//     => ALL material faces of the sketch (even-odd outer regions WITH holes —
+//        concentric circles become one washer face).
+//   - region selector(s) carrying centroid (prefer) and/or index:
+//       * centroid present => pick the material face whose (u,v) centroid is
+//         nearest the requested centroid (robust vs. reordering).
+//       * else index => order material faces the same way doc_sketch_regions
+//         orders regions (by centroid u then v) and take that index among the
+//         material faces. The GUI region picker emits material-region indices
+//         for profile wells (void/hole regions are not selectable as profiles).
+//   Multiple selectors union their matched faces (de-duplicated by row index).
+std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
+                                               const json& feat) {
+    auto it = feat.find("profile");
+    if (it == feat.end())
+        throw std::runtime_error("missing string ref 'profile'");
+    const json& profile = *it;
+
+    // Collect region selector objects (or invent a whole-sketch one from a bare id).
+    std::vector<json> sels;
+    std::string sketch_id;
+    if (profile.is_string()) {
+        sketch_id = profile.get<std::string>();
+        sels.push_back(json{{"kind", "region"}, {"sketch", sketch_id}});
+    } else if (profile.is_object()) {
+        sels.push_back(profile);
+        sketch_id = selector_owner_id(profile);
+    } else if (profile.is_array()) {
+        for (const json& s : profile) {
+            if (s.is_string()) {
+                if (sketch_id.empty()) sketch_id = s.get<std::string>();
+                sels.push_back(json{{"kind", "region"}, {"sketch", s.get<std::string>()}});
+            } else if (s.is_object()) {
+                sels.push_back(s);
+                if (sketch_id.empty()) sketch_id = selector_owner_id(s);
+            }
+        }
+    }
+    if (sketch_id.empty())
+        throw std::runtime_error("missing string ref 'profile'");
+
+    // All selectors must name the same sketch (multi-sketch profiles not supported).
+    for (const json& s : sels) {
+        const std::string sid = selector_owner_id(s);
+        if (!sid.empty() && sid != sketch_id)
+            throw std::runtime_error("profile: multi-sketch region picks are not supported");
+    }
+
+    const SketchResult& src = require_sketch(results, sketch_id, sketch_id.c_str());
+    if (src.faces.empty())
+        throw std::runtime_error("profile sketch has no closed face");
+
+    // Does ANY selector carry a region target (index and/or centroid)?
+    bool any_targeted = false;
+    for (const json& s : sels) {
+        if (!s.is_object()) continue;
+        if (s.contains("index") && !s["index"].is_null()) { any_targeted = true; break; }
+        if (s.contains("centroid") && s["centroid"].is_array() && s["centroid"].size() >= 2)
+            { any_targeted = true; break; }
+    }
+    if (!any_targeted) {
+        // Whole-sketch: every material face (with holes already nested by faces_from_solved_sketch).
+        return src.faces;
+    }
+
+    // Targeted pick: build the FULL region face list (material + void), matching
+    // doc_sketch_regions so index/centroid can address the inner disc of a washer.
+    std::vector<TopoDS_Face> all_faces =
+        aicad::geom::all_region_faces_from_solved_sketch(src.entities, src.plane);
+    if (all_faces.empty())
+        throw std::runtime_error("profile sketch has no closed face");
+
+    // Build (uv_centroid, area, face) rows, sorted by (u, v) — same order as
+    // doc_sketch_regions (session.cpp ~10039-10048) so `index` matches the GUI.
+    struct FaceRow {
+        Eigen::Vector2d uv;
+        double area;
+        TopoDS_Face face;
+    };
+    std::vector<FaceRow> rows;
+    rows.reserve(all_faces.size());
+    for (const TopoDS_Face& f : all_faces) {
+        FaceRow r;
+        r.face = f;
+        r.uv = face_uv_centroid(f, src.plane);
+        r.area = face_surface_area(f);
+        rows.push_back(std::move(r));
+    }
+    std::sort(rows.begin(), rows.end(), [](const FaceRow& a, const FaceRow& b) {
+        if (a.uv.x() != b.uv.x()) return a.uv.x() < b.uv.x();
+        if (a.uv.y() != b.uv.y()) return a.uv.y() < b.uv.y();
+        // Stable when centroids coincide (concentric): smaller area first so the
+        // inner disc gets a lower index than the washer when both share a center.
+        return a.area < b.area;
+    });
+
+    std::vector<TopoDS_Face> out;
+    std::vector<bool> taken(rows.size(), false);
+    auto take = [&](size_t i) {
+        if (i >= rows.size() || taken[i]) return;
+        taken[i] = true;
+        out.push_back(rows[i].face);
+    };
+
+    for (const json& s : sels) {
+        if (!s.is_object()) continue;
+        // Prefer centroid when present (more robust than index).
+        if (s.contains("centroid") && s["centroid"].is_array() && s["centroid"].size() >= 2) {
+            const double cu = s["centroid"][0].get<double>();
+            const double cv = s["centroid"][1].get<double>();
+            // Nearest face centroid. When several faces share a centroid (concentric
+            // circles both report centre (0,0)), prefer the smaller-area face so a
+            // center pick resolves to the inner disc, not the washer. hint_index is
+            // only a seed; a strictly closer face still wins.
+            int best = -1;
+            double best_d2 = 0.0;
+            double best_area = 0.0;
+            if (s.contains("hint_index") && s["hint_index"].is_number()) {
+                int hi = static_cast<int>(s["hint_index"].get<double>());
+                if (hi >= 0 && hi < static_cast<int>(rows.size())) {
+                    best = hi;
+                    double du = rows[static_cast<size_t>(hi)].uv.x() - cu;
+                    double dv = rows[static_cast<size_t>(hi)].uv.y() - cv;
+                    best_d2 = du * du + dv * dv;
+                    best_area = rows[static_cast<size_t>(hi)].area;
+                }
+            }
+            for (size_t i = 0; i < rows.size(); ++i) {
+                double du = rows[i].uv.x() - cu;
+                double dv = rows[i].uv.y() - cv;
+                double d2 = du * du + dv * dv;
+                if (best < 0 || d2 < best_d2 - 1e-18 ||
+                    (std::abs(d2 - best_d2) <= 1e-18 && rows[i].area < best_area)) {
+                    best = static_cast<int>(i);
+                    best_d2 = d2;
+                    best_area = rows[i].area;
+                }
+            }
+            if (best >= 0) take(static_cast<size_t>(best));
+            continue;
+        }
+        if (s.contains("index") && s["index"].is_number()) {
+            int idx = static_cast<int>(s["index"].get<double>());
+            if (idx < 0 || idx >= static_cast<int>(rows.size()))
+                throw std::runtime_error("profile: region index " + std::to_string(idx) +
+                                         " out of range (sketch has " +
+                                         std::to_string(rows.size()) + " region(s))");
+            take(static_cast<size_t>(idx));
+            continue;
+        }
+        // Untargeted selector mixed with targeted ones: contribute ALL material faces.
+        for (size_t i = 0; i < rows.size(); ++i) take(i);
+    }
+
+    if (out.empty())
+        throw std::runtime_error("profile: no region face matched the selector(s)");
+    return out;
+}
+
+
 // A canonical extrude/revolve `profile` ref is a SEL_LIST of region selectors
-// {"kind":"region","sketch":fid,...} (engine/doc/features/extrude.py). In the
-// simplified id-ref model a profile is just the sketch's feature id string. Map
-// the canonical list to that id (the first region selector's sketch) so the
-// existing profile path resolves it. A bare string passes through (simplified
-// shape). Other selector kinds (face profiles) are not yet supported here.
+// {"kind":"region","sketch":fid, "index"?, "centroid"?, "hint_index"?}
+// (contracts/feature_params.md). The simplified id-ref model also accepts a bare
+// sketch feature-id string. We PRESERVE the full selector payload (index/centroid)
+// so resolve_profile_faces can pick specific regions; only the sketch id is
+// extracted when the profile is a bare string or a selector without any region
+// targeting fields. Other selector kinds (face profiles) are not yet supported here.
 json canonical_profile_to_id(const json& profile) {
     if (profile.is_string()) return profile;  // already simplified
-    if (profile.is_array() && !profile.empty()) {
-        const json& sel = profile.front();
-        if (sel.is_string()) return sel;
-        if (sel.is_object() && sel.contains("sketch") && sel["sketch"].is_string())
-            return sel["sketch"];
+    // List of region selectors — keep the list (or a single selector object) so
+    // index / centroid survive into the feature compiler. A bare sketch-id list
+    // collapses to that string.
+    if (profile.is_array()) {
+        if (profile.empty()) return profile;
+        // All entries strings -> first id (simplified multi-id not used).
+        bool all_str = true;
+        for (const json& s : profile)
+            if (!s.is_string()) { all_str = false; break; }
+        if (all_str) return profile.front();
+        // Single region/object selector -> keep the object (or the whole list if >1
+        // so multi-region picks can union their faces).
+        if (profile.size() == 1 && profile.front().is_object()) return profile.front();
+        return profile;  // multi-selector list, preserve as-is
     }
     if (profile.is_object() && profile.contains("sketch") && profile["sketch"].is_string())
-        return profile["sketch"];
+        return profile;  // keep object (may carry index/centroid)
     return profile;  // leave as-is -> the profile resolver will raise a clear error
 }
 
@@ -1127,14 +1337,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     };
 
     // --- surfacing helpers (engine/doc/features/surf_*.py) -----------------------
-    // Resolve a `profile` ref (a sketch id, after normalize_feature) to its solved
-    // planar faces. Mirrors extrude._resolve_profile_faces for the simplified model.
+    // Resolve a `profile` ref (sketch id or region selector after normalize_feature)
+    // to its planar faces — same region semantics as extrude/revolve/sweep.
     auto surf_profile_faces = [&](const json& feat) -> std::vector<TopoDS_Face> {
-        const std::string prof = req_str(feat, "profile");
-        const SketchResult& src = require_sketch(results, prof, prof.c_str());
-        if (src.faces.empty())
-            throw std::runtime_error("surf: profile sketch has no closed face");
-        return src.faces;
+        return resolve_profile_faces(results, feat);
     };
     // Planar-face normal (build123d face.normal_at() analogue): the geometric surface
     // normal at the face's UV midpoint, used to set the surf_extrude sweep direction.
@@ -3148,7 +3354,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }  // end planar half-space path (!nonplanar_done)
 
             } else if (type == "extrude") {
-                const std::string prof = req_str(feat, "profile");
+                // Profile faces honor region selectors (index/centroid) via the shared
+                // resolver; a bare sketch id still means whole-sketch (all material faces).
+                auto pit = feat.find("profile");
+                if (pit == feat.end())
+                    throw std::runtime_error("missing string ref 'profile'");
+                const std::string prof = profile_sketch_id(*pit);
+                if (prof.empty())
+                    throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
                 // Canonical mode: "cut" subtracts the prism from the current body;
                 // anything else ("new"/"boss"/"add") builds a standalone boss.
@@ -3169,7 +3382,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // --- thin feature: replace each filled profile face with its thin-wall
                 // ring (port of extrude.py::_thin_profile_face). thin_side: one (inside,
                 // default) | two/mid (1/2 each side) | outside.
-                std::vector<TopoDS_Face> faces = src.faces;
+                std::vector<TopoDS_Face> faces = resolve_profile_faces(results, feat);
                 const bool thin = feat.value("thin", false);
                 if (thin) {
                     const double thin_thk = feat.contains("thin_thickness")
@@ -3519,7 +3732,12 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "revolve") {
-                const std::string prof = req_str(feat, "profile");
+                auto rpit = feat.find("profile");
+                if (rpit == feat.end())
+                    throw std::runtime_error("missing string ref 'profile'");
+                const std::string prof = profile_sketch_id(*rpit);
+                if (prof.empty())
+                    throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
                 // Axis: either pre-translated reserved-datum vecs (axis_pt/axis_dir)
                 // or a datum-axis FEATURE ref left in feat["axis"] (resolve here so a
@@ -3545,11 +3763,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (!(std::abs(angle) > 0.0))
                     throw std::runtime_error("revolve angle must be non-zero");
 
-                // Profile faces: the sketch's closed regions, or — if the model left the
+                // Profile faces: region-resolved sketch faces, or — if the model left the
                 // profile OPEN (a common weak-model mistake) — a region synthesised by
                 // closing the outer curve back to the axis. The fallback only runs when
                 // there is no closed region, so a properly closed profile is untouched.
-                std::vector<TopoDS_Face> rev_faces = src.faces;
+                // resolve_profile_faces throws on empty; catch open-profile case by probing
+                // src.faces first for the auto-close path.
+                std::vector<TopoDS_Face> rev_faces;
+                if (src.faces.empty()) {
+                    rev_faces = {};  // will auto-close below
+                } else {
+                    rev_faces = resolve_profile_faces(results, feat);
+                }
                 // Track whether we had to synthesise the region by closing an OPEN profile
                 // to the axis, so we can surface it as a warning (Bug B4): the auto-close is
                 // useful, but a model that left the profile open should be told its disc was
@@ -3681,9 +3906,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // Sweep profile region face(s) along a path sketch's raw wire
                 // (BRepOffsetAPI_MakePipe). Port of engine/doc/features/sweep.py's
                 // MakePipe fast path (guides/twist/orientation/thin deferred).
-                const std::string prof = req_str(feat, "profile");
-                const SketchResult& src = require_sketch(results, prof, prof.c_str());
-                if (src.faces.empty())
+                auto spit = feat.find("profile");
+                if (spit == feat.end())
+                    throw std::runtime_error("missing string ref 'profile'");
+                std::vector<TopoDS_Face> sw_faces = resolve_profile_faces(results, feat);
+                if (sw_faces.empty())
                     throw std::runtime_error("sweep: profile sketch has no closed face");
 
                 auto pit = feat.find("path");
@@ -3751,26 +3978,21 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     const std::string gid = selector_owner_id(gsel);
                     if (gid.empty())
                         throw std::runtime_error("sweep: malformed guide-curve ref");
-                    if (gid == path_id)
-                        throw std::runtime_error(
-                            "sweep: the guide curve must be a different sketch/curve "
-                            "than the path");
                     TopoDS_Wire gw;
-                    auto gres = results.find(gid);
-                    if (gres != results.end() &&
-                        std::holds_alternative<CurveResult>(*gres->second)) {
-                        const CurveResult& cr = std::get<CurveResult>(*gres->second);
+                    auto git2 = results.find(gid);
+                    if (git2 != results.end() &&
+                        std::holds_alternative<CurveResult>(*git2->second)) {
+                        const CurveResult& cr = std::get<CurveResult>(*git2->second);
                         const aicad::geom::SketchPlane& b = cr.base;
                         gp_Trsf lift;
                         lift.SetValues(
                             b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
                             b.uAxis.y(), b.vAxis.y(), b.normal.y(), b.origin.y(),
                             b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
-                        gw = TopoDS::Wire(
-                            BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
-                    } else if (gres != results.end() &&
-                               std::holds_alternative<Sketch3DResult>(*gres->second)) {
-                        gw = sketch3d_ref_wire(std::get<Sketch3DResult>(*gres->second),
+                        gw = TopoDS::Wire(BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
+                    } else if (git2 != results.end() &&
+                               std::holds_alternative<Sketch3DResult>(*git2->second)) {
+                        gw = sketch3d_ref_wire(std::get<Sketch3DResult>(*git2->second),
                                                gsel, "guide");
                     } else {
                         const SketchResult& gsk = require_sketch(results, gid, "guide");
@@ -3785,7 +4007,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
 
                 TopoDS_Shape solid;
-                for (const TopoDS_Face& f : src.faces) {
+                for (const TopoDS_Face& f : sw_faces) {
                     TopoDS_Shape pipe = ::geom::sweep_profile(f, spine, orient, guides);
                     if (pipe.IsNull())
                         throw std::runtime_error("sweep produced an empty solid "
@@ -3814,7 +4036,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         // not coincide with the profile centroid. Measure the actual gap and,
                         // when it is significant, name the exact distance so the user fixes the
                         // right coordinate instead of guessing.
-                        GProp_GProps pc; BRepGProp::SurfaceProperties(src.faces.front(), pc);
+                        GProp_GProps pc; BRepGProp::SurfaceProperties(sw_faces.front(), pc);
                         gp_Pnt pcm = pc.CentreOfMass();
                         BRepAdaptor_Curve spc(TopoDS::Edge(
                             TopExp_Explorer(spine, TopAbs_EDGE).Current()));
@@ -3857,7 +4079,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 {
                     GProp_GProps pa;
                     double profile_area = 0.0;
-                    for (const TopoDS_Face& f : src.faces) {
+                    for (const TopoDS_Face& f : sw_faces) {
                         BRepGProp::SurfaceProperties(f, pa);
                         profile_area += pa.Mass();
                     }
@@ -3944,7 +4166,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (!(thickness > 0.0))
                     throw std::runtime_error("rib thickness must be > 0");
 
-                const std::string prof = req_str(feat, "profile");
+                // Rib uses the OPEN contour of the profile sketch (not closed regions).
+                auto rib_pit = feat.find("profile");
+                if (rib_pit == feat.end())
+                    throw std::runtime_error("missing string ref 'profile'");
+                const std::string prof = profile_sketch_id(*rib_pit);
+                if (prof.empty())
+                    throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
                 TopoDS_Wire contour =
                     aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
@@ -5373,9 +5601,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // base sheet. Establishes the part as sheet metal (stores thickness /
                 // k-factor / default bend radius so later flanges inherit them). Port
                 // of engine/doc/features/sheetmetal.py::compile_sm_base_flange.
-                const std::string prof = req_str(feat, "profile");
+                auto sm_pit = feat.find("profile");
+                if (sm_pit == feat.end())
+                    throw std::runtime_error("missing string ref 'profile'");
+                const std::string prof = profile_sketch_id(*sm_pit);
+                if (prof.empty())
+                    throw std::runtime_error("missing string ref 'profile'");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
-                if (src.faces.empty())
+                std::vector<TopoDS_Face> sm_faces = resolve_profile_faces(results, feat);
+                if (sm_faces.empty())
                     throw std::runtime_error("sm_base_flange: profile sketch has no closed face");
 
                 const double thickness = num_or_expr(feat.at("thickness"), env);
@@ -5390,7 +5624,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 // Extrude each region face along its plane normal by thickness, union.
                 TopoDS_Shape sheet;
-                for (const TopoDS_Face& fc : src.faces) {
+                for (const TopoDS_Face& fc : sm_faces) {
                     TopoDS_Shape piece =
                         ::geom::extrude_face(fc, src.plane.normal, thickness, false);
                     if (piece.IsNull())

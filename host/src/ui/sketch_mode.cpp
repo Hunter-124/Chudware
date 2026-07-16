@@ -569,6 +569,75 @@ static const nlohmann::json* sketchParamsInTree(AppState& st, const std::string&
     return nullptr;
 }
 
+// Features that consume `sketchFid` via profile/path/guide (or other sketch) refs.
+// Walk matches the FeatureManager nesting scan: region selectors {"kind":"region","sketch":…}
+// plus bare sketch-id strings under profile/path/guide/*sketch* keys. Returns display names.
+static void collectSketchDependents(AppState& st, const std::string& sketchFid,
+                                    std::vector<std::string>& outNames) {
+    outNames.clear();
+    if (sketchFid.empty() || !st.docMirror.hasDoc()) return;
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return;
+    auto fa = tree.find("features");
+    if (fa == tree.end() || !fa->is_array()) return;
+
+    std::function<bool(const nlohmann::json&, const std::string&)> mentions =
+        [&](const nlohmann::json& node, const std::string& key) -> bool {
+        if (node.is_object()) {
+            if (node.value("kind", std::string()) == "region" &&
+                node.value("sketch", std::string()) == sketchFid)
+                return true;
+            for (auto it = node.begin(); it != node.end(); ++it)
+                if (mentions(it.value(), it.key())) return true;
+        } else if (node.is_array()) {
+            for (const auto& e : node)
+                if (mentions(e, key)) return true;
+        } else if (node.is_string() && node.get<std::string>() == sketchFid) {
+            // Bare sketch id under a profile/path/guide/sketch-ish key.
+            if (key.find("sketch") != std::string::npos ||
+                key == "profile" || key == "path" || key == "guide" ||
+                key == "guides" || key == "centerline" || key == "sections")
+                return true;
+        }
+        return false;
+    };
+
+    for (const auto& f : *fa) {
+        if (!f.is_object()) continue;
+        if (f.value("type", std::string()) == "sketch") continue;
+        if (f.value("id", std::string()) == sketchFid) continue;
+        auto refs = f.find("refs");
+        if (refs == f.end()) continue;
+        if (!mentions(*refs, std::string())) continue;
+        std::string name = f.value("name", std::string());
+        if (name.empty()) name = f.value("id", std::string("feature"));
+        outNames.push_back(std::move(name));
+    }
+}
+
+static std::string featureDisplayName(AppState& st, const std::string& fid) {
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+        for (const auto& f : tree["features"])
+            if (f.is_object() && f.value("id", std::string()) == fid) {
+                std::string n = f.value("name", std::string());
+                return n.empty() ? fid : n;
+            }
+    return fid;
+}
+
+// Warn toast when a consumed sketch is emptied: dependents stay (red badge) but need a profile.
+static std::string emptyProfileToast(const std::vector<std::string>& depNames,
+                                     const std::string& sketchName) {
+    std::string joined;
+    for (size_t i = 0; i < depNames.size(); ++i) {
+        if (i) joined += ", ";
+        joined += depNames[i];
+    }
+    return joined + " has no profile \xE2\x80\x94 add a closed profile in " +
+           sketchName + " to restore it";
+}
+
 // Copy the selected entities (+ their internal constraints) into st.clipboard as an entities bundle.
 // Entities are pulled RAW from the doc tree so all type-specific fields survive the round-trip; the
 // constraint set keeps only relations whose every handle references a SELECTED entity (external /
@@ -1249,13 +1318,20 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     }
     // Resync the mirror revision (sketch_exit bumps it server-side).
     resyncMirror(st);
-    // An EMPTY sketch is noise — delete it on exit rather than leaving a contentless feature in the
-    // tree. Fires for a never-populated NEW sketch AND for an existing sketch the user emptied out;
-    // both plain Finish and discard route here (matches the 3D sketcher's behavior).
+    // Empty-sketch cleanup: cascade-delete only when NOTHING depends on this sketch
+    // (brand-new empty cancel). If dependents exist, KEEP the empty sketch so they
+    // remain in the tree with rebuild errors; warn the user to re-add a profile.
     if (ents_.empty()) {
-        nlohmann::json ops = nlohmann::json::array({
-            {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
-        st.docMirror.applyOps(st.worker, ops);
+        std::vector<std::string> deps;
+        collectSketchDependents(st, fid_, deps);
+        if (deps.empty()) {
+            nlohmann::json ops = nlohmann::json::array({
+                {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
+            st.docMirror.applyOps(st.worker, ops);
+        } else {
+            st.toast(ui::ToastLevel::Warn,
+                     emptyProfileToast(deps, featureDisplayName(st, fid_)));
+        }
     }
     st.addLog("[sketch] exited " + fid_);
     active_ = false;
@@ -6031,6 +6107,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             else {
                 if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                 resolve(st);
+                // Emptied a consumed sketch (select-all + delete, etc.): warn once.
+                // Dependents stay with rebuild errors; don't cascade-delete them.
+                if (ents_.empty()) {
+                    std::vector<std::string> deps;
+                    collectSketchDependents(st, fid_, deps);
+                    if (!deps.empty()) {
+                        st.toast(ui::ToastLevel::Warn,
+                                 emptyProfileToast(deps, featureDisplayName(st, fid_)));
+                    }
+                }
             }
             selIds_.clear(); selRelIds_.clear();
         }

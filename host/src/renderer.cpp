@@ -1798,7 +1798,9 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                                 upload(t, 9); glDrawArrays(GL_TRIANGLES, 0, 3);
                             }
                         };
-                        if (selected) drawOcta(rd * 2.4f, 0.55f, 0.80f, 1.00f, 0.35f);  // glow halo
+                        // Selected highlight is a constant screen-space ring in viewport_panel
+                        // (matches the hover grab radius) — world-space rd*2.4 halo scaled with
+                        // scene radius and is intentionally not drawn for point.origin.
                         drawOcta(rd, selected ? 1.0f : 0.92f, selected ? 1.0f : 0.92f,
                                  selected ? 1.0f : 0.95f, 1.0f);
                     }

@@ -756,6 +756,10 @@ void AppState::syncActiveTabTitle() {
     // Wave 2: ECAD tabs keep their own name too — their doc lives in the ecad_* registry, not the
     // DocMirror, so the DocMirror tree's name (a part's) must not overwrite the schematic/PCB title.
     if (t.kind == DocTab::TabKind::Schematic || t.kind == DocTab::TabKind::PCB) return;
+    // Mid-open: DocMirror::adoptOpenResponse notifies before applyOpenedDoc creates/activates the
+    // new tab, so activeTab can still be the previous doc while the mirror already points at the
+    // new one. Refuse to rewrite the lagging tab's title from the wrong tree.
+    if (t.docId != docMirror.docId()) return;
     t.isAssembly = docMirror.tree().is_object() &&
                    (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
     t.title = docTitle(docMirror.tree(), t.isAssembly);

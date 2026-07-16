@@ -43,6 +43,14 @@ namespace aicad::geom {
 std::vector<TopoDS_Face> faces_from_solved_sketch(
     const nlohmann::json& solved_entities, const SketchPlane& plane);
 
+// Like faces_from_solved_sketch, but returns ONE face per detected loop — both
+// material (even depth) and void (odd depth) regions — each with its direct child
+// loops as holes. Callers that need the doc_sketch_regions GUI index must re-sort
+// by face (u,v) centroid themselves. Used so a region pick of the "inner disc" of
+// concentric circles extrudes a solid cylinder rather than the washer.
+std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
+    const nlohmann::json& solved_entities, const SketchPlane& plane);
+
 // Build a single (open OR closed) wire from a sketch's raw non-construction edges,
 // lifted onto `plane`, in entity order — the SPINE/PATH a sweep follows and the
 // open trace a rib rides (where faces_from_solved_sketch's closed-loop assembly

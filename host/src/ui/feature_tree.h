@@ -139,6 +139,12 @@ std::string featureTreeOpenDialog(AppState& st);
 std::string featureTreeSaveDoc(AppState& st, bool saveAs);
 std::string featureTreeActivePath();
 
+// Open a component's source part in a document tab. Dedups by canonical path: if a tab
+// already has that file open, switches to it; otherwise requests a new open. Used by the
+// assembly FeatureManager (component / instance-group context menus) and the viewport
+// component context menu.
+void openComponentPart(AppState& st, const std::string& absPath);
+
 // Live MCP handoff: a separate process (the AI-CAD MCP server Claude drives) builds parts in
 // its OWN engine, so its docs are invisible here. It publishes the part it's working on to
 // %APPDATA%\AI-CAD\handoff\ (live.step + a live.json carrying a monotonically rising "rev").

@@ -7268,12 +7268,47 @@ const TopoDS_Shape& eval_active_shape(const CompileResult& r, const std::string&
     return r.shapes.back();
 }
 
-// Resolve a plane ref (datum id string "plane.top/front/right", or {"kind":"datum",
-// "feature":<id>}) to a gp_Pln whose origin/normal/X-axis match the build123d Plane the
-// Python oracle produces (reserved_datums + worker.py::_resolve_eval_plane). The X-axis
-// (uAxis) parity matters for section_props' Ixx/Iyy/Ixy (the face MatrixOfInertia is
-// expressed in the plane frame). Throws OpError on a non-reserved/non-planar ref.
+// Resolve a plane ref to a gp_Pln. Accepts:
+//   * datum id string "plane.top/front/right" (or bare "top"/"front"/"right")
+//   * {"kind":"datum","feature":<id>}
+//   * {"origin":[x,y,z],"normal":[nx,ny,nz]} with optional "xdir":[3]
+// Origin/normal/X-axis match the build123d Plane the Python oracle produces for
+// reserved datums (section_props Ixx/Iyy/Ixy are expressed in the plane frame).
+// Throws OpError on a non-reserved/non-planar/degenerate ref.
 gp_Pln eval_resolve_plane(const json& plane_ref) {
+    // Explicit origin+normal plane (Evaluate tool custom plane).
+    if (plane_ref.is_object() && plane_ref.contains("origin") && plane_ref.contains("normal") &&
+        plane_ref["origin"].is_array() && plane_ref["origin"].size() == 3 &&
+        plane_ref["normal"].is_array() && plane_ref["normal"].size() == 3) {
+        const json& o = plane_ref["origin"];
+        const json& n = plane_ref["normal"];
+        if (!o[0].is_number() || !o[1].is_number() || !o[2].is_number() ||
+            !n[0].is_number() || !n[1].is_number() || !n[2].is_number())
+            throw OpError("invalid_op", "plane origin/normal must be numeric [x,y,z]",
+                          {{"reason", "bad plane"}});
+        const double nx = n[0].get<double>(), ny = n[1].get<double>(), nz = n[2].get<double>();
+        const double nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (nlen < 1e-12)
+            throw OpError("invalid_op", "plane normal is near-zero",
+                          {{"reason", "degenerate normal"}});
+        gp_Pnt origin(o[0].get<double>(), o[1].get<double>(), o[2].get<double>());
+        gp_Dir normal(nx / nlen, ny / nlen, nz / nlen);
+        if (plane_ref.contains("xdir") && plane_ref["xdir"].is_array() &&
+            plane_ref["xdir"].size() == 3 && plane_ref["xdir"][0].is_number() &&
+            plane_ref["xdir"][1].is_number() && plane_ref["xdir"][2].is_number()) {
+            const json& xd = plane_ref["xdir"];
+            const double xx = xd[0].get<double>(), xy = xd[1].get<double>(),
+                         xz = xd[2].get<double>();
+            const double xlen = std::sqrt(xx * xx + xy * xy + xz * xz);
+            if (xlen < 1e-12)
+                throw OpError("invalid_op", "plane xdir is near-zero",
+                              {{"reason", "degenerate xdir"}});
+            gp_Dir xdir(xx / xlen, xy / xlen, xz / xlen);
+            return gp_Pln(gp_Ax3(origin, normal, xdir));
+        }
+        return gp_Pln(gp_Ax3(origin, normal));
+    }
+
     std::string name;
     if (plane_ref.is_string()) {
         name = plane_ref.get<std::string>();
@@ -7281,7 +7316,8 @@ gp_Pln eval_resolve_plane(const json& plane_ref) {
                plane_ref.contains("feature") && plane_ref["feature"].is_string()) {
         name = plane_ref["feature"].get<std::string>();
     } else {
-        throw OpError("invalid_op", "plane must be a datum id or datum selector",
+        throw OpError("invalid_op",
+                      "plane must be a datum id, datum selector, or {origin,normal}",
                       {{"reason", "bad plane"}});
     }
     std::string bare = name;
@@ -7381,24 +7417,44 @@ bool eval_try_angle(const TopoDS_Shape& a, const TopoDS_Shape& b, double& out) {
     return false;
 }
 
-// engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius (circle) or length;
-// FACE -> area; VERTEX -> point; else volume.
+// engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius+diameter+length (circle)
+// or length; FACE -> area+perimeter; VERTEX -> point; else volume.
 json eval_measure_single(const TopoDS_Shape& raw) {
     const TopAbs_ShapeEnum st = raw.ShapeType();
     if (st == TopAbs_EDGE) {
         TopoDS_Edge edge = TopoDS::Edge(raw);
+        const double len = eval_edge_length(edge);
         try {
             BRepAdaptor_Curve ca(edge);
-            if (ca.GetType() == GeomAbs_Circle)
-                return json{{"kind", "radius"}, {"radius", ca.Circle().Radius()}};
+            if (ca.GetType() == GeomAbs_Circle) {
+                const double r = ca.Circle().Radius();
+                return json{{"kind", "radius"},
+                            {"radius", r},
+                            {"diameter", 2.0 * r},
+                            {"length", len}};
+            }
         } catch (const Standard_Failure&) {
         }
-        return json{{"kind", "length"}, {"length", eval_edge_length(edge)}};
+        return json{{"kind", "length"}, {"length", len}};
     }
     if (st == TopAbs_FACE) {
         GProp_GProps gp;
         BRepGProp::SurfaceProperties(raw, gp);
-        return json{{"kind", "area"}, {"area", gp.Mass()}};
+        double perimeter = 0.0;
+        try {
+            const TopoDS_Face face = TopoDS::Face(raw);
+            const TopoDS_Wire outer = BRepTools::OuterWire(face);
+            if (!outer.IsNull()) {
+                for (TopExp_Explorer ex(outer, TopAbs_EDGE); ex.More(); ex.Next()) {
+                    GProp_GProps lp;
+                    BRepGProp::LinearProperties(ex.Current(), lp);
+                    perimeter += lp.Mass();
+                }
+            }
+        } catch (const Standard_Failure&) {
+            perimeter = 0.0;
+        }
+        return json{{"kind", "area"}, {"area", gp.Mass()}, {"perimeter", perimeter}};
     }
     if (st == TopAbs_VERTEX) {
         gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(raw));
@@ -7410,18 +7466,50 @@ json eval_measure_single(const TopoDS_Shape& raw) {
 }
 
 // engine/doc/evaluate.py::_measure_pair — distance (BRepExtrema) + optional angle.
+// Always emits path==points when distance extrema are available. Two EDGEs that share an
+// endpoint (within 1e-3 mm) report as connected_edges with segment/total lengths.
 json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     json result = json::object();
+
+    // Connected open edges: any endpoint pair within 1e-3 mm → chain length.
+    if (a.ShapeType() == TopAbs_EDGE && b.ShapeType() == TopAbs_EDGE) {
+        try {
+            TopoDS_Vertex av1, av2, bv1, bv2;
+            TopExp::Vertices(TopoDS::Edge(a), av1, av2);
+            TopExp::Vertices(TopoDS::Edge(b), bv1, bv2);
+            if (!av1.IsNull() && !av2.IsNull() && !bv1.IsNull() && !bv2.IsNull()) {
+                const gp_Pnt ap[2] = {BRep_Tool::Pnt(av1), BRep_Tool::Pnt(av2)};
+                const gp_Pnt bp[2] = {BRep_Tool::Pnt(bv1), BRep_Tool::Pnt(bv2)};
+                constexpr double kConnTol = 1e-3;  // mm
+                bool connected = false;
+                for (int i = 0; i < 2 && !connected; ++i)
+                    for (int j = 0; j < 2 && !connected; ++j)
+                        if (ap[i].Distance(bp[j]) <= kConnTol) connected = true;
+                if (connected) {
+                    const double L1 = eval_edge_length(TopoDS::Edge(a));
+                    const double L2 = eval_edge_length(TopoDS::Edge(b));
+                    result["kind"] = "connected_edges";
+                    result["segment_lengths"] = json::array({L1, L2});
+                    result["total_length"] = L1 + L2;
+                    // Still compute distance/path below for the extrema read-out.
+                }
+            }
+        } catch (const Standard_Failure&) {
+        }
+    }
+
     try {
         BRepExtrema_DistShapeShape dss(a, b);
         if (dss.IsDone()) {
             result["distance"] = dss.Value();
-            result["kind"] = "distance";
+            if (!result.contains("kind")) result["kind"] = "distance";
             if (dss.NbSolution() > 0) {
                 gp_Pnt p1 = dss.PointOnShape1(1);
                 gp_Pnt p2 = dss.PointOnShape2(1);
-                result["points"] = json::array({json::array({p1.X(), p1.Y(), p1.Z()}),
-                                                 json::array({p2.X(), p2.Y(), p2.Z()})});
+                json pts = json::array({json::array({p1.X(), p1.Y(), p1.Z()}),
+                                        json::array({p2.X(), p2.Y(), p2.Z()})});
+                result["points"] = pts;
+                result["path"] = pts;  // path mirrors extrema points when distance solved
             }
         }
     } catch (const Standard_Failure&) {
@@ -8360,9 +8448,9 @@ json doc_face_wires(const std::string& doc_id, const json& params) {
 }
 
 
-// engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-2 refs against
-// the LAST body, then single-entity or pair measure. Refs resolve in the SAME enumeration
-// describe_* + body.faces()/edges()/vertices() use (a TopExp re-walk).
+// engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-8 refs against
+// the LAST body, then single / pair / multi-distance measure. Refs resolve in the SAME
+// enumeration describe_* + body.faces()/edges()/vertices() use (a TopExp re-walk).
 json doc_eval_measure(const std::string& doc_id, const json& refs) {
     DocLock lk;
     Session& s = require_session(doc_id);
@@ -8386,16 +8474,48 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
     } catch (const Standard_Failure&) {
     }
 
-    if (!refs.is_array() || refs.empty() || refs.size() > 2)
+    if (!refs.is_array() || refs.empty() || refs.size() > 8)
         throw OpError("invalid_op",
-                      "measure() takes 1 or 2 refs, got " +
+                      "measure() takes 1..8 refs, got " +
                           std::to_string(refs.is_array() ? refs.size() : 0));
 
     std::vector<TopoDS_Shape> shapes;
+    shapes.reserve(refs.size());
     for (const auto& ref : refs) shapes.push_back(eval_resolve_ref(ref, shape, diag));
 
     if (shapes.size() == 1) return eval_measure_single(shapes[0]);
-    return eval_measure_pair(shapes[0], shapes[1]);
+    if (shapes.size() == 2) return eval_measure_pair(shapes[0], shapes[1]);
+
+    // 3+ refs: successive pairwise distances along the given order (v1 multi — no wire
+    // topology). points = chain of extrema midpoints when each pair solves.
+    json distances = json::array();
+    json points = json::array();
+    double total = 0.0;
+    for (std::size_t i = 0; i + 1 < shapes.size(); ++i) {
+        const json pair = eval_measure_pair(shapes[i], shapes[i + 1]);
+        const double d = pair.value("distance", 0.0);
+        distances.push_back(d);
+        total += d;
+        if (pair.contains("points") && pair["points"].is_array() &&
+            pair["points"].size() == 2) {
+            const json& p0 = pair["points"][0];
+            const json& p1 = pair["points"][1];
+            if (p0.is_array() && p0.size() == 3 && p1.is_array() && p1.size() == 3 &&
+                p0[0].is_number() && p0[1].is_number() && p0[2].is_number() &&
+                p1[0].is_number() && p1[1].is_number() && p1[2].is_number()) {
+                points.push_back(json::array({
+                    0.5 * (p0[0].get<double>() + p1[0].get<double>()),
+                    0.5 * (p0[1].get<double>() + p1[1].get<double>()),
+                    0.5 * (p0[2].get<double>() + p1[2].get<double>()),
+                }));
+            }
+        }
+    }
+    json out = json{{"kind", "multi_distance"},
+                    {"distances", distances},
+                    {"total_distance", total}};
+    if (!points.empty()) out["points"] = points;
+    return out;
 }
 
 // ----------------------------------------------------------- Evaluate field methods

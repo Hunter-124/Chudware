@@ -1,17 +1,20 @@
-// Evaluate dialogs implementation (C19) — see evaluate_dialogs.h.
+// Evaluate dialogs implementation (C19 + Evaluate overhaul) — see evaluate_dialogs.h.
 #include "evaluate_dialogs.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "imgui.h"
 #include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
+#include "appearance_common.h"
 #include "layout.h"    // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
-#include "property_manager.h"   // pmFormatDim — linear readouts follow the document units
+#include "property_manager.h"   // pmFormatDim / Area / Volume / Mass / AreaMoment
 
 namespace ui {
 
@@ -20,20 +23,47 @@ namespace ui {
 // renderer's default frequency; the slider (4..60) drives it live via Renderer::setZebra().
 static float gZebraFreq = 18.0f;
 
-// Format a linear value (canonical mm) for an evaluate readout in the active document units
-// (mm in MMGS, inch in IPS). Area/volume/mass/inertia stay in their canonical units below — only
-// pure LENGTH measures convert, mirroring SolidWorks (which reformats length, not the derived
-// units, on a units toggle).
+// Format a linear value (canonical mm) for an evaluate readout in the active document units.
 static std::string evalLen(AppState& st, double mm) { return pmFormatDim(mm, st.ips()); }
 
-// Build the refs array for eval_measure from the current selection's resolved selectors.
+// Build the refs array for eval_measure from the current selection's resolved selectors (cap 8).
 static nlohmann::json selectionRefs(AppState& st) {
     nlohmann::json refs = nlohmann::json::array();
     for (const auto& it : st.selection.items()) {
         if (it.selector.empty()) continue;
-        try { refs.push_back(nlohmann::json::parse(it.selector)); } catch (...) {}
+        try {
+            refs.push_back(nlohmann::json::parse(it.selector));
+        } catch (...) {
+        }
+        if (refs.size() >= 8) break;
     }
     return refs;
+}
+
+static const char* kPlaneNames[] = {"plane.top", "plane.front", "plane.right"};
+
+void EvaluateDialogs::clearOverlays() {
+    overlaySegs_.clear();
+    overlayLabels_.clear();
+    massBodyAlpha_ = 1.0f;
+}
+
+void EvaluateDialogs::seedMassFromDoc(AppState& st) {
+    massDocKey_.clear();
+    massDocName_ = "(not set)";
+    massDensity_ = 7.85f;
+    massMaterial_ = 1;  // Steel preset after Document slot
+    if (!st.docMirror.hasDoc()) return;
+    const auto& tree = st.docMirror.tree();
+    if (!tree.is_object()) return;
+    auto m = tree.find("material");
+    if (m == tree.end() || !m->is_object()) return;
+    std::string key = m->value("key", std::string());
+    if (key.empty()) return;
+    massDocKey_ = key;
+    massDocName_ = materialDisplayName(key);
+    massDensity_ = materialDensityGcm3(key);
+    massMaterial_ = 0;  // Document material row
 }
 
 // C39: evals run async on st.rpc — heavy methods (interference, thickness on a dense model)
@@ -44,7 +74,10 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
     errorText_.clear();
     result_ = nlohmann::json::object();
     pending_ = false;
-    if (!st.docMirror.hasDoc()) { errorText_ = "No document loaded."; return; }
+    if (!st.docMirror.hasDoc()) {
+        errorText_ = "No document loaded.";
+        return;
+    }
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
@@ -63,6 +96,9 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
             return;
         }
         result_ = r.result;
+        if (openWindow_ == "mass") designSectionsDirty_ = true;
+        if (openWindow_ == "measure") rebuildMeasureOverlays(st);
+        if (openWindow_ == "mass") rebuildMassOverlays(st);
     }, 60000);
 }
 
@@ -73,40 +109,49 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
     result_ = nlohmann::json::object();
     pending_ = false;
     title_ = legendTitle;
-    if (!st.docMirror.hasDoc()) { errorText_ = "No document loaded."; openWindow_ = "field_err"; return; }
+    if (!st.docMirror.hasDoc()) {
+        errorText_ = "No document loaded.";
+        openWindow_ = "field_err";
+        return;
+    }
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
     const int gen = ++gen_;
-    // Multi-document: this overlay loads its mesh into the SHARED renderer (st.loadDocMesh + the
-    // colormap). Bind it to the doc it was computed on so a tab switch before the async result
-    // drains can't paint this field overlay onto a different document's geometry.
     const std::string fieldDocId = st.docMirror.docId();
-    // Field results are shown in-viewport; while computing, a small wait window gives the
-    // user feedback (the old sync call "gave feedback" by freezing the app instead).
     openWindow_ = "field_wait";
     ++st.rebuildsInFlight;
     st.rpc.call(method, params,
         [this, &st, gen, method, legendTitle, units, fieldDocId](const core::RpcResult& r) {
             --st.rebuildsInFlight;
             if (gen != gen_) return;
-            if (st.docMirror.docId() != fieldDocId) { pending_ = false; return; }  // active doc changed
+            if (st.docMirror.docId() != fieldDocId) {
+                pending_ = false;
+                return;
+            }
             pending_ = false;
             if (!r.ok) {
                 errorText_ = r.err.empty() ? ("worker call failed: " + method) : r.err;
-                openWindow_ = "field_err"; return;
+                openWindow_ = "field_err";
+                return;
             }
             if (r.result.is_object() && r.result.contains("code")) {
                 errorText_ = r.result.value("message", std::string("evaluate error"));
-                openWindow_ = "field_err"; return;
+                openWindow_ = "field_err";
+                return;
             }
             result_ = r.result;
             std::string aicm = result_.value("aicm_path", std::string());
-            if (aicm.empty()) { errorText_ = "no overlay produced"; openWindow_ = "field_err"; return; }
+            if (aicm.empty()) {
+                errorText_ = "no overlay produced";
+                openWindow_ = "field_err";
+                return;
+            }
             std::string le;
             if (!st.loadDocMesh(aicm, le)) {
                 errorText_ = "overlay load failed: " + le;
-                openWindow_ = "field_err"; return;
+                openWindow_ = "field_err";
+                return;
             }
             st.colormapOn = true;
             if (st.renderer) st.renderer->setColormapMode(true);
@@ -114,67 +159,355 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
             st.legendTitle = legendTitle;
             st.legendUnits = units;
             float vmin = 0, vmax = 1;
-            if (st.renderer && st.renderer->scalarRange(vmin, vmax)) { st.legendMin = vmin; st.legendMax = vmax; }
-            openWindow_.clear();  // field results are shown in-viewport, not a window
+            if (st.renderer && st.renderer->scalarRange(vmin, vmax)) {
+                st.legendMin = vmin;
+                st.legendMax = vmax;
+            }
+            openWindow_.clear();
             st.addLog("[eval] " + method + " overlay loaded");
         }, 60000);
 }
 
+void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
+    (void)st;
+    overlaySegs_.clear();
+    overlayLabels_.clear();
+    auto pushSeg = [&](double ax, double ay, double az, double bx, double by, double bz) {
+        overlaySegs_.push_back((float)ax);
+        overlaySegs_.push_back((float)ay);
+        overlaySegs_.push_back((float)az);
+        overlaySegs_.push_back((float)bx);
+        overlaySegs_.push_back((float)by);
+        overlaySegs_.push_back((float)bz);
+    };
+    auto midLabel = [&](double ax, double ay, double az, double bx, double by, double bz,
+                        const std::string& text) {
+        overlayLabels_.push_back(
+            {{(float)((ax + bx) * 0.5), (float)((ay + by) * 0.5), (float)((az + bz) * 0.5)}, text});
+    };
+
+    // Prefer explicit path, else points pair.
+    nlohmann::json pts = nlohmann::json::array();
+    if (result_.contains("path") && result_["path"].is_array()) pts = result_["path"];
+    else if (result_.contains("points") && result_["points"].is_array()) pts = result_["points"];
+
+    if (pts.size() >= 2) {
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            if (!pts[i].is_array() || pts[i].size() < 3) continue;
+            if (!pts[i + 1].is_array() || pts[i + 1].size() < 3) continue;
+            double ax = pts[i][0].get<double>(), ay = pts[i][1].get<double>(),
+                   az = pts[i][2].get<double>();
+            double bx = pts[i + 1][0].get<double>(), by = pts[i + 1][1].get<double>(),
+                   bz = pts[i + 1][2].get<double>();
+            pushSeg(ax, ay, az, bx, by, bz);
+            double dx = bx - ax, dy = by - ay, dz = bz - az;
+            double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            midLabel(ax, ay, az, bx, by, bz, evalLen(st, d));
+        }
+    }
+    if (result_.contains("distance") && result_["distance"].is_number() && pts.size() >= 2) {
+        // Ensure at least one label uses the reported distance (more accurate than recompute).
+        if (!overlayLabels_.empty())
+            overlayLabels_.back().second = evalLen(st, result_["distance"].get<double>());
+    }
+}
+
+void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
+    overlaySegs_.clear();
+    overlayLabels_.clear();
+    massBodyAlpha_ = 1.0f;
+    if (openWindow_ != "mass") return;
+
+    const bool anyMark = showCom_ || showI_ || showJ_;
+    if (anyMark) massBodyAlpha_ = 0.45f;
+
+    if (!result_.contains("com") || !result_["com"].is_array() || result_["com"].size() != 3)
+        return;
+    const double cx = result_["com"][0].get<double>();
+    const double cy = result_["com"][1].get<double>();
+    const double cz = result_["com"][2].get<double>();
+
+    // Cross size ~ 5% of a typical part; fall back to 5 mm.
+    float arm = 5.0f;
+    if (st.renderer) {
+        // radius_ is private; use a fixed scale relative to COM magnitude as a soft fallback.
+        double r = std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (r > 1.0) arm = (float)(r * 0.08);
+        if (arm < 2.0f) arm = 2.0f;
+        if (arm > 50.0f) arm = 50.0f;
+    }
+
+    auto pushSeg = [&](float ax, float ay, float az, float bx, float by, float bz) {
+        overlaySegs_.push_back(ax);
+        overlaySegs_.push_back(ay);
+        overlaySegs_.push_back(az);
+        overlaySegs_.push_back(bx);
+        overlaySegs_.push_back(by);
+        overlaySegs_.push_back(bz);
+    };
+
+    if (showCom_) {
+        pushSeg(cx - arm, cy, cz, cx + arm, cy, cz);
+        pushSeg(cx, cy - arm, cz, cx, cy + arm, cz);
+        pushSeg(cx, cy, cz - arm, cx, cy, cz + arm);
+        overlayLabels_.push_back({{(float)cx, (float)cy, (float)cz}, "CG"});
+    }
+
+    // Principal axes through COM for I/J markers.
+    if ((showI_ || showJ_) && result_.contains("principal_axes") &&
+        result_["principal_axes"].is_array() && result_["principal_axes"].size() == 3) {
+        const auto& Pa = result_["principal_axes"];
+        for (int i = 0; i < 3; ++i) {
+            if (!Pa[i].is_array() || Pa[i].size() != 3) continue;
+            float nx = (float)Pa[i][0].get<double>();
+            float ny = (float)Pa[i][1].get<double>();
+            float nz = (float)Pa[i][2].get<double>();
+            float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (len < 1e-8f) continue;
+            nx /= len;
+            ny /= len;
+            nz /= len;
+            float L = arm * 2.5f;
+            if (showI_ || showJ_) {
+                pushSeg(cx - nx * L, cy - ny * L, cz - nz * L, cx + nx * L, cy + ny * L, cz + nz * L);
+            }
+            // Label with J or I from design section if available.
+            std::string lab;
+            if (designSections_.is_array() && (size_t)i < designSections_.size() &&
+                designSections_[i].is_object()) {
+                const auto& sec = designSections_[i];
+                if (showJ_ && sec.contains("J") && sec["J"].is_number())
+                    lab = "J" + std::to_string(i + 1) + " " +
+                          pmFormatAreaMoment(sec["J"].get<double>(), st.ips());
+                else if (showI_) {
+                    double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
+                    double Imax = std::max(Ixx, Iyy);
+                    lab = "I" + std::to_string(i + 1) + " " +
+                          pmFormatAreaMoment(Imax, st.ips());
+                }
+            } else if (showJ_) {
+                lab = "J" + std::to_string(i + 1);
+            } else if (showI_) {
+                lab = "I" + std::to_string(i + 1);
+            }
+            if (!lab.empty())
+                overlayLabels_.push_back(
+                    {{(float)(cx + nx * L), (float)(cy + ny * L), (float)(cz + nz * L)}, lab});
+
+            // Approximate polar-moment ring in plane ⟂ axis i (8 segments).
+            if (showJ_) {
+                // Build orthonormal basis u,v ⟂ n
+                float ux = 1, uy = 0, uz = 0;
+                if (std::fabs(nx) > 0.9f) {
+                    ux = 0;
+                    uy = 1;
+                }
+                // u = normalize(cross(n, arbitrary))
+                float cxu = ny * uz - nz * uy;
+                float cyu = nz * ux - nx * uz;
+                float czu = nx * uy - ny * ux;
+                float ul = std::sqrt(cxu * cxu + cyu * cyu + czu * czu);
+                if (ul < 1e-8f) continue;
+                cxu /= ul;
+                cyu /= ul;
+                czu /= ul;
+                float vx = ny * czu - nz * cyu;
+                float vy = nz * cxu - nx * czu;
+                float vz = nx * cyu - ny * cxu;
+                float R = L * 0.55f;
+                const int N = 16;
+                for (int k = 0; k < N; ++k) {
+                    float a0 = (float)(2.0 * 3.14159265358979323846 * k / N);
+                    float a1 = (float)(2.0 * 3.14159265358979323846 * (k + 1) / N);
+                    float x0 = (float)cx + R * (std::cos(a0) * cxu + std::sin(a0) * vx);
+                    float y0 = (float)cy + R * (std::cos(a0) * cyu + std::sin(a0) * vy);
+                    float z0 = (float)cz + R * (std::cos(a0) * czu + std::sin(a0) * vz);
+                    float x1 = (float)cx + R * (std::cos(a1) * cxu + std::sin(a1) * vx);
+                    float y1 = (float)cy + R * (std::cos(a1) * cyu + std::sin(a1) * vy);
+                    float z1 = (float)cz + R * (std::cos(a1) * czu + std::sin(a1) * vz);
+                    pushSeg(x0, y0, z0, x1, y1, z1);
+                }
+            }
+        }
+    }
+}
+
+void EvaluateDialogs::tickLiveMeasure(AppState& st) {
+    if (openWindow_ != "measure") return;
+    nlohmann::json refs = selectionRefs(st);
+    std::string key = refs.dump();
+    if (key == lastMeasureRefs_) return;
+    const double now = ImGui::GetTime();
+    if (now - lastMeasureFireT_ < 0.05) return;  // 50 ms debounce
+    lastMeasureFireT_ = now;
+    lastMeasureRefs_ = key;
+    if (refs.empty()) {
+        result_ = nlohmann::json::object();
+        errorText_.clear();
+        clearOverlays();
+        pending_ = false;
+        return;
+    }
+    runEval(st, "eval_measure", {{"refs", refs}});
+}
+
+void EvaluateDialogs::tickMassDesignSections(AppState& st) {
+    if (openWindow_ != "mass") return;
+    if (!designSectionsDirty_) return;
+    if (pending_ || designSectionsPending_ > 0) return;
+    if (!result_.contains("com") || !result_["com"].is_array() || result_["com"].size() != 3)
+        return;
+    if (!result_.contains("principal_axes") || !result_["principal_axes"].is_array() ||
+        result_["principal_axes"].size() != 3)
+        return;
+
+    designSectionsDirty_ = false;
+    designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
+    const int batch = ++designSectionGen_;
+    designSectionsPending_ = 3;
+    const double cx = result_["com"][0].get<double>();
+    const double cy = result_["com"][1].get<double>();
+    const double cz = result_["com"][2].get<double>();
+    const auto Pa = result_["principal_axes"];
+
+    for (int i = 0; i < 3; ++i) {
+        if (!Pa[i].is_array() || Pa[i].size() != 3) {
+            --designSectionsPending_;
+            continue;
+        }
+        nlohmann::json plane = {
+            {"origin", {cx, cy, cz}},
+            {"normal",
+             {Pa[i][0].get<double>(), Pa[i][1].get<double>(), Pa[i][2].get<double>()}},
+        };
+        nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"plane", plane}};
+        ++st.rebuildsInFlight;
+        st.rpc.call(
+            "eval_section_props", params,
+            [this, &st, batch, i](const core::RpcResult& r) {
+                --st.rebuildsInFlight;
+                if (batch != designSectionGen_) return;
+                --designSectionsPending_;
+                if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+                    nlohmann::json sec = r.result;
+                    double Ixx = sec.value("Ixx", 0.0);
+                    double Iyy = sec.value("Iyy", 0.0);
+                    sec["J"] = Ixx + Iyy;
+                    // Axial stiffness k = E*A/L when E known. L estimated from principal extent
+                    // is not available here cheaply — leave k null unless we have E and area only
+                    // as a note. Parent can still show EA without L.
+                    std::string key = massDocKey_;
+                    float E = materialYoungsEMpa(key);
+                    double A = sec.value("area_mm2", 0.0);
+                    if (E > 0.0f && A > 0.0) {
+                        sec["E_mpa"] = E;
+                        sec["EA"] = (double)E * A;  // N (MPa*mm² = N)
+                    }
+                    if (designSections_.is_array() && (size_t)i < designSections_.size())
+                        designSections_[i] = std::move(sec);
+                }
+                if (designSectionsPending_ <= 0) rebuildMassOverlays(st);
+            },
+            60000);
+    }
+}
+
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
-    if (cmdId == "eval_mass_props") { runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}}); openWindow_ = "mass"; title_ = "Mass Properties"; return true; }
+    if (cmdId == "eval_mass_props") {
+        seedMassFromDoc(st);
+        designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
+        designSectionsDirty_ = false;
+        runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+        openWindow_ = "mass";
+        title_ = "Mass Properties";
+        return true;
+    }
     if (cmdId == "eval_measure") {
+        lastMeasureRefs_.clear();
+        lastMeasureFireT_ = -1e9;
+        measureLoggedGen_ = -1;
+        openWindow_ = "measure";
+        title_ = "Measure";
+        // Immediate first eval if selection present.
         nlohmann::json refs = selectionRefs(st);
-        runEval(st, "eval_measure", {{"refs", refs}});
-        openWindow_ = "measure"; title_ = "Measure"; return true;
+        if (!refs.empty()) {
+            lastMeasureRefs_ = refs.dump();
+            runEval(st, "eval_measure", {{"refs", refs}});
+        } else {
+            result_ = nlohmann::json::object();
+            errorText_.clear();
+            pending_ = false;
+            clearOverlays();
+        }
+        return true;
     }
     if (cmdId == "eval_section_props") {
-        runEval(st, "eval_section_props", {{"plane", "plane.top"}});
-        openWindow_ = "section"; title_ = "Section Properties"; return true;
+        sectionPlane_ = 0;
+        runEval(st, "eval_section_props", {{"plane", kPlaneNames[0]}});
+        openWindow_ = "section";
+        title_ = "Section Properties";
+        return true;
     }
     if (cmdId == "eval_check" || cmdId == "eval_geometry") {
         runEval(st, "eval_check", nlohmann::json::object());
-        openWindow_ = "check"; title_ = "Geometry Check"; return true;
+        openWindow_ = "check";
+        title_ = "Geometry Check";
+        return true;
     }
     if (cmdId == "eval_interference") {
-        // Single-body parts have no interference; assemblies arrive in C20.
+        // Assemblies / multi-body: real fit report. Single-body parts get an explanatory window.
         runEval(st, "eval_interference", nlohmann::json::object());
-        openWindow_ = "interference"; title_ = "Interference Detection"; return true;
+        openWindow_ = "interference";
+        title_ = "Interference Detection";
+        return true;
     }
     if (cmdId == "eval_symmetry") {
-        runEval(st, "eval_symmetry", {{"plane", "plane.front"}});
-        openWindow_ = "symmetry"; title_ = "Symmetry Check"; return true;
+        symmetryPlane_ = 0;
+        runEval(st, "eval_symmetry", {{"plane", kPlaneNames[1]}});  // front default
+        openWindow_ = "symmetry";
+        title_ = "Symmetry Check";
+        return true;
     }
-    if (cmdId == "eval_draft")     { runFieldEval(st, "eval_draft", {{"pull", {0,0,1}}, {"angle_deg", 1.0}}, "Draft angle", "deg"); return true; }
-    if (cmdId == "eval_thickness") { runFieldEval(st, "eval_thickness", nlohmann::json::object(), "Wall thickness", "mm"); return true; }
-    if (cmdId == "eval_curvature") { runFieldEval(st, "eval_curvature", {{"kind", "mean"}}, "Mean curvature", "1/mm"); return true; }
+    if (cmdId == "eval_draft") {
+        runFieldEval(st, "eval_draft", {{"pull", {0, 0, 1}}, {"angle_deg", 1.0}}, "Draft angle",
+                     "deg");
+        return true;
+    }
+    if (cmdId == "eval_thickness") {
+        runFieldEval(st, "eval_thickness", nlohmann::json::object(), "Wall thickness",
+                     st.ips() ? "in" : "mm");
+        return true;
+    }
+    if (cmdId == "eval_curvature") {
+        runFieldEval(st, "eval_curvature", {{"kind", "mean"}}, "Mean curvature", "1/mm");
+        return true;
+    }
     if (cmdId == "eval_zebra") {
-        // Zebra surface-continuity inspection: turn the renderer's striped-environment shader on
-        // and open a small control window (frequency slider + Turn Off). Closing the window — or
-        // pressing Turn Off — disables zebra so the user is never stuck in stripe mode.
         errorText_.clear();
         result_ = nlohmann::json::object();
         pending_ = false;
         if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
-        openWindow_ = "zebra"; title_ = "Zebra Stripes";
+        openWindow_ = "zebra";
+        title_ = "Zebra Stripes";
         return true;
     }
     return false;
 }
 
 void EvaluateDialogs::draw(AppState& st) {
-    if (openWindow_.empty()) return;
+    if (openWindow_.empty()) {
+        if (massBodyAlpha_ < 0.999f || !overlaySegs_.empty()) clearOverlays();
+        return;
+    }
+
+    // Live measure re-eval + mass design section chain.
+    tickLiveMeasure(st);
+    tickMassDesignSections(st);
+    if (openWindow_ == "mass" && !pending_) rebuildMassOverlays(st);
+
     bool open = true;
-    ui::setNextCommandDialogPlacement();   // floats over the full-width viewport, top-right
-    // T-G14: auto-scale to content. Height 0 forces an auto-fit on the Y axis; applying it EVERY
-    // frame (ImGuiCond_Always) — not just _Appearing — lets the window grow/shrink as the readout
-    // fills in (pending -> result, material change adding mass/inertia rows) instead of being frozen
-    // at its first-frame size and clipping the selection's properties. Width stays pinned at 340.
-    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Always);
-    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
-    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
-    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
-    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
-    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
+    ui::setNextCommandDialogPlacement();
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(360), 0), ImGuiCond_Always);
     const auto& gpal = ui::palette;
     const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
@@ -182,151 +515,315 @@ void EvaluateDialogs::draw(AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
     ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
     const bool evVis = ImGui::Begin(title_.c_str(), &open);
-    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    ImGui::PopStyleColor(3);
     if (evVis) {
-        // Paint the result window's own frosted-glass background over the content region.
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         const float contentTopY =
             ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
         const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
-        const ui::AdaptiveSurface& surf = ui::adaptivePanel(
-            ui::panelId("host_evaluate_glass"), winRect, ui::GlassGroup::Global);
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId("host_evaluate_glass"), winRect, ui::GlassGroup::Global);
         ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
-        // Default ink for the plain readouts below tracks the frost's contrast tone; the branches
-        // that need semantic color (status err/ok, dim) push their own on top of this.
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
-        if (pending_) {
-            // C39: the eval is in flight on the dispatch thread; the result fills in when
-            // it drains. A spinner-ish pulse keeps it obviously alive.
+        if (pending_ && openWindow_ != "measure") {
+            // Measure stays interactive while computing.
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted("Computing");
             ImGui::SameLine(0, 0);
             ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
             ImGui::PopStyleColor();
-        } else if (!errorText_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
+        } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "mass") {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
                 ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "mass") {
-            // Material override — density (g/cm3) is forwarded to the engine's eval_mass; changing
-            // the material preset or the density re-runs the evaluation. Last preset = Custom.
-            static const struct { const char* name; float d; } kMaterials[] = {
-                {"Steel", 7.85f}, {"Stainless", 8.00f}, {"Aluminum", 2.70f}, {"Titanium", 4.51f},
-                {"Brass", 8.50f}, {"ABS plastic", 1.05f}, {"PLA", 1.24f}, {"Custom", 0.0f},
+            // ---- Material seed + override ----
+            // Combo: 0 = Document material (if any), then Steel…PLA, Custom.
+            static const struct {
+                const char* name;
+                float d;
+            } kPresets[] = {
+                {"Steel", 7.85f},      {"Stainless", 8.00f}, {"Aluminum", 2.70f},
+                {"Titanium", 4.51f},   {"Brass", 8.50f},     {"ABS plastic", 1.05f},
+                {"PLA", 1.24f},        {"Custom", 0.0f},
             };
-            const int kCustom = (int)(sizeof(kMaterials) / sizeof(kMaterials[0])) - 1;
-            ImGui::SetNextItemWidth(140 * ui::uiScale);
-            if (ImGui::Combo("Material", &massMaterial_,
-                             "Steel\0Stainless\0Aluminum\0Titanium\0Brass\0ABS plastic\0PLA\0Custom\0")) {
-                if (massMaterial_ != kCustom) massDensity_ = kMaterials[massMaterial_].d;
-                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+            const int kPresetN = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
+            const int kCustom = kPresetN;  // after Document slot: indices 1..kPresetN are presets
+            // Build items: [0]=Document, [1..]=presets
+            if (!massDocKey_.empty())
+                ImGui::Text("Document: %s", massDocName_.c_str());
+            else
+                ImGui::TextDisabled("Document material: not set");
+
+            ImGui::SetNextItemWidth(180 * ui::uiScale);
+            // Simplified combo: Document | presets
+            int comboIdx = massMaterial_;
+            std::string comboLabel;
+            if (comboIdx == 0 && !massDocKey_.empty())
+                comboLabel = "Document: " + massDocName_;
+            else if (comboIdx >= 1 && comboIdx <= kPresetN)
+                comboLabel = kPresets[comboIdx - 1].name;
+            else
+                comboLabel = "Custom";
+            if (ImGui::BeginCombo("Material", comboLabel.c_str())) {
+                if (!massDocKey_.empty()) {
+                    bool sel = (massMaterial_ == 0);
+                    if (ImGui::Selectable(("Document: " + massDocName_).c_str(), sel)) {
+                        massMaterial_ = 0;
+                        massDensity_ = materialDensityGcm3(massDocKey_);
+                        runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+                    }
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                for (int i = 0; i < kPresetN; ++i) {
+                    int idx = i + 1;
+                    bool sel = (massMaterial_ == idx);
+                    if (ImGui::Selectable(kPresets[i].name, sel)) {
+                        massMaterial_ = idx;
+                        if (i != kPresetN - 1) {  // not Custom
+                            massDensity_ = kPresets[i].d;
+                            runEval(st, "eval_mass",
+                                    {{"density_g_cm3", (double)massDensity_}});
+                        }
+                    }
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
             }
-            // Bounded drag (real materials span ~0.9..22.6 g/cm3); CTRL+click still types an exact
-            // value, AlwaysClamp keeps typed entries inside the range too.
             ImGui::SetNextItemWidth(140 * ui::uiScale);
             if (ImGui::DragFloat("Density", &massDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3",
                                  ImGuiSliderFlags_AlwaysClamp))
-                massMaterial_ = kCustom;
+                massMaterial_ = kCustom;  // force custom when dragging
             if (ImGui::IsItemDeactivatedAfterEdit())
                 runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
-            ImGui::Separator();
-            ImGui::Text("Volume:  %.3f mm3", result_.value("volume_mm3", 0.0));
-            ImGui::Text("Mass:    %.3f g", result_.value("mass_g", 0.0));
-            if (result_.contains("com") && result_["com"].is_array() && result_["com"].size() == 3)
-                ImGui::Text("COM:     %s, %s, %s",
-                            evalLen(st, result_["com"][0].get<double>()).c_str(),
-                            evalLen(st, result_["com"][1].get<double>()).c_str(),
-                            evalLen(st, result_["com"][2].get<double>()).c_str());
-            if (result_.contains("inertia") && result_["inertia"].is_array() &&
-                result_["inertia"].size() == 9) {
-                ImGui::SeparatorText("Inertia tensor (g.mm2)");
-                const auto& I = result_["inertia"];
-                for (int r = 0; r < 3; ++r)
-                    ImGui::Text("%12.2f %12.2f %12.2f",
-                                I[r*3+0].get<double>(), I[r*3+1].get<double>(), I[r*3+2].get<double>());
-            }
-            // Principal moments of inertia (g.mm2) + their axes (unit vectors at the CoM).
-            if (result_.contains("principal_moments") && result_["principal_moments"].is_array() &&
-                result_["principal_moments"].size() == 3 &&
-                result_.contains("principal_axes") && result_["principal_axes"].is_array() &&
-                result_["principal_axes"].size() == 3) {
-                ImGui::SeparatorText("Principal axes (g.mm2)");
-                const auto& Pm = result_["principal_moments"];
-                const auto& Pa = result_["principal_axes"];
-                for (int i = 0; i < 3; ++i) {
-                    if (!Pa[i].is_array() || Pa[i].size() != 3) continue;
-                    ImGui::Text("Px%d %12.2f  [% .3f % .3f % .3f]", i + 1,
-                                Pm[i].get<double>(),
-                                Pa[i][0].get<double>(), Pa[i][1].get<double>(), Pa[i][2].get<double>());
+
+            if (!errorText_.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                           gpal.statusErr[2], gpal.statusErr[3]));
+                ImGui::TextWrapped("%s", errorText_.c_str());
+                ImGui::PopStyleColor();
+            } else if (pending_) {
+                ImGui::TextDisabled("Computing…");
+            } else {
+                ImGui::Separator();
+                ImGui::Text("Volume:  %s",
+                            pmFormatVolume(result_.value("volume_mm3", 0.0), st.ips()).c_str());
+                ImGui::Text("Mass:    %s",
+                            pmFormatMass(result_.value("mass_g", 0.0), st.ips()).c_str());
+                ImGui::Text("Density: %.3f g/cm3", massDensity_);
+                if (result_.contains("com") && result_["com"].is_array() &&
+                    result_["com"].size() == 3) {
+                    ImGui::SeparatorText("Center of gravity");
+                    ImGui::Text("X: %s   Y: %s   Z: %s",
+                                evalLen(st, result_["com"][0].get<double>()).c_str(),
+                                evalLen(st, result_["com"][1].get<double>()).c_str(),
+                                evalLen(st, result_["com"][2].get<double>()).c_str());
+                }
+
+                ImGui::SeparatorText("Design properties");
+                bool cb = false;
+                cb |= ImGui::Checkbox("Show COM in viewport", &showCom_);
+                cb |= ImGui::Checkbox("Area moment I (bending)", &showI_);
+                cb |= ImGui::Checkbox("Polar moment J (torsion)", &showJ_);
+                cb |= ImGui::Checkbox("Axial stiffness k (EA/L est.)", &showK_);
+                if (cb) rebuildMassOverlays(st);
+
+                if (designSectionsPending_ > 0)
+                    ImGui::TextDisabled("Computing section I/J…");
+                if (designSections_.is_array()) {
+                    for (int i = 0; i < 3; ++i) {
+                        if ((size_t)i >= designSections_.size() || !designSections_[i].is_object())
+                            continue;
+                        const auto& sec = designSections_[i];
+                        ImGui::Separator();
+                        ImGui::Text("Principal axis %d", i + 1);
+                        double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
+                        double J = sec.value("J", Ixx + Iyy);
+                        if (showI_) {
+                            ImGui::Text("  Imax: %s   Imin: %s",
+                                        pmFormatAreaMoment(std::max(Ixx, Iyy), st.ips()).c_str(),
+                                        pmFormatAreaMoment(std::min(Ixx, Iyy), st.ips()).c_str());
+                        }
+                        if (showJ_)
+                            ImGui::Text("  J:    %s",
+                                        pmFormatAreaMoment(J, st.ips()).c_str());
+                        if (showK_ && sec.contains("EA") && sec["EA"].is_number()) {
+                            ImGui::TextDisabled("  EA: %.4g N  (divide by length L for k)");
+                            ImGui::Text("  EA:  %.4g N", sec["EA"].get<double>());
+                        }
+                        if (sec.contains("area_mm2"))
+                            ImGui::Text("  Section area: %s",
+                                        pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
+                    }
+                }
+
+                if (ImGui::TreeNode("Advanced mass inertia")) {
+                    if (result_.contains("inertia") && result_["inertia"].is_array() &&
+                        result_["inertia"].size() == 9) {
+                        ImGui::TextDisabled("Inertia tensor (g·mm², about origin)");
+                        const auto& I = result_["inertia"];
+                        for (int r = 0; r < 3; ++r)
+                            ImGui::Text("%12.2f %12.2f %12.2f", I[r * 3 + 0].get<double>(),
+                                        I[r * 3 + 1].get<double>(), I[r * 3 + 2].get<double>());
+                    }
+                    if (result_.contains("principal_moments") &&
+                        result_["principal_moments"].is_array() &&
+                        result_["principal_moments"].size() == 3) {
+                        ImGui::TextDisabled("Principal mass moments (g·mm²)");
+                        const auto& Pm = result_["principal_moments"];
+                        for (int i = 0; i < 3; ++i)
+                            ImGui::Text("  P%d  %12.2f", i + 1, Pm[i].get<double>());
+                    }
+                    ImGui::TreePop();
                 }
             }
         } else if (openWindow_ == "measure") {
+            if (pending_) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextUnformatted("Computing…");
+                ImGui::PopStyleColor();
+            }
+            if (!errorText_.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                           gpal.statusErr[2], gpal.statusErr[3]));
+                ImGui::TextWrapped("%s", errorText_.c_str());
+                ImGui::PopStyleColor();
+            }
             std::string kind = result_.value("kind", std::string("(none)"));
             auto numAt = [&](const char* k, double& out) -> bool {
-                if (result_.contains(k) && result_[k].is_number()) { out = result_[k].get<double>(); return true; }
+                if (result_.contains(k) && result_[k].is_number()) {
+                    out = result_[k].get<double>();
+                    return true;
+                }
                 return false;
             };
-            // One-line summary of this measurement (for the running History list, SW-style).
-            std::string summary; double v;
-            if (numAt("distance", v))    summary = "Distance " + evalLen(st, v);
-            else if (numAt("length", v)) summary = "Length " + evalLen(st, v);
-            else if (numAt("radius", v)) summary = "Radius " + evalLen(st, v) + " (Dia " + evalLen(st, 2.0 * v) + ")";
-            else if (numAt("area", v))   { char b[64]; std::snprintf(b, sizeof(b), "Area %.3f mm2", v); summary = b; }
-            else if (numAt("volume", v)) { char b[64]; std::snprintf(b, sizeof(b), "Volume %.3f mm3", v); summary = b; }
+            std::string summary;
+            double v;
+            if (numAt("distance", v))
+                summary = "Distance " + evalLen(st, v);
+            else if (numAt("length", v))
+                summary = "Length " + evalLen(st, v);
+            else if (numAt("radius", v))
+                summary =
+                    "Radius " + evalLen(st, v) + " (Dia " + evalLen(st, 2.0 * v) + ")";
+            else if (numAt("area", v))
+                summary = "Area " + pmFormatArea(v, st.ips());
+            else if (numAt("volume", v))
+                summary = "Volume " + pmFormatVolume(v, st.ips());
+            else if (numAt("total_length", v))
+                summary = "Path " + evalLen(st, v);
+            else if (numAt("total_distance", v))
+                summary = "Chain " + evalLen(st, v);
             double ang;
-            if (numAt("angle", ang)) { char b[48]; std::snprintf(b, sizeof(b), "Angle %.3f deg", ang);
-                                       summary = summary.empty() ? std::string(b) : summary + ", " + b; }
-            // Accumulate: append each completed measurement exactly once (gen_ bumps per eval).
+            if (numAt("angle", ang)) {
+                char b[48];
+                std::snprintf(b, sizeof(b), "Angle %.3f deg", ang);
+                summary = summary.empty() ? std::string(b) : summary + ", " + b;
+            }
             if (!pending_ && !summary.empty() && gen_ != measureLoggedGen_) {
                 measureLoggedGen_ = gen_;
                 measureLog_.push_back(summary);
             }
 
             ImGui::Text("Kind: %s", kind.c_str());
-            auto show = [&](const char* k, const char* unit) {
-                if (result_.contains(k) && result_[k].is_number())
-                    ImGui::Text("%s: %.4f %s", k, result_[k].get<double>(), unit);
-            };
-            // Linear measures reformat to the document units (mm / inch); angle stays in degrees,
-            // and area/volume keep their canonical derived units.
             auto showLen = [&](const char* k) {
                 if (result_.contains(k) && result_[k].is_number())
                     ImGui::Text("%s: %s", k, evalLen(st, result_[k].get<double>()).c_str());
             };
-            showLen("distance"); show("angle", "deg"); showLen("length");
-            show("area", "mm2"); showLen("radius");
-            { double r; if (numAt("radius", r)) ImGui::Text("diameter: %s", evalLen(st, 2.0 * r).c_str()); }
-            show("volume", "mm3");
+            showLen("distance");
+            if (result_.contains("angle") && result_["angle"].is_number())
+                ImGui::Text("angle: %.4f deg", result_["angle"].get<double>());
+            showLen("length");
+            showLen("radius");
+            showLen("diameter");
+            showLen("perimeter");
+            showLen("total_length");
+            showLen("total_distance");
+            if (result_.contains("area") && result_["area"].is_number())
+                ImGui::Text("area: %s",
+                            pmFormatArea(result_["area"].get<double>(), st.ips()).c_str());
+            if (result_.contains("volume") && result_["volume"].is_number())
+                ImGui::Text("volume: %s",
+                            pmFormatVolume(result_["volume"].get<double>(), st.ips()).c_str());
+            if (result_.contains("segment_lengths") && result_["segment_lengths"].is_array()) {
+                ImGui::TextUnformatted("Segments:");
+                int si = 0;
+                for (const auto& s : result_["segment_lengths"]) {
+                    if (!s.is_number()) continue;
+                    ImGui::BulletText("#%d  %s", ++si, evalLen(st, s.get<double>()).c_str());
+                }
+            }
+            if (result_.contains("closed") && result_["closed"].is_boolean())
+                ImGui::Text("Closed profile: %s", result_["closed"].get<bool>() ? "yes" : "no");
+
             if (kind == "(none)" || result_.empty())
-                ImGui::TextDisabled("Select 1-2 faces/edges/vertices, then Measure.");
-            // Running history (SolidWorks Measure accumulates) — newest first, with Clear.
+                ImGui::TextDisabled(
+                    "Select faces, edges, or vertices. 1 = property; 2 = distance; 3+ = chain.");
+
             if (!measureLog_.empty()) {
                 ImGui::SeparatorText("History");
-                if (ImGui::SmallButton("Clear")) { measureLog_.clear(); measureLoggedGen_ = -1; }
-                ImGui::BeginChild("##measlog", ImVec2(0, 120 * ui::uiScale), ImGuiChildFlags_Border);
-                for (size_t i = measureLog_.size(); i-- > 0; )
+                if (ImGui::SmallButton("Clear")) {
+                    measureLog_.clear();
+                    measureLoggedGen_ = -1;
+                }
+                ImGui::BeginChild("##measlog", ImVec2(0, 120 * ui::uiScale),
+                                  ImGuiChildFlags_Border);
+                for (size_t i = measureLog_.size(); i-- > 0;)
                     ImGui::TextUnformatted(measureLog_[i].c_str());
                 ImGui::EndChild();
             }
         } else if (openWindow_ == "section") {
-            ImGui::Text("Area:     %.3f mm2", result_.value("area_mm2", 0.0));
-            if (result_.contains("centroid") && result_["centroid"].is_array() &&
-                result_["centroid"].size() == 3)
-                ImGui::Text("Centroid: %s, %s, %s",
-                            evalLen(st, result_["centroid"][0].get<double>()).c_str(),
-                            evalLen(st, result_["centroid"][1].get<double>()).c_str(),
-                            evalLen(st, result_["centroid"][2].get<double>()).c_str());
-            ImGui::Text("Ixx: %.3f  Iyy: %.3f  Ixy: %.3f",
-                        result_.value("Ixx", 0.0), result_.value("Iyy", 0.0),
-                        result_.value("Ixy", 0.0));
+            ImGui::SetNextItemWidth(160 * ui::uiScale);
+            const char* planeItems = "Top\0Front\0Right\0Selected face\0";
+            if (ImGui::Combo("Plane", &sectionPlane_, planeItems)) {
+                nlohmann::json plane;
+                if (sectionPlane_ >= 0 && sectionPlane_ <= 2) {
+                    plane = kPlaneNames[sectionPlane_];
+                } else {
+                    // Selected planar face: first face selector in selection.
+                    nlohmann::json refs = selectionRefs(st);
+                    plane = "plane.top";
+                    for (const auto& r : refs) {
+                        if (r.is_object() && r.value("kind", std::string()) == "face") {
+                            plane = r;
+                            break;
+                        }
+                    }
+                }
+                runEval(st, "eval_section_props", {{"plane", plane}});
+            }
+            if (pending_) {
+                ImGui::TextDisabled("Computing…");
+            } else if (!errorText_.empty()) {
+                ImGui::TextWrapped("%s", errorText_.c_str());
+            } else {
+                ImGui::Text("Area:     %s",
+                            pmFormatArea(result_.value("area_mm2", 0.0), st.ips()).c_str());
+                if (result_.contains("centroid") && result_["centroid"].is_array() &&
+                    result_["centroid"].size() == 3)
+                    ImGui::Text("Centroid: %s, %s, %s",
+                                evalLen(st, result_["centroid"][0].get<double>()).c_str(),
+                                evalLen(st, result_["centroid"][1].get<double>()).c_str(),
+                                evalLen(st, result_["centroid"][2].get<double>()).c_str());
+                double Ixx = result_.value("Ixx", 0.0);
+                double Iyy = result_.value("Iyy", 0.0);
+                double Ixy = result_.value("Ixy", 0.0);
+                ImGui::Text("Ixx: %s", pmFormatAreaMoment(Ixx, st.ips()).c_str());
+                ImGui::Text("Iyy: %s", pmFormatAreaMoment(Iyy, st.ips()).c_str());
+                ImGui::Text("Ixy: %s", pmFormatAreaMoment(Ixy, st.ips()).c_str());
+                ImGui::Text("J (Ixx+Iyy): %s",
+                            pmFormatAreaMoment(Ixx + Iyy, st.ips()).c_str());
+            }
         } else if (openWindow_ == "check") {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];
                 if (issues.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2], gpal.statusOk[3]));
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text, ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2],
+                                              gpal.statusOk[3]));
                     ImGui::TextWrapped("No geometry issues found.");
                     ImGui::PopStyleColor();
                 } else {
@@ -339,19 +836,67 @@ void EvaluateDialogs::draw(AppState& st) {
                 }
             }
         } else if (openWindow_ == "interference") {
-            // Single-body parts: explain. (eval_interference returns a fit report shape.)
-            ImGui::TextWrapped("Interference detection runs across assembly components. This is a "
-                               "single-body part; open an assembly (C20) to check component clashes.");
+            // Prefer real fit report when the kernel returned pairs.
+            bool hasPairs = result_.contains("interferences") &&
+                            result_["interferences"].is_array() &&
+                            !result_["interferences"].empty();
+            bool hasClear = result_.contains("clearances") && result_["clearances"].is_array() &&
+                            !result_["clearances"].empty();
             if (result_.contains("summary"))
                 ImGui::TextWrapped("%s", result_.value("summary", std::string()).c_str());
+            if (hasPairs) {
+                ImGui::SeparatorText("Interferences");
+                for (const auto& p : result_["interferences"]) {
+                    std::string a = p.value("a", std::string("?"));
+                    std::string b = p.value("b", std::string("?"));
+                    double vol = p.value("volume", p.value("volume_mm3", 0.0));
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                         ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                gpal.statusErr[2], gpal.statusErr[3]));
+                    ImGui::BulletText("%s <-> %s : %s", a.c_str(), b.c_str(),
+                                      pmFormatVolume(vol, st.ips()).c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
+            if (hasClear) {
+                ImGui::SeparatorText("Clearances");
+                for (const auto& p : result_["clearances"]) {
+                    std::string a = p.value("a", std::string("?"));
+                    std::string b = p.value("b", std::string("?"));
+                    double d = p.value("distance", 0.0);
+                    ImGui::BulletText("%s <-> %s : %s", a.c_str(), b.c_str(),
+                                      evalLen(st, d).c_str());
+                }
+            }
+            if (!hasPairs && !hasClear && !result_.contains("summary")) {
+                ImGui::TextWrapped(
+                    "Interference detection runs across assembly components or multi-body parts. "
+                    "Open an assembly or a multi-body part to check clashes.");
+            }
+            if (result_.value("ok", true) && !hasPairs)
+                ImGui::TextColored(ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2], 1),
+                                   "No interference.");
         } else if (openWindow_ == "symmetry") {
-            bool sym = result_.value("symmetric", false);
-            ImGui::Text("Symmetric: %s", sym ? "yes" : "no");
-            ImGui::Text("Deviation: %.3f mm3", result_.value("deviation_mm3", 0.0));
+            ImGui::SetNextItemWidth(120 * ui::uiScale);
+            if (ImGui::Combo("Plane", &symmetryPlane_, "Front\0Top\0Right\0")) {
+                // Map UI order front/top/right → kPlaneNames front=1, top=0, right=2
+                static const int map[] = {1, 0, 2};
+                int pi = (symmetryPlane_ >= 0 && symmetryPlane_ < 3) ? map[symmetryPlane_] : 1;
+                runEval(st, "eval_symmetry", {{"plane", kPlaneNames[pi]}});
+            }
+            if (pending_) {
+                ImGui::TextDisabled("Computing…");
+            } else {
+                bool sym = result_.value("symmetric", false);
+                ImGui::Text("Symmetric: %s", sym ? "yes" : "no");
+                ImGui::Text("Deviation: %s",
+                            pmFormatVolume(result_.value("deviation_mm3", 0.0), st.ips()).c_str());
+            }
         } else if (openWindow_ == "zebra") {
-            ImGui::TextWrapped("Surface-continuity inspection. Smooth, evenly-spaced stripes = a "
-                               "fair surface; stripes that kink = tangency (G1) break; stripes that "
-                               "jog/step = curvature (G2) break.");
+            ImGui::TextWrapped(
+                "Surface-continuity inspection. Smooth, evenly-spaced stripes = a fair surface; "
+                "stripes that kink = tangency (G1) break; stripes that jog/step = curvature (G2) "
+                "break.");
             ImGui::Spacing();
             if (ImGui::SliderFloat("Stripe density", &gZebraFreq, 4.0f, 60.0f, "%.0f")) {
                 if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
@@ -361,15 +906,24 @@ void EvaluateDialogs::draw(AppState& st) {
                 if (st.renderer) st.renderer->setZebra(false, gZebraFreq);
                 openWindow_.clear();
             }
+        } else if (openWindow_ == "field_wait") {
+            ImGui::TextDisabled("Computing field overlay…");
+        } else if (openWindow_ == "field_err") {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
+            ImGui::TextWrapped("%s", errorText_.c_str());
+            ImGui::PopStyleColor();
         }
         ImGui::PopStyleColor();  // default text ink
     }
     ImGui::End();
     ImGui::PopStyleColor();  // ImGuiCol_WindowBg
     if (!open) {
-        // Closing the window must also exit stripe mode so the user isn't stuck in zebra shading.
         if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);
+        clearOverlays();
         openWindow_.clear();
+        if (st.renderer) st.renderer->setBodyAlpha(1.0f);
     }
 }
 

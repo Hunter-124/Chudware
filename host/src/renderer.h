@@ -166,6 +166,12 @@ public:
     // set (or alpha >= 1) to clear isolation and render everything opaque.
     void setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha);
     void clearPreviewIsolation() { previewFaces_.clear(); previewAlpha_ = 1.0f; }
+    // Whole-body translucency (Mass Properties COM/I/J viewport). Unlike setPreviewIsolation this
+    // tints EVERY visible body at `a` so internal markers (COM cross, axes) read through the solid.
+    // 1.0 = fully opaque (default). Clamped to [0,1].
+    void setBodyAlpha(float a) { bodyAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
+    float bodyAlpha() const { return bodyAlpha_; }
+
 
     // In-context component edit (SolidWorks "Edit Component"): while a component's part-doc is the
     // active doc, the ASSEMBLY is drawn as a dimmed static ghost behind the live part so the user
@@ -514,6 +520,7 @@ private:
     float groundShadow_[4] = {0.20f, 0.22f, 0.26f, 0.35f};
     bool realView_ = true;  // C30-C: environment-reflection sheen (uRealView in kFrag)
     float previewAlpha_ = 1.0f; // < 1 ghosts the edited feature's faces (per-feature edit preview)
+    float bodyAlpha_ = 1.0f;    // whole-body translucency (Mass Properties); 1 = opaque
     std::unordered_set<uint64_t> previewFaces_;  // (body<<32)|face keys to ghost; empty = none
     bool zebra_ = false;        // Zebra surface-continuity stripe mode (uZebra in kFrag); default OFF
     float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord

@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
+
 
 #include <map>
 #include <string>
@@ -125,12 +128,16 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
             st.addLog("[err] new assembly: " + err);
         }
         insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+        if (insertBrowseDir_.empty() && !st.workspaceDir.empty())
+            insertBrowseDir_ = st.workspaceDir;
         insertOpen_ = true; insertFocus_ = true;
         openPmGuest(st, "insert");
         return true;
     }
     if (cmdId == "asm_insert") {
         insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+        if (insertBrowseDir_.empty() && !st.workspaceDir.empty())
+            insertBrowseDir_ = st.workspaceDir;
         if (st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
             st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1")
             insertTargetDocId_ = st.docMirror.docId();
@@ -329,6 +336,53 @@ std::string pathBaseName(const std::string& p) {
     return (slash == std::string::npos) ? p : p.substr(slash + 1);
 }
 
+// Lower-cased extension including the leading dot (handles ".step+" via last-dot).
+std::string insertLowerExt(const std::string& path) {
+    size_t slash = path.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) return {};
+    std::string e = name.substr(dot);
+    std::transform(e.begin(), e.end(), e.begin(),
+                   [](unsigned char ch) { return (char)std::tolower(ch); });
+    return e;
+}
+
+// Component source extensions for the Insert Workspace browser (mirrors kInsertFilter /
+// file_explorer isCadExt plus .brep/.obj/.ply which Browse already accepts).
+bool insertIsCadExt(const std::string& e) {
+    return e == ".step+" || e == ".step" || e == ".stp" || e == ".iges" || e == ".igs" ||
+           e == ".brep"  || e == ".stl"  || e == ".3mf" || e == ".obj"  || e == ".ply";
+}
+
+// Non-recursive CAD files under dir. Errors → empty list (caller shows dim text).
+std::vector<std::string> listInsertWorkspaceFiles(const std::string& dir) {
+    std::vector<std::string> out;
+    if (dir.empty()) return out;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path root(dir);
+    if (!fs::is_directory(root, ec) || ec) return out;
+    for (fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code fec;
+        if (!it->is_regular_file(fec) || fec) continue;
+        const std::string full = it->path().string();
+        if (!insertIsCadExt(insertLowerExt(full))) continue;
+        out.push_back(full);
+    }
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        const std::string an = pathBaseName(a), bn = pathBaseName(b);
+        return std::lexicographical_compare(
+            an.begin(), an.end(), bn.begin(), bn.end(),
+            [](char c1, char c2) {
+                return std::tolower((unsigned char)c1) < std::tolower((unsigned char)c2);
+            });
+    });
+    return out;
+}
+
 // One selectable entry in the Insert Component chooser.
 struct InsertCandidate {
     std::string path;    // absolute path (empty for unsaved open parts)
@@ -492,6 +546,10 @@ void AsmPanels::drawInsertBody(AppState& st) {
         return;
     }
 
+    // Lazy-seed Workspace browse dir if still empty (workspace may have resolved after open).
+    if (insertBrowseDir_.empty() && !st.workspaceDir.empty())
+        insertBrowseDir_ = st.workspaceDir;
+
     std::string targetLabel;
     if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly)
@@ -504,7 +562,7 @@ void AsmPanels::drawInsertBody(AppState& st) {
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // Browse from disk — prominent, in addition to open/recent list.
+    // Browse from disk — prominent, in addition to open/recent + workspace lists.
     if (ImGui::Button("Browse from disk\xe2\x80\xa6", ImVec2(-1, 0))) {
         if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
             st.toast(ui::ToastLevel::Info,
@@ -525,12 +583,21 @@ void AsmPanels::drawInsertBody(AppState& st) {
     ImGui::SeparatorText("Open & recent parts");
 
     const auto candidates = buildInsertCandidates(st);
-    const float listH = std::max(120.0f * S, ImGui::GetContentRegionAvail().y -
-                                (ImGui::GetFrameHeightWithSpacing() * 4.5f));
+    // Paths already offered under Open/Recent — Workspace rows skip these (already() pattern).
+    auto alreadyInOpenRecent = [&](const std::string& p) {
+        if (p.empty()) return false;
+        for (const auto& c : candidates)
+            if (!c.path.empty() && c.path == p) return true;
+        return false;
+    };
+
+    // Split remaining height between Open/Recent and Workspace lists.
+    const float listH = std::max(80.0f * S, (ImGui::GetContentRegionAvail().y -
+                                (ImGui::GetFrameHeightWithSpacing() * 8.0f)) * 0.45f);
     ImGui::BeginChild("##asm_insert_list", ImVec2(0, listH), true);
     if (candidates.empty()) {
         pushText(pal.textDim);
-        ImGui::TextWrapped("No open or recent parts. Use Browse from disk\xe2\x80\xa6 above.");
+        ImGui::TextWrapped("No open or recent parts. Use Browse from disk\xe2\x80\xa6 or Workspace below.");
         ImGui::PopStyleColor();
     } else {
         for (int i = 0; i < (int)candidates.size(); ++i) {
@@ -563,6 +630,105 @@ void AsmPanels::drawInsertBody(AppState& st) {
         }
     }
     ImGui::EndChild();
+
+    // ---- Workspace directory browser ---------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Workspace");
+
+    if (insertBrowseDir_.empty()) {
+        pushText(pal.textDim);
+        ImGui::TextWrapped(
+            "No workspace folder set. Set one in Settings \xe2\x86\x92 General, or use Browse from disk\xe2\x80\xa6.");
+        ImGui::PopStyleColor();
+    } else {
+        // Dim path label + optional editable path + Parent folder.
+        pushText(pal.textDim);
+        ImGui::TextWrapped("%s", insertBrowseDir_.c_str());
+        ImGui::PopStyleColor();
+
+        static char s_wsPathBuf[1024] = {};
+        static std::string s_wsPathSynced;
+        if (s_wsPathSynced != insertBrowseDir_) {
+            std::snprintf(s_wsPathBuf, sizeof(s_wsPathBuf), "%s", insertBrowseDir_.c_str());
+            s_wsPathSynced = insertBrowseDir_;
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##asm_insert_ws_path", s_wsPathBuf, sizeof(s_wsPathBuf),
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
+            std::string typed = s_wsPathBuf;
+            // Trim trailing whitespace.
+            while (!typed.empty() && (typed.back() == ' ' || typed.back() == '\t'))
+                typed.pop_back();
+            if (!typed.empty()) {
+                insertBrowseDir_ = typed;
+                s_wsPathSynced = insertBrowseDir_;
+            }
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            std::string typed = s_wsPathBuf;
+            while (!typed.empty() && (typed.back() == ' ' || typed.back() == '\t'))
+                typed.pop_back();
+            if (!typed.empty()) {
+                insertBrowseDir_ = typed;
+                s_wsPathSynced = insertBrowseDir_;
+            }
+        }
+
+        namespace fs = std::filesystem;
+        std::error_code pec;
+        fs::path cur(insertBrowseDir_);
+        fs::path parent = cur.parent_path();
+        const bool canParent = !parent.empty() && parent != cur &&
+                               fs::is_directory(parent, pec);
+        if (!canParent) ImGui::BeginDisabled();
+        if (ImGui::Button("Parent folder", ImVec2(-1, 0)) && canParent) {
+            insertBrowseDir_ = parent.string();
+            s_wsPathSynced.clear();  // force path buffer resync next frame
+        }
+        if (!canParent) ImGui::EndDisabled();
+
+        const auto wsFiles = listInsertWorkspaceFiles(insertBrowseDir_);
+        std::vector<std::string> shown;
+        shown.reserve(wsFiles.size());
+        for (const auto& p : wsFiles) {
+            if (alreadyInOpenRecent(p)) continue;
+            shown.push_back(p);
+        }
+
+        const float wsH = std::max(80.0f * S, ImGui::GetContentRegionAvail().y -
+                                    (ImGui::GetFrameHeightWithSpacing() * 4.0f));
+        ImGui::BeginChild("##asm_insert_ws_list", ImVec2(0, wsH), true);
+        if (shown.empty()) {
+            pushText(pal.textDim);
+            if (wsFiles.empty())
+                ImGui::TextWrapped("No CAD parts in this folder (or folder unreadable).");
+            else
+                ImGui::TextWrapped("All CAD parts here are already listed under Open & recent.");
+            ImGui::PopStyleColor();
+        } else {
+            for (int i = 0; i < (int)shown.size(); ++i) {
+                const std::string& p = shown[i];
+                const std::string label = pathBaseName(p);
+                const bool sel = (!insertChosenPath_.empty() && insertChosenPath_ == p);
+                if (ImGui::Selectable((label + "##wsi" + std::to_string(i)).c_str(), sel,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    insertSel_ = -1;
+                    insertChosenPath_ = p;
+                    insertNote_.clear();
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        std::string aicm;
+                        if (insertComponent(st, p, nullptr, aicm)) {
+                            insertNote_ = "Inserting " + label + "\xe2\x80\xa6";
+                            st.addLog("[asm] inserted: " + p);
+                        }
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", p.c_str());
+            }
+        }
+        ImGui::EndChild();
+    }
 
     ImGui::Spacing();
     if (!insertChosenPath_.empty()) {

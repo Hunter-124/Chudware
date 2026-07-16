@@ -5,11 +5,16 @@
 #include "appearance_common.h"
 
 #include <array>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 
+#include <nlohmann/json.hpp>
+
 #include "imgui.h"
 
+#include "../bootstrap.h"
+#include "../core/app_state.h"  // appdataAppDir — custom_materials.json
 #include "../ui_theme.h"
 
 namespace ui {
@@ -59,6 +64,100 @@ bool materialAppearance(const std::string& key, float outColor[3],
     emit(kMaterials[p].metallic, kMaterials[p].roughness, kMaterials[p].rgb);
     return true;
 }
+
+namespace {
+struct MatMech { float density = 7.85f; float E_mpa = 0.0f; std::string name; };
+
+// Hardcoded fallbacks for curated keys + common aliases (used when materials.json is missing).
+static MatMech hardcodedMech(const std::string& key) {
+    static const struct { const char* k; float d; float E; const char* n; } kTable[] = {
+        {"alu_6061", 2.70f, 68900.f, "Aluminum 6061-T6"},
+        {"steel_1018", 7.87f, 205000.f, "Steel 1018"},
+        {"steel_304_stainless", 8.00f, 193000.f, "Stainless Steel 304"},
+        {"ti_6al4v", 4.43f, 113800.f, "Titanium Ti-6Al-4V"},
+        {"brass_c360", 8.50f, 97000.f, "Brass C360"},
+        {"copper_c110", 8.94f, 117000.f, "Copper C110"},
+        {"cast_iron_gray", 7.20f, 100000.f, "Cast Iron (Gray)"},
+        {"abs", 1.04f, 2300.f, "ABS Plastic"},
+        {"pla", 1.24f, 3500.f, "PLA"},
+        {"steel", 7.85f, 200000.f, "Steel"},
+        {"aluminum", 2.70f, 69000.f, "Aluminum"},
+        {"stainless", 8.00f, 193000.f, "Stainless"},
+        {"titanium", 4.51f, 110000.f, "Titanium"},
+        {"brass", 8.50f, 97000.f, "Brass"},
+    };
+    for (const auto& r : kTable)
+        if (key == r.k) return {r.d, r.E, r.n};
+    // Category heuristics
+    auto has = [&](const char* s) { return key.find(s) != std::string::npos; };
+    if (has("brass") || has("copper")) return {8.50f, 97000.f, key};
+    if (has("alu") || has("aluminum")) return {2.70f, 69000.f, key};
+    if (has("stainless")) return {8.00f, 193000.f, key};
+    if (has("steel") || has("iron")) return {7.85f, 200000.f, key};
+    if (has("ti_") || has("titanium")) return {4.43f, 113800.f, key};
+    if (has("pla")) return {1.24f, 3500.f, key};
+    if (has("abs")) return {1.04f, 2300.f, key};
+    return {7.85f, 0.0f, key.empty() ? std::string("(not set)") : key};
+}
+
+static const std::unordered_map<std::string, MatMech>& materialsMechMap() {
+    static std::unordered_map<std::string, MatMech> map;
+    static bool loaded = false;
+    if (loaded) return map;
+    loaded = true;
+    // Seed curated keys first so they always resolve even if the JSON is absent.
+    for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
+        MatMech m = hardcodedMech(kPhysicalMaterials[i].key);
+        m.name = kPhysicalMaterials[i].name;
+        map[kPhysicalMaterials[i].key] = m;
+    }
+    auto loadFile = [&](const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return;
+        nlohmann::json j = nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
+        if (!j.is_object()) return;
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (!it.value().is_object()) continue;
+            MatMech m;
+            m.density = (float)it.value().value("density_g_cm3", 7.85);
+            m.E_mpa = (float)it.value().value("E_mpa", 0.0);
+            m.name = it.value().value("name", it.key());
+            map[it.key()] = m;
+        }
+    };
+    // Same merge order as SimManager: stock engine table, then user custom materials.
+    loadFile(appDir() + "/engine/sim/materials.json");
+    loadFile(appdataAppDir() + "/custom_materials.json");
+    return map;
+}
+}  // namespace
+
+float materialDensityGcm3(const std::string& key) {
+    if (key.empty()) return 7.85f;
+    const auto& map = materialsMechMap();
+    auto it = map.find(key);
+    if (it != map.end()) return it->second.density;
+    return hardcodedMech(key).density;
+}
+
+float materialYoungsEMpa(const std::string& key) {
+    if (key.empty()) return 0.0f;
+    const auto& map = materialsMechMap();
+    auto it = map.find(key);
+    if (it != map.end()) return it->second.E_mpa;
+    return hardcodedMech(key).E_mpa;
+}
+
+std::string materialDisplayName(const std::string& key) {
+    if (key.empty()) return "(not set)";
+    for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+        if (key == kPhysicalMaterials[i].key) return kPhysicalMaterials[i].name;
+    const auto& map = materialsMechMap();
+    auto it = map.find(key);
+    if (it != map.end() && !it->second.name.empty()) return it->second.name;
+    return key;
+}
+
 
 bool appearanceColorPicker(const char* popupId, float outColor[3],
                            float* outMetallic, float* outRoughness) {

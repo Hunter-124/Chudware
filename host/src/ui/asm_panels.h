@@ -125,6 +125,7 @@ private:
     std::string insertChosenPath_;        // absolute path of the selected open/recent/browse part
     std::string insertNote_;              // last insert status / error line
     std::string insertTargetDocId_;       // assembly doc_id captured when the dialog opened / last insert
+    std::string insertBrowseDir_;         // Workspace section directory (seeded from st.workspaceDir)
 
 
     // ---- Mate form (PM-style) ----

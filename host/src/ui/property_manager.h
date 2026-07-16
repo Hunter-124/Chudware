@@ -179,6 +179,13 @@ bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool a
                 double bareLengthScale = 1.0);
 // Format a canonical mm value for display, honouring IPS when ips==true.
 std::string pmFormatDim(double mm, bool ips, bool angle = false);
+// Format derived quantities (canonical mm-based) for Evaluate / mass / section readouts.
+// IPS uses in² / in³ / lb / in⁴; MMGS uses mm² / mm³ / g / mm⁴.
+std::string pmFormatArea(double mm2, bool ips);
+std::string pmFormatVolume(double mm3, bool ips);
+std::string pmFormatMass(double g, bool ips);
+std::string pmFormatAreaMoment(double mm4, bool ips);
+
 
 // ---- in-viewport callouts (C27-A) -----------------------------------------
 

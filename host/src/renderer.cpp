@@ -1110,8 +1110,17 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         if (hlr) glUniform1i(useScalarLoc, 0);
         if (hlr) glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
-        // Pass 1 — opaque: every body's faces, minus the edited feature's when isolating.
-        glUniform1f(alphaLoc, 1.0f);
+        // Pass 1 — (semi-)opaque: every body's faces, minus the edited feature's when isolating.
+        // bodyAlpha_ < 1 (Mass Properties) draws the whole part translucent so COM/I/J markers show.
+        const bool bodyGhost = !isolate && !hlr && (bodyAlpha_ < 0.999f);
+        if (bodyGhost) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glUniform1f(alphaLoc, bodyAlpha_);
+        } else {
+            glUniform1f(alphaLoc, 1.0f);
+        }
         for (const auto& s : subs_) {
             if (!s.visible) continue;   // Solid Bodies: hidden body draws nothing
             bool useScalar = !hlr && colormap_ && s.hasScalar;
@@ -1127,6 +1136,11 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glBindVertexArray(s.vao);
             if (isolate) drawSubFaces(s, /*editing=*/false);
             else         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+        }
+        if (bodyGhost) {
+            glUniform1f(alphaLoc, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
         }
         if (hlr) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 

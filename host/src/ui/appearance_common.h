@@ -55,6 +55,17 @@ extern const PhysicalMaterial kPhysicalMaterials[kPhysicalMaterialsCount];
 bool materialAppearance(const std::string& key, float outColor[3],
                         float& outMetallic, float& outRoughness);
 
+// Density (g/cm³) for an engine material key. Looks up engine/sim/materials.json (lazy), then
+// kPhysicalMaterials heuristics, then category fallbacks. Unknown/empty key → 7.85 (steel).
+float materialDensityGcm3(const std::string& key);
+
+// Young's modulus (MPa) for axial stiffness estimates. 0 when unknown.
+float materialYoungsEMpa(const std::string& key);
+
+// Friendly display name for a material key (kPhysicalMaterials name, else the key, else "(not set)").
+std::string materialDisplayName(const std::string& key);
+
+
 // The appearance editor popup. Returns true once on commit. See header note.
 bool appearanceColorPicker(const char* popupId, float outColor[3],
                            float* outMetallic, float* outRoughness);

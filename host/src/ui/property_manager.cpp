@@ -381,6 +381,33 @@ std::string pmFormatDim(double mm, bool ips, bool angle) {
     return buf;
 }
 
+std::string pmFormatArea(double mm2, bool ips) {
+    char buf[48];
+    if (ips) std::snprintf(buf, sizeof(buf), "%.4gin\xc2\xb2", mm2 / 645.16);
+    else     std::snprintf(buf, sizeof(buf), "%.4gmm\xc2\xb2", mm2);
+    return buf;
+}
+std::string pmFormatVolume(double mm3, bool ips) {
+    char buf[48];
+    if (ips) std::snprintf(buf, sizeof(buf), "%.4gin\xc2\xb3", mm3 / 16387.064);
+    else     std::snprintf(buf, sizeof(buf), "%.4gmm\xc2\xb3", mm3);
+    return buf;
+}
+std::string pmFormatMass(double g, bool ips) {
+    char buf[48];
+    if (ips) std::snprintf(buf, sizeof(buf), "%.4glb", g / 453.59237);
+    else     std::snprintf(buf, sizeof(buf), "%.4gg", g);
+    return buf;
+}
+std::string pmFormatAreaMoment(double mm4, bool ips) {
+    char buf[48];
+    // 25.4^4 = 416231.4256
+    if (ips) std::snprintf(buf, sizeof(buf), "%.4gin\xe2\x81\xb4", mm4 / 416231.4256);
+    else     std::snprintf(buf, sizeof(buf), "%.4gmm\xe2\x81\xb4", mm4);
+    return buf;
+}
+
+
 // An angle-valued Dim field is tagged by a "deg" unit label (Angle/AngleIf helpers). Its value
 // is stored in degrees and must NOT carry the mm/inch length suffix.
 static inline bool pmFieldIsAngle(const PMFieldDef* d) {

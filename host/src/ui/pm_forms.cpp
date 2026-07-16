@@ -97,7 +97,14 @@ static PMFieldDef Range(PMFieldDef f, double mn, double mx, double step = 0.0) {
     f.dimMin = mn; f.dimMax = mx; f.dimStep = step; return f;
 }
 // Allow negative values on a drag Dim (offsets that reverse direction). Default drags clamp at 0.
-static PMFieldDef Signed(PMFieldDef f) { f.dimMin = -1.0e9; return f; }
+// IMPORTANT: dimMax must stay <= dimMin so the field is UNBOUNDED (DragFloat). Setting only dimMin
+// to -1e9 while dimMax stays 0 made dimMax > dimMin → a broken SliderFloat from -1e9..0 that
+// AlwaysClamp'd any positive default (e.g. plane Offset Distance 10) down to 0.
+static PMFieldDef Signed(PMFieldDef f) {
+    f.dimMin = -1.0e9;
+    f.dimMax = -1.0e9;  // dimMax <= dimMin => unbounded above (see PMFieldDef)
+    return f;
+}
 // Render a 2-option combo as a segmented pill pair (one click to flip) instead of a dropdown.
 static PMFieldDef Seg(PMFieldDef f) { f.segmented = true; return f; }
 // A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").

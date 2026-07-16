@@ -467,9 +467,12 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
     parseEntities(res, ents_);
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
     // C41 (T2) / C50: drop selected handles whose OWNING entity no longer exists (deleted/undone).
+    // Virtual refs (sketch origin + datum axes) are not in ents_ but stay selectable as references.
     selIds_.erase(std::remove_if(selIds_.begin(), selIds_.end(),
                                  [&](const std::string& id) {
-                                     return entById(id.substr(0, id.find('.'))) == nullptr;
+                                     const std::string base = id.substr(0, id.find('.'));
+                                     if (base == "origin" || base.rfind("axis.", 0) == 0) return false;
+                                     return entById(base) == nullptr;
                                  }),
                   selIds_.end());
     // C51: drop selected relations whose constraint vanished (deleted/undone/re-solved away).
@@ -1545,8 +1548,13 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         }
         nlohmann::json ops = nlohmann::json::array();
         for (const auto& id : selIds_) {
-            if (id == "origin") continue;   // the virtual origin has no construction state
+            if (id == "origin" || id.rfind("axis.", 0) == 0) continue;  // virtual refs
+            if (!entById(id.substr(0, id.find('.')))) continue;
             ops.push_back({{"op", "sketch_toggle_construction"}, {"sketch", fid_}, {"id", id}});
+        }
+        if (ops.empty()) {
+            st.toast(ui::ToastLevel::Info, "Construction: select sketch entities first");
+            return true;
         }
         auto r = st.docMirror.applyOps(st.worker, ops);
         if (!r.ok) st.toast(ui::ToastLevel::Error, "Construction: " + r.error_message);
@@ -1579,9 +1587,17 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         }
         relPopupPos_ = ImGui::GetMousePos();   // anchor the over-def prompt at the cursor
         nlohmann::json ops = nlohmann::json::array();
-        for (const auto& h : selIds_)
+        for (const auto& h : selIds_) {
+            const std::string base = h.substr(0, h.find('.'));
+            if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
+            if (!entById(base) && h.find('.') == std::string::npos) continue;
             ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
                 {"constraint", {{"type", "fix"}, {"refs", nlohmann::json::array({h})}}}});
+        }
+        if (ops.empty()) {
+            st.toast(ui::ToastLevel::Info, "Fix: select sketch entities or points first");
+            return true;
+        }
         addRelationOps(st, ops, "Fix");
         return true;
     }
@@ -2779,7 +2795,7 @@ int SketchMode::hitTestRelationBadge(const ImVec2& s) const {
 void SketchMode::boxSelect(const ImVec2& a, const ImVec2& b, bool crossing, bool additive) {
     ImVec2 lo(std::fmin(a.x, b.x), std::fmin(a.y, b.y));
     ImVec2 hi(std::fmax(a.x, b.x), std::fmax(a.y, b.y));
-    if (!additive) selIds_.clear();
+    if (!additive) { selIds_.clear(); selRelIds_.clear(); }
     std::vector<ImVec2> uv; bool closed;
     for (const auto& e : ents_) {
         entityBoundaryUV(e, uv, closed);
@@ -4781,18 +4797,18 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
 // Hit-test the displayed datum-axis lines in screen space. Consumes renderer-injected axes
 // (defaults + auto cache + user) — never re-solves plane pairs. Returns true + the hovered
 // axis's screen endpoints + feature id/name when the cursor is within the
-// pick radius. Shared by the PM axis picker (route into a well) and general datum selection. The
-// endpoints use L = radius*1.6 so the clickable segment coincides with the drawn dashed amber line.
+// pick radius. Shared by the PM axis picker (route into a well) and general datum selection.
+// Pick segment half-length L must match the DRAWN axis half-length in Renderer::drawRefDatums:
+// plane half-extent e = (radius_>0 ? radius_ : kEmptySceneRadius), L = e * 1.0 (not the old e*1.6).
+// cam.radius is published as that same sceneR (renderer.cpp drawCurrent), so use it directly —
+// modelRadius() is 0 with no solid body (e.g. during Revolve: sketch + axis, no body).
 static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
                              ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
     if (!st.renderer || !st.docMirror.hasDoc()) return false;
     const Renderer& r = *st.renderer;
     const auto& cam = r.camera();
-    // Match the DRAWN axis length exactly: drawRefDatums uses e=(radius_>0?radius_:kEmptySceneRadius)
-    // and L=e*1.6. cam.radius is published as that same sceneR (renderer.cpp drawCurrent), so use it
-    // directly — modelRadius() is 0 with no solid body (e.g. during Revolve: sketch + axis, no body),
-    // which shrank the pickable segment to ~1.6mm while the visible line spanned ~56mm. See handoff.
-    const float L = cam.radius * 1.6f;
+    // Match DRAWN axis half-length: e = plane half-extent, L = e (factor 1.0).
+    const float L = cam.radius;
     auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
         float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
         float len2 = vx * vx + vy * vy;
@@ -5578,6 +5594,38 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         dl->AddCircle(o, 3.5f * ui::uiScale, oc, 0, th);
     }
 
+    // Selected datum axes (virtual sketch refs like "axis.x"): emphasize with accent stroke so
+    // the pick stays visible after click, matching the origin selection treatment.
+    if (st.renderer && !selIds_.empty()) {
+        const auto& cam = st.renderer->camera();
+        const float L = cam.radius;   // matches hitTestDatumAxis / drawn half-length (factor 1.0)
+        const auto& rds = st.renderer->refDatums();
+        for (const auto& sid : selIds_) {
+            if (sid.rfind("axis.", 0) != 0) continue;
+            Vec3 P(0, 0, 0), D(0, 0, 0);
+            bool found = false;
+            for (const auto& d : rds) {
+                if (d.kind != Renderer::RefDatum::Kind::Axis || d.id != sid) continue;
+                P = d.origin; D = d.dir; found = true; break;
+            }
+            if (!found) {
+                if (sid == "axis.x") { D = Vec3(1, 0, 0); found = true; }
+                else if (sid == "axis.y") { D = Vec3(0, 1, 0); found = true; }
+                else if (sid == "axis.z") { D = Vec3(0, 0, 1); found = true; }
+            }
+            if (!found || length(D) < 1e-9f) continue;
+            D = normalize(D);
+            ImVec2 sa, sb;
+            if (!worldToScreen(cam, imgMin, vw, vh,
+                               P.x - D.x * L, P.y - D.y * L, P.z - D.z * L, sa))
+                continue;
+            if (!worldToScreen(cam, imgMin, vw, vh,
+                               P.x + D.x * L, P.y + D.y * L, P.z + D.z * L, sb))
+                continue;
+            dl->AddLine(sa, sb, canvasAccent(), 3.5f * ui::uiScale);
+        }
+    }
+
     // ---- C51: closed-profile region shading (under the entities) ----
     // Loops detected from the live geometry are filled faintly so a closed profile reads as a
     // selectable face; the one the cursor has dwelled in (hotRegion_) brightens + gets an outline,
@@ -6118,9 +6166,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 break;
             }
         }
-        // C41 (T2): Delete/Backspace removes the selected entities (one ops array for all of
-        // them, then re-solve). A hovered dimension text takes priority (handler below) — keep
-        // this gated on dimHoverCid_.empty() and BEFORE that handler (it clears the hover id).
+        // C41 (T2): Delete/Backspace removes the selected entities (one ops array for ALL of
+        // them, then re-solve). Virtual refs (origin / datum axes) are skipped. A hovered
+        // dimension text takes priority (handler below) — keep this gated on dimHoverCid_.empty()
+        // and BEFORE that handler (it clears the hover id).
         if ((!selIds_.empty() || !selRelIds_.empty()) && dimHoverCid_.empty() && !io.WantTextInput &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
             // C50: selection may hold point handles ("e3.p2") — delete the OWNING entity, deduped.
@@ -6129,26 +6178,32 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             std::vector<std::string> done;
             for (const auto& sel : selIds_) {
                 std::string base = sel.substr(0, sel.find('.'));
-                if (base == "origin") continue;   // the virtual origin can't be deleted
+                // Virtual sketch refs (origin, datum axes) cannot be deleted as entities.
+                if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
                 if (std::find(done.begin(), done.end(), base) != done.end()) continue;
+                // Only emit deletes for entities that still exist (stale handles are no-ops).
+                if (!entById(base)) continue;
                 done.push_back(base);
                 ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", base}});
             }
             for (const auto& cid : selRelIds_)
                 ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", cid}});
-            auto r = st.docMirror.applyOps(st.worker, ops);
-            if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
-            else {
-                if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-                resolve(st);
-                // Emptied a consumed sketch (select-all + delete, etc.): warn once.
-                // Dependents stay with rebuild errors; don't cascade-delete them.
-                if (ents_.empty()) {
-                    std::vector<std::string> deps;
-                    collectSketchDependents(st, fid_, deps);
-                    if (!deps.empty()) {
-                        st.toast(ui::ToastLevel::Warn,
-                                 emptyProfileToast(deps, featureDisplayName(st, fid_)));
+            // Empty ops (only virtual refs selected) — just clear selection, no RPC.
+            if (!ops.empty()) {
+                auto r = st.docMirror.applyOps(st.worker, ops);
+                if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
+                else {
+                    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                    resolve(st);
+                    // Emptied a consumed sketch (select-all + delete, etc.): warn once.
+                    // Dependents stay with rebuild errors; don't cascade-delete them.
+                    if (ents_.empty()) {
+                        std::vector<std::string> deps;
+                        collectSketchDependents(st, fid_, deps);
+                        if (!deps.empty()) {
+                            st.toast(ui::ToastLevel::Warn,
+                                     emptyProfileToast(deps, featureDisplayName(st, fid_)));
+                        }
                     }
                 }
             }
@@ -6183,12 +6238,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         };
 
         // ---- C51: hover target (what a click will grab). Priority handle > relation badge >
-        // entity (or its dwelled loop) > region interior. Computed once and reused for the
-        // pre-highlight AND the press, so the cursor's affordance and its action always agree. ----
+        // entity (or its dwelled loop) > region interior > datum axis. Computed once and reused
+        // for the pre-highlight AND the press, so the cursor's affordance and its action always agree.
         bool idleHover = imgHovered && !dragging_ && !boxSelecting_ && !groupDragging_ &&
                          !dragArmed_ && !groupDragArmed_ && !dimDragging_ && dimHoverCid_.empty();
         std::string hovHandle; float hovHu = 0, hovHv = 0;
-        std::string hovRel, hovEnt;
+        std::string hovRel, hovEnt, hovAxis;
+        ImVec2 hovAxisA, hovAxisB;
         int hovRegion = -1;
         if (idleHover) {
             if (hitTestHandle(io.MousePos, hovHandle, hovHu, hovHv) > 0) {
@@ -6199,16 +6255,32 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 else {
                     int ei = hitTestEntity(io.MousePos);
                     if (ei >= 0) hovEnt = ents_[ei].id;
-                    else { int r = hitTestRegion(io.MousePos); if (regionValid(r)) hovRegion = r; }
+                    else {
+                        int r = hitTestRegion(io.MousePos);
+                        if (regionValid(r)) hovRegion = r;
+                        else {
+                            // No sketch geometry under the cursor — allow selecting a drawn
+                            // datum axis (X/Y/Z + injected auto axes) as a sketch reference,
+                            // same idea as the virtual "origin" handle. Uses the shared
+                            // hitTestDatumAxis (renderer refDatums Kind::Axis).
+                            std::string axFid, axName;
+                            ImVec2 aa, ab;
+                            if (hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh,
+                                                 aa, ab, axFid, axName)) {
+                                hovAxis = axFid;
+                                hovAxisA = aa; hovAxisB = ab;
+                            }
+                        }
+                    }
                 }
             }
         }
         hoverRelCid_ = hovRel;   // feeds the badge tint on the next frame's render pass
-        // GUI-picking overhaul: "hot" whenever a sketch entity/handle/relation/region claims the
-        // cursor, or a drag/box-select is armed/live (idleHover false covers those cases) — either
-        // way the viewport's fallback model-pick must not also fire this frame.
+        // GUI-picking overhaul: "hot" whenever a sketch entity/handle/relation/region/axis claims
+        // the cursor, or a drag/box-select is armed/live (idleHover false covers those cases) —
+        // either way the viewport's fallback model-pick must not also fire this frame.
         entityHoverHot_ = !idleHover || !hovHandle.empty() || !hovRel.empty() ||
-                          !hovEnt.empty() || hovRegion >= 0;
+                          !hovEnt.empty() || hovRegion >= 0 || !hovAxis.empty();
 
         // C51: entity-edge dwell -> loop preview. Resting on the same loop-member edge for kLoopDwell
         // grows the pick from that lone edge to its whole closed loop (SolidWorks-ish loop pick).
@@ -6239,6 +6311,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (const SketchEntity* e = entById(hovEnt)) strokeEntityOutline(dl, *e, hiCol, hiTh);
             hotRegion_ = -1;
             st.requestCursor(ui::CursorKind::Hand);
+        } else if (!hovAxis.empty()) {
+            // Highlight the hovered datum axis along its drawn segment (accent, thicker).
+            dl->AddLine(hovAxisA, hovAxisB, col(pal.accent, 0.95f), 4.0f * ui::uiScale);
+            hotRegion_ = -1;
+            st.requestCursor(ui::CursorKind::Hand);
         } else {
             if (hovRel.empty()) hotRegion_ = -1;   // badge hover is tinted in the render pass
             else st.requestCursor(ui::CursorKind::Hand);
@@ -6262,6 +6339,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // it, else just this entity); release without moving selects it.
                 groupDragArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;
                 groupClickKind_ = 1; groupClickEnt_ = hovEnt; groupClickRegion_ = -1;
+            } else if (!hovAxis.empty()) {
+                // Datum axis as sketch reference (virtual id like "axis.x") — select, no drag.
+                toggleSel(hovAxis);
+                st.selectedFeatureId = hovAxis;   // FM + renderer emphasis stay in step
             } else {
                 boxArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;   // empty canvas
             }
@@ -6448,9 +6529,65 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::OpenPopup("##SketchCtx");
     }
     if (ImGui::BeginPopup("##SketchCtx")) {
+        // Count deletable sketch entities in the selection (virtual origin/axes don't count).
+        int nDelEnt = 0;
+        {
+            std::vector<std::string> seen;
+            for (const auto& sel : selIds_) {
+                std::string base = sel.substr(0, sel.find('.'));
+                if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
+                if (!entById(base)) continue;
+                if (std::find(seen.begin(), seen.end(), base) != seen.end()) continue;
+                seen.push_back(base);
+            }
+            nDelEnt = (int)seen.size();
+        }
+        const int nDelRel = (int)selRelIds_.size();
+        const bool canDelete = nDelEnt > 0 || nDelRel > 0;
+        // "Delete all" when every real sketch entity is selected (and there is at least one).
+        int nRealEnts = 0;
+        for (const auto& e : ents_) ++nRealEnts;
+        const bool allSelected = nRealEnts > 0 && nDelEnt >= nRealEnts;
+
         if (!selIds_.empty()) {
             if (ImGui::MenuItem("Add Relation...")) {
                 relIds_ = selIds_; relPopupOpen_ = true; relPopupPos_ = ImGui::GetMousePos();
+            }
+            ImGui::Separator();
+        }
+        if (canDelete) {
+            const char* delLabel = allSelected ? "Delete all" : "Delete";
+            if (ImGui::MenuItem(delLabel)) {
+                // Same multi-delete batch as the Delete/Backspace key handler.
+                nlohmann::json ops = nlohmann::json::array();
+                std::vector<std::string> done;
+                for (const auto& sel : selIds_) {
+                    std::string base = sel.substr(0, sel.find('.'));
+                    if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
+                    if (std::find(done.begin(), done.end(), base) != done.end()) continue;
+                    if (!entById(base)) continue;
+                    done.push_back(base);
+                    ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", base}});
+                }
+                for (const auto& cid : selRelIds_)
+                    ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", cid}});
+                if (!ops.empty()) {
+                    auto r = st.docMirror.applyOps(st.worker, ops);
+                    if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
+                    else {
+                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                        resolve(st);
+                        if (ents_.empty()) {
+                            std::vector<std::string> deps;
+                            collectSketchDependents(st, fid_, deps);
+                            if (!deps.empty()) {
+                                st.toast(ui::ToastLevel::Warn,
+                                         emptyProfileToast(deps, featureDisplayName(st, fid_)));
+                            }
+                        }
+                    }
+                }
+                selIds_.clear(); selRelIds_.clear();
             }
             ImGui::Separator();
         }
@@ -9015,8 +9152,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (relPopupOpen_) {
         for (const auto& h : relIds_) {
             const std::string base = h.substr(0, h.find('.'));
-            // "origin" is the virtual fixed-origin handle (not in ents_) — keep it, don't purge.
-            if (base != "origin" && !entById(base)) { relPopupOpen_ = false; relIds_.clear(); break; }
+            // Virtual refs (origin / datum axes) are not in ents_ — keep them.
+            if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
+            if (!entById(base)) { relPopupOpen_ = false; relIds_.clear(); break; }
         }
     }
     if (relPopupOpen_) {

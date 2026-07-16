@@ -1424,6 +1424,7 @@ void AppState::clearViewportForNewDoc() {
     // A fresh part re-enters the auto-show "pick a plane to start" state until the user toggles.
     planesUserToggled = false;
     originUserToggled = false;
+    axesUserToggled = false;
     showPlane[0] = showPlane[1] = showPlane[2] = false;
 }
 
@@ -1446,6 +1447,7 @@ void AppState::captureDocState(DocSession& s) {
     for (int i = 0; i < 3; ++i) s.showPlane[i] = showPlane[i];
     s.planesUserToggled = planesUserToggled;
     s.originUserToggled = originUserToggled;
+    s.axesUserToggled = axesUserToggled;
     s.modelInfo    = std::move(modelInfo);
     s.asmParts     = std::move(asmParts);
     s.asmFit       = std::move(asmFit);
@@ -1470,6 +1472,7 @@ void AppState::restoreDocState(DocSession& s) {
     for (int i = 0; i < 3; ++i) showPlane[i] = s.showPlane[i];
     planesUserToggled = s.planesUserToggled;
     originUserToggled = s.originUserToggled;
+    axesUserToggled = s.axesUserToggled;
     applyDatumVisibility();   // reflect this tab's datum hides in the renderer
     modelInfo    = std::move(s.modelInfo);
     asmParts     = std::move(s.asmParts);
@@ -1677,6 +1680,25 @@ static bool isReferenceOnlyFeature(const std::string& type) {
            type == "sketch" || type == "sketch3d";
 }
 
+// True when the doc has at least one solid/3D-producing feature (or assembly components).
+// Sketches and pure reference datums do NOT count — refs stay visible after the first sketch
+// and only auto-hide once a real solid feature (extrude/revolve/fillet/…) exists.
+static bool treeHasSolidContent(const nlohmann::json& tree) {
+    if (!tree.is_object()) return false;
+    auto ci = tree.find("components");
+    if (ci != tree.end() && ci->is_array() && !ci->empty()) return true;
+    auto fi = tree.find("features");
+    if (fi == tree.end() || !fi->is_array()) return false;
+    for (const auto& f : *fi) {
+        if (!f.is_object()) continue;
+        if (f.value("suppressed", false)) continue;
+        const std::string type = f.value("type", std::string());
+        if (type.empty()) continue;
+        if (!isReferenceOnlyFeature(type)) return true;
+    }
+    return false;
+}
+
 // Collect feature-id and reserved-plane references from any canonical refs value. Selector refs use
 // nested objects (feature/owner_feature/sketch), feature lists use arrays of bare ids, and the three
 // default planes are bare strings, so recursively walking only `refs` is both complete and avoids
@@ -1707,13 +1729,10 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     if (!tree.is_object()) return;
     const bool isAsm = tree.value("schema", std::string()) == "aicad.asm/1";
 
-    // Shared hasContent signal (mirrors viewport origin auto-hide): any feature (incl. sketch)
-    // or any assembly component means the doc is non-empty for reference-plane auto-hide.
-    bool hasContent = false;
+    // Shared hasSolidContent signal (mirrors viewport origin/axis/plane auto-hide): a solid/3D
+    // feature or any assembly component means references should auto-hide. Sketches alone do not.
+    const bool hasSolidContent = treeHasSolidContent(tree);
     auto fi = tree.find("features");
-    if (fi != tree.end() && fi->is_array() && !fi->empty()) hasContent = true;
-    auto ciAll = tree.find("components");
-    if (ciAll != tree.end() && ciAll->is_array() && !ciAll->empty()) hasContent = true;
 
     if (isAsm) {
         // Assembly: re-derive the per-component hide mask from document.json. The engine builds one
@@ -1735,11 +1754,11 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         // Do not return: assembly-level features can consume datum planes too.
     }
 
-    // No features array: still apply default-plane hasContent rule (e.g. components-only asm).
+    // No features array: still apply default-plane hasSolidContent rule (e.g. components-only asm).
     if (fi == tree.end() || !fi->is_array()) {
         if (!planesUserToggled) {
             static const char* kDefaultPlanes[3] = {"plane.front", "plane.top", "plane.right"};
-            if (hasContent) {
+            if (hasSolidContent) {
                 for (const char* p : kDefaultPlanes) autoHiddenPlanes.insert(p);
             } else {
                 for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);
@@ -1818,14 +1837,14 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         }
     }
 
-    // W2-ref: default planes hide whenever the open doc has content (any feature/sketch or
-    // assembly component), independent of consumption. MUST run AFTER the consumption erase
-    // loop above — that loop drops every autoHiddenPlanes entry not in consumedPlanes, which
-    // would undo an earlier insert for unreferenced default planes (e.g. sketch-only docs).
-    // Empty docs: ensure the three are NOT in autoHiddenPlanes so they stay visible.
+    // Default planes hide whenever the open doc has SOLID content (a 3D feature or assembly
+    // component), independent of consumption. Sketches alone leave planes visible. MUST run
+    // AFTER the consumption erase loop above — that loop drops every autoHiddenPlanes entry
+    // not in consumedPlanes, which would undo an earlier insert for unreferenced defaults.
+    // Empty / sketch-only docs: ensure the three are NOT in autoHiddenPlanes so they stay shown.
     if (!planesUserToggled) {
         static const char* kDefaultPlanes[3] = {"plane.front", "plane.top", "plane.right"};
-        if (hasContent) {
+        if (hasSolidContent) {
             for (const char* p : kDefaultPlanes) autoHiddenPlanes.insert(p);
         } else {
             for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);

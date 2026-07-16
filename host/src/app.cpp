@@ -1563,20 +1563,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                              Vec3(ent.dir[0], ent.dir[1], ent.dir[2]));
                 }
 
-                // Rebuild axisDatumIds; auto-hide any newly-seen synthetic axis (default + auto).
-                // User-created axis features are left alone (visible unless the user hid them).
-                // Membership in the previous axisDatumIds set is the per-doc "ever seen" marker —
-                // once the user unhides an id it stays unhidden across rebuilds.
+                // Rebuild axisDatumIds. Visibility is driven per-frame by hasSolidContent
+                // (viewport_panel / applyDocDrivenVisibility) unless axesUserToggled. Do NOT
+                // permanently insert newly-seen synthetic axes into hiddenFeatures here — that
+                // made empty/sketch-only docs start with axes force-hidden and blocked the
+                // auto-show path. User-created axis features stay whatever the user left them.
                 std::unordered_set<std::string> prevAxisIds = std::move(st.axisDatumIds);
                 st.axisDatumIds.clear();
                 for (const auto& rd : rds) {
                     if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty()) continue;
                     st.axisDatumIds.insert(rd.id);
-                    const bool isSynthetic =
-                        rd.id == "axis.x" || rd.id == "axis.y" || rd.id == "axis.z" ||
-                        rd.id.rfind("axis.auto:", 0) == 0;
-                    if (isSynthetic && !prevAxisIds.count(rd.id))
-                        st.hiddenFeatures.insert(rd.id);
                 }
                 // Rebuild display names when axis set membership changes (or first fill).
                 bool membershipChanged =
@@ -1826,7 +1822,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // mechanical/advanced type (e.g. "gear") so its parameter field renders.
     const bool wantMateForm = st.wantAsm && std::getenv("AI_CAD_MATEFORM") != nullptr;
     if (st.wantAsm) {
-        st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;  // Assembly tab forward
+        st.showRibbon = true; st.ribbonTab = AppState::RT_Features;  // Assembly tools live on Features tab
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
         if (wantMateForm) {
             st.wantAsm = false;                  // suppress the scripted scenario; just show the form
@@ -1862,7 +1858,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             else if (t == "sketch")     idx = AppState::RT_Sketch;
             else if (t == "evaluate")   idx = AppState::RT_Evaluate;
             else if (t == "simulation") idx = AppState::RT_Simulation;
-            else if (t == "assembly")   idx = AppState::RT_Assembly;
+            else if (t == "assembly")   idx = AppState::RT_Features;  // Assembly tab retired -> Features
             else if (t == "sheetmetal") idx = AppState::RT_SheetMetal;
             else if (t == "weldments")  idx = AppState::RT_Weldments;
             else if (t == "pcb")        idx = AppState::RT_PCB;
@@ -3168,6 +3164,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     ecadOpenPath(st, path);   // records Recent itself
                 } else if (ui::featureTreeOpenPath(st, path)) {
                     st.pushRecentFile(path);
+                    // ITEM 13: queue Zoom-to-Fit for THIS doc's first real display, even if the
+                    // viewport isn't drawn this frame (e.g. Parts Library workspace focused).
+                    if (st.docMirror.hasDoc()) {
+                        const std::string id = st.docMirror.docId();
+                        if (!id.empty()) st.fitPendingDocIds.insert(id);
+                    }
+                    // Keep legacy flag for any path that still keys on it; viewport migrates it.
+                    if (!st.handoffQuietOpen) st.fitViewOnNextMeshCommit = true;
                 }
             }
             // Save / Save As route through the unified per-tab saver so the active tab saves by its

@@ -43,14 +43,22 @@ struct SketchEdge {
     Eigen::Vector2d p_start;  // 2D sketch-space start
     Eigen::Vector2d p_end;    // 2D sketch-space end
     bool closed = false;      // single-edge closed loop (circle / self-closing spline)
+    // Exact full-circle params (when type=="circle"). Nesting uses these for area /
+    // containment so a circle-in-circle washer is classified without depending on the
+    // N-gon sample ring (which can put both centroids at the shared centre and leave
+    // ray-cast containment ambiguous at vertices). Geometry stays a true gp_Circ edge.
+    bool is_circle = false;
+    Eigen::Vector2d circle_center{0, 0};
+    double circle_radius = 0.0;
     // 2D sample points to splice into the loop polygon AFTER p_start when this edge
-    // is traversed start->end. Empty for straight/analytic edges (line/circle/arc) so
-    // their loop polygons stay byte-identical to the pre-spline behavior; populated for
-    // curved through-point edges (splines) so the shoelace area / containment tests see
-    // the real curve shape instead of just the two endpoints. For an OPEN spline these
-    // are the strictly-interior points (the end vertex is supplied by the next edge's
-    // start); for a self-closing spline (closed==true) these are every unique ring point
-    // after the start (the start closes the ring via the shoelace wrap).
+    // is traversed start->end. Empty for straight/analytic edges (line/arc) so their
+    // loop polygons stay byte-identical to the pre-spline behavior; populated for
+    // circles (nesting fallback + shoelace orientation) and curved through-point
+    // edges (splines) so the shoelace area / containment tests see the real curve
+    // shape instead of just the two endpoints. For an OPEN spline these are the
+    // strictly-interior points (the end vertex is supplied by the next edge's
+    // start); for a self-closing spline (closed==true) these are every unique ring
+    // point after the start (the start closes the ring via the shoelace wrap).
     std::vector<Eigen::Vector2d> interior;
 };
 
@@ -97,12 +105,13 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
             BRepBuilderAPI_MakeEdge mk(gp_Circ(ax, r));
             if (!mk.IsDone()) return false;
             out.edge = mk.Edge();
-            // Full circle = one closed edge. Sample the boundary into the loop polygon
-            // (same N=64 ring as session.cpp::reg_build_edge) so area / nesting /
-            // containment see the real disc — a center-only degenerate square made
-            // every concentric pair look equal-area and produced a solid disc instead
-            // of a washer. p_start is the first sample (on the ring), interior the rest
-            // (mirrors the self-closing spline path below).
+            // Exact circle params for nesting (area = pi r^2, containment by radii).
+            // Sampled ring still fills the loop polygon for shoelace orientation and as
+            // a fallback when mixing circles with non-circle loops — same N=64 as
+            // session.cpp::reg_build_edge. Geometry remains a true gp_Circ edge.
+            out.is_circle = true;
+            out.circle_center = c;
+            out.circle_radius = r;
             constexpr int kCircleSamples = 64;
             out.interior.clear();
             out.interior.reserve(static_cast<size_t>(kCircleSamples - 1));
@@ -203,10 +212,14 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
 
 // One detected closed loop: the edges in head-to-tail order (reversed where the
 // walk matched an edge by its end) plus the ordered 2D polyline of loop-corner
-// points used for area / containment tests.
+// points used for area / containment tests. Full-circle loops also keep exact
+// centre/radius so nesting is analytic (circle-in-circle washer).
 struct Loop {
     std::vector<TopoDS_Edge> edges;
     std::vector<Eigen::Vector2d> poly;  // ordered loop corners (2D)
+    bool is_circle = false;
+    Eigen::Vector2d circle_center{0, 0};
+    double circle_radius = 0.0;
 };
 
 // Port of sketch.py::_detect_loops. Circles become one-edge loops immediately;
@@ -218,13 +231,19 @@ std::vector<Loop> detect_loops(const std::vector<SketchEdge>& edges) {
     std::vector<bool> used(n, false);
 
     // Closed single edges (circles / self-closing splines) -> immediate one-edge loops.
-    // Circles carry a sampled boundary ring in `interior` (see build_edge); self-closing
-    // splines carry their through-points. The polygon drives shoelace area + nesting.
+    // Circles carry exact centre/radius + a sampled boundary ring in `interior`; self-
+    // closing splines carry their through-points. The polygon drives shoelace area +
+    // nesting for non-circle loops; exact circle params drive circle-vs-circle.
     for (size_t i = 0; i < n; ++i) {
         if (!edges[i].closed) continue;
         used[i] = true;
         Loop lp;
         lp.edges.push_back(edges[i].edge);
+        if (edges[i].is_circle) {
+            lp.is_circle = true;
+            lp.circle_center = edges[i].circle_center;
+            lp.circle_radius = edges[i].circle_radius;
+        }
         if (!edges[i].interior.empty()) {
             // Closed curve with samples: ring = start + interior (circle N-1 samples
             // after the first station, or spline through-points after the first).
@@ -348,6 +367,64 @@ bool point_in_poly(const Eigen::Vector2d& pt, const std::vector<Eigen::Vector2d>
     return inside;
 }
 
+// Loop area for nesting: exact pi r^2 for full circles, shoelace otherwise.
+double loop_area(const Loop& lp) {
+    if (lp.is_circle && lp.circle_radius > kEps)
+        return kPi * lp.circle_radius * lp.circle_radius;
+    return std::abs(signed_area(lp.poly));
+}
+
+// Representative interior point: circle centre, else polygon centroid.
+Eigen::Vector2d loop_centroid(const Loop& lp) {
+    if (lp.is_circle) return lp.circle_center;
+    return poly_centroid(lp.poly);
+}
+
+// Does loop `outer` strictly contain the representative point of `inner`?
+// Circle-in-circle uses radii (inner fully inside outer when centres are close enough
+// that |c_i - c_o| + r_i < r_o). Mixed/poly cases fall back to point-in-poly.
+bool loop_contains(const Loop& outer, const Loop& inner) {
+    if (outer.is_circle && outer.circle_radius > kEps) {
+        if (inner.is_circle && inner.circle_radius > kEps) {
+            const double dx = inner.circle_center.x() - outer.circle_center.x();
+            const double dy = inner.circle_center.y() - outer.circle_center.y();
+            const double d = std::sqrt(dx * dx + dy * dy);
+            // Strict containment: inner disc fully inside outer (positive wall thickness).
+            return d + inner.circle_radius < outer.circle_radius - kEps;
+        }
+        const Eigen::Vector2d c = loop_centroid(inner);
+        const double dx = c.x() - outer.circle_center.x();
+        const double dy = c.y() - outer.circle_center.y();
+        return (dx * dx + dy * dy) < outer.circle_radius * outer.circle_radius;
+    }
+    return point_in_poly(loop_centroid(inner), outer.poly);
+}
+
+// even-odd nesting: parent = smallest-area enclosing loop; depth = # of enclosers.
+void nest_loops(const std::vector<Loop>& loops, std::vector<double>& area,
+                std::vector<int>& parent, std::vector<int>& depth) {
+    const size_t n = loops.size();
+    area.assign(n, 0.0);
+    parent.assign(n, -1);
+    depth.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) area[i] = loop_area(loops[i]);
+    for (size_t i = 0; i < n; ++i) {
+        double best_area = 0.0;
+        int best = -1;
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j || area[j] <= area[i]) continue;
+            if (loop_contains(loops[j], loops[i])) {
+                depth[i]++;
+                if (best < 0 || area[j] < best_area) {
+                    best_area = area[j];
+                    best = (int)j;
+                }
+            }
+        }
+        parent[i] = best;
+    }
+}
+
 // Build a wire from a loop's edges. Returns an empty (null) wire on failure.
 TopoDS_Wire make_wire(const std::vector<TopoDS_Edge>& edges) {
     if (edges.empty()) return TopoDS_Wire();
@@ -393,32 +470,14 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
     if (loops.empty()) return faces;
 
     // 3) even-odd nesting: for each loop, its parent is the smallest-area loop
-    //    that contains its centroid. Loops with no parent are outer regions; a
-    //    loop whose parent is an outer region is that region's hole. (We build the
-    //    simplest correct version: one nesting level — outer + direct holes —
-    //    which is what the four parity test cases exercise.)
+    //    that contains it. Full circles use exact centre/radius so a concentric
+    //    pair nests as outer+hole (annulus); poly loops use centroid + point-in-poly.
+    //    Loops with no parent are outer regions; a loop whose parent is an outer
+    //    region is that region's hole. (One nesting level — outer + direct holes.)
     const size_t n = loops.size();
-    std::vector<double> area(n);
-    std::vector<Eigen::Vector2d> cent(n);
-    for (size_t i = 0; i < n; ++i) {
-        area[i] = std::abs(signed_area(loops[i].poly));
-        cent[i] = poly_centroid(loops[i].poly);
-    }
-
-    std::vector<int> parent(n, -1);
-    std::vector<int> depth(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        double best_area = 0.0;
-        int best = -1;
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j || area[j] <= area[i]) continue;
-            if (point_in_poly(cent[i], loops[j].poly)) {
-                depth[i]++;
-                if (best < 0 || area[j] < best_area) { best_area = area[j]; best = (int)j; }
-            }
-        }
-        parent[i] = best;
-    }
+    std::vector<double> area;
+    std::vector<int> parent, depth;
+    nest_loops(loops, area, parent, depth);
 
     // 4) Build one face per OUTER region (even depth — a top-level material loop)
     //    with its DIRECT child loops added as reversed (hole) wires. We normalise
@@ -472,27 +531,9 @@ std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
     if (loops.empty()) return faces;
 
     const size_t n = loops.size();
-    std::vector<double> area(n);
-    std::vector<Eigen::Vector2d> cent(n);
-    for (size_t i = 0; i < n; ++i) {
-        area[i] = std::abs(signed_area(loops[i].poly));
-        cent[i] = poly_centroid(loops[i].poly);
-    }
-
-    std::vector<int> parent(n, -1);
-    std::vector<int> depth(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        double best_area = 0.0;
-        int best = -1;
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j || area[j] <= area[i]) continue;
-            if (point_in_poly(cent[i], loops[j].poly)) {
-                depth[i]++;
-                if (best < 0 || area[j] < best_area) { best_area = area[j]; best = (int)j; }
-            }
-        }
-        parent[i] = best;
-    }
+    std::vector<double> area;
+    std::vector<int> parent, depth;
+    nest_loops(loops, area, parent, depth);
 
     auto wire_ccw = [&](const Loop& lp) -> TopoDS_Wire {
         TopoDS_Wire w = make_wire(lp.edges);

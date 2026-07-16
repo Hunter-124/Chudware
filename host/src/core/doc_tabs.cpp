@@ -452,7 +452,7 @@ void AppState::switchToTabCore(int idx) {
     // 7) Contextual ribbon (Wave 2 2D): Assembly docs want the Assembly tab forward (mirrors New
     //    Assembly). A Part has no Assembly/PCB context, so coming from either (e.g. switching from a
     //    Schematic/PCB tab, or an assembly) snaps the ribbon back to Features.
-    if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
+    if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Features; }
     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
 
     // SimManager is per-document and retains its known studies. Do not synchronously refresh here:
@@ -534,7 +534,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx,
                          yaw = d.yaw; pitch = d.pitch; zoom = d.zoom;
                          pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
                      }
-                     if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
+                     if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Features; }
                      else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
                          ribbonTab = RT_Features;
                  } else {

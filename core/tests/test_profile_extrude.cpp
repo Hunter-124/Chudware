@@ -279,11 +279,13 @@ TEST_CASE("circle inside square -> single washer face -> prism with a hole") {
 // 3b. Two concentric circles (no square) -> ONE washer face. Regression for the
 //     detect_loops circle-polygon bug: a full circle used to contribute only a
 //     kEps-sized square at its center, so both loops had equal ~0 area, neither
-//     nested, and extruding fused two solid discs into one solid disc. Sampled
-//     boundary polygons make the outer contain the inner -> one face with a hole.
-//     Volume = pi*(R^2 - r^2)*D.
+//     nested, and extruding fused two solid discs into one solid disc. Exact
+//     circle centre/radius nesting classifies the smaller as a hole; sampled
+//     rings remain for shoelace orientation. Volume = pi*(R^2 - r^2)*D and is
+//     strictly less than the full outer disc (through hole present).
+//     Spec dims: outer r=10, inner r=4 (also covers the R=20/r=10 case shape).
 TEST_CASE("two concentric circles -> single washer face -> annular prism") {
-    const double R = 20.0, r = 10.0, D = 5.0;
+    const double R = 10.0, r = 4.0, D = 5.0;
     json s;
     s["entities"] = json::array({
         circle("outer", 0, 0, R),
@@ -301,21 +303,41 @@ TEST_CASE("two concentric circles -> single washer face -> annular prism") {
     auto faces = faces_from_solved_sketch(sol.entities, SketchPlane::top());
     REQUIRE(faces.size() == 1);  // ONE region = outer disc minus inner hole
 
+    // Face surface area must already be the annulus (not the full disc).
+    {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(faces[0], props);
+        CHECK(props.Mass() == doctest::Approx(PI * (R * R - r * r)).epsilon(1e-3));
+    }
+
     TopoDS_Shape solid =
         geom::extrude_face(faces[0], Eigen::Vector3d(0, 0, 1), D, false);
     double expected_vol = PI * (R * R - r * r) * D;
+    double full_disc_vol = PI * R * R * D;
     double vol = solid_volume(solid);
     MESSAGE("concentric washer: faces=" << faces.size()
             << " volume=" << vol << " (expected " << expected_vol << ")");
     CHECK(vol == doctest::Approx(expected_vol).epsilon(1e-3));
+    // Through-hole: strictly less than the solid outer disc (not a fused pair of discs).
+    CHECK(vol < full_disc_vol * 0.99);
+    CHECK(vol > full_disc_vol * 0.5);  // not the tiny inner disc alone either
+
+    // Exact gp_Circ edges survive: extruded solid has cylindrical side walls.
+    const float color[3] = {0.5f, 0.55f, 0.6f};
+    Loaded ld = roundtrip(solid, "ConcentricWasher", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& b = ld.doc.bodies[0];
+    check_common(b);
+    CHECK(count_surf(b, 1) >= 2);  // outer + inner cylindrical walls
+    CHECK(count_surf(b, 0) >= 2);  // top + bottom annular caps
 }
 
 // 3c. Region pick of the INNER disc of two concentric circles. all_region_faces
 //     exposes both material (washer) and void (inner disc) faces; picking the
-//     void region by its (0,0) centroid must extrude a solid cylinder of radius r.
+//     void region by area must extrude a solid cylinder of radius r.
 //     This is the kernel half of the Extrude PropertyManager region picker.
 TEST_CASE("concentric circles: all-region inner disc extrudes to solid cylinder") {
-    const double R = 20.0, r = 10.0, D = 8.0;
+    const double R = 10.0, r = 4.0, D = 8.0;
     json s;
     s["entities"] = json::array({
         circle("outer", 0, 0, R),

@@ -1981,25 +1981,53 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             frameBBox(st, st.zoomToBBoxMin, st.zoomToBBoxMax);
         }
 
-        // W2-ref: one-shot Zoom-to-Fit after open/new once real mesh geometry exists.
-        // Skip empty docs (no mesh / radius 0); clear so rebuilds never re-fire.
-        if (st.fitViewOnNextMeshCommit && st.hasDocMesh && renderer.modelRadius() > 0.0f) {
-            st.fitViewOnNextMeshCommit = false;
-            applyViewPreset(st, ViewPreset::ZoomFit);
+        // W2-ref / ITEM 13: one-shot Zoom-to-Fit on the FIRST actual display of a doc with a
+        // known model radius. Prefer per-doc fitPendingDocIds (survives opening while another
+        // tab/workspace is focused); migrate the legacy global flag onto the active doc id.
+        // Consumed once — never re-fits on rebuilds or later tab switches.
+        {
+            const std::string curDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+            if (st.fitViewOnNextMeshCommit) {
+                st.fitViewOnNextMeshCommit = false;
+                if (!curDocId.empty()) st.fitPendingDocIds.insert(curDocId);
+            }
+            if (!curDocId.empty() && st.fitPendingDocIds.count(curDocId) &&
+                st.hasDocMesh && renderer.modelRadius() > 0.0f) {
+                st.fitPendingDocIds.erase(curDocId);
+                applyViewPreset(st, ViewPreset::ZoomFit);
+            }
         }
 
-        // Shared hasContent signal (same definition as AppState::applyDocDrivenVisibility):
-        // any feature (incl. sketch) OR any assembly component => non-empty doc for
-        // reference-plane/origin auto-hide. Planes use autoHiddenPlanes; origin uses this
-        // flag so the two never diverge.
-        bool hasContent = false;
+        // Shared hasSolidContent signal (same definition as AppState::applyDocDrivenVisibility):
+        // a solid/3D-producing feature OR any assembly component => references auto-hide.
+        // Sketches and pure reference datums alone do NOT hide planes/origin/axes.
+        bool hasSolidContent = false;
         if (st.docMirror.hasDoc()) {
             const auto& tree = st.docMirror.tree();
             if (tree.is_object()) {
-                auto tfi = tree.find("features");
-                if (tfi != tree.end() && tfi->is_array() && !tfi->empty()) hasContent = true;
                 auto tci = tree.find("components");
-                if (tci != tree.end() && tci->is_array() && !tci->empty()) hasContent = true;
+                if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+                    hasSolidContent = true;
+                } else {
+                    auto tfi = tree.find("features");
+                    if (tfi != tree.end() && tfi->is_array()) {
+                        auto isRefOnly = [](const std::string& type) {
+                            return type == "sketch" || type == "sketch3d" ||
+                                   type == "plane" || type == "datum_plane" ||
+                                   type == "axis" || type == "datum_axis" ||
+                                   type == "point" || type == "datum_point" ||
+                                   type == "csys";
+                        };
+                        for (const auto& f : *tfi) {
+                            if (!f.is_object() || f.value("suppressed", false)) continue;
+                            const std::string type = f.value("type", std::string());
+                            if (!type.empty() && !isRefOnly(type)) {
+                                hasSolidContent = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2007,7 +2035,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Until the user takes control, each default plane stays visible until a downstream 3D
         // feature consumes it. AppState records those transitive dependency hits alongside consumed
         // user-created planes; this replaces the old all-or-nothing "any body hides all planes".
-        // W2-ref: also auto-hides all three whenever hasContent (any feature/sketch/component).
+        // ITEM 2: also auto-hides all three whenever hasSolidContent (not mere sketches).
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
         if (st.docMirror.hasDoc() && !st.planesUserToggled) {
             static const char* kPlaneFids[3] = {"plane.front", "plane.top", "plane.right"};
@@ -2038,19 +2066,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // this, a force-shown plane renders but stays unclickable (issues #20/#21).
         for (int pv = 0; pv < 3; ++pv) st.planeVisEff[pv] = effPlane[pv];
 
-        // Origin gizmo + axis force-show: build one effective hidden-datums set per frame.
-        // Origin auto-hide (issue #30 / W2-ref): show only on empty docs; hide once hasContent.
-        // Skipped once the user explicitly toggles origin visibility via the FM eye.
-        // Axis force-show: while a PM axis well is active, unhide every axis in axisDatumIds
-        // (and any "axis.*" id) so revolve/circular-pattern axis picking can see them drawn.
+        // Origin gizmo + axis auto-hide/force-show: one effective hidden-datums set per frame.
+        // Origin auto-hide: show until hasSolidContent; hide once a solid exists (unless user-toggled).
+        // Axis auto-hide: same hasSolidContent gate for every id in axisDatumIds (unless axesUserToggled
+        // or a PM axis well force-shows them). Does not mutate hiddenFeatures — only the renderer set.
         bool pmWantsAxis = !inSketch && st.propertyManager && st.propertyManager->active() &&
                            st.propertyManager->activeWellWantsAxis();
-        if (!st.originUserToggled || pmWantsAxis) {
+        const bool needEffDatums =
+            !st.originUserToggled || !st.axesUserToggled || pmWantsAxis;
+        if (needEffDatums) {
             std::unordered_set<std::string> effDatums = st.hiddenFeatures;
             if (!st.originUserToggled) {
-                if (hasContent) effDatums.insert("point.origin");
-                else            effDatums.erase("point.origin");
-                st.originVisEff = !hasContent;
+                if (hasSolidContent) effDatums.insert("point.origin");
+                else                 effDatums.erase("point.origin");
+                st.originVisEff = !hasSolidContent;
             } else {
                 st.originVisEff = !st.hiddenFeatures.count("point.origin");
             }
@@ -2062,12 +2091,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     else
                         ++it;
                 }
+            } else if (!st.axesUserToggled) {
+                // Auto-hide all injected axes once solid content exists; show them before that
+                // (even if clearViewport seeded them hidden). Individual user hides wait for
+                // axesUserToggled (FM eye).
+                if (hasSolidContent) {
+                    for (const auto& id : st.axisDatumIds) effDatums.insert(id);
+                } else {
+                    for (const auto& id : st.axisDatumIds) effDatums.erase(id);
+                }
             }
             renderer.setHiddenDatums(std::move(effDatums));
         } else {
-            // User took control of origin and no axis well: resync renderer to hiddenFeatures so
-            // a just-closed axis well doesn't leave force-shown axes drawn (Escape/cancel has no
-            // rebuild to call applyDatumVisibility). Does not mutate hiddenFeatures.
+            // User took control of origin AND axes, no axis well: resync to hiddenFeatures so
+            // a just-closed axis well doesn't leave force-shown axes drawn.
             renderer.setHiddenDatums(st.hiddenFeatures);
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }
@@ -2937,7 +2974,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
                 !s_viewSelector.active() && !s_lmbDragActive && !pmOwnsAxisPlane &&
                 st.originVisEff) {
+                // Pick hitbox stays a generous fixed pixel radius (not zoom-dependent).
                 const float grabRadius = 20.0f * ui::uiScale;
+                // ITEM 14: DRAWN ring is a smaller fixed pixel radius — NOT grabRadius*0.8 and
+                // NOT derived from scene/model size. Root cause of zoom-dependent look: the 3D
+                // origin glyph is world-sized (renderer os*0.16f ~ sceneR), so its on-screen size
+                // scales with zoom; a ring tied to the large pick hitbox (16px) looked huge vs the
+                // tiny zoomed-out glyph and tiny vs the zoomed-in glyph. Keep pick = grabRadius.
+                const float ringRadius = 9.0f * ui::uiScale;
                 const float originW[3] = {0.0f, 0.0f, 0.0f};
                 ImVec2 originS;
                 if (ppProject(renderer, vr0, vr1, vw, vh, originW, originS)) {
@@ -2945,14 +2989,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const float dy = io.MousePos.y - originS.y;
                     if (std::sqrt(dx * dx + dy * dy) < grabRadius) {
                         originPickHot = true;
-                        // Hover ring only when not selected — selected uses a distinct
-                        // constant screen-space ring drawn below (same radius family).
+                        // Hover ring only when not selected — selected uses a distinct style below.
                         if (st.selectedFeatureId != "point.origin") {
                             ImDrawList* wdl = ImGui::GetWindowDrawList();
                             wdl->PushClipRect(vr0, vr1, true);
                             float accA[4];
                             ui::Palette::withAlpha(ui::palette.accent, accA, 0.95f);
-                            wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(accA),
+                            wdl->AddCircle(originS, ringRadius, ui::Palette::toU32(accA),
                                            24, 2.0f * ui::uiScale);
                             wdl->PopClipRect();
                         }
@@ -2969,12 +3012,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                 }
             }
-            // Selected-origin highlight: constant screen-space circle (grabRadius*0.8), same
-            // family as the hover ring, distinct style (soft fill + thicker accent stroke).
-            // World-space selected octa halo was removed from renderer for point.origin.
+            // Selected-origin highlight: fixed screen-space circle (ringRadius), distinct style
+            // (soft fill + thicker accent stroke). Pick hitbox remains grabRadius above.
             if (!inSketch && !inSketch3d && st.originVisEff &&
                 st.selectedFeatureId == "point.origin") {
-                const float grabRadius = 20.0f * ui::uiScale;
+                const float ringRadius = 9.0f * ui::uiScale;
                 const float originW[3] = {0.0f, 0.0f, 0.0f};
                 ImVec2 originS;
                 if (ppProject(renderer, vr0, vr1, vw, vh, originW, originS)) {
@@ -2982,10 +3024,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     wdl->PushClipRect(vr0, vr1, true);
                     float fillA[4];
                     ui::Palette::withAlpha(ui::palette.selectionHighlight, fillA, 1.0f);
-                    wdl->AddCircleFilled(originS, grabRadius * 0.8f, ui::Palette::toU32(fillA), 24);
+                    wdl->AddCircleFilled(originS, ringRadius, ui::Palette::toU32(fillA), 24);
                     float ringA[4];
                     ui::Palette::withAlpha(ui::palette.accent, ringA, 1.0f);
-                    wdl->AddCircle(originS, grabRadius * 0.8f, ui::Palette::toU32(ringA),
+                    wdl->AddCircle(originS, ringRadius, ui::Palette::toU32(ringA),
                                    24, 2.5f * ui::uiScale);
                     wdl->PopClipRect();
                 }
@@ -3163,8 +3205,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // ---- C25 W3-J: viewport right-click context menu ----
         // Opened by mouse_gestures when right button released without drag (kRmbContextMenuHook).
+        // ITEM 11: RMB over a component with no prior LMB selection still resolves Open Part —
+        // promote the live hover pick into the selection when the menu opens.
         if (st.wantContextMenu && !inSketch) {
             st.wantContextMenu = false;
+            if (st.hover.valid() &&
+                (st.selection.empty() ||
+                 st.selection.items().back().hit.body_id != st.hover.body_id ||
+                 st.selection.items().back().hit.topo_id != st.hover.topo_id ||
+                 st.selection.items().back().hit.kind != st.hover.kind)) {
+                st.selection.selectOne(st.hover);
+            }
             ImGui::OpenPopup("##vp_ctx");
         }
         // C26: appearance state shared between the vp_ctx menu item and its sibling picker popup.
@@ -3210,9 +3261,33 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // Part-body slot under selection (for Hide/Show/Isolate on solid bodies).
+        int vpBodySlot = -1;
+        uint32_t vpBodyId = 0;
+        bool vpBodyHidden = false;
+        if (!st.selection.empty()) {
+            vpBodyId = st.selection.items().back().hit.body_id;
+            for (int i = 0; i < (int)st.docBodyIds.size(); ++i) {
+                if (st.docBodyIds[i] == vpBodyId) {
+                    vpBodySlot = i;
+                    if (i < (int)st.bodyVisible.size())
+                        vpBodyHidden = (st.bodyVisible[i] == 0);
+                    break;
+                }
+            }
+        }
+        const bool vpHasTopoSel = !st.selection.empty() && st.selection.items().back().hit.valid();
+        const bool vpHasFace = vpHasTopoSel &&
+            st.selection.items().back().hit.kind == render::PickKind::Face;
+        const bool vpHasEdge = vpHasTopoSel &&
+            st.selection.items().back().hit.kind == render::PickKind::Edge;
+        const bool vpHasComp = vpComp && !vpCompId.empty();
+        const bool vpHasBody = vpBodySlot >= 0 && !vpHasComp;
+
         if (ImGui::BeginPopup("##vp_ctx")) {
-            // Assembly component actions (prepended when the pick resolves to a component body).
-            if (vpComp && !vpCompId.empty()) {
+            // ---- ITEM 8: selection-dependent entries ----
+            // Assembly component under cursor/selection.
+            if (vpHasComp) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
                            ui::palette.textDim[2], 1.0f));
@@ -3220,16 +3295,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::PopStyleColor();
                 const bool pathOk = !vpCompAbsPath.empty();
                 if (!pathOk) ImGui::BeginDisabled();
-                if (ImGui::MenuItem("Open Part"))
-                    openComponentPart(st, vpCompAbsPath);
+                // ITEM 11: Open Part must open a focused tab. openComponentPart dedups by path
+                // and sets requestOpenPath / switchToTab; path resolution uses asm tab path.
+                if (ImGui::MenuItem("Open Part")) {
+                    if (pathOk) openComponentPart(st, vpCompAbsPath);
+                    else st.toast(ui::ToastLevel::Warn, "Component has no resolvable source path");
+                }
                 if (ImGui::MenuItem("Edit Model"))
                     st.enterComponentEdit(vpCompId, vpCompAbsPath);
                 if (!pathOk) ImGui::EndDisabled();
                 if (ImGui::MenuItem("Edit Mates"))
                     st.requestEditComponentMates = vpCompId;
                 if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
-                    // Same asm_edit_component hidden op the FeatureManager eye uses. Direct
-                    // apply is safe here (not mid tree-walk) — mirrors applyAppearanceFromViewport.
                     if (st.docMirror.hasDoc() && st.workerStarted) {
                         nlohmann::json op = {{"op", "asm_edit_component"},
                                              {"id", vpCompId},
@@ -3247,15 +3324,57 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 ImGui::Separator();
             }
-            // Selection section (shown only when something is selected / hovered).
-            if (!st.pickStatus.empty()) {
+
+            // Face/edge/body selection actions (part or non-component body).
+            if (vpHasTopoSel && !vpHasComp) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
                            ui::palette.textDim[2], 1.0f));
-                ImGui::TextUnformatted(st.pickStatus.c_str());
+                if (!st.pickStatus.empty())
+                    ImGui::TextUnformatted(st.pickStatus.c_str());
+                else
+                    ImGui::TextUnformatted(vpHasFace ? "Face" : (vpHasEdge ? "Edge" : "Body"));
                 ImGui::PopStyleColor();
+
+                // Edit owning feature when we know it.
+                if (!st.selectedFeatureId.empty() && st.propertyManager) {
+                    if (ImGui::MenuItem("Edit Feature")) {
+                        if (st.propertyManager->openForEdit(st, st.selectedFeatureId))
+                            st.leftPaneTab = AppState::LP_PropertyManager;
+                    }
+                }
+
+                // Hide / Show / Isolate body (host-side bodyVisible, same as FM Solid Bodies).
+                if (vpHasBody) {
+                    if (ImGui::MenuItem(vpBodyHidden ? "Show Body" : "Hide Body")) {
+                        if (vpBodySlot >= 0 && vpBodySlot < (int)st.bodyVisible.size()) {
+                            st.bodyVisible[vpBodySlot] = vpBodyHidden ? 1 : 0;
+                            if (!vpBodyHidden) {
+                                // Drop selection on the body we just hid.
+                                st.selection.clear();
+                            }
+                            st.applyBodyVisibility();
+                        }
+                    }
+                    if (ImGui::MenuItem("Isolate")) {
+                        bool othersAllHidden = true;
+                        for (int j = 0; j < (int)st.bodyVisible.size(); ++j)
+                            if (j != vpBodySlot && st.bodyVisible[j]) {
+                                othersAllHidden = false; break;
+                            }
+                        if (othersAllHidden) {
+                            // Already isolated -> Exit Isolate = Show All.
+                            std::fill(st.bodyVisible.begin(), st.bodyVisible.end(), (uint8_t)1);
+                        } else {
+                            for (int j = 0; j < (int)st.bodyVisible.size(); ++j)
+                                st.bodyVisible[j] = (j == vpBodySlot) ? 1 : 0;
+                        }
+                        st.applyBodyVisibility();
+                    }
+                }
+
                 if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
-                // C26: recolor the selected body. Opens the shared picker (a sibling popup).
+                // C26: recolor the selected body.
                 if (!vpBodyKey.empty()) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_vpKey = vpBodyKey;
@@ -3267,9 +3386,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         applyAppearanceFromViewport(st, vpBodyKey, nullptr);
                 }
                 ImGui::Separator();
+            } else if (!vpHasComp && !st.pickStatus.empty()) {
+                // Hover status without a resolvable body (rare) — still offer clear.
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                           ui::palette.textDim[2], 1.0f));
+                ImGui::TextUnformatted(st.pickStatus.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
+                ImGui::Separator();
             }
-            // View presets submenu.
-            // C37-C: added Normal To (Ctrl+8) and Zoom to Selection (Shift+F).
+
+            // Empty-space / always-available view commands.
             if (ImGui::BeginMenu("View Orientation")) {
                 struct { const char* lbl; ViewPreset p; } prows[] = {
                     {"Front",    ViewPreset::Front},
@@ -3283,13 +3411,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 for (const auto& r : prows)
                     if (ImGui::MenuItem(r.lbl)) applyViewPreset(st, r.p);
                 ImGui::Separator();
-                // C37-C item 1: Normal To — available when a face is selected or always for axis fallback.
                 if (ImGui::MenuItem("Normal To (Ctrl+8)"))
                     normalToSelectionOrNearestAxis(st, inSketch);
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Zoom to Fit (F)"))   applyViewPreset(st, ViewPreset::ZoomFit);
-            // C37-C item 2: Zoom to Selection — disabled when nothing is selected.
             {
                 bool hasSelection = !st.selection.empty();
                 if (!hasSelection) ImGui::BeginDisabled();
@@ -3300,7 +3426,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 s_zoomAreaArmed    = true;
                 s_zoomAreaDragging = false;
             }
-            // Display style submenu.
             if (ImGui::BeginMenu("Display Style")) {
                 struct { const char* lbl; int val; } drows[] = {
                     {"Shaded",                0},
@@ -3319,7 +3444,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             if (ImGui::MenuItem("Section View", nullptr, s_sectionTool.active()))
                 s_sectionTool.toggle(st);
-            // Hide/show submenu.
+            // Hide/show references — empty-space menu and always available.
             if (ImGui::BeginMenu("Hide / Show")) {
                 bool allPlanes = st.planeVisEff[0] && st.planeVisEff[1] && st.planeVisEff[2];
                 if (ImGui::MenuItem("Reference Planes", nullptr, allPlanes)) {
@@ -3330,10 +3455,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::MenuItem("Origin Triad",  nullptr, &st.showTriad);
                 ImGui::MenuItem("Ground Shadow", nullptr, &st.showGroundShadow);
                 ImGui::MenuItem("RealView reflections", nullptr, &st.showRealView);
+                // Show All Bodies when any body is hidden.
+                bool anyBodyHidden = false;
+                for (uint8_t v : st.bodyVisible) if (!v) { anyBodyHidden = true; break; }
+                if (anyBodyHidden && ImGui::MenuItem("Show All Bodies")) {
+                    std::fill(st.bodyVisible.begin(), st.bodyVisible.end(), (uint8_t)1);
+                    st.applyBodyVisibility();
+                }
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            // C37-C item 3: wire the dead "View Selector (Space)" menu item to actually open the selector.
             if (ImGui::MenuItem("View Selector (Space)")) {
                 if (!s_viewSelector.active()) s_viewSelector.open();
             }

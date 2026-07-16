@@ -798,7 +798,7 @@ void createNewDoc(AppState& st, int kindOrd) {
                       "  rev=" + std::to_string(st.docMirror.revision()));
             st.clearViewportForNewDoc();
             st.addDocTab(/*isAssembly=*/asm_);
-            if (asm_) { st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly; }
+            if (asm_) { st.showRibbon = true; st.ribbonTab = AppState::RT_Features; }
         } else {
             st.addLog(std::string("[err] new ") + (asm_ ? "assembly" : "part") + ": " + err);
             st.toast(ui::ToastLevel::Error,

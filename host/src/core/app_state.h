@@ -267,6 +267,7 @@ struct DocSession {
     bool showPlane[3] = {false, false, false};
     bool planesUserToggled = false;
     bool originUserToggled = false;
+    bool axesUserToggled = false;   // sticky: FM eye on any axis takes control of axis auto-hide
     std::string                modelInfo;            // (DocSession parked copy — see AppState field)
     std::vector<PartInfo>      asmParts;
     FitReport                  asmFit;
@@ -1116,6 +1117,9 @@ struct AppState {
     // (reference for the first sketch), auto-hide once a body exists — until the user explicitly
     // toggles origin visibility via the FeatureManager eye, after which hiddenFeatures is honored.
     bool originUserToggled = false;
+    // Sticky escape hatch for reference-axis auto-hide (mirrors originUserToggled). Set when the
+    // user toggles any axis eye in the FeatureManager; until then axes follow hasSolidContent.
+    bool axesUserToggled = false;
     // W2-ref: ids of every reference-axis datum currently injected (default axis.x/y/z +
     // GUI-derived plane-intersection axes). Seeded hidden on a fresh doc; consulted by the
     // viewport to FORCE-SHOW every axis while a Revolve/axis PropertyManager well is active,
@@ -1134,10 +1138,15 @@ struct AppState {
     std::string axisInjectPlaneFp;  // fingerprint of user planes that built axisAutoCache
     // Tree display-name cache: id -> display name, rebuilt when axisDatumIds membership changes.
     std::unordered_map<std::string, std::string> axisDisplayNames;
-    // W2-ref: one-shot request to animate Zoom-to-Fit after the next real mesh commit for the
-    // active doc (set on file open / new doc; consumed + cleared once by the viewport when
-    // geometry with a known model radius exists, so rebuilds/tab switches never re-fit).
+    // W2-ref: one-shot Zoom-to-Fit after open/new. Legacy global flag still set by open paths;
+    // prefer fitPendingDocIds (per-doc) so a part opened while another tab is focused still fits
+    // the first time THAT doc is actually drawn with a known model radius. Consumed once; never
+    // re-fits on rebuilds or later tab switches.
     bool fitViewOnNextMeshCommit = false;
+    // Per-doc pending first-display Zoom-to-Fit. Keyed by worker doc id. Set on file open
+    // (alongside fitViewOnNextMeshCommit); consumed by the viewport when that doc is the
+    // active drawn doc AND has a mesh with modelRadius > 0.
+    std::unordered_set<std::string> fitPendingDocIds;
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire

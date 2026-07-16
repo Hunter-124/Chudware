@@ -148,6 +148,7 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     // Model workspace (0) and fallback: all 3D modeling tabs, no sim/pcb/drawing/manufacture
     // unless the legacy bools override (backwards compat for callers that pass them explicitly).
     if (tab == 9 || tab == 10) return false;   // drawing tabs: 3D docs never
+    if (tab == 4) return false;                // Assembly tab retired: tools live on Features>Assembly group
     if (tab == 3) return showSimulationTools;  // Simulation: legacy bool
     if (tab == 7) return showPcbTools;         // PCB Design: legacy bool
     if (tab == 20) return showPcbTools;        // Schematic: same legacy ECAD bool as PCB Design

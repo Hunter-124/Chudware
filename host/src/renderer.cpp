@@ -1653,7 +1653,9 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     auto setCol = [&](float r, float g, float b, float a) { glUniform4f(colLoc, r, g, b, a); };
 
     // Soft grey datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
-    const float L = e * 1.6f;     // half-length of an axis line (matches hit-test)
+    // Axis half-length L equals the plane half-extent basis e (NOT e*1.6) so a drawn axis
+    // spans the same distance as a datum plane edge from center to side. Worker C pick must match.
+    const float L = e;            // half-length of an axis line (matches hit-test; was e*1.6)
     const float ps = e * 0.55f;   // half-extent of a datum-plane quad (smaller than origin planes)
     const float ms = e * 0.04f;   // half-size of a point marker cross
     const float cs = e * 0.35f;   // csys axis length
@@ -1667,7 +1669,8 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
             case RefDatum::Kind::Axis: {
                 // Soft grey DASHED line (slightly brighter + thicker when selected). The dashes are
                 // split on the CPU into cells and every other cell drawn, since core-profile GL has
-                // no line stipple. Endpoints match the axis picker's hit-test (L = radius*1.6).
+                // no line stipple. Endpoints match the axis picker's hit-test (L = e = radius or
+                // kEmptySceneRadius).
                 // Normalize dir so a non-unit inject never collapses the segment; skip only true
                 // zero-length directions (all three axes inject as unit vectors).
                 Vec3 dir = d.dir;

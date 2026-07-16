@@ -1056,6 +1056,21 @@ if(AICAD_WITH_OCCT)
   add_test(NAME export_assembly COMMAND test_export_assembly)
   set_tests_properties(export_assembly PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Assembly insert: asm_insert_component places components into the tree ---
+  # Locks the host Insert Component contract (new assembly → insert source path →
+  # component appears, first is fixed, second is floating).
+  add_executable(test_insert_component
+    tests/test_insert_component.cpp)
+  target_include_directories(test_insert_component PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_insert_component PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_insert_component PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME insert_component COMMAND test_insert_component)
+  set_tests_properties(insert_component PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- simulate_motion: assembly kinematic sweep smoke test -------------------
   # Exercises doc_simulate_motion end-to-end: assembly + angle mate + sweep 0->90 deg.
   # Linked like test_export_assembly (needs STEP writer via aicad_geom_occt).

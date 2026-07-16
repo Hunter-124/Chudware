@@ -4,8 +4,8 @@
 // Assembly tab. It drives the LIVE worker through core::DocMirror (assembly doc), mirroring the
 // verified engine flow in engine/doc/test_worker_asm.py:
 //
-//   - Insert Component:  a path input + "Insert" (asm_insert_component). The first component is
-//                        auto-fixed by the engine (fixed = first). Re-tessellates -> viewport.
+//   - Insert Component:  open/recent-parts chooser + Browse… (asm_insert_component). The first
+//                        component is auto-fixed by the engine (fixed = first). Re-tessellates -> viewport.
 //   - Mate PM form:      C17 PropertyManager visual style. Two SelectorWells fed by viewport picks
 //                        resolved via doc_resolve_pick (assembly picks return {component, selector};
 //                        the component id is taken straight from the resolve response). Mate-type
@@ -40,8 +40,8 @@ enum class MateSurfKind { None, Plane, Cylinder, Other };
 class AsmPanels {
 public:
     // Ribbon dispatch for the Assembly tab (and File > New Assembly). Returns true if consumed.
-    // cmdId: "asm_insert" | "asm_mate" | "asm_move" | "asm_pattern" | "asm_explode" |
-    //        "asm_bom" | "asm_interference" | "new_assembly".
+    // cmdId: "asm_insert" | "asm_parts_library" | "asm_mate" | "asm_move" | "asm_pattern" |
+    //        "asm_explode" | "asm_bom" | "asm_interference" | "new_assembly".
     bool handleCommand(AppState& st, const std::string& cmdId);
 
     // Draw every open assembly window/form. Call once per frame after the other panels.
@@ -78,7 +78,7 @@ public:
     // Set the explode factor (0..1); reloads the re-tessellated mesh in place.
     bool setExplode(AppState& st, bool active, float factor);
     // Close transient windows (scenario housekeeping so only the intended window is on top).
-    void closeInsert()  { insertOpen_ = false; }
+    void closeInsert()  { insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear(); }
     void closeExplode() { explodeOpen_ = false; }
 
     // Close the mate form (public so scripted scenarios can dismiss it before other shots).
@@ -88,11 +88,6 @@ private:
     void beginMateForm();
     void beginPatternForm();
     void drawInsert(AppState& st);
-    void drawPartsLibrary(AppState& st);
-    // Generate a catalog part (parts_make) and insert it into the active assembly. Returns the
-    // solved aicm path in aicmOut. length_mm <= 0 means "use the family default".
-    bool insertCatalogPart(AppState& st, const std::string& family, const std::string& size,
-                           double length_mm, std::string& aicmOut);
     void drawMateForm(AppState& st);
     void drawPatternForm(AppState& st);
     void drawExplode(AppState& st);
@@ -111,18 +106,11 @@ private:
 
     // ---- Insert ----
     bool insertOpen_ = false, insertFocus_ = false;
-    std::vector<char> insertPath_{std::vector<char>(512, 0)};
+    int  insertSel_ = -1;                 // selected row in the open/recent chooser (-1 = none)
+    std::string insertChosenPath_;        // absolute path of the selected open/recent/browse part
+    std::string insertNote_;              // last insert status / error line
+    std::string insertTargetDocId_;       // assembly doc_id captured when the dialog opened / last insert
 
-    // ---- Standard Parts Library (parametric catalog browser) ----
-    bool partsLibOpen_ = false, partsLibFocus_ = false;
-    bool partsCatalogFetched_ = false;          // lazy parts_catalog_list fetch done
-    nlohmann::json partsCatalog_;               // {"families":[...]} from the core
-    std::string partsCatalogError_;             // non-empty if the fetch failed
-    int partsSelFamily_ = -1;                   // index into families (-1 = none)
-    int partsSelSize_ = 0;                       // index into the selected family's sizes
-    std::vector<char> partsLenBuf_{std::vector<char>(32, 0)};  // length (mm) when needs_length
-    std::vector<char> partsFilter_{std::vector<char>(64, 0)};  // family search filter
-    std::string partsNote_;                     // last insert status line
 
     // ---- Mate form (PM-style) ----
     bool mateOpen_ = false, mateFocus_ = false;

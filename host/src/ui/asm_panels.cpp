@@ -2,11 +2,12 @@
 #include "asm_panels.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+
 #include <map>
 #include <string>
 
@@ -19,11 +20,13 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "file_dialog.h"
+#include "toast.h"
 #include "../ui_theme.h"
 
 namespace ui {
 
-// Liquid-glass v2 for the floating assembly tool windows (Insert / Parts Library / Mate / Pattern /
+// Liquid-glass v2 for the floating assembly tool windows (Insert / Mate / Pattern /
 // Explode / Interference / BOM). These are independent top-level ImGui::Begin() windows (NOT embedded
 // in a pinned column), so each paints its OWN frosted backdrop — the layout.cpp drawLeftPane recipe:
 //   pushGlassWindow()  -> WindowBg transparent (so the native fill doesn't sit over our glassPanel)
@@ -115,15 +118,38 @@ static std::string componentName(AppState& st, const std::string& cid) {
 bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "new_assembly") {
         std::string err;
-        if (st.docMirror.newAssembly(st.worker, err))
+        if (st.docMirror.newAssembly(st.worker, err)) {
             st.addLog("[asm] new assembly  rev=" + std::to_string(st.docMirror.revision()));
-        else
+            // ensureActiveTab runs per-frame; stamp the insert target now so Insert lands here.
+            insertTargetDocId_ = st.docMirror.docId();
+        } else {
             st.addLog("[err] new assembly: " + err);
-        insertOpen_ = true; insertFocus_ = true;  // SolidWorks opens Insert Component on a new assembly
+        }
+        insertOpen_ = true; insertFocus_ = true;
+        insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
         return true;
     }
-    if (cmdId == "asm_insert")  { insertOpen_ = true; insertFocus_ = true; return true; }
-    if (cmdId == "asm_parts_library") { partsLibOpen_ = true; partsLibFocus_ = true; return true; }
+    if (cmdId == "asm_insert") {
+        insertOpen_ = true; insertFocus_ = true;
+        insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+        // Capture the intended assembly while the user is still on it.
+        if (st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
+            st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1")
+            insertTargetDocId_ = st.docMirror.docId();
+        else if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                 st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly)
+            insertTargetDocId_ = st.docTabs[st.activeTab].docId;
+        else
+            insertTargetDocId_.clear();
+        return true;
+    }
+    if (cmdId == "asm_parts_library") {
+        // Route to the full Parts Library workspace tab instead of a mini popup.
+        st.activeWorkspace = AppState::Workspace::PartsLibrary;
+        st.toast(ui::ToastLevel::Info, "Parts Library — pick a standard part to insert.");
+        st.addLog("[asm] Std. Parts → Parts Library workspace");
+        return true;
+    }
     if (cmdId == "asm_mate")    { beginMateForm(); return true; }
     if (cmdId == "asm_explode") { explodeOpen_ = true; explodeFocus_ = true; return true; }
     if (cmdId == "asm_interference") {
@@ -170,7 +196,7 @@ void AsmPanels::draw(AppState& st) {
         st.addLog("[asm] edit mates for component " + cid);
     }
     drawInsert(st);
-    drawPartsLibrary(st);
+    // Std. Parts routes to the Parts Library workspace (no mini popup).
     drawMateForm(st);
     drawPatternForm(st);
     drawExplode(st);
@@ -182,22 +208,161 @@ void AsmPanels::draw(AppState& st) {
 // Insert Component
 // ===========================================================================
 
+namespace {
+// True when the active DocMirror document is an assembly.
+bool mirrorIsAssembly(AppState& st) {
+    const auto& tree = st.docMirror.tree();
+    return st.docMirror.hasDoc() && tree.is_object() &&
+           tree.value("schema", std::string()) == "aicad.asm/1";
+}
+
+// Basename (no directory) for list rows / tooltips.
+std::string pathBaseName(const std::string& p) {
+    size_t slash = p.find_last_of("/\\");
+    return (slash == std::string::npos) ? p : p.substr(slash + 1);
+}
+
+// One selectable entry in the Insert Component chooser.
+struct InsertCandidate {
+    std::string path;    // absolute path (empty for unsaved open parts)
+    std::string label;   // display title
+    std::string detail;  // secondary line (Open / Recent / path)
+    bool isOpen = false;
+};
+
+// Build open-part tabs + recent files (deduped). Open tabs first so the user can
+// drop a part they already have loaded without re-browsing the disk.
+std::vector<InsertCandidate> buildInsertCandidates(AppState& st) {
+    std::vector<InsertCandidate> out;
+    std::vector<std::string> seenPaths;
+    auto already = [&](const std::string& p) {
+        if (p.empty()) return false;
+        for (const auto& s : seenPaths)
+            if (s == p) return true;
+        return false;
+    };
+    auto pushSeen = [&](const std::string& p) {
+        if (!p.empty()) seenPaths.push_back(p);
+    };
+
+    // Open part tabs (skip the active assembly itself and non-part docs).
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const auto& t = st.docTabs[i];
+        if (t.kind != AppState::DocTab::TabKind::Part) continue;
+        if (already(t.path)) continue;
+        InsertCandidate c;
+        c.path = t.path;
+        c.label = t.displayTitle();
+        if (c.label.empty()) c.label = t.title.empty() ? std::string("Part") : t.title;
+        c.detail = t.path.empty() ? std::string("Open · unsaved")
+                                  : std::string("Open");
+        c.isOpen = true;
+        out.push_back(std::move(c));
+        pushSeen(t.path);
+    }
+
+    // Recent files — parts only (skip assemblies / unknown extensions).
+    for (const auto& rp : st.recentFiles) {
+        if (rp.empty() || already(rp)) continue;
+        std::string low = rp;
+        std::transform(low.begin(), low.end(), low.begin(),
+                       [](unsigned char ch) { return (char)std::tolower(ch); });
+        // Skip assembly-looking recent entries; component sources are parts.
+        if (low.size() >= 7 && low.compare(low.size() - 7, 7, ".sldasm") == 0) continue;
+        InsertCandidate c;
+        c.path = rp;
+        c.label = pathBaseName(rp);
+        c.detail = "Recent";
+        c.isOpen = false;
+        out.push_back(std::move(c));
+        pushSeen(rp);
+    }
+    return out;
+}
+
+// Filter for Browse… (component source files the engine can load).
+static const char* kInsertFilter =
+    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply\0"
+    "Billet part (*.step+)\0*.step+\0"
+    "STEP (*.step;*.stp)\0*.step;*.stp\0"
+    "All files (*.*)\0*.*\0";
+}  // namespace
+
 bool AsmPanels::insertComponent(AppState& st, const std::string& path,
                                 const nlohmann::json& transform, std::string& aicmOut) {
     aicmOut.clear();
-    if (!st.docMirror.hasDoc()) return false;
+    if (path.empty()) {
+        insertNote_ = "No part selected.";
+        return false;
+    }
+
+    // Resolve the intended assembly document. Prefer the explicit target captured when
+    // Insert opened / New Assembly ran; fall back to the active assembly tab / live mirror.
+    std::string targetDoc = insertTargetDocId_;
+    if (targetDoc.empty() && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly &&
+        !st.docTabs[st.activeTab].docId.empty()) {
+        targetDoc = st.docTabs[st.activeTab].docId;
+    }
+    if (targetDoc.empty() && mirrorIsAssembly(st))
+        targetDoc = st.docMirror.docId();
+
+    if (targetDoc.empty()) {
+        insertNote_ = "No assembly open. Use File > New Assembly first.";
+        st.addLog("[err] insert: no target assembly");
+        return false;
+    }
+
+    // If the live mirror is pointing at a different doc (user switched tabs), re-activate the
+    // intended assembly so the op lands on the right document — never a part or another asm.
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != targetDoc) {
+        // Prefer switchToTab so camera/session state stays coherent.
+        int tabIdx = -1;
+        for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+            if (st.docTabs[i].docId == targetDoc) { tabIdx = i; break; }
+        }
+        if (tabIdx >= 0) {
+            st.switchToTab(tabIdx);
+        } else {
+            std::string aicm, err;
+            if (!st.docMirror.activate(st.worker, targetDoc, aicm, err)) {
+                insertNote_ = "Could not activate assembly: " + err;
+                st.addLog("[err] insert activate: " + err);
+                return false;
+            }
+            if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+        }
+    }
+
+    if (!mirrorIsAssembly(st) || st.docMirror.docId() != targetDoc) {
+        insertNote_ = "Active document is not the target assembly.";
+        st.addLog("[err] insert: active doc is not the target assembly (" +
+                  st.docMirror.docId() + " vs " + targetDoc + ")");
+        return false;
+    }
+
+    // Keep the target sticky for subsequent Inserts from the same dialog.
+    insertTargetDocId_ = targetDoc;
+
     nlohmann::json op = {{"op", "asm_insert_component"}, {"source", {{"path", path}}}};
     if (!transform.is_null()) op["transform"] = transform;
     // T-PERF1: async so large component inserts don't freeze the GL thread. aicmOut is filled
     // only on the sync path for callers that need it immediately; the mesh reloads in the
-    // drain callback either way.
+    // drain callback either way. Capture targetDoc so a superseded completion can't load mesh
+    // into a different document.
     aicmOut.clear();
     ++st.rebuildsInFlight;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
-        [&st](const core::OpsResponse& r, bool applied) {
+        [&st, targetDoc](const core::OpsResponse& r, bool applied) {
             --st.rebuildsInFlight;
             if (!applied) return;
             if (!r.ok) { st.addLog("[err] insert: " + r.error_message); return; }
+            // Only load mesh if the mirror is still on the target assembly.
+            if (st.docMirror.docId() != targetDoc) {
+                st.addLog("[asm] insert completed on " + targetDoc +
+                          " (active doc changed — mesh not reloaded here)");
+                return;
+            }
             if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
         });
     return true;
@@ -207,7 +372,7 @@ void AsmPanels::drawInsert(AppState& st) {
     if (!insertOpen_) return;
     bool open = true;
     ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(380 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
+    ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 360 * ui::uiScale), ImGuiCond_Appearing);
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
     pushGlassWindow();
     const bool insWin = ImGui::Begin("Insert Component", &open);
@@ -217,14 +382,88 @@ void AsmPanels::drawInsert(AppState& st) {
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert a part into the assembly");
         ImGui::Spacing();
-        if (!st.docMirror.hasDoc()) {
+
+        const bool haveAsm = mirrorIsAssembly(st) ||
+            (!insertTargetDocId_.empty()) ||
+            (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+             st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
+
+        if (!haveAsm) {
             pushText(ui::palette.statusWarn);
             ImGui::TextWrapped("No assembly open. Use File > New Assembly first.");
             ImGui::PopStyleColor();
         } else {
-            ImGui::TextUnformatted("Source file (.step+ / .step / .stl):");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##asm_insert_path", insertPath_.data(), insertPath_.size());
+            // Target assembly readout so the user knows which doc receives the insert.
+            std::string targetLabel;
+            if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly)
+                targetLabel = st.docTabs[st.activeTab].displayTitle();
+            if (targetLabel.empty() && mirrorIsAssembly(st)) {
+                targetLabel = st.docMirror.tree().value("name", std::string("Assembly"));
+            }
+            if (targetLabel.empty()) targetLabel = "Assembly";
+            pushText(ui::palette.textDim);
+            ImGui::Text("Target: %s", targetLabel.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+
+            const auto candidates = buildInsertCandidates(st);
+
+            ImGui::TextUnformatted("Open & recent parts");
+            const float listH = ImGui::GetContentRegionAvail().y -
+                                (ImGui::GetFrameHeightWithSpacing() * 3.2f);
+            ImGui::BeginChild("##asm_insert_list",
+                              ImVec2(0, listH > 80.0f * ui::uiScale ? listH : 120.0f * ui::uiScale),
+                              true);
+            if (candidates.empty()) {
+                pushText(ui::palette.textDim);
+                ImGui::TextWrapped("No open or recent parts. Use Browse… to pick a file.");
+                ImGui::PopStyleColor();
+            } else {
+                for (int i = 0; i < (int)candidates.size(); ++i) {
+                    const auto& c = candidates[i];
+                    const bool selectable = !c.path.empty();  // unsaved open parts can't insert by path
+                    if (!selectable) ImGui::BeginDisabled();
+                    // "Open · bracket.step+    [label]" — single row, full path on hover.
+                    std::string row = c.label;
+                    if (!c.detail.empty()) row += "  —  " + c.detail;
+                    const bool sel = (insertSel_ == i);
+                    if (ImGui::Selectable((row + "##ins" + std::to_string(i)).c_str(), sel,
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                        insertSel_ = i;
+                        insertChosenPath_ = c.path;
+                        insertNote_.clear();
+                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !c.path.empty()) {
+                            std::string aicm;
+                            if (insertComponent(st, c.path, nullptr, aicm)) {
+                                insertNote_ = "Inserting " + pathBaseName(c.path) + "…";
+                                st.addLog("[asm] inserted: " + c.path);
+                            }
+                        }
+                    }
+                    if (!selectable) {
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("Save this part first so it has a path to insert.");
+                    } else if (ImGui::IsItemHovered() && !c.path.empty()) {
+                        ImGui::SetTooltip("%s", c.path.c_str());
+                    }
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::Spacing();
+            // Chosen path summary + Browse fallback.
+            if (!insertChosenPath_.empty()) {
+                pushText(ui::palette.textDim);
+                ImGui::Text("Selected: %s", pathBaseName(insertChosenPath_).c_str());
+                ImGui::PopStyleColor();
+            } else {
+                pushText(ui::palette.textDim);
+                ImGui::TextUnformatted("Select a part above, or Browse…");
+                ImGui::PopStyleColor();
+            }
+
             const bool hasComps =
                 st.docMirror.tree().is_object() &&
                 st.docMirror.tree().contains("components") &&
@@ -235,248 +474,47 @@ void AsmPanels::drawInsert(AppState& st) {
                 ? "Inserted at the origin (drag/mate to position)."
                 : "First component is fixed automatically (SolidWorks behaviour).");
             ImGui::PopStyleColor();
+
             ImGui::Spacing();
-            if (ImGui::Button("Insert", ImVec2(ui::metrics::asmBtnW(), 0)) && insertPath_[0]) {
+            const float btnW = ui::metrics::asmBtnW();
+            const bool canInsert = !insertChosenPath_.empty();
+            if (!canInsert) ImGui::BeginDisabled();
+            if (ImGui::Button("Insert", ImVec2(btnW, 0))) {
                 std::string aicm;
-                if (insertComponent(st, insertPath_.data(), nullptr, aicm))
-                    st.addLog("[asm] inserted: " + std::string(insertPath_.data()));
+                if (insertComponent(st, insertChosenPath_, nullptr, aicm)) {
+                    insertNote_ = "Inserting " + pathBaseName(insertChosenPath_) + "…";
+                    st.addLog("[asm] inserted: " + insertChosenPath_);
+                }
+            }
+            if (!canInsert) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Browse…", ImVec2(btnW, 0))) {
+                if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
+                    st.toast(ui::ToastLevel::Info,
+                             "File dialogs disabled (AI_CAD_NO_FILE_DIALOGS).");
+                } else {
+                    std::string path = openFileDialog(kInsertFilter);
+                    if (!path.empty()) {
+                        insertChosenPath_ = path;
+                        insertSel_ = -1;  // browse is outside the list
+                        insertNote_.clear();
+                    }
+                }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Close", ImVec2(ui::metrics::asmBtnW(), 0))) insertOpen_ = false;
+            if (ImGui::Button("Close", ImVec2(btnW, 0))) insertOpen_ = false;
+
+            if (!insertNote_.empty()) {
+                ImGui::Spacing();
+                pushText(ui::palette.textDim);
+                ImGui::TextWrapped("%s", insertNote_.c_str());
+                ImGui::PopStyleColor();
+            }
         }
         endGlassWindow();
     }
     ImGui::End();
     if (!open) insertOpen_ = false;
-}
-
-// ===========================================================================
-// Standard Parts Library — parametric catalog browser (parts_catalog_list / parts_make)
-// ===========================================================================
-
-namespace {
-// A stable cache path per part identity, so the same part dedupes to one .step and the
-// assembly's source.path stays valid across rebuilds. Sanitizes size designators
-// ("1/4-20" / "#6-32") into filename-safe tokens.
-std::string partsCacheDir() {
-    // appdataDir() resolves %APPDATA% on Windows / XDG (~/.local/share) on POSIX; '/' is a
-    // valid separator on both, so the cache path is correct cross-platform.
-    return appdataAppDir() + "/cache/parts_library";
-}
-std::string sanitizeToken(const std::string& s) {
-    std::string out;
-    for (char c : s) out += (c == '/' || c == '\\' || c == '#' || c == ' ' || c == '.') ? '_' : c;
-    return out;
-}
-}  // namespace
-
-bool AsmPanels::insertCatalogPart(AppState& st, const std::string& family,
-                                  const std::string& size, double length_mm,
-                                  std::string& aicmOut) {
-    aicmOut.clear();
-    if (!st.docMirror.hasDoc()) {
-        partsNote_ = "Open or create an assembly first.";
-        return false;
-    }
-    std::error_code ec;
-    std::filesystem::create_directories(partsCacheDir(), ec);
-    std::string fname = family + "_" + sanitizeToken(size);
-    if (length_mm > 0.0) fname += "_" + std::to_string((int)length_mm);
-    const std::string stepPath = partsCacheDir() + "\\" + fname + ".step";
-
-    nlohmann::json params = {{"family", family}, {"size", size}, {"save_path", stepPath}};
-    if (length_mm > 0.0) params["length_mm"] = length_mm;
-    nlohmann::json res;
-    std::string err;
-    if (!st.worker.call("parts_make", params, res, err)) {
-        partsNote_ = "parts_make failed: " + err;
-        st.addLog("[err] parts_make: " + err);
-        return false;
-    }
-    if (!res.value("ok", false)) {
-        const std::string e = res.value("error", std::string("unknown error"));
-        partsNote_ = "parts_make: " + e;
-        st.addLog("[err] parts_make: " + e);
-        return false;
-    }
-    const std::string sp = res.value("step_path", stepPath);
-    if (!insertComponent(st, sp, nullptr, aicmOut)) return false;
-    partsNote_ = "Inserted " + res.value("name", fname) + ".";
-    st.addLog("[asm] inserted catalog part: " + res.value("name", fname));
-    return true;
-}
-
-void AsmPanels::drawPartsLibrary(AppState& st) {
-    if (!partsLibOpen_) return;
-    bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 420 * ui::uiScale), ImGuiCond_Appearing);
-    if (partsLibFocus_) { ImGui::SetNextWindowFocus(); partsLibFocus_ = false; }
-    pushGlassWindow();
-    const bool partsLibWin = ImGui::Begin("Standard Parts Library", &open);
-    popGlassWindow();
-    if (partsLibWin) {
-        paintGlassWindow("asm_partslib_glass");
-        asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        ImGui::TextUnformatted("Insert standard hardware (generated to spec)");
-        ImGui::Spacing();
-
-        // Lazy fetch the catalog from the core (synchronous; tiny payload).
-        if (!partsCatalogFetched_) {
-            nlohmann::json res;
-            std::string err;
-            if (st.worker.call("parts_catalog_list", nlohmann::json::object(), res, err) &&
-                res.is_object() && res.contains("families")) {
-                partsCatalog_ = res;
-                partsCatalogError_.clear();
-            } else {
-                partsCatalogError_ = err.empty() ? "catalog unavailable" : err;
-            }
-            partsCatalogFetched_ = true;
-        }
-
-        if (!partsCatalogError_.empty()) {
-            pushText(ui::palette.statusWarn);
-            ImGui::TextWrapped("Could not load the parts catalog: %s", partsCatalogError_.c_str());
-            ImGui::PopStyleColor();
-            if (ImGui::Button("Retry")) partsCatalogFetched_ = false;
-            endGlassWindow();
-            ImGui::End();
-            if (!open) partsLibOpen_ = false;
-            return;
-        }
-
-        const nlohmann::json& fams =
-            (partsCatalog_.is_object() && partsCatalog_["families"].is_array())
-                ? partsCatalog_["families"]
-                : nlohmann::json::array();
-
-        if (!st.docMirror.hasDoc()) {
-            pushText(ui::palette.statusWarn);
-            ImGui::TextWrapped("No assembly open — use File > New Assembly to insert parts.");
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-        }
-
-        // Search filter over family names/categories.
-        ImGui::SetNextItemWidth(220 * ui::uiScale);
-        ImGui::InputTextWithHint("##parts_filter", "filter (e.g. screw, bearing, M3)",
-                                 partsFilter_.data(), partsFilter_.size());
-        std::string filt = partsFilter_.data();
-        std::transform(filt.begin(), filt.end(), filt.begin(), ::tolower);
-
-        ImGui::Spacing();
-        ImGui::BeginChild("parts_list", ImVec2(220 * ui::uiScale, -1), true);
-        std::string lastCat;
-        for (int i = 0; i < (int)fams.size(); ++i) {
-            const nlohmann::json& f = fams[i];
-            const std::string name = f.value("name", std::string());
-            const std::string cat = f.value("category", std::string());
-            const std::string key = f.value("key", std::string());
-            if (!filt.empty()) {
-                std::string hay = name + " " + cat + " " + key;
-                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
-                // also match any size token (e.g. "m3")
-                for (const auto& s : f.value("sizes", nlohmann::json::array())) {
-                    std::string sv = s.get<std::string>();
-                    std::transform(sv.begin(), sv.end(), sv.begin(), ::tolower);
-                    hay += " " + sv;
-                }
-                if (hay.find(filt) == std::string::npos) continue;
-            }
-            if (cat != lastCat) {
-                pushText(ui::palette.textDim);
-                ImGui::TextUnformatted(cat.c_str());
-                ImGui::PopStyleColor();
-                lastCat = cat;
-            }
-            if (ImGui::Selectable((name + "##fam" + std::to_string(i)).c_str(),
-                                  partsSelFamily_ == i)) {
-                partsSelFamily_ = i;
-                partsSelSize_ = 0;
-                partsLenBuf_[0] = 0;
-            }
-        }
-        ImGui::EndChild();
-
-        ImGui::SameLine();
-        ImGui::BeginChild("parts_detail", ImVec2(0, -1), false);
-        if (partsSelFamily_ >= 0 && partsSelFamily_ < (int)fams.size()) {
-            const nlohmann::json& f = fams[partsSelFamily_];
-            ImGui::TextUnformatted(f.value("name", std::string("?")).c_str());
-            pushText(ui::palette.textDim);
-            ImGui::TextWrapped("%s", f.value("description", std::string()).c_str());
-            ImGui::Text("Standard: %s", f.value("standard", std::string("-")).c_str());
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-
-            const nlohmann::json sizes = f.value("sizes", nlohmann::json::array());
-            if (partsSelSize_ >= (int)sizes.size()) partsSelSize_ = 0;
-            const std::string curSize =
-                sizes.empty() ? std::string() : sizes[partsSelSize_].get<std::string>();
-
-            ImGui::TextUnformatted("Size");
-            ImGui::SetNextItemWidth(160 * ui::uiScale);
-            if (ImGui::BeginCombo("##parts_size", curSize.c_str())) {
-                for (int s = 0; s < (int)sizes.size(); ++s) {
-                    const std::string sv = sizes[s].get<std::string>();
-                    if (ImGui::Selectable(sv.c_str(), partsSelSize_ == s)) partsSelSize_ = s;
-                }
-                ImGui::EndCombo();
-            }
-
-            const bool needsLen = f.value("needs_length", false);
-            double lenVal = 0.0;
-            if (needsLen) {
-                ImGui::TextUnformatted("Length (mm)");
-                ImGui::SetNextItemWidth(160 * ui::uiScale);
-                ImGui::InputText("##parts_len", partsLenBuf_.data(), partsLenBuf_.size(),
-                                 ImGuiInputTextFlags_CharsDecimal);
-                const nlohmann::json lens = f.value("lengths_mm", nlohmann::json::array());
-                if (!lens.empty()) {
-                    ImGui::SameLine();
-                    if (ImGui::BeginCombo("##parts_len_menu", "common", ImGuiComboFlags_NoPreview)) {
-                        for (const auto& L : lens) {
-                            const int lv = (int)L.get<double>();
-                            if (ImGui::Selectable((std::to_string(lv) + " mm").c_str()))
-                                std::snprintf(partsLenBuf_.data(), partsLenBuf_.size(), "%d", lv);
-                        }
-                        ImGui::EndCombo();
-                    }
-                }
-                lenVal = std::atof(partsLenBuf_.data());
-            }
-
-            ImGui::Spacing();
-            const bool canInsert = st.docMirror.hasDoc() && !curSize.empty() &&
-                                   (!needsLen || lenVal > 0.0);
-            if (!canInsert) ImGui::BeginDisabled();
-            if (ImGui::Button("Insert into Assembly", ImVec2(180 * ui::uiScale, 0))) {
-                std::string aicm;
-                insertCatalogPart(st, f.value("key", std::string()), curSize, lenVal, aicm);
-            }
-            if (!canInsert) ImGui::EndDisabled();
-            if (needsLen && lenVal <= 0.0) {
-                pushText(ui::palette.textDim);
-                ImGui::TextUnformatted("Enter or pick a length.");
-                ImGui::PopStyleColor();
-            }
-        } else {
-            pushText(ui::palette.textDim);
-            ImGui::TextWrapped("Select a part family on the left.");
-            ImGui::PopStyleColor();
-        }
-        if (!partsNote_.empty()) {
-            ImGui::Spacing();
-            pushText(ui::palette.textDim);
-            ImGui::TextWrapped("%s", partsNote_.c_str());
-            ImGui::PopStyleColor();
-        }
-        ImGui::EndChild();
-        endGlassWindow();
-    }
-    ImGui::End();
-    if (!open) partsLibOpen_ = false;
 }
 
 // ===========================================================================

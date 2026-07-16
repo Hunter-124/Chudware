@@ -791,9 +791,11 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
             const double cu = s["centroid"][0].get<double>();
             const double cv = s["centroid"][1].get<double>();
             // Nearest face centroid. When several faces share a centroid (concentric
-            // circles both report centre (0,0)), prefer the smaller-area face so a
-            // center pick resolves to the inner disc, not the washer. hint_index is
-            // only a seed; a strictly closer face still wins.
+            // circles both report centre (0,0)), prefer the LARGER-area face so the
+            // default agent/guide pick {"centroid":[0,0],"hint_index":0} resolves to
+            // the washer (material), not the void inner disc. An explicit index still
+            // addresses the inner disc. hint_index is only a seed; a strictly closer
+            // face still wins.
             int best = -1;
             double best_d2 = 0.0;
             double best_area = 0.0;
@@ -812,7 +814,7 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
                 double dv = rows[i].uv.y() - cv;
                 double d2 = du * du + dv * dv;
                 if (best < 0 || d2 < best_d2 - 1e-18 ||
-                    (std::abs(d2 - best_d2) <= 1e-18 && rows[i].area < best_area)) {
+                    (std::abs(d2 - best_d2) <= 1e-18 && rows[i].area > best_area)) {
                     best = static_cast<int>(i);
                     best_d2 = d2;
                     best_area = rows[i].area;
@@ -830,8 +832,21 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
             take(static_cast<size_t>(idx));
             continue;
         }
-        // Untargeted selector mixed with targeted ones: contribute ALL material faces.
-        for (size_t i = 0; i < rows.size(); ++i) take(i);
+        // Untargeted selector mixed with targeted ones: contribute material faces
+        // only (same as whole-sketch). Never pull void/hole regions into a profile.
+        for (const TopoDS_Face& mf : src.faces) {
+            // Match by area+uv against rows to avoid double-adding.
+            const double a = face_surface_area(mf);
+            const Eigen::Vector2d uv = face_uv_centroid(mf, src.plane);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                if (taken[i]) continue;
+                if (std::abs(rows[i].area - a) <= 1e-9 * std::max(1.0, a) &&
+                    (rows[i].uv - uv).squaredNorm() <= 1e-12) {
+                    take(i);
+                    break;
+                }
+            }
+        }
     }
 
     if (out.empty())

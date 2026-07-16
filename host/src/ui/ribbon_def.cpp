@@ -53,19 +53,19 @@ static const RibbonCmd kCmds[] = {
     { "mirror_feature",   "Mirror",         "mirror",          "Features", "Pattern",         true,  nullptr,          false },
 
     // --- Group: Reference Geometry ---
+    // Helix lives LEFT of Ref. Plane (ITEM 10a ribbon layout reorg).
+    { "curve_helix",       "Helix",          "curve_helix",     "Features", "Reference",       true,  nullptr,          false },
     { "ref_plane",         "Ref. Plane",     "ref_plane",       "Features", "Reference",       true,  nullptr,          false },
     { "ref_axis",          "Ref. Axis",      "ref_axis",        "Features", "Reference",       false, nullptr,          false },
     { "ref_point",         "Ref. Point",     "ref_point",       "Features", "Reference",       false, nullptr,          false },
     { "ref_csys",          "Coord. Sys.",    "ref_csys",        "Features", "Reference",       false, nullptr,          false },
 
     // --- Group: Multi-body ---
+    // Split moved here from Curves (ITEM 10a).
     { "boolean_combine",   "Combine",        "combine",         "Features", "Multi-body",      true,  nullptr,          false },
     { "boolean_subtract",  "Subtract",       "subtract",        "Features", "Multi-body",      false, nullptr,          false },
     { "boolean_intersect", "Intersect",      "intersect",       "Features", "Multi-body",      false, nullptr,          false },
-
-    // --- Group: Curves ---
-    { "curve_helix",       "Helix",          "curve_helix",     "Features", "Curves",          true,  nullptr,          false },
-    { "split",             "Split",          "split",           "Features", "Curves",          false, nullptr,          false },
+    { "split",             "Split",          "split",           "Features", "Multi-body",      false, nullptr,          false },
 
     // =========================================================================
     // Tab: Sketch
@@ -199,24 +199,21 @@ static const RibbonCmd kCmds[] = {
     { "sim_results",       "Results",        "results",         "Simulation","Run",            true,  nullptr,          false },
 
     // =========================================================================
-    // Tab: Assembly (C20b)
+    // Group: Assembly — former standalone Assembly tab tools, merged onto the RIGHT
+    // of the Features ribbon (ITEM 10a). Same cmd_ids / icons / big flags; only the
+    // tab/group placement changed. The standalone "Assembly" tab is removed from the
+    // tab strip in ribbon.cpp (cross-file patch request).
     // =========================================================================
 
-    // --- Group: Components ---
-    { "asm_insert",        "Insert Comp.",   "insert_component", "Assembly", "Components",      true,  nullptr,          false },
-    { "asm_parts_library", "Std. Parts",     "insert_component", "Assembly", "Components",      true,  nullptr,          false },
-    { "asm_move",          "Move Comp.",     "move_component",   "Assembly", "Components",      true,  nullptr,          false },
-    { "asm_pattern",       "Comp. Pattern",  "pattern_component","Assembly", "Components",      true,  nullptr,          false },
-
-    // --- Group: Mate ---
-    { "asm_mate",          "Mate",           "mate",             "Assembly", "Mate",            true,  nullptr,          false },
-
-    // --- Group: Evaluate ---
-    { "asm_interference",  "Interference",   "interference",     "Assembly", "Evaluate",        true,  nullptr,          false },
-    { "asm_bom",           "BOM",            "bom",              "Assembly", "Evaluate",        true,  nullptr,          false },
-
-    // --- Group: Display ---
-    { "asm_explode",       "Exploded View",  "exploded_view",    "Assembly", "Display",         true,  nullptr,          false },
+    // --- Group: Assembly (on Features tab) ---
+    { "asm_insert",        "Insert Comp.",   "insert_component", "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_parts_library", "Std. Parts",     "insert_component", "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_move",          "Move Comp.",     "move_component",   "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_pattern",       "Comp. Pattern",  "pattern_component","Features", "Assembly",        true,  nullptr,          false },
+    { "asm_mate",          "Mate",           "mate",             "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_interference",  "Interference",   "interference",     "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_bom",           "BOM",            "bom",              "Features", "Assembly",        true,  nullptr,          false },
+    { "asm_explode",       "Exploded View",  "exploded_view",    "Features", "Assembly",        true,  nullptr,          false },
 
     // =========================================================================
     // C25: Sketch flyout variants (SolidWorks parity — append-only)

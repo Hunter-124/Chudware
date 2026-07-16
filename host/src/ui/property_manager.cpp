@@ -2414,6 +2414,27 @@ static bool pmCompactLabel(const char* label, const char* suffix,
     return false;
 }
 
+// Optional / secondary PM groups start collapsed; primary required groups stay open.
+// Matched by group title string from pm_forms.cpp (e.g. "Direction 2", "Options").
+static bool pmGroupDefaultOpen(const char* label) {
+    if (!label || !label[0]) return true;
+    // Secondary / optional groups — keep this list in sync with optional sections in pm_forms.
+    static const char* kCollapsedDefaults[] = {
+        "Direction 2",
+        "Thin Feature",
+        "Options",
+        "Selected Contours",
+        "Guide Curves",
+        "Advanced",
+        "Instances to Skip",
+        "Centerline",
+        "Tangency",
+    };
+    for (const char* g : kCollapsedDefaults)
+        if (std::strcmp(label, g) == 0) return false;
+    return true;
+}
+
 static bool pmSectionHeader(const char* label, const Palette& pal) {
     if (!label || !label[0]) return true;
     const float S = ui::uiScale;
@@ -2444,7 +2465,10 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {
     const bool hov = ImGui::IsMouseHoveringRect(rowMin, rowMax);
     ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 6.0f * S,
                            /*stripe=*/false, /*selected=*/false, hov ? 0.42f : 0.30f);
-    const bool open = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
+    // Force default open/closed when the header appears (form open / first show). User toggles
+    // stick for the rest of the session while the form stays open (ImGuiCond_Appearing).
+    ImGui::SetNextItemOpen(pmGroupDefaultOpen(label), ImGuiCond_Appearing);
+    const bool open = ImGui::CollapsingHeader(label);
 
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(2);
@@ -2798,7 +2822,8 @@ void PropertyManager::drawBody(AppState& st) {
             ImGui::PopStyleColor();
         }
 
-        ImGui::Spacing();
+        // Tight gap under the description / header — Spacing() was too loose above the AI button.
+        ImGui::Dummy(ImVec2(0, 2.0f * S));
         if (aiBusy_) ImGui::BeginDisabled();
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.20f));
@@ -3079,12 +3104,25 @@ void PropertyManager::drawBody(AppState& st) {
             }
             case PMFieldKind::SelectorWell: {
                 const ui::AdaptiveSurface& wsurf = pmSurf();
-                // Label + activate toggle. Active -> semantic accent (unchanged intent); inactive ->
-                // adaptive secondary text so the label reads against the live column glass tint.
+                const float S = ui::uiScale;
+                // Label row: left = field label; when active, right-align "Pick in viewport" to the
+                // well box's right edge (same content width as the indicator box below).
                 if (f.wellActive) pushTextColor(pal.accent);
                 else              pushTextColorV(wsurf.textSecondary);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
+                if (f.wellActive) {
+                    const char* pickHint = "Pick in viewport";
+                    const float hintW = ImGui::CalcTextSize(pickHint).x;
+                    ImGui::SameLine(0, 0.0f);
+                    const float remain = ImGui::GetContentRegionAvail().x;
+                    if (remain > hintW)
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remain - hintW);
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
+                    ImGui::TextUnformatted(pickHint);
+                    ImGui::PopStyleColor();
+                }
 
                 // C37-F: chip shows count + entity kind for filled wells.
                 std::string chip;
@@ -3103,7 +3141,6 @@ void PropertyManager::drawBody(AppState& st) {
                     : (f.wellActive
                         ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
                         : ImVec4(pal.border[0], pal.border[1], pal.border[2], pal.border[3]));
-                const float S = ui::uiScale;
                 const float availW = ImGui::GetContentRegionAvail().x;
                 const float textPadX = 10.0f * S;
                 const float textPadY = 7.0f * S;
@@ -3155,14 +3192,6 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     f.picks.clear(); f.wellDangling = false;
                     dirty_ = true; lastEditTime_ = ImGui::GetTime();
-                }
-                // C37-F: hint line under active well.
-                if (f.wellActive) {
-                    // Use accent with reduced alpha as the hint color.
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
-                    ImGui::TextUnformatted("Pick in viewport");
-                    ImGui::PopStyleColor();
                 }
                 if (f.wellDangling) {
                     pushTextColor(pal.statusErr);

@@ -1276,16 +1276,49 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // right-clicked the tiny status dot, i.e. effectively never (C40 fix).
     pushTreePopupGlass();
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
-        bool isSketch = c.iconName && std::strcmp(c.iconName, "sketch_node") == 0;
-        bool multi    = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
+        const bool isSketch = (c.type == "sketch") ||
+            (c.iconName && std::strcmp(c.iconName, "sketch_node") == 0);
+        const bool isSketch3d = (c.type == "sketch3d");
+        const bool multi = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
+        // Resolve import source once for "Open Part" (item 11 FM). Prefer params.source_path;
+        // fall back to original_name only as a label — path is required to open.
+        std::string importSrcPath;
+        bool importIsMeshOnly = false;
+        if (!multi && c.type == "import") {
+            const nlohmann::json& tree = st.docMirror.tree();
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array()) {
+                for (const auto& f : tree["features"]) {
+                    if (!f.is_object() || jfld(f, "id") != fid) continue;
+                    if (f.contains("params") && f["params"].is_object()) {
+                        importSrcPath = jfld(f["params"], "source_path");
+                        importIsMeshOnly = !f["params"].value("as_solid", false);
+                    }
+                    break;
+                }
+            }
+        }
+        const bool isImportComponent = !multi && c.type == "import";
+
         if (c.selected && ImGui::MenuItem("Deselect"))
             clearTreeFeatureSelection(st);
         if (c.selected) ImGui::Separator();
-        if (!c.canDoc) ImGui::BeginDisabled();   // gate every mutating item while an agent run is busy
+        if (!c.canDoc) ImGui::BeginDisabled();   // gate mutating items while an agent run is busy
 
-        if (isSketch) {
-            // A sketch gets "Edit Sketch" (enter the sketcher) + "Edit Sketch Plane" (re-pick the
-            // plane it sits on) — NOT the generic "Edit" form, which doesn't apply to a sketch.
+        // ---- type-specific edit / open (selection-dependent; item 8 FM RMB) ----
+        if (multi) {
+            // Multi-select: no Edit / Open / Rename — only bulk ops below.
+        } else if (isImportComponent) {
+            // Imported component: Open Part is the primary action (item 11).
+            const bool canOpen = !importSrcPath.empty();
+            if (!canOpen) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Open Part"))
+                openComponentPart(st, importSrcPath);
+            if (!canOpen) ImGui::EndDisabled();
+            if (ImGui::MenuItem("Rename")) {
+                s_renamingId = fid;
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
+            }
+        } else if (isSketch) {
             if (ImGui::MenuItem("Edit Sketch")) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->enterForFeature(st, fid);
@@ -1294,29 +1327,33 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->beginPlaneEdit(st, fid);
             }
-        } else if (c.type == "sketch3d") {
+            if (ImGui::MenuItem("Rename")) {
+                s_renamingId = fid;
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
+            }
+        } else if (isSketch3d) {
             if (ImGui::MenuItem("Edit 3D Sketch")) {
                 if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, fid);
             }
-        } else if (c.editCallback && *c.editCallback) {
-            if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
+            if (ImGui::MenuItem("Rename")) {
+                s_renamingId = fid;
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
+            }
         } else {
-            ImGui::BeginDisabled(); ImGui::MenuItem("Edit"); ImGui::EndDisabled();
-        }
-        if (ImGui::MenuItem("Rename")) {
-            s_renamingId = fid;
-            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
-        }
-        if (ImGui::MenuItem("Remove from folder")) {
-            applyTreeOps(st, nlohmann::json::array({
-                {{"op", "set_folder"}, {"id", fid}, {"folder", ""}}}), "set_folder");
+            if (c.editCallback && *c.editCallback) {
+                if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
+            }
+            if (ImGui::MenuItem("Rename")) {
+                s_renamingId = fid;
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
+            }
+            if (ImGui::MenuItem("Remove from folder")) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op", "set_folder"}, {"id", fid}, {"folder", ""}}}), "set_folder");
+            }
         }
 
-        // ---- Wave 4C: Copy / Cut / Paste ----
-        // The copy set is the whole multi-selection when this row is part of it, else just this row.
-        // Recorded as a deferred request (run after the tree walk) because the copy's DocMirror call
-        // replaces the tree json this menu sits inside. Paste enables only when a feature bundle is
-        // on the clipboard.
+        // ---- Copy / Cut / Paste (all feature rows; multi uses the whole set) ----
         ImGui::Separator();
         {
             std::vector<std::string> copySet;
@@ -1338,8 +1375,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             if (!canPaste) ImGui::EndDisabled();
         }
 
+        // ---- Suppress / Delete ----
         ImGui::Separator();
-        // C37-E (item 3): multi-selection applies Suppress/Unsuppress/Delete to ALL selected rows.
         if (multi) {
             int n = (int)s_multiSel.size();
             if (ImGui::MenuItem(("Suppress " + std::to_string(n) + " features").c_str())) {
@@ -1367,67 +1404,53 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             }
         }
 
-        // "Convert to Solid Body": sew an imported mesh (STL/OBJ/PLY/3MF/glTF/3dm) into an OCCT solid
-        // so it can be cut/filleted/combined. Shown only for an `import` feature still in mesh form
-        // (as_solid not yet set). Flips the import's as_solid param; the rebuild re-sews it. (Engine:
-        // edit_feature -> import recompiles via mesh_solidify.) Deferred via applyTreeOps like the rest.
-        if (!multi) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            if (tree.is_object() && tree.contains("features") && tree["features"].is_array()) {
-                for (const auto& f : tree["features"]) {
-                    if (!f.is_object() || f.value("id", std::string()) != fid) continue;
-                    if (f.value("type", std::string()) == "import") {
-                        const bool already = f.contains("params") && f["params"].is_object() &&
-                                             f["params"].value("as_solid", false);
-                        if (!already) {
-                            ImGui::Separator();
-                            if (ImGui::MenuItem("Convert to Solid Body")) {
-                                applyTreeOps(st, nlohmann::json::array({
-                                    {{"op", "edit_feature"}, {"id", fid},
-                                     {"params", {{"as_solid", true}}}}}), "convert to solid");
-                            }
-                        }
-                    }
-                    break;
-                }
+        // Import-only: Convert to Solid Body (mesh imports not yet sewn).
+        if (isImportComponent && importIsMeshOnly) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Convert to Solid Body")) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op", "edit_feature"}, {"id", fid},
+                     {"params", {{"as_solid", true}}}}}), "convert to solid");
             }
         }
 
-        if (c.convertCb && c.convertLabel) {
+        if (!multi && c.convertCb && c.convertLabel) {
             ImGui::Separator();
             if (ImGui::MenuItem(c.convertLabel)) c.convertCb();
         }
 
-        // C37-E (item 3): Zoom to Feature / Rollback to Here / Roll to End / Appearance.
-        ImGui::Separator();
-        if (ImGui::MenuItem("Zoom to Feature")) zoomToFeature(st, fid);
-        if (ImGui::MenuItem("Rollback to Here")) {
-            applyTreeOps(st, nlohmann::json::array({
-                {{"op", "set_rollback"}, {"after", fid}}}), "rollback");
-        }
-        if (!c.barAtEnd) {
-            if (ImGui::MenuItem("Roll to End")) {
+        // View / history tools (single-row only).
+        if (!multi) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Zoom to Feature")) zoomToFeature(st, fid);
+            if (ImGui::MenuItem("Rollback to Here")) {
                 applyTreeOps(st, nlohmann::json::array({
-                    {{"op", "set_rollback"}, {"after", nullptr}}}), "rollback");
+                    {{"op", "set_rollback"}, {"after", fid}}}), "rollback");
             }
-        }
-        if (!c.firstOwnedBody.empty()) {
-            if (ImGui::MenuItem("Appearance...")) {
-                s_apprBody = c.firstOwnedBody;
-                s_apprColor[0] = 0.71f; s_apprColor[1] = 0.76f; s_apprColor[2] = 0.82f;
-                s_apprMetallic = 0.0f; s_apprRoughness = 0.5f;
-                s_apprOpen = true;   // a sibling popup opens next frame (see drawFeatureTree)
+            if (!c.barAtEnd) {
+                if (ImGui::MenuItem("Roll to End")) {
+                    applyTreeOps(st, nlohmann::json::array({
+                        {{"op", "set_rollback"}, {"after", nullptr}}}), "rollback");
+                }
             }
-        }
-
-        ImGui::Separator();
-        if (ImGui::MenuItem("Delete")) {
-            applyTreeOps(st, nlohmann::json::array({
-                {{"op", "delete_feature"}, {"id", fid}, {"cascade", false}}}), "delete");
+            if (!c.firstOwnedBody.empty()) {
+                if (ImGui::MenuItem("Appearance...")) {
+                    s_apprBody = c.firstOwnedBody;
+                    s_apprColor[0] = 0.71f; s_apprColor[1] = 0.76f; s_apprColor[2] = 0.82f;
+                    s_apprMetallic = 0.0f; s_apprRoughness = 0.5f;
+                    s_apprOpen = true;
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete")) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op", "delete_feature"}, {"id", fid}, {"cascade", false}}}), "delete");
+            }
         }
         if (!c.canDoc) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
+
     popTreePopupGlass();
 
     // ---- per-feature eye toggle (every row, right edge) ----
@@ -1501,6 +1524,7 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
     if (type == "axis" || type == "datum_axis")   return "ref_axis";
     if (type == "point" || type == "datum_point") return "ref_point";
     if (type == "import")           return "open";
+    if (type == "transform")        return "part";
     if (type == "script")           return "history";
     if (type == "helix")            return "curve_helix";
     if (type == "csys")             return "ref_csys";
@@ -1585,6 +1609,7 @@ static const char* featureFallback(const std::string& type) {
     if (type == "boolean")           return "[Bl]";
     // Misc
     if (type == "import")            return "[Im]";
+    if (type == "transform")         return "[Tr]";
     if (type == "script")            return "[Sc]";
     if (type == "split")             return "[Sl]";
     // Surfaces
@@ -1655,17 +1680,69 @@ static std::string resolveComponentPath(const std::string& srcPath) {
     return (fs::path(s_docPath).parent_path() / path).lexically_normal().string();
 }
 
+// ---- Import features treated as expandable component nodes (item 9) ----
+// AI-built multi-body "assemblies" store each external part as type=import (with
+// params.source_path) and a type=transform Place_* that moves that body. The tree
+// collapses those into ONE expandable component row so the name is not duplicated
+// (import name + Place_X), and expands into the source part's feature history.
+static const nlohmann::json* featureParamsObj(const nlohmann::json& f) {
+    auto it = f.find("params");
+    if (it != f.end() && it->is_object()) return &(*it);
+    return nullptr;
+}
+static std::string featureParamString(const nlohmann::json& f, const char* key) {
+    if (const nlohmann::json* p = featureParamsObj(f)) {
+        auto it = p->find(key);
+        if (it != p->end() && it->is_string()) return it->get<std::string>();
+    }
+    return jfld(f, key);
+}
+// Absolute/resolved source path for an import feature, or empty if none / unresolvable.
+static std::string importFeatureSourceAbs(const nlohmann::json& f) {
+    if (jfld(f, "type") != "import") return {};
+    std::string src = featureParamString(f, "source_path");
+    if (src.empty()) return {};
+    return resolveComponentPath(src);
+}
+// Prefer the human part name (original_name) over a Place_* / instance-counter label.
+static std::string importDisplayName(const nlohmann::json& f) {
+    std::string n = jfld(f, "name");
+    std::string orig = featureParamString(f, "original_name");
+    if (!orig.empty()) {
+        // Keep a trailing instance counter from the feature name when present
+        // ("CD-201_Mag_Wheel_2" stays distinguishable from the first instance).
+        if (n.size() > orig.size() && n.compare(0, orig.size(), orig) == 0 &&
+            n[orig.size()] == '_')
+            return n;
+        return orig;
+    }
+    return n.empty() ? std::string("Imported Part") : n;
+}
+// True when this transform merely places/copies an import body (absorbed under the import row).
+static bool isImportPlacementTransform(
+    const nlohmann::json& f,
+    const std::unordered_map<std::string, const nlohmann::json*>& importById) {
+    if (jfld(f, "type") != "transform") return false;
+    const std::string body = featureParamString(f, "body");
+    return !body.empty() && importById.count(body) > 0;
+}
+
 // Open a referenced document in a normal tab, focusing an existing tab for the same
 // canonical path. Accepts an absolute path or an assembly-relative source path.
 void openComponentPart(AppState& st, const std::string& absPath) {
     // resolveComponentPath accepts absolute paths unchanged (lexically_normal) and resolves
     // assembly-relative ones against s_docPath; callers typically pass the absolute form.
+    // Also accept already-absolute paths when s_docPath is empty (Open Part from an unsaved
+    // host doc still works for absolute source_path on import features).
     std::string abs = resolveComponentPath(absPath);
     if (abs.empty() && !absPath.empty()) {
-        // Absolute-looking path that didn't need assembly resolve (or s_docPath unset).
         namespace fs = std::filesystem;
         fs::path p(absPath);
         if (p.is_absolute()) abs = p.lexically_normal().string();
+        else if (!s_docPath.empty())
+            abs = (fs::path(s_docPath).parent_path() / p).lexically_normal().string();
+        else
+            abs = p.lexically_normal().string();  // last-ditch: treat relative as CWD-relative
     }
     if (abs.empty()) {
         st.toast(ui::ToastLevel::Warn, "Referenced file has no resolvable path");
@@ -1675,6 +1752,8 @@ void openComponentPart(AppState& st, const std::string& absPath) {
     std::error_code ec;
     fs::path want = fs::weakly_canonical(fs::path(abs), ec);
     if (ec) want = fs::path(abs).lexically_normal();
+    abs = want.string();
+    // Prefer an already-open non-handoff tab for the same canonical path.
     for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i) {
         const AppState::DocTab& tab = st.docTabs[i];
         if (tab.aiHandoff || tab.path.empty()) continue;
@@ -1686,6 +1765,7 @@ void openComponentPart(AppState& st, const std::string& absPath) {
             return;
         }
     }
+    // Missing file: still request open so the open path can surface a clear error toast.
     st.requestOpenPath = abs;
 }
 
@@ -3077,7 +3157,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
             st.clearViewportForNewDoc();   // C34
             st.addDocTab(/*isAssembly=*/true);
-            st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;
+            st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         } else st.addLog("[err] new assembly: " + err);
     }
     if (toolBtn("fm_open", "open", "Open...", canDoc) && canDoc)
@@ -3700,6 +3780,7 @@ void drawFeatureTreeBody(AppState& st,
                                         st.hiddenFeatures.insert(ar.id);
                                         if (axisSel) st.selectedFeatureId.clear();
                                     }
+                                    st.axesUserToggled = true;  // stick: stop auto-hide (parity with origin)
                                     st.applyDatumVisibility();
                                 }
                             }
@@ -3869,6 +3950,43 @@ void drawFeatureTreeBody(AppState& st,
                         return nestedSketchIds.count(fid) != 0;
                     };
 
+                    // Item 9: import features act as expandable component nodes. Map each
+                    // import id -> feature json, and collect Place_*/transform rows that
+                    // reference an import body so they nest under the component (not as a
+                    // second duplicated sibling).
+                    std::unordered_map<std::string, const nlohmann::json*> importById;
+                    std::unordered_map<std::string, std::vector<const nlohmann::json*>> placeChildrenOf;
+                    std::unordered_set<std::string> nestedPlacementIds;
+                    for (const auto& f : *feat) {
+                        if (!f.is_object()) continue;
+                        if (jfld(f, "type") == "import") {
+                            const std::string id = jfld(f, "id");
+                            if (!id.empty()) importById[id] = &f;
+                        }
+                    }
+                    for (const auto& f : *feat) {
+                        if (!f.is_object()) continue;
+                        if (!isImportPlacementTransform(f, importById)) continue;
+                        const std::string body = featureParamString(f, "body");
+                        const std::string pid = jfld(f, "id");
+                        if (body.empty() || pid.empty()) continue;
+                        placeChildrenOf[body].push_back(&f);
+                        nestedPlacementIds.insert(pid);
+                    }
+                    auto importHasExpandableContent = [&](const nlohmann::json& f) -> bool {
+                        const std::string id = jfld(f, "id");
+                        if (placeChildrenOf.count(id)) return true;
+                        const std::string abs = importFeatureSourceAbs(f);
+                        if (abs.empty()) return false;
+                        const ui::NestedDocument& nd = ui::featureTreeNestedDocument(abs);
+                        if (nd.state == ui::NestedDocumentState::Ready &&
+                            (!nd.features.empty() || !nd.components.empty()))
+                            return true;
+                        // Still expand so Material / File / source status is reachable.
+                        return !abs.empty();
+                    };
+
+
                     // Reorder op: drop draggedId before beforeId. A "@after:<id>" sentinel means drop
                     // AFTER <id> (i.e. before the feature following <id>, or end). "" = end.
                     auto reorderCb = [&st, &order](const std::string& dragged, const std::string& before) {
@@ -3914,10 +4032,13 @@ void drawFeatureTreeBody(AppState& st,
                         std::string ftype  = jfld(f, "type");
                         // W2-ref: axes live under References only — skip in Features history.
                         if (ftype == "axis" || ftype == "datum_axis") return true;
+                        // Item 9: show the component/part name, not Place_* or a raw instance id.
+                        if (ftype == "import") fname = importDisplayName(f);
                         if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
                         if (s_fmFilter[0] && !fm_icontains(fname.c_str(), s_fmFilter) &&
                             !fm_icontains(ftype.c_str(), s_fmFilter))
                             return true;
+
 
                         // Nested-child indent wraps the WHOLE row (background pill + text + icon) so
                         // the tinted background steps in with the content, not just the glyphs
@@ -4014,15 +4135,19 @@ void drawFeatureTreeBody(AppState& st,
 
                         RowCtx ctx;
                         ctx.fid = fid; ctx.name = fname; ctx.type = ftype;
-                        ctx.iconName = featureIcon(ftype, &f);
-                        ctx.iconFallback = featureFallback(ftype);
+                        // Imported components render as part nodes (not the generic "open" glyph).
+                        ctx.iconName = (ftype == "import") ? "part" : featureIcon(ftype, &f);
+                        ctx.iconFallback = (ftype == "import") ? "[P]" : featureFallback(ftype);
                         ctx.suppressed = suppressed; ctx.selected = sel;
                         ctx.rolledBack = rolledBack; ctx.fs = fs;
                         ctx.ownerBodyCount = bodyCount(fid);
                         ctx.ownedBodies = ownedBodies(fid);
                         ctx.nested = nested;
-                        // A top-level row with consumed-sketch children draws a real collapse arrow.
-                        ctx.expandable = !nested && childrenOf.count(fid) > 0;
+                        // Expandable: consumed-sketch children OR import component history/placements.
+                        const bool importExpand = (ftype == "import") && !nested &&
+                                                 importHasExpandableContent(f);
+                        ctx.expandable = (!nested && childrenOf.count(fid) > 0) || importExpand;
+
                         ctx.canDoc = canDocTree;
                         ctx.barAtEnd = barAtEnd;
                         ctx.firstOwnedBody = firstBodyKey(fid);
@@ -4090,6 +4215,12 @@ void drawFeatureTreeBody(AppState& st,
                                 if (st.sketchMode) st.sketchMode->enterForFeature(st, fid);
                             } else if (ftype == "sketch3d") {
                                 if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, fid);
+                            } else if (ftype == "import") {
+                                // Double-click an imported component opens its source part
+                                // (same action as RMB Open Part).
+                                const std::string src = importFeatureSourceAbs(f);
+                                if (!src.empty()) openComponentPart(st, src);
+                                else if (editCallback) editCallback(fid);
                             } else if (editCallback) {
                                 editCallback(fid);
                             }
@@ -4160,6 +4291,8 @@ void drawFeatureTreeBody(AppState& st,
 
                         // Skip nested sketches in the flat pass — they render under their consumer.
                         if (ftype == "sketch" && isNestedSketch(fid)) continue;
+                        // Item 9: Place_*/import-placement transforms nest under their import body.
+                        if (nestedPlacementIds.count(fid)) continue;
 
                         // Folder grouping (C37-E item 2: ImGui id from the folder NAME, stable across
                         // reorders, not a per-frame counter).
@@ -4210,8 +4343,35 @@ void drawFeatureTreeBody(AppState& st,
                             }
                         }
 
-                        // C37-E (item 4): draw the rollback bar inline right after the bar feature
-                        // (and its absorbed sketches) when it sits mid-history.
+                        // Item 9: expand imported component → source history + placement transforms.
+                        if (rowOpen && ftype == "import") {
+                            const std::string absPath = importFeatureSourceAbs(f);
+                            if (!absPath.empty()) {
+                                const ui::NestedDocument& nestedDoc =
+                                    ui::featureTreeNestedDocument(absPath);
+                                std::unordered_set<std::string> pathStack;
+                                pathStack.insert(absPath);
+                                // Reuse the assembly nested renderer: material/file info +
+                                // feature history when the source is a native .step+ with
+                                // document.json. Dumb STEP/mesh imports show the info row +
+                                // "no editable feature history" (NestedDocumentState::External).
+                                drawNestedDocumentContents(st, "import_" + fid, fid, absPath,
+                                                           nestedDoc, pathStack, 0);
+                            } else {
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ImVec4(pal.textDim[0], pal.textDim[1],
+                                           pal.textDim[2], 0.72f));
+                                ImGui::TextUnformatted("  (no source path on import)");
+                                ImGui::PopStyleColor();
+                            }
+                            auto places = placeChildrenOf.find(fid);
+                            if (places != placeChildrenOf.end()) {
+                                for (const nlohmann::json* pf : places->second) {
+                                    if (pf) drawOneRow(*pf, /*nested=*/true);
+                                }
+                            }
+                        }
+
                         if (!barFid.empty() && fid == barFid)
                             drawRollbackBarLine(st, canDocTree, barFid);
                     }

@@ -1054,7 +1054,16 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             int max_tokens = params.value("max_tokens", 8000);
             aicad::agent::CompleteResult cr =
                 aicad::agent::complete(provider, cfg, system, messages, max_tokens);
-            return emit(json{{"text", cr.text}, {"thinking", cr.thinking}, {"error", cr.error}},
+            return emit(json{{"text", cr.text},
+                             {"thinking", cr.thinking},
+                             {"error", cr.error},
+                             {"http_status", cr.http_status},
+                             {"latency_ms", cr.latency_ms},
+                             {"attempt", cr.attempt},
+                             {"endpoint", cr.endpoint},
+                             {"model", cr.model},
+                             {"request_id", cr.request_id},
+                             {"error_excerpt", cr.error_excerpt}},
                         out_json, 0);
         }
         if (m == "agent_role_of") {
@@ -1779,6 +1788,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     aicad::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error")) {
                     return emit(json{{"ok", false},
+                                     {"status", "failed"},
+                                     {"stop_reason", "provider_error"},
+                                     {"error_detail", jstr(resolved, "error", "provider resolution failed")},
                                      {"error", jstr(resolved, "error", "provider resolution failed")}},
                                 out_json, 0);
                 }
@@ -1839,6 +1851,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     aicad::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error"))
                     return emit(json{{"ok", false},
+                                     {"status", "failed"},
+                                     {"stop_reason", "provider_error"},
+                                     {"error_detail", jstr(resolved, "error", "provider resolution failed")},
                                      {"error", jstr(resolved, "error", "provider resolution failed")}},
                                 out_json, 0);
                 provider = aicad::agent::apply_experimental(resolved, cfg, json::object());

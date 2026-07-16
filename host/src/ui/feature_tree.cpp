@@ -1113,6 +1113,10 @@ struct RowResult {
     bool open        = true;    // expandable row: is it expanded? (leaf rows: always true)
 };
 
+// Forward decls — featureRow runs before the featureKindTint block further down.
+static void fmSeedCollapsed();
+static const float* featureKindTint(const std::string& type, bool isCut, bool isError = false);
+
 static RowResult featureRow(RowCtx& c, AppState& st) {
     RowResult res;
     const std::string& fid = c.fid;
@@ -1192,7 +1196,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGuiTreeNodeFlags_SpanFullWidth |
         ImGuiTreeNodeFlags_FramePadding;
     if (!c.expandable) flags |= ImGuiTreeNodeFlags_Leaf;
-    else flags |= ImGuiTreeNodeFlags_DefaultOpen;   // start expanded (was always-visible before)
+    else flags |= ImGuiTreeNodeFlags_OpenOnArrow;  // collapsed by default; user expansions stick
 
     // Suppressed → dim. Rolled back → dim + italic-ish look (we cannot truly italicize a
     // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
@@ -1225,6 +1229,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    if (c.expandable) fmSeedCollapsed();
     const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
     // Drag source: drag a feature onto a folder header to file it into that folder. The click/drag
     // threshold means a plain click still selects; only an actual drag starts this.
@@ -1685,42 +1690,88 @@ static const char* featureFallback(const std::string& type) {
     return "[?]";
 }
 
-// Category color strip: thin left-edge accent by feature group.
-// Groups: sketch, solid-add, solid-cut, dress-up, pattern, datum, sheet-metal, weldment, surface.
-static ImU32 categoryColor(const std::string& type, bool isCut) {
-    if (type == "sketch" || type == "sketch3d")
-        return IM_COL32(86, 152, 245, 180);   // soft blue
-    if (isCut && (type == "extrude" || type == "revolve" ||
-                  type == "sweep"   || type == "loft"))
-        return IM_COL32(245, 120, 72, 190);   // orange-red (solid-cut)
-    if (type == "extrude" || type == "revolve" || type == "sweep" || type == "loft" ||
-        type == "box" || type == "cylinder" || type == "sphere" ||
-        type == "cone" || type == "torus"   || type == "hole")
-        return IM_COL32(45, 212, 191, 190);   // teal accent (solid-add)
+// Feature-kind → palette accent for the row wash + leading glyph tint.
+// Palette roles only (no raw hex). Strengths stay subtle (PCB Layers-style).
+// Mapping:
+//   sketch / sketch3d          → sketchUnder (blue)
+//   extrude/revolve/sweep/loft → accent (teal); cuts → statusErr (red-orange)
+//   box/cyl/sphere/cone/torus  → accent (teal solids)
+//   hole                       → statusWarn (amber)
+//   fillet/chamfer/shell/...   → sketchExternal (violet dress-up)
+//   patterns / mirror          → camPlunge (cyan)
+//   datums (plane/axis/point)  → axisZ (blue); axes keep axisX/Y/Z at call site
+//   import / components        → textDim (neutral slate)
+//   sheet-metal (sm_*)         → statusWarn (amber)
+//   weldment (weld_*)          → simLoad (coral)
+//   surface (surf_*)           → axisY (green)
+//   boolean                    → sketchExternal (violet)
+//   sketch-in-error            → statusErr (caller passes isError)
+static const float* featureKindTint(const std::string& type, bool isCut,
+                                    bool isError) {
+    const auto& p = ui::palette;
+    if (isError) return p.statusErr;
+    if (type == "sketch" || type == "sketch3d") return p.sketchUnder;
+    if (type == "hole") return p.statusWarn;
     if (type == "fillet" || type == "chamfer" || type == "shell" ||
         type == "draft"  || type == "rib")
-        return IM_COL32(155, 120, 220, 190);  // purple (dress-up)
-    if (type == "linear_pattern" || type == "circular_pattern" || type == "mirror")
-        return IM_COL32(74, 173, 204, 190);   // cyan (pattern)
-    if (type == "plane" || type == "datum_plane" ||
-        type == "axis"  || type == "point" || type == "csys")
-        return IM_COL32(100, 140, 210, 190);  // slate-blue (datum)
-    if (type.size() >= 3 && type[0]=='s' && type[1]=='m' && type[2]=='_')
-        return IM_COL32(242, 182, 64, 190);   // amber (sheet-metal)
-    if (type.size() >= 5 && type[0]=='w' && type[1]=='e' && type[2]=='l' &&
-        type[3]=='d' && type[4]=='_')
-        return IM_COL32(220, 90, 80, 190);    // coral-red (weldment)
-    if (type.size() >= 5 && type[0]=='s' && type[1]=='u' && type[2]=='r' &&
-        type[3]=='f' && type[4]=='_')
-        return IM_COL32(90, 200, 110, 190);   // green (surface)
-    if (type == "boolean")
-        return IM_COL32(175, 120, 205, 190);  // soft purple (multi-body boolean)
-    return IM_COL32(120, 130, 148, 140);      // grey (unknown)
+        return p.sketchExternal;
+    if (type == "linear_pattern" || type == "circular_pattern" ||
+        type == "mirror" || type == "curve_pattern" || type == "fill_pattern" ||
+        type == "table_pattern" || type == "sketch_pattern")
+        return p.camPlunge;
+    if (type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+        type == "axis"  || type == "datum_axis"  || type == "ref_axis" ||
+        type == "point" || type == "datum_point" || type == "ref_point" ||
+        type == "csys"  || type == "coordinate_system" || type == "ref_csys")
+        return p.axisZ;
+    if (type == "import" || type == "component" || type == "transform")
+        return p.textDim;
+    if (type == "boolean") return p.sketchExternal;
+    if (type.size() >= 3 && type[0] == 's' && type[1] == 'm' && type[2] == '_')
+        return p.statusWarn;
+    if (type.size() >= 5 && type[0] == 'w' && type[1] == 'e' && type[2] == 'l' &&
+        type[3] == 'd' && type[4] == '_')
+        return p.simLoad;
+    if (type.size() >= 5 && type[0] == 's' && type[1] == 'u' && type[2] == 'r' &&
+        type[3] == 'f' && type[4] == '_')
+        return p.axisY;
+    // Solids (add / cut) — extrude family + primitives.
+    if (type == "extrude" || type == "revolve" || type == "sweep" || type == "loft" ||
+        type == "box" || type == "cylinder" || type == "sphere" ||
+        type == "cone" || type == "torus")
+        return isCut ? p.statusErr : p.accent;
+    return p.textDim;
 }
-// RGB (0..1) view of categoryColor for the coloredRowWash tint. Alpha is ignored (the wash owns it).
-static void categoryColorRGB(const std::string& type, bool isCut, float out[3]) {
-    ImVec4 c = ImGui::ColorConvertU32ToFloat4(categoryColor(type, isCut));
-    out[0] = c.x; out[1] = c.y; out[2] = c.z;
+// RGB (0..1) view of featureKindTint for coloredRowWash. Alpha is ignored (wash owns it).
+static void categoryColorRGB(const std::string& type, bool isCut, float out[3],
+                             bool isError = false) {
+    const float* t = featureKindTint(type, isCut, isError);
+    out[0] = t[0]; out[1] = t[1]; out[2] = t[2];
+}
+
+// Frame-local: when true, the next expandable TreeNodeEx in Features is forced closed
+// (first-sight seed for a doc). Cleared after the Features walk finishes that frame.
+static bool s_fmCollapseSeed = false;
+static void fmSeedCollapsed() {
+    if (s_fmCollapseSeed)
+        ImGui::SetNextItemOpen(false, ImGuiCond_Always);
+}
+
+// Clip `text` to `maxW` with a trailing ellipsis. Empty maxW → unchanged.
+static std::string fmEllipsize(const std::string& text, float maxW) {
+    if (maxW <= 1.0f || text.empty()) return text;
+    if (ImGui::CalcTextSize(text.c_str()).x <= maxW) return text;
+    const char* ell = "...";
+    const float ew = ImGui::CalcTextSize(ell).x;
+    if (ew >= maxW) return std::string(ell);
+    // Shrink from the end until it fits.
+    std::string out = text;
+    while (!out.empty()) {
+        out.pop_back();
+        if (ImGui::CalcTextSize((out + ell).c_str()).x <= maxW)
+            return out + ell;
+    }
+    return std::string(ell);
 }
 
 // User-created datum features that belong under FM Reference (Planes/Axes/Points), not Features.
@@ -2004,7 +2055,9 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
                                     const std::string& sourcePath, bool editable) {
     const float nestIndent = 14.0f * ui::uiScale;
     if (nested) ImGui::Indent(nestIndent);
-    FmRowRect rect = fmRowPill();
+    const bool isCut = false;  // nested history has no live cut-mode bit; wash by type only
+    const float* kindTint = featureKindTint(feature.type, isCut);
+    FmRowRect rect = fmRowPill(false, kindTint);
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
     if (expandable) flags |= ImGuiTreeNodeFlags_OpenOnArrow;
@@ -2017,6 +2070,7 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
     const std::string name = feature.name.empty()
         ? (feature.type.empty() ? std::string("Feature") : feature.type) : feature.name;
+    if (expandable) fmSeedCollapsed();
     const bool open = ImGui::TreeNodeEx((name + "##" + idSuffix).c_str(), flags);
     if (!expandable) treeIconInArrowSlot(rowPos, icon, "[f]");
     fmRowPillEnd(rect);
@@ -2106,6 +2160,8 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
         FmRowRect rect = fmRowPill();
         treeIcon("body_folder", "[F]", 16.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
+        // Reference folder inside a nested component stays DefaultOpen (Reference section
+        // behaviour unchanged by the Features default-collapse rule).
         const bool open = ImGui::TreeNodeEx(("Reference##cref_" + idPrefix).c_str(),
             ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
             ImGuiTreeNodeFlags_FramePadding);
@@ -2134,10 +2190,11 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
                 FmRowRect fldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
+                fmSeedCollapsed();
                 folderOpen = ImGui::TreeNodeEx(
                     (folder + "##cfld_" + idPrefix + "_" + folder).c_str(),
-                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                    ImGuiTreeNodeFlags_FramePadding);
+                    ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
+                    ImGuiTreeNodeFlags_OpenOnArrow);
                 fmRowPillEnd(fldRect);
             }
         }
@@ -2147,12 +2204,13 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
     if (folderOpen) ImGui::TreePop();
 }
 
+// Material display name only — no "Material: " prefix, no <> brackets, no part filename.
 static std::string nestedMaterialLabel(const std::string& key) {
-    if (key.empty()) return "Material: <not specified>";
+    if (key.empty()) return "not specified";
     for (int i = 0; i < kPhysicalMaterialsCount; ++i)
         if (key == kPhysicalMaterials[i].key)
-            return std::string("Material: ") + kPhysicalMaterials[i].name;
-    return "Material: " + key;
+            return kPhysicalMaterials[i].name;
+    return key;
 }
 
 static void drawNestedInfoRow(const std::string& id, const std::string& label,
@@ -2160,16 +2218,23 @@ static void drawNestedInfoRow(const std::string& id, const std::string& label,
                               const std::string& tooltip = {}) {
     FmRowRect rect = fmRowPill();
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    // Clip the label to the row width so long names never overrun the pill.
+    const float iconReserve = ImGui::GetTreeNodeToLabelSpacing() + 8.0f * ui::uiScale;
+    const float maxW = std::max(8.0f, ImGui::GetContentRegionAvail().x - iconReserve);
+    const std::string clipped = fmEllipsize(label, maxW);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
                fmPalette().textDim[2], 0.72f));
-    ImGui::TreeNodeEx((label + "##" + id).c_str(),
+    ImGui::TreeNodeEx((clipped + "##" + id).c_str(),
         ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
     ImGui::PopStyleColor();
     treeIconInArrowSlot(rowPos, icon, fallback, 0.72f);
     fmRowPillEnd(rect);
-    if (!tooltip.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip.c_str());
+    if ((!tooltip.empty() || clipped != label) && ImGui::IsItemHovered()) {
+        const std::string tip = tooltip.empty() ? label : tooltip;
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
 }
 
 static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix,
@@ -2178,19 +2243,19 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                                        const ui::NestedDocument& document,
                                        std::unordered_set<std::string>& pathStack,
                                        int depth) {
-    // Compact Material + File into one muted info row (detail lives in the tooltip) so the
-    // nested history reads like SolidWorks FeatureManager rather than a property dump.
+    // Material-only info row (no part filename — the parent component row already owns that).
     {
-        std::string mat = nestedMaterialLabel(document.materialKey);
-        // Strip the "Material: " prefix for the compact row.
-        if (mat.rfind("Material: ", 0) == 0) mat = mat.substr(10);
-        const std::string fileBit = document.fileName.empty() ? std::string("<unresolved>")
-                                                              : document.fileName;
-        const std::string compact = mat + "  ·  " + fileBit;
-        std::string tip = nestedMaterialLabel(document.materialKey);
+        const std::string mat = nestedMaterialLabel(document.materialKey);
+        std::string tip = "Material: " + mat;
         if (!document.path.empty()) tip += "\n" + document.path;
-        drawNestedInfoRow(idPrefix + "_info", compact, "material", "[i]", tip);
+        else if (!document.fileName.empty()) tip += "\n" + document.fileName;
+        drawNestedInfoRow(idPrefix + "_info", mat, "material", "[i]", tip);
     }
+
+    // Nested children (feature history + sub-components) sit one indent step under the parent
+    // component so the hierarchy reads visually (Hunter nesting indentation).
+    const float nestIndent = 14.0f * ui::uiScale;
+    ImGui::Indent(nestIndent);
 
     if (document.state != ui::NestedDocumentState::Ready) {
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -2198,12 +2263,16 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                    fmPalette().textDim[2], 0.72f));
         ImGui::TextWrapped("%s", document.error.empty() ? "No feature history" : document.error.c_str());
         ImGui::PopStyleColor();
+        ImGui::Unindent(nestIndent);
         return;
     }
     if (!document.features.empty())
         drawComponentFeatureTree(st, idPrefix, topComponentId, sourcePath, document.features, true);
 
-    if (depth >= 16 || document.components.empty()) return;
+    if (depth >= 16 || document.components.empty()) {
+        ImGui::Unindent(nestIndent);
+        return;
+    }
     for (const ui::NestedComponent& component : document.components) {
         const std::string childId = idPrefix + "_component_" + component.id;
         const bool resolved = !component.sourceAbsPath.empty();
@@ -2217,11 +2286,12 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
                        fmPalette().textDim[2], unavailable ? 0.55f : 0.72f));
-        FmRowRect rect = fmRowPill();
+        FmRowRect rect = fmRowPill(false, featureKindTint("import", false));
         treeIcon(child.schema == "aicad.asm/1" ? "assembly" : "part",
                  child.schema == "aicad.asm/1" ? "[A]" : "[P]", 16.0f,
                  unavailable ? 0.5f : 1.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
+        fmSeedCollapsed();
         const bool open = ImGui::TreeNodeEx((label + "##" + childId).c_str(),
             ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
             ImGuiTreeNodeFlags_OpenOnArrow);
@@ -2256,6 +2326,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             ImGui::TreePop();
         }
     }
+    ImGui::Unindent(nestIndent);
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----
@@ -2381,7 +2452,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         const bool isAsm = nestedDoc.schema == "aicad.asm/1";
         FStatus fs = getFeatureStatus(statusArr, cid);
 
-        FmRowRect compRect = fmRowPill();
+        FmRowRect compRect = fmRowPill(false, featureKindTint("import", false));
         // SolidWorks marks fixed components with a "(f)" prefix.
         std::string label = (fixed ? "(f) " : "") + cname;
         if (suppressed) label += " [S]";
@@ -2396,6 +2467,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                  hidden || unavailable ? 0.5f : 1.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
         ImVec2 compRowPos = ImGui::GetCursorScreenPos();
+        fmSeedCollapsed();
         const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
         if (hidden || unavailable) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
@@ -2490,8 +2562,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         if (compOpen) {
             if (absPath.empty()) {
                 drawNestedInfoRow("component_" + cid + "_info",
-                                  "Material: <unavailable>  ·  <unresolved>",
-                                  "material", "[i]");
+                                  "not specified",
+                                  "material", "[i]", "Material: not specified");
                 ImGui::TextDisabled("(component has no resolvable source path)");
             } else {
                 std::unordered_set<std::string> pathStack;
@@ -2521,10 +2593,11 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         FmRowRect grpRect = fmRowPill();
         treeIcon("body_folder", "[F]", 16.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
+        fmSeedCollapsed();
         const bool groupOpen = ImGui::TreeNodeEx(
             (folderLabel + "##" + folderId).c_str(),
             ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
-            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen);
+            ImGuiTreeNodeFlags_OpenOnArrow);
         // Group-folder context menu: Open Part once for the shared source.
         pushTreePopupGlass();
         if (ImGui::BeginPopupContextItem(("##gctx_" + folderId).c_str())) {
@@ -2541,8 +2614,11 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         fmRowPillEnd(grpRect);
 
         if (groupOpen) {
+            const float nestIndent = 14.0f * ui::uiScale;
+            ImGui::Indent(nestIndent);
             for (size_t idx : group.indices)
                 drawComponentInstance(insts[idx]);
+            ImGui::Unindent(nestIndent);
             ImGui::TreePop();
         }
     }
@@ -2553,8 +2629,11 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
     FmRowRect matesRect = fmRowPill();
     treeIcon("mates_folder", "[M]", 16.0f);
     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-    ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
-                            ImGuiTreeNodeFlags_FramePadding;   // pill-height node
+    // Features-section item: start collapsed on first doc display (seed), then user choice sticks.
+    fmSeedCollapsed();
+    ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_SpanFullWidth |
+                            ImGuiTreeNodeFlags_FramePadding |
+                            ImGuiTreeNodeFlags_OpenOnArrow;
     bool matesOpen = ImGui::TreeNodeEx("Mates##mates_folder", ff);
     fmRowPillEnd(matesRect);
     if (matesOpen) {
@@ -3448,8 +3527,12 @@ void drawFeatureTreeBody(AppState& st,
             const bool wantOpen = !hasMesh;
             sec.fileOpen = wantOpen;
             sec.refOpen  = wantOpen;
+            sec.featOpen = true;   // Features HEADER stays expanded
             sec.lastHasMesh = hasMesh;
             sec.seeded = true;
+            // Force every expandable item *inside* Features collapsed on first display.
+            // User expansions after this frame stick via ImGui tree storage.
+            s_fmCollapseSeed = true;
         } else if (!sec.lastHasMesh && hasMesh) {
             // false→true transition: first solid body just appeared — auto-collapse both unless
             // the user already took control of that header.
@@ -4304,6 +4387,9 @@ void drawFeatureTreeBody(AppState& st,
         }
         if (s_featSecOpen) {
             ImGui::Indent(kSecIndent);
+            // Isolate ImGui tree-node open-state per document so tabs don't share expansions
+            // and a reopened doc re-seeds collapsed cleanly.
+            ImGui::PushID(secDocKey.c_str());
 
             // ---- feature history ----
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
@@ -4545,9 +4631,10 @@ void drawFeatureTreeBody(AppState& st,
                             if (!mf) continue;
                             const std::string mid = jfld(*mf, "id");
                             if (mid.empty()) continue;
-                            // Instance label: shared name + <k> (1-based) — folder owns the base name.
+                            // Instance label: shared name + " k" (1-based, no brackets) — folder owns the base name.
+                            // Selection/lookup keys on feature id, never this display label.
                             importInstanceLabel[mid] =
-                                g.sharedName + " <" + std::to_string(mi + 1) + ">";
+                                g.sharedName + " " + std::to_string(mi + 1);
                             if (mi == 0)
                                 importGroupLeaderIdx[mid] = gi;
                             else
@@ -4605,7 +4692,7 @@ void drawFeatureTreeBody(AppState& st,
                         // Nested=true rows (under a consumer) still draw via this path.
                         if (!nested && isUserRefGeomType(ftype)) return true;
                         // Item 9: show the component/part name, not Place_* or a raw instance id.
-                        // Multi-source groups use "Name <k>" so the folder owns the base name.
+                        // Multi-source groups use "Name k" so the folder owns the base name.
                         if (ftype == "import") {
                             auto il = importInstanceLabel.find(fid);
                             fname = (il != importInstanceLabel.end()) ? il->second
@@ -4652,7 +4739,8 @@ void drawFeatureTreeBody(AppState& st,
                         // Replaces the old 3px left color bar; selection is a glow border in-color.
                         {
                             const bool catIsCut = featureModeIsCut(&f);
-                            float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint);
+                            const bool catIsErr = !fs.ok && (ftype == "sketch" || ftype == "sketch3d");
+                            float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint, catIsErr);
                             // Same outer rect as the base — coloredRowWash self-insets.
                             ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint,
                                                sel ? 0.34f : 0.20f, sel);
@@ -4935,11 +5023,12 @@ void drawFeatureTreeBody(AppState& st,
                                 FmRowRect fldRect = fmRowPill();
                                 treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
                                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
+                                fmSeedCollapsed();
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
-                                    ImGuiTreeNodeFlags_DefaultOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth |
-                                    ImGuiTreeNodeFlags_FramePadding);
+                                    ImGuiTreeNodeFlags_FramePadding |
+                                    ImGuiTreeNodeFlags_OpenOnArrow);
                                 // Drop target: dragging a feature here files it into this folder.
                                 if (ImGui::BeginDragDropTarget()) {
                                     if (const ImGuiPayload* p =
@@ -4971,12 +5060,12 @@ void drawFeatureTreeBody(AppState& st,
                             FmRowRect grpRect = fmRowPill();
                             treeIcon("body_folder", "[F]", 16.0f);
                             ImGui::SameLine(0, 4 * ui::uiScale);
+                            fmSeedCollapsed();
                             const bool groupOpen = ImGui::TreeNodeEx(
                                 (folderLabel + "##" + folderId).c_str(),
                                 ImGuiTreeNodeFlags_SpanFullWidth |
                                 ImGuiTreeNodeFlags_FramePadding |
-                                ImGuiTreeNodeFlags_OpenOnArrow |
-                                ImGuiTreeNodeFlags_DefaultOpen);
+                                ImGuiTreeNodeFlags_OpenOnArrow);
                             // Folder context: Open Part once for the shared source file.
                             pushTreePopupGlass();
                             if (ImGui::BeginPopupContextItem(("##igctx_" + folderId).c_str())) {
@@ -4998,6 +5087,8 @@ void drawFeatureTreeBody(AppState& st,
                             fmRowPillEnd(grpRect);
 
                             if (groupOpen) {
+                                const float nestIndent = 14.0f * ui::uiScale;
+                                ImGui::Indent(nestIndent);
                                 for (const nlohmann::json* mf : g.members) {
                                     if (!mf) continue;
                                     const std::string mfid = jfld(*mf, "id");
@@ -5017,6 +5108,7 @@ void drawFeatureTreeBody(AppState& st,
                                     if (!barFid.empty() && mfid == barFid)
                                         drawRollbackBarLine(st, canDocTree, barFid);
                                 }
+                                ImGui::Unindent(nestIndent);
                                 ImGui::TreePop();
                             }
                             continue;
@@ -5145,8 +5237,12 @@ void drawFeatureTreeBody(AppState& st,
                 }
             }
 
+            ImGui::PopID();
             ImGui::Unindent(kSecIndent);
         }   // end Features section
+        // Always clear after the Features pass (even if header closed) so a one-shot seed
+        // cannot leak into subsequent frames.
+        s_fmCollapseSeed = false;
     }
 
     if (!st.selectedFeatureId.empty() || !s_multiSel.empty()) {

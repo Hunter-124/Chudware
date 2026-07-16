@@ -17,11 +17,6 @@
 #include "../core/fs_backend.h"
 #include "../core/web_file_pick.h"
 
-// Compile-unit inclusion until the integrator lists web_file_pick.cpp in CMake.
-#ifndef BILLET_WEB_FILE_PICK_TU
-#define BILLET_WEB_FILE_PICK_TU
-#include "../core/web_file_pick.cpp"
-#endif
 
 namespace ui {
 namespace {

@@ -241,6 +241,31 @@ def _subscription_usage(params: dict, _emit: Callable) -> dict:
             "rows": [],
         }
 
+def _subscription_ensure_fresh(params: dict, _emit: Callable) -> dict:
+    """Refresh a subscription access token if expired / expiring within 5 min.
+
+    Pre-run hook for the C++ in-app agent (read-only token reader). Python is the
+    single writer. Shape: ``{ok, refreshed, expires_in, error}`` — never tokens.
+    """
+    provider = str((params or {}).get("provider", "")).strip().lower()
+    if not provider:
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": None,
+            "error": "provider required (codex|claude|cursor|xai|*-sub)",
+        }
+    try:
+        return _sl().ensure_fresh(provider)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": None,
+            "error": f"subscription_ensure_fresh failed: {exc}",
+        }
+
+
 
 SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_status": _subscription_status,
@@ -249,5 +274,6 @@ SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_accounts": _subscription_accounts,
     "subscription_switch": _subscription_switch,
     "subscription_usage": _subscription_usage,
+    "subscription_ensure_fresh": _subscription_ensure_fresh,
 }
 

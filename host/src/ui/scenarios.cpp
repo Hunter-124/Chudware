@@ -2,7 +2,7 @@
 // app.cpp's run_gui frame loop (behavior-preserving; see scenarios.h).
 #include "scenarios.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 //
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>

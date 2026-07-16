@@ -1,8 +1,8 @@
 #include "worker_client.h"
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #include <windows.h>
-#else
+#elif !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -305,6 +305,11 @@ bool fileExists(const std::string& p) {
 WorkerClient::~WorkerClient() { stop(); }
 
 bool WorkerClient::start(std::string& err, const std::string& module) {
+#ifdef __EMSCRIPTEN__
+    (void)module;
+    err = "WASM: Python worker not available (daemon mode only)";
+    return false;
+#else
     // Resolve via the shared bootstrap logic so the worker, runtimeReady(), and the GUI
     // all agree on which python + app dir to use.
     std::string python = runtimePython();
@@ -397,11 +402,15 @@ bool WorkerClient::start(std::string& err, const std::string& module) {
     childStdinWr_ = inPipe[1];
     running_ = true;
     return true;
-#endif
+#endif  // _WIN32
+#endif  // __EMSCRIPTEN__
 }
 
 void WorkerClient::stop() {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    running_ = false;
+    return;
+#elif defined(_WIN32)
     if (childStdinWr_) {
         DWORD wrote = 0;
         const char* bye = "{\"id\":0,\"method\":\"shutdown\"}\n";
@@ -451,7 +460,10 @@ void WorkerClient::stop() {
 }
 
 bool WorkerClient::readLine(std::string& line, int timeoutMs) {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    (void)line; (void)timeoutMs;
+    return false;
+#elif defined(_WIN32)
     ULONGLONG start = GetTickCount64();
     for (;;) {
         if (abort_.load()) return false;  // C39: teardown — stop polling immediately
@@ -538,7 +550,7 @@ bool WorkerClient::readLine(std::string& line, int timeoutMs) {
             return false;
         }
     }
-#endif
+#endif  // platform
 }
 
 // T-G9 parity trace: with AI_CAD_RPC_TRACE=<file> set, every call() appends one JSONL
@@ -601,10 +613,18 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         json cppResult;
         bool ok = false;
         if (method == "agent_run_v2") {
-            // {request, doc_id, ...} -> agent_run {request, doc_id, options:<passthrough>}.
-            // The C++ core resolves the provider from config.json and picks micro vs design.
+            // {request, doc_id, provider?, model?, reasoning_effort?, ...} -> agent_run.
+            // The C++ core resolves the provider from config.json unless the GUI pins a
+            // provider NAME (or full descriptor) + model/effort overrides (picker O1).
+            // CRITICAL: those top-level override fields MUST be forwarded — dropping them
+            // makes the picker decorative and leaves ambient config.json/env in charge.
             json p = {{"request", params.value("request", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
+            for (const char* k : {"provider", "model", "reasoning_effort", "attachments",
+                                  "context_refs"}) {
+                auto it = params.find(k);
+                if (it != params.end()) p[k] = *it;
+            }
             // Pass through any run options the host may carry (budgets/run_id/control).
             json options = json::object();
             for (const char* k : {"options", "budgets", "run_id", "control"}) {
@@ -623,11 +643,15 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 for (const auto& ev : cppResult["events"]) onEvent(ev);
             }
         } else if (method == "agent_mission_v1") {
-            // {request, doc_id, ...} -> agent_mission_v1 {request, doc_id, options}. The core
-            // decomposes the request into a task chain (design -> CFD -> verdict), threads the
-            // working doc forward, and returns {..., verdict, tasks, created_doc?, asm_path?}.
+            // {request, doc_id, provider?, model?, ...} -> agent_mission_v1. Same O1
+            // passthrough as agent_run_v2 so the picker beats ambient config.
             json p = {{"request", params.value("request", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
+            for (const char* k : {"provider", "model", "reasoning_effort", "attachments",
+                                  "context_refs"}) {
+                auto it = params.find(k);
+                if (it != params.end()) p[k] = *it;
+            }
             json options = json::object();
             for (const char* k : {"options", "budgets", "run_id", "control"}) {
                 auto it = params.find(k);
@@ -645,15 +669,22 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
                 for (const auto& ev : cppResult["events"]) onEvent(ev);
             }
         } else if (method == "agent_ask_v2") {
-            // {question, doc_id, ...} -> agent_answer_question {question, doc_id}.
+            // {question, doc_id, provider?, model?, ...} -> agent_answer_question.
             json p = {{"question", params.value("question", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
+            for (const char* k : {"provider", "model", "reasoning_effort"}) {
+                auto it = params.find(k);
+                if (it != params.end()) p[k] = *it;
+            }
             ok = engine::call("agent_answer_question", p, cppResult, cerr, timeoutMs);
         } else if (method == "agent_clarify_v1") {
-            // {request, doc_id, ...} -> agent_clarify {request, doc_id}. Returns
-            // {ready, questions:[{key,ask,unit,suggested}], assumptions:[...]}.
+            // {request, doc_id, provider?, model?, ...} -> agent_clarify.
             json p = {{"request", params.value("request", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
+            for (const char* k : {"provider", "model", "reasoning_effort"}) {
+                auto it = params.find(k);
+                if (it != params.end()) p[k] = *it;
+            }
             ok = engine::call("agent_clarify", p, cppResult, cerr, timeoutMs);
         } else if (method == "agent_pm_assist_v1") {
             // The host's PM payload (doc_id, intent, form_schema, current, selected_refs)
@@ -821,6 +852,12 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
     int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};
     std::string line = req.dump() + "\n";
+#if defined(__EMSCRIPTEN__)
+    (void)line;
+    err = "WASM: worker pipe write not available";
+    if (errorSink_) errorSink_(method, err);
+    return false;
+#else
 #ifdef _WIN32
     DWORD wrote = 0;
     if (!WriteFile(childStdinWr_, line.data(), (DWORD)line.size(), &wrote, nullptr)) {
@@ -831,6 +868,7 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
         if (errorSink_) errorSink_(method, err);  // W1-B
         return false;
     }
+#endif  // !__EMSCRIPTEN__
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {

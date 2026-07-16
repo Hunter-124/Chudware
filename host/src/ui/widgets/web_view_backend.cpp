@@ -46,6 +46,7 @@ public:
     bool active() const override                   { return false; }
     bool starting() const override                 { return false; }
     const std::string& lastError() const override  { return s_; }
+    bool available() const override                { return false; }
 
 private:
     std::string s_;

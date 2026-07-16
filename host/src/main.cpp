@@ -7,7 +7,10 @@
 //
 // The offscreen modes need only a hidden GL context, so they verify the whole render
 // path headlessly. GUI mode is in gui.cpp.
-#include <glad/gl.h>
+#include "gl_compat.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 //
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -216,10 +219,12 @@ GLFWwindow* makeContext(int w, int h, bool visible) {
         return nullptr;
     }
     glfwMakeContextCurrent(win);
+#ifndef __EMSCRIPTEN__
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) {
         std::fprintf(stderr, "glad load failed\n");
         return nullptr;
     }
+#endif
     return win;
 }
 
@@ -346,6 +351,16 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 }
 
 int main(int argc, char** argv) {
+#ifdef __EMSCRIPTEN__
+    std::fprintf(stderr, "[wasm-boot] main enter\n");
+    std::fflush(stderr);
+    MAIN_THREAD_EM_ASM({
+        var el = document.getElementById('status');
+        if (el) el.textContent = 'main enter';
+        if (!window.__billetLogs) window.__billetLogs = [];
+        window.__billetLogs.push('boot: main enter');
+    });
+#endif
     // FIRST: mirror BILLET_* env vars onto the legacy AI_CAD_*/AICAD_* names every
     // subsystem (and every child process we spawn) actually reads.
     propagateBilletEnv();
@@ -452,5 +467,9 @@ int main(int argc, char** argv) {
         return run_gui(nullptr, openArg);
     }
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
+#ifdef __EMSCRIPTEN__
+    std::fprintf(stderr, "[wasm-boot] calling run_gui\n");
+    std::fflush(stderr);
+#endif
     return run_gui(nullptr);
 }

@@ -315,6 +315,20 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     }
 
     RunEvents events(run_id, emit);
+    // Live provider_call debug events (endpoint/status/latency) land on the same
+    // emit stream as stage events so the host can orch_-prefix them into chat.
+    set_provider_call_emitter([&events](const json& ev) {
+        json data = ev;
+        std::string kind = "provider_call";
+        if (data.contains("kind") && data["kind"].is_string()) {
+            kind = data["kind"].get<std::string>();
+            data.erase("kind");
+        }
+        events.emit(kind, data);
+    });
+    struct ProviderEmitGuard {
+        ~ProviderEmitGuard() { set_provider_call_emitter(nullptr); }
+    } provider_emit_guard;
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);

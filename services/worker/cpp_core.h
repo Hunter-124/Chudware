@@ -20,11 +20,12 @@ namespace core {
 
 class CppCore {
 public:
-    // Lazily load libaicad.dll. Resolution order:
-    //   1. $AI_CAD_LIBAICAD (an explicit absolute path to libaicad.dll), then
-    //   2. libaicad.dll next to the host exe.
-    // Loaded with LOAD_WITH_ALTERED_SEARCH_PATH so the DLL's OCCT sibling DLLs
-    // resolve from its own directory. Returns false (err filled) if unavailable.
+    // Lazily load libaicad.{so,dll}. Resolve order (first hit wins):
+    //   1. $BILLET_LIBAICAD / $AI_CAD_LIBAICAD (explicit absolute path)
+    //   2. AICAD_DEFAULT_LIBAICAD (compile-time build-tree path, if set)
+    //   3. libaicad next to the running host/hostd executable (staged install)
+    //   4. bare name via the dynamic loader (rpath / LD_DIRECTORY / PATH)
+    // Logs the winner once to stderr: "[cpp_core] loaded libaicad ... path=...".
     // Safe to call repeatedly; only loads once.
     bool ensureLoaded(std::string& err);
     bool available() const { return loaded_; }

@@ -144,7 +144,21 @@ struct CompleteResult {
     std::string text;
     std::string thinking;
     std::string error;
+    // Per-call debug (provider_call orch event). Zero/empty when not applicable
+    // (mock / pre-HTTP failures). attempt is 1-based including retries.
+    int http_status = 0;
+    int latency_ms = 0;
+    int attempt = 1;
+    std::string endpoint;
+    std::string model;
+    std::string request_id;
+    std::string error_excerpt;  // ≤200 chars of raw failure body/message
 };
+// Optional live sink for per-provider-call debug events (kind "provider_call").
+// Set for the duration of a design/micro run so complete() can emit without
+// every call site knowing about RunEvents. Thread-local; nullptr = no emit.
+void set_provider_call_emitter(std::function<void(const json&)> emit);
+std::function<void(const json&)>& provider_call_emitter();
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens = 8000);
 

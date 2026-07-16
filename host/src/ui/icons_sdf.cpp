@@ -5,7 +5,7 @@
 // cached quad thereafter. All GL on the calling (GUI) thread.
 #include "icons_sdf.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 

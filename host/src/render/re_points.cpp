@@ -2,7 +2,7 @@
 // See re_points.h for the API contract.
 #include "re_points.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include "ui/viewport/glsl_compat.h"
 
 

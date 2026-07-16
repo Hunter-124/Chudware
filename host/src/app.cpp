@@ -5,10 +5,36 @@
 // handling, the headless screenshot modes, and teardown. The data model, job launcher, and each
 // panel's draw code live in core/* and ui/* (see core/app_state.h). Behavior-preserving split of
 // the former gui_app.cpp monolith.
-#include <glad/gl.h>
+#include "gl_compat.h"
 //
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+// Worker stderr often never reaches the page console under PROXY_TO_PTHREAD;
+// always mirror the last checkpoint onto #status via the browser main thread.
+inline void wasmBootDom(const char* msg) {
+    MAIN_THREAD_EM_ASM({
+        var el = document.getElementById('status');
+        if (el) el.textContent = UTF8ToString($0);
+        try {
+            if (!window.__billetLogs) window.__billetLogs = [];
+            window.__billetLogs.push('boot: ' + UTF8ToString($0));
+            if (window.__billetLogs.length > 400) window.__billetLogs.shift();
+        } catch (e) {}
+    }, msg);
+}
+#define WASM_BOOT_LOG(...) do { \
+    std::fprintf(stderr, __VA_ARGS__); std::fflush(stderr); \
+    char _wb[256]; std::snprintf(_wb, sizeof(_wb), __VA_ARGS__); \
+    /* strip trailing newline for DOM */ \
+    size_t _n = std::strlen(_wb); if (_n && _wb[_n-1]=='\n') _wb[_n-1]=0; \
+    wasmBootDom(_wb); \
+} while (0)
+#else
+#define WASM_BOOT_LOG(...) do {} while (0)
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -819,9 +845,38 @@ static bool saveAllDirtyForQuit(AppState& st) {
 // TEMP DIAGNOSTIC: forward decl for the vendor-wizard headless repro in run_gui.
 namespace ui { namespace parts { void startLoginWizard(AppState&, const std::string&); } }
 
+
+#ifdef __EMSCRIPTEN__
+// Under PROXY_TO_PTHREAD + OffscreenCanvas the drawing buffer stays at the
+// HTMLCanvasElement default (300x150) unless we explicitly size it from CSS.
+static void wasmSyncCanvasSize(GLFWwindow* win) {
+    double cssW = 0, cssH = 0;
+    if (emscripten_get_element_css_size("#canvas", &cssW, &cssH) != EMSCRIPTEN_RESULT_SUCCESS) {
+        cssW = 1280; cssH = 800;
+    }
+    if (cssW < 64) cssW = 64;
+    if (cssH < 64) cssH = 64;
+    double dpr = emscripten_get_device_pixel_ratio();
+    if (dpr < 0.5) dpr = 1.0;
+    if (dpr > 3.0) dpr = 3.0;
+    const int fbW = (int)(cssW * dpr + 0.5);
+    const int fbH = (int)(cssH * dpr + 0.5);
+    static int sLastW = 0, sLastH = 0;
+    if (fbW == sLastW && fbH == sLastH) return;
+    sLastW = fbW; sLastH = fbH;
+    emscripten_set_canvas_element_size("#canvas", fbW, fbH);
+    // Keep GLFW's notion of the window in CSS pixels so ImGui io.DisplaySize matches layout.
+    glfwSetWindowSize(win, (int)(cssW + 0.5), (int)(cssH + 0.5));
+    WASM_BOOT_LOG("[wasm-boot] canvas size css=%.0fx%.0f dpr=%.2f fb=%dx%d\n", cssW, cssH, dpr, fbW, fbH);
+}
+#endif
+
 int run_gui(const char* screenshotPath, const char* openPath) {
+WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
     const bool shot = screenshotPath != nullptr;
-#ifndef _WIN32
+#ifdef __EMSCRIPTEN__
+    if (!glfwInit()) return 1;
+#elif !defined(_WIN32)
     // The borderless custom chrome (chrome::tick drag/resize) needs a backend where a client
     // can position itself; Wayland forbids that, so prefer X11 (XWayland). Fall back to the
     // default platform if X11 isn't available (the window stays borderless but can't self-move).
@@ -833,11 +888,17 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 #else
     if (!glfwInit()) return 1;
 #endif
+#ifdef __EMSCRIPTEN__
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+#else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#endif
     if (!shot) glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     // Borderless: the app draws its own title bar; chrome::tick handles move/resize. (Windows
     // creates a normal window and strips the frame later via the WndProc in chrome::install.)
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
@@ -866,16 +927,29 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         }
     }
     GLFWwindow* win = glfwCreateWindow(winW, winH, "Billet", nullptr, nullptr);
+#ifdef __EMSCRIPTEN__
+    WASM_BOOT_LOG("[wasm-boot] glfwCreateWindow %s\n", win?"ok":"FAIL");
+#endif
     if (!win) { glfwTerminate(); return 1; }
     if (winSized) glfwSetWindowPos(win, 0, 0);
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
+#ifndef __EMSCRIPTEN__
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;
+#endif
+#ifdef __EMSCRIPTEN__
+    std::fprintf(stderr, "[wasm-boot] GL context current\n");
+    wasmSyncCanvasSize(win);
+#endif
 
     // CEF (when the cef backend is selected) is initialised early in main(),
     // before GLFW — see main.cpp. Nothing to do here.
 
+#ifdef __EMSCRIPTEN__
+    const std::string assets = "/assets";
+#else
     const std::string assets = exeDir() + "/assets";  // '/' is valid on Windows + POSIX
+#endif
     setWindowIcon(win, assets + "/logo_icon.png");
 
     IMGUI_CHECKVERSION();
@@ -911,8 +985,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::applyTheme(initTheme, scale);
     }
     ui::Fonts fonts = ui::loadFonts(assets, scale);
+WASM_BOOT_LOG("[wasm-boot] loadFonts done\n");
     ImGui_ImplGlfw_InitForOpenGL(win, true);
+#ifdef __EMSCRIPTEN__
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+    std::fprintf(stderr, "[wasm-boot] ImGui_ImplOpenGL3_Init done\n");
+#else
     ImGui_ImplOpenGL3_Init("#version 330");
+#endif
 
     // Borderless window: strip the OS title bar/frame and drive our own (drag/resize/snap
     // stay native). Must be installed after the ImGui GLFW backend so our WndProc is on top.
@@ -949,6 +1029,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
     // C14: load icon atlases (stb_image; must be after GL context is live).
     ui::loadIcons(assets);
+WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
 
     // W1-B: create the GLFW standard cursors once (consumed per-frame via st.requestCursor).
     ui::initCursors(win);
@@ -2185,7 +2266,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             ui::applyTheme(desired, scale);
     };
 
+WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
     while (!glfwWindowShouldClose(win)) {
+#ifdef __EMSCRIPTEN__
+        static int s_wasmFrames = 0;
+        if (s_wasmFrames < 3) WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
+        ++s_wasmFrames;
+        wasmSyncCanvasSize(win);
+#endif
         // T-PERF10: idle render throttle. When nothing needs continuous redraw (no animation,
         // no async RPCs, no camera tween, no headless shot), wait up to 50ms for an event
         // instead of spinning at full vsync and burning a core. Input still wakes immediately.
@@ -2198,7 +2286,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             if (busy || shot) {
                 glfwPollEvents();
             } else {
-                glfwWaitEventsTimeout(0.05);  // 20 Hz idle floor
+                #ifdef __EMSCRIPTEN__
+        glfwPollEvents();  // wait-timeout can stall under PROXY_TO_PTHREAD + contrib.glfw3
+#else
+        glfwWaitEventsTimeout(0.05);
+#endif  // 20 Hz idle floor
             }
         }
 #ifdef AI_CAD_ENABLE_CEF
@@ -2551,13 +2643,17 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             } else if (!st.job.error.empty()) {
                 st.status = "System error";
                 st.statusKind = 2;
-                std::string e = st.job.error.substr(0, 300);
+                // Prefer the structured provider detail when present (longer, more actionable).
+                std::string full = !st.job.errorDetail.empty() ? st.job.errorDetail : st.job.error;
+                if (!st.job.stopReason.empty() && full.find(st.job.stopReason) == std::string::npos)
+                    full = st.job.stopReason + " — " + full;
+                std::string e = full.substr(0, 400);
                 st.addLog("[err] " + e);
-                st.toast(ui::ToastLevel::Error, "System error: " + errSummary(st.job.error));  // W1-B
+                st.toast(ui::ToastLevel::Error, "System error: " + errSummary(full));  // W1-B
                 assistantErr = ERR_SYSTEM;
                 // A missing Python module means the venv is incomplete — auto-repair once.
-                bool missingModule = st.job.error.find("ModuleNotFoundError") != std::string::npos ||
-                                     st.job.error.find("No module named") != std::string::npos;
+                bool missingModule = full.find("ModuleNotFoundError") != std::string::npos ||
+                                     full.find("No module named") != std::string::npos;
                 if (missingModule && !st.importRepairTried && !st.setupRunning.load()) {
                     st.importRepairTried = true;
                     st.addLog("[..] runtime module missing — auto-repairing (use Billet > Repair runtime if this persists)...");
@@ -2644,7 +2740,15 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     st.status = "Stopped early";
                     st.statusKind = 1;
                     assistantErr = ERR_CAD;
-                    std::string why = st.job.stopReason.empty() ? "unknown reason" : st.job.stopReason;
+                    // Prefer errorDetail (provider HTTP body / auth message) so the card
+                    // never falls back to "unknown reason" when stopReason was dropped.
+                    std::string why = !st.job.errorDetail.empty()
+                                          ? st.job.errorDetail
+                                          : (st.job.stopReason.empty() ? "unknown reason"
+                                                                      : st.job.stopReason);
+                    if (!st.job.stopReason.empty() && !st.job.errorDetail.empty() &&
+                        st.job.stopReason != st.job.errorDetail)
+                        why = st.job.stopReason + " — " + st.job.errorDetail;
                     assistant = "I stopped before fully finishing (" + why + "). Whatever was built "
                                 "so far is in the FeatureManager tree - check the Activity panel "
                                 "for the step-by-step log, or rephrase and try again.";

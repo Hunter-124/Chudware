@@ -1,6 +1,13 @@
 #include "renderer.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
+#ifdef BILLET_GLES3
+// GLES3 lacks polygon-offset-line (desktop-only); map to fill offset.
+#ifndef GL_POLYGON_OFFSET_LINE
+#  define GL_POLYGON_OFFSET_LINE GL_POLYGON_OFFSET_FILL
+#endif
+#endif
+
 
 #include <algorithm>
 #include <chrono>
@@ -2271,11 +2278,18 @@ bool Renderer::averageBackdropStats(float x0, float y0, float x1, float y1,
 
 // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
 void Renderer::beginGpuTimer(GpuTimerRing& t) {
+#ifdef BILLET_GLES3
+    (void)t;  // WebGL2 has no reliable TIME_ELAPSED timer queries
+#else
     if (!t.id[0]) glGenQueries(2, t.id);
     glBeginQuery(GL_TIME_ELAPSED, t.id[t.cur]);
+#endif
 }
 
 void Renderer::endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid) {
+#ifdef BILLET_GLES3
+    (void)t; (void)outMs; outValid = false;
+#else
     glEndQuery(GL_TIME_ELAPSED);
     t.pending[t.cur] = true;
     const int other = t.cur ^ 1;
@@ -2292,6 +2306,7 @@ void Renderer::endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid) {
         }
         // Not yet available: never block — keep reporting the previous outMs this frame.
     }
+#endif
 }
 
 GlassTimings Renderer::glassTimings() const {

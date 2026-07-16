@@ -1,7 +1,7 @@
 // RE-28: 3D Gaussian Splat renderer — implementation. See splat_renderer.h for the design.
 #include "splat_renderer.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include "ui/viewport/glsl_compat.h"
 
 

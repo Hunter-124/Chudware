@@ -22,14 +22,24 @@ include(FetchContent)
 # for an SDK-less build — makeWebView then returns a NullWebView (no browser).
 option(AI_CAD_ENABLE_CEF "Build the in-process CEF off-screen browser backend" ON)
 
+# Web/WASM builds never ship CEF. Force the option off so cmake/cef.cmake is
+# never included (the SDK is native-only). Native default stays ON above.
+if(EMSCRIPTEN)
+  set(AI_CAD_ENABLE_CEF OFF CACHE BOOL "Build the in-process CEF off-screen browser backend" FORCE)
+endif()
+
+
 # --- GLFW (window + GL context) ---------------------------------------------
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(glfw
-  GIT_REPOSITORY https://github.com/glfw/glfw.git
-  GIT_TAG 3.4)
+# Native: FetchContent glfw 3.4. EMSCRIPTEN: contrib.glfw3 port (link flags below).
+if(NOT EMSCRIPTEN)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.4)
+endif()
 
 # --- glad (GL 3.3 core loader) — vendored, pre-generated into extern/glad ----
 # Compiled directly into the target; no configure-time fetch/generation.
@@ -55,6 +65,7 @@ FetchContent_Declare(imgui
 # document.json out of a component `.step+` for the assembly tree's nested rows.
 # The release ships miniz.c/miniz.h with no root CMakeLists, so populate + build
 # a tiny static lib ourselves (C is already enabled on this project).
+# miniz: host reads document.json out of component `.step+` zips (assembly tree).
 FetchContent_Declare(miniz
   URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip)
 FetchContent_GetProperties(miniz)
@@ -64,9 +75,15 @@ endif()
 add_library(aicad_host_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
 target_include_directories(aicad_host_miniz PUBLIC ${miniz_SOURCE_DIR})
 
-FetchContent_MakeAvailable(glfw stb json imgui)
+if(EMSCRIPTEN)
+  FetchContent_MakeAvailable(stb json imgui)
+else()
+  FetchContent_MakeAvailable(glfw stb json imgui)
+endif()
 
-add_executable(Billet
+# Shared host sources (native + EMSCRIPTEN). Desktop-only / platform TUs are
+# stripped or swapped below for the web target.
+set(BILLET_CORE_SOURCES
   src/main.cpp
   src/app.cpp
   src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
@@ -74,6 +91,7 @@ add_executable(Billet
   src/core/jobs.cpp
   src/ui/legacy_chat.cpp
   src/ui/settings_modal.cpp
+  src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/console_panel.cpp
   # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
   src/ui/toast.cpp
@@ -170,14 +188,9 @@ add_executable(Billet
   ../services/worker/worker_client.cpp
   # --- Phase 4 (shared engine daemon): backend seam + IPC client + event drain ---
   ../services/worker/engine_backend.cpp
-  ../services/ipc/ipc_transport.cpp
-  ../services/ipc/ipc_transport_win.cpp
-  ../services/ipc/ipc_discovery.cpp
-  ../services/ipc/ipc_discovery_win.cpp
   ../services/ipc/ipc_client.cpp
   src/core/engine_events.cpp
   # --- end Phase 4 ---
-  src/bootstrap.cpp
   src/ui_theme.cpp
   src/win_chrome.cpp
   src/stb_impl.cpp
@@ -210,52 +223,130 @@ add_executable(Billet
   src/ui/firmware/fw_workspace.cpp    # T-FIN5 Firmware workspace (projects/build/emulation/trace)
   src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels
   src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
-  src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery
   src/ui/reveng/sources_panel.cpp    # RE-30 source-mode entry panel (Scan/Datasheet/Web/Library)
-  # RE-07/RE-19: CameraBackend (V4L2 / MF / stub) for live webcam capture
-  src/platform/camera_stub.cpp
   # --- end [parts-plm sources] ---
-  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
+  # --- FsBackend + browser fetch/pick (native + web) ---
+  src/core/fs_backend.cpp
+  src/core/web_fetch.cpp
+  src/core/web_file_pick.cpp
+  # --- end FsBackend ---
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-  ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
+if(EMSCRIPTEN)
+  # Full app under EMSCRIPTEN: same core list, swap IPC transport, stub bootstrap/
+  # discovery/spawn, drop glad + camera (browser has no V4L2/MF).
+  set(BILLET_WASM_SOURCES ${BILLET_CORE_SOURCES})
+  list(APPEND BILLET_WASM_SOURCES
+    src/wasm_stubs.cpp
+    ../services/ipc/ipc_transport_wasm.cpp
+    src/ui/reveng/webcam_capture.cpp   # RE-19 widget (uses camera_stub under web)
+    src/platform/camera_stub.cpp)
+  # Desktop-only TUs that must not enter the wasm link (if present in core list).
+  # camera / glad / native IPC / bootstrap are added only on the native branch.
+  add_executable(Billet ${BILLET_WASM_SOURCES})
+else()
+  set(BILLET_NATIVE_SOURCES ${BILLET_CORE_SOURCES})
+  list(APPEND BILLET_NATIVE_SOURCES
+    src/bootstrap.cpp
+    ../services/ipc/ipc_transport.cpp
+    ../services/ipc/ipc_transport_win.cpp
+    ../services/ipc/ipc_discovery.cpp
+    ../services/ipc/ipc_discovery_win.cpp
+    src/ui/reveng/webcam_capture.cpp   # RE-19 webcam widget + coverage overlay
+    src/platform/camera_stub.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c)
+  add_executable(Billet ${BILLET_NATIVE_SOURCES})
+endif()
+
 
 # Embed the Windows application icon + version info into Billet.exe so File
 # Explorer and the taskbar show the brand icon instead of the default. The .rc
 # references assets/app.ico (generated by assets/make_logo.py).
-if(WIN32)
-  target_sources(Billet PRIVATE app.rc)
+if(NOT EMSCRIPTEN)
+  if(WIN32)
+    target_sources(Billet PRIVATE app.rc)
+  endif()
+  if(NOT WIN32)
+    target_sources(Billet PRIVATE src/platform/camera_v4l2.cpp)
+  else()
+    target_sources(Billet PRIVATE src/platform/camera_mf.cpp)
+  endif()
 endif()
-if(NOT WIN32)
-  target_sources(Billet PRIVATE src/platform/camera_v4l2.cpp)
+
+
+if(EMSCRIPTEN)
+  target_include_directories(Billet PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
+    ${stb_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends)
+  target_compile_definitions(Billet PRIVATE BILLET_GLES3=1)
+  target_link_libraries(Billet PRIVATE nlohmann_json::nlohmann_json aicad_host_miniz)
+  # Assets preloaded at /assets (fonts + icon atlases the full app loads at boot).
+  set(_WASM_ASSETS "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
+  target_link_options(Billet PRIVATE
+    "SHELL:--use-port=contrib.glfw3"
+    "SHELL:-lwebsocket.js"
+    "SHELL:-sWASM=1"
+    "SHELL:-pthread"
+    "SHELL:-sPTHREAD_POOL_SIZE=8"
+    "SHELL:-sASSERTIONS=1"
+    "SHELL:-sALLOW_MEMORY_GROWTH=1"
+    "SHELL:-sMAXIMUM_MEMORY=4GB"
+    "SHELL:-sMAX_WEBGL_VERSION=2"
+    "SHELL:-sMIN_WEBGL_VERSION=2"
+    "SHELL:-sFETCH=1"
+    "SHELL:-sFULL_ES3=1"
+    "SHELL:-sUSE_WEBGL2=1"
+    "SHELL:-sOFFSCREEN_FRAMEBUFFER=1"
+    "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
+    "SHELL:--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
+    "SHELL:--preload-file=${_WASM_ASSETS}/fonts@/assets/fonts"
+    "SHELL:--preload-file=${_WASM_ASSETS}/icons/atlas.json@/assets/icons/atlas.json"
+    "SHELL:--preload-file=${_WASM_ASSETS}/icons/atlas_dark.png@/assets/icons/atlas_dark.png"
+    "SHELL:--preload-file=${_WASM_ASSETS}/icons/atlas_light.png@/assets/icons/atlas_light.png"
+    "SHELL:--preload-file=${_WASM_ASSETS}/logo_icon.png@/assets/logo_icon.png"
+    "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark.png@/assets/logo_wordmark.png"
+    "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark_dark.png@/assets/logo_wordmark_dark.png"
+  )
+  # Also pass the port at compile time so GLFW headers resolve.
+  target_compile_options(Billet PRIVATE
+    "SHELL:--use-port=contrib.glfw3"
+    "SHELL:-pthread")
+  set_target_properties(Billet PROPERTIES
+    SUFFIX ".html"
+    OUTPUT_NAME "Billet")
 else()
-  target_sources(Billet PRIVATE src/platform/camera_mf.cpp)
-endif()
-
-
-target_include_directories(Billet PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../core
-  ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
-  ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
-  ${stb_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
-  ${imgui_SOURCE_DIR}
-  ${imgui_SOURCE_DIR}/backends)
-target_link_libraries(Billet PRIVATE glfw nlohmann_json::nlohmann_json aicad_host_miniz)
-if(UNIX AND NOT APPLE)
-  target_link_libraries(Billet PRIVATE rt)  # shm_open (older glibc)
+  target_include_directories(Billet PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
+    ${stb_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(Billet PRIVATE glfw nlohmann_json::nlohmann_json aicad_host_miniz)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(Billet PRIVATE rt)  # shm_open (older glibc)
+  endif()
 endif()
 
 # CEF off-screen browser backend (opt-in). cmake/cef.cmake finds the CEF binary
 # distribution, adds the cef_web_view sources + libcef_dll_wrapper, defines
 # AI_CAD_ENABLE_CEF, and registers the mandatory subprocess-helper target. Kept
 # out of the default build entirely (no-op when the option is OFF).
-if(AI_CAD_ENABLE_CEF)
+if(AI_CAD_ENABLE_CEF AND NOT EMSCRIPTEN)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cef.cmake)
 endif()
 if(WIN32)
@@ -279,6 +370,7 @@ endif()
 set_target_properties(Billet PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+if(NOT EMSCRIPTEN)
 # --- C15: optional pure-CPU loader test (no GL/GLFW). Built with the default target set. ---
 add_executable(test_aicm
   src/render/aicm_loader.cpp
@@ -384,3 +476,5 @@ if(NOT WIN32)
             "$<TARGET_FILE_DIR:Billet>/AI-CAD"
     COMMENT "Creating AI-CAD compatibility symlink -> Billet")
 endif()
+
+endif()  # NOT EMSCRIPTEN (native tests + asset copy)

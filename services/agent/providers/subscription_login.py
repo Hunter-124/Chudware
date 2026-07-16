@@ -19,6 +19,7 @@ contract-shaped dict — never a traceback.
 from __future__ import annotations
 
 from typing import Callable
+import time
 
 from . import sub_auth
 
@@ -32,12 +33,14 @@ _PROVIDERS = {
 
 ProgressCb = Callable[[dict], None]
 
-
 def _resolve(provider: str):
     key = (provider or "").strip().lower()
-    # Accept the provider *name* too, so callers can pass either "codex" or "codex-sub".
+    # Wire / config aliases that are not the friendly id or provider name.
+    if key == "anthropic":
+        key = "claude"
+    # Accept friendly id, provider name, or credential-store id.
     for friendly, (name, cred_id, label) in _PROVIDERS.items():
-        if key in (friendly, name):
+        if key in (friendly, name, cred_id):
             return friendly, name, cred_id, label
     return None
 
@@ -62,6 +65,148 @@ def providers() -> list[dict]:
     """List the supported subscription providers (for populating the Settings UI)."""
     return [{"id": fid, "name": name, "label": label}
             for fid, (name, _cred, label) in _PROVIDERS.items()]
+
+# Default refresh skew for pre-run ensure_fresh (5 minutes). Matches anthropic /
+# cursor / xai provider skews so the C++ read-only token path never sees an
+# already-expired access token at run start.
+_ENSURE_FRESH_SKEW_MS = 5 * 60 * 1000
+
+def _has_api_key_fallback(friendly: str) -> bool:
+    """True when config is currently on a classic API-key path for this provider.
+
+    xAI and Anthropic both support API-key mode; a stale leftover subscription
+    credential must not block those runs. Cursor/codex are subscription-only.
+
+    Requires BOTH the active ``provider`` wire name AND a key shape that matches
+    the non-OAuth path — a leftover openai/gemini key must not soft-pass Claude.
+    """
+    if friendly not in ("xai", "claude"):
+        return False
+    try:
+        cfg = sub_auth._load_cfg()  # noqa: SLF001 — shared config reader
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    prov = str(cfg.get("provider") or "").strip().lower()
+    key = str(cfg.get("api_key") or "").strip()
+    if not key:
+        return False
+    if friendly == "claude":
+        # API-key mode is provider=anthropic with a classic sk-ant- key (not OAuth oat).
+        if prov != "anthropic":
+            return False
+        if key.startswith("sk-ant-oat"):
+            return False
+        return key.startswith("sk-ant-")
+    # xai API-key mode: app_state only writes bare "xai" (not xai-sub) when xaiKey is set.
+    if prov != "xai":
+        return False
+    return True
+
+
+
+def ensure_fresh(provider: str, *, skew_ms: int = _ENSURE_FRESH_SKEW_MS) -> dict:
+    """Refresh the active subscription token if expired or expiring within *skew_ms*.
+
+    Python is the single token-refresh writer (C++ reads subscription_auth
+    read-only). Returns a contract-shaped dict with no secrets::
+
+        {ok, refreshed, expires_in, error}
+
+    *provider* accepts friendly ids (claude/xai/cursor/codex) and provider
+    names (anthropic-sub/xai-sub/…) — same aliases as status/login.
+    """
+    resolved = _resolve(provider)
+    if resolved is None:
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": None,
+            "error": f"unknown subscription provider {provider!r}",
+        }
+    friendly, name, cred_id, _label = resolved
+    try:
+        cred = sub_auth.load_credential(cred_id)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": None,
+            "error": f"load credential failed: {exc}",
+        }
+    if not cred or not (
+        cred.get("access_token") or cred.get("refresh_token")
+    ):
+        # No stored subscription credential. Callers that use an API-key path
+        # (e.g. anthropic + sk-ant-…) still proceed; C++ refuses later if both
+        # are missing. Not a refresh failure.
+        return {
+            "ok": True,
+            "refreshed": False,
+            "expires_in": None,
+            "error": None,
+        }
+
+    def _expires_in_s(c: dict) -> int | None:
+        exp = c.get("expires_at_ms")
+        if exp is None:
+            return None
+        try:
+            return int(max(0, (float(exp) - time.time() * 1000) / 1000))
+        except (TypeError, ValueError):
+            return None
+
+    if not sub_auth.is_expired(cred, skew_ms=skew_ms):
+        return {
+            "ok": True,
+            "refreshed": False,
+            "expires_in": _expires_in_s(cred),
+            "error": None,
+        }
+
+    # Stale / near-expiry — refresh via the provider's single-writer path.
+    if not cred.get("refresh_token"):
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": _expires_in_s(cred),
+            "error": (
+                f"{friendly} access token expired and no refresh_token is stored. "
+                "Re-authenticate via Settings → AI → Accounts."
+            ),
+        }
+    try:
+        prov = _instantiate(name)
+        # Constructor already loaded active cred; re-bind for safety.
+        if getattr(prov, "_cred", None) is None:
+            prov._cred = cred
+        new_cred = prov.refresh()
+    except Exception as exc:  # noqa: BLE001 — never leak a traceback over RPC
+        # Dual-path providers (xai / anthropic) may run on a classic API key while a
+        # leftover subscription credential is stale. Don't brick the API-key path.
+        if _has_api_key_fallback(friendly):
+            return {
+                "ok": True,
+                "refreshed": False,
+                "expires_in": _expires_in_s(cred),
+                "error": None,
+            }
+        return {
+            "ok": False,
+            "refreshed": False,
+            "expires_in": _expires_in_s(cred),
+            "error": (
+                f"{friendly} token refresh failed — re-authenticate via "
+                f"Settings → AI → Accounts. ({exc})"
+            ),
+        }
+    return {
+        "ok": True,
+        "refreshed": True,
+        "expires_in": _expires_in_s(new_cred if isinstance(new_cred, dict) else {}),
+        "error": None,
+    }
 
 
 def login(

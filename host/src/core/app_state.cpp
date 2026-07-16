@@ -1,5 +1,5 @@
 // AI-CAD shared application state + data model — implementations (extracted from gui_app.cpp).
-#include <glad/gl.h>
+#include "gl_compat.h"
 //
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -46,7 +46,9 @@ const char* kStarterCode =
 
 // ---------------- settings (AI provider) ----------------
 std::string appdataDir() {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    return "/tmp";
+#elif defined(_WIN32)
     const char* a = std::getenv("APPDATA");
     return std::string(a ? a : ".");
 #else
@@ -83,6 +85,9 @@ std::string configPath() { return appdataAppDir() + "/config.json"; }
 // keeps being used; otherwise the default is Documents/Billet (created on first use by
 // the File Explorer). Falls back to the appdata base when no home/Documents resolves.
 std::string defaultWorkspaceDir() {
+#ifdef __EMSCRIPTEN__
+    return "/workspace";
+#else
     namespace fs = std::filesystem;
 #ifdef _WIN32
     const char* up = std::getenv("USERPROFILE");
@@ -95,6 +100,7 @@ std::string defaultWorkspaceDir() {
     const fs::path legacy = base / "AI-CAD";
     if (fs::exists(legacy, ec)) return legacy.string();
     return (base / "Billet").string();
+#endif
 }
 const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
 
@@ -722,6 +728,12 @@ void AppState::tryStartWorker() {
     // No managed Python runtime on this platform — the in-process C++ core (libaicad) is the
     // backend (doc/agent/sim ops route through cpp_core). If it loads, the app is ready; do NOT
     // dead-end into Python provisioning. On Windows the Python worker stays the production path.
+    //
+    // NOTE: when AI_CAD_ENGINE_DAEMON is unset/1 (default), engine::call goes to aicad-hostd,
+    // which dlopens its OWN libaicad. The path logged here is the GUI process's in-proc load
+    // (fallback / parity); hostd's path is in its stderr "[cpp_core] loaded ..." line and in
+    // daemon hello engine_build_id. Stale hostd holding an old .so is the classic trap —
+    // `aicad-hostd --stop` after a core rebuild, or wait for hostd's mtime self-drain.
     {
         std::string lerr;
         if (core::cpp_core().ensureLoaded(lerr)) {
@@ -732,7 +744,12 @@ void AppState::tryStartWorker() {
             workerStarted = true;
             status = "Ready.";
             statusKind = 0;
-            addLog("[ok] in-process C++ core (libaicad) ready; Python worker not required");
+            const std::string path = core::cpp_core().loadedPath();
+            const std::string bid = core::cpp_core().buildId();
+            addLog("[ok] in-process C++ core (libaicad) ready path=" +
+                   (path.empty() ? std::string("?") : path) +
+                   " abi=" + core::cpp_core().abiVersion() +
+                   (bid.empty() ? std::string() : (" build_id=" + bid)));
             return;
         }
         addLog("[..] libaicad not loaded: " + lerr);

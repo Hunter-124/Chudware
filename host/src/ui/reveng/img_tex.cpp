@@ -3,7 +3,7 @@
 #include "img_tex.h"
 
 #include "stb_image.h"
-#include <glad/gl.h>
+#include "gl_compat.h"
 
 #include <cstdio>
 

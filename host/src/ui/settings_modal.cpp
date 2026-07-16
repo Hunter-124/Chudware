@@ -22,6 +22,7 @@
 #include "legacy_chat.h"  // ui::drawAiSettingsSection (glass-grouped AI tab sections)
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
+#include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
 
 
 // ---- C22b prompt editor state ----
@@ -560,6 +561,10 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     pollSubscriptionAccounts(st, false);
     pollSubscriptionUsage(st, justOpened);
 
+    // In-app xAI OAuth modal (CEF). Draw every frame so the approve page keeps
+    // receiving frames/input even if Accounts scrolls out of view.
+    ui::oauthCapture().draw(st, sc);
+
     if (!s_subAccts.lastError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
         ImGui::TextWrapped("%s", s_subAccts.lastError.c_str());
@@ -753,8 +758,19 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         }
 
         // Live login progress for this provider (device-code UX).
+        // When the in-app CEF modal owns the xAI flow, suppress the inline
+        // external-browser progress (modal shows code + page instead).
         SubLoginProgress& prog = s_subAccts.login[prov];
-        if (prog.inProgress) {
+        const bool cefOwnsXai = (std::string(prov) == "xai") && ui::oauthCapture().active();
+        if (cefOwnsXai) {
+            // Modal owns the flow; Python status still drives prog via the normal
+            // poll above. Do not force-poll every frame (TTL + in-flight guard
+            // would still thrash accounts RPCs). Closing mid-flow leaves the
+            // Python device-code poll running — same as the external-browser path.
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted("Sign-in open in embedded browser\xe2\x80\xa6");
+            ImGui::PopStyleColor();
+        } else if (prog.inProgress) {
             if (prog.userCode.empty() && prog.verifyUrl.empty()) {
                 ImGui::TextUnformatted("Opening browser\xe2\x80\xa6");
             } else {
@@ -795,36 +811,57 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             char addId[64];
             std::snprintf(addId, sizeof(addId), "Add account##%s", prov);
             if (ImGui::SmallButton(addId)) {
-                prog.inProgress = true;
-                prog.lastError.clear();
-                prog.userCode.clear();
-                prog.verifyUrl.clear();
-                prog.browserOpened = false;
-                prog.stage = "start";
-                nlohmann::json p;
-                p["provider"] = prov;
-                // xAI is device-code only. Codex uses its browser callback flow here;
-                // its headless device flow cannot surface a code through this UI.
-                if (std::string(prov) == "xai")
-                    p["device"] = true;
-                st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
-                    SubLoginProgress& pr = s_subAccts.login[prov];
-                    if (!r.ok) {
-                        pr.inProgress = false;
-                        pr.lastError = r.err.empty() ? "login failed" : r.err;
-                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
-                        pr.inProgress = false;
-                        auto reason = optionalJsonString(r.result, "reason");
-                        auto hint = optionalJsonString(r.result, "hint");
-                        pr.lastError = reason.empty() ? "login failed" : reason;
-                        if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
-                    }
-                    s_subAccts.lastAccountsPoll = -1e9;
-                    s_subAccts.lastUsagePoll = -1e9;
-                });
+                const bool isXai = std::string(prov) == "xai";
+                // xAI: prefer in-app CEF device-code approve surface (multi-account
+                // isolation via clearSession). Fallback to external browser when CEF
+                // is unavailable (SDK-less build / cold-init failure).
+                if (isXai && ui::OauthCapture::cefAvailable()) {
+                    prog.inProgress = true;
+                    prog.lastError.clear();
+                    prog.userCode.clear();
+                    prog.verifyUrl.clear();
+                    prog.browserOpened = false;
+                    prog.stage = "start";
+                    ui::oauthCapture().beginXai(st);
+                } else {
+                    prog.inProgress = true;
+                    prog.lastError.clear();
+                    prog.userCode.clear();
+                    prog.verifyUrl.clear();
+                    prog.browserOpened = false;
+                    prog.stage = "start";
+                    nlohmann::json p;
+                    p["provider"] = prov;
+                    // xAI is device-code only. Codex uses its browser callback flow here;
+                    // its headless device flow cannot surface a code through this UI.
+                    if (isXai)
+                        p["device"] = true;
+                    st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
+                        SubLoginProgress& pr = s_subAccts.login[prov];
+                        if (!r.ok) {
+                            pr.inProgress = false;
+                            pr.lastError = r.err.empty() ? "login failed" : r.err;
+                        } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                            pr.inProgress = false;
+                            auto reason = optionalJsonString(r.result, "reason");
+                            auto hint = optionalJsonString(r.result, "hint");
+                            pr.lastError = reason.empty() ? "login failed" : reason;
+                            if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
+                        }
+                        s_subAccts.lastAccountsPoll = -1e9;
+                        s_subAccts.lastUsagePoll = -1e9;
+                    });
+                }
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Add another %s subscription account (browser OAuth).", plabel);
+            if (ImGui::IsItemHovered()) {
+                if (std::string(prov) == "xai" && ui::OauthCapture::cefAvailable())
+                    ImGui::SetTooltip(
+                        "Add another %s account in the embedded browser "
+                        "(session isolated for multi-account).", plabel);
+                else
+                    ImGui::SetTooltip(
+                        "Add another %s subscription account (browser OAuth).", plabel);
+            }
         }
         if (!prog.lastError.empty() && !prog.inProgress) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));

@@ -35,7 +35,9 @@ bool g_daemon = false;
 std::once_flag g_once;
 
 std::string selfExePath() {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    return std::string();
+#elif defined(_WIN32)
     wchar_t buf[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return std::string();
@@ -97,6 +99,16 @@ void logPingLatency(aicad_ipc::EngineClient& c) {
 }
 
 void initOnce() {
+#ifdef __EMSCRIPTEN__
+    // Browser client is ALWAYS daemon mode. Do NOT connect here — first paint
+    // must not block on WebSocket open/hello. maintainConnection() connects
+    // with backoff once the frame loop is running.
+    auto* c = new aicad_ipc::EngineClient();
+    g_client = c;
+    g_daemon = true;
+    std::fprintf(stderr, "[engine] WASM daemon mode armed (connect deferred)\n");
+    return;
+#else
     // Phase-8 flip: daemon mode is the DEFAULT. Only an explicit
     // AI_CAD_ENGINE_DAEMON=0 forces the legacy in-process load (kept at least
     // one release; removal is a named N+1 task).
@@ -121,6 +133,7 @@ void initOnce() {
     std::fprintf(stderr, "[engine] daemon mode: connected to aicad-hostd (state=%s)\n",
                  c->serverInfo().value("state", std::string("?")).c_str());
     logPingLatency(*c);
+#endif
 }
 
 // Absorb {"code":"loading"}: the daemon binds before the (slow) OCCT load and
@@ -249,7 +262,20 @@ DaemonConnState maintainConnection() {
         return DaemonConnState::Unreachable;
 
     std::string err;
-    if (g_client->tryReconnect(err)) {
+#ifdef __EMSCRIPTEN__
+    // First connect (or full re-handshake): connectOrSpawn with allowSpawn=false.
+    // tryReconnect alone needs a prior sockPath_ from connectOrSpawn.
+    aicad_ipc::EngineClient::Options opts;
+    opts.hostdBin.clear();
+    opts.clientKind = "gui";
+    opts.allowSpawn = false;
+    const bool ok = g_client->connected()
+                        ? g_client->tryReconnect(err)
+                        : g_client->connectOrSpawn(opts, err);
+#else
+    const bool ok = g_client->tryReconnect(err);
+#endif
+    if (ok) {
         failedAttempts = 0;
         nextTry = {};
         std::fprintf(stderr, "[engine] daemon reconnected (gen=%llu)\n",

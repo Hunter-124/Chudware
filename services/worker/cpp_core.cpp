@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <vector>
 
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+// Browser never dlopens libaicad; keep platform helpers out of the TU.
+#elif defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
@@ -17,7 +19,7 @@ namespace core {
 
 namespace {
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
 // UTF-8 -> wide, for path APIs.
 std::wstring widen(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -36,7 +38,7 @@ std::wstring exe_dir() {
     size_t slash = p.find_last_of(L"\\/");
     return slash == std::wstring::npos ? std::wstring() : p.substr(0, slash);
 }
-#else
+#elif !defined(__EMSCRIPTEN__)
 // Directory containing the running host exe (where libaicad.so is staged).
 std::string exe_dir() {
     char buf[4096];
@@ -59,57 +61,82 @@ bool CppCore::ensureLoaded(std::string& err) {
     }
     tried_ = true;
 
-#if !defined(_WIN32)
-    // POSIX: dlopen libaicad.so. Candidate paths in priority order.
-    std::vector<std::string> candidates;
-    if (const char* env = std::getenv("AI_CAD_LIBAICAD"); env && env[0])
+#if defined(__EMSCRIPTEN__)
+    err = "WASM: in-process libaicad not available (daemon mode only)";
+    return false;
+#elif !defined(_WIN32)
+// POSIX: dlopen libaicad.so.
+// Resolve order (first successful load wins — keep this deterministic so a
+// staged dist/exe-dir binary cannot silently lose to a stale LD_LIBRARY_PATH):
+//   1. $AI_CAD_LIBAICAD (or $BILLET_LIBAICAD) — explicit absolute path
+//   2. AICAD_DEFAULT_LIBAICAD (compile-time build-tree path, if set by CMake)
+//   3. libaicad.so next to the running host/hostd executable (staged install)
+//   4. bare "libaicad.so" via the dynamic loader (rpath / LD_LIBRARY_PATH)
+// Note: when the GUI is in daemon mode (default), hostd is the process that
+// actually dlopens; the GUI only sees hostd's engine_build_id via hello.
+// A long-lived hostd holding a stale .so is the "builds go elsewhere" trap —
+// hostd self-drains on mtime change of selfBinary_ + loadedPath().
+std::vector<std::string> candidates;
+auto push_env = [&](const char* name) {
+    if (const char* env = std::getenv(name); env && env[0])
         candidates.push_back(env);
+};
+push_env("BILLET_LIBAICAD");
+push_env("AI_CAD_LIBAICAD");
 #ifdef AICAD_DEFAULT_LIBAICAD
-    candidates.push_back(AICAD_DEFAULT_LIBAICAD);  // build-tree fallback (set by CMake)
+candidates.push_back(AICAD_DEFAULT_LIBAICAD);  // build-tree fallback (set by CMake)
 #endif
-    std::string dir = exe_dir();
-    if (!dir.empty()) candidates.push_back(dir + "/libaicad.so");
-    candidates.push_back("libaicad.so");  // last resort: loader search (rpath / LD_LIBRARY_PATH)
+std::string dir = exe_dir();
+if (!dir.empty()) candidates.push_back(dir + "/libaicad.so");
+candidates.push_back("libaicad.so");  // last resort: loader search
 
-    void* h = nullptr;
-    std::string loadDiag;
-    std::string winner;
-    for (const std::string& path : candidates) {
-        h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (h) { winner = path; break; }
-        const char* de = dlerror();
-        loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
-    }
-    if (!h) {
-        err = "could not load libaicad.so: " + loadDiag;
-        if (const char* lp = std::getenv("AI_CAD_LOG_FILE"); lp && lp[0]) {
-            if (FILE* f = std::fopen(lp, "a")) {
-                std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
-                std::fclose(f);
-            }
+void* h = nullptr;
+std::string loadDiag;
+std::string winner;
+for (const std::string& path : candidates) {
+    h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (h) { winner = path; break; }
+    const char* de = dlerror();
+    loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
+}
+if (!h) {
+    err = "could not load libaicad.so: " + loadDiag;
+    if (const char* lp = std::getenv("AI_CAD_LOG_FILE"); lp && lp[0]) {
+        if (FILE* f = std::fopen(lp, "a")) {
+            std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
+            std::fclose(f);
         }
-        return false;
     }
-    call_ = reinterpret_cast<int (*)(const char*, const char*, char**)>(dlsym(h, "aicad_call"));
-    free_ = reinterpret_cast<void (*)(char*)>(dlsym(h, "aicad_free"));
-    abi_fn_ = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_abi_version"));
-    if (!call_ || !free_ || !abi_fn_) {
-        dlclose(h);
-        call_ = nullptr;
-        free_ = nullptr;
-        abi_fn_ = nullptr;
-        err = "libaicad.so missing an expected export";
-        return false;
-    }
-    dll_ = h;
-    abi_ = abi_fn_();
-    path_ = winner;
-    // Optional export (older engines predate it): the configure-time git-describe
-    // build id, surfaced by hostd as engine_build_id for staleness checks.
-    if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_build_id")))
-        build_id_ = bid();
-    loaded_ = true;
-    return true;
+    std::fprintf(stderr, "[cpp_core] libaicad load FAILED: %s\n", loadDiag.c_str());
+    return false;
+}
+call_ = reinterpret_cast<int (*)(const char*, const char*, char**)>(dlsym(h, "aicad_call"));
+free_ = reinterpret_cast<void (*)(char*)>(dlsym(h, "aicad_free"));
+abi_fn_ = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_abi_version"));
+if (!call_ || !free_ || !abi_fn_) {
+    dlclose(h);
+    call_ = nullptr;
+    free_ = nullptr;
+    abi_fn_ = nullptr;
+    err = "libaicad.so missing an expected export";
+    return false;
+}
+dll_ = h;
+abi_ = abi_fn_();
+path_ = winner;
+// Optional export (older engines predate it): the configure-time git-describe
+// build id, surfaced by hostd as engine_build_id for staleness checks.
+if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "aicad_build_id")))
+    build_id_ = bid();
+loaded_ = true;
+// One-shot startup diagnostic: which lib actually serves in-proc agent runs.
+std::fprintf(stderr,
+             "[cpp_core] loaded libaicad abi=%s build_id=%s path=%s\n",
+             abi_.c_str(),
+             build_id_.empty() ? "?" : build_id_.c_str(),
+             path_.c_str());
+std::fflush(stderr);
+return true;
 #else
     // Candidate paths in priority order (mirrors MCP core_bridge + Linux build-tree fallbacks).
     std::vector<std::wstring> candidates;
@@ -201,7 +228,6 @@ bool CppCore::ensureLoaded(std::string& err) {
     return true;
 #endif
 }
-
 bool CppCore::call(const std::string& method, const nlohmann::json& params,
                    nlohmann::json& result, std::string& err) {
     result = nlohmann::json::object();

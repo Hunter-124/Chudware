@@ -32,11 +32,6 @@
 #include "../core/fs_backend.h"
 #include "../ui_theme.h"    // ui::uiScale, ui::palette
 
-// Compile-unit inclusion until the integrator lists fs_backend.cpp in CMake.
-#ifndef BILLET_FS_BACKEND_TU
-#define BILLET_FS_BACKEND_TU
-#include "../core/fs_backend.cpp"
-#endif
 
 namespace ui {
 

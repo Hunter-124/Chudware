@@ -755,6 +755,109 @@ def test_subscription_rpc_multi_account_shapes(tmp_config):
     assert "subscription_switch" in rpc.SUBSCRIPTION_METHODS
 
 
+# ── ensure_fresh (pre-run token refresh) ─────────────────────────────────────
+
+def test_ensure_fresh_stale_token_refreshes_and_persists(tmp_config, monkeypatch):
+    """Stale access token → real provider.refresh via mocked token endpoint + persist."""
+    now = time.time() * 1000
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "old-at",
+        "refresh_token": "rt-1",
+        "expires_at_ms": now - 60_000,  # already expired
+        "email": "me@x.com",
+        "account_id": "acct-1",
+    })
+
+    def fake_post_json(url, body, headers=None, timeout=30.0):  # noqa: ARG001
+        assert body.get("grant_type") == "refresh_token"
+        assert body.get("refresh_token") == "rt-1"
+        return {
+            "access_token": "new-at",
+            "refresh_token": "rt-2",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(sub_auth, "post_json", fake_post_json)
+
+    out = sl.ensure_fresh("claude")
+    assert out["ok"] is True
+    assert out["refreshed"] is True
+    assert out.get("error") in (None, "")
+    stored = sub_auth.load_credential("anthropic-sub")
+    assert stored["access_token"] == "new-at"
+    assert stored["refresh_token"] == "rt-2"
+    assert out["expires_in"] is not None and out["expires_in"] > 0
+
+    # Naming variants all resolve the same way; second call is fresh → no refresh.
+    for alias in ("anthropic-sub", "anthropic", "claude"):
+        out2 = sl.ensure_fresh(alias)
+        assert out2["ok"] is True and out2["refreshed"] is False
+
+
+def test_ensure_fresh_fresh_token_skips_refresh(tmp_config, monkeypatch):
+    """Token valid beyond 5 min skew → no network refresh."""
+    from agent.providers.xai_sub_provider import XAISubProvider
+
+    now = time.time() * 1000
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "live-at",
+        "refresh_token": "rt",
+        "expires_at_ms": now + 60 * 60 * 1000,  # 1h left
+        "email": "g@x.ai",
+    })
+
+    def boom(self):
+        raise AssertionError("refresh must not be called for a fresh token")
+
+    monkeypatch.setattr(XAISubProvider, "refresh", boom)
+
+    out = sl.ensure_fresh("xai-sub")
+    assert out == {
+        "ok": True,
+        "refreshed": False,
+        "expires_in": out["expires_in"],  # dynamic
+        "error": None,
+    } or (out["ok"] is True and out["refreshed"] is False and out["error"] is None)
+    assert out["expires_in"] is not None and out["expires_in"] > 50 * 60
+
+
+def test_ensure_fresh_refresh_failure_clean_error(tmp_config, monkeypatch):
+    """Refresh exception → clean error dict, no traceback, nothing half-written."""
+    from agent.providers.anthropic_sub_provider import AnthropicSubProvider
+
+    now = time.time() * 1000
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "old-at",
+        "refresh_token": "bad-rt",
+        "expires_at_ms": now - 1,
+    })
+
+    def fail(self):
+        raise RuntimeError("OAuth access token has expired (mock)")
+
+    monkeypatch.setattr(AnthropicSubProvider, "refresh", fail)
+
+    out = sl.ensure_fresh("claude")
+    assert out["ok"] is False
+    assert out["refreshed"] is False
+    assert "error" in out and out["error"]
+    assert "traceback" not in out["error"].lower()
+    assert "re-authenticate" in out["error"].lower() or "refresh failed" in out["error"].lower()
+    # Original token still on disk (refresh never persisted).
+    assert sub_auth.load_credential("anthropic-sub")["access_token"] == "old-at"
+
+    # RPC seam mirrors the same shape.
+    from engine_oracle.parts_hub import subscription_rpc as rpc
+    emit = lambda _e: None  # noqa: E731
+    rpc_out = rpc.SUBSCRIPTION_METHODS["subscription_ensure_fresh"](
+        {"provider": "claude"}, emit
+    )
+    assert rpc_out["ok"] is False and rpc_out["refreshed"] is False
+    assert rpc_out.get("error")
+    assert "subscription_ensure_fresh" in rpc.SUBSCRIPTION_METHODS
+
+
+
 @pytest.mark.parametrize(
     ("friendly", "provider_name", "cred_id"),
     [

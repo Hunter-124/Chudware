@@ -22,7 +22,7 @@
 #include <cstdlib>
 
 #include "imgui.h"
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"

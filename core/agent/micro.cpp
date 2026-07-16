@@ -755,6 +755,19 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     std::string prompts_dir = options.value("prompts_dir", std::string());
 
     RunEvents events(run_id, emit);
+    // Live provider_call debug events → same orch stream as stage events.
+    set_provider_call_emitter([&events](const json& ev) {
+        json data = ev;
+        std::string kind = "provider_call";
+        if (data.contains("kind") && data["kind"].is_string()) {
+            kind = data["kind"].get<std::string>();
+            data.erase("kind");
+        }
+        events.emit(kind, data);
+    });
+    struct ProviderEmitGuard {
+        ~ProviderEmitGuard() { set_provider_call_emitter(nullptr); }
+    } provider_emit_guard;
 
     // Offline-mode defense in depth (mirror run.cpp).
     bool offline = options.value("offline", false);

@@ -4,7 +4,7 @@
 #include "icons.h"
 #include "icons_sdf.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include "imgui.h"
 
 #include "stb_image.h"

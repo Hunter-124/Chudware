@@ -1,22 +1,17 @@
-// EMSCRIPTEN-only stubs for symbols / entry points that the full host links but
-// this wave's slim WASM target does not yet port. Next wave un-stubs:
-//   - services/ipc/* websocket transport (connectTo / spawnDetached / hostd)
-//   - host/src/renderer.cpp + render/* GLSL ES shims (#version 330 -> 300 es)
-//   - host/src/ui/file_dialog.cpp
-//   - CEF / camera / V4L2 backends
-//
-// The slim wasm_boot.cpp path does not call these; they exist so a fuller
-// EMSCRIPTEN source list can link without dragging in AF_UNIX / fork / glad.
+// EMSCRIPTEN-only stubs for symbols that have no browser implementation.
+// Real IPC lives in services/ipc/ipc_transport_wasm.cpp + ipc_client.cpp.
+// Real engine::* lives in services/worker/engine_backend.cpp.
+// Bootstrap symbols (exeDir/runtime/…) are stubbed here because bootstrap.cpp
+// is excluded from the EMSCRIPTEN source list.
 #ifdef __EMSCRIPTEN__
 
+#include "ipc_discovery.h"
+
+#include <cstdint>
 #include <cstdio>
 #include <string>
 
-#include <nlohmann/json.hpp>
-
 // ---- bootstrap (no python runtime / no /proc/self/exe on the web) ----------
-// When the full app.cpp is re-enabled for WASM these soft-fail instead of
-// pulling POSIX process + filesystem provisioning.
 std::string exeDir() { return "/"; }
 std::string runtimePython() { return ""; }
 std::string appDir() { return "/"; }
@@ -31,49 +26,51 @@ bool repairRuntime(std::string& log) {
 }
 void ensurePromptsDir() {}
 
-// ---- IPC transport stubs (real WS gateway is next wave) --------------------
+// ---- IPC discovery / spawn (browser never forks hostd) --------------------
 namespace aicad_ipc {
 
-struct IpcConnStub {
-    bool valid() const { return false; }
-    void close() {}
-    bool eof() const { return true; }
-};
-
-// Soft-fail connect so any accidental call site reports a clear error.
-inline bool wasmIpcUnsupported(std::string& err) {
-    err = "WASM: unix-socket IPC not available (websocket gateway next wave)";
-    std::fprintf(stderr, "[wasm_stubs] %s\n", err.c_str());
+bool spawnDetached(const std::string& /*exe*/, const std::string& /*arg*/, std::string& err) {
+    err = "WASM: spawnDetached not available (gateway-hosted daemon)";
     return false;
 }
 
-// Named to match the real header APIs when those TUs are excluded from the
-// EMSCRIPTEN target. If a future source starts calling them, link succeeds and
-// runtime fails gracefully.
-bool spawnDetached(const std::string& /*exe*/, const std::string& /*arg*/, std::string& err) {
-    return wasmIpcUnsupported(err);
-}
+// socketPath is ignored by connectTo under EMSCRIPTEN (dials location.host/engine)
+// but EngineClient still needs a non-empty path to pass its empty-check.
+std::string socketPath(const std::string& /*key*/) { return "ws://engine"; }
 
-std::string socketPath(const std::string& /*key*/) { return ""; }
-std::string runtimeDir() { return ""; }
+std::string runtimeDir() { return "/tmp"; }
+
 std::string resolveHostdBin(const std::string& /*hint*/) { return ""; }
+
 std::string instanceKey(const std::string& /*exePath*/) { return "wasm"; }
 
-}  // namespace aicad_ipc
+std::string lockPath(const std::string& key) { return "/tmp/aicad-lock-" + key; }
 
-// ---- engine backend soft-fail ----------------------------------------------
-namespace engine {
-bool daemonMode() { return false; }
-bool available() { return false; }
-bool ensureLoaded(std::string& err) {
-    err = "WASM: engine backend not linked this wave";
+std::string stateDir() { return "/tmp"; }
+
+std::string fnv1aHex(const std::string& s) {
+    uint64_t h = 14695981039346656037ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    char buf[17];
+    for (int i = 15; i >= 0; --i) {
+        const int n = (int)(h & 0xF);
+        buf[i] = (char)(n < 10 ? '0' + n : 'a' + (n - 10));
+        h >>= 4;
+    }
+    buf[16] = 0;
+    return std::string(buf);
+}
+
+// SingleInstance is daemon-side only; provide no-op bodies so the class links.
+bool SingleInstance::acquire(const std::string& /*lockFile*/, std::string& err) {
+    err = "WASM: SingleInstance not available";
     return false;
 }
-bool call(const std::string& method, const nlohmann::json& /*params*/,
-          nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/ = -1) {
-    err = "WASM: engine call '" + method + "' not available (IPC next wave)";
-    return false;
-}
-}  // namespace engine
+void SingleInstance::release() {}
+
+}  // namespace aicad_ipc
 
 #endif  // __EMSCRIPTEN__

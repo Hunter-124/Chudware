@@ -12,6 +12,59 @@
 
 
 #include "../worker_client.h"
+
+// Map a GUI / wire provider id to the subscription_ensure_fresh RPC id, or "" when
+// the provider is NOT subscription-auth (API key / local / gemini / etc. — skip).
+// Accepts friendly + *-sub names so launch paths and config.json both work.
+static std::string subscriptionEnsureProvider(const std::string& provider) {
+    if (provider == "xai-sub" || provider == "xai") return "xai";
+    if (provider == "anthropic-sub" || provider == "claude" || provider == "anthropic")
+        return "claude";
+    if (provider == "cursor-sub" || provider == "cursor") return "cursor";
+    if (provider == "codex-sub" || provider == "codex") return "codex";
+    return {};
+}
+
+// Pre-run: ask Python (single token-refresh writer) to refresh a stale subscription
+// access token before the C++ agent reads it read-only. 10s hard timeout; transport
+// failure / unknown_method → proceed (don't brick runs when the worker is down).
+// Returns false only when Python reported {ok:false} (refresh failed → re-auth).
+static bool ensureSubscriptionFreshBeforeRun(WorkerClient& w, JobState& job,
+                                             const nlohmann::json& extra) {
+    std::string prov;
+    if (extra.is_object() && extra.contains("provider") && extra["provider"].is_string())
+        prov = extra["provider"].get<std::string>();
+    const std::string sub = subscriptionEnsureProvider(prov);
+    if (sub.empty()) return true;  // not a subscription provider
+    if (!w.started()) return true;  // can't refresh; let the run fail later if needed
+
+    nlohmann::json freshen;
+    std::string ferr;
+    const bool ok = w.call("subscription_ensure_fresh",
+                           nlohmann::json{{"provider", sub}},
+                           freshen, ferr, /*timeoutMs=*/10000);
+    if (!ok) {
+        // Transport / timeout / unknown_method — degrade gracefully.
+        return true;
+    }
+    if (!freshen.is_object()) return true;
+    if (freshen.value("ok", true)) return true;
+
+    std::string detail = freshen.value("error", std::string());
+    if (detail.empty()) detail = freshen.value("reason", std::string());
+    if (detail.empty())
+        detail = "Subscription auth expired — re-authenticate via Settings → AI → Accounts.";
+    {
+        std::lock_guard<std::mutex> lk(job.mtx);
+        job.error = detail;
+        job.errorDetail = detail;
+        job.errorIsCad = false;
+        job.converged = false;
+        job.stopReason = "provider_auth";
+    }
+    return false;
+}
+
 // --- C22b: agent_run_v2 launcher ---
 // Runs agent_run_v2 on a background thread. Orchestrator events arrive via the EventFn
 // callback with kind = "run_started" / "stage_started" / etc.  We push them into
@@ -27,8 +80,11 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         std::lock_guard<std::mutex> lk(job.mtx);
         job.error.clear(); job.stl.clear(); job.info.clear();
         job.errorIsCad = false;
-        job.converged = true; job.stopReason.clear();
+        job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.isMission = false; job.missionVerdict.clear();
+        job.createdDocPath.clear();
+        job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
+        job.camDocId.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -52,11 +108,47 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             if (origKind == "stage_started")
                 e.notes = stage + " > " + role + " attempt " +
                           std::to_string(jint(d, "attempt") + 1) + "...";
-            else if (origKind == "run_finished")
+            else if (origKind == "run_finished") {
                 e.notes = "run " + jstr(d, "status");
+                // Early-stop fields on the stream (provider_error etc.) — stash onto the
+                // job so the GL drain can fill the chat card even if the RPC result shape
+                // is thin ({ok:false,error} without stop_reason).
+                std::string sr = jstr(d, "stop_reason");
+                std::string ed = jstr(d, "error_detail");
+                if (ed.empty()) ed = jstr(d, "error");
+                if (ed.empty()) ed = jstr(d, "error_human");
+                if (!sr.empty() || !ed.empty()) {
+                    std::lock_guard<std::mutex> jlk(job.mtx);
+                    if (!sr.empty() && job.stopReason.empty()) job.stopReason = sr;
+                    if (!ed.empty() && job.errorDetail.empty()) job.errorDetail = ed;
+                }
+            } else if (origKind == "provider_call") {
+                // Compact live status: "xai · grok-4.5 HTTP 200 412ms"
+                std::string prov = jstr(d, "provider");
+                std::string model = jstr(d, "model");
+                int http = jint(d, "http_status");
+                int lat = jint(d, "latency_ms");
+                char buf[160];
+                if (http > 0)
+                    std::snprintf(buf, sizeof(buf), "%s · %s HTTP %d %dms",
+                                  prov.c_str(), model.c_str(), http, lat);
+                else
+                    std::snprintf(buf, sizeof(buf), "%s · %s transport %dms",
+                                  prov.c_str(), model.c_str(), lat);
+                e.notes = buf;
+            }
             std::lock_guard<std::mutex> lk(job.evMtx);
             job.events.push_back(std::move(e));
         };
+
+        // Refresh stale subscription tokens BEFORE agent_run_v2 (C++ reads tokens
+        // read-only; Python is the single writer). Auth failure → stop_reason=provider_auth.
+        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
+            std::lock_guard<std::mutex> lk(job.mtx);
+            job.ready = true;
+            job.running = false;
+            return;
+        }
 
         // options.cam (true when launched from the Manufacture workspace) lets the core's
         // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
@@ -70,32 +162,62 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         bool ok = w.call("agent_run_v2", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
+            // Hard transport/DLL failure — no result payload.
             job.error = err;
             job.errorIsCad = false;
+            job.converged = false;
+            if (job.stopReason.empty()) job.stopReason = "provider_error";
+            if (job.errorDetail.empty()) job.errorDetail = err;
         } else {
-            // agent_run_v2 returns {status, stop_reason, run_id, revision}.
-            // The doc was rebuilt by the orchestrator; the DocMirror listener will be
-            // called next time the GL thread calls doc_tree (or the existing listener path
-            // fires via the worker's rebuild). The simplest correct path: on job ready,
-            // the GL thread calls docMirror.open() or resync (C22b: see app.cpp drain).
-            job.converged = (result.value("status", "") == "done");
-            job.stopReason = result.value("stop_reason", "");
-            // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
-            // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
-            // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
-            if (result.value("created_doc", false) && result.value("status", "") == "done")
-                job.createdDocPath = result.value("asm_path", std::string());
-            // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
-            // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
-            if (result.value("created_drawing", false) && result.value("status", "") == "done") {
-                job.drawingDocId = result.value("drawing_doc_id", std::string());
-                job.drawingName = result.value("drawing_name", std::string());
-                job.drawingSourceId = result.value("source_doc_id", std::string());
+            // agent_run_v2 returns {status, stop_reason, run_id, revision[, error_detail]}
+            // OR a pre-run refusal {ok:false, error} (provider resolution / offline).
+            // Without mapping the latter, stopReason stays empty → app.cpp "unknown reason".
+            const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
+                                    !result["ok"].get<bool>();
+            if (preRunFail) {
+                std::string detail = result.value("error_detail", std::string());
+                if (detail.empty()) detail = result.value("error", std::string());
+                if (detail.empty()) detail = err.empty() ? "agent_run_v2 failed" : err;
+                job.error = detail;
+                job.errorDetail = detail;
+                job.errorIsCad = false;
+                job.converged = false;
+                job.stopReason = result.value("stop_reason", std::string("provider_error"));
+            } else {
+                job.converged = (result.value("status", "") == "done");
+                std::string sr = result.value("stop_reason", std::string());
+                if (!sr.empty()) job.stopReason = sr;
+                std::string ed = result.value("error_detail", std::string());
+                if (ed.empty()) ed = result.value("error", std::string());
+                if (ed.empty()) ed = result.value("error_human", std::string());
+                if (!ed.empty()) job.errorDetail = ed;
+                // Failed run with detail but no hard error string — still surface it so
+                // the chat card prefers errorDetail over the generic early-stop prose.
+                if (!job.converged && job.error.empty() && !job.errorDetail.empty()) {
+                    job.error = job.errorDetail;
+                    job.errorIsCad = (job.stopReason == "failed" ||
+                                      job.stopReason == "no_code" ||
+                                      job.stopReason == "max_iters" ||
+                                      job.stopReason == "model_failed" ||
+                                      job.stopReason == "decompose_failed");
+                }
+                // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
+                // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
+                // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
+                if (result.value("created_doc", false) && result.value("status", "") == "done")
+                    job.createdDocPath = result.value("asm_path", std::string());
+                // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
+                // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
+                if (result.value("created_drawing", false) && result.value("status", "") == "done") {
+                    job.drawingDocId = result.value("drawing_doc_id", std::string());
+                    job.drawingName = result.value("drawing_name", std::string());
+                    job.drawingSourceId = result.value("source_doc_id", std::string());
+                }
+                // CAM fast-path: the run built a machining job from the current part (its own cam
+                // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
+                if (result.value("created_cam", false) && result.value("status", "") == "done")
+                    job.camDocId = result.value("cam_doc_id", std::string());
             }
-            // CAM fast-path: the run built a machining job from the current part (its own cam
-            // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
-            if (result.value("created_cam", false) && result.value("status", "") == "done")
-                job.camDocId = result.value("cam_doc_id", std::string());
         }
         job.ready = true;
         job.running = false;
@@ -117,7 +239,7 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         job.error.clear(); job.stl.clear(); job.info.clear();
         job.errorIsCad = false;
         job.isAssembly = false; job.parts.clear(); job.fit = FitReport{};
-        job.converged = true; job.stopReason.clear();
+        job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.createdDocPath.clear();
         job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
         job.camDocId.clear();
@@ -190,6 +312,14 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         if (extra.is_object())
             for (auto it = extra.begin(); it != extra.end(); ++it)
                 if (!params.contains(it.key())) params[it.key()] = it.value();
+
+        // Cursor (and any other sub provider on this path) — refresh before design.
+        if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
+            std::lock_guard<std::mutex> lk(job.mtx);
+            job.ready = true;
+            job.running = false;
+            return;
+        }
 
         bool ok = w.call("agent_design", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
@@ -282,7 +412,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         std::lock_guard<std::mutex> lk(job.mtx);
         job.error.clear(); job.stl.clear(); job.info.clear();
         job.errorIsCad = false;
-        job.converged = true; job.stopReason.clear();
+        job.converged = true; job.stopReason.clear(); job.errorDetail.clear();
         job.createdDocPath.clear();
         job.isMission = true; job.missionVerdict.clear();
     }
@@ -304,8 +434,17 @@ void launchMissionRun(WorkerClient& w, JobState& job,
                           std::to_string(jint(d, "attempt") + 1) + "...";
             else if (origKind == "mission_task_started")
                 e.notes = jstr(d, "title");
-            else if (origKind == "run_finished" || origKind == "mission_finished")
+            else if (origKind == "run_finished" || origKind == "mission_finished") {
                 e.notes = "run " + jstr(d, "status");
+                std::string sr = jstr(d, "stop_reason");
+                std::string ed = jstr(d, "error_detail");
+                if (ed.empty()) ed = jstr(d, "error");
+                if (!sr.empty() || !ed.empty()) {
+                    std::lock_guard<std::mutex> jlk(job.mtx);
+                    if (!sr.empty() && job.stopReason.empty()) job.stopReason = sr;
+                    if (!ed.empty() && job.errorDetail.empty()) job.errorDetail = ed;
+                }
+            }
             std::lock_guard<std::mutex> lk(job.evMtx);
             job.events.push_back(std::move(e));
         };
@@ -319,14 +458,34 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         if (!ok) {
             job.error = err;
             job.errorIsCad = false;
+            job.converged = false;
+            if (job.stopReason.empty()) job.stopReason = "provider_error";
+            if (job.errorDetail.empty()) job.errorDetail = err;
         } else {
-            // agent_mission_v1 returns {status, stop_reason, doc_id, verdict, tasks, created_doc?,
-            // asm_path?}. The verdict is the assistant's final reply; createdDocPath opens a tab.
-            job.converged = (result.value("status", "") == "done");
-            job.stopReason = result.value("stop_reason", "");
-            job.missionVerdict = result.value("verdict", std::string());
-            if (result.value("created_doc", false))
-                job.createdDocPath = result.value("asm_path", std::string());
+            // agent_mission_v1 returns {status, stop_reason, doc_id, verdict, tasks, ...}
+            // or {ok:false, error} on provider resolution failure.
+            const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
+                                    !result["ok"].get<bool>();
+            if (preRunFail) {
+                std::string detail = result.value("error_detail", std::string());
+                if (detail.empty()) detail = result.value("error", std::string());
+                if (detail.empty()) detail = err.empty() ? "agent_mission_v1 failed" : err;
+                job.error = detail;
+                job.errorDetail = detail;
+                job.errorIsCad = false;
+                job.converged = false;
+                job.stopReason = result.value("stop_reason", std::string("provider_error"));
+            } else {
+                job.converged = (result.value("status", "") == "done");
+                std::string sr = result.value("stop_reason", std::string());
+                if (!sr.empty()) job.stopReason = sr;
+                std::string ed = result.value("error_detail", std::string());
+                if (ed.empty()) ed = result.value("error", std::string());
+                if (!ed.empty()) job.errorDetail = ed;
+                job.missionVerdict = result.value("verdict", std::string());
+                if (result.value("created_doc", false))
+                    job.createdDocPath = result.value("asm_path", std::string());
+            }
         }
         job.ready = true;
         job.running = false;

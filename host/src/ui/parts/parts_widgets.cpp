@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 
 #include "stb_image.h"
 

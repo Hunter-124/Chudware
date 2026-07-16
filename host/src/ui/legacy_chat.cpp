@@ -1470,6 +1470,87 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         const bool ok = !data.is_object() || data.value("ok", true);
         ni.status     = ok ? "done" : "fail";
         m.activity.push_back(std::move(ni));
+    } else if (kind == "provider_call") {
+        // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
+        // rowKind 9; fields packed into existing ActivityItem slots so we never touch
+        // integrator-owned app_state.h:
+        //   title      = "provider · model" (display)
+        //   reason     = single-line summary (status + latency + endpoint snippet)
+        //   detail     = full copyable line (+ error_excerpt when present)
+        //   durationMs = latency_ms
+        //   tokensIn   = http_status (0 = transport fail)
+        //   opsCount   = attempt (1-based)
+        //   status     = "done" | "fail" from ok / http_status
+        ActivityItem ni;
+        ni.rowKind = 9;
+        const std::string prov = jstr(data, "provider");
+        const std::string model = jstr(data, "model");
+        const std::string endpoint = jstr(data, "endpoint");
+        const std::string reqId = jstr(data, "request_id");
+        const std::string errEx = jstr(data, "error_excerpt");
+        int httpStatus = jint(data, "http_status");
+        // Tolerate float-ish JSON numbers (some emitters use double).
+        if (httpStatus == 0 && data.contains("http_status") && data["http_status"].is_number())
+            httpStatus = (int)data["http_status"].get<double>();
+        int latency = jint(data, "latency_ms");
+        if (latency == 0 && data.contains("latency_ms") && data["latency_ms"].is_number())
+            latency = (int)data["latency_ms"].get<double>();
+        int attempt = jint(data, "attempt");
+        if (attempt == 0 && data.contains("attempt") && data["attempt"].is_number())
+            attempt = (int)data["attempt"].get<double>();
+        if (attempt <= 0) attempt = 1;
+        bool ok = true;
+        if (data.contains("ok") && data["ok"].is_boolean())
+            ok = data["ok"].get<bool>();
+        else if (httpStatus != 0)
+            ok = (httpStatus >= 200 && httpStatus < 300);
+        else if (!errEx.empty())
+            ok = false;
+
+        std::string head;
+        if (!prov.empty() && !model.empty()) head = prov + " \xc2\xb7 " + model;
+        else if (!prov.empty()) head = prov;
+        else if (!model.empty()) head = model;
+        else head = "provider";
+        ni.title = head;
+
+        char statusBuf[32];
+        if (httpStatus > 0)
+            std::snprintf(statusBuf, sizeof(statusBuf), "HTTP %d", httpStatus);
+        else
+            std::snprintf(statusBuf, sizeof(statusBuf), "transport");
+
+        std::string summary = statusBuf;
+        if (latency > 0) {
+            char lb[32];
+            std::snprintf(lb, sizeof(lb), " %dms", latency);
+            summary += lb;
+        }
+        if (attempt > 1) {
+            char ab[24];
+            std::snprintf(ab, sizeof(ab), " try#%d", attempt);
+            summary += ab;
+        }
+        if (!endpoint.empty()) {
+            summary += " ";
+            // Keep endpoint short so the one-liner fits the chat column.
+            if (endpoint.size() > 48) summary += endpoint.substr(0, 45) + "...";
+            else summary += endpoint;
+        }
+        ni.reason = summary;
+
+        // Full line for copy / expanded body.
+        std::string full = head + "  " + summary;
+        if (!reqId.empty()) { full += "  id="; full += reqId; }
+        if (!errEx.empty()) { full += "\n  "; full += errEx; }
+        ni.detail = full;
+
+        ni.durationMs = latency;
+        ni.tokensIn = httpStatus;
+        ni.opsCount = attempt;
+        ni.status = ok ? "done" : "fail";
+        ni.stage = "prov:" + std::to_string(m.activity.size());
+        m.activity.push_back(std::move(ni));
     } else if (kind == "corporate") {                               // Corporate Roles live UI
         // Additive aicad.corporate/1 stream: corp_event + optional dept/agent/payload.
         // Same drain as stage/tool events (app.cpp strips orch_ prefix).
@@ -2524,7 +2605,8 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
         // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
-        if (a.stage == "__stop_meta__") continue;
+        // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
+        if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         ImGui::PushID((int)i);
         if (a.rowKind == 1) {
             drawContextChip(a, fonts);
@@ -3220,16 +3302,18 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Body only — the "You" author label lives in the footer row under the bubble.
+    // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
+    // click-drag + Ctrl+C toast + right-click Copy).
     const std::string userBody = stripMdMarks(m.text);
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextWrapped("%s", userBody.c_str());
-    ImGui::PopStyleColor();
+    const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
     ImGui::EndChild();
     ImRect bubble = endGlassBubble(gb);
     ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
         ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
         8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
-    chatCopyContext(bubble, "##umsg_copy", userBody);
+    const std::string sel = chatInputSelection(textId);
+    chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
+    chatHoverCopyGlyph(bubble, userBody);
 
 
     // Footer row: "You" (left) + ◁◁ rewind / pencil edit (right). Tight under the bubble.
@@ -3338,6 +3422,99 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
 }
 
 
+// Collapsible "Provider log" — aggregates rowKind=9 provider_call events into a compact
+// monospace-ish list (one line per HTTP attempt). Always expanded when the turn failed;
+// collapsed behind a small toggle on success. Right-click copies the full log.
+static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
+    std::vector<ActivityItem*> calls;
+    calls.reserve(8);
+    bool anyFail = false;
+    for (auto& a : m.activity) {
+        if (a.rowKind != 9) continue;
+        calls.push_back(&a);
+        if (a.status == "fail" || a.status == "error") anyFail = true;
+    }
+    if (calls.empty()) return;
+
+    const bool turnFailed = (m.errKind != ERR_NONE) || anyFail;
+    // Persist toggle on the first call row; force-open on failure so xai/claude debug is visible.
+    bool& open = calls.front()->expanded;
+    if (turnFailed) open = true;
+
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const auto& pal = ui::palette;
+
+    ImGui::Dummy(ImVec2(0, 3 * sc));
+    {
+        char hdr[64];
+        std::snprintf(hdr, sizeof(hdr), "Provider log (%d)", (int)calls.size());
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::PushFont(fonts.medium ? fonts.medium : fonts.body);
+        const char* chev = open ? "\xe2\x96\xbc " : "\xe2\x96\xb6 ";  // ▼ / ▶
+        ImGui::Text("%s%s", chev, hdr);
+        ImGui::PopFont();
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked() && !turnFailed) open = !open;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(turnFailed
+                                  ? "Provider HTTP attempts for this run (expanded on failure)."
+                                  : "Toggle provider HTTP call log.");
+    }
+    if (!open) return;
+
+    // Build full copy text once.
+    std::string allCopy;
+    allCopy.reserve(calls.size() * 96);
+    for (const ActivityItem* a : calls) {
+        if (!allCopy.empty()) allCopy += "\n";
+        allCopy += !a->detail.empty() ? a->detail
+                 : (!a->title.empty() ? a->title + "  " + a->reason : a->reason);
+    }
+
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 6.0f);
+    ImGui::BeginChild("##provlog", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    if (fonts.mono) ImGui::PushFont(fonts.mono);
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const ActivityItem* a = calls[i];
+        const bool fail = (a->status == "fail" || a->status == "error");
+        // One compact line: "provider · model  HTTP n  Nms  endpoint…"
+        std::string line = a->title;
+        if (!a->reason.empty()) {
+            if (!line.empty()) line += "  ";
+            line += a->reason;
+        }
+        if (line.empty()) line = a->detail.empty() ? "(call)" : a->detail;
+        // Collapse multi-line detail into the primary line for the list; error_excerpt stays
+        // on a second muted line under fails.
+        size_t nl = line.find('\n');
+        std::string rest;
+        if (nl != std::string::npos) {
+            rest = line.substr(nl + 1);
+            line.resize(nl);
+        }
+        ImVec4 col = fail ? semanticOnGlass(pal.statusErr, surf) : surf.textTertiary;
+        // Soft red tint even when statusErr is strong — keep it muted for density.
+        if (fail) col.w = std::min(col.w, 0.95f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextWrapped("%s", line.c_str());
+        ImGui::PopStyleColor();
+        if (!rest.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                fail ? semanticOnGlass(pal.statusErr, surf) : surf.textTertiary);
+            ImGui::TextWrapped("  %s", rest.c_str());
+            ImGui::PopStyleColor();
+        }
+        (void)i;
+    }
+    if (fonts.mono) ImGui::PopFont();
+    ImGui::EndChild();
+    ImRect cardRect = endGlassBubble(gb);
+    chatCopyContext(cardRect, "##provlog_copy", allCopy);
+}
+
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               int msgIdx = -1, int turnNum = 0) {
     const auto& pal = ui::palette;
@@ -3433,7 +3610,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // (7) Usage footer — tokens + wall-time for the finished turn, dim (DESIGN §5).
         int tin = 0, tout = 0, tms = 0;
         for (const auto& a : m.activity) {
-            if (a.rowKind != 0) continue;   // tool latency / ctx estimates aren't stage wall-time
+            if (a.rowKind != 0) continue;   // tool / ctx / provider rows aren't stage wall-time
             tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs;
         }
         if (tin > 0) {
@@ -3446,7 +3623,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (8) Error block — a distinct red-bordered glass card carrying the real reason (DESIGN §5).
     // Prefer full multi-line detail from stop_reason / error_detail (stashed on a hidden
     // __stop_meta__ activity row by feedTurnActivity). When detail is absent, keep m.text.
-    if (m.errKind != ERR_NONE && !m.text.empty()) {
+    if (m.errKind != ERR_NONE) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
             if (a.stage != "__stop_meta__") continue;
@@ -3454,11 +3631,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             errorDetail = !a.detail.empty() ? a.detail : a.reason;
             break;
         }
+        // Nothing to show if the turn has no prose AND no stop fields.
+        if (!(m.text.empty() && stopReason.empty() && errorDetail.empty())) {
         // Also surface any failed activity reason strings (phase errors) that aren't already
         // folded into the meta row — keeps "budget exhausted (1)" from being the only line.
         std::string phaseErr;
         for (const auto& a : m.activity) {
-            if (a.stage == "__stop_meta__") continue;
+            if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
             if (a.status != "fail" && a.status != "error") continue;
             std::string bit;
             if (!a.reason.empty()) bit = a.reason;
@@ -3472,6 +3651,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         }
 
         // Prefer full detail as the primary body when present; otherwise keep m.text.
+        // Headline is always "stopped: <reason>" when stop_reason is known; full error_detail
+        // is the selectable body. Generic "I stopped before fully finishing (unknown reason)"
+        // only survives when both stop fields are truly absent.
         std::string body;
         if (!stopReason.empty() || !errorDetail.empty()) {
             body = "stopped: ";
@@ -3506,23 +3688,30 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             body += phaseErr;
         }
 
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          8.0f);
-        ImGui::BeginChild("##errcard", ImVec2(0, 0),
-                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-        // Error tone retuned for the frost so the reason stays readable over any model.
-        const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
-        const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
-        const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
-        ImGui::EndChild();
-        ImRect cardRect = endGlassBubble(gb);
-        ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
-                                            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
-        const std::string sel = chatInputSelection(textId);
-        chatCopyContext(cardRect, "##err_copy", body, body, sel);
-        chatHoverCopyGlyph(cardRect, body);
+        if (!body.empty()) {
+            ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+            GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                              8.0f);
+            ImGui::BeginChild("##errcard", ImVec2(0, 0),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+            // Error tone retuned for the frost so the reason stays readable over any model.
+            const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
+            const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
+            const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
+            ImGui::EndChild();
+            ImRect cardRect = endGlassBubble(gb);
+            ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
+                                                8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
+            const std::string sel = chatInputSelection(textId);
+            chatCopyContext(cardRect, "##err_copy", body, body, sel);
+            chatHoverCopyGlyph(cardRect, body);
+        }
+        } // has something to show
     }
+
+    // (9) Provider HTTP call log — always expanded on fail; collapsed toggle on success.
+    if (!m.running)
+        drawProviderLog(m, fonts);
 
 }
 

@@ -803,7 +803,7 @@ def test_xai_last_usage_cold_restore(tmp_config, monkeypatch):
 
 
 def test_xai_api_userinfo_and_ratelimit_headers(tmp_config, monkeypatch):
-    """Live API path: OIDC userinfo for identity + x-ratelimit headers for bars."""
+    """When billing is empty, API path falls back to rate-limit headers."""
     token = _jwt({"sub": "u-api-1", "tier": 1})
     sub_auth.save_credential("xai-sub", {
         "access_token": token,
@@ -820,6 +820,10 @@ def test_xai_api_userinfo_and_ratelimit_headers(tmp_config, monkeypatch):
                 "email": "ada@example.com",
                 "email_verified": True,
             }, {}
+        if "billing" in url:
+            return 404, None, {}
+        if "include=subscription" in url or url.rstrip("/").endswith("/user"):
+            return 404, None, {}
         if url.rstrip("/").endswith("/me"):
             return 200, {
                 "user_id": "u-api-1",
@@ -855,6 +859,166 @@ def test_xai_api_userinfo_and_ratelimit_headers(tmp_config, monkeypatch):
     assert cred.get("email") == "ada@example.com"
     assert cred.get("display_name") == "Ada Lovelace"
     assert cred.get("last_usage")
+
+
+def test_xai_billing_credits_primary(tmp_config, monkeypatch):
+    """Official cli-chat-proxy billing fills credits window + plan from tier."""
+    token = _jwt({"sub": "u-bill-1", "tier": 1})
+    sub_auth.save_credential("xai-sub", {
+        "access_token": token,
+        "refresh_token": "rt",
+        "account_id": "u-bill-1",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="u-bill-1")
+
+    seen_headers: list[dict] = []
+
+    def fake_http(url, headers=None, timeout=20.0):
+        seen_headers.append(dict(headers or {}))
+        if "userinfo" in url:
+            return 200, {
+                "sub": "u-bill-1",
+                "name": "Bill User",
+                "email": "bill@example.com",
+            }, {}
+        if "billing" in url and "format=credits" in url:
+            return 200, {
+                "config": {
+                    "creditUsagePercent": 42.5,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-07-01T00:00:00Z",
+                        "end": "2026-07-08T00:00:00Z",
+                    },
+                    "prepaidBalance": {"val": 150},
+                    "isUnifiedBillingUser": True,
+                },
+                "subscriptionTier": "SuperGrok",
+            }, {}
+        if "include=subscription" in url:
+            return 200, {
+                "userId": "u-bill-1",
+                "email": "bill@example.com",
+                "firstName": "Bill",
+                "lastName": "User",
+                "subscriptionTier": "SuperGrokPro",
+            }, {}
+        if url.rstrip("/").endswith("/me"):
+            return 200, {"user_id": "u-bill-1", "team_blocked": False}, {}
+        # Models should not be required once billing succeeds.
+        if url.rstrip("/").endswith("/models"):
+            return 200, {"data": []}, {
+                "x-ratelimit-limit-requests": "1000",
+                "x-ratelimit-remaining-requests": "1",
+            }
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_API)
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    monkeypatch.delenv("AICAD_XAI_USAGE_PROBE", raising=False)
+    usage.clear_cache()
+
+    row = usage.fetch_account_usage("xai", "u-bill-1", force=True)
+    assert row["source"] == "api"
+    assert row["email"] == "bill@example.com"
+    assert row["plan"] == "SuperGrok"
+    credits = next(u for u in row["usage"] if u["window"] == "credits")
+    assert abs(credits["used_fraction"] - 0.425) < 1e-9
+    assert credits["status"] in ("ok", "warn", "blocked")
+    assert credits.get("resets_at")
+    # Rate-limit secondary must NOT replace primary credits when billing works.
+    assert not any(u.get("window") == "requests" for u in row["usage"])
+    # Proxy auth header present on billing/user calls.
+    proxy_calls = [
+        h for h in seen_headers
+        if h.get("X-XAI-Token-Auth") == "xai-grok-cli"
+        or h.get("x-xai-token-auth") == "xai-grok-cli"
+    ]
+    # Our headers use exact case from _xai_auth_headers.
+    assert any(h.get("X-XAI-Token-Auth") == usage.XAI_TOKEN_AUTH_VALUE for h in seen_headers)
+
+    cred = sub_auth.load_credential("xai-sub", account_id="u-bill-1")
+    assert cred.get("last_usage")
+    assert any(u.get("window") == "credits" for u in (cred.get("last_usage") or []))
+
+
+def test_parse_xai_billing_config_snake_and_legacy():
+    """Parser accepts camelCase credits shape and legacy limit/used."""
+    modern = usage._parse_xai_billing_config({
+        "config": {
+            "credit_usage_percent": 10.0,
+            "current_period": {
+                "period_type": "USAGE_PERIOD_TYPE_MONTHLY",
+                "end": "2026-08-01T00:00:00Z",
+            },
+            "prepaid_balance": {"val": 0},
+        }
+    })
+    assert abs(modern["credit_usage_percent"] - 10.0) < 1e-9
+    assert modern["usage"][0]["window"] == "credits"
+    assert "Monthly" in modern["usage"][0]["label"]
+
+    legacy = usage._parse_xai_billing_config({
+        "config": {
+            "monthly_limit": {"val": 1000},
+            "used": {"val": 250},
+            "billing_period_end": "2026-08-01T00:00:00Z",
+        }
+    })
+    assert abs(legacy["credit_usage_percent"] - 25.0) < 1e-9
+    assert abs(legacy["usage"][0]["used_fraction"] - 0.25) < 1e-9
+
+
+def test_xai_billing_cache_ttl(tmp_config, monkeypatch):
+    """Billing GETs are cached ~60s so force path does not hammer the proxy."""
+    token = _jwt({"sub": "u-cache", "tier": 1})
+    sub_auth.save_credential("xai-sub", {
+        "access_token": token,
+        "account_id": "u-cache",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="u-cache")
+
+    n = {"billing": 0}
+
+    def fake_http(url, headers=None, timeout=20.0):
+        if "userinfo" in url:
+            return 200, {"sub": "u-cache", "email": "c@x.ai", "name": "C"}, {}
+        if "billing" in url:
+            n["billing"] += 1
+            return 200, {"config": {"creditUsagePercent": 5.0}}, {}
+        if "include=subscription" in url:
+            return 200, {"subscriptionTier": "SuperGrok", "userId": "u-cache"}, {}
+        if url.rstrip("/").endswith("/me"):
+            return 200, {"user_id": "u-cache", "team_blocked": False}, {}
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_API)
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    usage.clear_cache()
+
+    # Bypass outer 5-min cache with force; inner billing cache still applies.
+    r1 = usage.fetch_account_usage("xai", "u-cache", force=True)
+    r2 = usage.fetch_account_usage("xai", "u-cache", force=True)
+    assert r1["usage"][0]["window"] == "credits"
+    assert r2["usage"][0]["window"] == "credits"
+    assert n["billing"] == 1
+
+
+def test_parse_xai_billing_absent_percent_is_zero():
+    """Live SuperGrok configs omit creditUsagePercent when unused → 0% bar."""
+    parsed = usage._parse_xai_billing_config({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2026-07-20T00:58:27.738321+00:00",
+            },
+            "prepaidBalance": {"val": 0},
+            "isUnifiedBillingUser": True,
+        }
+    })
+    assert parsed["credit_usage_percent"] == 0.0
+    assert parsed["usage"][0]["window"] == "credits"
+    assert abs(parsed["usage"][0]["used_fraction"] - 0.0) < 1e-9
 
 
 def test_xai_record_ratelimit_headers_from_chat(tmp_config):

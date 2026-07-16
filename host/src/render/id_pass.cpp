@@ -1,6 +1,6 @@
 #include "id_pass.h"
 
-#include <glad/gl.h>
+#include "gl_compat.h"
 #include "ui/viewport/glsl_compat.h"
 
 
@@ -152,7 +152,13 @@ void IdPass::allocTargets(int w, int h) {
 bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     // Decide encoding once (env-gated fallback) and build the matching program.
     const char* mode = std::getenv("AI_CAD_IDBUF");
+#ifdef __EMSCRIPTEN__
+    // WebGL2 has no reliable R32UI integer color attachment — force the RGBA8 path.
+    rgba8_ = true;
+    (void)mode;
+#else
     rgba8_ = (mode && std::strcmp(mode, "rgba8") == 0);
+#endif
 
     if (!prog_) prog_ = linkProgram(kVertU, rgba8_ ? kFragRGBA : kFragU);
     int linked = 0;

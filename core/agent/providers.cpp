@@ -19,6 +19,78 @@
 
 namespace aicad {
 namespace agent {
+namespace {
+// Per-thread sink so a design/micro run can observe every HTTP completion without
+// threading RunEvents through complete()'s call graph.
+thread_local std::function<void(const json&)> g_provider_call_emitter;
+
+std::string truncate_excerpt(std::string s, size_t n = 200) {
+    // Collapse whitespace so a multi-line JSON error body becomes one chat-friendly line.
+    for (char& c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    // Squeeze runs of spaces.
+    std::string out;
+    out.reserve(s.size());
+    bool sp = false;
+    for (char c : s) {
+        if (c == ' ') {
+            if (!sp) out.push_back(c);
+            sp = true;
+        } else {
+            out.push_back(c);
+            sp = false;
+        }
+    }
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.size() > n) out = out.substr(0, n - 3) + "...";
+    return out;
+}
+
+std::string request_id_from_body(const std::string& body) {
+    if (body.empty()) return {};
+    json j = json::parse(body, nullptr, false);
+    if (!j.is_object()) return {};
+    // OpenAI/xAI: top-level "id"; Anthropic: "id" or error.error.request_id.
+    if (j.contains("id") && j["id"].is_string()) return j["id"].get<std::string>();
+    if (j.contains("request_id") && j["request_id"].is_string())
+        return j["request_id"].get<std::string>();
+    if (j.contains("error") && j["error"].is_object()) {
+        const auto& e = j["error"];
+        if (e.contains("request_id") && e["request_id"].is_string())
+            return e["request_id"].get<std::string>();
+    }
+    return {};
+}
+
+void emit_provider_call(const CompleteResult& res, const std::string& provider) {
+    auto& emit = g_provider_call_emitter;
+    if (!emit) return;
+    json ev = {
+        {"kind", "provider_call"},
+        {"provider", provider},
+        {"endpoint", res.endpoint},
+        {"model", res.model},
+        {"http_status", res.http_status},
+        {"latency_ms", res.latency_ms},
+        {"request_id", res.request_id},
+        {"attempt", res.attempt > 0 ? res.attempt : 1},
+        {"error_excerpt", res.error_excerpt},
+        {"ok", res.error.empty()},
+    };
+    try {
+        emit(ev);
+    } catch (...) {
+    }
+}
+}  // namespace
+
+void set_provider_call_emitter(std::function<void(const json&)> emit) {
+    g_provider_call_emitter = std::move(emit);
+}
+std::function<void(const json&)>& provider_call_emitter() { return g_provider_call_emitter; }
+
 
 const char* kAnthropicDefaultModel = "claude-opus-4-8";
 const char* kOpenAIDefaultModel = "gpt-4o";
@@ -700,19 +772,26 @@ bool is_daily_quota_exhausted(const HttpResponse& hr) {
            b.find("free_tier") != std::string::npos ||
            b.find("FreeTier") != std::string::npos;
 }
-HttpResponse http_post_retry(const std::string& url,
-                             const std::vector<std::pair<std::string, std::string>>& headers,
-                             const std::string& body) {
-    HttpResponse hr = http_post(url, headers, body);
+// Returns the response plus 1-based attempt count (1 = first try, >1 after 429/503 retries).
+struct RetryResult {
+    HttpResponse hr;
+    int attempt = 1;
+};
+RetryResult http_post_retry(const std::string& url,
+                            const std::vector<std::pair<std::string, std::string>>& headers,
+                            const std::string& body) {
+    RetryResult out;
+    out.hr = http_post(url, headers, body);
     int delay_ms = 1000;
-    for (int attempt = 0; attempt < 4 && hr.error.empty() &&
-                          (hr.status == 429 || hr.status == 503); ++attempt) {
-        if (is_daily_quota_exhausted(hr)) break;  // retrying won't help today — surface it now
+    for (int attempt = 0; attempt < 4 && out.hr.error.empty() &&
+                          (out.hr.status == 429 || out.hr.status == 503); ++attempt) {
+        if (is_daily_quota_exhausted(out.hr)) break;  // retrying won't help today — surface it now
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         delay_ms *= 2;
-        hr = http_post(url, headers, body);
+        out.hr = http_post(url, headers, body);
+        out.attempt = attempt + 2;  // 1-based: first retry => 2
     }
-    return hr;
+    return out;
 }
 }  // namespace
 
@@ -836,6 +915,18 @@ std::string humanize_provider_error(const std::string& raw) {
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens) {
     CompleteResult res;
+    auto t0 = std::chrono::steady_clock::now();
+    auto finish = [&](CompleteResult r) -> CompleteResult {
+        r.latency_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        if (r.attempt <= 0) r.attempt = 1;
+        if (!r.error.empty() && r.error_excerpt.empty())
+            r.error_excerpt = truncate_excerpt(r.error);
+        emit_provider_call(r, provider);
+        return r;
+    };
 
     if (provider == "mock") {
         std::vector<std::string> replies;
@@ -843,7 +934,9 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             for (const auto& r : cfg["replies"]) replies.push_back(r.get<std::string>());
         MockProvider mp(std::move(replies));
         res.text = mp.complete();
-        return res;
+        res.model = "mock";
+        res.endpoint = "mock";
+        return finish(std::move(res));
     }
 
     std::string api_key = str_or(cfg, "api_key");
@@ -864,7 +957,9 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         if (api_key.empty()) {
             res.error = oauth ? "anthropic-sub: no access_token (sign in via Settings → Accounts)"
                               : "anthropic: missing api_key";
-            return res;
+            res.model = model;
+            res.endpoint = "https://api.anthropic.com/v1/messages";
+            return finish(std::move(res));
         }
 
         BuiltRequest req =
@@ -1054,20 +1149,27 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                 if (h.first == "x-api-key") h.second = api_key;
         }
 
-        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
-        if (!hr.error.empty()) {
-            res.error = hr.error;
-            return res;
+        RetryResult rr = http_post_retry(req.url, req.headers, req.body);
+        res.endpoint = req.url;
+        res.model = model;
+        res.attempt = rr.attempt;
+        res.http_status = static_cast<int>(rr.hr.status);
+        res.request_id = request_id_from_body(rr.hr.body);
+        if (!rr.hr.error.empty()) {
+            res.error = rr.hr.error;
+            res.error_excerpt = truncate_excerpt(rr.hr.error);
+            return finish(std::move(res));
         }
-        if (hr.status < 200 || hr.status >= 300) {
-            res.error = concise_http_error(oauth ? "anthropic-sub" : "anthropic", hr.status,
-                                           hr.body);
-            return res;
+        if (rr.hr.status < 200 || rr.hr.status >= 300) {
+            res.error = concise_http_error(oauth ? "anthropic-sub" : "anthropic", rr.hr.status,
+                                           rr.hr.body);
+            res.error_excerpt = truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
+            return finish(std::move(res));
         }
-        ParsedReply pr = anthropic_parse_response(json::parse(hr.body, nullptr, false));
+        ParsedReply pr = anthropic_parse_response(json::parse(rr.hr.body, nullptr, false));
         res.text = pr.text;
         res.thinking = pr.thinking;
-        return res;
+        return finish(std::move(res));
     }
 
     // OpenAI-compatible family: openai / llamacpp / xai / xai-sub.
@@ -1085,26 +1187,35 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             base_url = "https://api.x.ai/v1";
         if (api_key.empty() && (provider == "xai" || provider == "xai-sub")) {
             res.error = "xai: missing access_token/api_key (sign in via Settings → Accounts)";
-            return res;
+            res.model = model;
+            res.endpoint = base_url.empty() ? "https://api.x.ai/v1" : base_url;
+            return finish(std::move(res));
         }
         BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
         for (auto& h : req.headers)
             if (h.first == "Authorization")
                 h.second = "Bearer " + (api_key.empty() ? std::string("not-needed") : api_key);
-        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
-        if (!hr.error.empty()) {
-            res.error = hr.error;
-            return res;
+        RetryResult rr = http_post_retry(req.url, req.headers, req.body);
+        res.endpoint = req.url;
+        res.model = model;
+        res.attempt = rr.attempt;
+        res.http_status = static_cast<int>(rr.hr.status);
+        res.request_id = request_id_from_body(rr.hr.body);
+        if (!rr.hr.error.empty()) {
+            res.error = rr.hr.error;
+            res.error_excerpt = truncate_excerpt(rr.hr.error);
+            return finish(std::move(res));
         }
         const char* err_name =
             (provider == "xai" || provider == "xai-sub")
                 ? (provider == "xai-sub" ? "xai-sub" : "xai")
                 : "openai";
-        if (hr.status < 200 || hr.status >= 300) {
-            res.error = concise_http_error(err_name, hr.status, hr.body);
-            return res;
+        if (rr.hr.status < 200 || rr.hr.status >= 300) {
+            res.error = concise_http_error(err_name, rr.hr.status, rr.hr.body);
+            res.error_excerpt = truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
+            return finish(std::move(res));
         }
-        json parsed = json::parse(hr.body, nullptr, false);
+        json parsed = json::parse(rr.hr.body, nullptr, false);
         ParsedReply pr = openai_parse_response(parsed);
         if (pr.text.empty()) {
             // Grok reasoning variants may put CoT only in reasoning_content.
@@ -1120,13 +1231,15 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                 if (!parsed.contains("choices") || !parsed["choices"].is_array() ||
                     parsed["choices"].empty()) {
                     res.error = std::string(err_name) + " endpoint returned no completion";
-                    return res;
+                    res.error_excerpt =
+                        truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
+                    return finish(std::move(res));
                 }
             }
         }
         res.text = pr.text;
         res.thinking = pr.thinking;
-        return res;
+        return finish(std::move(res));
     }
 
     if (provider == "gemini") {
@@ -1135,19 +1248,27 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         BuiltRequest req = gemini_build_request(model, system, messages, max_tokens, effort);
         for (auto& h : req.headers)
             if (h.first == "x-goog-api-key") h.second = api_key;
-        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
-        if (!hr.error.empty()) {
-            res.error = hr.error;
-            return res;
+        RetryResult rr = http_post_retry(req.url, req.headers, req.body);
+        res.endpoint = req.url;
+        res.model = model;
+        res.attempt = rr.attempt;
+        res.http_status = static_cast<int>(rr.hr.status);
+        res.request_id = request_id_from_body(rr.hr.body);
+        if (!rr.hr.error.empty()) {
+            res.error = rr.hr.error;
+            res.error_excerpt = truncate_excerpt(rr.hr.error);
+            return finish(std::move(res));
         }
-        if (hr.status < 200 || hr.status >= 300) {
-            res.error = concise_http_error("gemini", hr.status, hr.body);
-            return res;
+        if (rr.hr.status < 200 || rr.hr.status >= 300) {
+            res.error = concise_http_error("gemini", rr.hr.status, rr.hr.body);
+            res.error_excerpt = truncate_excerpt(rr.hr.body.empty() ? res.error : rr.hr.body);
+            return finish(std::move(res));
         }
-        json parsed = json::parse(hr.body, nullptr, false);
+        json parsed = json::parse(rr.hr.body, nullptr, false);
         if (parsed.is_discarded()) {
             res.error = "gemini: unparseable response body";
-            return res;
+            res.error_excerpt = truncate_excerpt(rr.hr.body);
+            return finish(std::move(res));
         }
         ParsedReply pr = gemini_parse_response(parsed);
         if (pr.text.empty()) {
@@ -1157,7 +1278,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                 if (parsed.contains("promptFeedback")) why = parsed["promptFeedback"].dump();
                 res.error = "gemini endpoint returned no completion" +
                             (why.empty() ? std::string() : (": " + why));
-                return res;
+                res.error_excerpt = truncate_excerpt(res.error);
+                return finish(std::move(res));
             }
             std::string fr = parsed["candidates"][0].value("finishReason", std::string());
             res.error = "gemini: empty completion (finishReason " +
@@ -1166,22 +1288,25 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                              ? " — thinking consumed the output budget; lower reasoning effort or"
                                " raise max_output_tokens"
                              : "");
-            return res;
+            res.error_excerpt = truncate_excerpt(res.error);
+            return finish(std::move(res));
         }
         res.text = pr.text;
         res.thinking = pr.thinking;
-        return res;
+        return finish(std::move(res));
     }
 
     if (provider == "cursor" || provider == "cursor-sub") {
         res.error =
             "cursor: no C++ chat completions transport (Connect-RPC/protobuf only). "
             "Pick xAI, Claude, or OpenAI.";
-        return res;
+        res.model = str_or(cfg, "model");
+        res.endpoint = "cursor";
+        return finish(std::move(res));
     }
 
     res.error = "unknown provider: " + provider;
-    return res;
+    return finish(std::move(res));
 }
 
 // --------------------------------------------------------------------------- assist provider

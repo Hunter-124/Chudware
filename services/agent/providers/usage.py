@@ -50,20 +50,30 @@ DASHBOARD_URLS = {
     "xai": "https://grok.com/?_s=usage",
 }
 
-# xAI usage sources. Live OIDC userinfo + rate-limit headers (from /v1/models
-# when present, else last chat headers / optional 1-token probe) are the
-# primary path — JWT has NO email/name claims (only sub/tier/team_id). Browser
-# scrape is a degrade path when the API path returns empty windows.
+# xAI usage sources. Primary path hits the official cli-chat-proxy credits
+# endpoint (same as grok-build ``GET /v1/billing?format=credits``) plus
+# ``GET /v1/user?include=subscription`` for live tier. Rate-limit headers
+# from api.x.ai remain secondary enrichment. JWT has NO email/name claims
+# (only sub/tier/team_id); OIDC userinfo fills identity. Browser scrape is a
+# degrade path when the billing path returns empty windows.
 XAI_SOURCE_JWT = "jwt_inference"
 XAI_SOURCE_BROWSER = "browser_scrape"
 XAI_SOURCE_API = "api"
-# Prefer live API (userinfo + rate-limit headers). Override with env AICAD_XAI_USAGE_SOURCE.
+# Prefer live billing + userinfo. Override with env AICAD_XAI_USAGE_SOURCE.
 XAI_USAGE_SOURCE = XAI_SOURCE_API
 
 XAI_USERINFO_URL = "https://auth.x.ai/oauth2/userinfo"
 XAI_ME_URL = "https://api.x.ai/v1/me"
 XAI_MODELS_URL = "https://api.x.ai/v1/models"
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
+# Official SuperGrok credits source (grok-build extensions/billing.rs).
+XAI_CLI_CHAT_PROXY_BASE = "https://cli-chat-proxy.grok.com/v1"
+XAI_BILLING_URL = f"{XAI_CLI_CHAT_PROXY_BASE}/billing?format=credits"
+XAI_USER_SUB_URL = f"{XAI_CLI_CHAT_PROXY_BASE}/user?include=subscription"
+# Token-auth header value from grok-build auth/config.rs ``token_header``.
+XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
+# Brief per-process cache for billing GETs (Settings polls; avoid hammering).
+XAI_BILLING_CACHE_TTL_S = 60
 
 # Anthropic OAuth product surfaces
 _ANTHROPIC_OAUTH_BASE = "https://api.anthropic.com/api/oauth"
@@ -256,12 +266,29 @@ def _http_request(
     return status, body, rh
 
 
-def _xai_auth_headers(cred: dict) -> dict[str, str]:
+def _xai_auth_headers(cred: dict, *, proxy: bool = False) -> dict[str, str]:
+    """Bearer headers for xAI endpoints.
+
+    *proxy*=True adds the cli-chat-proxy session markers required by
+    grok-build (``X-XAI-Token-Auth: xai-grok-cli``, client version/mode,
+    ``x-authenticateresponse``). Tokens need ``conversations:read/write``
+    scopes in addition to ``grok-cli:access`` or the proxy returns 403.
+    """
     token = str(cred.get("access_token") or "").strip()
-    return {
+    headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
+    if proxy:
+        headers["X-XAI-Token-Auth"] = XAI_TOKEN_AUTH_VALUE
+        headers["x-grok-client-version"] = "0.1.210"
+        headers["x-grok-client-mode"] = "headless"
+        headers["x-authenticateresponse"] = "authenticate-response"
+        headers["x-grok-client-identifier"] = "billet"
+        uid = cred.get("account_id") or cred.get("user_id") or cred.get("sub")
+        if uid is not None and str(uid).strip():
+            headers["x-userid"] = str(uid).strip()
+    return headers
 
 
 def _usage_from_ratelimit_headers(headers: dict[str, str]) -> list[dict]:
@@ -319,7 +346,7 @@ def record_xai_ratelimit_headers(
     """Persist rate-limit headers from a live completion onto the credential.
 
     Called by :mod:`xai_sub_provider` after each chat round-trip so Settings can
-    show real percentages without a dedicated usage endpoint (xAI has none).
+    show rate-limit windows as secondary data alongside billing credits.
     Returns the normalized usage rows (may be empty).
     """
     if not isinstance(cred, dict) or not headers:
@@ -1041,6 +1068,8 @@ def fetch_cursor_usage(cred: dict) -> dict:
 
 
 # xAI OAuth JWT ``tier`` is often a bare int (1=SuperGrok, 2=Heavy, …).
+# Live ``/user?include=subscription`` returns strings like SuperGrokPro
+# (subscription_check.rs QUALIFYING_TIERS).
 _XAI_TIER_PLAN: dict[str, str] = {
     "0": "Free",
     "1": "SuperGrok",
@@ -1048,14 +1077,25 @@ _XAI_TIER_PLAN: dict[str, str] = {
     "3": "Premium+",
     "free": "Free",
     "supergrok": "SuperGrok",
+    "supergrokpro": "SuperGrok",
+    "supergroklite": "SuperGrok Lite",
+    "supergrokheavy": "SuperGrok Heavy",
+    "supergrok heavy": "SuperGrok Heavy",
+    "grokpro": "Grok Pro",
     "heavy": "SuperGrok Heavy",
     "premium": "Premium+",
     "premium+": "Premium+",
+    "xpremiumplus": "Premium+",
+    "xpremium": "X Premium",
+    "xbasic": "X Basic",
+    "x_premium_plus": "Premium+",
+    "x_premium": "X Premium",
+    "x_basic": "X Basic",
 }
 
 
 def _map_xai_tier_claim(value: Any) -> str | None:
-    """Map JWT/store tier claim to a human plan label."""
+    """Map JWT/store/subscription-API tier claim to a human plan label."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -1066,11 +1106,14 @@ def _map_xai_tier_claim(value: Any) -> str | None:
         if not s:
             return None
         low = s.lower()
+        compact = low.replace(" ", "").replace("_", "").replace("-", "")
         if low in _XAI_TIER_PLAN:
             return _XAI_TIER_PLAN[low]
+        if compact in _XAI_TIER_PLAN:
+            return _XAI_TIER_PLAN[compact]
         if s.isdigit():
             return _XAI_TIER_PLAN.get(s) or f"tier-{s}"
-        # Already a label (SuperGrok / Premium+ / …).
+        # Already a label (SuperGrok / Premium+ / SuperGrok Heavy / …).
         return s
     return None
 
@@ -1242,20 +1285,294 @@ def fetch_xai_usage_browser_scrape(cred: dict) -> dict:
     return out
 
 
+# Process-local cache for cli-chat-proxy billing/user GETs (~60s).
+_xai_billing_cache: dict[str, dict[str, Any]] = {}
+
+
+def _cent_val(value: Any) -> float | None:
+    """Extract a numeric amount from a Cent ``{val: N}`` or bare number."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, dict):
+        return _to_number(value.get("val") if "val" in value else value.get("value"))
+    return _to_number(value)
+
+
+def _period_field(period: dict | None, *keys: str) -> Any:
+    if not isinstance(period, dict):
+        return None
+    for k in keys:
+        if k in period and period[k] is not None:
+            return period[k]
+    return None
+
+
+def _period_type_label(raw: Any) -> str:
+    """Map USAGE_PERIOD_TYPE_* (or free text) to a short window/label stem."""
+    if raw is None:
+        return "credits"
+    s = str(raw).strip()
+    if not s:
+        return "credits"
+    up = s.upper()
+    if "WEEK" in up:
+        return "weekly"
+    if "MONTH" in up:
+        return "monthly"
+    if "DAY" in up or "DAILY" in up:
+        return "daily"
+    # Already a short word.
+    low = s.lower()
+    if low in ("weekly", "monthly", "daily", "credits"):
+        return low
+    return "credits"
+
+
+def _parse_xai_billing_config(body: Any) -> dict[str, Any]:
+    """Normalize cli-chat-proxy billing JSON → usage windows + extras.
+
+    Accepts either the full ``BillingConfigResponse`` (``{config: …}``) or a
+    bare ``BillingConfig``. Field names may be camelCase (serde) or snake_case.
+    """
+    empty: dict[str, Any] = {
+        "usage": [],
+        "plan": None,
+        "prepaid_balance": None,
+        "credit_usage_percent": None,
+    }
+    if not isinstance(body, dict):
+        return empty
+
+    cfg = body.get("config") if isinstance(body.get("config"), dict) else body
+    if not isinstance(cfg, dict):
+        return empty
+
+    # Prefer creditUsagePercent; fall back to used/monthlyLimit.
+    pct = _to_number(
+        cfg.get("creditUsagePercent")
+        if cfg.get("creditUsagePercent") is not None
+        else cfg.get("credit_usage_percent")
+    )
+    if pct is None:
+        used = _cent_val(cfg.get("used"))
+        limit = _cent_val(
+            cfg.get("monthlyLimit")
+            if cfg.get("monthlyLimit") is not None
+            else cfg.get("monthly_limit")
+        )
+        if used is not None and limit is not None and limit > 0:
+            pct = min(100.0, max(0.0, (used / limit) * 100.0))
+
+    period = (
+        cfg.get("currentPeriod")
+        if isinstance(cfg.get("currentPeriod"), dict)
+        else cfg.get("current_period")
+        if isinstance(cfg.get("current_period"), dict)
+        else None
+    )
+    period_type = _period_field(period, "type", "periodType", "period_type")
+    period_end = _period_field(period, "end") or (
+        cfg.get("billingPeriodEnd")
+        if cfg.get("billingPeriodEnd") is not None
+        else cfg.get("billing_period_end")
+    )
+    resets_at = _parse_iso_to_iso(str(period_end)) if period_end else None
+
+    window_stem = _period_type_label(period_type)
+    # Settings window key: "credits" (task) with a human label that may
+    # mention the period (Weekly credits / Monthly credits).
+    if window_stem in ("weekly", "monthly", "daily"):
+        label = f"{window_stem.capitalize()} credits"
+    else:
+        label = "Credits"
+
+    usage: list[dict] = []
+    # grok-build credit_balance_from_config: absent percent + no limit → 0.0.
+    # Live SuperGrok/GrokPro responses often omit creditUsagePercent when the
+    # weekly pool is untouched — still a real "0% used" bar for Settings.
+    if pct is None and isinstance(cfg, dict) and cfg:
+        markers = (
+            "currentPeriod", "current_period",
+            "prepaidBalance", "prepaid_balance",
+            "onDemandCap", "on_demand_cap",
+            "isUnifiedBillingUser", "is_unified_billing_user",
+            "billingPeriodEnd", "billing_period_end",
+            "monthlyLimit", "monthly_limit", "used",
+        )
+        if any(k in cfg for k in markers):
+            pct = 0.0
+    if pct is not None:
+        frac = _clamp_fraction(pct / 100.0)
+        usage.append(_usage_row("credits", label, frac, resets_at, None))
+
+    prepaid = _cent_val(
+        cfg.get("prepaidBalance")
+        if cfg.get("prepaidBalance") is not None
+        else cfg.get("prepaid_balance")
+    )
+    # Surface prepaid as a secondary detail row only when positive and we
+    # already have a primary credits bar (don't invent a 0% bar from prepaid).
+    if prepaid is not None and prepaid > 0 and usage:
+        # Encode remaining prepaid dollars (Cent.val is USD cents) into the
+        # label; fraction stays None so UI doesn't treat it as a second bar.
+        dollars = prepaid / 100.0
+        usage.append(
+            {
+                "window": "prepaid",
+                "label": f"Prepaid ${dollars:.2f}",
+                "used_fraction": None,
+                "resets_at": None,
+                "status": "ok",
+                "prepaid_balance_cents": prepaid,
+            }
+        )
+
+    plan = None
+    for key in (
+        "subscriptionTier",
+        "subscription_tier",
+        "tier",
+        "plan",
+    ):
+        # Top-level BillingConfigResponse may carry subscription_tier.
+        v = body.get(key)
+        if v is None and cfg is not body:
+            v = cfg.get(key)
+        mapped = _map_xai_tier_claim(v)
+        if mapped:
+            plan = mapped
+            break
+
+    return {
+        "usage": usage,
+        "plan": plan,
+        "prepaid_balance": prepaid,
+        "credit_usage_percent": pct,
+    }
+
+
+def _parse_xai_user_subscription(body: Any) -> dict[str, Any]:
+    """Pull plan + identity from ``GET /user?include=subscription``."""
+    out: dict[str, Any] = {}
+    if not isinstance(body, dict):
+        return out
+    for key in (
+        "subscriptionTier",
+        "subscription_tier",
+        "tier",
+        "plan",
+    ):
+        mapped = _map_xai_tier_claim(body.get(key))
+        if mapped:
+            out["plan"] = mapped
+            break
+    email = body.get("email")
+    if isinstance(email, str) and "@" in email:
+        out["email"] = email.strip().lower()
+    first = body.get("firstName") or body.get("first_name")
+    last = body.get("lastName") or body.get("last_name")
+    parts = [p for p in (first, last) if isinstance(p, str) and p.strip()]
+    if parts:
+        name = " ".join(p.strip() for p in parts)
+        if name and not _looks_like_uuid(name):
+            out["display_name"] = name
+    uid = body.get("userId") or body.get("user_id")
+    if uid is not None and str(uid).strip():
+        out["account_id"] = str(uid).strip()
+    return out
+
+
+def _xai_billing_cache_key(cred: dict) -> str:
+    aid = (
+        cred.get("account_id")
+        or cred.get("user_id")
+        or cred.get("sub")
+        or ""
+    )
+    # Token suffix so a re-login for the same sub doesn't reuse stale bars.
+    tok = str(cred.get("access_token") or "")
+    tail = tok[-12:] if tok else ""
+    return f"{aid}::{tail}"
+
+
+def _get_cached_xai_billing(cred: dict) -> dict[str, Any] | None:
+    key = _xai_billing_cache_key(cred)
+    entry = _xai_billing_cache.get(key)
+    if not entry:
+        return None
+    if (_now() - float(entry.get("fetched_at") or 0)) > XAI_BILLING_CACHE_TTL_S:
+        return None
+    return dict(entry.get("data") or {})
+
+
+def _set_cached_xai_billing(cred: dict, data: dict[str, Any]) -> None:
+    key = _xai_billing_cache_key(cred)
+    _xai_billing_cache[key] = {"fetched_at": _now(), "data": dict(data)}
+
+
+def fetch_xai_billing(cred: dict, *, force: bool = False) -> dict[str, Any]:
+    """GET cli-chat-proxy billing + subscription tier for one credential.
+
+    Returns ``{usage, plan, prepaid_balance, credit_usage_percent, source}``.
+    Network errors raise; HTTP 429 raises ``_RateLimited``.
+    """
+    if not force:
+        cached = _get_cached_xai_billing(cred)
+        if cached is not None:
+            return cached
+
+    proxy_headers = _xai_auth_headers(cred, proxy=True)
+    result: dict[str, Any] = {
+        "usage": [],
+        "plan": None,
+        "prepaid_balance": None,
+        "credit_usage_percent": None,
+        "source": "billing",
+    }
+
+    st, body, _rh = _http_get(XAI_BILLING_URL, headers=proxy_headers, timeout=15.0)
+    if st == 429:
+        raise _RateLimited("xAI billing 429")
+    if st == 200:
+        parsed = _parse_xai_billing_config(body)
+        result.update(parsed)
+    else:
+        log.info("xAI billing HTTP %s", st)
+
+    try:
+        st_u, user_body, _ = _http_get(
+            XAI_USER_SUB_URL, headers=proxy_headers, timeout=10.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xAI /user?include=subscription failed: %s", exc)
+        st_u, user_body = -1, None
+    if st_u == 429:
+        raise _RateLimited("xAI user subscription 429")
+    if st_u == 200 and isinstance(user_body, dict):
+        sub = _parse_xai_user_subscription(user_body)
+        if sub.get("plan"):
+            result["plan"] = sub["plan"]
+        for k in ("email", "display_name", "account_id"):
+            if sub.get(k):
+                result[k] = sub[k]
+
+    if result.get("usage") or result.get("plan") is not None:
+        _set_cached_xai_billing(cred, result)
+    return result
+
 def fetch_xai_usage_api(cred: dict) -> dict:
-    """Live xAI identity + usage from OIDC userinfo + rate-limit headers.
+    """Live xAI identity + SuperGrok credits from official billing proxy.
 
-    Root-cause findings (live probe 2026-07-16):
-    - OAuth JWT carries only ``sub`` / ``tier`` / ``team_id`` — never email/name.
-    - ``GET https://auth.x.ai/oauth2/userinfo`` returns real name + email.
-    - ``GET https://api.x.ai/v1/me`` returns user_id/team_id/team_blocked only.
-    - There is NO dedicated usage/quota HTTP endpoint on api.x.ai.
-    - Chat completions return ``x-ratelimit-limit/remaining-{requests,tokens}``.
-    - ``GET /v1/models`` authenticates but usually omits rate-limit headers.
+    Primary (grok-build /usage path):
+    - ``GET https://cli-chat-proxy.grok.com/v1/billing?format=credits``
+      → ``credit_usage_percent``, ``prepaid_balance``, period reset
+    - ``GET …/v1/user?include=subscription`` → live ``subscription_tier``
 
-    Strategy: always hit userinfo for identity; pull rate-limit headers from
-    /v1/models when present else last_usage from prior chat; optional 1-token
-    probe via ``AICAD_XAI_USAGE_PROBE=1``.
+    Auth for those: ``Authorization: Bearer`` + ``X-XAI-Token-Auth: xai-grok-cli``.
+
+    Identity still comes from OIDC userinfo (JWT has no email/name).
+    Rate-limit headers (api.x.ai chat / last_usage) are secondary enrichment
+    appended only when billing did not return a credits window.
     """
     base = fetch_xai_usage_jwt_inference(cred)
     token = str(cred.get("access_token") or "").strip()
@@ -1300,67 +1617,126 @@ def fetch_xai_usage_api(cred: dict) -> dict:
         if me_body.get("user_id") and not out.get("account_id"):
             out["account_id"] = str(me_body["user_id"])
 
-    # ── Usage: live rate headers, then last_usage, then optional probe ───────
+    # ── Primary: SuperGrok credits via cli-chat-proxy billing ────────────────
     usage_rows: list[dict] = []
-
+    billing_ok = False
     try:
-        st_m, _body_m, rh_m = _http_get(XAI_MODELS_URL, headers=headers, timeout=20.0)
+        bill_cred = dict(cred)
+        if out.get("account_id") and not bill_cred.get("account_id"):
+            bill_cred["account_id"] = out["account_id"]
+        billing = fetch_xai_billing(bill_cred)
+    except _RateLimited:
+        raise
     except Exception as exc:  # noqa: BLE001
-        log.debug("xAI /v1/models for rate headers failed: %s", exc)
-        st_m, rh_m = -1, {}
-    if st_m == 429:
-        raise _RateLimited("xAI models 429")
-    if st_m == 200:
-        usage_rows = _usage_from_ratelimit_headers(rh_m or {})
+        log.warning("xAI billing fetch failed: %s", exc)
+        billing = {}
 
-    if not usage_rows and isinstance(cred.get("last_usage"), list) and cred["last_usage"]:
-        has_frac = any(
-            isinstance(r, dict) and r.get("used_fraction") is not None
-            for r in cred["last_usage"]
-        )
-        if has_frac:
-            # Prefer request/token windows from chat headers over browser scrape
-            # leftovers (window "2h" / "weekly" with no live binding).
-            liveish = [
-                r for r in cred["last_usage"]
-                if isinstance(r, dict) and r.get("window") in ("requests", "tokens")
+    if isinstance(billing, dict):
+        if billing.get("plan"):
+            out["plan"] = billing["plan"]
+        for k in ("email", "display_name", "account_id"):
+            if billing.get(k) and (
+                not out.get(k)
+                or (k == "display_name" and _looks_like_uuid(out.get(k)))
+            ):
+                out[k] = billing[k]
+        b_usage = billing.get("usage") or []
+        if isinstance(b_usage, list) and b_usage:
+            credits = [
+                r for r in b_usage
+                if isinstance(r, dict) and r.get("window") == "credits"
             ]
-            usage_rows = list(liveish or cred["last_usage"])
-
-    import os as _os
-    probe = str(_os.environ.get("AICAD_XAI_USAGE_PROBE") or "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-    if not usage_rows and probe:
-        try:
-            payload = json.dumps({
-                "model": "grok-4.5",
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-            }).encode("utf-8")
-            st_c, _body_c, rh_c = _http_request(
-                "POST",
-                XAI_CHAT_URL,
-                headers={**headers, "Content-Type": "application/json"},
-                data=payload,
-                timeout=45.0,
+            other = [
+                r for r in b_usage
+                if isinstance(r, dict) and r.get("window") != "credits"
+            ]
+            usage_rows = list(credits or b_usage)
+            for r in other:
+                if r not in usage_rows:
+                    usage_rows.append(r)
+            billing_ok = any(
+                isinstance(r, dict) and r.get("used_fraction") is not None
+                for r in credits
             )
-            if st_c == 429:
-                raise _RateLimited("xAI chat probe 429")
-            if st_c == 403:
-                usage_rows = [
-                    _usage_row("requests", "Request pool", 1.0, None, "blocked"),
-                ]
-            elif st_c == 200:
-                usage_rows = _usage_from_ratelimit_headers(rh_c or {})
-        except _RateLimited:
-            raise
+        if billing.get("credit_usage_percent") is not None:
+            out["credit_usage_percent"] = billing["credit_usage_percent"]
+        if billing.get("prepaid_balance") is not None:
+            out["prepaid_balance"] = billing["prepaid_balance"]
+
+    # ── Secondary: rate-limit headers (live / last chat) ─────────────────────
+    rate_rows: list[dict] = []
+    if not billing_ok:
+        try:
+            st_m, _body_m, rh_m = _http_get(
+                XAI_MODELS_URL, headers=headers, timeout=20.0
+            )
         except Exception as exc:  # noqa: BLE001
-            log.debug("xAI usage probe failed: %s", exc)
+            log.debug("xAI /v1/models for rate headers failed: %s", exc)
+            st_m, rh_m = -1, {}
+        if st_m == 429:
+            raise _RateLimited("xAI models 429")
+        if st_m == 200:
+            rate_rows = _usage_from_ratelimit_headers(rh_m or {})
+
+        if (
+            not rate_rows
+            and isinstance(cred.get("last_usage"), list)
+            and cred["last_usage"]
+        ):
+            has_frac = any(
+                isinstance(r, dict) and r.get("used_fraction") is not None
+                for r in cred["last_usage"]
+            )
+            if has_frac:
+                liveish = [
+                    r for r in cred["last_usage"]
+                    if isinstance(r, dict)
+                    and r.get("window") in ("requests", "tokens", "credits")
+                ]
+                rate_rows = list(liveish or cred["last_usage"])
+
+        import os as _os
+        probe = str(_os.environ.get("AICAD_XAI_USAGE_PROBE") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if not rate_rows and not usage_rows and probe:
+            try:
+                payload = json.dumps({
+                    "model": "grok-4.5",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                }).encode("utf-8")
+                st_c, _body_c, rh_c = _http_request(
+                    "POST",
+                    XAI_CHAT_URL,
+                    headers={**headers, "Content-Type": "application/json"},
+                    data=payload,
+                    timeout=45.0,
+                )
+                if st_c == 429:
+                    raise _RateLimited("xAI chat probe 429")
+                if st_c == 403:
+                    rate_rows = [
+                        _usage_row("requests", "Request pool", 1.0, None, "blocked"),
+                    ]
+                elif st_c == 200:
+                    rate_rows = _usage_from_ratelimit_headers(rh_c or {})
+            except _RateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("xAI usage probe failed: %s", exc)
+
+    # Merge: credits first, then secondary rate-limit windows (no overwrite).
+    if rate_rows:
+        seen = {r.get("window") for r in usage_rows if isinstance(r, dict)}
+        for r in rate_rows:
+            if isinstance(r, dict) and r.get("window") not in seen:
+                usage_rows.append(r)
+                seen.add(r.get("window"))
 
     if team_blocked and not usage_rows:
         usage_rows = [
-            _usage_row("requests", "Request pool", 1.0, None, "blocked"),
+            _usage_row("credits", "Credits", 1.0, None, "blocked"),
         ]
     elif team_blocked and usage_rows:
         usage_rows = [
@@ -1399,7 +1775,7 @@ def fetch_xai_usage_api(cred: dict) -> dict:
 def fetch_xai_usage(cred: dict) -> dict:
     """Dispatch xAI usage by pluggable source enum.
 
-    Default is live API (userinfo + rate-limit headers). Env
+    Default is live API (cli-chat-proxy billing + userinfo). Env
     ``AICAD_XAI_USAGE_SOURCE`` may force ``api`` / ``browser_scrape`` /
     ``jwt_inference``.
     """
@@ -1439,8 +1815,9 @@ _FETCHERS: dict[str, Callable[[dict], dict]] = {
 
 
 def clear_cache() -> None:
-    """Drop the in-process usage cache (tests)."""
+    """Drop the in-process usage + billing caches (tests)."""
     _cache.clear()
+    _xai_billing_cache.clear()
 
 def invalidate_account(provider: str, account_id: str | None = None) -> None:
     """Drop cached usage for one account, or every account for a provider."""

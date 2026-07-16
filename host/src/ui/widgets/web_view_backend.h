@@ -92,6 +92,15 @@ public:
     // False when the backend cannot host a browser (e.g. CEF cold-init failed).
     // Wizard falls back to headed/native desktop login instead of crashing.
     virtual bool available() const { return true; }
+
+    // Wipe cookies / session storage so the next OAuth login is not auto-signed
+    // into the previous account (multi-account add). CEF deletes the request-
+    // context cookie jar; default is a no-op. `done` fires on the GL/UI thread
+    // when the wipe finishes (or immediately for backends with nothing to clear).
+    virtual void clearSession(AppState& st, std::function<void()> done = nullptr) {
+        (void)st;
+        if (done) done();
+    }
 };
 
 // Backend selection, single source of truth. Returns the in-process CefWebView —

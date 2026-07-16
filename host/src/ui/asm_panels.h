@@ -44,8 +44,16 @@ public:
     //        "asm_explode" | "asm_bom" | "asm_interference" | "new_assembly".
     bool handleCommand(AppState& st, const std::string& cmdId);
 
-    // Draw every open assembly window/form. Call once per frame after the other panels.
+    // Draw BOM (floating) + service any pending tree "Edit" mate requests. Mate/Insert/Pattern/
+    // Explode/Interference now render as PropertyManager guest forms in the left column (openGuest);
+    // their bodies are driven by the PM while open. Call once per frame after the other panels.
     void draw(AppState& st);
+
+    // True while any left-pane assembly tool form is open (Mate/Insert/Pattern/Explode/Interference).
+    // layout.cpp can OR this with pm->active() if needed; currently openGuest makes pm->active() true.
+    bool pmFormActive() const {
+        return mateOpen_ || insertOpen_ || patternOpen_ || explodeOpen_ || interferenceOpen_;
+    }
 
     // Feed a resolved assembly pick into the active mate well. Called from the selection observer
     // when the Mate form is open. Returns true if a well consumed the pick.
@@ -62,7 +70,9 @@ public:
     bool patternFormActive() const { return patternOpen_; }
 
     // --- scripted scenario helpers (AI_CAD_SHOT=asm) ---
-    void openMateForm()     { beginMateForm(); }
+    // Scenario/shot helper — opens state only. Prefer handleCommand(st,"asm_mate") so the form
+    // hosts in the left PM column (openPmGuest). Callers with AppState should use handleCommand.
+    void openMateForm() { beginMateForm(); }
     // Preselect a mate type for a headless shot (AI_CAD_MATETYPE=gear), so the type-aware
     // parameter block renders. Mirrors PropertyManager::presetFieldForShot. No-op if the type
     // is unknown; the mate form must already be open.
@@ -78,7 +88,9 @@ public:
     // Set the explode factor (0..1); reloads the re-tessellated mesh in place.
     bool setExplode(AppState& st, bool active, float factor);
     // Close transient windows (scenario housekeeping so only the intended window is on top).
-    void closeInsert()  { insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear(); }
+    void closeInsert()  {
+        insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+    }
     void closeExplode() { explodeOpen_ = false; }
 
     // Close the mate form (public so scripted scenarios can dismiss it before other shots).
@@ -87,12 +99,15 @@ public:
 private:
     void beginMateForm();
     void beginPatternForm();
-    void drawInsert(AppState& st);
-    void drawMateForm(AppState& st);
-    void drawPatternForm(AppState& st);
-    void drawExplode(AppState& st);
-    void drawInterference(AppState& st);
-    void drawBom(AppState& st);
+    // Open/replace the left-pane PM guest for the named tool (mutual-excludes other asm tools).
+    void openPmGuest(AppState& st, const char* which);
+    void closeAllToolForms(AppState& st);  // closes Mate/Insert/Pattern/Explode/Interference + PM guest
+    void drawInsertBody(AppState& st);
+    void drawMateFormBody(AppState& st);
+    void drawPatternFormBody(AppState& st);
+    void drawExplodeBody(AppState& st);
+    void drawInterferenceBody(AppState& st);
+    void drawBom(AppState& st);  // stays floating
     // Emit the component-pattern add_feature op + reload. Returns the solved aicm path (empty on
     // error, errorOut filled).
     bool addPattern(AppState& st, std::string& aicmOut, std::string& errorOut);

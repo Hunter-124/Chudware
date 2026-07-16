@@ -3582,8 +3582,8 @@ bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
 }
 
 // AI-settings OVERLAY body — fills the Copilot chat area when the header gear is
-// toggled (same in-column swap as Sessions). Interwebz vertical category rail +
-// 2-column glass groups for Agents / Prompts / Skills / Permissions / Accounts.
+// toggled (same in-column swap as Sessions). Wrapping top tabs + Interwebz glass
+// groups for Agents / Prompts / Skills / Permissions / Accounts.
 // Esc / gear / "< Chat" style back returns to the conversation.
 namespace {
 // Forward decl — definition lives with the subscription usage strip below.
@@ -4581,8 +4581,10 @@ static void drawAISettingsBody(AppState& st, bool busy) {
         return;
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(1.25f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(2.0f), ui::metrics::U(1.0f)));
+    // Tight chrome spacing so the narrow copilot column packs options without
+    // large empty gaps between header / tabs / content.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(0.75f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(0.75f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     ImGui::PushFont(st.fonts.medium);
@@ -4591,64 +4593,102 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextWrapped("Agents, prompts, skills, permissions, accounts.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
+    // Clear vertical separation so the tab strip never overlaps the title block.
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.25f)));
 
-    // Horizontal top tabs (narrow copilot column — vertical rail wasted width).
+    // Wrapping top tabs — all five must stay visible in the narrow copilot column
+    // (no horizontal scrollbar that clips Permissions/Accounts).
     static int s_aiSettingsRail = 0;
     static const char* kRailLabels[] = {
         "Agents", "Prompts", "Skills", "Permissions", "Accounts",
     };
     const int nTabs = 5;
-    const float tabH = ImGui::GetFrameHeight() + 2.0f * S;
     const float availW = ImGui::GetContentRegionAvail().x;
-    // Equal-width tabs; min width from longest label so text never clips.
-    float maxLabelW = 0.0f;
+    const float gapX = ui::metrics::U(0.5f);
+    const float gapY = ui::metrics::U(0.5f);
+    // Compact pad so more labels fit per row; still readable at any uiScale.
+    const float tabPadX = ui::metrics::U(1.5f);
+    const float tabH = ImGui::GetFrameHeight();
+
+    float naturalW[5];
     for (int i = 0; i < nTabs; ++i)
-        maxLabelW = ImMax(maxLabelW, ImGui::CalcTextSize(kRailLabels[i]).x);
-    const float tabPadX = 8.0f * S;
-    const float minTabW = maxLabelW + tabPadX * 2.0f;
-    const float tabW = ImMax(minTabW, availW / (float)nTabs);
-    const bool scrollTabs = (tabW * nTabs > availW + 0.5f);
+        naturalW[i] = ImGui::CalcTextSize(kRailLabels[i]).x + tabPadX * 2.0f;
+
+    // Greedy wrap into rows, then even-fit each row to the column width so the
+    // strip always shows every tab (typically 3+2 in a narrow copilot pane).
+    int rowStart[5];
+    int rowCount[5];
+    int nRows = 0;
+    {
+        int i = 0;
+        while (i < nTabs && nRows < nTabs) {
+            rowStart[nRows] = i;
+            float used = 0.0f;
+            int count = 0;
+            while (i < nTabs) {
+                const float need = naturalW[i] + (count ? gapX : 0.0f);
+                if (count > 0 && used + need > availW + 0.5f) break;
+                used += need;
+                ++count;
+                ++i;
+            }
+            // Always place at least one tab per row (pathological narrow width).
+            if (count == 0) {
+                count = 1;
+                ++i;
+            }
+            rowCount[nRows] = count;
+            ++nRows;
+        }
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f * S, 0));
-    if (scrollTabs) {
-        ImGui::BeginChild("##ai_ov_tabs", ImVec2(0, tabH + 4.0f * S),
-                          ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
-    }
-    for (int i = 0; i < nTabs; ++i) {
-        if (i) ImGui::SameLine(0, 2.0f * S);
-        const bool sel = (s_aiSettingsRail == i);
-        ImGui::PushStyleColor(ImGuiCol_Button, sel
-            ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
-                     ui::palette.chipBg[2], ui::palette.chipBg[3])
-            : ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.06f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-            ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f));
-        ImGui::PushStyleColor(ImGuiCol_Text, sel ? surf.textPrimary : surf.textSecondary);
-        // Vertically center label via FramePadding + fixed height.
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-            ImVec2(tabPadX, (tabH - ImGui::GetFontSize()) * 0.5f));
-        if (ImGui::Button(kRailLabels[i], ImVec2(tabW, tabH)))
-            s_aiSettingsRail = i;
-        ImGui::PopStyleVar();
-        if (sel) {
-            ImGui::GetWindowDrawList()->AddRect(
-                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                ImGui::ColorConvertFloat4ToU32(semanticOnGlass(ui::palette.accent, surf)),
-                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gapX, gapY));
+    for (int r = 0; r < nRows; ++r) {
+        const int start = rowStart[r];
+        const int count = rowCount[r];
+        float naturalSum = 0.0f;
+        for (int k = 0; k < count; ++k) naturalSum += naturalW[start + k];
+        const float gaps = gapX * (float)ImMax(0, count - 1);
+        const float extra = ImMax(0.0f, availW - naturalSum - gaps);
+        // Distribute leftover width evenly so a partial last row still fills.
+        const float grow = (count > 0) ? extra / (float)count : 0.0f;
+
+        for (int k = 0; k < count; ++k) {
+            const int i = start + k;
+            if (k) ImGui::SameLine(0, gapX);
+            const bool sel = (s_aiSettingsRail == i);
+            const float tw = naturalW[i] + grow;
+            ImGui::PushStyleColor(ImGuiCol_Button, sel
+                ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
+                         ui::palette.chipBg[2], ui::palette.chipBg[3])
+                : ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.06f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f));
+            ImGui::PushStyleColor(ImGuiCol_Text, sel ? surf.textPrimary : surf.textSecondary);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                ImVec2(tabPadX, (tabH - ImGui::GetFontSize()) * 0.5f));
+            if (ImGui::Button(kRailLabels[i], ImVec2(tw, tabH)))
+                s_aiSettingsRail = i;
+            ImGui::PopStyleVar();
+            if (sel) {
+                ImGui::GetWindowDrawList()->AddRect(
+                    ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                    ImGui::ColorConvertFloat4ToU32(semanticOnGlass(ui::palette.accent, surf)),
+                    ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+            }
+            ImGui::PopStyleColor(4);
         }
-        ImGui::PopStyleColor(4);
     }
-    if (scrollTabs) ImGui::EndChild();
     ImGui::PopStyleVar(2);
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
+    // Content starts immediately under the tab strip — small gap only.
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(0.75f)));
 
     ImGui::BeginChild("##ai_ov_body", ImVec2(0, 0), ImGuiChildFlags_None);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(1.5f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(1.0f)));
     switch (s_aiSettingsRail) {
     case 0: drawOvAgentsTab(st, S, changed); break;
     case 1: drawOvPromptsTab(st, S, changed); break;

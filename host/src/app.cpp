@@ -1857,7 +1857,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
         if (wantMateForm) {
             st.wantAsm = false;                  // suppress the scripted scenario; just show the form
-            asmPanels.openMateForm();
+            asmPanels.handleCommand(st, "asm_mate");  // open the PM-guest mate form (left column)
             if (const char* mt = std::getenv("AI_CAD_MATETYPE"))
                 if (*mt) asmPanels.presetMateTypeForShot(mt);
         }

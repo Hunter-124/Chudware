@@ -120,19 +120,17 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
         std::string err;
         if (st.docMirror.newAssembly(st.worker, err)) {
             st.addLog("[asm] new assembly  rev=" + std::to_string(st.docMirror.revision()));
-            // ensureActiveTab runs per-frame; stamp the insert target now so Insert lands here.
             insertTargetDocId_ = st.docMirror.docId();
         } else {
             st.addLog("[err] new assembly: " + err);
         }
-        insertOpen_ = true; insertFocus_ = true;
         insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+        insertOpen_ = true; insertFocus_ = true;
+        openPmGuest(st, "insert");
         return true;
     }
     if (cmdId == "asm_insert") {
-        insertOpen_ = true; insertFocus_ = true;
         insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
-        // Capture the intended assembly while the user is still on it.
         if (st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
             st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1")
             insertTargetDocId_ = st.docMirror.docId();
@@ -141,28 +139,34 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
             insertTargetDocId_ = st.docTabs[st.activeTab].docId;
         else
             insertTargetDocId_.clear();
+        insertOpen_ = true; insertFocus_ = true;
+        openPmGuest(st, "insert");
         return true;
     }
     if (cmdId == "asm_parts_library") {
-        // Route to the full Parts Library workspace tab instead of a mini popup.
         st.activeWorkspace = AppState::Workspace::PartsLibrary;
         st.toast(ui::ToastLevel::Info, "Parts Library — pick a standard part to insert.");
         st.addLog("[asm] Std. Parts → Parts Library workspace");
         return true;
     }
-    if (cmdId == "asm_mate")    { beginMateForm(); return true; }
-    if (cmdId == "asm_explode") { explodeOpen_ = true; explodeFocus_ = true; return true; }
+    if (cmdId == "asm_mate") {
+        beginMateForm();
+        openPmGuest(st, "mate");
+        return true;
+    }
+    if (cmdId == "asm_explode") {
+        explodeOpen_ = true; explodeFocus_ = true;
+        openPmGuest(st, "explode");
+        return true;
+    }
     if (cmdId == "asm_interference") {
-        interferenceOpen_ = true; interferenceFocus_ = true; refreshInterference(st); return true;
+        interferenceOpen_ = true; interferenceFocus_ = true;
+        refreshInterference(st);
+        openPmGuest(st, "interference");
+        return true;
     }
     if (cmdId == "asm_bom") { bomOpen_ = true; bomFocus_ = true; refreshBom(st); return true; }
     if (cmdId == "asm_move") {
-        // Move Component: the actual gesture is a constrained viewport drag — select a (floating)
-        // component, then drag it in the graphics area. The viewport owns that gesture
-        // (viewport_panel.cpp s_asmDrag): doc_checkpoint on press, transient doc_solve_mates
-        // {drag:{component, target}} during the drag, one final solve on release (single undo).
-        // The ribbon command itself just re-solves the current mates (so a manually-edited or
-        // newly-mated component re-seats) and points the user at the drag.
         if (st.docMirror.hasDoc()) {
             nlohmann::json res; std::string err;
             if (st.worker.call("doc_solve_mates", {{"doc_id", st.docMirror.docId()}}, res, err)) {
@@ -178,30 +182,133 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     }
     if (cmdId == "asm_pattern") {
         beginPatternForm();
+        openPmGuest(st, "pattern");
         return true;
     }
     return false;
 }
 
 void AsmPanels::draw(AppState& st) {
-    // Feature-tree "Edit" on a component → open + focus the Mate/placement panel for it. Consumed once
-    // per frame and cleared. The mate form is an add-mate workflow (no "existing mates for X" list state
-    // yet), so we surface it focused and remember the component so its next viewport/tree pick lands in
-    // the active reference well; the user picks the mating geometry as usual.
+    // Feature-tree "Edit" on a component → open + focus the Mate form for it.
     if (!st.requestEditComponentMates.empty()) {
         const std::string cid = st.requestEditComponentMates;
         st.requestEditComponentMates.clear();
-        beginMateForm();                 // sets mateOpen_ + mateFocus_, resets wells
-        editComponentTarget_ = cid;      // scope hint (used for the header note / pick routing)
+        beginMateForm();
+        editComponentTarget_ = cid;
+        openPmGuest(st, "mate");
         st.addLog("[asm] edit mates for component " + cid);
     }
-    drawInsert(st);
-    // Std. Parts routes to the Parts Library workspace (no mini popup).
-    drawMateForm(st);
-    drawPatternForm(st);
-    drawExplode(st);
-    drawInterference(st);
+    // Mate/Insert/Pattern/Explode/Interference draw via PropertyManager::drawBody guest callback.
+    // BOM stays a floating glass window.
     drawBom(st);
+}
+
+void AsmPanels::closeAllToolForms(AppState& st) {
+    mateOpen_ = false; editComponentTarget_.clear();
+    insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
+    patternOpen_ = false;
+    explodeOpen_ = false;
+    interferenceOpen_ = false;
+    if (st.propertyManager && st.propertyManager->guestActive())
+        st.propertyManager->closeGuest();
+}
+
+void AsmPanels::openPmGuest(AppState& st, const char* which) {
+    if (!st.propertyManager || !which) return;
+    // Mutual exclusion among assembly tools (keep BOM independent).
+    const bool wantMate = std::strcmp(which, "mate") == 0;
+    const bool wantInsert = std::strcmp(which, "insert") == 0;
+    const bool wantPattern = std::strcmp(which, "pattern") == 0;
+    const bool wantExplode = std::strcmp(which, "explode") == 0;
+    const bool wantInterf = std::strcmp(which, "interference") == 0;
+    if (!wantMate) { mateOpen_ = false; editComponentTarget_.clear(); }
+    if (!wantInsert) { insertOpen_ = false; }
+    if (!wantPattern) patternOpen_ = false;
+    if (!wantExplode) explodeOpen_ = false;
+    if (!wantInterf) interferenceOpen_ = false;
+
+    const char* title = "Assembly";
+    const char* icon = "mate";
+    if (wantMate)        { title = "Mate";                  icon = "mate"; }
+    else if (wantInsert) { title = "Insert Component";      icon = "insert_component"; }
+    else if (wantPattern){ title = "Component Pattern";     icon = "pattern_component"; }
+    else if (wantExplode){ title = "Exploded View";         icon = "exploded_view"; }
+    else if (wantInterf) { title = "Interference Detection"; icon = "interference"; }
+
+    // Capture `this` + which tool; body draws only while the matching flag is still open.
+    st.propertyManager->openGuest(
+        title, icon,
+        /*body=*/[this, which](AppState& s) {
+            if (std::strcmp(which, "mate") == 0)              drawMateFormBody(s);
+            else if (std::strcmp(which, "insert") == 0)       drawInsertBody(s);
+            else if (std::strcmp(which, "pattern") == 0)      drawPatternFormBody(s);
+            else if (std::strcmp(which, "explode") == 0)      drawExplodeBody(s);
+            else if (std::strcmp(which, "interference") == 0) drawInterferenceBody(s);
+        },
+        /*onOk=*/[this, which](AppState& s) {
+            // Mate / Pattern / Insert treat OK as "Add" when ready; Explode/Interference just close.
+            if (std::strcmp(which, "mate") == 0) {
+                // Attempt add; leave form open on success for chaining (SolidWorks-like).
+                std::string type = effectiveMateType();
+                const int wellCount = typeNeedsThirdRef(type) ? 3 : 2;
+                bool refsReady = true;
+                for (int i = 0; i < wellCount; ++i) if (!picks_[i].has) refsReady = false;
+                if (!refsReady) {
+                    mateError_ = "Pick the required references first.";
+                    return;
+                }
+                nlohmann::json refs = nlohmann::json::array();
+                for (int i = 0; i < wellCount; ++i)
+                    refs.push_back({{"component", picks_[i].component},
+                                    {"selector", picks_[i].selector}});
+                std::string aicm;
+                if (addMate(s, type, aligned_ ? "aligned" : "anti", refs, aicm)) {
+                    s.addLog("[asm] mate added: " + type);
+                    picks_[0] = MatePick{}; picks_[1] = MatePick{}; picks_[2] = MatePick{};
+                    activeWell_ = 0; mateError_.clear();
+                }
+            } else if (std::strcmp(which, "insert") == 0) {
+                if (insertChosenPath_.empty()) {
+                    insertNote_ = "Select a part or Browse from disk…";
+                    return;
+                }
+                std::string aicm;
+                if (insertComponent(s, insertChosenPath_, nullptr, aicm)) {
+                    {
+                        size_t slash = insertChosenPath_.find_last_of("/\\");
+                        insertNote_ = "Inserted " + (slash == std::string::npos
+                            ? insertChosenPath_
+                            : insertChosenPath_.substr(slash + 1));
+                    }
+                    s.addLog("[asm] inserted: " + insertChosenPath_);
+                }
+            } else if (std::strcmp(which, "pattern") == 0) {
+                std::string aicm, err;
+                if (addPattern(s, aicm, err)) {
+                    s.addLog("[asm] component pattern added");
+                    patternError_.clear();
+                    patternComps_.clear();
+                } else {
+                    patternError_ = err;
+                }
+            } else {
+                // Explode / Interference: OK = close
+                if (std::strcmp(which, "explode") == 0) explodeOpen_ = false;
+                if (std::strcmp(which, "interference") == 0) interferenceOpen_ = false;
+                if (s.propertyManager) s.propertyManager->closeGuest();
+            }
+        },
+        /*onCancel=*/[this, which](AppState& s) {
+            if (std::strcmp(which, "mate") == 0) closeMateForm();
+            else if (std::strcmp(which, "insert") == 0) insertOpen_ = false;
+            else if (std::strcmp(which, "pattern") == 0) patternOpen_ = false;
+            else if (std::strcmp(which, "explode") == 0) explodeOpen_ = false;
+            else if (std::strcmp(which, "interference") == 0) interferenceOpen_ = false;
+            if (s.propertyManager) s.propertyManager->closeGuest();
+        });
+
+    // Auto-front FeatureManager tab so the guest form is visible (pm->active() is true).
+    st.leftPaneTab = AppState::LP_FeatureManager;
 }
 
 // ===========================================================================
@@ -368,153 +475,128 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
     return true;
 }
 
-void AsmPanels::drawInsert(AppState& st) {
+void AsmPanels::drawInsertBody(AppState& st) {
     if (!insertOpen_) return;
-    bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 360 * ui::uiScale), ImGuiCond_Appearing);
-    if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
-    pushGlassWindow();
-    const bool insWin = ImGui::Begin("Insert Component", &open);
-    popGlassWindow();
-    if (insWin) {
-        paintGlassWindow("asm_insert_glass");
-        asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        ImGui::TextUnformatted("Insert a part into the assembly");
-        ImGui::Spacing();
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
 
-        const bool haveAsm = mirrorIsAssembly(st) ||
-            (!insertTargetDocId_.empty()) ||
-            (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-             st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
+    const bool haveAsm = mirrorIsAssembly(st) ||
+        (!insertTargetDocId_.empty()) ||
+        (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
 
-        if (!haveAsm) {
-            pushText(ui::palette.statusWarn);
-            ImGui::TextWrapped("No assembly open. Use File > New Assembly first.");
-            ImGui::PopStyleColor();
+    if (!haveAsm) {
+        pushText(pal.statusWarn);
+        ImGui::TextWrapped("No assembly open. Use File > New Assembly first.");
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    std::string targetLabel;
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly)
+        targetLabel = st.docTabs[st.activeTab].displayTitle();
+    if (targetLabel.empty() && mirrorIsAssembly(st))
+        targetLabel = st.docMirror.tree().value("name", std::string("Assembly"));
+    if (targetLabel.empty()) targetLabel = "Assembly";
+    pushText(pal.textDim);
+    ImGui::Text("Target: %s", targetLabel.c_str());
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    // Browse from disk — prominent, in addition to open/recent list.
+    if (ImGui::Button("Browse from disk\xe2\x80\xa6", ImVec2(-1, 0))) {
+        if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
+            st.toast(ui::ToastLevel::Info,
+                     "File dialogs disabled (AI_CAD_NO_FILE_DIALOGS).");
         } else {
-            // Target assembly readout so the user knows which doc receives the insert.
-            std::string targetLabel;
-            if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-                st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly)
-                targetLabel = st.docTabs[st.activeTab].displayTitle();
-            if (targetLabel.empty() && mirrorIsAssembly(st)) {
-                targetLabel = st.docMirror.tree().value("name", std::string("Assembly"));
-            }
-            if (targetLabel.empty()) targetLabel = "Assembly";
-            pushText(ui::palette.textDim);
-            ImGui::Text("Target: %s", targetLabel.c_str());
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-
-            const auto candidates = buildInsertCandidates(st);
-
-            ImGui::TextUnformatted("Open & recent parts");
-            const float listH = ImGui::GetContentRegionAvail().y -
-                                (ImGui::GetFrameHeightWithSpacing() * 3.2f);
-            ImGui::BeginChild("##asm_insert_list",
-                              ImVec2(0, listH > 80.0f * ui::uiScale ? listH : 120.0f * ui::uiScale),
-                              true);
-            if (candidates.empty()) {
-                pushText(ui::palette.textDim);
-                ImGui::TextWrapped("No open or recent parts. Use Browse… to pick a file.");
-                ImGui::PopStyleColor();
-            } else {
-                for (int i = 0; i < (int)candidates.size(); ++i) {
-                    const auto& c = candidates[i];
-                    const bool selectable = !c.path.empty();  // unsaved open parts can't insert by path
-                    if (!selectable) ImGui::BeginDisabled();
-                    // "Open · bracket.step+    [label]" — single row, full path on hover.
-                    std::string row = c.label;
-                    if (!c.detail.empty()) row += "  —  " + c.detail;
-                    const bool sel = (insertSel_ == i);
-                    if (ImGui::Selectable((row + "##ins" + std::to_string(i)).c_str(), sel,
-                                          ImGuiSelectableFlags_AllowDoubleClick)) {
-                        insertSel_ = i;
-                        insertChosenPath_ = c.path;
-                        insertNote_.clear();
-                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !c.path.empty()) {
-                            std::string aicm;
-                            if (insertComponent(st, c.path, nullptr, aicm)) {
-                                insertNote_ = "Inserting " + pathBaseName(c.path) + "…";
-                                st.addLog("[asm] inserted: " + c.path);
-                            }
-                        }
-                    }
-                    if (!selectable) {
-                        ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                            ImGui::SetTooltip("Save this part first so it has a path to insert.");
-                    } else if (ImGui::IsItemHovered() && !c.path.empty()) {
-                        ImGui::SetTooltip("%s", c.path.c_str());
-                    }
-                }
-            }
-            ImGui::EndChild();
-
-            ImGui::Spacing();
-            // Chosen path summary + Browse fallback.
-            if (!insertChosenPath_.empty()) {
-                pushText(ui::palette.textDim);
-                ImGui::Text("Selected: %s", pathBaseName(insertChosenPath_).c_str());
-                ImGui::PopStyleColor();
-            } else {
-                pushText(ui::palette.textDim);
-                ImGui::TextUnformatted("Select a part above, or Browse…");
-                ImGui::PopStyleColor();
-            }
-
-            const bool hasComps =
-                st.docMirror.tree().is_object() &&
-                st.docMirror.tree().contains("components") &&
-                st.docMirror.tree()["components"].is_array() &&
-                !st.docMirror.tree()["components"].empty();
-            pushText(ui::palette.textDim);
-            ImGui::TextUnformatted(hasComps
-                ? "Inserted at the origin (drag/mate to position)."
-                : "First component is fixed automatically (SolidWorks behaviour).");
-            ImGui::PopStyleColor();
-
-            ImGui::Spacing();
-            const float btnW = ui::metrics::asmBtnW();
-            const bool canInsert = !insertChosenPath_.empty();
-            if (!canInsert) ImGui::BeginDisabled();
-            if (ImGui::Button("Insert", ImVec2(btnW, 0))) {
-                std::string aicm;
-                if (insertComponent(st, insertChosenPath_, nullptr, aicm)) {
-                    insertNote_ = "Inserting " + pathBaseName(insertChosenPath_) + "…";
-                    st.addLog("[asm] inserted: " + insertChosenPath_);
-                }
-            }
-            if (!canInsert) ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Browse…", ImVec2(btnW, 0))) {
-                if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
-                    st.toast(ui::ToastLevel::Info,
-                             "File dialogs disabled (AI_CAD_NO_FILE_DIALOGS).");
-                } else {
-                    std::string path = openFileDialog(kInsertFilter);
-                    if (!path.empty()) {
-                        insertChosenPath_ = path;
-                        insertSel_ = -1;  // browse is outside the list
-                        insertNote_.clear();
-                    }
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Close", ImVec2(btnW, 0))) insertOpen_ = false;
-
-            if (!insertNote_.empty()) {
-                ImGui::Spacing();
-                pushText(ui::palette.textDim);
-                ImGui::TextWrapped("%s", insertNote_.c_str());
-                ImGui::PopStyleColor();
+            std::string path = openFileDialog(kInsertFilter);
+            if (!path.empty()) {
+                insertChosenPath_ = path;
+                insertSel_ = -1;
+                insertNote_.clear();
             }
         }
-        endGlassWindow();
     }
-    ImGui::End();
-    if (!open) insertOpen_ = false;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Open a part file from disk (STEP+, STEP, mesh, \xe2\x80\xa6)");
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Open & recent parts");
+
+    const auto candidates = buildInsertCandidates(st);
+    const float listH = std::max(120.0f * S, ImGui::GetContentRegionAvail().y -
+                                (ImGui::GetFrameHeightWithSpacing() * 4.5f));
+    ImGui::BeginChild("##asm_insert_list", ImVec2(0, listH), true);
+    if (candidates.empty()) {
+        pushText(pal.textDim);
+        ImGui::TextWrapped("No open or recent parts. Use Browse from disk\xe2\x80\xa6 above.");
+        ImGui::PopStyleColor();
+    } else {
+        for (int i = 0; i < (int)candidates.size(); ++i) {
+            const auto& c = candidates[i];
+            const bool selectable = !c.path.empty();
+            if (!selectable) ImGui::BeginDisabled();
+            std::string row = c.label;
+            if (!c.detail.empty()) row += "  —  " + c.detail;
+            const bool sel = (insertSel_ == i);
+            if (ImGui::Selectable((row + "##ins" + std::to_string(i)).c_str(), sel,
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                insertSel_ = i;
+                insertChosenPath_ = c.path;
+                insertNote_.clear();
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !c.path.empty()) {
+                    std::string aicm;
+                    if (insertComponent(st, c.path, nullptr, aicm)) {
+                        insertNote_ = "Inserting " + pathBaseName(c.path) + "\xe2\x80\xa6";
+                        st.addLog("[asm] inserted: " + c.path);
+                    }
+                }
+            }
+            if (!selectable) {
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Save this part first so it has a path to insert.");
+            } else if (ImGui::IsItemHovered() && !c.path.empty()) {
+                ImGui::SetTooltip("%s", c.path.c_str());
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    if (!insertChosenPath_.empty()) {
+        pushText(pal.textDim);
+        ImGui::Text("Selected: %s", pathBaseName(insertChosenPath_).c_str());
+        ImGui::PopStyleColor();
+    } else {
+        pushText(pal.textDim);
+        ImGui::TextUnformatted("Select a part above, or Browse from disk\xe2\x80\xa6");
+        ImGui::PopStyleColor();
+    }
+
+    const bool hasComps =
+        st.docMirror.tree().is_object() &&
+        st.docMirror.tree().contains("components") &&
+        st.docMirror.tree()["components"].is_array() &&
+        !st.docMirror.tree()["components"].empty();
+    pushText(pal.textDim);
+    ImGui::TextUnformatted(hasComps
+        ? "Inserted at the origin (drag/mate to position)."
+        : "First component is fixed automatically (SolidWorks behaviour).");
+    ImGui::PopStyleColor();
+
+    if (!insertNote_.empty()) {
+        ImGui::Spacing();
+        pushText(pal.textDim);
+        ImGui::TextWrapped("%s", insertNote_.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    pushText(pal.textDim);
+    ImGui::TextUnformatted("OK inserts the selected part \xc2\xb7 Cancel closes.");
+    ImGui::PopStyleColor();
 }
 
 // ===========================================================================
@@ -676,227 +758,148 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
     return true;
 }
 
-void AsmPanels::drawMateForm(AppState& st) {
+void AsmPanels::drawMateFormBody(AppState& st) {
     if (!mateOpen_) return;
     const auto& pal = ui::palette;
-    bool open = true;
-    // Place near the top-left of the work area on first appearance so the now-taller form (Standard
-    // + Mechanical/Advanced + param block) is fully on-screen, and cap the height to the viewport so
-    // overflow scrolls inside the window instead of clipping off the bottom edge.
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 24 * ui::uiScale,
-                                   vp->WorkPos.y + 96 * ui::uiScale), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(320 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
-    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
-                                        ImVec2(FLT_MAX, vp->WorkSize.y - 120 * ui::uiScale));
-    if (mateFocus_) { ImGui::SetNextWindowFocus(); mateFocus_ = false; }
-    pushGlassWindow();
-    const bool mateWin = ImGui::Begin("Mate##asm", &open);
-    popGlassWindow();
-    if (mateWin) {
-        paintGlassWindow("asm_mate_glass");
-        // header: icon + title + Add / Cancel (PM style)
-        asmIcon("mate", "[M]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        pushText(pal.text);
-        ImGui::TextUnformatted("Mate");
-        ImGui::PopStyleColor();
-        // Opened from the tree "Edit" on a component: note which component this placement edit is for.
-        if (!editComponentTarget_.empty()) {
-            pushText(pal.textDim);
-            ImGui::TextWrapped("Editing placement of: %s",
-                               componentName(st, editComponentTarget_).c_str());
-            ImGui::PopStyleColor();
-        }
-        ImGui::Separator();
+    mateFocus_ = false;
 
-        // The effective type drives the well count + the parameter block + the Add gate.
-        std::string type = effectiveMateType();
-        const int wellCount = typeNeedsThirdRef(type) ? 3 : 2;
-        if (activeWell_ >= wellCount) activeWell_ = 0;
-
-        // ---- Mate Selections (two or three wells) ----
-        ImGui::SeparatorText("Mate Selections");
-        static const char* const kWellHint[3] = {
-            "(pick a face/edge)", "(pick a face/edge)", "(pick the jaw / symmetry plane)"};
-        for (int i = 0; i < wellCount; ++i) {
-            bool active = (activeWell_ == i);
-            pushText(active ? pal.accent : pal.textDim);
-            ImGui::Text("Reference %d", i + 1);
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            // The well: a selectable that, when clicked, becomes the active pick target.
-            std::string cell = picks_[i].has ? picks_[i].label : std::string(kWellHint[i]);
-            ImVec4 wellBg = active
-                ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], 0.6f)
-                : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Header, wellBg);
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, wellBg);
-            if (ImGui::Selectable(("##well" + std::to_string(i)).c_str(), active,
-                                  ImGuiSelectableFlags_None, ImVec2(-1, 0)))
-                activeWell_ = i;
-            ImGui::PopStyleColor(2);
-            ImGui::SameLine(0, 0);
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
-            pushText(picks_[i].has ? pal.text : pal.textDim);
-            ImGui::TextUnformatted(cell.c_str());
-            ImGui::PopStyleColor();
-            // right-click clears
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { picks_[i] = MatePick{}; activeWell_ = i; }
-        }
-
-        ImGui::Spacing();
-        // ---- Standard Mates (auto-suggested type buttons) ----
-        ImGui::SeparatorText("Standard Mates");
-        bool bothPlanes = picks_[0].surf == MateSurfKind::Plane && picks_[1].surf == MateSurfKind::Plane;
-        bool bothCyl    = picks_[0].surf == MateSurfKind::Cylinder && picks_[1].surf == MateSurfKind::Cylinder;
-        const char* const* opts; int nopts;
-        if (bothPlanes)   { opts = kPlanePlane; nopts = 3; }
-        else if (bothCyl) { opts = kCylCyl;     nopts = 1; }
-        else              { opts = kGeneric;    nopts = 4; }
-        if (mateType_ >= nopts) mateType_ = 0;
-        // A standard button is highlighted only when the explicit selection matches its label
-        // (selecting a Mechanical/Advanced type deselects the standard row).
-        for (int i = 0; i < nopts; ++i) {
-            if (i) ImGui::SameLine();
-            bool sel = selectedMateType_.empty()
-                ? (mateType_ == i)               // surface-suggest mode: highlight the cycled index
-                : (selectedMateType_ == opts[i]); // explicit mode: highlight the chosen standard type
-            if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
-            std::string label = opts[i];
-            if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
-            if (ImGui::Button((label + "##mt" + std::to_string(i)).c_str())) {
-                mateType_ = i;
-                selectedMateType_ = opts[i];   // standard buttons now also stamp the explicit type
-            }
-            if (sel) ImGui::PopStyleColor();
-        }
-
-        // ---- Mechanical & Advanced Mates ----
-        ImGui::Spacing();
-        ImGui::SeparatorText("Mechanical & Advanced Mates");
-        struct AdvOpt { const char* label; const char* type; };
-        // Order groups mechanical (coupling), then limit, then advanced (geometry / 3rd-ref).
-        static const AdvOpt kAdvOpts[] = {
-            {"Gear",           "gear"},
-            {"Screw",          "screw"},
-            {"Rack & Pinion",  "rack_pinion"},
-            {"Distance Limit", "distance_limit"},
-            {"Angle Limit",    "angle_limit"},
-            {"Hinge",          "hinge"},
-            {"Slot",           "slot"},
-            {"Cam Follower",   "cam_follower"},
-            {"Profile Center", "profile_center"},
-            {"Width",          "width"},
-            {"Symmetric",      "symmetric"},
-        };
-        const float availW = ImGui::GetContentRegionAvail().x;
-        for (int i = 0; i < (int)(sizeof(kAdvOpts) / sizeof(kAdvOpts[0])); ++i) {
-            bool sel = (selectedMateType_ == kAdvOpts[i].type);
-            // Wrap onto a new row when the next button would overflow the form width.
-            if (i) {
-                float next = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
-                             ImGui::GetStyle().ItemSpacing.x +
-                             ImGui::CalcTextSize(kAdvOpts[i].label).x +
-                             ImGui::GetStyle().FramePadding.x * 2.0f;
-                if (next <= availW) ImGui::SameLine();
-            }
-            if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
-            if (ImGui::Button((std::string(kAdvOpts[i].label) + "##adv" + std::to_string(i)).c_str())) {
-                selectedMateType_ = kAdvOpts[i].type;
-                mateError_.clear();
-                if (activeWell_ >= (typeNeedsThirdRef(selectedMateType_) ? 3 : 2)) activeWell_ = 0;
-            }
-            if (sel) ImGui::PopStyleColor();
-        }
-        // Re-read the effective type (a button click this frame may have changed it).
-        type = effectiveMateType();
-
-        // ---- Align flip (SolidWorks "Aligned" / "Anti-Aligned") ----
-        ImGui::Spacing();
-        ImGui::TextUnformatted("Mate alignment:");
-        if (ImGui::RadioButton("Aligned", aligned_)) aligned_ = true;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Anti-Aligned", !aligned_)) aligned_ = false;
+    if (!editComponentTarget_.empty()) {
         pushText(pal.textDim);
-        ImGui::TextWrapped("Seating one face flat onto another is Anti-Aligned (the normals oppose).");
+        ImGui::TextWrapped("Editing placement of: %s",
+                           componentName(st, editComponentTarget_).c_str());
         ImGui::PopStyleColor();
-
-        // ---- type-aware parameter block ----
-        // A labelled numeric field at the assembly input width. angle=true for degree-valued fields.
-        auto field = [](const char* label, std::vector<char>& buf, const char* id) {
-            ImGui::TextUnformatted(label);
-            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText(id, buf.data(), buf.size());
-        };
-        bool paramsOk = true;  // gates the Add button for types with REQUIRED params
         ImGui::Spacing();
-        if (type == "distance" || type == "angle") {
-            field(type == "distance" ? "Distance:" : "Angle (deg):", dimBuf_, "##asm_mate_dim");
-        } else if (type == "distance_limit" || type == "angle_limit") {
-            const bool angle = (type == "angle_limit");
-            field(angle ? "Min angle (deg):" : "Min distance (mm):", minBuf_, "##asm_mate_min");
-            field(angle ? "Max angle (deg):" : "Max distance (mm):", maxBuf_, "##asm_mate_max");
-            paramsOk = minBuf_[0] && maxBuf_[0];  // both required
-        } else if (type == "gear") {
-            field("Ratio:", ratioBuf_, "##asm_mate_ratio");
-            paramsOk = ratioBuf_[0];
-        } else if (type == "screw") {
-            field("Pitch (mm/rev):", pitchBuf_, "##asm_mate_pitch");
-            paramsOk = pitchBuf_[0];
-        } else if (type == "rack_pinion") {
-            field("Pitch radius (mm, optional):", pitchRadBuf_, "##asm_mate_pitchrad");
-            pushText(pal.textDim);
-            ImGui::TextWrapped("Leave blank to derive from the pinion's cylinder radius.");
-            ImGui::PopStyleColor();
-        } else if (type == "hinge") {
-            field("Min angle (deg, optional):", minBuf_, "##asm_mate_hmin");
-            field("Max angle (deg, optional):", maxBuf_, "##asm_mate_hmax");
-            pushText(pal.textDim);
-            ImGui::TextWrapped("Leave blank for the default 0..360 swing range.");
-            ImGui::PopStyleColor();
-        } else {
-            // width / symmetric / slot / cam_follower / profile_center carry no params.
-            pushText(pal.textDim);
-            ImGui::TextWrapped(typeNeedsThirdRef(type)
-                ? "Pick two faces/edges plus the jaw or symmetry plane (Reference 3)."
-                : "No parameters — this mate is geometry-driven.");
-            ImGui::PopStyleColor();
-        }
-
-        if (!mateError_.empty()) {
-            ImGui::Spacing();
-            pushText(pal.statusErr);
-            ImGui::TextWrapped("%s", mateError_.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::Separator();
-        // Gate on the required reference count (3 for width/symmetric, else 2) AND required params.
-        bool refsReady = true;
-        for (int i = 0; i < wellCount; ++i) if (!picks_[i].has) refsReady = false;
-        bool ready = refsReady && paramsOk;
-        if (!ready) ImGui::BeginDisabled();
-        if (ImGui::Button("Add##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) {
-            nlohmann::json refs = nlohmann::json::array();
-            for (int i = 0; i < wellCount; ++i)
-                refs.push_back({{"component", picks_[i].component}, {"selector", picks_[i].selector}});
-            std::string aicm;
-            if (addMate(st, type, aligned_ ? "aligned" : "anti", refs, aicm)) {
-                st.addLog("[asm] mate added: " + type + " (" + (aligned_ ? "aligned" : "anti") + ")");
-                // keep the form open for chaining more mates, reset selections
-                picks_[0] = MatePick{}; picks_[1] = MatePick{}; picks_[2] = MatePick{};
-                activeWell_ = 0; mateError_.clear();
-            }
-        }
-        if (!ready) ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Close##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) closeMateForm();
-        endGlassWindow();
     }
-    ImGui::End();
-    if (!open) closeMateForm();
+
+    std::string type = effectiveMateType();
+    const int wellCount = typeNeedsThirdRef(type) ? 3 : 2;
+    if (activeWell_ >= wellCount) activeWell_ = 0;
+
+    // ---- Mate Selections — standard PM selection wells ----
+    ImGui::SeparatorText("Mate Selections");
+    static const char* const kWellLabels[3] = {
+        "Reference 1", "Reference 2", "Reference 3 (jaw / plane)"};
+    static const char* const kWellIds[3] = {
+        "##asm_mate_well0", "##asm_mate_well1", "##asm_mate_well2"};
+    for (int i = 0; i < wellCount; ++i) {
+        const char* chip = picks_[i].has ? picks_[i].label.c_str() : "(pick in viewport)";
+        auto wr = pmDrawSelectionWell(kWellIds[i], kWellLabels[i], chip,
+                                      /*active=*/activeWell_ == i);
+        if (wr.clicked) activeWell_ = i;
+        if (wr.rightClicked) { picks_[i] = MatePick{}; activeWell_ = i; }
+        ImGui::Spacing();
+    }
+
+    // ---- Standard Mates ----
+    ImGui::SeparatorText("Standard Mates");
+    bool bothPlanes = picks_[0].surf == MateSurfKind::Plane && picks_[1].surf == MateSurfKind::Plane;
+    bool bothCyl    = picks_[0].surf == MateSurfKind::Cylinder && picks_[1].surf == MateSurfKind::Cylinder;
+    const char* const* opts; int nopts;
+    if (bothPlanes)   { opts = kPlanePlane; nopts = 3; }
+    else if (bothCyl) { opts = kCylCyl;     nopts = 1; }
+    else              { opts = kGeneric;    nopts = 4; }
+    if (mateType_ >= nopts) mateType_ = 0;
+    for (int i = 0; i < nopts; ++i) {
+        if (i) ImGui::SameLine();
+        bool sel = selectedMateType_.empty()
+            ? (mateType_ == i)
+            : (selectedMateType_ == opts[i]);
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
+        std::string label = opts[i];
+        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+        if (ImGui::Button((label + "##mt" + std::to_string(i)).c_str())) {
+            mateType_ = i;
+            selectedMateType_ = opts[i];
+        }
+        if (sel) ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Mechanical & Advanced Mates");
+    struct AdvOpt { const char* label; const char* type; };
+    static const AdvOpt kAdvOpts[] = {
+        {"Gear", "gear"}, {"Screw", "screw"}, {"Rack & Pinion", "rack_pinion"},
+        {"Distance Limit", "distance_limit"}, {"Angle Limit", "angle_limit"},
+        {"Hinge", "hinge"}, {"Slot", "slot"}, {"Cam Follower", "cam_follower"},
+        {"Profile Center", "profile_center"}, {"Width", "width"}, {"Symmetric", "symmetric"},
+    };
+    const float availW = ImGui::GetContentRegionAvail().x;
+    for (int i = 0; i < (int)(sizeof(kAdvOpts) / sizeof(kAdvOpts[0])); ++i) {
+        bool sel = (selectedMateType_ == kAdvOpts[i].type);
+        if (i) {
+            float next = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
+                         ImGui::GetStyle().ItemSpacing.x +
+                         ImGui::CalcTextSize(kAdvOpts[i].label).x +
+                         ImGui::GetStyle().FramePadding.x * 2.0f;
+            if (next <= availW) ImGui::SameLine();
+        }
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
+        if (ImGui::Button((std::string(kAdvOpts[i].label) + "##adv" + std::to_string(i)).c_str())) {
+            selectedMateType_ = kAdvOpts[i].type;
+            mateError_.clear();
+            if (activeWell_ >= (typeNeedsThirdRef(selectedMateType_) ? 3 : 2)) activeWell_ = 0;
+        }
+        if (sel) ImGui::PopStyleColor();
+    }
+    type = effectiveMateType();
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Mate alignment:");
+    if (ImGui::RadioButton("Aligned", aligned_)) aligned_ = true;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Anti-Aligned", !aligned_)) aligned_ = false;
+    pushText(pal.textDim);
+    ImGui::TextWrapped("Seating one face flat onto another is Anti-Aligned (the normals oppose).");
+    ImGui::PopStyleColor();
+
+    auto field = [](const char* label, std::vector<char>& buf, const char* id) {
+        ImGui::TextUnformatted(label);
+        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::InputText(id, buf.data(), buf.size());
+    };
+    ImGui::Spacing();
+    if (type == "distance" || type == "angle") {
+        field(type == "distance" ? "Distance:" : "Angle (deg):", dimBuf_, "##asm_mate_dim");
+    } else if (type == "distance_limit" || type == "angle_limit") {
+        const bool angle = (type == "angle_limit");
+        field(angle ? "Min angle (deg):" : "Min distance (mm):", minBuf_, "##asm_mate_min");
+        field(angle ? "Max angle (deg):" : "Max distance (mm):", maxBuf_, "##asm_mate_max");
+    } else if (type == "gear") {
+        field("Ratio:", ratioBuf_, "##asm_mate_ratio");
+    } else if (type == "screw") {
+        field("Pitch (mm/rev):", pitchBuf_, "##asm_mate_pitch");
+    } else if (type == "rack_pinion") {
+        field("Pitch radius (mm, optional):", pitchRadBuf_, "##asm_mate_pitchrad");
+        pushText(pal.textDim);
+        ImGui::TextWrapped("Leave blank to derive from the pinion's cylinder radius.");
+        ImGui::PopStyleColor();
+    } else if (type == "hinge") {
+        field("Min angle (deg, optional):", minBuf_, "##asm_mate_hmin");
+        field("Max angle (deg, optional):", maxBuf_, "##asm_mate_hmax");
+        pushText(pal.textDim);
+        ImGui::TextWrapped("Leave blank for the default 0..360 swing range.");
+        ImGui::PopStyleColor();
+    } else {
+        pushText(pal.textDim);
+        ImGui::TextWrapped(typeNeedsThirdRef(type)
+            ? "Pick two faces/edges plus the jaw or symmetry plane (Reference 3)."
+            : "No parameters — this mate is geometry-driven.");
+        ImGui::PopStyleColor();
+    }
+
+    if (!mateError_.empty()) {
+        ImGui::Spacing();
+        pushText(pal.statusErr);
+        ImGui::TextWrapped("%s", mateError_.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    pushText(pal.textDim);
+    ImGui::TextUnformatted("OK adds the mate (form stays open) \xc2\xb7 Cancel closes.");
+    ImGui::PopStyleColor();
 }
 
 // ===========================================================================
@@ -989,123 +992,95 @@ bool AsmPanels::addPattern(AppState& st, std::string& aicmOut, std::string& erro
     return true;
 }
 
-void AsmPanels::drawPatternForm(AppState& st) {
+void AsmPanels::drawPatternFormBody(AppState& st) {
     if (!patternOpen_) return;
     const auto& pal = ui::palette;
-    bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
-    if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
-    pushGlassWindow();
-    const bool patternWin = ImGui::Begin("Component Pattern##asm", &open);
-    popGlassWindow();
-    if (patternWin) {
-        paintGlassWindow("asm_pattern_glass");
-        asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        pushText(pal.text);
-        ImGui::TextUnformatted("Component Pattern");
+    patternFocus_ = false;
+
+    if (!st.docMirror.hasDoc()) {
+        pushText(pal.statusWarn);
+        ImGui::TextWrapped("No assembly open.");
         ImGui::PopStyleColor();
-        ImGui::Separator();
-
-        if (!st.docMirror.hasDoc()) {
-            pushText(pal.statusWarn);
-            ImGui::TextWrapped("No assembly open.");
-            ImGui::PopStyleColor();
-            endGlassWindow();
-            ImGui::End();
-            if (!open) patternOpen_ = false;
-            return;
-        }
-
-        // ---- Pattern type ----
-        ImGui::TextUnformatted("Type:");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Linear", patternKind_ == 0)) patternKind_ = 0;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Circular", patternKind_ == 1)) patternKind_ = 1;
-
-        // ---- Direction / Axis (world/datum) ----
-        ImGui::Spacing();
-        ImGui::TextUnformatted(patternKind_ == 0 ? "Direction:" : "Axis:");
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##asm_pat_dir", kAsmDirOpts[patternDir_].label)) {
-            for (int i = 0; i < (int)(sizeof(kAsmDirOpts) / sizeof(kAsmDirOpts[0])); ++i) {
-                bool sel = (patternDir_ == i);
-                if (ImGui::Selectable(kAsmDirOpts[i].label, sel)) patternDir_ = i;
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-
-        // ---- Count + spacing/angle ----
-        ImGui::Spacing();
-        if (patternKind_ == 0) {
-            ImGui::TextUnformatted("Instances (count):");
-            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
-            ImGui::TextUnformatted("Spacing (mm):");
-            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText("##asm_pat_spacing", patternSpacingBuf_.data(), patternSpacingBuf_.size());
-        } else {
-            ImGui::TextUnformatted("Instances (count):");
-            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
-            ImGui::TextUnformatted("Angle (deg):");
-            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText("##asm_pat_angle", patternAngleBuf_.data(), patternAngleBuf_.size());
-            ImGui::Checkbox("Equal spacing (fill angle)", &patternEqual_);
-        }
-
-        // ---- Seed components (filled by viewport / tree picks while this form is open) ----
-        ImGui::Spacing();
-        ImGui::SeparatorText("Components to Pattern");
-        if (patternComps_.empty()) {
-            pushText(pal.textDim);
-            ImGui::TextWrapped("Click components in the graphics area or the tree to add them.");
-            ImGui::PopStyleColor();
-        } else {
-            for (size_t i = 0; i < patternComps_.size(); ++i) {
-                ImGui::Bullet();
-                ImGui::TextUnformatted(componentName(st, patternComps_[i]).c_str());
-                ImGui::SameLine(ImGui::GetWindowWidth() - 40);
-                if (ImGui::SmallButton(("x##pc" + std::to_string(i)).c_str())) {
-                    patternComps_.erase(patternComps_.begin() + i);
-                    break;
-                }
-            }
-        }
-
-        if (!patternError_.empty()) {
-            ImGui::Spacing();
-            pushText(pal.statusErr);
-            ImGui::TextWrapped("%s", patternError_.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::Separator();
-        bool ready = !patternComps_.empty();
-        if (!ready) ImGui::BeginDisabled();
-        if (ImGui::Button("Add##asm_pat", ImVec2(ui::metrics::asmBtnW(), 0))) {
-            std::string aicm, err;
-            if (addPattern(st, aicm, err)) {
-                st.addLog("[asm] component pattern added (" +
-                          std::string(patternKind_ == 0 ? "linear" : "circular") + ", " +
-                          std::to_string(patternComps_.size()) + " seed(s))");
-                patternError_.clear();
-                // keep the form open for chaining; clear the seed picks
-                patternComps_.clear();
-            } else {
-                patternError_ = err;
-                st.addLog("[err] asm_pattern: " + err);
-            }
-        }
-        if (!ready) ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Close##asm_pat", ImVec2(ui::metrics::asmBtnW(), 0))) patternOpen_ = false;
-        endGlassWindow();
+        return;
     }
-    ImGui::End();
-    if (!open) patternOpen_ = false;
+
+    ImGui::TextUnformatted("Type:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Linear", patternKind_ == 0)) patternKind_ = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Circular", patternKind_ == 1)) patternKind_ = 1;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted(patternKind_ == 0 ? "Direction:" : "Axis:");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##asm_pat_dir", kAsmDirOpts[patternDir_].label)) {
+        for (int i = 0; i < (int)(sizeof(kAsmDirOpts) / sizeof(kAsmDirOpts[0])); ++i) {
+            bool sel = (patternDir_ == i);
+            if (ImGui::Selectable(kAsmDirOpts[i].label, sel)) patternDir_ = i;
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::Spacing();
+    if (patternKind_ == 0) {
+        ImGui::TextUnformatted("Instances (count):");
+        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
+        ImGui::TextUnformatted("Spacing (mm):");
+        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::InputText("##asm_pat_spacing", patternSpacingBuf_.data(), patternSpacingBuf_.size());
+    } else {
+        ImGui::TextUnformatted("Instances (count):");
+        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
+        ImGui::TextUnformatted("Angle (deg):");
+        ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+        ImGui::InputText("##asm_pat_angle", patternAngleBuf_.data(), patternAngleBuf_.size());
+        ImGui::Checkbox("Equal spacing (fill angle)", &patternEqual_);
+    }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Components to Pattern");
+    // Multi-select well visual for seed components (picks toggle via routeAsmPatternPick).
+    {
+        std::string chip;
+        if (patternComps_.empty()) {
+            chip = "(pick components in viewport)";
+        } else if (patternComps_.size() == 1) {
+            chip = componentName(st, patternComps_[0]);
+        } else {
+            chip = componentName(st, patternComps_[0]) + " x" +
+                   std::to_string(patternComps_.size());
+        }
+        auto wr = pmDrawSelectionWell("##asm_pat_comps", "Seed components",
+                                      chip.c_str(), /*active=*/true);
+        if (wr.rightClicked) patternComps_.clear();
+        (void)wr.clicked;  // always active while form is open
+    }
+    if (!patternComps_.empty()) {
+        for (size_t i = 0; i < patternComps_.size(); ++i) {
+            ImGui::Bullet();
+            ImGui::TextUnformatted(componentName(st, patternComps_[i]).c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton(("x##pc" + std::to_string(i)).c_str())) {
+                patternComps_.erase(patternComps_.begin() + i);
+                break;
+            }
+        }
+    }
+
+    if (!patternError_.empty()) {
+        ImGui::Spacing();
+        pushText(pal.statusErr);
+        ImGui::TextWrapped("%s", patternError_.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    pushText(pal.textDim);
+    ImGui::TextUnformatted("OK adds the pattern (form stays open) \xc2\xb7 Cancel closes.");
+    ImGui::PopStyleColor();
 }
 
 // ===========================================================================
@@ -1161,35 +1136,26 @@ bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
     return true;
 }
 
-void AsmPanels::drawExplode(AppState& st) {
+void AsmPanels::drawExplodeBody(AppState& st) {
     if (!explodeOpen_) return;
-    bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(300 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
-    if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
-    pushGlassWindow();
-    const bool explodeWin = ImGui::Begin("Exploded View", &open);
-    popGlassWindow();
-    if (explodeWin) {
-        paintGlassWindow("asm_explode_glass");
-        asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        ImGui::TextUnformatted("Explode factor");
-        ImGui::Spacing();
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##explode_factor", &explodeFactor_, 0.0f, 1.0f, "%.2f")) {
-            setExplode(st, explodeFactor_ > 0.001f, explodeFactor_);
-        }
-        pushText(ui::palette.textDim);
-        ImGui::TextWrapped("View-only — drag to slide components apart along their explode vectors.");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 0.0f; setExplode(st, false, 0.0f); }
-        ImGui::SameLine();
-        if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 1.0f; setExplode(st, true, 1.0f); }
-        endGlassWindow();
+    explodeFocus_ = false;
+    ImGui::TextUnformatted("Explode factor");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderFloat("##explode_factor", &explodeFactor_, 0.0f, 1.0f, "%.2f")) {
+        setExplode(st, explodeFactor_ > 0.001f, explodeFactor_);
     }
-    ImGui::End();
-    if (!open) explodeOpen_ = false;
+    pushText(ui::palette.textDim);
+    ImGui::TextWrapped("View-only — drag to slide components apart along their explode vectors.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) {
+        explodeFactor_ = 0.0f; setExplode(st, false, 0.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) {
+        explodeFactor_ = 1.0f; setExplode(st, true, 1.0f);
+    }
 }
 
 // ===========================================================================
@@ -1232,77 +1198,64 @@ void AsmPanels::refreshInterference(AppState& st) {
         }, 60000);
 }
 
-void AsmPanels::drawInterference(AppState& st) {
+void AsmPanels::drawInterferenceBody(AppState& st) {
     if (!interferenceOpen_) return;
     const auto& pal = ui::palette;
-    bool open = true;
-    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
-    ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
-    if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
-    pushGlassWindow();
-    const bool interfWin = ImGui::Begin("Interference Detection", &open);
-    popGlassWindow();
-    if (interfWin) {
-        paintGlassWindow("asm_interference_glass");
-        asmIcon("interference", "[!]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        ImGui::TextUnformatted("Component interference + clearance");
-        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-        if (ImGui::Button("Refresh")) refreshInterference(st);
-        ImGui::Separator();
+    interferenceFocus_ = false;
 
-        if (interferencePending_) {
-            pushText(pal.textDim);
-            ImGui::TextUnformatted("Computing interference...");
-            ImGui::PopStyleColor();
-        } else if (!interferenceError_.empty()) {
-            pushText(pal.statusErr);
-            ImGui::TextWrapped("%s", interferenceError_.c_str());
-            ImGui::PopStyleColor();
-        } else {
-            const auto& r = interferenceResult_;
-            auto inter = r.contains("interferences") && r["interferences"].is_array()
-                ? r["interferences"] : nlohmann::json::array();
-            auto clear = r.contains("clearances") && r["clearances"].is_array()
-                ? r["clearances"] : nlohmann::json::array();
-            bool clash = !inter.empty();
-            pushText(clash ? pal.statusErr : pal.statusOk);
-            ImGui::TextUnformatted(clash ? "Interference detected" : "No interference");
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-            if (ImGui::BeginTable("##inter_tbl", 3,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("Component A");
-                ImGui::TableSetupColumn("Component B");
-                ImGui::TableSetupColumn("Overlap / Gap");
-                ImGui::TableHeadersRow();
-                for (const auto& it : inter) {
-                    ImGui::TableNextRow();
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f));
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("a", std::string()).c_str());
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("b", std::string()).c_str());
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%.3f mm3 overlap", it.value("volume", 0.0));
-                    ImGui::PopStyleColor();
-                }
-                for (const auto& it : clear) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("a", std::string()).c_str());
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("b", std::string()).c_str());
-                    ImGui::TableNextColumn(); ImGui::Text("%.3f mm gap", it.value("distance", 0.0));
-                }
-                ImGui::EndTable();
-            }
-            if (inter.empty() && clear.empty()) {
-                pushText(pal.textDim);
-                ImGui::TextWrapped("Fewer than two components, or nothing to compare.");
+    if (ImGui::Button("Refresh", ImVec2(ui::metrics::asmBtnW(), 0)))
+        refreshInterference(st);
+    ImGui::Spacing();
+
+    if (interferencePending_) {
+        pushText(pal.textDim);
+        ImGui::TextUnformatted("Computing interference...");
+        ImGui::PopStyleColor();
+    } else if (!interferenceError_.empty()) {
+        pushText(pal.statusErr);
+        ImGui::TextWrapped("%s", interferenceError_.c_str());
+        ImGui::PopStyleColor();
+    } else {
+        const auto& r = interferenceResult_;
+        auto inter = r.contains("interferences") && r["interferences"].is_array()
+            ? r["interferences"] : nlohmann::json::array();
+        auto clear = r.contains("clearances") && r["clearances"].is_array()
+            ? r["clearances"] : nlohmann::json::array();
+        bool clash = !inter.empty();
+        pushText(clash ? pal.statusErr : pal.statusOk);
+        ImGui::TextUnformatted(clash ? "Interference detected" : "No interference");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##inter_tbl", 3,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Component A");
+            ImGui::TableSetupColumn("Component B");
+            ImGui::TableSetupColumn("Overlap / Gap");
+            ImGui::TableHeadersRow();
+            for (const auto& it : inter) {
+                ImGui::TableNextRow();
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f));
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("a", std::string()).c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("b", std::string()).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%.3f mm3 overlap", it.value("volume", 0.0));
                 ImGui::PopStyleColor();
             }
+            for (const auto& it : clear) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("a", std::string()).c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(it.value("b", std::string()).c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%.3f mm gap", it.value("distance", 0.0));
+            }
+            ImGui::EndTable();
         }
-        endGlassWindow();
+        if (inter.empty() && clear.empty()) {
+            pushText(pal.textDim);
+            ImGui::TextWrapped("Fewer than two components, or nothing to compare.");
+            ImGui::PopStyleColor();
+        }
     }
-    ImGui::End();
-    if (!open) interferenceOpen_ = false;
 }
 
 // ===========================================================================

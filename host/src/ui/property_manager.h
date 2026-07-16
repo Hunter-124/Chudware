@@ -191,11 +191,43 @@ struct PMCalloutItem {
     float anchor[3] = {0, 0, 0};  // world-space anchor point (valid when hasAnchor)
 };
 
+// ---- shared selection-well widget (used by feature forms AND assembly tools) ----
+// Draws the same glass selection well as Extrude/Revolve reference wells: label row with
+// optional "Pick in viewport" hint when active, frosted pill chip, accent border when armed,
+// right-click clear. Returns click/right-click so the caller owns pick storage.
+struct PMSelectionWellResult {
+    bool clicked = false;       // left-click: activate this well
+    bool rightClicked = false;  // right-click: clear
+    bool hovered = false;
+};
+PMSelectionWellResult pmDrawSelectionWell(const char* id, const char* label,
+                                          const char* chipText, bool active,
+                                          bool dangling = false);
+
+// Shared PM form header strip (icon + accent title) used by modeling forms and assembly guest forms.
+void pmDrawFormHeader(const char* icon, const char* title, const char* description = nullptr);
+
+
 // ---- the PropertyManager --------------------------------------------------
 
 class PropertyManager {
 public:
-    bool active() const { return active_; }
+    bool active() const { return active_ || guestActive_; }
+
+
+    // ---- guest form (assembly tools hosted in the left PM column) -----------------------------
+    // Assembly Mate/Insert/Pattern/Explode/Interference are NOT data-driven feature forms; they
+    // still need to occupy the FeatureManager/PM column like Extrude. openGuest() makes active()
+    // true so layout.cpp auto-fronts the left pane and calls drawBody(); the body is a free-form
+    // callback (AsmPanels draws its own fields + standard selection wells). OK/Cancel chrome
+    // buttons call onOk/onCancel. Mutual exclusion: openGuest closes a live feature form (cancel),
+    // and openForCommand/openForEdit close any guest.
+    using GuestFn = std::function<void(AppState&)>;
+    void openGuest(const char* title, const char* icon,
+                   GuestFn body, GuestFn onOk, GuestFn onCancel);
+    void closeGuest();
+    bool guestActive() const { return guestActive_; }
+
 
     // C27-A: build the list of viewport callout items for the active form (empty if not active).
     // For each visible+enabled Dim field: {label, formatted value, anchor}. The anchor is derived
@@ -474,6 +506,16 @@ private:
     int aiRequestSeq_ = 0;
     std::string aiMessage_;
     std::vector<std::string> aiHighlights_;
+
+    // Guest form (assembly tools in the left PM column). When guestActive_, drawBody renders the
+    // guest header + body callback instead of a feature form; drawChromeButtons routes OK/Cancel
+    // to guestOnOk_/guestOnCancel_.
+    bool guestActive_ = false;
+    std::string guestTitle_;
+    std::string guestIcon_;
+    GuestFn guestBody_;
+    GuestFn guestOnOk_;
+    GuestFn guestOnCancel_;
 };
 
 }  // namespace ui

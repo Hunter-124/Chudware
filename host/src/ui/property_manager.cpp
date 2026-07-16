@@ -567,6 +567,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     std::string mode;
     const PMFormDef* form = pmFormForCommand(cmdId, mode);
     if (!form) return false;
+    if (guestActive_) closeGuest();
     if (active_ && !cancelEdits(st)) return false;   // replacing a PM must roll back previews first
 
     // C40: SolidWorks mode exclusion. Invoking a feature command while a sketch is being
@@ -808,6 +809,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     std::string type = target->value("type", std::string());
     const PMFormDef* form = pmFindForm(type);
     if (!form) { st.addLog("[pm] no form for feature type '" + type + "'"); return false; }
+    if (guestActive_) closeGuest();
     if (active_ && !cancelEdits(st)) return false;
 
     active_ = true;
@@ -2432,6 +2434,168 @@ static const ui::AdaptiveSurface& pmSurf() {
     // for a given id) so the FeatureManager per-group glass knobs ride through unchanged.
     return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
 }
+
+// Forward decls — used by the exported selection-well / form header below.
+static void pushTextColorV(const ImVec4& c);
+static void pushTextColor(const float c[4]);
+static void pmTooltip(const char* fmt, ...);
+
+// ---- exported selection-well + form header (asm tools + feature forms share these) ------------
+
+PMSelectionWellResult pmDrawSelectionWell(const char* id, const char* label,
+                                          const char* chipText, bool active,
+                                          bool dangling) {
+    PMSelectionWellResult r;
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& wsurf = pmSurf();
+    const float S = ui::uiScale;
+
+    if (active) pushTextColor(pal.accent);
+    else        pushTextColorV(wsurf.textSecondary);
+    ImGui::TextUnformatted(label ? label : "");
+    ImGui::PopStyleColor();
+    if (active) {
+        const char* pickHint = "Pick in viewport";
+        const float hintW = ImGui::CalcTextSize(pickHint).x;
+        ImGui::SameLine(0, 0.0f);
+        const float remain = ImGui::GetContentRegionAvail().x;
+        if (remain > hintW)
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remain - hintW);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
+        ImGui::TextUnformatted(pickHint);
+        ImGui::PopStyleColor();
+    }
+
+    const char* chip = (chipText && chipText[0]) ? chipText : "(pick in viewport)";
+    ImVec4 border = dangling
+        ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
+        : (active
+            ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+            : ImVec4(pal.border[0], pal.border[1], pal.border[2], pal.border[3]));
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float textPadX = 10.0f * S;
+    const float textPadY = 7.0f * S;
+    const float wrapW = std::max(40.0f * S, availW - textPadX * 2.0f);
+    ImVec2 chipSz = ImGui::CalcTextSize(chip, nullptr, false, wrapW);
+    float wellH = std::max(ImGui::GetFrameHeight(), chipSz.y + textPadY * 2.0f);
+
+    ImGui::PushID(id ? id : "##well");
+    ImVec2 wp0 = ImGui::GetCursorScreenPos();
+    ImVec2 wp1(wp0.x + availW, wp0.y + wellH);
+    if (ImGui::InvisibleButton("##well", ImVec2(availW, wellH)))
+        r.clicked = true;
+    r.hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
+        r.rightClicked = true;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (active) {
+        ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
+                               /*selected=*/true, 0.42f);
+    } else {
+        ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
+                               /*selected=*/false, r.hovered ? 0.42f : 0.28f);
+    }
+    dl->AddRect(wp0, wp1, ImGui::ColorConvertFloat4ToU32(border), 6.0f * S, 0,
+                active ? std::max(1.0f, 2.0f * S) : std::max(1.0f, 1.0f * S));
+    ImU32 chipCol = (!chipText || !chipText[0] || std::strcmp(chip, "(pick in viewport)") == 0)
+        ? ImGui::ColorConvertFloat4ToU32(wsurf.textSecondary)
+        : ImGui::ColorConvertFloat4ToU32(wsurf.textPrimary);
+    // Treat empty-looking chips (placeholder) as secondary; callers pass a filled label otherwise.
+    if (chipText && chipText[0] && std::strcmp(chipText, "(pick in viewport)") != 0)
+        chipCol = ImGui::ColorConvertFloat4ToU32(wsurf.textPrimary);
+    else
+        chipCol = ImGui::ColorConvertFloat4ToU32(wsurf.textSecondary);
+    dl->AddText(nullptr, 0.0f, ImVec2(wp0.x + textPadX, wp0.y + textPadY),
+                chipCol, chip, nullptr, wrapW);
+    if (r.hovered) {
+        if (active) pmTooltip("Active — pick faces/edges in the viewport");
+        else if (chipText && chipText[0] && std::strcmp(chipText, "(pick in viewport)") != 0)
+            pmTooltip("Click to re-activate; right-click to clear");
+        else
+            pmTooltip("Click to activate pick target");
+    }
+    if (dangling) {
+        pushTextColor(pal.statusErr);
+        ImGui::TextUnformatted("! dangling reference");
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
+    return r;
+}
+
+void pmDrawFormHeader(const char* icon, const char* title, const char* description) {
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = pmSurf();
+    const float S = ui::uiScale;
+    const float glyphSz = 26.0f * S;
+    const float hdrPadV = 7.0f * S;
+    const float hdrPadH = 10.0f * S;
+    const float accentBarW = 4.0f * S;
+    const float rowAvail = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const float hdrH = glyphSz + hdrPadV * 2.0f;
+
+    ImVec2 hdrMin = ImGui::GetCursorScreenPos();
+    ImVec2 hdrMax(hdrMin.x + rowAvail, hdrMin.y + hdrH);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ui::glassBackground(dl, hdrMin, hdrMax, 6.0f);
+    {
+        const float bi = 4.0f * S;
+        dl->AddRectFilled(ImVec2(hdrMin.x,             hdrMin.y + bi),
+                          ImVec2(hdrMin.x + accentBarW, hdrMax.y - bi),
+                          Palette::toU32(pal.accent), 2.0f * S);
+    }
+    ImGui::SetCursorScreenPos(ImVec2(hdrMin.x + accentBarW + hdrPadH, hdrMin.y + hdrPadV));
+    float afterGlyphX = hdrMin.x + accentBarW + hdrPadH;
+    if (icon && icon[0]) {
+        IconUV ic = getIcon(icon, 32);
+        if (ic.valid) {
+            ImGui::Image(ic.texId, ImVec2(glyphSz, glyphSz), ic.uv0, ic.uv1);
+            afterGlyphX += glyphSz + 8.0f * S;
+        }
+    }
+    float titleY = hdrMin.y + (hdrH - ImGui::GetTextLineHeight()) * 0.5f;
+    ImGui::SetCursorScreenPos(ImVec2(afterGlyphX, titleY));
+    pushTextColor(pal.accent);
+    ImGui::TextUnformatted(title ? title : "");
+    ImGui::PopStyleColor();
+    ImGui::SetCursorScreenPos(ImVec2(hdrMin.x, hdrMax.y + 4.0f * S));
+    if (description && description[0]) {
+        pushTextColorV(surf.textSecondary);
+        float wrapW = ImGui::GetContentRegionAvail().x;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextUnformatted(description);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2.0f * S));
+    }
+}
+
+void PropertyManager::openGuest(const char* title, const char* icon,
+                                GuestFn body, GuestFn onOk, GuestFn onCancel) {
+    // Close a live feature form without rolling back if somehow both want the slot; prefer cancel
+    // so previews don't stick. Guest forms are mutually exclusive with feature forms.
+    if (active_ && !guestActive_) {
+        // Soft close: drop feature form state (no AppState available here for cancelEdits).
+        close();
+    }
+    guestActive_ = true;
+    guestTitle_ = title ? title : "";
+    guestIcon_ = icon ? icon : "";
+    guestBody_ = std::move(body);
+    guestOnOk_ = std::move(onOk);
+    guestOnCancel_ = std::move(onCancel);
+}
+
+void PropertyManager::closeGuest() {
+    guestActive_ = false;
+    guestTitle_.clear();
+    guestIcon_.clear();
+    guestBody_ = nullptr;
+    guestOnOk_ = nullptr;
+    guestOnCancel_ = nullptr;
+}
+
 // Push a text color from an adaptive ImVec4 (surf.textPrimary/textSecondary).
 static void pushTextColorV(const ImVec4& c) { ImGui::PushStyleColor(ImGuiCol_Text, c); }
 
@@ -2584,7 +2748,8 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {
 // OK commits (commit() still guards form readiness + toasts on failure); Cancel reverts every preview
 // batch. Returns the cluster's pixel width (0 when inactive) so the caller can reserve space.
 float PropertyManager::drawChromeButtons(AppState& st, float rightX, float centerY) {
-    if (!active_ || !form_) return 0.0f;
+    if (!active()) return 0.0f;
+    if (active_ && !guestActive_ && !form_) return 0.0f;
     const float S   = ui::uiScale;
     const auto& pal = ui::palette;
     // TASK C: larger, SQUARE, easy-to-hit targets. The old cluster was a 40x26 non-square pair using
@@ -2705,8 +2870,14 @@ float PropertyManager::drawChromeButtons(AppState& st, float rightX, float cente
     ImGui::PopID();
     ImGui::SetCursorScreenPos(savedCur);   // restore the caller's layout flow
 
-    if (ok)     commit(st);
-    else if (cancel) cancelEdits(st);
+    if (guestActive_) {
+        if (ok && guestOnOk_)          guestOnOk_(st);
+        else if (cancel && guestOnCancel_) guestOnCancel_(st);
+        else if (cancel)              closeGuest();
+    } else {
+        if (ok)     commit(st);
+        else if (cancel) cancelEdits(st);
+    }
     return clusterW;
 }
 
@@ -2753,6 +2924,35 @@ void PropertyManager::draw(AppState& st) {
 
 // Wave 1D: the form's inner content (no Begin/End). Caller owns the surrounding window/child.
 void PropertyManager::drawBody(AppState& st) {
+    // Guest assembly forms (Mate/Insert/…) occupy the same left-pane slot as feature forms.
+    if (guestActive_) {
+        const ui::AdaptiveSurface& surf = pmSurf();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.16f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.26f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.30f));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+        // Esc cancels the guest form (same policy as feature forms, sketch owns Esc when active).
+        const bool sketchActive = st.sketchMode && st.sketchMode->active();
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
+            !st.sketchPlanePickActive && !sketchActive && !ImGui::GetIO().WantTextInput) {
+            if (guestOnCancel_) guestOnCancel_(st);
+            else closeGuest();
+            ImGui::PopStyleColor(4);
+            return;
+        }
+
+        pmDrawFormHeader(guestIcon_.c_str(), guestTitle_.c_str(), nullptr);
+        ImGui::Separator();
+        if (guestBody_) guestBody_(st);
+
+        ImGui::PopStyleColor(4);
+        return;
+    }
+
     if (!active_ || !form_) return;
 
     // Keep a VISIBLE selector well active at all times. A method combo can HIDE the currently-
@@ -3205,28 +3405,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::SelectorWell: {
-                const ui::AdaptiveSurface& wsurf = pmSurf();
-                const float S = ui::uiScale;
-                // Label row: left = field label; when active, right-align "Pick in viewport" to the
-                // well box's right edge (same content width as the indicator box below).
-                if (f.wellActive) pushTextColor(pal.accent);
-                else              pushTextColorV(wsurf.textSecondary);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopStyleColor();
-                if (f.wellActive) {
-                    const char* pickHint = "Pick in viewport";
-                    const float hintW = ImGui::CalcTextSize(pickHint).x;
-                    ImGui::SameLine(0, 0.0f);
-                    const float remain = ImGui::GetContentRegionAvail().x;
-                    if (remain > hintW)
-                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + remain - hintW);
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
-                    ImGui::TextUnformatted(pickHint);
-                    ImGui::PopStyleColor();
-                }
-
-                // C37-F: chip shows count + entity kind for filled wells.
+                // Chip shows count + entity kind for filled wells.
                 std::string chip;
                 if (f.picks.empty()) {
                     chip = "(pick in viewport)";
@@ -3237,68 +3416,16 @@ void PropertyManager::drawBody(AppState& st) {
                     // single pick was pure noise anyway.
                     chip = f.picks.front().label + " x" + std::to_string(f.picks.size());
                 }
-
-                ImVec4 border = f.wellDangling
-                    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
-                    : (f.wellActive
-                        ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
-                        : ImVec4(pal.border[0], pal.border[1], pal.border[2], pal.border[3]));
-                const float availW = ImGui::GetContentRegionAvail().x;
-                const float textPadX = 10.0f * S;
-                const float textPadY = 7.0f * S;
-                const float wrapW = std::max(40.0f * S, availW - textPadX * 2.0f);
-                ImVec2 chipText = ImGui::CalcTextSize(chip.c_str(), nullptr, false, wrapW);
-                float wellH = std::max(ImGui::GetFrameHeight(), chipText.y + textPadY * 2.0f);
-
-                ImVec2 wp0 = ImGui::GetCursorScreenPos();
-                ImVec2 wp1(wp0.x + availW, wp0.y + wellH);
-                if (ImGui::InvisibleButton("##well", ImVec2(availW, wellH))) {
-                    // Activate this well; deactivate others.
+                auto wr = pmDrawSelectionWell("##well", f.def->label, chip.c_str(),
+                                             f.wellActive, f.wellDangling);
+                if (wr.clicked) {
                     for (auto& o : fields_)
                         if (o.def->kind == PMFieldKind::SelectorWell) o.wellActive = false;
                     f.wellActive = true;
                 }
-                const bool wellHovered = ImGui::IsItemHovered();
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                // Liquid glass v2: the well fill is a translucent glass pill (glassRowBackground)
-                // consistent with FeatureManager rows — instead of the opaque frameBg/frameBgHovered
-                // rects. An ACTIVE well keeps the semantic accent wash (selected pill) so the
-                // receiving pick target still flashes accent; idle/hover use the neutral frosted wash.
-                if (f.wellActive) {
-                    ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
-                                           /*selected=*/true, 0.42f);
-                } else {
-                    ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
-                                           /*selected=*/false, wellHovered ? 0.42f : 0.28f);
-                }
-                dl->AddRect(wp0, wp1, ImGui::ColorConvertFloat4ToU32(border), 6.0f * S, 0,
-                            f.wellActive ? std::max(1.0f, 2.0f * S)
-                                          : std::max(1.0f, 1.0f * S));
-                // Chip text: adaptive contrast over the frosted pill (empty -> dimmer secondary).
-                ImU32 chipCol = f.picks.empty()
-                    ? ImGui::ColorConvertFloat4ToU32(wsurf.textSecondary)
-                    : ImGui::ColorConvertFloat4ToU32(wsurf.textPrimary);
-                dl->AddText(nullptr, 0.0f, ImVec2(wp0.x + textPadX, wp0.y + textPadY),
-                            chipCol, chip.c_str(), nullptr, wrapW);
-
-                // C37-F: tooltip on the well button.
-                if (wellHovered) {
-                    if (f.wellActive)
-                        pmTooltip("Active — pick faces/edges in the viewport");
-                    else if (!f.picks.empty())
-                        pmTooltip("Click to re-activate; right-click to clear");
-                    else
-                        pmTooltip("Click to activate pick target");
-                }
-
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (wr.rightClicked) {
                     f.picks.clear(); f.wellDangling = false;
                     dirty_ = true; lastEditTime_ = ImGui::GetTime();
-                }
-                if (f.wellDangling) {
-                    pushTextColor(pal.statusErr);
-                    ImGui::TextUnformatted("! dangling reference");
-                    ImGui::PopStyleColor();
                 }
                 break;
             }

@@ -359,9 +359,15 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_FrameBg]             = fromRole(p.frameBg);
     c[ImGuiCol_FrameBgHovered]      = fromRole(p.frameBgHovered);
     c[ImGuiCol_FrameBgActive]       = fromRole(p.frameBgActive);
-    c[ImGuiCol_TitleBg]             = rgba(0,0,0,0);
-    c[ImGuiCol_TitleBgActive]       = rgba(0,0,0,0);
-    c[ImGuiCol_TitleBgCollapsed]    = rgba(0,0,0,0);
+    // Floating-window title bar chrome. Was fully transparent so ImGui title text sat on
+    // the frosted body (BOM / Profiler / other Begin()-with-title windows: text bleeds
+    // through, chrome looks missing). headerBg is the palette role for menu/title bars
+    // and is fully opaque in both themes — distinct from glass body fill. Pinned
+    // FeatureManager + Copilot columns use NoTitleBar|NoBackground and never sample
+    // these colors (they paint their own glass over a transparent WindowBg locally).
+    c[ImGuiCol_TitleBg]             = fromRole(p.headerBg);
+    c[ImGuiCol_TitleBgActive]       = fromRole(p.headerBg);
+    c[ImGuiCol_TitleBgCollapsed]    = fromRole(p.headerBg);
     c[ImGuiCol_MenuBarBg]           = fromRole(p.headerBg);
     c[ImGuiCol_ScrollbarBg]         = rgba(0,0,0,0);
     c[ImGuiCol_ScrollbarGrab]       = fromRole(p.button);
@@ -584,31 +590,46 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     };
     // Translucent left->right tint over the frosted glass, bounded to the rounded pill: bright at
     // the left edge (`strength`), fading to a faint right edge (~15% of strength, min 0.02).
+    // Same class of fix as ribbon_vGradRounded: never draw a rounded cap of width==radius
+    // (ImGui clamps corner radius to half the short side → square corner pips) and never let
+    // square-cornered AddRectFilledMultiColor poke past the rounded outline.
     const float aL = strength;
     const float aR = std::max(0.02f, strength * 0.15f);
     const float W  = mx.x - mn.x;
-    // Value of the linear aL->aR gradient at fractional x-position t (0=left, 1=right).
-    auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
-    // The rounded corner caps CANNOT carry a gradient (AddRectFilledMultiColor is square-cornered),
-    // so each cap is a flat fill whose color equals the gradient's value AT THE CAP'S INNER EDGE
-    // (x = mn+rr on the left, mx-rr on the right). The interior band then runs cap-to-cap using the
-    // same two boundary colors — so cap and band meet at an identical value with no bright flat
-    // block, which is what produced the hard vertical line at the corner (a Mach band).
-    const float tL = std::max(0.0f, std::min(1.0f, rr / W));
-    const float tR = std::max(0.0f, std::min(1.0f, (W - rr) / W));
-    const ImU32 cLcap = mixAt(tL);
-    const ImU32 cRcap = mixAt(tR);
-    const ImU32 cFaint = dye(aR);
-    // Faint tint fills the WHOLE rounded pill first (guarantees rounded corners everywhere).
-    dl->AddRectFilled(mn, mx, cFaint, rr);
-    if (mx.x - rr > mn.x + rr) {
-        dl->AddRectFilled(mn, ImVec2(mn.x + rr, mx.y), cLcap, rr, ImDrawFlags_RoundCornersLeft);
-        dl->AddRectFilled(ImVec2(mx.x - rr, mn.y), mx, cRcap, rr, ImDrawFlags_RoundCornersRight);
-        dl->AddRectFilledMultiColor(ImVec2(mn.x + rr, mn.y), ImVec2(mx.x - rr, mx.y),
-                                    cLcap, cRcap, cRcap, cLcap);
+    const float H  = mx.y - mn.y;
+    const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
+
+    // Full rounded base in the faint (right) colour — owns every corner.
+    dl->AddRectFilled(mn, mx, dye(aR), rnd);
+
+    // Bright left strip. Width ≥ 2·rnd so ImGui does not clamp the corner radius into
+    // square corner pips (width==rnd was the artifact source).
+    const float leftW = ImMax(2.0f * rnd, 1.0f);
+    if (W > leftW + rnd) {
+        const float tJoin = leftW / W;
+        const ImU32 cLeft = dye(aL);
+        const ImU32 cJoin = dye(aL * (1.0f - tJoin) + aR * tJoin);
+        const ImU32 cRight = dye(aR);
+
+        dl->AddRectFilled(mn, ImVec2(mn.x + leftW, mx.y), cLeft, rnd,
+                          ImDrawFlags_RoundCornersLeft);
+
+        // Interior L→R fade. AddRectFilledMultiColor is SQUARE-cornered — keep it
+        // strictly inside the rounded outline (below the top arc, above the bottom
+        // arc, right of the left strip, left of the right radius).
+        const float x0 = mn.x + leftW;
+        const float x1 = mx.x - rnd;
+        const float y0 = mn.y + rnd;
+        const float y1 = mx.y - rnd;
+        if (x1 > x0 && y1 > y0) {
+            dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1),
+                                        cJoin, cRight, cRight, cJoin);
+        }
     } else {
-        dl->AddRectFilled(mn, mx, dye(aL), rr);   // too narrow for caps+band: single bright fill
+        // Too narrow for strip+band: single bright rounded fill.
+        dl->AddRectFilled(mn, mx, dye(aL), rnd);
     }
+
     if (selected) {
         const float glow[4] = {tint[0], tint[1], tint[2], 1.0f};
         glassSelectionGlow(dl, omn, omx, rounding, glow);   // outer rect; glow self-insets to match

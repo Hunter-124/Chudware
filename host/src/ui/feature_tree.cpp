@@ -216,6 +216,7 @@ void fmRowStripeReset() {
     // below read g_fmPal — without this they'd render with a stale (or first-frame zero) palette.
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &fmSurf() : nullptr);
 }
+
 FmRowRect fmRowPill(bool selected, const float* tint) {
     // polish(G2): 6dp horizontal gives icons breathing room from the left edge; 4dp vertical gives
     // text more vertical breathing without making rows too tall.
@@ -238,8 +239,8 @@ FmRowRect fmRowPill(bool selected, const float* tint) {
     // border marks selection, dyed the same color.
     const float* eff = tint ? tint : ui::palette.accent;   // accent is float[4]; wash reads [0..2]
     const float strength = tint ? (selected ? 0.34f : 0.20f) : (selected ? 0.22f : 0.11f);
-    // Same outer rect as the frosted base — coloredRowWash self-insets by the identical 2dp, so the
-    // two stay perfectly concentric (no early-ending corner seam).
+    // Same outer rect as the frosted base — coloredRowWash self-insets by the identical 2dp
+    // (and keeps MultiColor inside the rounded outline — see ui_theme.cpp).
     ui::coloredRowWash(dl, rowMin, rowMax, 3.5f, eff, strength, selected);
     return {rowMin, rowMax};
 }
@@ -4165,15 +4166,22 @@ void drawFeatureTreeBody(AppState& st,
                         {
                             const bool catIsCut = featureModeIsCut(&f);
                             float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint);
-                            // Same outer rect as the base — coloredRowWash self-insets to stay concentric.
+                            // Same outer rect as the base — coloredRowWash self-insets.
                             ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint,
                                                sel ? 0.34f : 0.20f, sel);
                         }
-                        if (suppressed)
-                            rowDl->AddRectFilled(rowMin, rowMax,
+                        if (suppressed) {
+                            // Inset + rounded to match the pill (square full-rect fill poked
+                            // bright corners past the rounded outline).
+                            const float sIn = 2.0f * S;
+                            rowDl->AddRectFilled(
+                                ImVec2(rowMin.x + sIn, rowMin.y + sIn),
+                                ImVec2(rowMax.x - sIn, rowMax.y - sIn),
                                 IM_COL32((int)(pal.statusWarn[0] * 255),
                                          (int)(pal.statusWarn[1] * 255),
-                                         (int)(pal.statusWarn[2] * 255), 8));
+                                         (int)(pal.statusWarn[2] * 255), 8),
+                                3.5f * S);
+                        }
                         if (sel) {
                             // selection card drawn by glassRowBackground(selected=true)
                             if (selectedFeatureId == fid && st.treeScrollToSelection) {

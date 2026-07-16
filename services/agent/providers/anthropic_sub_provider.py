@@ -99,7 +99,7 @@ class AnthropicSubProvider(Provider):
             "account_id": None,
             "email": None,
         }
-        # Best-effort profile fill (user:profile scope) — email/display_name/plan.
+        # Best-effort profile + usage seed (user:profile scope).
         try:
             from . import usage as usage_mod
             cred = usage_mod.enrich_anthropic_profile(cred)
@@ -132,6 +132,10 @@ class AnthropicSubProvider(Provider):
             "display_name": self._cred.get("display_name"),
             "plan": self._cred.get("plan"),
         }
+        # Preserve last-known usage windows across refresh so cold-start restore works.
+        for k in ("last_usage", "last_usage_fetched_at"):
+            if self._cred.get(k) is not None:
+                cred[k] = self._cred[k]
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

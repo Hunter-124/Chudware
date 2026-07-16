@@ -90,3 +90,21 @@ Same gates + any core tests J touches -> commit+push.
   history (read off-disk via source_path). Plain STEP/mesh imports and embedded-brep-only
   imports have NO parametric history to show; a doc_import_feature_tree RPC would be needed.
 - Item 5b/6b contract note (feature_params.md) left un-appended (optional; GUI-only defaults).
+
+## Wave 3 (AI copilot overlay + settings + providers + callback) — interjection batch
+Live copilot chat overlay is host/src/ui/legacy_chat.cpp (despite name). drawProviderModelPicker
+and the Agents/Prompts/Skills/Permissions/Accounts overlay tabs also live there.
+- N ChatOverlay legacy_chat.cpp: (1) no-usage-API -> toast not chatbox; (2) context meter inline
+  with Design/Edit/Ask; (3) Design/Edit/Ask -> dropdown, vertically centered; (4) remove
+  Permissions dropdown from composer (keep as overlay Settings tab); (5) restyle overlay Settings;
+  (6) Agents/Prompts/Skills/Permissions/Accounts tabs -> horizontal row on top; (7) fix UI
+  scaling (privacy checkbox text cutoff etc.); (8) remove Checkpoints button; (9) model picker
+  lists models for signed-in providers (xAI/cursor/claude); (10) rewind+edit buttons below box,
+  right-aligned, smaller rewind, Edit message -> pencil icon next to rewind.
+- O SettingsModal settings_modal.cpp: (11) sticky tab bar on scroll; (12-display) render provider
+  account names/usage the backend provides.
+- P ProviderBackend usage.py/xai_sub_provider.py/cursor_sub_provider.py/anthropic_sub_provider.py:
+  (12-data) grok real account names (not UUIDs), cursor name+usage, claude usage after restart.
+- Q CallbackPage providers/sub_auth.py (CallbackServer do_GET 62-87): (13) brand the
+  localhost:54545/callback success/failure HTML.
+Gate 3: ./build.sh + agent pytest (subscription/usage) + gui_lint theme -> commit+push.

@@ -252,10 +252,58 @@ def _base_row(
     return row
 
 
+def _looks_like_uuid(value: str | None) -> bool:
+    """True when *value* is a bare UUID (common xAI ``sub`` / account_id)."""
+    if not value or not isinstance(value, str):
+        return False
+    s = value.strip()
+    if len(s) != 36:
+        return False
+    # 8-4-4-4-12 hex with hyphens
+    parts = s.split("-")
+    if len(parts) != 5 or [len(p) for p in parts] != [8, 4, 4, 4, 12]:
+        return False
+    try:
+        int(s.replace("-", ""), 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _looks_like_acct_slug(value: str | None) -> bool:
+    """True for derive_account_id timestamp fallbacks like ``acct-1784192914``."""
+    if not value or not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not s.startswith("acct-"):
+        return False
+    rest = s[5:]
+    return bool(rest) and rest.isdigit()
+
+
+def _short_id(value: str | None, *, n: int = 8) -> str:
+    if not value:
+        return ""
+    s = str(value).strip()
+    if _looks_like_uuid(s):
+        return s.split("-", 1)[0][:n]
+    if _looks_like_acct_slug(s):
+        return s[5:][:n]
+    return s[:n]
+
+
 def _merge_identity(row: dict, cred: dict) -> dict:
     """Fill missing display_name/plan/email from the credential store."""
     if not row.get("display_name"):
         row["display_name"] = cred.get("display_name") or cred.get("email")
+    # Replace bare UUID / acct-slug labels when the credential has a better name.
+    dn = row.get("display_name")
+    if isinstance(dn, str) and (_looks_like_uuid(dn) or _looks_like_acct_slug(dn)):
+        better = cred.get("display_name") or cred.get("email")
+        if isinstance(better, str) and better.strip() and not (
+            _looks_like_uuid(better) or _looks_like_acct_slug(better)
+        ):
+            row["display_name"] = better.strip()
     if not row.get("plan"):
         row["plan"] = cred.get("plan")
     if not row.get("email") and cred.get("email"):
@@ -270,8 +318,15 @@ def persist_identity(
     display_name: str | None = None,
     plan: str | None = None,
     email: str | None = None,
+    usage: list | None = None,
+    usage_fetched_at: float | None = None,
 ) -> None:
-    """Write identity fields onto a stored credential without clobbering tokens."""
+    """Write identity (+ optional last-known usage) onto a stored credential.
+
+    Tokens are never clobbered. Usage snapshots let Settings restore bars after a
+    cold restart until the next live fetch succeeds (Claude "Usage unavailable"
+    after restart).
+    """
     cred = sub_auth.load_credential(cred_id, account_id=account_id)
     if not cred:
         return
@@ -280,18 +335,37 @@ def persist_identity(
         cred["display_name"] = display_name
         changed = True
     elif display_name and cred.get("display_name") != display_name:
-        cred["display_name"] = display_name
-        changed = True
+        # Prefer human labels over bare UUID / acct-* leftovers.
+        prev = cred.get("display_name")
+        if (
+            _looks_like_uuid(prev)
+            or _looks_like_acct_slug(prev)
+            or prev != display_name
+        ):
+            # Don't overwrite a good email/name with a weaker UUID fallback.
+            if not (
+                (_looks_like_uuid(display_name) or _looks_like_acct_slug(display_name))
+                and prev
+                and not (_looks_like_uuid(prev) or _looks_like_acct_slug(prev))
+            ):
+                cred["display_name"] = display_name
+                changed = True
     if plan and cred.get("plan") != plan:
         cred["plan"] = plan
         changed = True
     if email and not cred.get("email"):
         cred["email"] = email
         changed = True
+    if usage:
+        # Only snapshot non-empty windows — empty means "unknown", not "zero".
+        cred["last_usage"] = list(usage)
+        cred["last_usage_fetched_at"] = float(
+            usage_fetched_at if usage_fetched_at is not None else _now()
+        )
+        changed = True
     if changed:
         aid = account_id or sub_auth.get_active_account_id(cred_id)
         sub_auth.save_credential(cred_id, cred, account_id=aid, set_active=False)
-
 
 # ── Per-provider fetchers ────────────────────────────────────────────────────
 
@@ -500,100 +574,153 @@ def fetch_codex_usage(cred: dict) -> dict:
 
 
 def fetch_cursor_usage(cred: dict) -> dict:
-    """Cursor Pro: /auth/usage + optional /auth/full_stripe_profile for plan."""
+    """Cursor Pro: /auth/usage + optional /auth/full_stripe_profile for plan.
+
+    Usage endpoint needs a live personal OAuth access token:
+      GET https://api2.cursor.sh/auth/usage
+      Authorization: Bearer <access_token>
+      Accept: application/json
+
+    Some tokens (stale refresh, enterprise SSO, CLI-exchanged keys) return 401/403
+    on /auth/usage even while /auth/full_stripe_profile still answers — in that
+    case we still return a human display_name/plan and an empty usage list so
+    Settings never shows a bare ``acct-…`` row.
+    """
     token = cred.get("access_token") or ""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    status, body, _rh = _http_get(_CURSOR_USAGE_URL, headers)
-    if status == 429:
-        raise _RateLimited()
-    if status != 200 or not isinstance(body, dict):
-        raise RuntimeError(f"cursor usage HTTP {status}")
-
-    usage: list[dict] = []
     plan = cred.get("plan")
-    now = _now()
-
-    # Nested quota objects: each key → {numRequests|used|..., maxRequestUsage|limit|...}
-    # plus startOfMonth / billingCycleEnd / resetsAt at top or per bucket.
-    global_reset = None
-    for rk in ("billingCycleEnd", "resetsAt", "startOfMonth"):
-        if body.get(rk) is not None:
-            if rk == "startOfMonth":
-                # +1 month approximate — prefer explicit reset fields
-                continue
-            global_reset = (
-                _parse_iso_to_iso(body[rk]) if isinstance(body[rk], str)
-                else _iso_from_ms(body[rk]) if _to_number(body[rk]) is not None
-                else None
-            )
-            if global_reset:
-                break
-    if not global_reset and isinstance(body.get("startOfMonth"), str):
-        try:
-            start = datetime.fromisoformat(body["startOfMonth"].replace("Z", "+00:00"))
-            # naive +31d
-            month = start.month + 1
-            year = start.year + (1 if month > 12 else 0)
-            month = month if month <= 12 else 1
-            end = start.replace(year=year, month=month)
-            global_reset = end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        except (ValueError, TypeError, OverflowError):
-            pass
-
-    def _add_bucket(name: str, bucket: dict) -> None:
-        used = (
-            _to_number(bucket.get("numRequests"))
-            or _to_number(bucket.get("used"))
-            or _to_number(bucket.get("amountUsed"))
-            or _to_number(bucket.get("usdUsed"))
-        )
-        limit = (
-            _to_number(bucket.get("maxRequestUsage"))
-            or _to_number(bucket.get("limit"))
-            or _to_number(bucket.get("amountLimit"))
-            or _to_number(bucket.get("usdLimit"))
-        )
-        frac = None
-        if used is not None and limit and limit > 0:
-            frac = _clamp_fraction(used / limit)
-        elif _to_number(bucket.get("used_fraction")) is not None:
-            frac = _clamp_fraction(bucket.get("used_fraction"))
-        elif _to_number(bucket.get("percent")) is not None:
-            frac = _clamp_fraction(bucket.get("percent"))
-        resets = None
-        for rk in ("resetsAt", "billingCycleEnd", "reset_at"):
-            if bucket.get(rk) is not None:
-                v = bucket[rk]
-                resets = _parse_iso_to_iso(v) if isinstance(v, str) else _iso_from_ms(v)
-                if resets:
-                    break
-        if not resets:
-            resets = global_reset
-        if frac is None and resets is None and used is None:
-            return
-        label = name.replace("_", " ").strip() or "usage"
-        if label.lower() == "planusage" or label.lower() == "plan usage":
-            label = "Plan usage"
-        usage.append(_usage_row(name, label, frac, resets))
-
-    for key, val in body.items():
-        if key in ("startOfMonth", "billingCycleEnd", "resetsAt", "email", "membershipType", "plan"):
-            continue
-        if isinstance(val, dict) and any(
-            k in val for k in (
-                "numRequests", "used", "amountUsed", "usdUsed",
-                "maxRequestUsage", "limit", "amountLimit", "usdLimit",
-                "used_fraction", "percent",
-            )
-        ):
-            _add_bucket(str(key), val)
-
-    # Plan from stripe profile (best-effort, unstable internal endpoint).
     email = cred.get("email")
     display_name = cred.get("display_name") or email
+    account_id = cred.get("account_id")
+    usage: list[dict] = []
+    source = "api"
+
+    # JWT claims first (no network) — often carries email/sub even when profile fails.
+    if token:
+        claims = sub_auth.decode_jwt_payload(token)
+        if not email:
+            for key in ("email", "preferred_username", "unique_name", "upn"):
+                v = claims.get(key)
+                if isinstance(v, str) and "@" in v:
+                    email = v.strip().lower()
+                    break
+            nested = claims.get("profile") if isinstance(claims.get("profile"), dict) else {}
+            if not email and isinstance(nested.get("email"), str):
+                email = nested["email"].strip().lower()
+        if not account_id:
+            for key in ("sub", "user_id", "userId", "id"):
+                v = claims.get(key)
+                if v is not None and str(v).strip():
+                    account_id = str(v).strip()
+                    break
+        if not display_name:
+            for key in ("name", "display_name", "displayName", "preferred_username"):
+                v = claims.get(key)
+                if isinstance(v, str) and v.strip():
+                    display_name = v.strip()
+                    break
+
+    usage_error: str | None = None
+    try:
+        status, body, _rh = _http_get(_CURSOR_USAGE_URL, headers)
+        if status == 429:
+            raise _RateLimited()
+        if status != 200 or not isinstance(body, dict):
+            usage_error = f"cursor usage HTTP {status}"
+            body = {}
+        else:
+            # Nested quota objects: each key → {numRequests|used|..., maxRequestUsage|limit|...}
+            # plus startOfMonth / billingCycleEnd / resetsAt at top or per bucket.
+            global_reset = None
+            for rk in ("billingCycleEnd", "resetsAt", "startOfMonth"):
+                if body.get(rk) is not None:
+                    if rk == "startOfMonth":
+                        # +1 month approximate — prefer explicit reset fields
+                        continue
+                    global_reset = (
+                        _parse_iso_to_iso(body[rk]) if isinstance(body[rk], str)
+                        else _iso_from_ms(body[rk]) if _to_number(body[rk]) is not None
+                        else None
+                    )
+                    if global_reset:
+                        break
+            if not global_reset and isinstance(body.get("startOfMonth"), str):
+                try:
+                    start = datetime.fromisoformat(body["startOfMonth"].replace("Z", "+00:00"))
+                    # naive +31d
+                    month = start.month + 1
+                    year = start.year + (1 if month > 12 else 0)
+                    month = month if month <= 12 else 1
+                    end = start.replace(year=year, month=month)
+                    global_reset = end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                except (ValueError, TypeError, OverflowError):
+                    pass
+
+            def _add_bucket(name: str, bucket: dict) -> None:
+                used = (
+                    _to_number(bucket.get("numRequests"))
+                    or _to_number(bucket.get("used"))
+                    or _to_number(bucket.get("amountUsed"))
+                    or _to_number(bucket.get("usdUsed"))
+                )
+                limit = (
+                    _to_number(bucket.get("maxRequestUsage"))
+                    or _to_number(bucket.get("limit"))
+                    or _to_number(bucket.get("amountLimit"))
+                    or _to_number(bucket.get("usdLimit"))
+                )
+                frac = None
+                if used is not None and limit and limit > 0:
+                    frac = _clamp_fraction(used / limit)
+                elif _to_number(bucket.get("used_fraction")) is not None:
+                    frac = _clamp_fraction(bucket.get("used_fraction"))
+                elif _to_number(bucket.get("percent")) is not None:
+                    frac = _clamp_fraction(bucket.get("percent"))
+                resets = None
+                for rk in ("resetsAt", "billingCycleEnd", "reset_at"):
+                    if bucket.get(rk) is not None:
+                        v = bucket[rk]
+                        resets = _parse_iso_to_iso(v) if isinstance(v, str) else _iso_from_ms(v)
+                        if resets:
+                            break
+                if not resets:
+                    resets = global_reset
+                if frac is None and resets is None and used is None:
+                    return
+                label = name.replace("_", " ").strip() or "usage"
+                if label.lower() == "planusage" or label.lower() == "plan usage":
+                    label = "Plan usage"
+                usage.append(_usage_row(name, label, frac, resets))
+
+            for key, val in body.items():
+                if key in ("startOfMonth", "billingCycleEnd", "resetsAt", "email", "membershipType", "plan"):
+                    continue
+                if isinstance(val, dict) and any(
+                    k in val for k in (
+                        "numRequests", "used", "amountUsed", "usdUsed",
+                        "maxRequestUsage", "limit", "amountLimit", "usdLimit",
+                        "used_fraction", "percent",
+                    )
+                ):
+                    _add_bucket(str(key), val)
+
+            # Top-level plan/email fallthroughs on usage payload itself.
+            if not plan and isinstance(body.get("membershipType"), str):
+                plan = body["membershipType"]
+            if not plan and isinstance(body.get("plan"), str):
+                plan = body["plan"]
+            if not email and isinstance(body.get("email"), str):
+                email = body["email"]
+    except _RateLimited:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        usage_error = str(exc)
+        log.debug("cursor usage fetch failed: %s", exc)
+
+    # Plan/identity from stripe profile (best-effort, unstable internal endpoint).
     try:
         s_status, s_body, _ = _http_get(_CURSOR_STRIPE_URL, headers)
         if s_status == 200 and isinstance(s_body, dict):
@@ -601,27 +728,41 @@ def fetch_cursor_usage(cred: dict) -> dict:
             if isinstance(mt, str) and mt.strip():
                 plan = mt.strip()
             if not email and isinstance(s_body.get("email"), str):
-                email = s_body["email"]
-            if not display_name:
-                display_name = s_body.get("name") or s_body.get("displayName") or email
+                email = s_body["email"].strip().lower()
+            name = s_body.get("name") or s_body.get("displayName") or s_body.get("display_name")
+            if isinstance(name, str) and name.strip():
+                display_name = name.strip()
+            if not account_id:
+                for k in ("userId", "user_id", "id", "customerId"):
+                    v = s_body.get(k)
+                    if v is not None and str(v).strip():
+                        account_id = str(v).strip()
+                        break
     except Exception as exc:  # noqa: BLE001
         log.debug("cursor stripe profile failed: %s", exc)
 
-    # Top-level plan/email fallthroughs on usage payload itself.
-    if not plan and isinstance(body.get("membershipType"), str):
-        plan = body["membershipType"]
-    if not plan and isinstance(body.get("plan"), str):
-        plan = body["plan"]
-    if not email and isinstance(body.get("email"), str):
-        email = body["email"]
+    if not display_name:
+        display_name = email
+    if not display_name or _looks_like_uuid(display_name) or _looks_like_acct_slug(display_name):
+        # Friendly fallback so the Accounts row is never just acct-…
+        if plan:
+            display_name = f"Cursor ({plan})"
+        elif account_id and not _looks_like_acct_slug(str(account_id)):
+            display_name = f"Cursor ({_short_id(str(account_id))})"
+        else:
+            display_name = "Cursor"
+
+    if usage_error and not usage:
+        source = "unavailable"
+        log.info("cursor usage unavailable (%s); identity-only row", usage_error)
 
     return {
-        "display_name": display_name or email,
+        "display_name": display_name,
         "plan": plan,
         "usage": usage,
         "email": email,
-        "account_id": cred.get("account_id"),
-        "source": "api",
+        "account_id": account_id or cred.get("account_id"),
+        "source": source,
         "dashboard_url": DASHBOARD_URLS["cursor"],
     }
 
@@ -660,15 +801,17 @@ def _infer_xai_plan(cred: dict) -> str | None:
 
 def fetch_xai_usage_jwt_inference(cred: dict) -> dict:
     """xAI degrade path: plan from JWT / stored tier; no remaining-quota API."""
-    email = cred.get("email")
-    display_name = cred.get("display_name") or email
-    plan = _infer_xai_plan(cred)
+    # Re-run identity so cold-start credentials without display_name get a label.
+    enriched = enrich_xai_identity(dict(cred))
+    email = enriched.get("email") or cred.get("email")
+    plan = enriched.get("plan") or _infer_xai_plan(cred)
+    display_name = enriched.get("display_name") or email
     return {
         "display_name": display_name,
         "plan": plan,
-        "usage": [],
+        "usage": list(cred.get("last_usage") or []),
         "email": email,
-        "account_id": cred.get("account_id"),
+        "account_id": enriched.get("account_id") or cred.get("account_id"),
         "source": XAI_SOURCE_JWT,
         "dashboard_url": DASHBOARD_URLS["xai"],
     }
@@ -911,22 +1054,27 @@ def fetch_account_usage(
         result = fetcher(stored)
     except _RateLimited:
         log.info("usage: %s/%s rate-limited; freezing for %ss", friendly, aid, CACHE_TTL_S)
+        last_usage = []
+        if cached and cached.get("row") and cached["row"].get("usage"):
+            last_usage = list(cached["row"]["usage"])
+        elif isinstance(stored.get("last_usage"), list):
+            last_usage = list(stored["last_usage"])
         row = _merge_identity(
             _base_row(
                 friendly,
                 str(aid),
                 display_name=stored.get("display_name") or stored.get("email"),
                 plan=stored.get("plan"),
-                usage=(cached or {}).get("row", {}).get("usage") if cached else [],
+                usage=last_usage,
                 source="api",
                 email=stored.get("email"),
             ),
             stored,
         )
-        # Preserve last-good usage if we had one.
+        # Preserve last-good identity fields if we had a cached row.
         if cached and cached.get("row"):
             prev = cached["row"]
-            if prev.get("usage"):
+            if prev.get("usage") and not row.get("usage"):
                 row["usage"] = list(prev["usage"])
             if prev.get("plan") and not row.get("plan"):
                 row["plan"] = prev["plan"]
@@ -949,32 +1097,69 @@ def fetch_account_usage(
         if friendly == "xai":
             result = fetch_xai_usage_jwt_inference(stored)
         else:
+            # Cold-start restore: last live snapshot written to the credential.
+            last_usage = stored.get("last_usage") if isinstance(stored.get("last_usage"), list) else []
             row = _base_row(
                 friendly,
                 str(aid),
                 display_name=stored.get("display_name") or stored.get("email"),
                 plan=stored.get("plan"),
-                usage=[],
-                source="unavailable",
+                usage=list(last_usage or []),
+                source="cached" if last_usage else "unavailable",
                 email=stored.get("email"),
             )
-            return row
+            return _merge_identity(row, stored)
 
     display_name = result.get("display_name") or stored.get("display_name") or stored.get("email")
     plan = result.get("plan") or stored.get("plan")
     email = result.get("email") or stored.get("email")
+    usage_rows = list(result.get("usage") or [])
+    # Prefer live usage; fall back to last-known snapshot when the fetch returned empty
+    # but we previously persisted windows (e.g. transient network blip).
+    if not usage_rows and isinstance(stored.get("last_usage"), list) and stored["last_usage"]:
+        usage_rows = list(stored["last_usage"])
+    source = result.get("source") or "api"
+    if usage_rows and not result.get("usage") and source == "unavailable":
+        source = "cached"
+
     row = _base_row(
         friendly,
         str(aid),
         display_name=display_name,
         plan=plan,
-        usage=result.get("usage") or [],
+        usage=usage_rows,
         dashboard_url=result.get("dashboard_url") or DASHBOARD_URLS.get(friendly),
-        source=result.get("source") or "api",
+        source=source,
         email=email,
     )
+    # Ensure xAI/cursor never surface a bare UUID / acct-slug as the only label.
+    row = _merge_identity(row, stored)
+    if (
+        not row.get("display_name")
+        or _looks_like_uuid(row.get("display_name"))
+        or _looks_like_acct_slug(row.get("display_name"))
+    ):
+        if friendly == "xai":
+            fixed = enrich_xai_identity(dict(stored))
+            row["display_name"] = fixed.get("display_name") or row.get("display_name")
+            if fixed.get("plan") and not row.get("plan"):
+                row["plan"] = fixed["plan"]
+            if fixed.get("email") and not row.get("email"):
+                row["email"] = fixed["email"]
+        elif friendly == "cursor":
+            plan_lbl = row.get("plan") or stored.get("plan")
+            if stored.get("email"):
+                row["display_name"] = stored["email"]
+            elif plan_lbl:
+                row["display_name"] = f"Cursor ({plan_lbl})"
+            else:
+                row["display_name"] = "Cursor"
 
-    # Persist identity enrichments for status/accounts surfaces.
+    display_name = row.get("display_name")
+    plan = row.get("plan")
+    email = row.get("email")
+
+    # Persist identity + last-known usage for cold-start restore.
     try:
         persist_identity(
             cred_id,
@@ -982,6 +1167,8 @@ def fetch_account_usage(
             display_name=display_name if isinstance(display_name, str) else None,
             plan=plan if isinstance(plan, str) else None,
             email=email if isinstance(email, str) else None,
+            usage=usage_rows if usage_rows else None,
+            usage_fetched_at=now if usage_rows else None,
         )
     except Exception as exc:  # noqa: BLE001
         log.debug("usage: persist identity failed: %s", exc)
@@ -1047,7 +1234,11 @@ def subscription_usage(provider: str | None = None, *, force: bool = False) -> d
 
 
 def enrich_anthropic_profile(cred: dict) -> dict:
-    """Best-effort GET /api/oauth/profile; mutates and returns *cred*."""
+    """Best-effort GET /api/oauth/profile; mutates and returns *cred*.
+
+    Also best-effort seeds ``last_usage`` from /api/oauth/usage so a cold restart
+    can restore bars before the next live fetch (Settings "Usage unavailable").
+    """
     token = cred.get("access_token")
     if not token:
         return cred
@@ -1061,55 +1252,124 @@ def enrich_anthropic_profile(cred: dict) -> dict:
         status, body, _ = _http_get(f"{_ANTHROPIC_OAUTH_BASE}/profile", headers, timeout=15.0)
     except Exception as exc:  # noqa: BLE001
         log.debug("anthropic login profile failed: %s", exc)
-        return cred
-    if status != 200 or not isinstance(body, dict):
-        return cred
-    email = body.get("email")
-    if not email and isinstance(body.get("account"), dict):
-        email = body["account"].get("email")
-    if isinstance(email, str) and email.strip():
-        cred["email"] = email.strip().lower()
-    name = body.get("display_name") or body.get("name")
-    if isinstance(name, str) and name.strip():
-        cred["display_name"] = name.strip()
-    elif cred.get("email"):
-        cred.setdefault("display_name", cred["email"])
-    for k in ("subscriptionType", "subscription_type", "plan"):
-        v = body.get(k)
-        if isinstance(v, str) and v.strip():
-            cred["plan"] = v.strip()
-            break
-    uuid_ = body.get("uuid") or body.get("account_id")
-    if not uuid_ and isinstance(body.get("account"), dict):
-        uuid_ = body["account"].get("uuid") or body["account"].get("id")
-    if uuid_ and not cred.get("account_id"):
-        cred["account_id"] = str(uuid_)
+        body = None
+        status = 0
+    if status == 200 and isinstance(body, dict):
+        email = body.get("email")
+        if not email and isinstance(body.get("account"), dict):
+            email = body["account"].get("email")
+        if isinstance(email, str) and email.strip():
+            cred["email"] = email.strip().lower()
+        name = body.get("display_name") or body.get("name")
+        if isinstance(name, str) and name.strip():
+            cred["display_name"] = name.strip()
+        elif cred.get("email"):
+            cred.setdefault("display_name", cred["email"])
+        for k in ("subscriptionType", "subscription_type", "plan"):
+            v = body.get(k)
+            if isinstance(v, str) and v.strip():
+                cred["plan"] = v.strip()
+                break
+        uuid_ = body.get("uuid") or body.get("account_id")
+        if not uuid_ and isinstance(body.get("account"), dict):
+            uuid_ = body["account"].get("uuid") or body["account"].get("id")
+        if uuid_ and not cred.get("account_id"):
+            cred["account_id"] = str(uuid_)
+
+    # Seed last_usage at login / load so cold restart has something to restore.
+    if not cred.get("last_usage"):
+        try:
+            fetched = fetch_anthropic_usage(cred)
+            windows = fetched.get("usage") or []
+            if windows:
+                cred["last_usage"] = list(windows)
+                cred["last_usage_fetched_at"] = _now()
+            # Prefer profile/plan from the usage path when still missing.
+            if fetched.get("plan") and not cred.get("plan"):
+                cred["plan"] = fetched["plan"]
+            if fetched.get("display_name") and (
+                not cred.get("display_name")
+                or _looks_like_uuid(cred.get("display_name"))
+            ):
+                cred["display_name"] = fetched["display_name"]
+            if fetched.get("email") and not cred.get("email"):
+                cred["email"] = fetched["email"]
+        except _RateLimited:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("anthropic login usage seed failed: %s", exc)
     return cred
 
 
 def enrich_cursor_profile(cred: dict) -> dict:
-    """Best-effort full_stripe_profile at login for plan/email."""
+    """Best-effort full_stripe_profile at login for plan/email.
+
+    Always leaves a human ``display_name`` (email / plan / "Cursor") so Settings
+    never falls back to a bare ``acct-…`` account_id slug.
+    """
     token = cred.get("access_token")
     if not token:
+        # Offline identity fallback from whatever we already have.
+        if not cred.get("display_name") or _looks_like_acct_slug(cred.get("display_name")):
+            if cred.get("email"):
+                cred["display_name"] = cred["email"]
+            elif cred.get("plan"):
+                cred["display_name"] = f"Cursor ({cred['plan']})"
+            else:
+                cred["display_name"] = "Cursor"
         return cred
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    # JWT claims first (no network).
+    claims = sub_auth.decode_jwt_payload(token)
+    if not cred.get("email"):
+        for key in ("email", "preferred_username", "unique_name", "upn"):
+            v = claims.get(key)
+            if isinstance(v, str) and "@" in v:
+                cred["email"] = v.strip().lower()
+                break
+    if not cred.get("account_id"):
+        for key in ("sub", "user_id", "userId", "id"):
+            v = claims.get(key)
+            if v is not None and str(v).strip() and not _looks_like_acct_slug(str(v)):
+                # Keep numeric/user ids; timestamp acct-* is not a real id.
+                cred["account_id"] = str(v).strip()
+                break
+    if not cred.get("display_name"):
+        for key in ("name", "display_name", "displayName"):
+            v = claims.get(key)
+            if isinstance(v, str) and v.strip():
+                cred["display_name"] = v.strip()
+                break
     try:
         status, body, _ = _http_get(_CURSOR_STRIPE_URL, headers, timeout=15.0)
     except Exception as exc:  # noqa: BLE001
         log.debug("cursor login profile failed: %s", exc)
-        return cred
-    if status != 200 or not isinstance(body, dict):
-        return cred
-    mt = body.get("membershipType") or body.get("membership_type") or body.get("plan")
-    if isinstance(mt, str) and mt.strip():
-        cred["plan"] = mt.strip()
-    if isinstance(body.get("email"), str) and body["email"].strip():
-        cred["email"] = body["email"].strip().lower()
-    name = body.get("name") or body.get("displayName") or body.get("display_name")
-    if isinstance(name, str) and name.strip():
-        cred["display_name"] = name.strip()
-    elif cred.get("email"):
-        cred.setdefault("display_name", cred["email"])
+        body = None
+        status = 0
+    if status == 200 and isinstance(body, dict):
+        mt = body.get("membershipType") or body.get("membership_type") or body.get("plan")
+        if isinstance(mt, str) and mt.strip():
+            cred["plan"] = mt.strip()
+        if isinstance(body.get("email"), str) and body["email"].strip():
+            cred["email"] = body["email"].strip().lower()
+        name = body.get("name") or body.get("displayName") or body.get("display_name")
+        if isinstance(name, str) and name.strip():
+            cred["display_name"] = name.strip()
+        if not cred.get("account_id"):
+            for k in ("userId", "user_id", "id", "customerId"):
+                v = body.get(k)
+                if v is not None and str(v).strip():
+                    cred["account_id"] = str(v).strip()
+                    break
+    # Final friendly label — never leave bare acct-* or empty.
+    dn = cred.get("display_name")
+    if not dn or _looks_like_uuid(dn) or _looks_like_acct_slug(dn):
+        if cred.get("email"):
+            cred["display_name"] = cred["email"]
+        elif cred.get("plan"):
+            cred["display_name"] = f"Cursor ({cred['plan']})"
+        else:
+            cred["display_name"] = "Cursor"
     return cred
 
 
@@ -1133,10 +1393,69 @@ def enrich_codex_identity(cred: dict) -> dict:
 
 
 def enrich_xai_identity(cred: dict) -> dict:
-    """Fill display_name + plan from JWT claims at login."""
-    if cred.get("email") and not cred.get("display_name"):
-        cred["display_name"] = cred["email"]
+    """Fill display_name + plan from JWT claims at login.
+
+    Never leaves display_name as a bare UUID (xAI ``sub``). Prefer email, then
+    JWT name/preferred_username, then ``Grok (<plan>)`` / short-id fallback.
+    """
+    token = cred.get("access_token") or cred.get("id_token") or ""
+    claims: dict = sub_auth.decode_jwt_payload(token) if token else {}
+
+    # Email from cred or JWT.
+    email = cred.get("email")
+    if not email:
+        for key in ("email", "preferred_username", "unique_name"):
+            v = claims.get(key)
+            if isinstance(v, str) and "@" in v:
+                email = v.strip().lower()
+                break
+        if not email:
+            nested = claims.get("profile") if isinstance(claims.get("profile"), dict) else {}
+            if isinstance(nested.get("email"), str) and "@" in nested["email"]:
+                email = nested["email"].strip().lower()
+        if email:
+            cred["email"] = email
+
+    # Plan from JWT / stored.
     plan = _infer_xai_plan(cred)
     if plan:
         cred["plan"] = plan
+
+    # account_id from sub when missing.
+    if not cred.get("account_id"):
+        sub = claims.get("sub") or claims.get("account_id") or claims.get("user_id")
+        if sub is not None and str(sub).strip():
+            cred["account_id"] = str(sub).strip()
+
+    # Human display_name — never a bare UUID.
+    name = None
+    for key in ("name", "display_name", "preferred_username", "given_name"):
+        v = claims.get(key)
+        if isinstance(v, str) and v.strip() and not _looks_like_uuid(v.strip()):
+            # Skip email-shaped preferred_username when we already have email as fallback.
+            name = v.strip()
+            break
+        # Nested profile block
+    nested = claims.get("profile") if isinstance(claims.get("profile"), dict) else {}
+    if not name:
+        for key in ("name", "display_name"):
+            v = nested.get(key)
+            if isinstance(v, str) and v.strip() and not _looks_like_uuid(v.strip()):
+                name = v.strip()
+                break
+
+    current = cred.get("display_name")
+    if current and not (_looks_like_uuid(current) or _looks_like_acct_slug(current)):
+        # Keep a good existing label.
+        pass
+    elif name and not (_looks_like_uuid(name) or (name == cred.get("account_id"))):
+        cred["display_name"] = name
+    elif email:
+        cred["display_name"] = email
+    elif plan:
+        short = _short_id(cred.get("account_id"))
+        cred["display_name"] = f"Grok ({plan})" if not short else f"Grok ({plan} · {short})"
+    else:
+        short = _short_id(cred.get("account_id"))
+        cred["display_name"] = f"Grok ({short})" if short else "Grok"
     return cred

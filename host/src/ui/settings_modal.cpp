@@ -143,6 +143,18 @@ static void settingsGlassSectionEnd() {
     ui::popGlassChildStyle();
 }
 
+// Sticky Settings tabs: tab bar stays put; only the body child scrolls.
+static void settingsTabBodyBegin(const char* id) {
+    const float sc = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 8.0f * sc));
+    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None);
+}
+static void settingsTabBodyEnd() {
+    ImGui::EndChild();
+    ImGui::PopStyleVar(1);  // WindowPadding
+}
+
+
 // Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
 // background. Shared by the General-tab theme control. MUST pass st.scale: applyTheme re-seeds all
 // style-vars to base and only multiplies them by the scale argument (ScaleAllSizes) — passing 1.0f
@@ -244,15 +256,32 @@ static void parseUsageWindows(const nlohmann::json& src, SubAccountRow& row) {
 }
 
 // Fill optional identity fields from an accounts/status row (absent = unknown).
+// label holds email or a human label only — never the raw account_id (display shortens that).
 static void parseAccountIdentity(const nlohmann::json& a, SubAccountRow& row) {
     row.displayName = optionalJsonString(a, "display_name");
     row.plan        = optionalJsonString(a, "plan");
-    // Prefer explicit email, then label, then account_id.
+    // Prefer explicit email, then label. Account id is a last-resort display path only.
     row.label = optionalJsonString(a, "email");
     if (row.label.empty()) row.label = optionalJsonString(a, "label");
-    if (row.label.empty())
-        row.label = row.accountId.empty() ? "(account)" : row.accountId;
+    // If backend stuffed the raw account_id into label/display_name, clear so the
+    // display path can short-id it instead of showing a full UUID as the title.
+    if (!row.label.empty() && row.label == row.accountId) row.label.clear();
+    if (!row.displayName.empty() && row.displayName == row.accountId) row.displayName.clear();
     parseUsageWindows(a, row);
+}
+
+// Shorten a long account id / UUID for the primary label (never a full 36-char UUID).
+static std::string shortAccountId(const std::string& id) {
+    if (id.empty()) return "(account)";
+    if (id.size() <= 10) return id;
+    return id.substr(0, 8) + "\xe2\x80\xa6";
+}
+
+// Primary row label: display_name → email/label → shortened account id.
+static std::string accountPrimaryLabel(const SubAccountRow& row) {
+    if (!row.displayName.empty()) return row.displayName;
+    if (!row.label.empty()) return row.label;
+    return shortAccountId(row.accountId);
 }
 
 // Merge usage rows from subscription_usage into existing account rows by
@@ -268,7 +297,15 @@ static void mergeUsageRows(const nlohmann::json& rows) {
             if (!aid.empty() && row.accountId != aid) continue;
             if (r.contains("display_name") && r["display_name"].is_string()) {
                 const std::string dn = r["display_name"].get<std::string>();
-                if (!dn.empty()) row.displayName = dn;
+                if (!dn.empty() && dn != row.accountId) row.displayName = dn;
+            }
+            if (r.contains("email") && r["email"].is_string()) {
+                const std::string em = r["email"].get<std::string>();
+                if (!em.empty() && em != row.accountId) row.label = em;
+            } else if (r.contains("label") && r["label"].is_string()) {
+                const std::string lb = r["label"].get<std::string>();
+                if (!lb.empty() && lb != row.accountId && row.label.empty())
+                    row.label = lb;
             }
             if (r.contains("plan") && r["plan"].is_string()) {
                 const std::string pl = r["plan"].get<std::string>();
@@ -575,34 +612,76 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             }
             ImGui::SameLine(0, 8.0f * sc);
 
-            // Primary identity line: display_name (if any) + email/label.
+            // Primary: display_name → email/label → shortened account id (never full UUID).
+            // Reserve room for plan chip + Sign out so long labels never clip the actions.
+            const char* soLabel = "Sign out";
+            const float soW = ImGui::CalcTextSize(soLabel).x
+                + ImGui::GetStyle().FramePadding.x * 2.0f;
+            const float planChipW = row.plan.empty()
+                ? 0.0f
+                : (ImGui::CalcTextSize(row.plan.c_str()).x + 12.0f * sc);
+            const float gap = 8.0f * sc;
+            const float rightBlockW = soW
+                + (planChipW > 0.0f ? planChipW + gap : 0.0f)
+                + gap;
+            const float labelMaxW = std::max(64.0f * sc,
+                ImGui::GetContentRegionAvail().x - rightBlockW);
+
+            std::string primary = accountPrimaryLabel(row);
+            std::string secondary;
+            if (!row.displayName.empty() && !row.label.empty()
+                && row.label != row.displayName)
+                secondary = row.label;
+            if (!row.connected) {
+                if (!secondary.empty()) secondary += "  (disconnected)";
+                else primary += " (disconnected)";
+            }
+
+            // Primary label (ellipsized) + plan chip + Sign out on one baseline.
+            ImGui::AlignTextToFramePadding();
             {
-                std::string primary = row.displayName.empty() ? row.label
-                    : (row.displayName + (row.label.empty() || row.label == row.displayName
-                                          ? std::string()
-                                          : ("  \xc2\xb7  " + row.label)));
-                if (!row.connected) primary += " (disconnected)";
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted(primary.c_str());
+                const ImVec2 ts = ImGui::CalcTextSize(primary.c_str());
+                if (ts.x > labelMaxW) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    const char* ell = "\xe2\x80\xa6";
+                    const float ellW = ImGui::CalcTextSize(ell).x;
+                    const float clipW = std::max(ellW + 4.0f * sc, labelMaxW);
+                    dl->PushClipRect(p0,
+                        ImVec2(p0.x + clipW - ellW, p0.y + ts.y + 2.0f * sc), true);
+                    dl->AddText(p0, ImGui::GetColorU32(ImGuiCol_Text), primary.c_str());
+                    dl->PopClipRect();
+                    dl->AddText(ImVec2(p0.x + clipW - ellW, p0.y),
+                                ImGui::GetColorU32(ImGuiCol_Text), ell);
+                    ImGui::Dummy(ImVec2(labelMaxW,
+                                        std::max(ts.y, ImGui::GetTextLineHeight())));
+                } else {
+                    ImGui::TextUnformatted(primary.c_str());
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (!secondary.empty() && !row.accountId.empty())
+                        ImGui::SetTooltip("%s\n%s\n%s", primary.c_str(), secondary.c_str(),
+                                          row.accountId.c_str());
+                    else if (!row.accountId.empty() && row.accountId != primary)
+                        ImGui::SetTooltip("%s\n%s", primary.c_str(), row.accountId.c_str());
+                    else if (!secondary.empty())
+                        ImGui::SetTooltip("%s\n%s", primary.c_str(), secondary.c_str());
+                }
             }
 
             if (!row.plan.empty()) {
-                ImGui::SameLine(0, 8.0f * sc);
+                ImGui::SameLine(0, gap);
                 ImGui::AlignTextToFramePadding();
                 drawPlanChip(row.plan, sc);
             }
 
-            ImGui::SameLine();
-            // Push Sign out to the right of the row.
+            ImGui::SameLine(0, 0.0f);
             {
-                const char* so = "Sign out";
-                const float soW = ImGui::CalcTextSize(so).x
-                    + ImGui::GetStyle().FramePadding.x * 2.0f;
                 const float avail = ImGui::GetContentRegionAvail().x;
                 if (avail > soW + 4.0f * sc)
                     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - soW);
             }
-            if (ImGui::SmallButton("Sign out")) {
+            if (ImGui::SmallButton(soLabel)) {
                 nlohmann::json p;
                 p["provider"] = prov;
                 p["account_id"] = row.accountId;
@@ -615,17 +694,42 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                         s_subAccts.lastError =
                             reason.empty() ? "sign out failed" : reason;
                     }
-                    s_subAccts.lastAccountsPoll = -1e9;  // force refresh/rollback
+                    s_subAccts.lastAccountsPoll = -1e9;
                     s_subAccts.lastUsagePoll = -1e9;
                 });
-                // Optimistic remove.
                 s_subAccts.rows.erase(s_subAccts.rows.begin() + (long)i);
                 ImGui::PopID();
                 break;
             }
 
+            // Optional email secondary line under the primary identity.
+            if (!secondary.empty()) {
+                ImGui::Indent(ImGui::GetFrameHeight() + gap);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+                const ImVec2 sts = ImGui::CalcTextSize(secondary.c_str());
+                const float secMax = std::max(48.0f * sc, ImGui::GetContentRegionAvail().x);
+                if (sts.x > secMax) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 sp = ImGui::GetCursorScreenPos();
+                    const char* ell = "\xe2\x80\xa6";
+                    const float ellW = ImGui::CalcTextSize(ell).x;
+                    dl->PushClipRect(sp,
+                        ImVec2(sp.x + secMax - ellW, sp.y + sts.y + 2.0f * sc), true);
+                    dl->AddText(sp, ui::Palette::toU32(ui::palette.textDim), secondary.c_str());
+                    dl->PopClipRect();
+                    dl->AddText(ImVec2(sp.x + secMax - ellW, sp.y),
+                                ui::Palette::toU32(ui::palette.textDim), ell);
+                    ImGui::Dummy(ImVec2(secMax, sts.y));
+                } else {
+                    ImGui::TextUnformatted(secondary.c_str());
+                }
+                ImGui::PopStyleColor();
+                ImGui::Unindent(ImGui::GetFrameHeight() + gap);
+            }
+
             // ---- usage bars (indented under the identity row) ----
-            ImGui::Indent(ImGui::GetFrameHeight() + 8.0f * sc);
+            ImGui::Indent(ImGui::GetFrameHeight() + gap);
+            ImGui::Dummy(ImVec2(0, 2.0f * sc));
             if (row.hasUsage && !row.usage.empty()) {
                 for (size_t wi = 0; wi < row.usage.size(); ++wi) {
                     ImGui::PushID((int)wi);
@@ -638,7 +742,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 ImGui::TextUnformatted("usage unavailable");
                 ImGui::PopStyleColor();
             }
-            ImGui::Unindent(ImGui::GetFrameHeight() + 8.0f * sc);
+            ImGui::Unindent(ImGui::GetFrameHeight() + gap);
 
             ImGui::PopID();
         }
@@ -1817,13 +1921,17 @@ void drawSettingsModal(AppState& st, bool busy) {
             st.openSettingsTab = -1;
         }
 
-        // Tab content scrolls in its own region (a subtle glass card); Save/Cancel stay pinned
-        // at the bottom.
+        // Sticky tab bar: fixed header region (tabs) + scrolling body per tab.
+        // Outer child is non-scrolling so the tab row never leaves the top; each
+        // tab wraps its content in settingsTabBodyBegin/End so only the body scrolls.
+        // Save/Cancel stay pinned under the whole tabs area.
         const float footerH = ImGui::GetFrameHeightWithSpacing() + 20.0f * sc;
         pushGlassChildStyle(10.0f);
         ImGui::BeginChild("##settabsarea",
                           ImVec2(0, std::max(120.0f * sc,
-                                             ImGui::GetContentRegionAvail().y - footerH)));
+                                             ImGui::GetContentRegionAvail().y - footerH)),
+                          ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
             // The canonical theme control lives here (moved from General; the View-menu item
@@ -1833,6 +1941,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Appearance", nullptr,
                                     (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_appearance");
                 settingsSectionHeader("Theme", /*first=*/true);
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
                 if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
@@ -2007,6 +2116,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "Adaptive text over this group's glass");
                     ImGui::Dummy(ImVec2(pw, ph));
                 }
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
 
@@ -2014,6 +2124,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("General", nullptr,
                                     (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_general");
                 settingsSectionHeader("Document", /*first=*/true);
                 ImGui::TextUnformatted("Units");
                 helpMarker("The unit system for dimension display and input. The model is always "
@@ -2113,11 +2224,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                     st.showProfilerWindow = true;
                 ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText(("All settings here are stored in " + configPath() + ".").c_str());
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("AI", nullptr,
                                     (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_ai");
                 dimText(("Used by Design, Edit, and Help. Stored in " + configPath() + ".")
                             .c_str());
 
@@ -2175,12 +2288,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::ManageModels);
                 settingsGlassSectionEnd();
 
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
             // ---- Benchmarks tab: categories + leaderboard + legacy runner ----
             if (ImGui::BeginTabItem("Benchmarks", nullptr,
                                     (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_benchmarks");
                 // Shared leaderboard board (refreshed by runner / refresh button).
                 static ui::leaderboard::Board s_lb;
                 static bool s_lbLoaded = false;
@@ -2212,6 +2327,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 drawBenchRunner(st, sc, s_lb, s_lbLast);
                 settingsGlassSectionEnd();
 
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
 
@@ -2219,6 +2335,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Prompts", nullptr,
                                     (jumpToPrompts || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                                       : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_prompts");
                 settingsSectionHeader("Role prompts", /*first=*/true);
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -2345,6 +2462,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
                 ImGui::EndChild();
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
             // --- end C22b marked block ---
@@ -2359,6 +2477,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Agent", nullptr,
                                     (wantSettingsSel || jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                                         : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_agent");
                 settingsSectionHeader("Run behavior", /*first=*/true);
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
                 dimText("The agent first drafts a build plan - the parts, concrete "
@@ -2375,6 +2494,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                      settings.maxIters == 0 ? "automatic" : "%d passes");
                 }
                 dimText("0 = automatic (stops once the render matches)");
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
 
@@ -2382,6 +2502,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Experimental", nullptr,
                                     (jumpToTab == 6) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
+                settingsTabBodyBegin("##tab_experimental");
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");
 
@@ -2472,6 +2593,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText(("Saved to " + configPath() + " under \"experimental\". Open-weight "
                          "model presets for your main provider live under AI → Local.")
                             .c_str());
+                settingsTabBodyEnd();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

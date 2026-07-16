@@ -110,24 +110,51 @@ class CursorSubProvider(Provider):
         else:
             expires_at_ms = int(time.time() * 1000) + 3600 * 1000
 
+        # Prefer a real identity key over derive_account_id's acct-<timestamp>.
+        account_id = None
+        for key in ("sub", "user_id", "userId", "id"):
+            v = claims.get(key)
+            if v is not None and str(v).strip():
+                account_id = str(v).strip()
+                break
+        email = None
+        for key in ("email", "preferred_username", "unique_name", "upn"):
+            v = claims.get(key)
+            if isinstance(v, str) and "@" in v:
+                email = v.strip().lower()
+                break
+
         cred = {
             "access_token": access,
             "refresh_token": refresh,
             "expires_at_ms": expires_at_ms,
-            "account_id": None,
-            "email": None,
+            "account_id": account_id,
+            "email": email,
         }
-        # Preserve identity across refresh when the poll payload omits it.
+        # Preserve identity + last_usage across refresh when the poll payload omits it.
         if self._cred:
-            for k in ("email", "display_name", "plan", "account_id"):
-                if self._cred.get(k) and not cred.get(k):
+            for k in (
+                "email", "display_name", "plan", "account_id",
+                "last_usage", "last_usage_fetched_at",
+            ):
+                if self._cred.get(k) is not None and not cred.get(k):
                     cred[k] = self._cred[k]
-        # Best-effort stripe profile for membershipType / email.
+        # Best-effort stripe profile for membershipType / email / display_name.
         try:
             from . import usage as usage_mod
             cred = usage_mod.enrich_cursor_profile(cred)
         except Exception:
-            pass
+            # Offline-safe friendly label so list_accounts never shows bare acct-…
+            if not cred.get("display_name"):
+                if cred.get("email"):
+                    cred["display_name"] = cred["email"]
+                elif cred.get("plan"):
+                    cred["display_name"] = f"Cursor ({cred['plan']})"
+                else:
+                    cred["display_name"] = "Cursor"
+        # If enrich still left account_id empty, prefer email slug over timestamp.
+        if not cred.get("account_id") and cred.get("email"):
+            cred["account_id"] = sub_auth._slug_account_id(cred["email"])
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

@@ -4,10 +4,10 @@
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
 // + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
-// timeline (what the AI is doing / thinking, expandable), and a bottom composer (segmented
-// Design|Edit|Ask toggle + Permissions + context meter; transparent prompt with an in-box send
-// button; model/thinking toolbar). Header gear swaps the chat area for a compact AI-settings
-// overlay (same in-column pattern as Sessions); the full form lives in the Settings modal AI tab.
+// timeline (what the AI is doing / thinking, expandable), and a bottom composer (Design/Edit/Ask
+// dropdown + context meter; transparent prompt with an in-box send button; model/thinking toolbar).
+// Header gear swaps the chat area for a compact AI-settings overlay (horizontal top tabs for
+// Agents/Prompts/Skills/Permissions/Accounts). The full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
 // as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
 // H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
@@ -1820,6 +1820,29 @@ static void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2
     (void)w;
 }
 
+// Small pencil (edit) glyph — diagonal shaft + tip + eraser band. Drawn, never text.
+static void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col) {
+    const float w = mx.x - mn.x, h = mx.y - mn.y;
+    const float cx = (mn.x + mx.x) * 0.5f;
+    const float cy = (mn.y + mx.y) * 0.5f;
+    const float s = std::min(w, h) * 0.34f;
+    const float th = ui::metrics::stroke(1.35f);
+    // Diagonal body (bottom-left tip → top-right eraser).
+    const ImVec2 tip(cx - s * 0.85f, cy + s * 0.75f);
+    const ImVec2 mid(cx + s * 0.15f, cy - s * 0.25f);
+    const ImVec2 end(cx + s * 0.75f, cy - s * 0.85f);
+    dl->AddLine(tip, mid, col, th);
+    dl->AddLine(mid, end, col, th);
+    // Tip wedge
+    dl->AddTriangleFilled(tip,
+                          ImVec2(tip.x + s * 0.28f, tip.y - s * 0.08f),
+                          ImVec2(tip.x + s * 0.08f, tip.y - s * 0.28f), col);
+    // Eraser band near the top
+    const ImVec2 e0(end.x - s * 0.18f, end.y + s * 0.18f);
+    const ImVec2 e1(end.x + s * 0.12f, end.y - s * 0.12f);
+    dl->AddLine(e0, e1, col, th * 1.15f);
+}
+
 // Shared rectangular less-rounded header button style for Sessions / Checkpoints / gear-as-box.
 // Returns true on click. `active` highlights like an open overlay.
 static bool drawHeaderTextButton(const char* id, const char* label, bool active, float minW = 0.0f) {
@@ -2026,7 +2049,7 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
 
 }  // namespace
 
-// One user turn: right-aligned bubble + ◁◁ rewind + Edit message (AI-VC msg:N).
+// One user turn: right-aligned bubble; rewind + pencil edit actions BELOW the bubble, right-aligned.
 static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           float panelW, int msgIdx) {
     const auto& pal = ui::palette;
@@ -2042,7 +2065,16 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     ImGui::TextColored(accentCol, "You");
     ImGui::PopFont();
 
-    // ◁◁ rewind + Edit message — always shown when AI-VC is available (degrade: hide).
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImRect bubble = endGlassBubble(gb);
+    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
+        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+
+    // ◁◁ rewind + pencil edit — BELOW the bubble, right-aligned (AI-VC available only).
     if (s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy) {
         const double now = ImGui::GetTime();
         if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
@@ -2051,18 +2083,27 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
         }
         const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
 
-        ImGui::SameLine(0, 8.0f * sc);
-        const float sz = ImGui::GetFrameHeight();
-        // Rewind glyph button
+        // Slightly smaller than a full frame; both icons share one right-aligned row.
+        const float btnSz = ImGui::GetFrameHeight() * 0.78f;
+        const float gap = 4.0f * sc;
+        const float totalW = btnSz + gap + btnSz;
+        ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        // Right-align under the bubble's right edge.
+        const float rowX = bubble.Max.x - totalW - ImGui::GetWindowPos().x
+                           + ImGui::GetCurrentWindow()->Scroll.x;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rowX));
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ui::AdaptiveSurface& surf = chatSurf();
+
+        // Rewind glyph button (smaller)
         {
             if (pending) {
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
             }
-            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(sz * 1.15f, sz));
+            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
             const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ui::AdaptiveSurface& surf = chatSurf();
             if (pending || ImGui::IsItemHovered())
                 dl->AddRectFilled(bmn, bmx,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
@@ -2077,9 +2118,6 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
                     s_aiVc.confirmKind = 3;
                     s_aiVc.confirmUntil = now + 4.0;
                 } else {
-                    // Prefer msg:N when the worker advertises msg granularity; else turn-level
-                    // degrade is not available for user rows — still send msg:N (core accepts it
-                    // per contract; unknown targets toast via aiVcOk).
                     aiVcRollback(st, "msg:" + std::to_string(msgIdx),
                                  "Rewound to before this message");
                 }
@@ -2088,25 +2126,25 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
                 ImGui::SetTooltip(pending ? "Click again to confirm rewind."
                                           : "Rewind — restore the part to before this message.");
         }
-        // Edit message — stages UI truncation + composer prefill; rollback only on send.
-        ImGui::SameLine(0, 4.0f * sc);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
-        if (ImGui::SmallButton("Edit message")) {
-            beginEditStage(st, msgIdx);
+
+        // Pencil edit — stages UI truncation + composer prefill; rollback only on send.
+        ImGui::SameLine(0, gap);
+        {
+            const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
+            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+            if (ImGui::IsItemHovered())
+                dl->AddRectFilled(bmn, bmx,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                          surf.textPrimary.z, 0.10f)),
+                    ui::metrics::rounding(4.0f));
+            drawPencilGlyph(dl, bmn, bmx,
+                ImGui::ColorConvertFloat4ToU32(surf.textSecondary));
+            if (clicked) beginEditStage(st, msgIdx);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
         }
-        ImGui::PopStyleVar();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
-    ImGui::PopStyleColor();
-    ImGui::EndChild();
-    ImRect bubble = endGlassBubble(gb);
-    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
-        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
-        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
     ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
@@ -2280,25 +2318,21 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    // Right-side control cluster: [Sessions|< Chat] [Checkpoints] [gear] [status],
+    // Right-side control cluster: [Sessions|< Chat] [Settings] [status],
     // hard-anchored to the column's right edge so every control is always on-screen (T-G17).
     // Sessions and Settings are mutually exclusive in-column overlays over the chat log.
-    // Checkpoints opens the AI-VC popover (hidden when AI-VC RPCs are absent).
-    // Sessions / Checkpoints / gear share drawHeaderTextButton (rectangular less-rounded boxes).
+    // Sessions / Settings share drawHeaderTextButton (rectangular less-rounded boxes).
+    // Checkpoints header button removed — AI-VC timeline stays available via per-message rewind.
     const float gearW = ImGui::CalcTextSize("Settings").x + 16.0f * sc;  // text box like Sessions
     const bool sessionsOpen = st.showSessionsPicker;
     const bool settingsOpen = st.showAISettingsOverlay;
-    const bool showAiVc = s_aiVc.available;
     const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
     // Widths for anchoring: text buttons stretch to fit label (+ padding from helper).
     const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
                                  ImGui::CalcTextSize("< Chat").x) + 16.0f * sc;
-    const float ckptW = showAiVc
-        ? (ImGui::CalcTextSize("Checkpoints").x + 16.0f * sc) : 0.0f;
-    const float histGap = showAiVc ? style.ItemSpacing.x : 0.0f;
     const float dotW  = lh;
     const float rightInset = ui::metrics::U(1);
-    const float cluster = sessW + style.ItemSpacing.x + ckptW + histGap + gearW +
+    const float cluster = sessW + style.ItemSpacing.x + gearW +
                           style.ItemSpacing.x + dotW;
     const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
 
@@ -2344,26 +2378,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
                                        : "Sessions — switch between chats.");
 
-    // Checkpoints text button — same style path as Sessions. Hidden when AI-VC RPCs absent.
-    if (showAiVc) {
-        ImGui::SameLine();
-        centerY(lh);
-        if (drawHeaderTextButton("##hdr_ckpt", "Checkpoints", false, ckptW)) {
-            aiVcFetchTimeline(st, /*force=*/true);
-            ImGui::OpenPopup("##ai_vc_timeline");
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("AI checkpoints — restore the part to a prior step.");
-        if (ImGui::BeginPopup("##ai_vc_timeline")) {
-            aiVcFetchTimeline(st, /*force=*/false);
-            drawAiVcTimelinePopover(st);
-            ImGui::EndPopup();
-        }
-    }
-
     ImGui::SameLine();
     centerY(lh);
-    // Settings as the same stretched rectangular text box as Sessions / Checkpoints (owner ask:
+    // Settings as the same stretched rectangular text box as Sessions (owner ask:
     // identical style, horizontally sized to the label — no icon-only square).
     if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW)) {
         st.showAISettingsOverlay = !st.showAISettingsOverlay;
@@ -3461,12 +3478,13 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 
     auto drawPrivacy = [&]() {
     // ---- privacy / offline ----
-    if (ImGui::Checkbox("Offline mode (local models only \xe2\x80\x94 no network egress)", &s.offlineMode))
+    // Keep labels short enough for narrow columns / high uiScale (CalcTextSize fit).
+    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode))
         changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Refuses any cloud provider (Gemini, Anthropic, OpenAI, xAI, OpenRouter).\n"
                           "Only a local loopback endpoint is allowed. Enforced before every run.");
-    // Session-local (not persisted): matches the composer Permissions popup + Copilot overlay.
+    // Session-local (not persisted): matches the Copilot overlay Permissions tab.
     ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
@@ -4415,9 +4433,11 @@ static void drawOvSkillsTab(AppState& st, float S) {
 
 static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
     Settings& s = st.settings;
-    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
-    ui::InterwebzTwoColumnBegin(12.0f);
-    if (ui::InterwebzGroupBegin("##ov_privacy", "Privacy", ImVec2(0, colH))) {
+    // Single-column stacked groups so narrow copilot width doesn't clip checkbox labels.
+    // (Two-column layout was clipping InterwebzCheckbox text when col_w < label width.)
+    const float gapY = ui::metrics::U(2.0f);
+    if (ui::InterwebzGroupBegin("##ov_privacy", "Privacy", ImVec2(0, 0))) {
+        // Shorter labels + wrap-friendly wording so text is never cut at the glass edge.
         if (ui::InterwebzCheckbox("Offline mode (local only)", &s.offlineMode))
             changed = true;
         if (ImGui::IsItemHovered())
@@ -4429,12 +4449,14 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         ImGui::Dummy(ImVec2(0, 4.0f * S));
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::TextWrapped("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted("Telemetry is not collected \xe2\x80\x94 Billet does not phone home.");
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
     ui::InterwebzGroupEnd();
-    ui::InterwebzTwoColumnNext();
-    if (ui::InterwebzGroupBegin("##ov_run", "Run permissions", ImVec2(0, colH))) {
+    ImGui::Dummy(ImVec2(0, gapY));
+    if (ui::InterwebzGroupBegin("##ov_run", "Run permissions", ImVec2(0, 0))) {
         if (ui::InterwebzCheckbox("Supervised (plan + clarify)", &s.planMode))
             changed = true;
         if (ImGui::IsItemHovered())
@@ -4443,6 +4465,8 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         if (ui::InterwebzCheckbox("Vision (send screenshots)", &s.vision))
             changed = true;
         int iters = s.maxIters;
+        // Give the slider enough width for label + value at any uiScale.
+        ImGui::SetNextItemWidth(ImMax(120.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
         if (ui::InterwebzSliderInt("Refine-pass cap", &iters, 0, 32, "%d")) {
             if (iters < 0) iters = 0;
             s.maxIters = iters;
@@ -4454,7 +4478,6 @@ static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
         ui::InterwebzKeyValueRow("Offline", s.offlineMode ? "on" : "off");
     }
     ui::InterwebzGroupEnd();
-    ui::InterwebzTwoColumnEnd();
 }
 
 static void drawOvAccountsTab(AppState& st, float S) {
@@ -4515,7 +4538,8 @@ static void drawAISettingsBody(AppState& st, bool busy) {
         return;
     }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * S, 5.0f * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(1.25f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(2.0f), ui::metrics::U(1.0f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     ImGui::PushFont(st.fonts.medium);
@@ -4524,22 +4548,64 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextWrapped("Agents, prompts, skills, permissions, accounts.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4.0f * S));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
 
+    // Horizontal top tabs (narrow copilot column — vertical rail wasted width).
     static int s_aiSettingsRail = 0;
     static const char* kRailLabels[] = {
         "Agents", "Prompts", "Skills", "Permissions", "Accounts",
     };
-    static const char* kRailIcons[] = {
-        nullptr, nullptr, nullptr, nullptr, nullptr,
-    };
-    const float railW = 120.0f * S;
-    const float gap = 10.0f * S;
+    const int nTabs = 5;
+    const float tabH = ImGui::GetFrameHeight() + 2.0f * S;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    // Equal-width tabs; min width from longest label so text never clips.
+    float maxLabelW = 0.0f;
+    for (int i = 0; i < nTabs; ++i)
+        maxLabelW = ImMax(maxLabelW, ImGui::CalcTextSize(kRailLabels[i]).x);
+    const float tabPadX = 8.0f * S;
+    const float minTabW = maxLabelW + tabPadX * 2.0f;
+    const float tabW = ImMax(minTabW, availW / (float)nTabs);
+    const bool scrollTabs = (tabW * nTabs > availW + 0.5f);
 
-    ui::InterwebzVTabRail("##ai_ov_rail", kRailLabels, kRailIcons, 5, &s_aiSettingsRail, railW);
-    ImGui::SameLine(0.0f, gap);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f * S, 0));
+    if (scrollTabs) {
+        ImGui::BeginChild("##ai_ov_tabs", ImVec2(0, tabH + 4.0f * S),
+                          ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+    }
+    for (int i = 0; i < nTabs; ++i) {
+        if (i) ImGui::SameLine(0, 2.0f * S);
+        const bool sel = (s_aiSettingsRail == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, sel
+            ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
+                     ui::palette.chipBg[2], ui::palette.chipBg[3])
+            : ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.06f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+            ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_Text, sel ? surf.textPrimary : surf.textSecondary);
+        // Vertically center label via FramePadding + fixed height.
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+            ImVec2(tabPadX, (tabH - ImGui::GetFontSize()) * 0.5f));
+        if (ImGui::Button(kRailLabels[i], ImVec2(tabW, tabH)))
+            s_aiSettingsRail = i;
+        ImGui::PopStyleVar();
+        if (sel) {
+            ImGui::GetWindowDrawList()->AddRect(
+                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                ImGui::ColorConvertFloat4ToU32(semanticOnGlass(ui::palette.accent, surf)),
+                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+        }
+        ImGui::PopStyleColor(4);
+    }
+    if (scrollTabs) ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
 
     ImGui::BeginChild("##ai_ov_body", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(1.5f)));
     switch (s_aiSettingsRail) {
     case 0: drawOvAgentsTab(st, S, changed); break;
     case 1: drawOvPromptsTab(st, S, changed); break;
@@ -4548,12 +4614,13 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     case 4: drawOvAccountsTab(st, S); break;
     default: break;
     }
+    ImGui::PopStyleVar();
     ImGui::EndChild();
 
     if (changed) saveSettings(s);
 
     ImGui::PopStyleColor();  // surf.textPrimary
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);    // ItemSpacing + FramePadding
 }
 
 // ============================ searchable model dropdown ============================
@@ -4585,15 +4652,52 @@ static bool modelHidden(AppState& st, const std::string& id) {
     return st.settings.hiddenModels.count(id) != 0;
 }
 
-// Does this provider have credentials / a reachable endpoint, so its models can be selected?
+// File-static cache of subscription_status "connected" flags so the model picker can show
+// signed-in providers (xAI / Claude / Cursor / Codex) without requiring an API key.
+namespace {
+struct SubConnectedCache {
+    bool xai = false;
+    bool claude = false;
+    bool cursor = false;
+    bool codex = false;
+    double lastPoll = -1e9;
+    bool inFlight = false;
+};
+static SubConnectedCache s_subConn;
+
+static void pollSubConnected(AppState& st) {
+    const double now = ImGui::GetTime();
+    if (s_subConn.inFlight || (now - s_subConn.lastPoll) < 2.0) return;
+    s_subConn.lastPoll = now;
+    s_subConn.inFlight = true;
+    st.rpc.call("subscription_status", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_subConn.inFlight = false;
+        if (!r.ok || !r.result.is_object()) return;
+        auto providers = r.result.value("providers", nlohmann::json::object());
+        auto connected = [](const nlohmann::json& providers, const char* key) {
+            auto p = providers.value(key, nlohmann::json::object());
+            return p.value("connected", false);
+        };
+        s_subConn.xai    = connected(providers, "xai");
+        s_subConn.claude = connected(providers, "claude");
+        s_subConn.cursor = connected(providers, "cursor");
+        s_subConn.codex  = connected(providers, "codex");
+    });
+}
+}  // namespace
+
+// Does this provider have credentials / a reachable endpoint / a signed-in subscription,
+// so its models can be selected?
 static bool providerUsable(AppState& st, int provider) {
+    pollSubConnected(st);
+    (void)s_subConn.cursor;  // reserved: no dedicated PROV_ yet; status still polled
     switch (provider) {
         case ui::PROV_GEMINI:      return st.settings.geminiKey[0] != 0;
-        case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0;
-        case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0;
+        case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
+        case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0 || s_subConn.codex;
         case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0;
-        case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0;  // OAuth also OK; key is the
-                                                                    // cheap check for picker enable
+        case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0 || s_subConn.xai;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
     }
@@ -4764,21 +4868,23 @@ static void drawModelDropdown(AppState& st, bool busy) {
     }
     if (shown == 0) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
-        ImGui::TextWrapped(q.empty() ? "No models available — add a provider key or start a local "
-                                       "model server (gear below)."
-                                     : "No models match your search.");
+        ImGui::TextWrapped(q.empty()
+            ? "No models available — sign in to a subscription (xAI / Claude / Cursor), "
+              "add an API key, or start a local model server (gear below)."
+            : "No models match your search.");
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
 
-    // Unavailable models (no key / endpoint down) are hidden from the list above; surface a
-    // single muted hint pointing at Settings so they're still discoverable.
+    // Unavailable models (no key / not signed in / endpoint down) are hidden from the list above;
+    // surface a single muted hint pointing at Settings so they're still discoverable.
     bool anyUnavailable = false;
     for (const auto& m : ui::builtinModels())
         if (!providerUsable(st, m.provider)) { anyUnavailable = true; break; }
     if (anyUnavailable) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::TextUnformatted("Other providers need an API key \xE2\x80\x94 add one in Settings.");
+        ImGui::TextUnformatted(
+            "Other providers need a sign-in or API key \xE2\x80\x94 add one in Settings.");
         ImGui::PopStyleColor();
     }
 
@@ -5204,58 +5310,65 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
 }
 
-// Prelude row above the prompt: Design + Permissions on the left, context meter on the right.
+// Prelude row above the prompt: Design/Edit/Ask dropdown (left) + context meter (right, same row).
+// Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
     const ui::AdaptiveSurface& surf = chatSurf();
 
-    // No backing strip here: the theme's glassBg wash didn't track the adaptive ink (dark text on
-    // a dark strip over a light model — visual-review fix). The chips carry their own fills; the
-    // pane's glass is the only background, so the adaptive text always reads.
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7 * sc, 2 * sc));
-    // Translucent chips over the glass composer (opaque fills fought the adaptive text).
+    // Vertically center combo label + items via symmetric FramePadding.
+    const float comboH = ImGui::GetFrameHeight();
+    const float padY = ImMax(2.0f * sc, (comboH - ImGui::GetFontSize()) * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, padY));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,
         ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.12f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.16f));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,
+        ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
 
-    // M22 (Hunter's mockup): row 1 = `Permissions ▾` alone on top (context meter rides the same
-    // row right-aligned as a passive readout); row 2 = the Design|Edit|Ask segmented toggle. The
-    // large prompt box and the [model][effort][paperclip]…[send] rail follow in drawComposer.
-    // Trailing spaces reserve room for a DRAWN dropdown caret — the UI font has no U+25BE glyph
-    // (it rendered as a floating "?").
-    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline   "
-                                                    : "Permissions   ";
-    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##cmpperm");
-    {
-        const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-        const float a = 3.0f * sc;
-        const ImVec2 c(bmx.x - 8.0f * sc - a, (bmn.y + bmx.y) * 0.5f - a * 0.4f);
-        ImGui::GetWindowDrawList()->AddTriangleFilled(
-            ImVec2(c.x - a, c.y), ImVec2(c.x + a, c.y), ImVec2(c.x, c.y + a),
-            ImGui::ColorConvertFloat4ToU32(surf.textSecondary));
+    // Design / Edit / Ask — combo (single active mode). Writes st.aiInteraction.
+    const char* modes[] = {"Design", "Edit", "Ask"};
+    const char* modeTips[] = {"Design — model a new part from a description.",
+                              "Edit — change the open part.",
+                              "Ask — questions about the part; nothing changes."};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
+    // Width from longest label so the box doesn't clip text at any scale.
+    float modeW = 0.0f;
+    for (const char* m : modes)
+        modeW = ImMax(modeW, ImGui::CalcTextSize(m).x);
+    modeW += ImGui::GetFrameHeight() + 16.0f * sc;  // caret + padding
+    ImGui::SetNextItemWidth(modeW);
+    if (ImGui::BeginCombo("##aimode", modes[mode], ImGuiComboFlags_HeightSmall)) {
+        for (int i = 0; i < 3; ++i) {
+            const bool needDoc = (i == 1 && !hasDoc);
+            if (needDoc) ImGui::BeginDisabled();
+            const bool sel = (mode == i);
+            if (ImGui::Selectable(modes[i], sel) && !needDoc) {
+                st.aiInteraction = i;
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+            if (needDoc) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
+        }
+        ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
-    if (ImGui::BeginPopup("##cmpperm")) {
-        bool off = st.settings.offlineMode;
-        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off)) {
-            st.settings.offlineMode = off;
-            saveSettings(st.settings);   // the core reads config.json — persist immediately
-        }
-        bool sup = st.settings.planMode;
-        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup)) {
-            st.settings.planMode = sup;
-            saveSettings(st.settings);
-        }
-        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-        ImGui::EndPopup();
-    }
+        ImGui::SetTooltip("%s", modeTips[mode]);
 
+    // Context meter on the SAME row, right-aligned.
     ImGui::SameLine();
     const float room = ImGui::GetContentRegionAvail().x;
     const float w    = measureContextMeter(st, room);
@@ -5263,39 +5376,8 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
     drawContextMeter(st, room);
 
-    // Mode chips: a PROPER segmented toggle (Design | Edit | Ask) — one click, visible state —
-    // instead of the old label-only popup. Active pill = translucent chip fill + accent outline;
-    // inactive pills stay transparent with secondary ink so the row reads on any backdrop.
-    const char* modes[] = {"Design", "Edit", "Ask"};
-    const char* modeTips[] = {"Design — model a new part from a description.",
-                              "Edit — change the open part.",
-                              "Ask — questions about the part; nothing changes."};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
-    for (int i = 0; i < 3; ++i) {
-        if (i) ImGui::SameLine(0, 2 * sc);
-        const bool selMode = (mode == i);
-        const bool needDoc = (i == 1 && !hasDoc);   // Edit needs an open document
-        if (needDoc) ImGui::BeginDisabled();
-        ImGui::PushStyleColor(ImGuiCol_Button, selMode
-            ? ImVec4(pal.chipBg[0], pal.chipBg[1], pal.chipBg[2], pal.chipBg[3])
-            : ImVec4(0, 0, 0, 0));
-        ImGui::PushStyleColor(ImGuiCol_Text, selMode ? surf.textPrimary : surf.textSecondary);
-        if (ImGui::SmallButton(modes[i]) && !selMode) st.aiInteraction = i;
-        ImGui::PopStyleColor(2);
-        if (selMode)
-            ImGui::GetWindowDrawList()->AddRect(
-                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf)),
-                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
-        if (needDoc) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
-    }
-    ImGui::PopStyleVar();
-
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(8);
+    ImGui::PopStyleVar(2);
     ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
 }
 
@@ -5463,16 +5545,20 @@ static void drawCopilotUsageBox(AppState& st) {
                 ui::metrics::rounding(4.0f), 0, ui::metrics::stroke(1.0f));
         }
     }
-    // Line 2: usage bars OR dim "no usage API" for xAI-class empty windows.
+    // Line 2: usage bars, OR a one-shot toast when usage API is absent (no in-composer spam).
     if (s_usage.windows.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        if (prov == "xai")
-            ImGui::TextUnformatted("no usage API — check grok.com Settings \xe2\x86\x92 Usage");
-        else if (s_usage.source == "unavailable" || s_usage.source.empty())
-            ImGui::TextUnformatted("usage unavailable");
-        else
-            ImGui::TextUnformatted("no usage windows");
-        ImGui::PopStyleColor();
+        static std::string s_usageToastKey;
+        std::string key = prov + "|" + s_usage.source + "|" + s_usage.plan + "|" + s_usage.accountId;
+        if (s_usageToastKey != key) {
+            s_usageToastKey = key;
+            if (prov == "xai") {
+                st.toast(ui::ToastLevel::Warn,
+                         "no usage API — check grok.com Settings \xe2\x86\x92 Usage");
+            } else if (s_usage.source == "unavailable" || s_usage.source.empty()) {
+                st.toast(ui::ToastLevel::Warn, "usage unavailable");
+            }
+            // "no usage windows" with a real source is quiet (no toast spam).
+        }
     } else {
         const float barH = 4.0f * sc;
         const float barW = std::max(40.0f * sc, ImGui::GetContentRegionAvail().x * 0.45f);

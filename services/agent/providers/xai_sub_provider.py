@@ -509,17 +509,29 @@ class XAISubProvider(Provider):
         }
         if resp.get("id_token"):
             cred["id_token"] = resp["id_token"]
-        # Preserve plan across refresh; infer plan/display_name from JWT.
-        if self._cred and self._cred.get("plan"):
-            cred["plan"] = self._cred.get("plan")
-        if self._cred and self._cred.get("display_name") and not cred.get("display_name"):
-            cred["display_name"] = self._cred.get("display_name")
+        # Preserve plan/display_name/last_usage across refresh.
+        if self._cred:
+            for k in ("plan", "display_name", "last_usage", "last_usage_fetched_at"):
+                if self._cred.get(k) is not None and not cred.get(k):
+                    cred[k] = self._cred[k]
         try:
             from . import usage as usage_mod
             cred = usage_mod.enrich_xai_identity(cred)
         except Exception:
             if email:
                 cred.setdefault("display_name", email)
+            elif not cred.get("display_name"):
+                # Never leave the UI with a bare UUID account_id as the only label.
+                plan = cred.get("plan")
+                short = (str(account_id).split("-")[0][:8] if account_id else "")
+                if plan and short:
+                    cred["display_name"] = f"Grok ({plan} · {short})"
+                elif plan:
+                    cred["display_name"] = f"Grok ({plan})"
+                elif short:
+                    cred["display_name"] = f"Grok ({short})"
+                else:
+                    cred["display_name"] = "Grok"
         sub_auth.save_credential(PROVIDER_ID, cred)
         self._cred = cred
         return cred

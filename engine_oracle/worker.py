@@ -125,7 +125,8 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
         pass
     run = loop.run_turn(session, request, provider,
                         on_event=emit_event, max_iters=max_iters,
-                        plan_first=bool(plan))
+                        plan_first=bool(plan),
+                        context_refs=params.get("context_refs"))
     return asdict(run)
 
 

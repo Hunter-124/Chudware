@@ -98,3 +98,13 @@ in-code `domainGlyph` vector art for unmapped ids, so a row is never icon-less.
 - **Categories**: `parts_all, cat_fasteners, cat_bearings, cat_stock_metal, cat_drivetrain,
   cat_wheels, cat_tools, cat_cutting_tools, cat_electronics, cat_hydraulics, cat_hardware`
 - **Panel chrome**: `vendor_globe, browser_panel, filter_funnel, health_check`
+
+## Chat context refs (Wave 4, append-only)
+
+Composer copilot toolbar icons for the chat context-reference feature:
+
+- `paperclip` — composer file-attach button (remade crisp diagonal double-wire clip;
+  replaces the old inline ImDrawList glyph, now a proper atlas id).
+- `context_cube` — composer context-pick button; the Billet logo cube drawn outline-only
+  (transparent background, theme stroke so the SDF tints by icon/text role). Arms the
+  viewport/feature-tree context picker (AppState::contextPickActive).

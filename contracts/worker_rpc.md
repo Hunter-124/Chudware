@@ -377,6 +377,14 @@ continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_
 `get_prompts` (v2 result: `{prompts:[{role, path, override_path, text, overridden}]}`) ·
 `agent_cancel {run_id}` → best-effort stop at the next stage boundary.
 
+### AI context references (Wave 4, append-only)
+`agent_design` and `agent_run_v2` accept an OPTIONAL `context_refs?: [{kind, id, doc_id?,
+label}]` array — model entities the user attached to the prompt via the composer context-cube
+picker (kind ∈ `component|body|face|edge|sketch|feature`). The host ALSO inlines the same
+refs as a plain-text "Context references:" block in `request` so the C++ `agent_run` path
+surfaces them; the structured array is the machine-readable mirror for the Python turn path
+(`loop.run_turn` / `agent_turn.run_turn`). Absent/empty = no-op; malformed entries skipped.
+
 `options.workflow`/`options.profile`: `"auto"` (default), `"micro"`/`"local"`/`"small-context"`
 to force the decomposed local-model workflow, or `"full"`/`"standard"` to force the normal v2
 machine. The micro workflow decomposes into tiny single-step executor calls and applies/validates

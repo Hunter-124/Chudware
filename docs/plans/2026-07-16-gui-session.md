@@ -108,3 +108,25 @@ and the Agents/Prompts/Skills/Permissions/Accounts overlay tabs also live there.
 - Q CallbackPage providers/sub_auth.py (CallbackServer do_GET 62-87): (13) brand the
   localhost:54545/callback success/failure HTML.
 Gate 3: ./build.sh + agent pytest (subscription/usage) + gui_lint theme -> commit+push.
+
+## Wave 5 (Assembly tools -> PropertyManager forms + popup chrome) — interjection batch
+Follow-up on wave-1 assembly work. Assembly tool forms currently render as ad-hoc popups
+(asm_panels.cpp); user wants them to behave like the 3D modeling tools.
+- Insert Comp.: ADD an explicit "Browse from disk" file-explorer button (in addition to the
+  open/recent list) so a part can be picked from disk.
+- Mate, Insert Comp., Comp. Pattern, Interference, Exploded View: render as PropertyManager
+  forms OVER the feature manager (like modeling tools), with reference selections in the
+  standard 3D-body selection-well style; bring spacing/styling to the modeling-tool standard.
+- BOM: keep as its own window, but fix the transparent title-bar/border chrome on it and the
+  other popup windows WITHOUT ruining feature-manager/copilot transparency over the viewport.
+Files: host/src/ui/asm_panels.cpp(+.h), host/src/ui/property_manager.cpp/pm_forms.cpp (PM
+integration), glass-window/modal chrome helper (gui-theme-layout). Dispatch AFTER wave-4 gate.
+Gate 5: ./build.sh + gui_lint theme + boot smoke (asm scenario) -> commit+push.
+
+## Wave 5 add-on: Feature Manager row artifact
+A weird visual artifact afflicts Feature Manager row elements (bright square-cornered
+edge/strip on rows, e.g. mate rows) — very likely the SAME class M fixed in wave-2 ribbon
+(AddRectFilledMultiColor square corners poking outside a rounded outline). Find the FM row
+highlight/pill helper (fmRowPill / a shared vGradRounded in feature_tree.cpp or a theme
+helper) and fix the square-corner bleed; apply the identical fix to every afflicted surface.
+File: host/src/ui/feature_tree.cpp (+ shared helper if the gradient lives in ui_theme).

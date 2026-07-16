@@ -523,6 +523,147 @@ def test_enrich_helpers_login_time(monkeypatch):
     assert x["display_name"] == "g@x.ai"
 
 
+def test_xai_display_name_never_bare_uuid(tmp_config, monkeypatch):
+    """UUID-only xAI accounts get a friendly Grok label, not the raw sub."""
+    uuid = "06dc3359-1234-5678-9abc-def012345678"
+    token = _jwt({"sub": uuid, "plan": "SuperGrok"})
+    sub_auth.save_credential("xai-sub", {
+        "access_token": token,
+        "refresh_token": "rt",
+        "account_id": uuid,
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id=uuid)
+
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_JWT)
+    monkeypatch.setattr(usage, "_http_get", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("jwt path must not hit network")
+    ))
+
+    row = usage.fetch_account_usage("xai", uuid, force=True)
+    assert row["display_name"]
+    assert not usage._looks_like_uuid(row["display_name"])
+    assert "Grok" in row["display_name"] or "SuperGrok" in (row["display_name"] or "")
+    assert row["plan"] == "SuperGrok"
+    # Persisted onto the credential for list_accounts / restart.
+    cred = sub_auth.load_credential("xai-sub", account_id=uuid)
+    assert cred["display_name"]
+    assert not usage._looks_like_uuid(cred["display_name"])
+
+    # enrich helper alone never returns bare UUID either.
+    bare = usage.enrich_xai_identity({"access_token": token, "account_id": uuid})
+    assert bare["display_name"]
+    assert not usage._looks_like_uuid(bare["display_name"])
+
+
+def test_cursor_identity_without_usage_endpoint(tmp_config, monkeypatch):
+    """When /auth/usage fails, still surface email/plan — never bare acct-…."""
+    sub_auth.save_credential("cursor", {
+        "access_token": "ctok",
+        "refresh_token": "rt",
+        "account_id": "acct-1784192914",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="acct-1784192914")
+
+    def fake_http(url, headers=None, timeout=20.0):
+        if url.endswith("/auth/usage"):
+            return 401, {"error": "unauthorized"}, {}
+        if url.endswith("/full_stripe_profile"):
+            return 200, {
+                "membershipType": "pro",
+                "email": "dev@cursor.com",
+                "name": "Dev",
+            }, {}
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    row = usage.fetch_account_usage("cursor", "acct-1784192914", force=True)
+    assert row["display_name"] == "Dev"
+    assert row["email"] == "dev@cursor.com"
+    assert row["plan"] == "pro"
+    assert not usage._looks_like_acct_slug(row["display_name"])
+    # Usage empty but source marked unavailable (identity still ok).
+    assert row["usage"] == []
+    assert row["source"] in ("unavailable", "api")
+
+    # enrich alone with no network still yields a non-acct label.
+    offline = usage.enrich_cursor_profile({
+        "account_id": "acct-1784192914",
+        "plan": "pro",
+    })
+    assert offline["display_name"]
+    assert not usage._looks_like_acct_slug(offline["display_name"])
+    assert "Cursor" in offline["display_name"] or offline["display_name"] == "pro"
+
+
+def test_claude_usage_restored_after_cold_reload(tmp_config, monkeypatch):
+    """last_usage on the credential restores bars when in-process cache is empty."""
+    windows = [
+        {"window": "5h", "label": "5 hour", "used_fraction": 0.33,
+         "resets_at": "2026-07-20T00:00:00Z", "status": "ok"},
+        {"window": "7d", "label": "7 day", "used_fraction": 0.1,
+         "resets_at": None, "status": "ok"},
+    ]
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "t",
+        "email": "a@c.com",
+        "account_id": "acct-a",
+        "display_name": "Ada",
+        "plan": "max",
+        "last_usage": windows,
+        "last_usage_fetched_at": time.time(),
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="acct-a")
+
+    # Simulate cold start: empty in-process cache + live fetch failure.
+    usage.clear_cache()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(usage, "_http_get", boom)
+    row = usage.fetch_account_usage("claude", "acct-a", force=True)
+    assert row["display_name"] == "Ada"
+    assert row["usage"], "expected last_usage restored after cold reload"
+    assert row["usage"][0]["window"] == "5h"
+    assert abs(row["usage"][0]["used_fraction"] - 0.33) < 1e-9
+    assert row["source"] == "cached"
+
+
+def test_claude_usage_persisted_on_successful_fetch(tmp_config, monkeypatch):
+    """Successful live fetch writes last_usage onto the credential."""
+    sub_auth.save_credential("anthropic-sub", {
+        "access_token": "t",
+        "email": "a@c.com",
+        "account_id": "acct-a",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="acct-a")
+
+    def fake_http(url, headers=None, timeout=20.0):
+        if url.endswith("/usage"):
+            return 200, {
+                "five_hour": {"utilization": 0.5, "resets_at": "2026-07-20T00:00:00Z"},
+                "seven_day": {"utilization": 0.2, "resets_at": None},
+            }, {}
+        if url.endswith("/profile"):
+            return 200, {
+                "email": "a@c.com",
+                "display_name": "Ada",
+                "subscriptionType": "max",
+                "uuid": "acct-a",
+            }, {}
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    usage.clear_cache()
+    row = usage.fetch_account_usage("claude", "acct-a", force=True)
+    assert row["usage"]
+    cred = sub_auth.load_credential("anthropic-sub", account_id="acct-a")
+    assert isinstance(cred.get("last_usage"), list) and cred["last_usage"]
+    assert cred["last_usage"][0]["window"] in ("5h", "7d")
+    assert cred.get("last_usage_fetched_at")
+
+
+
 def test_status_fraction_mapping():
     assert usage._status_from_fraction(0.0) == "ok"
     assert usage._status_from_fraction(0.89) == "ok"

@@ -354,3 +354,78 @@ def test_replay_grok45_specify_transcript_passes_gate():
         c.get("tool") == "ledger_note" and c.get("ok")
         for c in res.result.get("calls") or []
     )
+
+
+def test_context_refs_surfaced_in_user_message():
+    """Wave 4: structured context_refs appear in the model's user turn."""
+    seen = {"messages": None}
+
+    class _CaptureProvider:
+        name = "capture"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seen["messages"] = messages
+            return '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```'
+
+    refs = [
+        {"kind": "face", "id": "f:top", "doc_id": "doc-1", "label": "Top face"},
+        {"kind": "sketch", "id": "sk1", "doc_id": "doc-1", "label": "Profile"},
+        {"kind": "edge", "id": ""},  # malformed — skipped
+        "not-a-dict",  # malformed — skipped
+    ]
+    res = agent_turn.run_turn(
+        "fillet the selected edges",
+        _CaptureProvider(),
+        allowed_tools=["measure_part"],
+        tool_dispatch=lambda t, a: {"ok": True},
+        context_refs=refs,
+    )
+    assert res.success is True
+    assert seen["messages"] is not None
+    user_text = ""
+    for part in (seen["messages"][0].get("content") or []):
+        if isinstance(part, dict) and part.get("type") == "text":
+            user_text += part.get("text", "")
+    assert "Context references" in user_text
+    assert 'face "Top face" id=f:top doc_id=doc-1' in user_text
+    assert 'sketch "Profile" id=sk1 doc_id=doc-1' in user_text
+    assert "fillet the selected edges" in user_text
+
+
+def test_context_refs_absent_is_noop():
+    """Absent/empty context_refs leave the user message unchanged."""
+    seen = {"messages": None}
+
+    class _CaptureProvider:
+        name = "capture"
+
+        def complete(self, system, messages, max_tokens=8000):
+            seen["messages"] = messages
+            return '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```'
+
+    agent_turn.run_turn(
+        "just a plain request",
+        _CaptureProvider(),
+        tool_dispatch=lambda t, a: {},
+        context_refs=None,
+    )
+    assert seen["messages"] is not None
+    user_text = ""
+    for part in (seen["messages"][0].get("content") or []):
+        if isinstance(part, dict) and part.get("type") == "text":
+            user_text += part.get("text", "")
+    assert "Context references" not in user_text
+    assert "just a plain request" in user_text
+
+    # empty list also no-op
+    agent_turn.run_turn(
+        "just a plain request",
+        _CaptureProvider(),
+        tool_dispatch=lambda t, a: {},
+        context_refs=[],
+    )
+    user_text2 = ""
+    for part in (seen["messages"][0].get("content") or []):
+        if isinstance(part, dict) and part.get("type") == "text":
+            user_text2 += part.get("text", "")
+    assert "Context references" not in user_text2

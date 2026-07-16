@@ -321,7 +321,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              phase: str | None = None,
              task_class: str | None = None,
              msg_idx: int | None = None,
-             doc_id: str | None = None) -> TurnResult:
+             doc_id: str | None = None,
+             context_refs=None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -390,17 +391,53 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     actor = actor or name
     # WI-8: inject reference builds into the user request for A/B specify.
     _req = request
+    # Wave 4: surface GUI context_refs before scaffolds so both the model and
+    # reference-build novelty see the picked entities. No-op if absent/empty.
+    try:
+        from services.agent.loop import apply_context_refs as _apply_ctx  # noqa: PLC0415
+        _req = _apply_ctx(_req, context_refs)
+    except Exception:  # noqa: BLE001 — never break the turn on a missing helper
+        if context_refs:
+            try:
+                # Defensive local fallback (same shape as loop.apply_context_refs).
+                _lines = []
+                for _raw in (context_refs if isinstance(context_refs, (list, tuple)) else []):
+                    if not isinstance(_raw, dict):
+                        continue
+                    _k = str(_raw.get("kind") or "").strip()
+                    _i = str(_raw.get("id") or "").strip()
+                    if not _k or not _i:
+                        continue
+                    _lab = str(_raw.get("label") or "").strip()
+                    _doc = str(_raw.get("doc_id") or _raw.get("docId") or "").strip()
+                    _ln = f"- {_k}"
+                    if _lab:
+                        _ln += f' "{_lab}"'
+                    _ln += f" id={_i}"
+                    if _doc:
+                        _ln += f" doc_id={_doc}"
+                    _lines.append(_ln)
+                if _lines:
+                    _blk = (
+                        "Context references (user-picked model entities — resolve/"
+                        "measure/target via describe_part, query_geometry, "
+                        "measure_between, measure_part, hover using the listed "
+                        "id/doc_id):\n" + "\n".join(_lines)
+                    )
+                    _req = (_req + "\n\n" + _blk) if _req else _blk
+            except Exception:  # noqa: BLE001
+                pass
     if _sc is not None and _cap is not None:
         try:
             _ref = _sc.reference_build_context(
-                _cap, request,
+                _cap, _req,
                 task_class=task_class or getattr(mission_dispatch, "task_class", None)
                 if mission_dispatch is not None else task_class,
                 phase=_phase or "specify",
                 ledger=ledger, actor=actor,
             )
             if _ref:
-                _req = request + "\n\n" + _ref
+                _req = _req + "\n\n" + _ref
         except Exception:  # noqa: BLE001
             pass
 
@@ -438,7 +475,12 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         _sid = subagent_id or run_id or name or "_turn"
         _clean, _hits = _skills.resolve_slash(_req)
         if _hits and _clean.strip():
-            _req = _clean
+            # Keep context_refs visible after slash-command stripping.
+            try:
+                from services.agent.loop import apply_context_refs as _reapply  # noqa: PLC0415
+                _req = _reapply(_clean, context_refs)
+            except Exception:  # noqa: BLE001
+                _req = _clean
             messages = [{"role": "user", "content": _parts(_req)}]
         _sk = _skills.session_system_block(_sid, user_text=request, phase=_phase)
         if _sk:

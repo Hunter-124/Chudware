@@ -48,6 +48,36 @@ static inline bool jftbool(const nlohmann::json& o, const char* k, bool def = fa
     auto it = o.find(k);
     return (it != o.end() && it->is_boolean()) ? it->get<bool>() : def;
 }
+
+// Wave4: chat context-ref capture (composer "context cube"). Toggle by id.
+static void togglePendingContextRef(AppState& st, AppState::ContextRef ref) {
+    if (ref.id.empty()) return;
+    auto& refs = st.pendingContextRefs;
+    for (auto it = refs.begin(); it != refs.end(); ++it) {
+        if (it->id == ref.id) {
+            refs.erase(it);
+            return;
+        }
+    }
+    refs.push_back(std::move(ref));
+}
+
+static void pushFeatureContextRef(AppState& st, const std::string& fid,
+                                  const std::string& name, const std::string& type) {
+    if (fid.empty()) return;
+    AppState::ContextRef ref;
+    if (type == "sketch" || type == "sketch3d")
+        ref.kind = "sketch";
+    else if (type == "import")
+        ref.kind = "component";  // imported part treated as component-like for the agent
+    else
+        ref.kind = "feature";
+    ref.id = fid;
+    ref.docId = st.docMirror.docId();
+    ref.label = name.empty() ? fid : name;
+    togglePendingContextRef(st, std::move(ref));
+}
+
 // C37-E: tolerant number accessor (feature_status "ms" timing).
 static inline double jftnum(const nlohmann::json& o, const char* k, double def = -1.0) {
     auto it = o.find(k);
@@ -1301,7 +1331,30 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
         if (c.selected && ImGui::MenuItem("Deselect"))
             clearTreeFeatureSelection(st);
-        if (c.selected) ImGui::Separator();
+        // Wave4: attach this row (or multi-set) to the chat without arming the cube.
+        if (ImGui::MenuItem("Add to AI context")) {
+            if (multi) {
+                for (const auto& id : s_multiSel) {
+                    // Prefer display name from the live tree when available.
+                    std::string nm = id, tp;
+                    const auto& tree = st.docMirror.tree();
+                    if (tree.is_object() && tree.contains("features") &&
+                        tree["features"].is_array()) {
+                        for (const auto& f : tree["features"]) {
+                            if (!f.is_object() || jfld(f, "id") != id) continue;
+                            nm = jfld(f, "name");
+                            if (nm.empty()) nm = id;
+                            tp = jfld(f, "type");
+                            break;
+                        }
+                    }
+                    pushFeatureContextRef(st, id, nm, tp);
+                }
+            } else {
+                pushFeatureContextRef(st, fid, c.name, c.type);
+            }
+        }
+        ImGui::Separator();
         if (!c.canDoc) ImGui::BeginDisabled();   // gate mutating items while an agent run is busy
 
         // ---- type-specific edit / open (selection-dependent; item 8 FM RMB) ----
@@ -2287,6 +2340,15 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             ImGui::SetTooltip(hidden ? "Show Component" : "Hide Component");
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
         }
+        // Wave4: armed cube — LMB on component (not the eye) toggles chat context ref.
+        if (st.contextPickActive && ImGui::IsItemClicked(ImGuiMouseButton_Left) && !overCompEye) {
+            AppState::ContextRef ref;
+            ref.kind = "component";
+            ref.id = cid;
+            ref.docId = st.docMirror.docId();
+            ref.label = cname.empty() ? cid : cname;
+            togglePendingContextRef(st, std::move(ref));
+        }
         pushTreePopupGlass();
         if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
             // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
@@ -2308,6 +2370,14 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 openComponentPart(st, absPath);
             if (unavailable) ImGui::EndDisabled();
             ImGui::Separator();
+            if (ImGui::MenuItem("Add to AI context")) {
+                AppState::ContextRef ref;
+                ref.kind = "component";
+                ref.id = cid;
+                ref.docId = st.docMirror.docId();
+                ref.label = cname.empty() ? cid : cname;
+                togglePendingContextRef(st, std::move(ref));
+            }
             if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
                 toggleCompHidden(!hidden);
             ImGui::EndPopup();
@@ -3501,6 +3571,14 @@ void drawFeatureTreeBody(AppState& st,
                             std::snprintf(ctxId, sizeof(ctxId), "##body_ctx%d", bi);
                             pushTreePopupGlass();
                             if (ImGui::BeginPopupContextItem(ctxId)) {
+                                if (ImGui::MenuItem("Add to AI context")) {
+                                    AppState::ContextRef ref;
+                                    ref.kind = "body";
+                                    ref.id = "b" + std::to_string(bid);
+                                    ref.docId = st.docMirror.docId();
+                                    ref.label = bname;
+                                    togglePendingContextRef(st, std::move(ref));
+                                }
                                 if (ImGui::MenuItem(hidden ? "Show" : "Hide"))
                                     setBodyShown(st, bi, hidden);
                                 if (ImGui::MenuItem("Isolate")) {
@@ -3529,7 +3607,18 @@ void drawFeatureTreeBody(AppState& st,
                                 ImGui::EndPopup();
                             }
                             popTreePopupGlass();
-                            if (rowClicked) setBodyShown(st, bi, hidden);
+                            if (rowClicked) {
+                                if (st.contextPickActive) {
+                                    AppState::ContextRef ref;
+                                    ref.kind = "body";
+                                    ref.id = "b" + std::to_string(bid);
+                                    ref.docId = st.docMirror.docId();
+                                    ref.label = bname;
+                                    togglePendingContextRef(st, std::move(ref));
+                                } else {
+                                    setBodyShown(st, bi, hidden);
+                                }
+                            }
                             if (rowHovered)
                                 ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", bname);
                         }
@@ -4264,6 +4353,13 @@ void drawFeatureTreeBody(AppState& st,
                                 s_lastClickId = fid;
                                 s_lastClickTime = now;
                             }
+                        }
+
+                        // Wave4: context-cube armed → also push this row into pendingContextRefs.
+                        if (st.contextPickActive &&
+                            (rr.clicked || rr.ctrlClicked) &&
+                            ftype != "plane") {
+                            pushFeatureContextRef(st, fid, fname, ftype);
                         }
 
                         if (nested) ImGui::Unindent(nestIndent);   // balance the whole-row indent

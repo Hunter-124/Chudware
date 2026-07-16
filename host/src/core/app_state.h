@@ -1341,6 +1341,22 @@ struct AppState {
     // small text files are inlined into the request, every path travels in the RPC payload's
     // "attachments" field).
     std::vector<std::string> pendingAttachments;
+    // pendingContextRefs (Wave4): model entities the user attached to the NEXT prompt via the
+    // composer "context cube" button — parts/components, faces, edges, sketches, features picked
+    // from the viewport or the feature tree. Shown as chips above the input beside file
+    // attachments; consumed + cleared by submitTurn, which serializes them into the RPC payload's
+    // "context_refs" array so the agent can resolve/measure/target exactly those entities.
+    struct ContextRef {
+        std::string kind;   // "component" | "body" | "face" | "edge" | "sketch" | "feature"
+        std::string id;     // stable selector/id (feature id, component id, or face/edge sid)
+        std::string docId;  // owning doc (assembly/part) — empty = active doc
+        std::string label;  // human chip label (e.g. "Front face of Wheel", "Sketch1")
+    };
+    std::vector<ContextRef> pendingContextRefs;
+    // While true the composer "context cube" is armed: viewport picks and feature-tree row clicks
+    // append to pendingContextRefs instead of (or alongside) normal selection. Esc / re-click
+    // disarms. Mirrors a PropertyManager selection well but routes into the chat context store.
+    bool contextPickActive = false;
 
     // ---- C25: ribbon dispatch hook (set in app.cpp after the ribbon callback is wired) ----
     // Allows UI widgets (shortcut bar, gesture wheel) to fire ribbon commands without

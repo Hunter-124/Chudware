@@ -1555,6 +1555,100 @@ static std::string resolveVpComponentPath(const std::string& srcPath,
     return (fs::path(assemblyDocPath).parent_path() / path).lexically_normal().string();
 }
 
+// ---- Wave4: chat context-ref capture (composer "context cube") ----------------------------
+// Toggle by id: re-picking the same entity removes it. Labels stay short for chip display.
+static void togglePendingContextRef(AppState& st, AppState::ContextRef ref) {
+    if (ref.id.empty()) return;
+    auto& refs = st.pendingContextRefs;
+    for (auto it = refs.begin(); it != refs.end(); ++it) {
+        if (it->id == ref.id) {
+            refs.erase(it);
+            return;
+        }
+    }
+    refs.push_back(std::move(ref));
+}
+
+// Human feature name from the mirror tree (fallback to fid).
+static std::string contextFeatureName(AppState& st, const std::string& fid) {
+    if (fid.empty()) return {};
+    const nlohmann::json* f = findFeature(st.docMirror.tree(), fid);
+    if (!f) return fid;
+    std::string n = f->value("name", std::string());
+    return n.empty() ? fid : n;
+}
+
+// Build a ContextRef from a viewport pick. Face/edge ids prefer the resolved selector string
+// when the worker is ready; otherwise a stable body:topo key the agent can re-resolve.
+static bool makeContextRefFromPick(AppState& st, const render::PickHit& h,
+                                   AppState::ContextRef& out) {
+    if (!h.valid()) return false;
+    out = AppState::ContextRef{};
+    out.docId = st.docMirror.docId();
+
+    // Assembly: prefer component when the pick lands on a component body (still face/edge if
+    // those kinds win — the chip names the component for context).
+    const nlohmann::json* comp = nullptr;
+    std::string compName;
+    if (docIsAssembly(st)) {
+        comp = asmComponentByOrdinal(st, h.body_id);
+        if (comp) {
+            out.kind = "component";  // overwritten below for face/edge
+            out.id = comp->value("id", std::string());
+            compName = comp->value("name", std::string());
+            if (compName.empty()) compName = out.id;
+            out.label = compName;
+        }
+    }
+
+    if (h.kind == render::PickKind::Face || h.kind == render::PickKind::Edge) {
+        const bool isFace = h.kind == render::PickKind::Face;
+        out.kind = isFace ? "face" : "edge";
+        std::string sel;
+        if (st.workerStarted && st.docMirror.hasDoc() && !st.job.running.load()) {
+            std::string err;
+            const char* k = isFace ? "face" : "edge";
+            if (docIsAssembly(st)) {
+                std::string cname;
+                sel = st.docMirror.resolvePickAsm(st.worker, h.body_id, k, h.topo_id, cname, err);
+                if (!cname.empty() && compName.empty()) compName = cname;
+            } else {
+                sel = st.docMirror.resolvePick(st.worker, h.body_id, k, h.topo_id, err);
+            }
+        }
+        if (!sel.empty()) {
+            out.id = std::move(sel);
+        } else {
+            // Stable local key until/without resolve.
+            out.id = (isFace ? "face:" : "edge:") + std::to_string(h.body_id) + ":" +
+                     std::to_string(h.topo_id);
+        }
+        std::string owner = isFace
+            ? st.docMirror.ownerOfFace(h.body_id, h.topo_id)
+            : st.docMirror.ownerOfEdge(h.body_id, h.topo_id);
+        std::string ownerName = contextFeatureName(st, owner);
+        if (!compName.empty()) {
+            out.label = isFace ? ("Face of " + compName) : ("Edge of " + compName);
+        } else if (!ownerName.empty()) {
+            out.label = isFace ? ("Face of " + ownerName) : ("Edge of " + ownerName);
+        } else {
+            out.label = st.pickLabel(h);
+            if (out.label.empty()) out.label = isFace ? "Face" : "Edge";
+        }
+        return true;
+    }
+
+    // Body-level (or assembly component with non face/edge pick): component already filled above.
+    if (comp && !out.id.empty()) return true;
+
+    // Part multi-body: treat as body.
+    out.kind = "body";
+    out.id = "b" + std::to_string(h.body_id);
+    out.label = "Body" + std::to_string(h.body_id);
+    return !out.id.empty();
+}
+
+
 // T-PERF2: latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
 static void asmDragKickAsync(AppState& st);
 
@@ -3142,15 +3236,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot &&
                 !blendDeselectHot && !s_pp.active && !s_dim.active) {
+                // Wave4 context cube: arm → append/toggle pendingContextRefs (chips via composer).
+                // Still update normal selection so the face/edge highlight stays readable.
+                if (st.contextPickActive && st.hover.valid()) {
+                    AppState::ContextRef ref;
+                    if (makeContextRefFromPick(st, st.hover, ref))
+                        togglePendingContextRef(st, std::move(ref));
+                }
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else if (st.hover.valid()) {
                     st.selection.selectOne(st.hover);
-                } else {
-                    // W2 / Wave4: a left click on empty 3D space (no pick hit) deselects ALL
-                    // selection kinds (topology + feature-tree multi-select + sketch entities +
-                    // plane/datum emphasis via clearSelection), so clicking the open viewport
-                    // clears the model the way SolidWorks does.
+                } else if (!st.contextPickActive) {
+                    // Empty-space clear only when the cube is NOT armed (armed mode accumulates).
                     st.clearSelection();
                 }
             }
@@ -3165,6 +3263,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     // (the PM re-previews) and end the drag. The PM itself stays open.
                     if (st.propertyManager) st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
                     s_dim.reset();
+                } else if (st.contextPickActive) {
+                    // Wave4: Esc finishes context-pick mode (composer cube). Keep selection.
+                    st.contextPickActive = false;
                 }
                 else if (imgHovered) st.selection.clear();
             }
@@ -3286,7 +3387,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         if (ImGui::BeginPopup("##vp_ctx")) {
             // ---- ITEM 8: selection-dependent entries ----
-            // Assembly component under cursor/selection.
             if (vpHasComp) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
@@ -3306,6 +3406,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (!pathOk) ImGui::EndDisabled();
                 if (ImGui::MenuItem("Edit Mates"))
                     st.requestEditComponentMates = vpCompId;
+                if (ImGui::MenuItem("Add to AI context")) {
+                    AppState::ContextRef ref;
+                    ref.kind = "component";
+                    ref.id = vpCompId;
+                    ref.docId = st.docMirror.docId();
+                    ref.label = vpCompName.empty() ? vpCompId : vpCompName;
+                    togglePendingContextRef(st, std::move(ref));
+                }
                 if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
                     if (st.docMirror.hasDoc() && st.workerStarted) {
                         nlohmann::json op = {{"op", "asm_edit_component"},
@@ -3342,6 +3450,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         if (st.propertyManager->openForEdit(st, st.selectedFeatureId))
                             st.leftPaneTab = AppState::LP_PropertyManager;
                     }
+                }
+
+                // Wave4: push current topo selection into chat context chips (no pick mode needed).
+                if (ImGui::MenuItem("Add to AI context")) {
+                    const render::PickHit& hit = st.selection.items().back().hit;
+                    AppState::ContextRef ref;
+                    if (makeContextRefFromPick(st, hit, ref))
+                        togglePendingContextRef(st, std::move(ref));
                 }
 
                 // Hide / Show / Isolate body (host-side bodyVisible, same as FM Solid Bodies).
@@ -3853,6 +3969,34 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                          ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), pickSurf, st.pickStatus.c_str());
         }
+
+        // Wave4: context-cube pick mode banner (mirrors PM selection-well language).
+        if (st.contextPickActive) {
+            const float s2 = ui::uiScale;
+            const char* hint =
+                "Pick parts, faces, edges, sketches, or features for chat — Esc to finish";
+            ImVec2 ts = ImGui::CalcTextSize(hint);
+            float bannerRight = cr1.x;
+            {
+                const float e = ui::overlayColumnEdge(1);
+                if (e > cr0.x + ts.x + 60.0f * s2 && e < cr1.x) bannerRight = e;
+            }
+            // Sit just under the pick-status readout row.
+            ImVec2 bp0(bannerRight - ts.x - 20.0f * s2,
+                       cr0.y + (inSketch ? 32.0f : 64.0f) * s2);
+            ImVec2 bp1(bannerRight - 8.0f * s2, bp0.y + ts.y + 10.0f * s2);
+            const ui::AdaptiveSurface& banSurf =
+                ui::adaptivePanel(ui::panelId("vp_ctx_pick_banner"), ImRect(bp0, bp1),
+                                 ui::GlassGroup::Hud);
+            ui::glassPanel(vdl, ImRect(bp0, bp1), ui::GlassLevel::UltraThin, 5.0f, banSurf);
+            // Accent left bar so it reads as an active pick mode (same language as PM wells).
+            vdl->AddRectFilled(ImVec2(bp0.x, bp0.y + 2.0f * s2),
+                              ImVec2(bp0.x + 3.0f * s2, bp1.y - 2.0f * s2),
+                              ui::Palette::toU32(vpal.accent), 1.5f * s2);
+            ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                         ImVec2(bp0.x + 9.0f * s2, bp0.y + 5.0f * s2), banSurf, hint);
+        }
+
 
         // ---- Instant3D push-pull handle + live readout ----
         // The drag-to-extrude arrow is shown ONLY while the user is editing (tree "Edit Feature")

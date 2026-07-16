@@ -369,7 +369,32 @@ def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
     }, token_endpoint="https://auth.x.ai/oauth2/token")
     assert cred["email"] == "grok@x.ai"
     assert cred["account_id"] == "user-1"
+    assert cred["display_name"] == "grok@x.ai"
     assert sub_auth.load_credential(PROVIDER_ID)["refresh_token"] == "rt"
+    assert sub_auth.load_credential(PROVIDER_ID)["display_name"] == "grok@x.ai"
+
+
+def test_xai_store_tokens_uuid_only_gets_friendly_name(tmp_config, monkeypatch):
+    """JWT with sub UUID and no email still sets a non-UUID display_name."""
+    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+
+    p = XAISubProvider()
+    uuid = "06dc3359-aaaa-bbbb-cccc-ddddeeeeffff"
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": uuid, "plan": "SuperGrok"}).encode()
+    ).decode().rstrip("=")
+    token = f"hdr.{payload}.sig"
+    cred = p._store_tokens({
+        "access_token": token,
+        "refresh_token": "rt",
+        "expires_in": 3600,
+    }, token_endpoint="https://auth.x.ai/oauth2/token")
+    assert cred["account_id"] == uuid
+    assert cred["display_name"]
+    assert cred["display_name"] != uuid
+    assert "Grok" in cred["display_name"] or "SuperGrok" in cred["display_name"]
+    stored = sub_auth.load_credential(PROVIDER_ID)
+    assert stored["display_name"] == cred["display_name"]
 
 
 def test_xai_login_device_true_still_opens_browser(tmp_config, monkeypatch):

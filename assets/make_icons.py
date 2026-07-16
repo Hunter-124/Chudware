@@ -103,8 +103,9 @@ CONTRACT_NAMES: list[str] = [
     "plan_board", "issue_bug", "milestone_flag", "team",
     # ---- PLM Git tab (append-only) ----
     "git",
-    # ---- Thread Wizard (append-only): Features tab thread-cut feature ----
     "thread",
+    # ---- Chat context refs (Wave 4, append-only): composer attach + context picker ----
+    "paperclip", "context_cube",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3658,6 +3659,93 @@ def draw_team(d, cell, p):
               outline=p.stroke, width=lw, fill=_rgba(p.stroke, 30))
     d.pieslice([fx-s*0.18, s*0.55, fx+s*0.18, s*0.93], start=180, end=360,
                fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
+
+
+
+@icon("paperclip")
+def draw_paperclip(d, cell, p):
+    """Crisp diagonal paperclip for the copilot composer attach button.
+
+    Classic open-loop clip: outer wire runs from a free top tip, down one long
+    side, around the bottom U, up the other side, and over a tighter top U that
+    leaves the free tip open. An inner parallel loop nested inside gives the
+    classic double-wire read. Drawn at FULL cell size (not half-slot) so it
+    stays legible at 20 px toolbar height in both themes — monochrome stroke so
+    the SDF path tints with the icon/text role.
+    """
+    s = cell * SS
+    lw = stroke_width(cell)
+    # Diagonal orientation (~-35°) fills the slot better than axis-aligned.
+    ang = math.radians(-35.0)
+    ca, sa = math.cos(ang), math.sin(ang)
+    cx, cy = s * 0.50, s * 0.50
+
+    def xf(lx, ly):
+        # Local coords: +x along the clip length (tip toward +ly?); rotate+center.
+        return (cx + lx * ca - ly * sa, cy + lx * sa + ly * ca)
+
+    # Geometry in local space (full-slot scale). Length along x, width along y.
+    L = s * 0.34          # half-length of the straight sides
+    Ro = s * 0.155        # outer loop radius
+    Ri = s * 0.075        # inner loop radius (double-wire gap)
+    tip = L + Ro * 0.55   # free tip extends past the top U
+
+    def arc_pts(ox, oy, r, a0, a1, n=18):
+        pts = []
+        for i in range(n + 1):
+            t = a0 + (a1 - a0) * (i / n)
+            pts.append(xf(ox + r * math.cos(t), oy + r * math.sin(t)))
+        return pts
+
+    # Outer path, tip-free at top-right of local frame:
+    # start free tip (right side, above top U) -> down outer right -> bottom U
+    # -> up outer left -> top U (open, doesn't close to tip).
+    outer = []
+    outer.append(xf(tip, Ro))                         # free tip
+    outer.append(xf(L, Ro))                           # top of right straight
+    outer.append(xf(-L, Ro))                          # bottom of right straight
+    outer += arc_pts(-L, 0.0, Ro, math.pi * 0.5, math.pi * 1.5)  # bottom U
+    outer.append(xf(L, -Ro))                          # top of left straight
+    # top U: from left side over to just short of free tip on the right
+    outer += arc_pts(L, 0.0, Ro, -math.pi * 0.5, math.pi * 0.35)
+    polyline(d, outer, p.stroke, lw)
+
+    # Inner nested loop (closed oval) — the classic double-wire.
+    Li = L * 0.55
+    inner = []
+    inner.append(xf(Li, Ri))
+    inner.append(xf(-Li, Ri))
+    inner += arc_pts(-Li, 0.0, Ri, math.pi * 0.5, math.pi * 1.5)
+    inner.append(xf(Li, -Ri))
+    inner += arc_pts(Li, 0.0, Ri, -math.pi * 0.5, math.pi * 0.5)
+    polyline(d, inner, p.stroke, max(1, int(lw * 0.85)))
+
+
+@icon("context_cube")
+def draw_context_cube(d, cell, p):
+    """Billet logo cube as OUTLINE-ONLY strokes (transparent bg, no fills).
+
+    Matches brand_cube proportions (2:1 isometric via _iso_pts) but draws only
+    the visible edges — black-line art intent. Uses p.stroke so the monochrome
+    SDF/atlas path inherits the text/icon color role in both themes (light ink
+    on dark, slate on light) rather than hardcoding pure black.
+    """
+    s = cell * SS
+    # Slightly heavier than 1x so the thin wireframe reads at 20 px toolbar size.
+    lw = max(stroke_width(cell), int(2.2 * SS))
+    # Full-slot scale (brand app uses 0.36; we push a touch larger for toolbar).
+    r = s * 0.38
+    cx, cy = s * 0.50, s * 0.52
+    pt = _iso_pts(cx, cy, r)
+    # Visible silhouette + interior Y-junction — the classic iso cube outline.
+    edges = [
+        (pt["lt"], pt["top"]), (pt["top"], pt["rt"]),
+        (pt["rt"], pt["rb"]), (pt["rb"], pt["bot"]),
+        (pt["bot"], pt["lb"]), (pt["lb"], pt["lt"]),
+        (pt["lt"], pt["c"]), (pt["c"], pt["rt"]), (pt["c"], pt["bot"]),
+    ]
+    for a, b in edges:
+        d.line([a, b], fill=p.stroke, width=lw)
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,23 @@ build_wasm() {
         cp -f "$stage/Billet.html" "$stage/index.html"
         echo "[build] staged index.html (copy of Billet.html)"
     fi
+    # Cache-bust: version the bundle URLs so browsers never pair a fresh Billet.js with a
+    # stale Billet.wasm/.data (fatal LinkError). VER = short wasm content hash. index.html is
+    # served no-cache, so every client picks up the new versioned URLs immediately.
+    if [ -f "$stage/Billet.wasm" ]; then
+        VER="$(sha1sum "$stage/Billet.wasm" | cut -c1-12)"
+        for hf in "$stage/index.html" "$stage/Billet.html"; do
+            [ -f "$hf" ] || continue
+            sed -i \
+                -e "s/__BILLET_VER__/$VER/g" \
+                -e "s#src=Billet\.js#src=\"Billet.js?v=$VER\"#g" \
+                -e "s#src=coi-serviceworker\.js#src=\"coi-serviceworker.js?v=$VER\"#g" \
+                -e "s#src=\"Billet\.js\"#src=\"Billet.js?v=$VER\"#g" \
+                -e "s#src=\"coi-serviceworker\.js\"#src=\"coi-serviceworker.js?v=$VER\"#g" \
+                "$hf"
+        done
+        echo "[build] cache-busted bundle URLs (v=$VER)"
+    fi
     echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py)"
 }
 

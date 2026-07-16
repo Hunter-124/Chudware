@@ -3,29 +3,157 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Billet Web</title>
+  <title>Billet — browser-native CAD</title>
   <link rel="icon" type="image/png" href="/static/logo_wordmark_dark.png" />
-  <link rel="stylesheet" href="/static/portal.css?v=3" />
+  <style>
+    :root {
+      --bg: #0f1418;
+      --bg2: #12181c;
+      --panel: #161d23;
+      --panel-edge: rgba(255,255,255,0.07);
+      --text: #e6edf3;
+      --muted: #8b93a3;
+      --accent: #4f8cff;
+      --accent-hi: #6fa2ff;
+      --teal: #2fd4a7;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(1200px 700px at 50% -10%, rgba(79,140,255,0.10), transparent 60%),
+        radial-gradient(900px 600px at 90% 110%, rgba(47,212,167,0.07), transparent 55%),
+        linear-gradient(180deg, var(--bg2), var(--bg));
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+    }
+    /* Top brand bar */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 18px 28px;
+    }
+    header img { height: 34px; width: auto; display: block; }
+    header .tag {
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--muted);
+      border: 1px solid var(--panel-edge);
+      padding: 3px 8px;
+      border-radius: 999px;
+    }
+    /* Centered hero — fills the remaining height, centered both axes */
+    main {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .hero {
+      width: 100%;
+      max-width: 560px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 22px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+    .hero h1 .accent { color: var(--teal); }
+    .hero p.lead {
+      margin: 0;
+      max-width: 460px;
+      font-size: 1.05rem;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+      color: #fff;
+      text-decoration: none;
+      font-weight: 650;
+      font-size: 1.05rem;
+      padding: 14px 40px;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(79,140,255,0.35), inset 0 1px 0 rgba(255,255,255,0.25);
+      transition: transform .12s ease, box-shadow .12s ease;
+    }
+    .cta:hover { transform: translateY(-1px); box-shadow: 0 12px 30px rgba(79,140,255,0.45), inset 0 1px 0 rgba(255,255,255,0.3); }
+    .cta:active { transform: translateY(0); }
+    .cta svg { width: 18px; height: 18px; }
+    /* Feature row */
+    .features {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 6px;
+    }
+    .feature {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border: 1px solid var(--panel-edge);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .feature .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); flex: none; }
+    footer {
+      text-align: center;
+      padding: 18px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--muted); }
+  </style>
 </head>
 <body>
-  <div id="app">
-    <header class="topbar">
-      <div class="brand">
-        <img class="logo" src="/static/logo_wordmark_dark.png" alt="Billet" width="140" height="58" />
-        <span class="brand-sub">web</span>
+  <header>
+    <img src="/static/logo_wordmark_dark.png" alt="Billet" />
+    <span class="tag">Web</span>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Design in the browser,<br><span class="accent">together</span>.</h1>
+      <p class="lead">
+        The full Billet CAD suite runs natively in your browser on the shared team
+        workspace — no install. Everyone sees the same models update live.
+      </p>
+      <a class="cta" href="/app/">
+        Open Billet
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <div class="features">
+        <div class="feature"><span class="dot"></span> Live collaborative editing</div>
+        <div class="feature"><span class="dot"></span> AI copilot built in</div>
+        <div class="feature"><span class="dot"></span> Simulation &amp; CAM</div>
       </div>
-    </header>
-    <div class="workspace">
-      <main class="main" style="display:flex;align-items:center;justify-content:center;min-height:60vh">
-        <section class="session-card" style="text-align:center;max-width:420px">
-          <h2 style="margin:0 0 8px">Billet</h2>
-          <p style="font-size:.9rem;color:var(--muted,#8b93a3);margin:0 0 18px">
-            Browser-native client on the shared team workspace. Everyone sees the
-            same documents live.</p>
-          <a href="/app/" style="display:inline-block;background:var(--accent,#4f8cff);color:#fff;text-decoration:none;font-weight:600;padding:12px 34px;border-radius:10px">Open Billet</a>
-        </section>
-      </main>
-    </div>
-  </div>
+    </section>
+  </main>
+
+  <footer>
+    Sign in with your <strong>@ua.edu</strong> or <strong>@crimson.ua.edu</strong> account.
+  </footer>
 </body>
 </html>

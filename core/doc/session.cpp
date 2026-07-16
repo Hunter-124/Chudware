@@ -615,7 +615,7 @@ json blank_part(const std::string& doc_id, const std::string& name) {
         {"id", doc_id},
         {"name", name.empty() ? std::string("Part1") : name},
         {"units", {{"system", "MMGS"}}},
-        {"material", nullptr},
+        {"material", {{"key", "aluminum_6061_t6"}}},
         {"equations", {{"globals", json::array()}}},
         {"features", json::array()},
     };

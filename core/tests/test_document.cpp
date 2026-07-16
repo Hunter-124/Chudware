@@ -2926,3 +2926,87 @@ TEST_CASE("op-path: extrude flip puts solid on the opposite side of the sketch p
     CHECK(zf1 - zf0 == doctest::Approx(D).epsilon(0.05));
 }
 
+// Wave 3 Evaluate: blank PART docs default to Aluminium 6061-T6
+// (registry key aluminum_6061_t6). Assemblies stay material-free.
+TEST_CASE("blank part defaults material key to aluminum_6061_t6") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_tree;
+    json nr = doc_new("part", "DefaultMat");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json tree = doc_tree(id);
+    REQUIRE(tree.contains("tree"));
+    const json& mat = tree["tree"]["material"];
+    REQUIRE(mat.is_object());
+    REQUIRE(mat.contains("key"));
+    CHECK(mat["key"].get<std::string>() == "aluminum_6061_t6");
+
+    // Density path: a 10×10×10 mm cube at 2.70 g/cm³ → mass = 2.70 g.
+    using aicad::doc::doc_apply_ops;
+    using aicad::doc::doc_eval_mass;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json ops = json::array({
+        json{{"op", "add_feature"},
+             {"feature",
+              {{"type", "box"},
+               {"name", "Cube"},
+               {"params",
+                {{"length", dimv(10)}, {"width", dimv(10)}, {"height", dimv(10)}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    for (const auto& fst : resp["rebuild"]["feature_status"])
+        CHECK_MESSAGE(fst.value("ok", false),
+                      "feature " << fst.value("id", std::string())
+                                << " failed: " << fst.value("error", json(nullptr)).dump());
+    const double density = 2.70;  // g/cm³ — Aluminium 6061-T6
+    json m = doc_eval_mass(id, 0, density);
+    CHECK(m.value("volume_mm3", 0.0) == doctest::Approx(1000.0).epsilon(1e-6));
+    // mass_g = volume_mm3 * density_g_cm3 * 1e-3  → 1000 * 2.70 * 1e-3 = 2.70
+    CHECK(m.value("mass_g", 0.0) == doctest::Approx(2.70).epsilon(1e-6));
+}
+
+// Wave 3 Evaluate: section props accept an arbitrary {origin,normal} plane
+// (not only named datums), returning area_mm2 > 0 and finite Ixx/Iyy.
+TEST_CASE("eval_section_props accepts origin+normal plane on a box") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    using aicad::doc::doc_eval_section_props;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    json nr = doc_new("part", "SectionPlane");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    // 40×30×20 box centred at origin → mid-plane cut z=0 is a 40×30 rectangle.
+    json ops = json::array({
+        json{{"op", "add_feature"},
+             {"feature",
+              {{"type", "box"},
+               {"name", "Blk"},
+               {"params",
+                {{"length", dimv(40)},
+                 {"width", dimv(30)},
+                 {"height", dimv(20)}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    for (const auto& fst : resp["rebuild"]["feature_status"])
+        CHECK_MESSAGE(fst.value("ok", false),
+                      "feature " << fst.value("id", std::string())
+                                << " failed: " << fst.value("error", json(nullptr)).dump());
+
+    const json plane = {{"origin", json::array({0.0, 0.0, 0.0})},
+                        {"normal", json::array({0.0, 0.0, 1.0})}};
+    json sp = doc_eval_section_props(id, plane);
+    REQUIRE(sp.contains("area_mm2"));
+    REQUIRE(sp.contains("Ixx"));
+    REQUIRE(sp.contains("Iyy"));
+    const double area = sp["area_mm2"].get<double>();
+    const double Ixx = sp["Ixx"].get<double>();
+    const double Iyy = sp["Iyy"].get<double>();
+    MESSAGE("section area=" << area << " Ixx=" << Ixx << " Iyy=" << Iyy);
+    CHECK(area > 0.0);
+    CHECK(area == doctest::Approx(40.0 * 30.0).epsilon(0.02));
+    CHECK(std::isfinite(Ixx));
+    CHECK(std::isfinite(Iyy));
+    CHECK(Ixx > 0.0);
+    CHECK(Iyy > 0.0);
+}
+
+

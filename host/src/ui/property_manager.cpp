@@ -406,6 +406,14 @@ std::string pmFormatAreaMoment(double mm4, bool ips) {
     else     std::snprintf(buf, sizeof(buf), "%.4gmm\xe2\x81\xb4", mm4);
     return buf;
 }
+// Mass moment of inertia (canonical g·mm²): IPS -> lb·in², MMGS -> g·mm². 453.59237 g/lb,
+// 645.16 mm²/in² -> g·mm² / (453.59237*645.16) = g·mm² / 292639.66 = lb·in².
+std::string pmFormatMassMoment(double g_mm2, bool ips) {
+    char buf[48];
+    if (ips) std::snprintf(buf, sizeof(buf), "%.4glb\xc2\xb7in\xc2\xb2", g_mm2 / 292639.66);
+    else     std::snprintf(buf, sizeof(buf), "%.4gg\xc2\xb7mm\xc2\xb2", g_mm2);
+    return buf;
+}
 
 
 // An angle-valued Dim field is tagged by a "deg" unit label (Angle/AngleIf helpers). Its value

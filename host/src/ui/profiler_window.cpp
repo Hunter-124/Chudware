@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ImRect (adaptivePanel / glassPanel rect)
 
 #include "icons.h"
 #include "metrics.h"
@@ -345,30 +346,67 @@ void drawProfilerWindow(AppState& st) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
         ImVec2(vp->WorkPos.x + M::px(120), vp->WorkPos.y + M::px(80)), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(M::px(580), M::px(540)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(M::px(600), M::px(560)), ImGuiCond_FirstUseEver);
 
     bool open = st.showProfilerWindow;
-    ui::pushGlassWindowStyle();
-    if (ImGui::Begin("Profiler", &open)) {
-        // ---- header ----
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // Title bar renders DURING Begin, so give it an opaque-ish glassBg tint; frost only the
+    // content region so the title/X stay crisp.
+    const ImVec4 titleTint(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool profVis = ImGui::Begin("Profiler", &open);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (profVis) {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const float contentTopY =
+            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+            ui::panelId("host_profiler_glass"), winRect, ui::GlassGroup::Global);
+        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+        // Default ink tracks the frost's contrast tone; semantic status colors push on top.
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+        // ---- header: icon + title + run state + live FPS ----
         IconUV iv = ui::getIcon("performance", 20);
         if (iv.valid) {
             ImGui::Image(iv.texId, ImVec2(M::iconHeader(), M::iconHeader()), iv.uv0, iv.uv1);
             ImGui::SameLine(0, M::asmHeaderIconGap());
         }
-        pushText(pal.text);
+        if (st.fonts.medium) ImGui::PushFont(st.fonts.medium);
         ImGui::TextUnformatted("Sampling Profiler");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        pushText(st.profilerRunning ? pal.statusOk : pal.textDim);
-        ImGui::TextUnformatted(st.profilerRunning ? "  [running]" : "  [idle]");
-        ImGui::PopStyleColor();
+        if (st.fonts.medium) ImGui::PopFont();
+
+        ImGui::SameLine(0, M::px(10));
+        // Compact status chip (running / idle).
+        {
+            const bool running = st.profilerRunning;
+            const float* chipCol = running ? pal.statusOk : pal.textDim;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const char* label = running ? "RUNNING" : "IDLE";
+            const ImVec2 tsz = ImGui::CalcTextSize(label);
+            const float padX = M::px(7), padY = M::px(2);
+            const ImVec2 c0 = ImGui::GetCursorScreenPos();
+            const ImVec2 c1(c0.x + tsz.x + padX * 2.f, c0.y + tsz.y + padY * 2.f);
+            ui::glassRowBackground(dl, c0, c1, M::rounding(4), false, running, running ? 0.36f : 0.22f);
+            ImGui::SetCursorScreenPos(ImVec2(c0.x + padX, c0.y + padY));
+            pushText(chipCol);
+            ImGui::TextUnformatted(label);
+            ImGui::PopStyleColor();
+            ImGui::SetCursorScreenPos(ImVec2(c1.x + M::px(8), c0.y));
+            ImGui::Dummy(ImVec2(0, c1.y - c0.y));
+        }
+
         // Live GUI frame rate (ImGui Framerate) — labeled so Evaluate > Performance
         // always shows FPS while this window is open (H-B1 joint verify).
         {
             const float fps = ImGui::GetIO().Framerate;
-            ImGui::SameLine(0, M::px(16));
-            pushText(pal.textDim);
+            ImGui::SameLine(0, M::px(12));
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted("FPS");
             ImGui::PopStyleColor();
             ImGui::SameLine(0, M::px(6));
@@ -379,12 +417,20 @@ void drawProfilerWindow(AppState& st) {
                 ImGui::SetTooltip(
                     "GUI frames per second (ImGui). Not the sampling-profiler tick rate.");
         }
+
+        ImGui::Spacing();
         ImGui::Separator();
+        ImGui::Spacing();
 
         // ---- controls ----
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Session");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
         const bool running = st.profilerRunning;
         ImGui::BeginDisabled(running);
-        if (ImGui::Button("Start")) {
+        if (ImGui::Button("Start", ImVec2(M::px(72), 0))) {
             json res;
             if (profCall(st, "prof_start", {{"hz", 1000}, {"mode", "modeling"}}, res)) {
                 if (res.is_object() && res.contains("error")) {
@@ -402,9 +448,9 @@ void drawProfilerWindow(AppState& st) {
         }
         ImGui::EndDisabled();
 
-        ImGui::SameLine();
+        ImGui::SameLine(0, M::px(8));
         ImGui::BeginDisabled(!running);
-        if (ImGui::Button("Stop")) {
+        if (ImGui::Button("Stop", ImVec2(M::px(72), 0))) {
             json res;
             if (profCall(st, "prof_stop", {{"top", 40}}, res)) {
                 st.profilerRunning = false;
@@ -412,8 +458,8 @@ void drawProfilerWindow(AppState& st) {
                 s_haveReport = true;
             }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Refresh")) {
+        ImGui::SameLine(0, M::px(8));
+        if (ImGui::Button("Refresh", ImVec2(M::px(80), 0))) {
             json res;
             if (profCall(st, "prof_report", {{"top", 40}}, res)) {
                 s_report = std::move(res);
@@ -425,10 +471,16 @@ void drawProfilerWindow(AppState& st) {
             ImGui::SetTooltip("Symbolize the samples so far without stopping the profiler.");
 
         ImGui::Spacing();
+        ImGui::Spacing();
 
         // ---- report ----
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Report");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
         if (!s_haveReport) {
-            pushText(pal.textDim);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextWrapped(
                 "Click Start, exercise the model (extrude / fillet / boolean / rebuild), then "
                 "Stop to see where the time went. In modeling mode only doc_* operations are "
@@ -442,9 +494,10 @@ void drawProfilerWindow(AppState& st) {
             ImGui::PopStyleColor();
         } else {
             json s = s_report.value("summary", json::object());
-            pushText(pal.textDim);
+            // Summary strip — one readable line of capture stats.
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextWrapped(
-                "%llu samples  -  %llu unique stacks  -  %u us  -  %s mode  -  %.2fs wall  -  "
+                "%llu samples  ·  %llu unique stacks  ·  %u µs  ·  %s mode  ·  %.2fs wall  ·  "
                 "%llu unresolved",
                 s.value("samples", 0ULL), s.value("unique_stacks", 0ULL),
                 s.value("interval_us", 0u), s.value("mode", std::string("?")).c_str(),
@@ -452,42 +505,58 @@ void drawProfilerWindow(AppState& st) {
             ImGui::PopStyleColor();
             ImGui::Spacing();
 
-            if (ImGui::CollapsingHeader("Modules (self-time)", ImGuiTreeNodeFlags_DefaultOpen))
+            if (ImGui::CollapsingHeader("Modules (self-time)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Spacing();
                 drawModulesTable(s_report.value("modules", json::array()));
-            if (ImGui::CollapsingHeader("Flat self-time (hottest leaves)"))
+                ImGui::Spacing();
+            }
+            if (ImGui::CollapsingHeader("Flat self-time (hottest leaves)")) {
+                ImGui::Spacing();
                 drawFlatTable("##prof_self", s_report.value("flat_self", json::array()), "self",
                               "Self");
-            if (ImGui::CollapsingHeader("Flat total-time (callers on the stack)"))
+                ImGui::Spacing();
+            }
+            if (ImGui::CollapsingHeader("Flat total-time (callers on the stack)")) {
+                ImGui::Spacing();
                 drawFlatTable("##prof_total", s_report.value("flat_total", json::array()),
                               "total", "Total");
+                ImGui::Spacing();
+            }
 
             if (ImGui::CollapsingHeader("Flame graph", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Spacing();
                 rebuildFlameIfNeeded(s_report.value("folded", std::string()));
                 if (s_rects.empty()) {
-                    ImGui::TextDisabled("(no stacks to chart)");
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                    ImGui::TextUnformatted("(no stacks to chart)");
+                    ImGui::PopStyleColor();
                 } else {
-                    pushText(pal.textDim);
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
                     ImGui::TextUnformatted("Widest = hottest (left). Hover a box for details.");
                     ImGui::PopStyleColor();
+                    ImGui::Spacing();
                     const float rowH = ImGui::GetTextLineHeight() + M::px(3);
                     float wantH = (s_maxDepth + 1) * rowH + M::px(6);
                     float childH = std::min(wantH, M::px(320));
                     ui::pushGlassChildStyle();
-                    if (ImGui::BeginChild("##prof_flame", ImVec2(0, childH), ImGuiChildFlags_Border))
+                    if (ImGui::BeginChild("##prof_flame", ImVec2(0, childH),
+                                          ImGuiChildFlags_Border))
                         drawFlame(rowH);
                     ImGui::EndChild();
                     ui::popGlassChildStyle();
                 }
             }
         }
+
+        ImGui::PopStyleColor();  // surf.textPrimary
     }
     ImGui::End();
-    ui::popGlassWindowStyle();
+    ImGui::PopStyleColor();  // WindowBg
     st.showProfilerWindow = open;  // window close box drives the AppState flag
 
     // Corner overlay — always-on-top labeled FPS while the Performance profiler
     // window is open so drag/rebuild interactivity is visible without hunting
-    // the window header (H-B1).
+    // the window header (H-B1). Glass-styled chip to match the rest of the HUD.
     if (st.showProfilerWindow) {
         const ImGuiViewport* mvp = ImGui::GetMainViewport();
         const float fps = ImGui::GetIO().Framerate;
@@ -495,14 +564,19 @@ void drawProfilerWindow(AppState& st) {
         ImGui::SetNextWindowPos(
             ImVec2(mvp->WorkPos.x + mvp->WorkSize.x - pad.x, mvp->WorkPos.y + pad.y),
             ImGuiCond_Always, ImVec2(1.f, 0.f));
-        ImGui::SetNextWindowBgAlpha(0.72f);
+        ImGui::SetNextWindowBgAlpha(0.0f);  // glassPanel paints the fill
         const ImGuiWindowFlags flags =
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
             ImGuiWindowFlags_NoMove;
         if (ImGui::Begin("##perf_fps_overlay", nullptr, flags)) {
-            pushText(pal.textDim);
+            const ImVec2 owp = ImGui::GetWindowPos(), ows = ImGui::GetWindowSize();
+            const ImRect orect(owp, ImVec2(owp.x + ows.x, owp.y + ows.y));
+            const ui::AdaptiveSurface& osurf = ui::adaptivePanel(
+                ui::panelId("host_profiler_fps_overlay"), orect, ui::GlassGroup::Hud);
+            ui::glassPanel(ImGui::GetWindowDrawList(), orect, ui::GlassLevel::Thin, 8.0f, osurf);
+            ImGui::PushStyleColor(ImGuiCol_Text, osurf.textSecondary);
             ImGui::TextUnformatted("FPS");
             ImGui::PopStyleColor();
             ImGui::SameLine(0, M::px(6));

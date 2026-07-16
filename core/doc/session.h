@@ -298,10 +298,11 @@ nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 
 // Evaluate — cross-section properties of the LAST body at `plane` (port of
 // evaluate.py::section_props via worker.py::_eval_section_props). `plane` is a reserved
-// planar datum id ("plane.top/front/right") or a {"kind":"datum","feature":<id>} selector.
+// planar datum id ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector,
+// or an arbitrary cut {"origin":[x,y,z],"normal":[nx,ny,nz]} (optional "xdir":[3]).
 // Returns {area_mm2, centroid[3], Ixx, Iyy, Ixy}. Matches the oracle's degenerate path
 // (area/moments == 0; only the section-wire centroid is meaningful). Throws OpError on no
-// bodies / a non-reserved-planar plane.
+// bodies / a non-reserved-planar / degenerate plane.
 nlohmann::json doc_eval_section_props(const std::string& doc_id, const nlohmann::json& plane_ref);
 
 // Evaluate — mirror-symmetry of the active body about `plane` (port of evaluate.py::

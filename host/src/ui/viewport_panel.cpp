@@ -486,6 +486,10 @@ static bool   s_sketchRotated  = false;
 static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
 static ImVec2 s_lmbDragOrigin  = {0, 0}; // screen position of the LMB press
 
+// Evaluate Section Props: which plane handle is being dragged along its normal (-1 = none).
+// Owns the mouse while >= 0 so orbit/pan/pick never fight the cut-plane drag.
+static int s_sectionDragIdx = -1;
+
 // ---- Instant3D push-pull (drag-to-modify a face) -------------------------------------------
 // When EXACTLY ONE face is selected we draw a normal-axis drag handle (a short ⟂ arrow + its
 // mirror) at the face centroid. Pressing on the arrow starts a push-pull drag instead of an orbit:
@@ -2128,6 +2132,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // Evaluate Section Props plane-drag safety net: drop the handle grab if the section window
+        // closes, a sketch / plane-pick / PM takes the mouse, or LMB is released outside the image.
+        if (s_sectionDragIdx >= 0) {
+            bool secOpen = st.evaluateDialogs && st.evaluateDialogs->sectionDragActive();
+            bool secPm = st.propertyManager && st.propertyManager->active();
+            if (!secOpen || inSketch || inSketch3d || st.sketchPlanePickActive || secPm ||
+                !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                s_sectionDragIdx = -1;
+            }
+        }
+
         // C37-C: consume st.zoomToBBoxRequested (one-shot from feature tree "Zoom to Feature").
         if (st.zoomToBBoxRequested) {
             st.zoomToBBoxRequested = false;
@@ -2540,6 +2555,51 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         if (pr.overlapTris.size() >= 9)
                             st.overlays->drawTriangles(renderer.camera(), pr.overlapTris,
                                                       pr.overlapRgba, true);
+                    }
+                }
+                // Section Props: translucent cutting quads + normal arrows (world-space).
+                // Handles / labels / drag live in the screen overlay pass below.
+                if (st.evaluateDialogs->sectionDragActive()) {
+                    for (const auto& pl : st.evaluateDialogs->sectionPlanes()) {
+                        if (!pl.active) continue;
+                        const float hs = pl.halfSize;
+                        const float ox = pl.origin[0], oy = pl.origin[1], oz = pl.origin[2];
+                        const float ux = pl.uAxis[0] * hs, uy = pl.uAxis[1] * hs,
+                                    uz = pl.uAxis[2] * hs;
+                        const float vx = pl.vAxis[0] * hs, vy = pl.vAxis[1] * hs,
+                                    vz = pl.vAxis[2] * hs;
+                        // Corners: origin ± u*hs ± v*hs (sign combos).
+                        const float c00[3] = {ox - ux - vx, oy - uy - vy, oz - uz - vz};
+                        const float c10[3] = {ox + ux - vx, oy + uy - vy, oz + uz - vz};
+                        const float c11[3] = {ox + ux + vx, oy + uy + vy, oz + uz + vz};
+                        const float c01[3] = {ox - ux + vx, oy - uy + vy, oz - uz + vz};
+                        std::vector<float> tris = {
+                            c00[0], c00[1], c00[2], c10[0], c10[1], c10[2], c11[0], c11[1], c11[2],
+                            c00[0], c00[1], c00[2], c11[0], c11[1], c11[2], c01[0], c01[1], c01[2],
+                        };
+                        float planeRgba[4] = {pl.rgba[0], pl.rgba[1], pl.rgba[2],
+                                             pl.rgba[3] > 0.01f ? pl.rgba[3] * 0.35f : 0.28f};
+                        st.overlays->drawTriangles(renderer.camera(), tris, planeRgba, true);
+
+                        // Normal arrow shaft + short 2-segment arrowhead.
+                        const float L = hs * 0.8f;
+                        const float tipX = ox + pl.normal[0] * L;
+                        const float tipY = oy + pl.normal[1] * L;
+                        const float tipZ = oz + pl.normal[2] * L;
+                        const float hLen = L * 0.18f;
+                        const float hW = hLen * 0.55f;
+                        // Head base sits back along -normal; barbs use ±uAxis for a simple V.
+                        const float bx = tipX - pl.normal[0] * hLen;
+                        const float by = tipY - pl.normal[1] * hLen;
+                        const float bz = tipZ - pl.normal[2] * hLen;
+                        std::vector<float> arrow = {
+                            ox, oy, oz, tipX, tipY, tipZ,
+                            tipX, tipY, tipZ,
+                            bx + pl.uAxis[0] * hW, by + pl.uAxis[1] * hW, bz + pl.uAxis[2] * hW,
+                            tipX, tipY, tipZ,
+                            bx - pl.uAxis[0] * hW, by - pl.uAxis[1] * hW, bz - pl.uAxis[2] * hW,
+                        };
+                        st.overlays->drawSegments(renderer.camera(), arrow, pl.rgba, 2.4f, true);
                     }
                 }
                 // Whole-body translucency while mass markers / interference view are active.
@@ -3070,11 +3130,85 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
 
+            // ---- Evaluate Section Props: drag cutting plane along its normal --------------------
+            // Press near a plane's arrow-tip handle (screen-space square drawn in the HUD pass),
+            // project mouse delta onto the normal's screen direction, convert px→mm, and call
+            // dragSectionPlane for live re-eval. Never fires while orbit/pan/PM/sketch own the mouse.
+            if (st.evaluateDialogs && st.evaluateDialogs->sectionDragActive() &&
+                st.hasDocMesh && !st.sketchPlanePickActive && !inSketch && !inSketch3d &&
+                !s_zoomAreaArmed && !s_pp.active && !s_dim.active && !s_asmDrag.active) {
+                const bool secPmOpen = st.propertyManager && st.propertyManager->active();
+                if (!secPmOpen) {
+                    // Press: hit-test arrow-tip handles (~10px).
+                    if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                        s_sectionDragIdx < 0) {
+                        const float hitR = 10.0f * ui::uiScale;
+                        const ImVec2 mp = io.MousePos;
+                        int best = -1;
+                        float bestD = hitR;
+                        for (const auto& pl : st.evaluateDialogs->sectionPlanes()) {
+                            if (!pl.active) continue;
+                            const float L = pl.halfSize * 0.8f;
+                            float tipW[3] = {
+                                pl.origin[0] + pl.normal[0] * L,
+                                pl.origin[1] + pl.normal[1] * L,
+                                pl.origin[2] + pl.normal[2] * L,
+                            };
+                            ImVec2 tipSp;
+                            if (!ppProject(renderer, vr0, vr1, vw, vh, tipW, tipSp)) continue;
+                            float ddx = mp.x - tipSp.x, ddy = mp.y - tipSp.y;
+                            float d = std::sqrt(ddx * ddx + ddy * ddy);
+                            if (d <= bestD) { bestD = d; best = pl.index; }
+                        }
+                        if (best >= 0) {
+                            s_sectionDragIdx = best;
+                            cancelCameraAnimation();
+                        }
+                    }
+
+                    // Drag: mouse delta along normal's screen direction → world mm.
+                    if (s_sectionDragIdx >= 0 && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                        (io.MouseDelta.x != 0.f || io.MouseDelta.y != 0.f)) {
+                        st.requestCursor(ui::CursorKind::Crosshair);
+                        cancelCameraAnimation();
+                        for (const auto& pl : st.evaluateDialogs->sectionPlanes()) {
+                            if (pl.index != s_sectionDragIdx) continue;
+                            float oW[3] = {pl.origin[0], pl.origin[1], pl.origin[2]};
+                            // Probe 1 mm along the normal for screen dir + world-per-px scale.
+                            float nW[3] = {pl.origin[0] + pl.normal[0],
+                                           pl.origin[1] + pl.normal[1],
+                                           pl.origin[2] + pl.normal[2]};
+                            ImVec2 oSp, nSp;
+                            if (!ppProject(renderer, vr0, vr1, vw, vh, oW, oSp) ||
+                                !ppProject(renderer, vr0, vr1, vw, vh, nW, nSp))
+                                break;
+                            float sdx = nSp.x - oSp.x, sdy = nSp.y - oSp.y;
+                            float slen = std::sqrt(sdx * sdx + sdy * sdy);
+                            if (slen < 1e-3f) break;
+                            float nsx = sdx / slen, nsy = sdy / slen;
+                            float worldPerPxN = 1.0f / slen;  // 1 mm spans `slen` px
+                            float pxAlong = io.MouseDelta.x * nsx + io.MouseDelta.y * nsy;
+                            float worldDelta = pxAlong * worldPerPxN;
+                            if (std::fabs(worldDelta) > 1e-6f)
+                                st.evaluateDialogs->dragSectionPlane(st, s_sectionDragIdx,
+                                                                    worldDelta);
+                            break;
+                        }
+                    }
+
+                    if (s_sectionDragIdx >= 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                        s_sectionDragIdx = -1;
+                }
+            } else if (s_sectionDragIdx >= 0) {
+                s_sectionDragIdx = -1;
+            }
+
             // Left-drag: orbit or pan depending on vpDragMode. Cancels any tween.
             // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
             // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
             // Instant3D: a push-pull OR dimension drag owns the mouse — never orbit/pan while active.
             if (!s_pp.active && !s_dim.active && !s_asmDrag.active && !s_zoomAreaArmed &&
+                s_sectionDragIdx < 0 &&
                 s_lmbDragActive && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
@@ -3451,7 +3585,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (imgHovered && !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
                 !datumSelectHot && !blendDeselectHot &&
-                !s_pp.active && !s_dim.active) {
+                !s_pp.active && !s_dim.active && s_sectionDragIdx < 0) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 // Fillet/chamfer "Edges" wells: snap to the nearest edge within a grab radius so the
@@ -3484,7 +3618,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
                 !datumSelectHot &&
-                !blendDeselectHot && !s_pp.active && !s_dim.active) {
+                !blendDeselectHot && !s_pp.active && !s_dim.active && s_sectionDragIdx < 0) {
                 // Wave4 context cube: arm → append/toggle pendingContextRefs (chips via composer).
                 // Still update normal selection so the face/edge highlight stays readable.
                 if (st.contextPickActive && st.hover.valid()) {
@@ -3516,6 +3650,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             st.propertyManager->dragSetCheck("flip", s_dim.flipAtPress);
                     }
                     s_dim.reset();
+                } else if (s_sectionDragIdx >= 0) {
+                    s_sectionDragIdx = -1;
                 } else if (st.contextPickActive) {
                     // Wave4: Esc finishes context-pick mode (composer cube). Keep selection.
                     st.contextPickActive = false;
@@ -4344,6 +4480,111 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                               ImVec2(q0.x + 6.0f * ui::uiScale, q0.y + 3.0f * ui::uiScale), ls,
                               co.text.c_str());
+            }
+        }
+
+        // Evaluate Mass Properties value chips (COM + per-plane I/J) — world → screen glass chips
+        // with hover tooltips. Mass text lives only in massMarkers_ (overlayLabels_ is measure-only).
+        if (st.evaluateDialogs && !st.evaluateDialogs->massMarkers().empty()) {
+            const float* m = renderer.camera().mvp.m;
+            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
+                float x = m[0] * wx + m[4] * wy + m[8] * wz + m[12];
+                float y = m[1] * wx + m[5] * wy + m[9] * wz + m[13];
+                float wc = m[3] * wx + m[7] * wy + m[11] * wz + m[15];
+                if (wc <= 1e-4f) return false;
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            for (const auto& mk : st.evaluateDialogs->massMarkers()) {
+                if (mk.label.empty()) continue;
+                ImVec2 sp;
+                if (!project(mk.pos[0], mk.pos[1], mk.pos[2], sp)) continue;
+                ImVec2 ts = ImGui::CalcTextSize(mk.label.c_str());
+                ImVec2 q0(sp.x - ts.x * 0.5f - 6.0f * ui::uiScale,
+                          sp.y - ts.y - 8.0f * ui::uiScale);
+                ImVec2 q1(q0.x + ts.x + 12.0f * ui::uiScale, q0.y + ts.y + 6.0f * ui::uiScale);
+                const ui::AdaptiveSurface& ls =
+                    ui::adaptivePanel(ui::panelId("vp_eval_mass"), ImRect(q0, q1),
+                                      ui::GlassGroup::Hud);
+                ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ls);
+                // Marker-color wash + border (matches Measure callout chip language).
+                ImU32 bord = IM_COL32((int)(mk.rgba[0] * 255), (int)(mk.rgba[1] * 255),
+                                     (int)(mk.rgba[2] * 255), (int)(0.95f * 255));
+                ImU32 fill = IM_COL32((int)(mk.rgba[0] * 255), (int)(mk.rgba[1] * 255),
+                                     (int)(mk.rgba[2] * 255), (int)(0.28f * 255));
+                vdl->AddRectFilled(q0, q1, fill, 4.0f * ui::uiScale);
+                vdl->AddRect(q0, q1, bord, 4.0f * ui::uiScale, 0, 1.5f * ui::uiScale);
+                ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                              ImVec2(q0.x + 6.0f * ui::uiScale, q0.y + 3.0f * ui::uiScale), ls,
+                              mk.label.c_str());
+                if (ImGui::IsMouseHoveringRect(q0, q1) && !mk.tooltip.empty())
+                    ImGui::SetTooltip("%s", mk.tooltip.c_str());
+            }
+        }
+
+        // Evaluate Section Props: plane labels + draggable tip handles (screen-space).
+        // World quads/arrows are drawn earlier via overlays; this pass is the HUD chrome + grab.
+        if (st.evaluateDialogs && st.evaluateDialogs->sectionDragActive()) {
+            const float* m = renderer.camera().mvp.m;
+            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
+                float x = m[0] * wx + m[4] * wy + m[8] * wz + m[12];
+                float y = m[1] * wx + m[5] * wy + m[9] * wz + m[13];
+                float wc = m[3] * wx + m[7] * wy + m[11] * wz + m[15];
+                if (wc <= 1e-4f) return false;
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            const float sc = ui::uiScale;
+            const float handleHalf = 5.0f * sc;
+            for (const auto& pl : st.evaluateDialogs->sectionPlanes()) {
+                if (!pl.active) continue;
+
+                // Label chip near plane origin.
+                if (!pl.label.empty()) {
+                    ImVec2 osp;
+                    if (project(pl.origin[0], pl.origin[1], pl.origin[2], osp)) {
+                        ImVec2 ts = ImGui::CalcTextSize(pl.label.c_str());
+                        ImVec2 q0(osp.x - ts.x * 0.5f - 6.0f * sc,
+                                  osp.y - ts.y - 10.0f * sc);
+                        ImVec2 q1(q0.x + ts.x + 12.0f * sc, q0.y + ts.y + 6.0f * sc);
+                        const ui::AdaptiveSurface& ls =
+                            ui::adaptivePanel(ui::panelId("vp_eval_sec_lab"), ImRect(q0, q1),
+                                              ui::GlassGroup::Hud);
+                        ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ls);
+                        ImU32 bord = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
+                                             (int)(pl.rgba[2] * 255), (int)(0.95f * 255));
+                        ImU32 fill = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
+                                             (int)(pl.rgba[2] * 255), (int)(0.28f * 255));
+                        vdl->AddRectFilled(q0, q1, fill, 4.0f * sc);
+                        vdl->AddRect(q0, q1, bord, 4.0f * sc, 0, 1.5f * sc);
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                      ImVec2(q0.x + 6.0f * sc, q0.y + 3.0f * sc), ls,
+                                      pl.label.c_str());
+                    }
+                }
+
+                // Draggable handle square at the arrow tip (origin + normal * L).
+                const float L = pl.halfSize * 0.8f;
+                ImVec2 tipSp;
+                if (project(pl.origin[0] + pl.normal[0] * L,
+                            pl.origin[1] + pl.normal[1] * L,
+                            pl.origin[2] + pl.normal[2] * L, tipSp)) {
+                    ImVec2 h0(tipSp.x - handleHalf, tipSp.y - handleHalf);
+                    ImVec2 h1(tipSp.x + handleHalf, tipSp.y + handleHalf);
+                    const bool hot = (s_sectionDragIdx == pl.index) ||
+                                     ImGui::IsMouseHoveringRect(h0, h1);
+                    ImU32 fill = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
+                                         (int)(pl.rgba[2] * 255),
+                                         hot ? 220 : 170);
+                    ImU32 bord = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
+                                         (int)(pl.rgba[2] * 255), 255);
+                    vdl->AddRectFilled(h0, h1, fill, 2.0f * sc);
+                    vdl->AddRect(h0, h1, bord, 2.0f * sc, 0, (hot ? 2.0f : 1.4f) * sc);
+                    if (hot)
+                        ImGui::SetTooltip("Drag to move section plane");
+                }
             }
         }
 

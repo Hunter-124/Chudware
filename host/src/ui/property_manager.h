@@ -185,6 +185,7 @@ std::string pmFormatArea(double mm2, bool ips);
 std::string pmFormatVolume(double mm3, bool ips);
 std::string pmFormatMass(double g, bool ips);
 std::string pmFormatAreaMoment(double mm4, bool ips);
+std::string pmFormatMassMoment(double g_mm2, bool ips);  // mass·length²: lb·in² (IPS) / g·mm² (MMGS)
 
 
 // ---- in-viewport callouts (C27-A) -----------------------------------------

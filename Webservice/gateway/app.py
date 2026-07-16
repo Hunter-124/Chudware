@@ -44,6 +44,13 @@ try:
 except ImportError:
     from auth import UserDirectory
 
+try:
+    from .engine_bridge import router as engine_router
+    from .workspace import router as workspace_router
+except ImportError:
+    from engine_bridge import router as engine_router
+    from workspace import router as workspace_router
+
 settings.ensure_data_dirs()  # users_file must exist before the directory loads
 user_directory = UserDirectory(settings.users_file)
 
@@ -661,6 +668,8 @@ app.include_router(sessions_router)
 app.include_router(proxy_router)
 app.include_router(chat_router)
 app.include_router(admin_router)
+app.include_router(engine_router)
+app.include_router(workspace_router)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

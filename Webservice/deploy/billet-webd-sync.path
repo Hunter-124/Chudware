@@ -1,0 +1,11 @@
+# billet-webd-sync.path — re-promote the shared web daemon when the engine
+# build tree produces a new aicad-hostd binary.
+[Unit]
+Description=Watch aicad-hostd build output and re-install billet-webd
+
+[Path]
+PathChanged=%h/Repositories/CAD/core/build-occt-linux/bin/aicad-hostd
+Unit=billet-webd-sync.service
+
+[Install]
+WantedBy=default.target

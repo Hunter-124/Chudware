@@ -43,6 +43,23 @@ def _normalize_team_domain(raw: str) -> str:
         raw = "https://" + raw
     return raw
 
+def _load_webd_env() -> dict[str, str]:
+    """KEY=VALUE defaults written by deploy/install_webd.sh (~/billet-web/webd.env)."""
+    path = Path(_env("BILLET_WEBD_ENV", "~/billet-web/webd.env") or "").expanduser()
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
 @dataclass
 class Settings:
     """Runtime settings loaded once from the process environment."""
@@ -97,6 +114,11 @@ class Settings:
     healthcheck_interval_sec: float = field(
         default_factory=lambda: _env_float("BILLET_WEB_HEALTHCHECK_INTERVAL_SEC", 1.5)
     )
+    # Web-native client: shared engine daemon socket + team workspace root.
+    # Env overrides win; else webd.env (install_webd.sh); else deterministic
+    # defaults (instance key "billetweb" is verbatim => socket name is stable).
+    webd_socket: Path = field(default_factory=Path)
+    workspace_root: Path = field(default_factory=Path)
 
     def __post_init__(self) -> None:
         if not self.users_file or str(self.users_file) in {".", ""}:
@@ -105,6 +127,20 @@ class Settings:
                 self.users_file = _expand_path(override)
             else:
                 self.users_file = Path(__file__).resolve().parent / "users.yaml"
+        webd_env = _load_webd_env()
+        if not self.webd_socket or str(self.webd_socket) in {".", ""}:
+            raw = _env("BILLET_WEBD_SOCKET") or webd_env.get("BILLET_WEBD_SOCKET")
+            if not raw:
+                run = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/aicad-{os.getuid()}"
+                raw = f"{run}/aicad/hostd-billetweb.sock"
+            self.webd_socket = _expand_path(raw)
+        if not self.workspace_root or str(self.workspace_root) in {".", ""}:
+            raw = (
+                _env("BILLET_WORKSPACE_ROOT")
+                or webd_env.get("BILLET_WORKSPACE_ROOT")
+                or "~/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
+            )
+            self.workspace_root = _expand_path(raw)
 
     @property
     def homes_dir(self) -> Path:

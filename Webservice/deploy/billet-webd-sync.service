@@ -1,0 +1,10 @@
+# billet-webd-sync.service — triggered by billet-webd-sync.path when the
+# engine build tree writes a new aicad-hostd. Sleeps briefly so sibling .so
+# files finish writing, then re-runs install_webd.sh --restart.
+[Unit]
+Description=Re-install billet-webd after engine rebuild
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=%h/Repositories/CAD/Webservice/deploy/install_webd.sh --restart

@@ -23,7 +23,7 @@ the frame loop in `host/src/app.cpp`.
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h` | Versioning, releases, document control; `contracts/plm.md` |
 | **Reverse Eng.** | `host/src/ui/reveng/reveng_workspace.cpp`, `webcam_capture.cpp`, `dim_review.cpp` | Photo capture, dimension confirm, reconstruction; `contracts/reveng.md`; splat view lives in `host/src/render/` (gui-viewport) |
-| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h`, `host/src/ui/activity_panel.cpp` | Agent run tree, role-prompt editor, live progress; events per `contracts/agent_events.md` |
+| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h`, `host/src/ui/activity_panel.cpp`, `host/src/ui/legacy_chat.cpp` (Copilot Settings: Agents/Prompts/Skills/**Context**/Permissions/Providers) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `AI_CAD_SHOT=firmware` |

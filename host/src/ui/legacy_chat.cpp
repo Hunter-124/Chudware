@@ -4,11 +4,11 @@
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (outline
 // cube + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
-// timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact Design/
-// Edit/Ask dropdown + context meter; transparent prompt with in-box send; graduated-width segmented
+// timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact Agent/
+// Plan/Swarm/Edit/Ask dropdown + context meter; transparent prompt with in-box send; graduated-width segmented
 // model/thinking/paperclip/cube/New toolbar — model biggest, icons smallest).
 // Header gear swaps the chat area for a compact AI-settings overlay (horizontal top tabs for
-// Agents/Prompts/Skills/Permissions/Providers). The full form lives in the Settings modal AI tab.
+// Agents/Prompts/Skills/Context/Permissions/Providers). The full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
 // as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
 // H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
@@ -52,6 +52,7 @@
 #include "widgets/interwebz.h"
 
 #include "../core/app_state.h"
+#include "property_manager.h"  // Edit-mode scope: PM targetId
 #include "../core/cpp_core.h"  // detect the in-process C++ core (libaicad) backend
 #include "../core/sim_client.h"  // chat-triggered OpenFOAM CFD on the SimClient channel
 #include "../core/jobs.h"
@@ -2703,6 +2704,15 @@ static void launchDesignRun(AppState& st, const std::string& request,
         for (auto it = extra.begin(); it != extra.end(); ++it)
             payload[it.key()] = it.value();
     }
+    // Mode overhaul: default options.mode=agent when caller didn't stamp one (Build-it path).
+    {
+        nlohmann::json opts = nlohmann::json::object();
+        if (payload.contains("options") && payload["options"].is_object())
+            opts = payload["options"];
+        if (!opts.contains("mode")) opts["mode"] = "agent";
+        if (!opts.contains("advisor")) opts["advisor"] = true;
+        payload["options"] = std::move(opts);
+    }
     // Cursor has no C++ chat completions transport (Connect-RPC lives only in the Python
     // CursorSubProvider). Route Design to the Python worker's legacy agent_design loop so the
     // run actually completes; every other provider keeps agent_run_v2.
@@ -2777,6 +2787,18 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
     if (extra.is_object()) {
         for (auto it = extra.begin(); it != extra.end(); ++it)
             payload[it.key()] = it.value();
+    }
+    // Mode overhaul: default mode=swarm when corporate_force, else agent, if unstamped.
+    {
+        nlohmann::json opts = nlohmann::json::object();
+        if (payload.contains("options") && payload["options"].is_object())
+            opts = payload["options"];
+        if (!opts.contains("mode")) {
+            if (opts.value("corporate_force", false)) opts["mode"] = "swarm";
+            else opts["mode"] = "agent";
+        }
+        if (!opts.contains("advisor")) opts["advisor"] = true;
+        payload["options"] = std::move(opts);
     }
     launchMissionRun(st.worker, st.job, request, st.docMirror.docId(), payload);
 }
@@ -3011,7 +3033,111 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         m.running = true;
         if (st.settings.model[0]) m.model = st.settings.model;
         m.liveStatus = "Building...";
-        launchDesignRun(st, aug);
+        nlohmann::json buildExtra = nlohmann::json::object();
+        buildExtra["options"] = {{"mode", "agent"}, {"advisor", true}};
+        launchDesignRun(st, aug, buildExtra);
+    }
+}
+
+// Plan-mode approve gate: after a plan_only run, show the plan and let the user
+// Execute as Agent / Execute as Swarm / Cancel. Resends with options.approved_plan + execute_as.
+static void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
+    if (!m.planApprovePending || m.running) return;
+    // Failed plan_only run — drop the gate rather than offering execute on an error card.
+    if (m.errKind != ERR_NONE) {
+        m.planApprovePending = false;
+        return;
+    }
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##plan_approve", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "Plan ready — approve to build");
+    ImGui::PopFont();
+    dimText("Review the plan above, then execute as a single agent or a multi-agent swarm.");
+
+    auto planText = [&]() -> std::string {
+        std::string out;
+        if (m.planState.present) {
+            out = m.planState.title.empty() ? "Plan" : m.planState.title;
+            if (!m.planState.summary.empty()) { out += "\n"; out += m.planState.summary; }
+            for (const auto& it : m.planState.items) {
+                out += "\n- ";
+                if (!it.status.empty()) { out += "["; out += it.status; out += "] "; }
+                out += it.title.empty() ? it.id : it.title;
+                if (!it.desc.empty()) { out += " — "; out += it.desc; }
+            }
+        } else if (m.plan.present) {
+            out = m.plan.name.empty() ? "Plan" : m.plan.name;
+            if (!m.plan.summary.empty()) { out += "\n"; out += m.plan.summary; }
+            for (const auto& p : m.plan.parts) {
+                out += "\n- "; out += p.name;
+                if (!p.dims.empty()) { out += " ("; out += p.dims; out += ")"; }
+            }
+        } else if (!m.text.empty()) {
+            out = m.text;
+        } else {
+            out = m.planApproveRequest;
+        }
+        return out;
+    };
+
+    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    bool asAgent = primaryButton("Execute as Agent", ImVec2(-1, ui::metrics::copilotBtnH()));
+    bool asSwarm = ImGui::Button("Execute as Swarm", ImVec2(-1, 0));
+    bool cancel  = ImGui::Button("Cancel", ImVec2(-1, 0));
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    endGlassBubble(gb);
+
+    if (cancel) {
+        m.planApprovePending = false;
+        m.planApproveRequest.clear();
+        m.planApproveExtras = nlohmann::json::object();
+        if (m.text.empty()) m.text = "Plan cancelled.";
+        st.status = "Ready."; st.statusKind = 0;
+        return;
+    }
+    if (!asAgent && !asSwarm) return;
+
+    const std::string approved = planText();
+    const std::string req = m.planApproveRequest.empty() ? approved : m.planApproveRequest;
+    nlohmann::json extras = m.planApproveExtras.is_object() ? m.planApproveExtras
+                                                            : nlohmann::json::object();
+    nlohmann::json opts = nlohmann::json::object();
+    opts["advisor"] = true;
+    opts["approved_plan"] = approved;
+    if (asSwarm) {
+        opts["mode"] = "swarm";
+        opts["execute_as"] = "swarm";
+        opts["corporate_force"] = true;
+    } else {
+        opts["mode"] = "agent";
+        opts["execute_as"] = "agent";
+    }
+    extras["options"] = std::move(opts);
+    nlohmann::json payload = agentProviderOverride(st.settings);
+    for (auto it = extras.begin(); it != extras.end(); ++it)
+        payload[it.key()] = it.value();
+
+    m.planApprovePending = false;
+    m.running = true;
+    if (st.settings.model[0]) m.model = st.settings.model;
+    m.liveStatus = asSwarm ? "Executing plan (swarm)..." : "Executing plan (agent)...";
+    st.status = m.liveStatus; st.statusKind = 0;
+    st.agentV2Running = true;
+    st.agentV2 = true;
+    if (st.activityPanel) st.activityPanel->clearLive();
+
+    if (asSwarm) {
+        launchMissionRunChat(st, req, /*needFreshDoc=*/true, payload);
+    } else {
+        launchDesignRun(st, req, payload);
     }
 }
 
@@ -4639,6 +4765,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);
+    // (4b) Plan-mode approve gate (plan_only finished → Execute as Agent/Swarm).
+    if (m.planApprovePending && !m.running) drawPlanApproveCard(st, m, fonts);
 
     // (5) Legacy v1 AgentStep cards — kept for backward compat (glass-restyled in drawAgentStep).
     for (size_t si = 0; si < m.steps.size(); ++si) {
@@ -5033,7 +5161,11 @@ static void drawSessionsPanel(AppState& st, bool busy) {
                                             ImVec2(std::max(1.0f, rowW - trashSz - padX), rowH));
         bool rowHov = ImGui::IsItemHovered();
         if (picked && !busy) {
-            switchConversation(st, i);
+            // Always land in chat for the chosen session — including re-clicking
+            // the already-active one (switchConversation early-returns on same idx).
+            if (i != st.activeConv)
+                switchConversation(st, i);
+            st.showSessionsPicker = false;
             st.showAISettingsOverlay = false;
         }
 
@@ -6515,6 +6647,303 @@ static void ovDeleteSkill(AppState& st, const std::string& name) {
     });
 }
 
+
+// ---- Context Injection (triggers_list/get/save/delete + packs_*) ----
+// aicad.trigger/1: keyword/tool/event → context pack (+ optional prerun calcs).
+// User overrides live under ~/.local/share/AI-CAD/context_injection/; shipped
+// triggers.yaml is never rewritten.
+struct OvTriggerRow {
+    std::string id;
+    std::string purpose;
+    std::string source;   // builtin | override | user
+    std::string pack;
+    std::string exemplar;
+    bool enabled = true;
+    int budgetTokens = 250;
+    int cooldownTurns = 8;
+    std::vector<std::string> keywords;
+    std::vector<std::string> tools;
+    std::vector<std::string> events;
+};
+struct OvTriggersUi {
+    std::vector<OvTriggerRow> rows;
+    bool loaded = false;
+    bool rpcMissing = false;
+    bool listInFlight = false;
+    bool bodyInFlight = false;
+    bool saveInFlight = false;
+    double lastList = -1e9;
+    std::string lastError;
+    std::string selected;
+    // Editor buffers for the selected trigger.
+    bool enabled = true;
+    int budgetTokens = 250;
+    int cooldownTurns = 8;
+    char purpose[512] = {};
+    char packName[96] = {};
+    char keywords[2048] = {};   // one regex per line
+    char tools[1024] = {};      // comma or newline separated
+    char events[1024] = {};
+    char exemplar[512] = {};
+    std::vector<char> packBody{std::vector<char>(65536, 0)};
+    bool bodyDirty = false;   // any editor field dirty
+    bool packDirty = false;   // pack body specifically edited (avoid freezing shipped packs)
+    nlohmann::json prerunCalcs = nlohmann::json::array();  // preserved from get/list
+    bool creating = false;
+    char newId[96] = {};
+};
+static OvTriggersUi s_ovTrig;
+
+static bool ovTriggersAbsent(const core::RpcResult& r) {
+    if (!r.ok) {
+        const std::string& e = r.err;
+        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
+            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
+            return true;
+        return false;
+    }
+    if (r.result.is_object()) {
+        const std::string c = r.result.value("code", std::string());
+        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
+            return true;
+        if (!r.result.value("ok", true)) {
+            const std::string reason = r.result.value("reason", std::string());
+            if (reason == "unknown_method" || reason == "method_not_found")
+                return true;
+        }
+    }
+    return false;
+}
+static std::vector<std::string> ovSplitLinesOrCommas(const char* buf) {
+    std::vector<std::string> out;
+    if (!buf) return out;
+    std::string cur;
+    for (const char* p = buf; ; ++p) {
+        const char c = *p;
+        if (c == '\n' || c == '\r' || c == ',' || c == 0) {
+            size_t a = 0, b = cur.size();
+            while (a < b && std::isspace((unsigned char)cur[a])) ++a;
+            while (b > a && std::isspace((unsigned char)cur[b - 1])) --b;
+            if (b > a) out.emplace_back(cur.substr(a, b - a));
+            cur.clear();
+            if (c == 0) break;
+            continue;
+        }
+        cur.push_back(c);
+    }
+    return out;
+}
+static void ovJoinLines(const std::vector<std::string>& xs, char* buf, size_t n) {
+    if (!buf || n == 0) return;
+    buf[0] = 0;
+    std::string s;
+    for (size_t i = 0; i < xs.size(); ++i) {
+        if (i) s.push_back('\n');
+        s += xs[i];
+    }
+    if (s.size() >= n) s.resize(n - 1);
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = 0;
+}
+static void ovPollTriggers(AppState& st, bool force) {
+    if (s_ovTrig.rpcMissing) return;
+    const double now = ImGui::GetTime();
+    if (!force && s_ovTrig.loaded && (now - s_ovTrig.lastList) < 4.0) return;
+    if (s_ovTrig.listInFlight) return;
+    s_ovTrig.lastList = now;
+    s_ovTrig.listInFlight = true;
+    st.rpc.call("triggers_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_ovTrig.listInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            s_ovTrig.loaded = true;
+            s_ovTrig.rows.clear();
+            return;
+        }
+        if (!r.ok || !r.result.is_object()) {
+            s_ovTrig.lastError = r.err.empty() ? "triggers_list failed" : r.err;
+            s_ovTrig.loaded = true;
+            return;
+        }
+        s_ovTrig.lastError.clear();
+        s_ovTrig.rows.clear();
+        auto arr = r.result.value("triggers", nlohmann::json::array());
+        if (arr.is_array()) {
+            for (const auto& e : arr) {
+                if (!e.is_object()) continue;
+                OvTriggerRow row;
+                row.id = e.value("id", std::string());
+                row.purpose = e.value("purpose", std::string());
+                row.source = e.value("source", std::string("builtin"));
+                row.enabled = e.value("enabled", true);
+                row.budgetTokens = e.value("budget_tokens", 250);
+                row.cooldownTurns = e.value("cooldown_turns", 8);
+                auto inject = e.value("inject", nlohmann::json::object());
+                if (inject.is_object()) {
+                    row.pack = inject.value("context_pack", std::string());
+                    row.exemplar = inject.value("exemplar", std::string());
+                }
+                auto match = e.value("match", nlohmann::json::object());
+                if (match.is_object()) {
+                    auto kws = match.value("keywords", nlohmann::json::array());
+                    if (kws.is_array())
+                        for (const auto& k : kws)
+                            if (k.is_string()) row.keywords.push_back(k.get<std::string>());
+                    auto tools = match.value("tools", nlohmann::json::array());
+                    if (tools.is_array())
+                        for (const auto& t : tools)
+                            if (t.is_string()) row.tools.push_back(t.get<std::string>());
+                    auto evs = match.value("events", nlohmann::json::array());
+                    if (evs.is_array())
+                        for (const auto& ev : evs)
+                            if (ev.is_string()) row.events.push_back(ev.get<std::string>());
+                }
+                if (!row.id.empty()) s_ovTrig.rows.push_back(std::move(row));
+            }
+        }
+        std::sort(s_ovTrig.rows.begin(), s_ovTrig.rows.end(),
+                  [](const OvTriggerRow& a, const OvTriggerRow& b) {
+                      return a.id < b.id;
+                  });
+        s_ovTrig.loaded = true;
+    });
+}
+static void ovLoadTriggerBody(AppState& st, const std::string& id) {
+    if (id.empty() || s_ovTrig.bodyInFlight) return;
+    s_ovTrig.bodyInFlight = true;
+    s_ovTrig.bodyDirty = false;
+    s_ovTrig.packDirty = false;
+    st.rpc.call("triggers_get", nlohmann::json{{"id", id}},
+                [id](const core::RpcResult& r) {
+        s_ovTrig.bodyInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_get failed"))
+                : r.err;
+            return;
+        }
+        if (s_ovTrig.selected != id) return;
+        auto trig = r.result.value("trigger", nlohmann::json::object());
+        auto pack = r.result.value("pack", nlohmann::json::object());
+        s_ovTrig.enabled = trig.value("enabled", true);
+        s_ovTrig.budgetTokens = trig.value("budget_tokens", 250);
+        s_ovTrig.cooldownTurns = trig.value("cooldown_turns", 8);
+        std::string purpose = trig.value("purpose", std::string());
+        std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
+        std::strncpy(s_ovTrig.purpose, purpose.c_str(), sizeof(s_ovTrig.purpose) - 1);
+        auto inject = trig.value("inject", nlohmann::json::object());
+        std::string packName = inject.is_object()
+            ? inject.value("context_pack", std::string()) : std::string();
+        std::string exemplar = inject.is_object()
+            ? inject.value("exemplar", std::string()) : std::string();
+        s_ovTrig.prerunCalcs = (inject.is_object() && inject.contains("prerun_calcs")
+                                && inject["prerun_calcs"].is_array())
+            ? inject["prerun_calcs"] : nlohmann::json::array();
+        std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
+        std::strncpy(s_ovTrig.packName, packName.c_str(), sizeof(s_ovTrig.packName) - 1);
+        std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
+        std::strncpy(s_ovTrig.exemplar, exemplar.c_str(), sizeof(s_ovTrig.exemplar) - 1);
+        auto match = trig.value("match", nlohmann::json::object());
+        std::vector<std::string> kws, tools, evs;
+        if (match.is_object()) {
+            auto a = match.value("keywords", nlohmann::json::array());
+            if (a.is_array()) for (const auto& k : a)
+                if (k.is_string()) kws.push_back(k.get<std::string>());
+            a = match.value("tools", nlohmann::json::array());
+            if (a.is_array()) for (const auto& t : a)
+                if (t.is_string()) tools.push_back(t.get<std::string>());
+            a = match.value("events", nlohmann::json::array());
+            if (a.is_array()) for (const auto& e : a)
+                if (e.is_string()) evs.push_back(e.get<std::string>());
+        }
+        ovJoinLines(kws, s_ovTrig.keywords, sizeof(s_ovTrig.keywords));
+        ovJoinLines(tools, s_ovTrig.tools, sizeof(s_ovTrig.tools));
+        ovJoinLines(evs, s_ovTrig.events, sizeof(s_ovTrig.events));
+        std::string body = pack.is_object() ? pack.value("body", std::string()) : std::string();
+        std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
+        if (body.size() >= s_ovTrig.packBody.size())
+            body.resize(s_ovTrig.packBody.size() - 1);
+        std::memcpy(s_ovTrig.packBody.data(), body.data(), body.size());
+        s_ovTrig.bodyDirty = false;
+        s_ovTrig.packDirty = false;
+        s_ovTrig.lastError.clear();
+    });
+}
+static void ovSaveTrigger(AppState& st) {
+    if (s_ovTrig.selected.empty() || s_ovTrig.saveInFlight) return;
+    s_ovTrig.saveInFlight = true;
+    nlohmann::json p;
+    p["id"] = s_ovTrig.selected;
+    p["enabled"] = s_ovTrig.enabled;
+    p["purpose"] = std::string(s_ovTrig.purpose);
+    p["budget_tokens"] = s_ovTrig.budgetTokens;
+    p["cooldown_turns"] = s_ovTrig.cooldownTurns;
+    p["match"] = nlohmann::json{
+        {"keywords", ovSplitLinesOrCommas(s_ovTrig.keywords)},
+        {"tools", ovSplitLinesOrCommas(s_ovTrig.tools)},
+        {"events", ovSplitLinesOrCommas(s_ovTrig.events)},
+    };
+    p["inject"] = nlohmann::json{
+        {"context_pack", std::string(s_ovTrig.packName)},
+        {"prerun_calcs", s_ovTrig.prerunCalcs.is_array()
+            ? s_ovTrig.prerunCalcs : nlohmann::json::array()},
+        {"exemplar", std::string(s_ovTrig.exemplar)},
+    };
+    for (const auto& row : s_ovTrig.rows) {
+        if (row.id == s_ovTrig.selected) {
+            if (s_ovTrig.packName[0] == 0 && !row.pack.empty())
+                p["inject"]["context_pack"] = row.pack;
+            break;
+        }
+    }
+    // Only write pack body when the user actually edited it (or is creating).
+    // Toggling Enabled alone must not freeze a shipped pack into the user dir.
+    if (s_ovTrig.packDirty || s_ovTrig.creating) {
+        p["pack_body"] = std::string(s_ovTrig.packBody.data());
+        p["pack_name"] = std::string(s_ovTrig.packName);
+    }
+    st.rpc.call("triggers_save", p, [](const core::RpcResult& r) {
+        s_ovTrig.saveInFlight = false;
+        if (ovTriggersAbsent(r)) {
+            s_ovTrig.rpcMissing = true;
+            return;
+        }
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_save failed"))
+                : r.err;
+            return;
+        }
+        s_ovTrig.bodyDirty = false;
+        s_ovTrig.packDirty = false;
+        s_ovTrig.lastError.clear();
+        s_ovTrig.loaded = false;
+        s_ovTrig.lastList = -1e9;
+    });
+}
+static void ovDeleteTriggerOverride(AppState& st, const std::string& id) {
+    if (id.empty()) return;
+    st.rpc.call("triggers_delete", nlohmann::json{{"id", id}},
+                [id](const core::RpcResult& r) {
+        if (!r.ok || (r.result.is_object() && !r.result.value("ok", true))) {
+            s_ovTrig.lastError = r.err.empty()
+                ? r.result.value("reason", std::string("triggers_delete failed"))
+                : r.err;
+            return;
+        }
+        s_ovTrig.lastError.clear();
+        s_ovTrig.loaded = false;
+        s_ovTrig.lastList = -1e9;
+        if (s_ovTrig.selected == id)
+            s_ovTrig.bodyDirty = false;
+    });
+}
+
 // Apply provider switch defaults (shared with the old single-picker overlay).
 static void ovApplyProviderDefaults(Settings& s) {
     if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
@@ -7427,6 +7856,286 @@ static void ovSaveMaxSubagentDepth(int depth) {
     } catch (...) {}
 }
 
+static void drawOvContextTab(AppState& st, float S) {
+    ovPollTriggers(st, /*force=*/false);
+
+    if (s_ovTrig.rpcMissing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped(
+            "triggers_* RPC not available \xe2\x80\x94 Context Injection editor hidden.");
+        ImGui::PopStyleColor();
+        return;
+    }
+    if (!s_ovTrig.lastError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_ovTrig.lastError.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+               ui::palette.textDim[2], 1));
+    ImGui::TextWrapped(
+        "Keyword / tool / event triggers inject domain context so the model plans "
+        "with the right numbers and tool sequences (aicad.trigger/1).");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
+    ui::InterwebzTwoColumnBegin(10.0f);
+    if (ui::InterwebzGroupBegin("##ov_trig_list", "Triggers", ImVec2(0, colH))) {
+        if (ImGui::Button("New trigger", ImVec2(-1, 0))) {
+            s_ovTrig.creating = true;
+            s_ovTrig.selected.clear();
+            s_ovTrig.enabled = true;
+            s_ovTrig.budgetTokens = 250;
+            s_ovTrig.cooldownTurns = 8;
+            std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
+            std::strncpy(s_ovTrig.purpose, "What this pack teaches the model.",
+                         sizeof(s_ovTrig.purpose) - 1);
+            std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
+            std::strncpy(s_ovTrig.packName, "my_pack", sizeof(s_ovTrig.packName) - 1);
+            std::memset(s_ovTrig.keywords, 0, sizeof(s_ovTrig.keywords));
+            std::strncpy(s_ovTrig.keywords, "\\bmy_keyword\\b",
+                         sizeof(s_ovTrig.keywords) - 1);
+            std::memset(s_ovTrig.tools, 0, sizeof(s_ovTrig.tools));
+            std::memset(s_ovTrig.events, 0, sizeof(s_ovTrig.events));
+            std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
+            std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
+            std::strncpy(s_ovTrig.packBody.data(),
+                         "# My context pack\n\nImportant considerations:\n- ...\n",
+                         s_ovTrig.packBody.size() - 1);
+            s_ovTrig.prerunCalcs = nlohmann::json::array();
+            s_ovTrig.bodyDirty = true;
+            s_ovTrig.packDirty = true;
+            std::memset(s_ovTrig.newId, 0, sizeof(s_ovTrig.newId));
+            std::strncpy(s_ovTrig.newId, "my_trigger", sizeof(s_ovTrig.newId) - 1);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Create a user-only trigger + pack (saved under context_injection/).");
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+
+        if (!s_ovTrig.loaded && s_ovTrig.listInFlight) {
+            ImGui::TextUnformatted("Loading triggers\xe2\x80\xa6");
+        } else if (s_ovTrig.rows.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("No triggers discovered.");
+            ImGui::PopStyleColor();
+        } else {
+            for (size_t i = 0; i < s_ovTrig.rows.size(); ++i) {
+                const auto& tr = s_ovTrig.rows[i];
+                ImGui::PushID((int)i);
+                const bool sel = (!s_ovTrig.creating && s_ovTrig.selected == tr.id);
+                if (ImGui::Selectable("##trigrow", sel, 0, ImVec2(0, 0))) {
+                    s_ovTrig.creating = false;
+                    s_ovTrig.selected = tr.id;
+                    ovLoadTriggerBody(st, tr.id);
+                }
+                ImGui::SameLine(0, 0);
+                ImGui::BeginGroup();
+                ImGui::Text("%s %s", tr.enabled ? "\xe2\x97\x8f" : "\xe2\x97\x8b",
+                            tr.id.c_str());
+                ImGui::SameLine();
+                {
+                    const char* chip = tr.source.c_str();
+                    ImU32 chipCol = ui::Palette::toU32(ui::palette.textDim);
+                    if (tr.source == "user")
+                        chipCol = ui::Palette::toU32(ui::palette.accent);
+                    else if (tr.source == "override")
+                        chipCol = ui::Palette::toU32(ui::palette.statusOk);
+                    ImGui::PushStyleColor(ImGuiCol_Text, chipCol);
+                    ImGui::Text("[%s]", chip);
+                    ImGui::PopStyleColor();
+                }
+                if (!tr.purpose.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("%s", tr.purpose.c_str());
+                    ImGui::PopStyleColor();
+                } else if (!tr.pack.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                               ui::palette.textDim[2], 1));
+                    ImGui::TextWrapped("pack: %s", tr.pack.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::EndGroup();
+                if (ImGui::IsItemClicked()) {
+                    s_ovTrig.creating = false;
+                    s_ovTrig.selected = tr.id;
+                    ovLoadTriggerBody(st, tr.id);
+                }
+                ImGui::PopID();
+                ImGui::Dummy(ImVec2(0, 2.0f * S));
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ui::InterwebzTwoColumnNext();
+    if (ui::InterwebzGroupBegin("##ov_trig_ed", "Editor", ImVec2(0, colH))) {
+        if (s_ovTrig.creating) {
+            ImGui::TextUnformatted("Id");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##ov_newtrig", s_ovTrig.newId, sizeof(s_ovTrig.newId));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped(
+                "Letters, digits, _ and - only. Saved as a user trigger.");
+            ImGui::PopStyleColor();
+        } else if (s_ovTrig.selected.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                       ui::palette.textDim[2], 1));
+            ImGui::TextWrapped("Select a trigger to edit, or New trigger.");
+            ImGui::PopStyleColor();
+        } else {
+            ui::InterwebzKeyValueRow("Trigger", s_ovTrig.selected.c_str());
+            const char* src = "builtin";
+            for (const auto& tr : s_ovTrig.rows)
+                if (tr.id == s_ovTrig.selected) { src = tr.source.c_str(); break; }
+            ui::InterwebzKeyValueRow("Source", src);
+        }
+
+        if (s_ovTrig.creating || !s_ovTrig.selected.empty()) {
+            if (s_ovTrig.bodyInFlight && !s_ovTrig.creating) {
+                ImGui::TextUnformatted("Loading\xe2\x80\xa6");
+            } else {
+                if (ui::InterwebzCheckbox("Enabled", &s_ovTrig.enabled))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Off = never inject this pack (user override of shipped).");
+
+                ImGui::TextUnformatted("Purpose");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_purpose", s_ovTrig.purpose,
+                                     sizeof(s_ovTrig.purpose)))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Why this pack exists — what important considerations it "
+                        "forces the model to take.");
+
+                ImGui::TextUnformatted("Keywords (regex, one per line)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputTextMultiline("##ov_kws", s_ovTrig.keywords,
+                        sizeof(s_ovTrig.keywords),
+                        ImVec2(-1, 56.0f * S)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Tools (names that fire this)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_tools", s_ovTrig.tools,
+                                     sizeof(s_ovTrig.tools)))
+                    s_ovTrig.bodyDirty = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Comma or newline separated tool names, e.g. part_place, fit_calc.");
+
+                ImGui::TextUnformatted("Events");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_events", s_ovTrig.events,
+                                     sizeof(s_ovTrig.events)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Context pack name");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_packname", s_ovTrig.packName,
+                                     sizeof(s_ovTrig.packName)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Exemplar (short worked example)");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##ov_exemplar", s_ovTrig.exemplar,
+                                     sizeof(s_ovTrig.exemplar)))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::SetNextItemWidth(ImMax(100.0f * S,
+                    ImGui::GetContentRegionAvail().x * 0.48f));
+                if (ImGui::SliderInt("Budget tokens", &s_ovTrig.budgetTokens,
+                                     50, 2000))
+                    s_ovTrig.bodyDirty = true;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImMax(80.0f * S,
+                    ImGui::GetContentRegionAvail().x * 0.9f));
+                if (ImGui::SliderInt("Cooldown", &s_ovTrig.cooldownTurns, 0, 32))
+                    s_ovTrig.bodyDirty = true;
+
+                ImGui::TextUnformatted("Pack body (markdown injected into context)");
+                const float edH = ImMax(80.0f * S,
+                    ImGui::GetContentRegionAvail().y - 72.0f * S);
+                if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+                if (ImGui::InputTextMultiline("##ov_packbody",
+                        s_ovTrig.packBody.data(), s_ovTrig.packBody.size(),
+                        ImVec2(-1, edH))) {
+                    s_ovTrig.bodyDirty = true;
+                    s_ovTrig.packDirty = true;
+                }
+                if (st.fonts.mono) ImGui::PopFont();
+            }
+
+            const bool busySave = s_ovTrig.saveInFlight;
+            if (busySave) ImGui::BeginDisabled();
+            if (ImGui::Button(s_ovTrig.creating ? "Create##trsave" : "Save##trsave",
+                              ImVec2(-1, 0))) {
+                if (s_ovTrig.creating) {
+                    std::string name = s_ovTrig.newId;
+                    name.erase(std::remove_if(name.begin(), name.end(),
+                        [](unsigned char c) {
+                            return !(std::isalnum(c) || c == '_' || c == '-');
+                        }), name.end());
+                    if (name.empty()) name = "my_trigger";
+                    s_ovTrig.selected = name;
+                    s_ovTrig.creating = false;
+                    ovSaveTrigger(st);
+                } else {
+                    ovSaveTrigger(st);
+                }
+            }
+            if (busySave) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Writes a user override (shipped triggers.yaml is never rewritten).");
+
+            if (!s_ovTrig.creating && !s_ovTrig.selected.empty()) {
+                bool isOverrideOrUser = false;
+                bool isUserOnly = false;
+                for (const auto& tr : s_ovTrig.rows) {
+                    if (tr.id == s_ovTrig.selected) {
+                        isOverrideOrUser = (tr.source == "override" || tr.source == "user");
+                        isUserOnly = (tr.source == "user");
+                        break;
+                    }
+                }
+                if (isOverrideOrUser) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
+                               ui::palette.statusErr[2], 0.55f));
+                    if (ImGui::Button(
+                            isUserOnly ? "Delete user trigger"
+                                       : "Reset to shipped",
+                            ImVec2(-1, 0)))
+                        ovDeleteTriggerOverride(st, s_ovTrig.selected);
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            isUserOnly
+                                ? "Remove this user-only trigger."
+                                : "Clear the user override and restore the shipped trigger.");
+                }
+            }
+        }
+    }
+    ui::InterwebzGroupEnd();
+    ui::InterwebzTwoColumnEnd();
+}
+
 static void drawOvPermissionsTab(AppState& st, float S, bool& changed) {
     Settings& s = st.settings;
     // Run permissions first, then compact Privacy. Single column so narrow
@@ -8030,33 +8739,33 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::TextUnformatted("AI Settings");
     ImGui::PopFont();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("Agents, prompts, skills, permissions, providers.");
+    ImGui::TextWrapped("Agents, prompts, skills, context injection, permissions, providers.");
     ImGui::PopStyleColor();
     // Clear vertical separation so the tab strip never overlaps the title block.
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.0f)));
 
-    // Wrapping top tabs — all five must stay visible in the narrow copilot column
-    // (no horizontal scrollbar that clips Permissions/Providers).
+    // Wrapping top tabs — six labels; pad is tighter so Providers still fits
+    // next to the new Context Injection tab in the narrow copilot column.
     static int s_aiSettingsRail = 0;
     static const char* kRailLabels[] = {
-        "Agents", "Prompts", "Skills", "Permissions", "Providers",
+        "Agents", "Prompts", "Skills", "Context", "Permissions", "Providers",
     };
-    const int nTabs = 5;
+    const int nTabs = 6;
     const float availW = ImGui::GetContentRegionAvail().x;
     const float gapX = ui::metrics::U(0.5f);
     const float gapY = ui::metrics::U(0.5f);
     // Compact pad so more labels fit per row; still readable at any uiScale.
-    const float tabPadX = ui::metrics::U(1.5f);
+    const float tabPadX = ui::metrics::U(1.25f);
     const float tabH = ImGui::GetFrameHeight();
 
-    float naturalW[5];
+    float naturalW[6];
     for (int i = 0; i < nTabs; ++i)
         naturalW[i] = ImGui::CalcTextSize(kRailLabels[i]).x + tabPadX * 2.0f;
 
     // Greedy wrap into rows, then even-fit each row to the column width so the
-    // strip always shows every tab (typically 3+2 in a narrow copilot pane).
-    int rowStart[5];
-    int rowCount[5];
+    // strip always shows every tab (typically 3+3 in a narrow copilot pane).
+    int rowStart[6];
+    int rowCount[6];
     int nRows = 0;
     {
         int i = 0;
@@ -8132,8 +8841,9 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     case 0: drawOvAgentsTab(st, S, changed); break;
     case 1: drawOvPromptsTab(st, S, changed); break;
     case 2: drawOvSkillsTab(st, S); break;
-    case 3: drawOvPermissionsTab(st, S, changed); break;
-    case 4: drawOvProvidersTab(st, S); break;
+    case 3: drawOvContextTab(st, S); break;
+    case 4: drawOvPermissionsTab(st, S, changed); break;
+    case 5: drawOvProvidersTab(st, S); break;
     default: break;
     }
     ImGui::PopStyleVar();
@@ -8842,9 +9552,9 @@ static void drawBtwPanel(AppState& st) {
     s_btw.open = open;
 }
 
-// Launch the active turn for `text` according to the current mode (Design/Edit/Ask). Pushes
-// the user + live-assistant ChatMsgs. Centralizes the three old launch paths so the top input
-// and the per-turn follow-up input share one code path.
+// Launch the active turn for `text` according to the current CopilotMode
+// (Agent/Plan/Swarm/Edit/Ask). Pushes the user + live-assistant ChatMsgs.
+// Centralizes launch paths so the top input and per-turn follow-up share one code path.
 static void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
     // Slash commands: /compact /shake /handoff /btw /prewalk — pure host+RPC, no agent turn.
@@ -8897,22 +9607,56 @@ static void submitTurn(AppState& st, const std::string& text) {
     }
     ui::persistChatHistory(st);
 
-    bool editMode = (st.aiInteraction == 1);
-    bool askMode  = (st.aiInteraction == 2);
+    // Sync persisted settings.copilotMode with live dropdown.
+    st.settings.copilotMode = st.aiInteraction;
+    const CopilotMode mode = (st.aiInteraction >= 0 && st.aiInteraction <= 4)
+                                 ? (CopilotMode)st.aiInteraction
+                                 : CopilotMode::Agent;
+    const bool editMode  = (mode == CopilotMode::Edit);
+    const bool askMode   = (mode == CopilotMode::Ask);
+    const bool planMode  = (mode == CopilotMode::Plan);
+    const bool swarmMode = (mode == CopilotMode::Swarm);
+    const bool agentMode = (mode == CopilotMode::Agent);
+
+    auto withOptions = [&](nlohmann::json base, nlohmann::json opts) -> nlohmann::json {
+        if (!opts.is_object()) opts = nlohmann::json::object();
+        if (!opts.contains("advisor")) opts["advisor"] = true;
+        base["options"] = std::move(opts);
+        return base;
+    };
+    auto buildEditScope = [&]() -> nlohmann::json {
+        nlohmann::json scope = nlohmann::json::object();
+        if (st.docMirror.hasDoc()) scope["doc_id"] = st.docMirror.docId();
+        nlohmann::json fids = nlohmann::json::array();
+        if (st.propertyManager && st.propertyManager->active() &&
+            __omp_shell("st.propertyManager->targetId().empty()) {")
+            fids.push_back(st.propertyManager->targetId());
+        } else if (!st.selectedFeatureId.empty()) {
+            fids.push_back(st.selectedFeatureId);
+        }
+        if (!fids.empty()) scope["feature_ids"] = fids;
+        nlohmann::json sels = nlohmann::json::array();
+        for (const auto& it : st.selection.items()) {
+            if (!it.selector.empty()) {
+                try {
+                    sels.push_back(nlohmann::json::parse(it.selector));
+                } catch (...) {
+                    sels.push_back(it.selector);
+                }
+            }
+        }
+        if (!sels.empty()) scope["selection"] = sels;
+        return scope;
+    };
 
     std::string lo = text;
     std::transform(lo.begin(), lo.end(), lo.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
 
-    // MISSION intent: a request that asks to BUILD something AND then analyze/validate it
-    // ("model an airplane, then run CFD and prove it's good"; "design a bracket and FEA it").
-    // The old routing was mutually exclusive — a "...run a CFD..." phrase greedily hijacked the
-    // whole message into the sim tool, which then refused on the empty doc. Route the combined
-    // case to the mission orchestrator, which decomposes it into design -> analyze -> verdict.
-    // Conservative on purpose: a miss just falls through to plain design (no regression).
+    // MISSION intent: Agent mode only.
     auto looksLikeMission = [&]() -> bool {
-        if (editMode || askMode || st.agentV2Running) return false;
+        if (!agentMode || st.agentV2Running) return false;
         bool buildVerb = has("make ") || has("model ") || has("build ") || has("design ") ||
                          has("create ") || has("generate ") || has("give me");
         bool analyzeVerb = has("cfd") || has("wind tunnel") || has("windtunnel") ||
@@ -8925,16 +9669,14 @@ static void submitTurn(AppState& st, const std::string& text) {
         return buildVerb && analyzeVerb;
     };
     if (looksLikeMission()) {
-        launchMissionRunChat(st, sendText, /*needFreshDoc=*/true, turnExtras);
+        nlohmann::json extras = withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
+        launchMissionRunChat(st, sendText, /*needFreshDoc=*/true, extras);
         return;
     }
 
-    // CFD/sim intent: a flow-sim request on an open part routes to the simulation tool in ANY mode
-    // (the AI runs a wind-tunnel CFD and reports drag/lift). Mirrors Ask — async, fills the chat,
-    // never mutates geometry. Works fully offline (the core parses the flow condition itself).
-    // This is the SIM-ONLY quick path (no build verb) — a combined build+analyze request was
-    // already handled by looksLikeMission above.
+    // CFD/sim: Agent/Ask only — Plan/Swarm/Edit must not be hijacked.
     auto looksLikeSim = [&]() -> bool {
+        if (!(agentMode || askMode)) return false;
         if (!st.docMirror.hasDoc() || st.agentV2Running) return false;
         if (has("cfd") || has("wind tunnel") || has("windtunnel") || has("aerodynam") ||
             has("drag") || has("downforce"))
@@ -8947,12 +9689,6 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.addLog("[..] cfd: " + text);
         st.status = "Running CFD...";  st.statusKind = 0;
         nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"request", text}};
-        // Accurate (OpenFOAM RANS) opt-in: when the user asks for an accurate/validated run AND the
-        // worker reports OpenFOAM available, request solver=openfoam. The core exports an STL and
-        // hands back {needs_openfoam, stl_path, velocity_ms, aoa_deg, fluid}; the app loop fulfils
-        // it on the dedicated (non-blocking) SimClient channel — see pollChatOpenFoam in app.cpp.
-        // (sim_run_flow must NOT go through st.rpc: WorkerClient::call serialises on callMtx_, so a
-        // minutes-long solve there would freeze every other RPC.)
         const bool wantAccurate = has("accurate") || has("openfoam") || has("open foam") ||
                                   has("precise") || has("high-fidelity") || has("high fidelity") ||
                                   has("rans") || has("validated");
@@ -8974,8 +9710,6 @@ static void submitTurn(AppState& st, const std::string& text) {
             else if (r.result.is_object() && r.result.contains("code"))
                 err = r.result.value("message", std::string("worker error"));
 
-            // Accurate hand-off: the core exported an STL; launch OpenFOAM on the SimClient channel
-            // (non-blocking) and let the app loop post the result when the study finishes.
             if (err.empty() && r.result.value("needs_openfoam", false) && st.simClient) {
                 const bool water = (r.result.value("fluid", std::string("air")) == "water");
                 nlohmann::json fparams = {
@@ -8990,17 +9724,15 @@ static void submitTurn(AppState& st, const std::string& text) {
                     {"solver", "openfoam"},
                 };
                 std::string note;
-                // Sentinel owner so SimManager::tick (which matches the real doc id) ignores this
-                // job — the chat's own poll consumes it instead. No study/overlay side effects.
                 if (st.simClient->launch("sim_run_flow", fparams, note, "__chat_cfd__")) {
                     st.chatCfdVel = r.result.value("velocity_ms", 10.0);
                     st.chatCfdAoa = r.result.value("aoa_deg", 0.0);
-                    st.chatCfdPending = true;   // app loop polls SimClient and posts the result
+                    st.chatCfdPending = true;
                     if (msg) msg->liveStatus = "OpenFOAM RANS (a few minutes)...";
                     st.status = "Running OpenFOAM...";  st.statusKind = 0;
                     return;
                 }
-                err = note.empty() ? "could not launch OpenFOAM" : note;  // e.g. a study is running
+                err = note.empty() ? "could not launch OpenFOAM" : note;
             }
 
             if (msg) {
@@ -9018,26 +9750,34 @@ static void submitTurn(AppState& st, const std::string& text) {
         return;
     }
 
-    if (editMode && st.docMirror.hasDoc()) {
-        // Edit part -> orchestrator v2 (validated document ops).
+    // ---- mode branch table (Agent | Plan | Swarm | Edit | Ask) ----
+    if (editMode) {
+        if (!st.docMirror.hasDoc()) {
+            if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
+                st.chat.back().running = false;
+                st.chat.back().text = "Edit mode needs an open part — open a document first.";
+            }
+            return;
+        }
         st.addLog("[..] editing: " + text);
         st.status = "Editing...";  st.statusKind = 0;
         st.agentV2Running = true;
         st.agentV2 = true;
         if (st.activityPanel)
             st.activityPanel->clearLive();
-        nlohmann::json extra = provOverride;                       // O1: pin the picker
+        nlohmann::json extra = provOverride;
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            extra[it.key()] = it.value();                          // M23 + Wave4
+            extra[it.key()] = it.value();
+        nlohmann::json opts = {{"mode", "edit"}, {"advisor", true},
+                               {"scope", buildEditScope()}};
+        extra["options"] = std::move(opts);
         launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
                          st.ribbonTab == AppState::RT_Manufacture, extra);
-    } else if (askMode) {
-        // Ask -> Wave D: question answering about the open part via agent_ask_v2. The worker
-        // answers from the doc tree without mutating anything (an empty doc_id is handled
-        // there — the assistant falls back to general CAD usage). NOT a job: the call runs on
-        // the AsyncRpc dispatch thread and the callback fills the chat on the GL thread.
+        return;
+    }
+
+    if (askMode) {
         if (st.agentV2Running) {
-            // A design/edit run is in flight — refuse politely instead of queueing behind it.
             if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
                 st.chat.back().running = false;
                 st.chat.back().text = "A design/edit run is still in progress - "
@@ -9049,13 +9789,13 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.status = "Answering...";  st.statusKind = 0;
         nlohmann::json params = {
             {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
-            {"question", sendText}};
+            {"question", sendText},
+            {"options", {{"mode", "ask"}, {"advisor", true}}}};
         for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
-            params[it.key()] = it.value();                              // O1: pin the picker
+            params[it.key()] = it.value();
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            params[it.key()] = it.value();                              // M23 + Wave4
+            if (it.key() != "options") params[it.key()] = it.value();
         st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
-            // Find the last running assistant message (the one this turn pushed).
             ChatMsg* msg = nullptr;
             for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
                 if (!it->fromUser && it->running) { msg = &*it; break; }
@@ -9082,176 +9822,253 @@ static void submitTurn(AppState& st, const std::string& text) {
                 st.status = "Ready.";  st.statusKind = 0;
             }
         }, 300000);
-    } else {
-        // Design new -> pre-flight CLARIFY gate, THEN the v2 orchestrator on a FRESH part
-        // document. The clarify call (agent_clarify_v1) runs async via AsyncRpc; its callback
-        // (GL thread) either launches the run directly (request already specific) or shows the
-        // inline clarify card with the build-critical questions. Any failure falls straight
-        // through to the build — clarify never blocks. See launchDesignRun / drawClarifyCard.
-        st.designStarted = true;
-        // Autopilot (planMode off) skips the clarify gate and builds straight away.
-        if (!st.settings.planMode) {
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
-            launchDesignRun(st, sendText, turnExtras);
-            return;
+        return;
+    }
+
+    if (swarmMode) {
+        st.addLog("[..] swarm: " + text);
+        nlohmann::json extras = withOptions(turnExtras, {
+            {"mode", "swarm"},
+            {"corporate_force", true},
+            {"advisor", true}});
+        bool needFresh = true;
+        if (st.docMirror.hasDoc()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            bool hasFeatures = tree.is_object() && tree.contains("features") &&
+                               tree["features"].is_array() && !tree["features"].empty();
+            if (hasFeatures && (has("edit ") || has("change ") || has("modify ") ||
+                                has("update ") || has("fix ") || has("on this")))
+                needFresh = false;
         }
+        launchMissionRunChat(st, sendText, needFresh, extras);
+        return;
+    }
+
+    if (planMode) {
+        st.addLog("[..] plan: " + text);
+        st.status = "Planning...";  st.statusKind = 0;
+        st.agentV2Running = true;
+        st.agentV2 = true;
+        if (st.activityPanel)
+            st.activityPanel->clearLive();
         for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
             if (!it->fromUser && it->running) {
-                it->clarify.awaiting = true;
-                it->clarify.request = sendText;   // M23: the eventual build carries attachments
-                it->liveStatus = "Working out what I need to build this...";
+                it->planApprovePending = true;
+                it->planApproveRequest = sendText;
+                it->planApproveExtras = turnExtras;
+                it->liveStatus = "Drafting a plan...";
                 break;
             }
-        st.addLog("[..] clarify: " + text);
-        st.status = "Thinking...";  st.statusKind = 0;
-        const std::string clarifyDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
-        nlohmann::json params = {{"request", sendText}, {"doc_id", clarifyDocId}};
-        for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
-            params[it.key()] = it.value();                              // O1: pin the picker
+        nlohmann::json extra = provOverride;
         for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
-            params[it.key()] = it.value();                              // M23 + Wave4
-        st.rpc.call("agent_clarify_v1", params,
-                    [&st, text = sendText, clarifyDocId, turnExtras](const core::RpcResult& r) {
-            ChatMsg* msg = nullptr;
-            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-                if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
-            if (!msg) return;  // turn was cleared (New part) — nothing to do
-            // Multi-document: the user switched to a different document while clarify was in flight.
-            // launchDesignRun below would build against the NOW-active doc — the wrong one. Stop the
-            // turn's spinner and let the user re-issue from the doc they meant, rather than corrupt it.
-            if (st.docMirror.docId() != clarifyDocId) {
-                msg->clarify.awaiting = false;
-                msg->running = false;
-                msg->liveStatus.clear();
-                st.addLog("[..] clarify result for " + clarifyDocId + " dropped — active doc changed");
+            extra[it.key()] = it.value();
+        extra["options"] = {{"mode", "plan"}, {"plan_only", true}, {"advisor", true}};
+        std::string err;
+        if (!st.docMirror.hasDoc()) {
+            if (!st.docMirror.newPart(st.worker, err)) {
+                st.addLog("[err] plan: could not create a part document: " + err);
+                st.status = "Worker not ready";  st.statusKind = 2;
+                for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                    if (!it->fromUser && it->running) {
+                        it->running = false;
+                        it->planApprovePending = false;
+                        it->errKind = ERR_SYSTEM;
+                        it->text = "I couldn't open a part document (worker not ready).";
+                        break;
+                    }
                 return;
             }
-            msg->clarify.awaiting = false;
-            // Parse questions; on ANY error/empty -> build straight away (never block).
-            // Prefer the additive aicad.interaction/1 mirror when present (choice /
-            // geometry_select / multi); fall back to legacy {key,ask,unit,suggested}.
-            bool ready = true;
-            std::vector<ClarifyQ> qs;
-            std::vector<std::string> assumptions;
-            if (r.ok && r.result.is_object() && !r.result.contains("code")) {
-                ready = r.result.value("ready", true);
-                auto seedAnswer = [](ClarifyQ& cq) {
-                    std::strncpy(cq.answer.data(), cq.suggested.c_str(),
-                                 cq.answer.size() - 1);
-                    cq.answer[cq.answer.size() - 1] = '\0';
-                };
-                auto parseInteractionQ = [&](const nlohmann::json& q) -> bool {
-                    if (!q.is_object()) return false;
-                    ClarifyQ cq;
-                    cq.key = q.value("id", q.value("key", std::string()));
-                    cq.ask = q.value("prompt", q.value("ask", std::string()));
-                    cq.kind = q.value("kind", std::string("text"));
-                    cq.multi = q.value("multi", q.value("multiple", false));
-                    if (cq.ask.empty()) return false;
-                    if (q.contains("suggested")) {
-                        const auto& s = q["suggested"];
-                        if (s.is_string()) cq.suggested = s.get<std::string>();
-                        else if (s.is_boolean())
-                            cq.suggested = s.get<bool>() ? "true" : "false";
-                        else if (s.is_number())
-                            cq.suggested = std::to_string(s.get<double>());
-                        else if (s.is_array()) {
-                            for (const auto& v : s) {
-                                if (v.is_string())
-                                    cq.selectedValues.push_back(v.get<std::string>());
-                            }
-                            std::string joined;
-                            for (size_t j = 0; j < cq.selectedValues.size(); ++j) {
-                                if (j) joined += ", ";
-                                joined += cq.selectedValues[j];
-                            }
-                            cq.suggested = joined;
-                        } else if (s.is_object()) {
-                            if (s.contains("value") && s.contains("unit")) {
-                                cq.suggested = std::to_string(s.value("value", 0.0));
-                                cq.unit = s.value("unit", std::string());
-                            } else if (s.contains("id")) {
-                                cq.suggested = s.value("id", std::string());
-                                cq.selectedKind = s.value("kind", std::string());
-                                if (!cq.suggested.empty())
-                                    cq.selectedValues.push_back(cq.suggested);
-                            }
-                        }
-                    }
-                    if (q.contains("options") && q["options"].is_array()) {
-                        for (const auto& o : q["options"]) {
-                            if (!o.is_object()) continue;
-                            std::string val = o.value("value", std::string());
-                            std::string lab = o.value("label", val);
-                            if (!val.empty()) cq.options.emplace_back(val, lab);
-                        }
-                    }
-                    if (q.contains("targets") && q["targets"].is_array()) {
-                        for (const auto& t : q["targets"])
-                            if (t.is_string()) cq.targets.push_back(t.get<std::string>());
-                    }
-                    if (cq.kind == "dimension" && cq.unit.empty() &&
-                        q.contains("suggested") && q["suggested"].is_object())
-                        cq.unit = q["suggested"].value("unit", std::string());
-                    seedAnswer(cq);
-                    if (cq.kind == "choice" && !cq.multi && !cq.suggested.empty())
-                        cq.selectedValues = {cq.suggested};
-                    qs.push_back(std::move(cq));
-                    return true;
-                };
+        }
+        launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
+                         st.ribbonTab == AppState::RT_Manufacture, extra);
+        return;
+    }
 
-                bool usedInteraction = false;
-                if (r.result.contains("interaction") &&
-                    r.result["interaction"].is_object() &&
-                    r.result["interaction"].contains("questions") &&
-                    r.result["interaction"]["questions"].is_array() &&
-                    !r.result["interaction"]["questions"].empty()) {
-                    usedInteraction = true;
-                    for (const auto& q : r.result["interaction"]["questions"])
-                        parseInteractionQ(q);
-                }
-                if (!usedInteraction && r.result.contains("questions") &&
-                    r.result["questions"].is_array()) {
-                    for (const auto& q : r.result["questions"]) {
-                        if (!q.is_object()) continue;
-                        if (q.contains("kind") || q.contains("options") ||
-                            q.contains("targets")) {
-                            parseInteractionQ(q);
-                            continue;
-                        }
-                        ClarifyQ cq;
-                        cq.key = q.value("key", std::string());
-                        cq.ask = q.value("ask", std::string());
-                        cq.unit = q.value("unit", std::string());
-                        cq.suggested = q.value("suggested", std::string());
-                        cq.kind = cq.unit.empty() ? "text" : "dimension";
-                        if (cq.ask.empty()) continue;
-                        seedAnswer(cq);
-                        qs.push_back(std::move(cq));
-                    }
-                }
-                if (r.result.contains("assumptions") && r.result["assumptions"].is_array())
-                    for (const auto& a : r.result["assumptions"])
-                        if (a.is_string()) assumptions.push_back(a.get<std::string>());
-            }
-            if (ready || qs.empty()) {
-                msg->liveStatus.clear();
-                launchDesignRun(st, text, turnExtras);  // keeps msg->running + Wave4 extras
-                return;
-            }
-            // Hold for the user: show the clarify card (msg stops "running" until Build it).
+    // Agent (default)
+    st.designStarted = true;
+    {
+        bool hasFeatures = false;
+        if (st.docMirror.hasDoc()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            hasFeatures = tree.is_object() && tree.contains("features") &&
+                          tree["features"].is_array() && !tree["features"].empty();
+        }
+        const bool changeIntent = has("edit ") || has("change ") || has("modify ") ||
+                                  has("update ") || has("fix ") || has("on this") ||
+                                  has("this part") || has("the part");
+        if (hasFeatures && changeIntent) {
+            st.addLog("[..] agent edit-in-place: " + text);
+            st.status = "Editing...";  st.statusKind = 0;
+            st.agentV2Running = true;
+            st.agentV2 = true;
+            if (st.activityPanel)
+                st.activityPanel->clearLive();
+            nlohmann::json extra = provOverride;
+            for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
+                extra[it.key()] = it.value();
+            nlohmann::json opts = {{"mode", "agent"}, {"advisor", true},
+                                   {"scope", buildEditScope()}};
+            extra["options"] = std::move(opts);
+            launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
+                             st.ribbonTab == AppState::RT_Manufacture, extra);
+            return;
+        }
+    }
+    nlohmann::json agentExtras = withOptions(turnExtras, {{"mode", "agent"}, {"advisor", true}});
+    if (!st.settings.planMode) {
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
+        launchDesignRun(st, sendText, agentExtras);
+        return;
+    }
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->running) {
+            it->clarify.awaiting = true;
+            it->clarify.request = sendText;
+            it->liveStatus = "Working out what I need to build this...";
+            break;
+        }
+    st.addLog("[..] clarify: " + text);
+    st.status = "Thinking...";  st.statusKind = 0;
+    const std::string clarifyDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    nlohmann::json params = {{"request", sendText}, {"doc_id", clarifyDocId}};
+    for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
+        params[it.key()] = it.value();
+    for (auto it = turnExtras.begin(); it != turnExtras.end(); ++it)
+        params[it.key()] = it.value();
+    st.rpc.call("agent_clarify_v1", params,
+                [&st, text = sendText, clarifyDocId, agentExtras](const core::RpcResult& r) {
+        ChatMsg* msg = nullptr;
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
+        if (!msg) return;
+        if (st.docMirror.docId() != clarifyDocId) {
+            msg->clarify.awaiting = false;
             msg->running = false;
             msg->liveStatus.clear();
-            msg->clarify.active = true;
-            msg->clarify.request = text;
-            msg->clarify.questions = std::move(qs);
-            msg->clarify.assumptions = std::move(assumptions);
-            st.status = "Waiting on a few details...";  st.statusKind = 0;
-            st.addLog("[..] clarify: " + std::to_string(msg->clarify.questions.size()) +
-                      " question(s)");
-        }, 120000);
-    }
+            st.addLog("[..] clarify result for " + clarifyDocId + " dropped — active doc changed");
+            return;
+        }
+        msg->clarify.awaiting = false;
+        bool ready = true;
+        std::vector<ClarifyQ> qs;
+        std::vector<std::string> assumptions;
+        if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+            ready = r.result.value("ready", true);
+            auto seedAnswer = [](ClarifyQ& cq) {
+                std::strncpy(cq.answer.data(), cq.suggested.c_str(),
+                             cq.answer.size() - 1);
+                cq.answer[cq.answer.size() - 1] = '\0';
+            };
+            auto parseInteractionQ = [&](const nlohmann::json& q) -> bool {
+                if (!q.is_object()) return false;
+                ClarifyQ cq;
+                cq.key = q.value("id", q.value("key", std::string()));
+                cq.ask = q.value("prompt", q.value("ask", std::string()));
+                cq.kind = q.value("kind", std::string("text"));
+                cq.multi = q.value("multi", q.value("multiple", false));
+                if (cq.ask.empty()) return false;
+                if (q.contains("suggested")) {
+                    const auto& s = q["suggested"];
+                    if (s.is_string()) cq.suggested = s.get<std::string>();
+                    else if (s.is_boolean())
+                        cq.suggested = s.get<bool>() ? "true" : "false";
+                    else if (s.is_number())
+                        cq.suggested = std::to_string(s.get<double>());
+                    else if (s.is_array()) {
+                        for (const auto& v : s) {
+                            if (v.is_string())
+                                cq.selectedValues.push_back(v.get<std::string>());
+                        }
+                        std::string joined;
+                        for (size_t j = 0; j < cq.selectedValues.size(); ++j) {
+                            if (j) joined += ", ";
+                            joined += cq.selectedValues[j];
+                        }
+                        cq.suggested = joined;
+                    } else if (s.is_object()) {
+                        if (s.contains("value") && s.contains("unit")) {
+                            cq.suggested = std::to_string(s.value("value", 0.0));
+                            cq.unit = s.value("unit", std::string());
+                        } else if (s.contains("id")) {
+                            cq.suggested = s.value("id", std::string());
+                            cq.selectedKind = s.value("kind", std::string());
+                            if (!cq.suggested.empty())
+                                cq.selectedValues.push_back(cq.suggested);
+                        }
+                    }
+                }
+                if (q.contains("options") && q["options"].is_array()) {
+                    for (const auto& o : q["options"]) {
+                        if (!o.is_object()) continue;
+                        std::string val = o.value("value", std::string());
+                        std::string lab = o.value("label", val);
+                        if (!val.empty()) cq.options.emplace_back(val, lab);
+                    }
+                }
+                if (q.contains("targets") && q["targets"].is_array()) {
+                    for (const auto& tgt : q["targets"])
+                        if (tgt.is_string()) cq.targets.push_back(tgt.get<std::string>());
+                }
+                if (cq.kind == "dimension" && cq.unit.empty() &&
+                    q.contains("suggested") && q["suggested"].is_object())
+                    cq.unit = q["suggested"].value("unit", std::string());
+                seedAnswer(cq);
+                if (cq.kind == "choice" && !cq.multi && !cq.suggested.empty())
+                    cq.selectedValues = {cq.suggested};
+                qs.push_back(std::move(cq));
+                return true;
+            };
+
+            bool usedInteraction = false;
+            if (r.result.contains("interaction") &&
+                r.result["interaction"].is_object() &&
+                r.result["interaction"].contains("questions") &&
+                r.result["interaction"]["questions"].is_array() &&
+                __omp_shell("r.result[\"interaction\"][\"questions\"].empty()) {")
+                usedInteraction = true;
+                for (const auto& q : r.result["interaction"]["questions"])
+                    parseInteractionQ(q);
+            }
+            if (!usedInteraction && r.result.contains("questions") &&
+                r.result["questions"].is_array()) {
+                for (const auto& q : r.result["questions"]) {
+                    if (!q.is_object()) continue;
+                    if (q.contains("kind") || q.contains("options") ||
+                        q.contains("targets")) {
+                        parseInteractionQ(q);
+                        continue;
+                    }
+                    ClarifyQ cq;
+                    cq.key = q.value("key", std::string());
+                    cq.ask = q.value("ask", std::string());
+                    cq.unit = q.value("unit", std::string());
+                    cq.suggested = q.value("suggested", std::string());
+                    cq.kind = cq.unit.empty() ? "text" : "dimension";
+                    if (cq.ask.empty()) continue;
+                    seedAnswer(cq);
+                    qs.push_back(std::move(cq));
+                }
+            }
+            if (r.result.contains("assumptions") && r.result["assumptions"].is_array())
+                for (const auto& a : r.result["assumptions"])
+                    if (a.is_string()) assumptions.push_back(a.get<std::string>());
+        }
+        if (ready || qs.empty()) {
+            msg->liveStatus.clear();
+            launchDesignRun(st, text, agentExtras);
+            return;
+        }
+        msg->running = false;
+        msg->liveStatus.clear();
+        msg->clarify.active = true;
+        msg->clarify.request = text;
+        msg->clarify.questions = std::move(qs);
+        msg->clarify.assumptions = std::move(assumptions);
+        st.status = "Waiting on a few details...";  st.statusKind = 0;
+        st.addLog("[..] clarify: " + std::to_string(msg->clarify.questions.size()) +
+                  " question(s)");
+    }, 120000);
 }
 
 // ---- runtime-not-ready banner (kept from the old Design body) ----
@@ -9352,7 +10169,7 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
 }
 
-// Prelude row above the prompt: Design/Edit/Ask dropdown (left) + context meter (right, same row).
+// Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const auto& pal = ui::palette;
@@ -9381,12 +10198,15 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
 
-    // Design / Edit / Ask — combo (single active mode). Writes st.aiInteraction.
-    const char* modes[] = {"Design", "Edit", "Ask"};
-    const char* modeTips[] = {"Design — model a new part from a description.",
-                              "Edit — change the open part.",
-                              "Ask — questions about the part; nothing changes."};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
+    // Agent / Plan / Swarm / Edit / Ask — combo (single active mode).
+    const char* modes[] = {"Agent", "Plan", "Swarm", "Edit", "Ask"};
+    const char* modeTips[] = {
+        "Agent — full tools; auto-routes (may plan, swarm, or edit).",
+        "Plan — draft a plan only; approve before building.",
+        "Swarm — force multi-agent / corporate mission execution.",
+        "Edit — change the open part (scoped to selection when set).",
+        "Ask — questions about the part; nothing changes."};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 4) ? st.aiInteraction : 0;
     // Width from longest label so the box doesn't clip text at any scale.
     float modeW = 0.0f;
     for (const char* m : modes)
@@ -9394,12 +10214,15 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     modeW += ImGui::GetFrameHeight() + 12.0f * sc;  // caret + compact padding
     ImGui::SetNextItemWidth(modeW);
     if (ImGui::BeginCombo("##aimode", modes[mode], ImGuiComboFlags_HeightSmall)) {
-        for (int i = 0; i < 3; ++i) {
-            const bool needDoc = (i == 1 && !hasDoc);
+        for (int i = 0; i < 5; ++i) {
+            // Only Edit requires an open document; Agent/Plan/Swarm/Ask do not.
+            const bool needDoc = (i == (int)CopilotMode::Edit && !hasDoc);
             if (needDoc) ImGui::BeginDisabled();
             const bool sel = (mode == i);
             if (ImGui::Selectable(modes[i], sel) && !needDoc) {
                 st.aiInteraction = i;
+                st.settings.copilotMode = i;
+                saveSettings(st.settings);  // survive restart without waiting for next send
             }
             if (sel) ImGui::SetItemDefaultFocus();
             if (needDoc) ImGui::EndDisabled();
@@ -10021,9 +10844,22 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
 static void drawComposer(AppState& st, bool busy, bool canRun) {
     const bool hasDoc = st.docMirror.hasDoc();
 
-    // Keep the orchestrator flag synced to the mode (Edit == validated document ops on the doc).
-    if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;
-    st.agentV2 = (st.aiInteraction == 1);
+    // Keep mode valid + sync settings.copilotMode (persisted).
+    // Edit requires a doc — fall back to Agent when none is open.
+    if (st.aiInteraction == (int)CopilotMode::Edit && !hasDoc) {
+        st.aiInteraction = (int)CopilotMode::Agent;
+        st.settings.copilotMode = (int)CopilotMode::Agent;
+    }
+    if (st.aiInteraction < 0 || st.aiInteraction > 4) st.aiInteraction = 0;
+    // agentV2 flag: any mutating orchestrator mode (Agent/Plan/Swarm/Edit). Ask is one-shot.
+    st.agentV2 = (st.aiInteraction != (int)CopilotMode::Ask);
+    // One-shot: seed live mode from persisted settings after loadSettings.
+    static bool s_modeSeeded = false;
+    if (!s_modeSeeded) {
+        s_modeSeeded = true;
+        int cm = st.settings.copilotMode;
+        if (cm >= 0 && cm <= 4) st.aiInteraction = cm;
+    }
 
     // Esc: staged edit restore, else disarm context pick (Wave4).
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -10167,8 +11003,11 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     // ---- composer: prelude row -> transparent input -> toolbar row ----
     drawComposerPrelude(st, busy);
 
-    const char* placeholder = st.aiInteraction == 2 ? "Ask about this part\xE2\x80\xA6"
-                            : st.aiInteraction == 1 ? "Describe a change to this part\xE2\x80\xA6"
+    const char* placeholder =
+        st.aiInteraction == (int)CopilotMode::Ask   ? "Ask about this part\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Edit  ? "Describe a change to this part\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Plan  ? "Describe what to plan\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Swarm ? "Describe a multi-agent mission\xE2\x80\xA6"
                                                     : "Describe what to build\xE2\x80\xA6";
 
     ImDrawList* composerDl = ImGui::GetWindowDrawList();

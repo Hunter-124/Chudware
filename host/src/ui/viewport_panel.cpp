@@ -765,22 +765,24 @@ static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip, d
     }
     // The extrude axis is the (unsigned) shared normal; use cap bi's outward normal as +axis.
     Vec3 axis = faces[bi].n;
-    // Anchor on the cap that sits along the ACTIVE direction. Direction-1 (no flip) grows toward the
-    // cap whose centroid is further along +axis; flip picks the opposite cap. This keeps the handle
-    // on the moving/extruded surface rather than the fixed sketch cap.
+    // Anchor on the far cap (the surface the solid grew TOWARD). growDir is recovered from the
+    // LIVE preview solid, which already embeds params.flip in the engine (document.cpp negates
+    // dir when flip is true). So farCap is always the active extruded face — do NOT re-apply
+    // flip here or the arrow double-negates and freezes on Reverse direction / drag past plane
+    // (arrow tip stays on the same side of the sketch while the solid jumps, or both freeze if
+    // the mesh is also stale). The flip argument is kept for call-site clarity / future use.
+    (void)flip;
     float pi = dot(faces[bi].c, axis), pj = dot(faces[bj].c, axis);
     const FC& farCap = (pi >= pj) ? faces[bi] : faces[bj];
     const FC& nearCap = (pi >= pj) ? faces[bj] : faces[bi];
-    // Orient +axis to point OUT of the body (from the near cap toward the far cap) so the arrow's
-    // primary tip reads as "grow the extrusion". flip reverses that, matching params.flip.
+    // Orient +axis to point OUT of the body (from the near/sketch cap toward the far/extruded
+    // cap) so the arrow's primary tip reads as "grow the extrusion" on the side the solid is.
     Vec3 growDir = farCap.c - nearCap.c;
     if (dot(growDir, axis) < 0.0f) axis = Vec3(-axis.x, -axis.y, -axis.z);
-    if (flip) axis = Vec3(-axis.x, -axis.y, -axis.z);
-    // Anchor on the cap the active direction points toward (the surface being pulled).
-    const FC& anchorCap = flip ? nearCap : farCap;
     axisOut = axis;
-    anchorOut[0] = anchorCap.c.x; anchorOut[1] = anchorCap.c.y; anchorOut[2] = anchorCap.c.z;
+    anchorOut[0] = farCap.c.x; anchorOut[1] = farCap.c.y; anchorOut[2] = farCap.c.z;
     return true;
+
 }
 
 // Build the draggable-dimension list for the selected feature, reusing the PM-form field table to
@@ -857,7 +859,16 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         // that floated inside the solid and pointed along world +Z regardless of the sketch plane.
         bool extrudeAnchored = false;
         if (!isAngle && (c.param == "depth")) {
+            // Prefer the live PM flip checkbox over the tree's last-committed params — during an
+            // in-flight preview the tree can lag one apply behind the checkbox the user just
+            // toggled (or the drag just auto-flipped), which re-anchors the arrow on the wrong
+            // side for a frame and makes Reverse look dead.
             bool flip = params.value("flip", false);
+            if (st.propertyManager && st.propertyManager->active() &&
+                st.propertyManager->targetId() == fid) {
+                bool pmFlip = false;
+                if (st.propertyManager->dragGetCheck("flip", pmFlip)) flip = pmFlip;
+            }
             Vec3 axis; float capAnchor[3];
             if (extrudeAxisHandle(st, fid, flip, val, axis, capAnchor)) {
                 c.dirW = axis;

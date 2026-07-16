@@ -1717,8 +1717,36 @@ void PropertyManager::setProfilePicks(AppState& st, const std::vector<nlohmann::
         w->picks.push_back(std::move(e));
     }
     w->wellDangling = false;
+    // A region click re-enters the select session (user is actively picking contours).
+    for (auto& o : fields_)
+        if (o.def->kind == PMFieldKind::SelectorWell ||
+            o.def->kind == PMFieldKind::FeatureWell)
+            o.wellActive = false;
+    w->wellActive = true;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
 }
+
+void PropertyManager::endProfileSelection() {
+    if (!active_) return;
+    for (auto& f : fields_) {
+        if (f.def->kind == PMFieldKind::SelectorWell ||
+            f.def->kind == PMFieldKind::FeatureWell)
+            f.wellActive = false;
+    }
+}
+
+bool PropertyManager::hasActiveSelectorWell() const {
+    if (!active_) return false;
+    for (const auto& f : fields_) {
+        if ((f.def->kind == PMFieldKind::SelectorWell ||
+             f.def->kind == PMFieldKind::FeatureWell) &&
+            f.wellActive && fieldVisible(*f.def, fields_))
+            return true;
+    }
+    return false;
+}
+
+
 
 std::vector<std::string> PropertyManager::regionCandidateSketches(AppState& st) const {
     std::vector<std::string> out;

@@ -404,6 +404,14 @@ public:
     // profile well is coerced to nothing here — the picker guarantees a whole-sketch fallback so
     // the profile never dangles.
     void setProfilePicks(AppState& st, const std::vector<nlohmann::json>& sels);
+    // End the profile/sections SELECT session (deactivate selector wells) without clearing
+    // picks — click-off white space / other UI while a profile is already chosen. Empty wells
+    // stay armed so the first pick can still land.
+    void endProfileSelection();
+    // True while any visible selector/feature well is armed for viewport picks.
+    bool hasActiveSelectorWell() const;
+
+
     // Sketch feature ids whose regions the picker should display: the sketches already referenced
     // by the current picks, else (sections / unseeded) every unconsumed non-empty sketch.
     std::vector<std::string> regionCandidateSketches(AppState& st) const;

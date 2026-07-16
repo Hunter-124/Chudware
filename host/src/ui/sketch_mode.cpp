@@ -4602,7 +4602,11 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
     }
     dl->PopClipRect();
 
-    // ---- click: toggle the hovered region into/out of the profile ----
+    // ---- click: toggle hovered region, or dismiss the selection process on empty space ----
+    // User: clicking off a profile (white space / other UI) ends the SELECT process — but only
+    // when at least one profile is already selected. With an empty profile well the picker stays
+    // armed so the first pick can still land. Picks themselves are KEPT (killing them would drop
+    // the extrude preview and immediately re-arm, which is the opposite of "done selecting").
     if (hovS >= 0 && canHover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         st.requestCursor(ui::CursorKind::Hand);
         const std::string fid = pickRegions_[hovS].fid;
@@ -4653,10 +4657,23 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
                 out.push_back({{"kind", "region"}, {"sketch", fid}});
         }
         pm->setProfilePicks(st, out);
+        return true;   // consumed the region click
     } else if (hovS >= 0 && canHover) {
         st.requestCursor(ui::CursorKind::Hand);
+        return true;   // hover owns the cursor over a region
     }
-    return hovS >= 0;   // consumed the click target this frame
+    // Empty-space / off-region click while a profile is already selected AND the well is still
+    // armed: end the selection process (deactivate wells) without clearing picks. Empty well
+    // stays armed so the first profile can still be chosen. After dismiss, subsequent empty
+    // clicks fall through (return false) so model pick / clear-selection work normally.
+    if (canHover && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !picks.empty() &&
+        pm->hasActiveSelectorWell()) {
+        pm->endProfileSelection();
+        return true;   // consume THIS click only
+    }
+    return false;
+
+
 }
 
 // ---------------------------------------------------------------------------

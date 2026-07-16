@@ -429,3 +429,65 @@ def test_context_refs_absent_is_noop():
         if isinstance(part, dict) and part.get("type") == "text":
             user_text2 += part.get("text", "")
     assert "Context references" not in user_text2
+
+
+
+def test_provider_error_carries_stop_reason_and_error_detail():
+    """Early-stop provider failures must surface scrubbed error_detail for the GUI."""
+    class Boom(Exception):
+        status_code = 401
+
+    class Prov:
+        name = "xai"
+
+        def complete(self, system, messages, max_tokens=8000):
+            raise Boom("Incorrect API key provided: sk-secret-ABC123XYZ")
+
+    res = agent_turn.run_turn("go", Prov(), tool_dispatch=lambda t, a: {})
+    assert res.success is False
+    assert res.stop_reason == "provider_auth"
+    detail = res.result.get("error_detail") or ""
+    assert "xai" in detail
+    assert "HTTP 401" in detail
+    assert "Incorrect API key" in detail
+    # secrets must not leak into the GUI-facing field
+    assert "sk-secret" not in detail
+    assert "ABC123XYZ" not in detail
+    assert res.result.get("stop_reason") == "provider_auth"
+
+
+def test_no_code_and_budget_carry_error_detail():
+    empty = agent_turn.run_turn(
+        "go", _ScriptedProvider(["I am not sure what to do."]),
+        tool_dispatch=lambda t, a: {},
+    )
+    assert empty.success is False
+    assert empty.stop_reason == "no_code"
+    assert empty.result.get("error_detail")
+
+    budget = agent_turn.run_turn(
+        "loop",
+        _ScriptedProvider(
+            ['```json\n{"tool": "measure_part", "args": {}}\n```'] * 20),
+        allowed_tools=["measure_part"],
+        max_tool_calls=3,
+        tool_dispatch=lambda t, a: {"ok": True},
+    )
+    assert budget.stop_reason == "max_iters"
+    assert budget.result.get("error_detail")
+    assert "call" in budget.result["error_detail"].lower()
+
+
+def test_scrub_secrets_redacts_keys():
+    raw = (
+        "Authorization: Bearer sk-ant-xyzdeadbeef01 and "
+        "api_key=sk-ant-xyzdeadbeef02 and openrouter or-deadbeefcafe"
+    )
+    scrubbed = agent_turn.scrub_secrets(raw)
+    assert "sk-ant-xyzdeadbeef01" not in scrubbed
+    assert "sk-ant-xyzdeadbeef02" not in scrubbed
+    assert "or-deadbeefcafe" not in scrubbed
+    assert "[redacted]" in scrubbed
+    detail = agent_turn.format_error_detail("a\nb\n" + ("z" * 500), limit=80)
+    assert "\n" not in detail
+    assert len(detail) <= 80

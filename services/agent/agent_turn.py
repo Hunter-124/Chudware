@@ -28,8 +28,12 @@ Return type mirrors the ``AgentResult`` duck-type node_runner expects:
 from __future__ import annotations
 
 import json
+import logging
 import re
+import traceback
 from typing import Any, Callable
+
+_log_mod = logging.getLogger("ai-cad.agent_turn")
 
 # stop_reason values node_runner._map_verdict understands.
 _DONE = "confirmed"
@@ -37,6 +41,113 @@ _RETRY = "max_iters"
 _NOCODE = "no_code"
 _FAILED = "failed"
 _PROVIDER_AUTH = "provider_auth"  # non-retryable auth/bad-request (mega-1 TOP-4)
+
+# Human-facing error_detail scrubbers (never leak keys/tokens to the GUI).
+_SECRET_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|authorization)"
+    r"\s*[:=]\s*['\"]?[^\s'\",;]+"
+    r"|(?:bearer\s+)[a-z0-9._\-]+"
+    r"|\b(?:sk-[a-z0-9\-_]{8,}|xai-[a-z0-9\-_]{8,}|or-[a-z0-9\-_]{8,})\b"
+    r"|\b(?:tok|token)[_-][a-z0-9\-_]{4,}\b",
+    re.IGNORECASE,
+)
+
+
+def scrub_secrets(text: str) -> str:
+    """Redact key-like substrings from an error string destined for the GUI."""
+    if not text:
+        return ""
+    return _SECRET_RE.sub("[redacted]", str(text))
+
+
+def format_error_detail(text: str, *, limit: int = 300) -> str:
+    """Human sentence for GUI early-stop cards: scrubbed, single-line, ≤*limit* chars."""
+    s = scrub_secrets(str(text or "")).replace("\r", " ").replace("\n", " ").strip()
+    while "  " in s:
+        s = s.replace("  ", " ")
+    if len(s) > limit:
+        s = s[: max(0, limit - 1)].rstrip() + "…"
+    return s
+
+
+def _provider_label(provider: Any) -> str:
+    for attr in ("name", "provider", "provider_id"):
+        v = getattr(provider, attr, None)
+        if v:
+            return str(v)
+    return ""
+
+
+def format_provider_error_detail(exc: BaseException, provider: Any = None) -> str:
+    """HTTP status + provider name + exception text, scrubbed for the GUI."""
+    pname = _provider_label(provider)
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    try:
+        status_i = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_i = None
+    bits: list[str] = []
+    if pname:
+        bits.append(str(pname))
+    if status_i is not None:
+        bits.append(f"HTTP {status_i}")
+    head = " ".join(bits)
+    msg = str(exc).strip() or type(exc).__name__
+    body = f"{head}: {type(exc).__name__}: {msg}" if head else f"{type(exc).__name__}: {msg}"
+    return format_error_detail(body)
+
+
+def error_detail_for_stop(
+    stop_reason: str,
+    *,
+    tool_calls_made: int = 0,
+    budget: int = 0,
+    calls: list | None = None,
+    exc: BaseException | None = None,
+    provider: Any = None,
+    extra: str = "",
+) -> str:
+    """Build a short human error_detail for a terminal stop_reason."""
+    if exc is not None:
+        return format_provider_error_detail(exc, provider)
+    if stop_reason == "terminated_by_user":
+        return format_error_detail("Run cancelled by user.")
+    if stop_reason == "provider_auth":
+        return format_error_detail(extra or "Provider authentication failed.")
+    if stop_reason == "provider_unavailable":
+        return format_error_detail(extra or "Provider unavailable (credits/tier/spending limit).")
+    if stop_reason in (_RETRY, "max_iters"):
+        last_tool_err = ""
+        for c in reversed(calls or []):
+            if isinstance(c, dict) and c.get("ok") is False:
+                last_tool_err = str(c.get("error") or c.get("result") or "")[:160]
+                tname = c.get("tool") or "tool"
+                if last_tool_err:
+                    return format_error_detail(
+                        f"Tool budget exhausted after {tool_calls_made} call(s); "
+                        f"last error from {tname}: {last_tool_err}"
+                    )
+                break
+        return format_error_detail(
+            f"Tool budget exhausted after {tool_calls_made}"
+            + (f" of {budget}" if budget else "")
+            + " call(s) without a clean finish."
+        )
+    if stop_reason == "phase_step_cap":
+        return format_error_detail(
+            f"Phase step cap hit after {tool_calls_made} tool call(s)."
+        )
+    if stop_reason == _NOCODE:
+        return format_error_detail(
+            extra or "Model produced no valid tool call or completion."
+        )
+    if stop_reason == _FAILED:
+        return format_error_detail(extra or "Agent turn failed.")
+    if extra:
+        return format_error_detail(extra)
+    return format_error_detail(f"Stopped early ({stop_reason})." if stop_reason else "Stopped early (unknown reason).")
 
 # T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
 # pattern truncated at the FIRST closing brace, so any tool call with nested args
@@ -542,9 +653,14 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         subagent_id, "system",
                         "Sub-agent stopped: user termination honored at turn boundary.")
                     _log(ledger, actor, {"event": "subagent_terminated",
-                                         "subagent_id": subagent_id})
+                                         "subagent_id": subagent_id,
+                                         "stop_reason": "terminated_by_user",
+                                         "error_detail": "Run cancelled by user."})
                     return TurnResult(False, "terminated_by_user",
-                                      {"calls": calls, "tool_calls": tool_calls_made})
+                                      {"calls": calls,
+                                       "tool_calls": tool_calls_made,
+                                       "stop_reason": "terminated_by_user",
+                                       "error_detail": "Run cancelled by user."})
                 for _steer in _sreg.consume_steers(subagent_id):
                     messages.append({"role": "user", "content": _parts(
                         "[Human steering] " + str(_steer.get("text", "")))})
@@ -577,6 +693,11 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     pass
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
             stop, retryable = classify_provider_error(exc)
+            # Always log the full traceback server-side (GUI only gets scrubbed detail).
+            _log_mod.error(
+                "provider error stop_reason=%s retryable=%s: %s\n%s",
+                stop, retryable, exc, traceback.format_exc(),
+            )
             # mega-16: spending-limit / tier-denied → mark provider unavailable so
             # subsequent auto_pick falls through (no xai retry loop).
             if stop == "provider_unavailable":
@@ -594,6 +715,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                         "event": "provider_unavailable",
                         "provider": str(pname),
                         "error": str(exc)[:300],
+                        "error_detail": format_provider_error_detail(exc, provider),
                         "stop_reason": stop,
                     })
                 except Exception:  # noqa: BLE001
@@ -699,23 +821,31 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                             # Surface the last degrade error if all models failed.
                             exc = last_degrade_exc
                             stop, retryable = classify_provider_error(exc)
+                            _log_mod.error(
+                                "provider degrade failed stop_reason=%s: %s\n%s",
+                                stop, exc, traceback.format_exc(),
+                            )
                 except Exception:  # noqa: BLE001
                     recovered = False
             if not recovered:
+                detail = format_provider_error_detail(exc, provider)
                 _log(ledger, actor, {
                     "event": "provider_error",
-                    "error": str(exc),
+                    "error": str(exc)[:300],
+                    "error_detail": detail,
                     "stop_reason": stop,
                     "retryable": retryable,
                 })
                 if stop == _PROVIDER_AUTH:
                     _log(ledger, actor, {
                         "event": "provider_fatal",
-                        "error": str(exc),
+                        "error": str(exc)[:300],
+                        "error_detail": detail,
                         "stop_reason": stop,
                     })
                 return TurnResult(False, stop,
                                   {"error": f"provider error: {exc}",
+                                   "error_detail": detail,
                                    "calls": calls,
                                    "retryable": retryable,
                                    "stop_reason": stop,
@@ -1894,6 +2024,13 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             )
         if not bootstrapped_only:
             boot_why = ""
+        detail = error_detail_for_stop(
+            last_reason,
+            tool_calls_made=tool_calls_made,
+            budget=budget,
+            calls=calls,
+            extra=boot_why or "",
+        )
         synth_partial = {
             "status": status,
             "summary": (
@@ -1920,9 +2057,19 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         return TurnResult(ok_turn, last_reason, _with_usage(
             {"handoff": synth_partial, "calls": calls,
              "tool_calls": tool_calls_made,
-             "bootstrapped_only": bootstrapped_only}, _tu))
+             "bootstrapped_only": bootstrapped_only,
+             "stop_reason": last_reason,
+             "error_detail": detail}, _tu))
+    detail = error_detail_for_stop(
+        last_reason,
+        tool_calls_made=tool_calls_made,
+        budget=budget,
+        calls=calls,
+    )
     return TurnResult(False, last_reason, _with_usage(
-        {"calls": calls, "tool_calls": tool_calls_made}, _tu))
+        {"calls": calls, "tool_calls": tool_calls_made,
+         "stop_reason": last_reason,
+         "error_detail": detail}, _tu))
 
 
 # ---------------------------------------------------------------------------

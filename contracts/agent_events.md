@@ -194,3 +194,10 @@ A conforming consumer MUST:
 {"kind":"dag.node.done","ts":"2026-07-03T00:47:41Z","run_id":"c8efe1ae","node_id":"n_gate_preorder","output_summary":"Gate approved"}
 {"kind":"dag.run.done","ts":"2026-07-03T00:47:41Z","run_id":"c8efe1ae","status":"done","node_states":{"n_design":{"status":"done"},"n_gate_preorder":{"status":"done"}}}
 ```
+
+## Early-stop detail (2026-07-16, additive)
+On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and the
+`agent_design` RPC result, optional additive fields:
+- `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|phase_step_cap|terminated_by_user|…)
+- `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
+GUI renders error bubbles as `stopped: <stop_reason> — <error_detail>` when present.

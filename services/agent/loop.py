@@ -18,9 +18,11 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import logging
 import os
 import re
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -1042,7 +1044,8 @@ class AgentRun:
     is_assembly: bool = False
     fit: dict | None = None       # final assembly fit report (None for single parts)
     converged: bool = False       # True = the model declared/settled done; False = hit the cap
-    stop_reason: str = ""         # confirmed | stabilized | failed | no_code | max_iters
+    stop_reason: str = ""         # confirmed | stabilized | failed | no_code | max_iters | provider_error | cancelled
+    error_detail: str = ""        # human sentence for early-stop GUI cards (scrubbed, ≤300)
     plan: dict | None = None      # the session's build plan (parts/dimensions/features)
 
 
@@ -1532,13 +1535,38 @@ def run_turn(session: Session, request: str, provider: Provider,
     prev_metrics = None               # (volume, triangles) of the previous successful build
     converged = False
     stop_reason = "max_iters"
+    error_detail = ""
     stable_geometry_count = 0         # WI-10: successful geometry iterations this turn
 
     for i in range(max_iters):
         _iter_t0 = time.monotonic()
         _emit(on_event, kind="status", index=i, turn=turn, phase="thinking",
               text=f"Iteration {i + 1}: generating build123d...")
-        reply, thinking = _generate(session, provider, on_event, i, turn)
+        try:
+            reply, thinking = _generate(session, provider, on_event, i, turn)
+        except Exception as _prov_exc:  # noqa: BLE001 — surface provider/API failure
+            logging.getLogger("ai-cad.loop").error(
+                "provider error during design loop: %s\n%s",
+                _prov_exc, traceback.format_exc(),
+            )
+            try:
+                from services.agent.agent_turn import (  # noqa: PLC0415
+                    classify_provider_error,
+                    format_provider_error_detail,
+                )
+                stop_reason, _ = classify_provider_error(_prov_exc)
+                # Map generic "failed" to a clearer provider_error for the design loop.
+                if stop_reason == "failed":
+                    stop_reason = "provider_error"
+                error_detail = format_provider_error_detail(_prov_exc, provider)
+            except Exception:  # noqa: BLE001
+                stop_reason = "provider_error"
+                error_detail = f"{type(_prov_exc).__name__}: {_prov_exc}"[:300]
+            _emit(on_event, kind="status", index=i, turn=turn, phase="error",
+                  text=error_detail or "Provider error",
+                  converged=False, stop_reason=stop_reason,
+                  error_detail=error_detail)
+            break
         session.messages.append(assistant([text_part(reply)]))
 
         # M20: emit the model's COMPLETED thinking block (summary-on-arrival). The
@@ -1801,15 +1829,48 @@ def run_turn(session: Session, request: str, provider: Provider,
     session.contact_sheet = contact_sheet
 
     # A closing status so the UI can say WHY the turn ended (and whether a nudge would help).
+    if not error_detail:
+        if stop_reason == "max_iters":
+            error_detail = (
+                f"Stopped after {len(log)} iterations (cap). Ask me to keep going to "
+                f"continue refining."
+            )
+        elif stop_reason == "failed":
+            last_err = ""
+            for entry in reversed(log):
+                if getattr(entry, "error", None):
+                    last_err = str(entry.error).strip().splitlines()[-1][:200]
+                    break
+            error_detail = (
+                f"Couldn't get a clean build after {len(log)} iteration(s)"
+                + (f": {last_err}" if last_err else ".")
+            )
+        elif stop_reason == "no_code":
+            error_detail = (
+                f"Model returned no build123d code after {len(log)} attempt(s)."
+            )
+        elif stop_reason in ("confirmed", "stabilized", "refine_cap"):
+            error_detail = ""  # normal completion — leave blank
+        else:
+            error_detail = f"Stopped early ({stop_reason})."
+
     if stop_reason == "max_iters":
         done_text = (f"Stopped after {len(log)} iterations (cap). Ask me to keep going to "
                      f"continue refining.")
-    elif stop_reason in ("failed", "no_code"):
-        done_text = f"Stopped after {len(log)} iterations - couldn't get a clean build."
+    elif stop_reason in ("failed", "no_code", "provider_error", "provider_auth",
+                         "provider_unavailable"):
+        done_text = error_detail or (
+            f"Stopped after {len(log)} iterations - couldn't get a clean build."
+        )
     else:
         done_text = f"Finished in {len(log)} iteration(s)."
-    _emit(on_event, kind="status", index=len(log), turn=turn, phase="done",
-          text=done_text, converged=converged, stop_reason=stop_reason)
+    _emit_kw = dict(
+        kind="status", index=len(log), turn=turn, phase="done",
+        text=done_text, converged=converged, stop_reason=stop_reason,
+    )
+    if error_detail:
+        _emit_kw["error_detail"] = error_detail
+    _emit(on_event, **_emit_kw)
 
     return AgentRun(
         request=request,
@@ -1826,6 +1887,7 @@ def run_turn(session: Session, request: str, provider: Provider,
         fit=best_res.fit if best_res and best_res.is_assembly else None,
         converged=converged,
         stop_reason=stop_reason,
+        error_detail=error_detail,
         plan=session.plan,
     )
 

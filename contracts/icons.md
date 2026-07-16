@@ -108,3 +108,6 @@ Composer copilot toolbar icons for the chat context-reference feature:
 - `context_cube` — composer context-pick button; the Billet logo cube drawn outline-only
   (transparent background, theme stroke so the SDF tints by icon/text role). Arms the
   viewport/feature-tree context picker (AppState::contextPickActive).
+
+## 2026-07-16 append (batch 9)
+- `msg_edit` — General: chat user-bubble edit pencil (procedural, shared draw_pencil).

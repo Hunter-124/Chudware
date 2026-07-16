@@ -58,6 +58,7 @@ CONTRACT_NAMES: list[str] = [
     # General
     "ok_check", "cancel_x", "settings", "save", "open", "new_doc",
     "undo", "redo", "theme_toggle", "ai_panel", "activity", "prompt_edit",
+    "msg_edit",
     "copy", "paste", "delete", "folder_new", "refresh",
     # C25: sketch flyout variant icons (append-only)
     "rect_3pt_corner", "rect_3pt_center", "parallelogram",
@@ -2273,6 +2274,13 @@ def draw_prompt_edit(d, cell, p):
     d.line([(s*0.22, s*0.56), (s*0.45, s*0.56)], fill=p.stroke, width=lw)
     # cursor
     d.line([(s*0.65, s*0.38), (s*0.65, s*0.62)], fill=p.accent, width=lw*2)
+
+@icon("msg_edit")
+def draw_msg_edit(d, cell, p):
+    """Diagonal pencil for chat message edit (user-bubble footer)."""
+    s = cell * SS
+    # Reuse the shared detailed pencil: bottom-left tip → top-right eraser.
+    draw_pencil(d, s, p, s * 0.22, s * 0.78, s * 0.80, s * 0.20, s * 0.055)
 
 @icon("copy")
 def draw_copy(d, cell, p):

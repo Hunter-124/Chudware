@@ -767,10 +767,50 @@ def fetch_cursor_usage(cred: dict) -> dict:
     }
 
 
+# xAI OAuth JWT ``tier`` is often a bare int (1=SuperGrok, 2=Heavy, …).
+_XAI_TIER_PLAN: dict[str, str] = {
+    "0": "Free",
+    "1": "SuperGrok",
+    "2": "SuperGrok Heavy",
+    "3": "Premium+",
+    "free": "Free",
+    "supergrok": "SuperGrok",
+    "heavy": "SuperGrok Heavy",
+    "premium": "Premium+",
+    "premium+": "Premium+",
+}
+
+
+def _map_xai_tier_claim(value: Any) -> str | None:
+    """Map JWT/store tier claim to a human plan label."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        key = str(int(value))
+        return _XAI_TIER_PLAN.get(key) or f"tier-{key}"
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        low = s.lower()
+        if low in _XAI_TIER_PLAN:
+            return _XAI_TIER_PLAN[low]
+        if s.isdigit():
+            return _XAI_TIER_PLAN.get(s) or f"tier-{s}"
+        # Already a label (SuperGrok / Premium+ / …).
+        return s
+    return None
+
+
 def _infer_xai_plan(cred: dict) -> str | None:
     """Infer SuperGrok / Premium+ tier from stored plan or JWT claims."""
-    if cred.get("plan"):
-        return str(cred["plan"])
+    mapped = _map_xai_tier_claim(cred.get("plan"))
+    if mapped:
+        return mapped
+    # Numeric tier stored alongside plan on some cold-restore paths.
+    mapped = _map_xai_tier_claim(cred.get("tier"))
+    if mapped:
+        return mapped
     token = cred.get("access_token") or cred.get("id_token") or ""
     if not token:
         return None
@@ -780,22 +820,23 @@ def _infer_xai_plan(cred: dict) -> str | None:
         "grok_tier", "xai_tier", "account_tier",
     ):
         v = claims.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+        mapped = _map_xai_tier_claim(v)
+        if mapped:
+            return mapped
         if isinstance(v, dict):
             for kk in ("name", "type", "id", "tier", "plan"):
-                vv = v.get(kk)
-                if isinstance(vv, str) and vv.strip():
-                    return vv.strip()
+                mapped = _map_xai_tier_claim(v.get(kk))
+                if mapped:
+                    return mapped
     # Nested app_metadata / user_metadata common in OIDC
     for nest in ("app_metadata", "user_metadata", "https://x.ai/claims"):
         block = claims.get(nest)
         if not isinstance(block, dict):
             continue
         for key in ("plan", "tier", "subscription", "product"):
-            v = block.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+            mapped = _map_xai_tier_claim(block.get(key))
+            if mapped:
+                return mapped
     return None
 
 

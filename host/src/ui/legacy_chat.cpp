@@ -614,6 +614,55 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 a.status = "done";
                 a.streaming = false;  // finalize any still-open thought box (M13)
             }
+        // Capture additive early-stop fields (ErrorDetail / contracts): stop_reason +
+        // error_detail. Prefer error_detail over legacy `error`. Stashed as a meta activity
+        // row so the error card can render "stopped: <reason> — <detail>" without touching
+        // ChatMsg (app_state.h is integrator-owned).
+        {
+            std::string sr = jstr(data, "stop_reason");
+            std::string ed = jstr(data, "error_detail");
+            if (ed.empty()) ed = jstr(data, "error");  // soft alias
+            if (!sr.empty() || !ed.empty()) {
+                ActivityItem* meta = nullptr;
+                for (auto& a : m.activity)
+                    if (a.stage == "__stop_meta__") { meta = &a; break; }
+                if (!meta) {
+                    ActivityItem ni;
+                    ni.stage = "__stop_meta__";
+                    ni.rowKind = 0;
+                    ni.status = "done";
+                    ni.missionHeader = false;
+                    m.activity.push_back(std::move(ni));
+                    meta = &m.activity.back();
+                }
+                if (!sr.empty()) meta->title = sr;
+                if (!ed.empty()) meta->detail = ed;
+                if (!ed.empty()) meta->reason = ed;
+            }
+        }
+    } else if (kind == "status") {
+        // Live status/phase envelope: phase=done|error may carry the same additive fields.
+        const std::string phase = jstr(data, "phase");
+        if (phase == "done" || phase == "error" || phase == "failed" || phase == "cancelled") {
+            std::string sr = jstr(data, "stop_reason");
+            std::string ed = jstr(data, "error_detail");
+            if (ed.empty()) ed = jstr(data, "error");
+            if (!sr.empty() || !ed.empty()) {
+                ActivityItem* meta = nullptr;
+                for (auto& a : m.activity)
+                    if (a.stage == "__stop_meta__") { meta = &a; break; }
+                if (!meta) {
+                    ActivityItem ni;
+                    ni.stage = "__stop_meta__";
+                    ni.rowKind = 0;
+                    ni.status = "done";
+                    m.activity.push_back(std::move(ni));
+                    meta = &m.activity.back();
+                }
+                if (!sr.empty()) meta->title = sr;
+                if (!ed.empty()) { meta->detail = ed; meta->reason = ed; }
+            }
+        }
     }
     // ---- M12-M14: typed transparency rows from the aicad.agent_events/2 stream ----
     // These arrive through the SAME app.cpp drain as the stage events above (kind already has the
@@ -1144,6 +1193,7 @@ static const char* stageIconName(const std::string& stage, bool missionHeader) {
 // block; build/tool stages (model/edit/review/fix/memory) and mission headers are action cards.
 static bool isThinkingItem(const ActivityItem& a) {
     if (a.missionHeader) return false;
+    if (a.stage == "__stop_meta__") return false;  // hidden stop_reason/error_detail carrier
     std::string s = a.stage;
     size_t colon = s.find(':');
     if (colon != std::string::npos) s = s.substr(colon + 1);
@@ -1435,6 +1485,8 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
+        // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
+        if (a.stage == "__stop_meta__") continue;
         ImGui::PushID((int)i);
         if (a.rowKind == 1) {
             drawContextChip(a, fonts);
@@ -1446,6 +1498,7 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
             bool laterDone = false;
             for (size_t j = i + 1; j < m.activity.size(); ++j) {
                 if (m.activity[j].rowKind != 0) continue;   // transparency rows don't close stages
+                if (m.activity[j].stage == "__stop_meta__") continue;
                 const std::string& s = m.activity[j].status;
                 if (s == "pass" || s == "done" || s == "fail" || s == "retry") { laterDone = true; break; }
             }
@@ -1865,27 +1918,40 @@ static void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2
     (void)w;
 }
 
-// Small pencil (edit) glyph — diagonal shaft + tip + eraser band. Drawn, never text.
+// Small pencil (edit) glyph — filled diagonal body + tip + eraser. Drawn when the atlas
+// tile is unavailable (pre-regeneration). Prefer getIcon("msg_edit") / prompt_edit.
 static void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col) {
     const float w = mx.x - mn.x, h = mx.y - mn.y;
     const float cx = (mn.x + mx.x) * 0.5f;
     const float cy = (mn.y + mx.y) * 0.5f;
-    const float s = std::min(w, h) * 0.34f;
-    const float th = ui::metrics::stroke(1.35f);
-    // Diagonal body (bottom-left tip → top-right eraser).
-    const ImVec2 tip(cx - s * 0.85f, cy + s * 0.75f);
-    const ImVec2 mid(cx + s * 0.15f, cy - s * 0.25f);
-    const ImVec2 end(cx + s * 0.75f, cy - s * 0.85f);
-    dl->AddLine(tip, mid, col, th);
-    dl->AddLine(mid, end, col, th);
-    // Tip wedge
+    const float s = std::min(w, h) * 0.38f;
+    // Diagonal body (bottom-left tip → top-right eraser), as a filled quad so it never
+    // collapses to a bare slash at small sizes.
+    const ImVec2 tip(cx - s * 0.78f, cy + s * 0.72f);
+    const ImVec2 end(cx + s * 0.72f, cy - s * 0.78f);
+    const float dx = end.x - tip.x, dy = end.y - tip.y;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 1.0f) return;
+    const float nx = -dy / len, ny = dx / len;
+    const float half = s * 0.18f;
+    // Tip wedge (leading ~22% of the shaft).
+    const ImVec2 tipJoin(tip.x + dx * 0.22f, tip.y + dy * 0.22f);
     dl->AddTriangleFilled(tip,
-                          ImVec2(tip.x + s * 0.28f, tip.y - s * 0.08f),
-                          ImVec2(tip.x + s * 0.08f, tip.y - s * 0.28f), col);
-    // Eraser band near the top
-    const ImVec2 e0(end.x - s * 0.18f, end.y + s * 0.18f);
-    const ImVec2 e1(end.x + s * 0.12f, end.y - s * 0.12f);
-    dl->AddLine(e0, e1, col, th * 1.15f);
+                          ImVec2(tipJoin.x + nx * half, tipJoin.y + ny * half),
+                          ImVec2(tipJoin.x - nx * half, tipJoin.y - ny * half), col);
+    // Body rectangle from tip-join to eraser band.
+    const ImVec2 erJoin(tip.x + dx * 0.82f, tip.y + dy * 0.82f);
+    const ImVec2 b0(tipJoin.x + nx * half, tipJoin.y + ny * half);
+    const ImVec2 b1(erJoin.x  + nx * half, erJoin.y  + ny * half);
+    const ImVec2 b2(erJoin.x  - nx * half, erJoin.y  - ny * half);
+    const ImVec2 b3(tipJoin.x - nx * half, tipJoin.y - ny * half);
+    dl->AddQuadFilled(b0, b1, b2, b3, col);
+    // Eraser band (short thicker cross-stroke near the top end).
+    const ImVec2 e0(erJoin.x + nx * half * 1.15f, erJoin.y + ny * half * 1.15f);
+    const ImVec2 e1(erJoin.x - nx * half * 1.15f, erJoin.y - ny * half * 1.15f);
+    const ImVec2 e2(end.x    - nx * half * 1.15f, end.y    - ny * half * 1.15f);
+    const ImVec2 e3(end.x    + nx * half * 1.15f, end.y    + ny * half * 1.15f);
+    dl->AddQuadFilled(e0, e3, e2, e1, col);
 }
 
 // Shared rectangular less-rounded header button style for Sessions / Checkpoints / gear-as-box.
@@ -2094,7 +2160,8 @@ static void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum) {
 
 }  // namespace
 
-// One user turn: right-aligned bubble; rewind + pencil edit actions BELOW the bubble, right-aligned.
+// One user turn: right-aligned bubble; "You" label + rewind/edit sit on ONE row just under
+// the bubble (label left, buttons right — mirrors the assistant-row footer style).
 static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           float panelW, int msgIdx) {
     const auto& pal = ui::palette;
@@ -2106,10 +2173,7 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accentCol, "You");
-    ImGui::PopFont();
-
+    // Body only — the "You" author label lives in the footer row under the bubble.
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
     ImGui::PopStyleColor();
@@ -2119,78 +2183,109 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
         ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
         8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
 
-    // ◁◁ rewind + pencil edit — BELOW the bubble, right-aligned (AI-VC available only).
-    if (s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy) {
+    // Footer row: "You" (left) + ◁◁ rewind / pencil edit (right). Tight under the bubble.
+    {
         const double now = ImGui::GetTime();
         if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
             s_aiVc.confirmMsgIdx = -1;
             s_aiVc.confirmKind = 0;
         }
         const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
+        const bool showBtns = s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy;
 
-        // Slightly smaller than a full frame; both icons share one right-aligned row.
         const float btnSz = ImGui::GetFrameHeight() * 0.78f;
         const float gap = 4.0f * sc;
-        const float totalW = btnSz + gap + btnSz;
-        ImGui::Dummy(ImVec2(0, 2.0f * sc));
-        // Right-align under the bubble's right edge.
-        const float rowX = bubble.Max.x - totalW - ImGui::GetWindowPos().x
-                           + ImGui::GetCurrentWindow()->Scroll.x;
-        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rowX));
+        const float totalBtnW = showBtns ? (btnSz + gap + btnSz) : 0.0f;
 
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ui::AdaptiveSurface& surf = chatSurf();
+        // Sit flush under the bubble's bottom edge (1px-scale hairline gap only).
+        ImGui::Dummy(ImVec2(0, 1.0f * sc));
 
-        // Rewind glyph button (smaller)
-        {
-            if (pending) {
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
-            }
-            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
-            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-            if (pending || ImGui::IsItemHovered())
-                dl->AddRectFilled(bmn, bmx,
-                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                          surf.textPrimary.z, pending ? 0.18f : 0.10f)),
-                    ui::metrics::rounding(4.0f));
-            drawDoubleRewindGlyph(dl, bmn, bmx,
-                ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
-            if (pending) ImGui::PopStyleColor();
-            if (clicked) {
-                if (!pending) {
-                    s_aiVc.confirmMsgIdx = msgIdx;
-                    s_aiVc.confirmKind = 3;
-                    s_aiVc.confirmUntil = now + 4.0;
-                } else {
-                    aiVcRollback(st, "msg:" + std::to_string(msgIdx),
-                                 "Rewound to before this message");
+        // Align the footer to the bubble's left edge (same indent as the bubble).
+        const float winX = ImGui::GetWindowPos().x - ImGui::GetCurrentWindow()->Scroll.x;
+        const float leftX = bubble.Min.x - winX;
+        ImGui::SetCursorPosX(std::max(0.0f, leftX));
+
+        // Capture the start of the row so we can place buttons on the same line, right-aligned.
+        const float rowStartY = ImGui::GetCursorPosY();
+        const float rowStartX = ImGui::GetCursorPosX();
+
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(accentCol, "You");
+        ImGui::PopFont();
+
+        if (showBtns) {
+            // Right-align buttons under the bubble's right edge, same baseline as the label.
+            const float rowX = bubble.Max.x - totalBtnW - winX;
+            ImGui::SetCursorPos(ImVec2(std::max(rowStartX + ImGui::CalcTextSize("You").x + gap,
+                                               rowX),
+                                      rowStartY + (ImGui::GetTextLineHeight() - btnSz) * 0.5f));
+
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ui::AdaptiveSurface& surf = chatSurf();
+
+            // Rewind glyph button
+            {
+                if (pending) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
                 }
+                const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
+                const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+                if (pending || ImGui::IsItemHovered())
+                    dl->AddRectFilled(bmn, bmx,
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                              surf.textPrimary.z, pending ? 0.18f : 0.10f)),
+                        ui::metrics::rounding(4.0f));
+                drawDoubleRewindGlyph(dl, bmn, bmx,
+                    ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
+                if (pending) ImGui::PopStyleColor();
+                if (clicked) {
+                    if (!pending) {
+                        s_aiVc.confirmMsgIdx = msgIdx;
+                        s_aiVc.confirmKind = 3;
+                        s_aiVc.confirmUntil = now + 4.0;
+                    } else {
+                        aiVcRollback(st, "msg:" + std::to_string(msgIdx),
+                                     "Rewound to before this message");
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(pending ? "Click again to confirm rewind."
+                                              : "Rewind — restore the part to before this message.");
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(pending ? "Click again to confirm rewind."
-                                          : "Rewind — restore the part to before this message.");
-        }
 
-        // Pencil edit — stages UI truncation + composer prefill; rollback only on send.
-        ImGui::SameLine(0, gap);
-        {
-            const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
-            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-            if (ImGui::IsItemHovered())
-                dl->AddRectFilled(bmn, bmx,
-                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                          surf.textPrimary.z, 0.10f)),
-                    ui::metrics::rounding(4.0f));
-            drawPencilGlyph(dl, bmn, bmx,
-                ImGui::ColorConvertFloat4ToU32(surf.textSecondary));
-            if (clicked) beginEditStage(st, msgIdx);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
+            // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
+            ImGui::SameLine(0, gap);
+            {
+                const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
+                const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
+                if (ImGui::IsItemHovered())
+                    dl->AddRectFilled(bmn, bmx,
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                              surf.textPrimary.z, 0.10f)),
+                        ui::metrics::rounding(4.0f));
+                const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+                // Prefer dedicated msg_edit atlas tile (integrator regenerates make_icons);
+                // until then, use the filled pencil glyph (never a bare slash).
+                IconUV editIcon = ui::getIcon("msg_edit", 20);
+                if (editIcon.valid) {
+                    const float pad = btnSz * 0.18f;
+                    dl->AddImage(editIcon.texId,
+                                 ImVec2(bmn.x + pad, bmn.y + pad),
+                                 ImVec2(bmx.x - pad, bmx.y - pad),
+                                 editIcon.uv0, editIcon.uv1,
+                                 ink);
+                } else {
+                    drawPencilGlyph(dl, bmn, bmx, ink);
+                }
+                if (clicked) beginEditStage(st, msgIdx);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
+            }
         }
     }
 
-    ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
+    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
 
 
@@ -2280,7 +2375,47 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (8) Error block — a distinct red-bordered glass card carrying the real reason (DESIGN §5).
+    // When the agent stream carried stop_reason / error_detail (stashed on a hidden
+    // __stop_meta__ activity row by feedTurnActivity), prefer a "stopped: <reason> — <detail>"
+    // lead-in; fall back to the existing prose when those fields are absent.
     if (m.errKind != ERR_NONE && !m.text.empty()) {
+        std::string stopReason, errorDetail;
+        for (const auto& a : m.activity) {
+            if (a.stage != "__stop_meta__") continue;
+            stopReason = a.title;
+            errorDetail = !a.detail.empty() ? a.detail : a.reason;
+            break;
+        }
+        std::string body = m.text;
+        if (!stopReason.empty() || !errorDetail.empty()) {
+            // Build "stopped: <reason> — <detail>" lead-in.
+            std::string lead = "stopped: ";
+            lead += stopReason.empty() ? "unknown" : stopReason;
+            if (!errorDetail.empty()) {
+                lead += " \xe2\x80\x94 ";  // em dash
+                lead += errorDetail;
+            }
+            // If the body is the generic early-stop fallback, replace its parenthetical why
+            // with the richer lead; otherwise prepend the lead above the existing prose.
+            const char* kFallback = "I stopped before fully finishing";
+            if (body.find(kFallback) != std::string::npos) {
+                // Keep the guidance after the first sentence when present.
+                std::string rest;
+                const size_t dot = body.find(". ");
+                if (dot != std::string::npos && dot + 2 < body.size())
+                    rest = body.substr(dot + 2);
+                body = lead;
+                if (!rest.empty()) {
+                    body += ". ";
+                    body += rest;
+                } else {
+                    body += ".";
+                }
+            } else if (body.find(errorDetail) == std::string::npos &&
+                       body.find(stopReason) == std::string::npos) {
+                body = lead + "\n\n" + body;
+            }
+        }
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           8.0f);
@@ -2289,7 +2424,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // Error tone retuned for the frost so the reason stays readable over any model.
         const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
         ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(ec, chatSurf()));
-        ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+        // Selectable + wrapped so the user can copy the reason/detail from the card.
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextWrapped("%s", stripMdMarks(body).c_str());
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
         ImGui::EndChild();
         ImRect cardRect = endGlassBubble(gb);

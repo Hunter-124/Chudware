@@ -1,7 +1,7 @@
 {
   "atlas_px": [
     56,
-    7956
+    7990
   ],
   "cell": {
     "app@32": {
@@ -1648,1167 +1648,1179 @@
       "w": 20,
       "h": 20
     },
-    "copy@32": {
+    "msg_edit@32": {
       "x": 0,
       "y": 4659,
       "w": 32,
       "h": 32
     },
-    "copy@20": {
+    "msg_edit@20": {
       "x": 34,
       "y": 4665,
       "w": 20,
       "h": 20
     },
-    "paste@32": {
+    "copy@32": {
       "x": 0,
       "y": 4693,
       "w": 32,
       "h": 32
     },
-    "paste@20": {
+    "copy@20": {
       "x": 34,
       "y": 4699,
       "w": 20,
       "h": 20
     },
-    "delete@32": {
+    "paste@32": {
       "x": 0,
       "y": 4727,
       "w": 32,
       "h": 32
     },
-    "delete@20": {
+    "paste@20": {
       "x": 34,
       "y": 4733,
       "w": 20,
       "h": 20
     },
-    "folder_new@32": {
+    "delete@32": {
       "x": 0,
       "y": 4761,
       "w": 32,
       "h": 32
     },
-    "folder_new@20": {
+    "delete@20": {
       "x": 34,
       "y": 4767,
       "w": 20,
       "h": 20
     },
-    "refresh@32": {
+    "folder_new@32": {
       "x": 0,
       "y": 4795,
       "w": 32,
       "h": 32
     },
-    "refresh@20": {
+    "folder_new@20": {
       "x": 34,
       "y": 4801,
       "w": 20,
       "h": 20
     },
-    "rect_3pt_corner@32": {
+    "refresh@32": {
       "x": 0,
       "y": 4829,
       "w": 32,
       "h": 32
     },
-    "rect_3pt_corner@20": {
+    "refresh@20": {
       "x": 34,
       "y": 4835,
       "w": 20,
       "h": 20
     },
-    "rect_3pt_center@32": {
+    "rect_3pt_corner@32": {
       "x": 0,
       "y": 4863,
       "w": 32,
       "h": 32
     },
-    "rect_3pt_center@20": {
+    "rect_3pt_corner@20": {
       "x": 34,
       "y": 4869,
       "w": 20,
       "h": 20
     },
-    "parallelogram@32": {
+    "rect_3pt_center@32": {
       "x": 0,
       "y": 4897,
       "w": 32,
       "h": 32
     },
-    "parallelogram@20": {
+    "rect_3pt_center@20": {
       "x": 34,
       "y": 4903,
       "w": 20,
       "h": 20
     },
-    "circle_perimeter@32": {
+    "parallelogram@32": {
       "x": 0,
       "y": 4931,
       "w": 32,
       "h": 32
     },
-    "circle_perimeter@20": {
+    "parallelogram@20": {
       "x": 34,
       "y": 4937,
       "w": 20,
       "h": 20
     },
-    "slot_ctr_str@32": {
+    "circle_perimeter@32": {
       "x": 0,
       "y": 4965,
       "w": 32,
       "h": 32
     },
-    "slot_ctr_str@20": {
+    "circle_perimeter@20": {
       "x": 34,
       "y": 4971,
       "w": 20,
       "h": 20
     },
-    "slot_arc_3pt@32": {
+    "slot_ctr_str@32": {
       "x": 0,
       "y": 4999,
       "w": 32,
       "h": 32
     },
-    "slot_arc_3pt@20": {
+    "slot_ctr_str@20": {
       "x": 34,
       "y": 5005,
       "w": 20,
       "h": 20
     },
-    "slot_arc_ctr@32": {
+    "slot_arc_3pt@32": {
       "x": 0,
       "y": 5033,
       "w": 32,
       "h": 32
     },
-    "slot_arc_ctr@20": {
+    "slot_arc_3pt@20": {
       "x": 34,
       "y": 5039,
       "w": 20,
       "h": 20
     },
-    "spline_style@32": {
+    "slot_arc_ctr@32": {
       "x": 0,
       "y": 5067,
       "w": 32,
       "h": 32
     },
-    "spline_style@20": {
+    "slot_arc_ctr@20": {
       "x": 34,
       "y": 5073,
       "w": 20,
       "h": 20
     },
-    "spline_surface@32": {
+    "spline_style@32": {
       "x": 0,
       "y": 5101,
       "w": 32,
       "h": 32
     },
-    "spline_surface@20": {
+    "spline_style@20": {
       "x": 34,
       "y": 5107,
       "w": 20,
       "h": 20
     },
-    "spline_equation@32": {
+    "spline_surface@32": {
       "x": 0,
       "y": 5135,
       "w": 32,
       "h": 32
     },
-    "spline_equation@20": {
+    "spline_surface@20": {
       "x": 34,
       "y": 5141,
       "w": 20,
       "h": 20
     },
-    "ellipse_partial@32": {
+    "spline_equation@32": {
       "x": 0,
       "y": 5169,
       "w": 32,
       "h": 32
     },
-    "ellipse_partial@20": {
+    "spline_equation@20": {
       "x": 34,
       "y": 5175,
       "w": 20,
       "h": 20
     },
-    "parabola@32": {
+    "ellipse_partial@32": {
       "x": 0,
       "y": 5203,
       "w": 32,
       "h": 32
     },
-    "parabola@20": {
+    "ellipse_partial@20": {
       "x": 34,
       "y": 5209,
       "w": 20,
       "h": 20
     },
-    "conic@32": {
+    "parabola@32": {
       "x": 0,
       "y": 5237,
       "w": 32,
       "h": 32
     },
-    "conic@20": {
+    "parabola@20": {
       "x": 34,
       "y": 5243,
       "w": 20,
       "h": 20
     },
-    "hide_show_eye@32": {
+    "conic@32": {
       "x": 0,
       "y": 5271,
       "w": 32,
       "h": 32
     },
-    "hide_show_eye@20": {
+    "conic@20": {
       "x": 34,
       "y": 5277,
       "w": 20,
       "h": 20
     },
-    "ws_features@32": {
+    "hide_show_eye@32": {
       "x": 0,
       "y": 5305,
       "w": 32,
       "h": 32
     },
-    "ws_features@20": {
+    "hide_show_eye@20": {
       "x": 34,
       "y": 5311,
       "w": 20,
       "h": 20
     },
-    "ws_sketch@32": {
+    "ws_features@32": {
       "x": 0,
       "y": 5339,
       "w": 32,
       "h": 32
     },
-    "ws_sketch@20": {
+    "ws_features@20": {
       "x": 34,
       "y": 5345,
       "w": 20,
       "h": 20
     },
-    "ws_evaluate@32": {
+    "ws_sketch@32": {
       "x": 0,
       "y": 5373,
       "w": 32,
       "h": 32
     },
-    "ws_evaluate@20": {
+    "ws_sketch@20": {
       "x": 34,
       "y": 5379,
       "w": 20,
       "h": 20
     },
-    "ws_assembly@32": {
+    "ws_evaluate@32": {
       "x": 0,
       "y": 5407,
       "w": 32,
       "h": 32
     },
-    "ws_assembly@20": {
+    "ws_evaluate@20": {
       "x": 34,
       "y": 5413,
       "w": 20,
       "h": 20
     },
-    "ws_sheetmetal@32": {
+    "ws_assembly@32": {
       "x": 0,
       "y": 5441,
       "w": 32,
       "h": 32
     },
-    "ws_sheetmetal@20": {
+    "ws_assembly@20": {
       "x": 34,
       "y": 5447,
       "w": 20,
       "h": 20
     },
-    "ws_weldments@32": {
+    "ws_sheetmetal@32": {
       "x": 0,
       "y": 5475,
       "w": 32,
       "h": 32
     },
-    "ws_weldments@20": {
+    "ws_sheetmetal@20": {
       "x": 34,
       "y": 5481,
       "w": 20,
       "h": 20
     },
-    "ws_surfaces@32": {
+    "ws_weldments@32": {
       "x": 0,
       "y": 5509,
       "w": 32,
       "h": 32
     },
-    "ws_surfaces@20": {
+    "ws_weldments@20": {
       "x": 34,
       "y": 5515,
       "w": 20,
       "h": 20
     },
-    "ws_appearance@32": {
+    "ws_surfaces@32": {
       "x": 0,
       "y": 5543,
       "w": 32,
       "h": 32
     },
-    "ws_appearance@20": {
+    "ws_surfaces@20": {
       "x": 34,
       "y": 5549,
       "w": 20,
       "h": 20
     },
-    "study_thermal@32": {
+    "ws_appearance@32": {
       "x": 0,
       "y": 5577,
       "w": 32,
       "h": 32
     },
-    "study_thermal@20": {
+    "ws_appearance@20": {
       "x": 34,
       "y": 5583,
       "w": 20,
       "h": 20
     },
-    "study_fatigue@32": {
+    "study_thermal@32": {
       "x": 0,
       "y": 5611,
       "w": 32,
       "h": 32
     },
-    "study_fatigue@20": {
+    "study_thermal@20": {
       "x": 34,
       "y": 5617,
       "w": 20,
       "h": 20
     },
-    "mesh_tet@32": {
+    "study_fatigue@32": {
       "x": 0,
       "y": 5645,
       "w": 32,
       "h": 32
     },
-    "mesh_tet@20": {
+    "study_fatigue@20": {
       "x": 34,
       "y": 5651,
       "w": 20,
       "h": 20
     },
-    "mesh_hex@32": {
+    "mesh_tet@32": {
       "x": 0,
       "y": 5679,
       "w": 32,
       "h": 32
     },
-    "mesh_hex@20": {
+    "mesh_tet@20": {
       "x": 34,
       "y": 5685,
       "w": 20,
       "h": 20
     },
-    "mesh_auto@32": {
+    "mesh_hex@32": {
       "x": 0,
       "y": 5713,
       "w": 32,
       "h": 32
     },
-    "mesh_auto@20": {
+    "mesh_hex@20": {
       "x": 34,
       "y": 5719,
       "w": 20,
       "h": 20
     },
-    "sm_base_flange@32": {
+    "mesh_auto@32": {
       "x": 0,
       "y": 5747,
       "w": 32,
       "h": 32
     },
-    "sm_base_flange@20": {
+    "mesh_auto@20": {
       "x": 34,
       "y": 5753,
       "w": 20,
       "h": 20
     },
-    "sm_edge_flange@32": {
+    "sm_base_flange@32": {
       "x": 0,
       "y": 5781,
       "w": 32,
       "h": 32
     },
-    "sm_edge_flange@20": {
+    "sm_base_flange@20": {
       "x": 34,
       "y": 5787,
       "w": 20,
       "h": 20
     },
-    "sm_hem@32": {
+    "sm_edge_flange@32": {
       "x": 0,
       "y": 5815,
       "w": 32,
       "h": 32
     },
-    "sm_hem@20": {
+    "sm_edge_flange@20": {
       "x": 34,
       "y": 5821,
       "w": 20,
       "h": 20
     },
-    "sm_jog@32": {
+    "sm_hem@32": {
       "x": 0,
       "y": 5849,
       "w": 32,
       "h": 32
     },
-    "sm_jog@20": {
+    "sm_hem@20": {
       "x": 34,
       "y": 5855,
       "w": 20,
       "h": 20
     },
-    "sm_flat_pattern@32": {
+    "sm_jog@32": {
       "x": 0,
       "y": 5883,
       "w": 32,
       "h": 32
     },
-    "sm_flat_pattern@20": {
+    "sm_jog@20": {
       "x": 34,
       "y": 5889,
       "w": 20,
       "h": 20
     },
-    "weld_member@32": {
+    "sm_flat_pattern@32": {
       "x": 0,
       "y": 5917,
       "w": 32,
       "h": 32
     },
-    "weld_member@20": {
+    "sm_flat_pattern@20": {
       "x": 34,
       "y": 5923,
       "w": 20,
       "h": 20
     },
-    "weld_gusset@32": {
+    "weld_member@32": {
       "x": 0,
       "y": 5951,
       "w": 32,
       "h": 32
     },
-    "weld_gusset@20": {
+    "weld_member@20": {
       "x": 34,
       "y": 5957,
       "w": 20,
       "h": 20
     },
-    "weld_end_cap@32": {
+    "weld_gusset@32": {
       "x": 0,
       "y": 5985,
       "w": 32,
       "h": 32
     },
-    "weld_end_cap@20": {
+    "weld_gusset@20": {
       "x": 34,
       "y": 5991,
       "w": 20,
       "h": 20
     },
-    "color_picker@32": {
+    "weld_end_cap@32": {
       "x": 0,
       "y": 6019,
       "w": 32,
       "h": 32
     },
-    "color_picker@20": {
+    "weld_end_cap@20": {
       "x": 34,
       "y": 6025,
       "w": 20,
       "h": 20
     },
-    "appr_metal@32": {
+    "color_picker@32": {
       "x": 0,
       "y": 6053,
       "w": 32,
       "h": 32
     },
-    "appr_metal@20": {
+    "color_picker@20": {
       "x": 34,
       "y": 6059,
       "w": 20,
       "h": 20
     },
-    "appr_plastic@32": {
+    "appr_metal@32": {
       "x": 0,
       "y": 6087,
       "w": 32,
       "h": 32
     },
-    "appr_plastic@20": {
+    "appr_metal@20": {
       "x": 34,
       "y": 6093,
       "w": 20,
       "h": 20
     },
-    "appr_glass@32": {
+    "appr_plastic@32": {
       "x": 0,
       "y": 6121,
       "w": 32,
       "h": 32
     },
-    "appr_glass@20": {
+    "appr_plastic@20": {
       "x": 34,
       "y": 6127,
       "w": 20,
       "h": 20
     },
-    "appr_paint@32": {
+    "appr_glass@32": {
       "x": 0,
       "y": 6155,
       "w": 32,
       "h": 32
     },
-    "appr_paint@20": {
+    "appr_glass@20": {
       "x": 34,
       "y": 6161,
       "w": 20,
       "h": 20
     },
-    "appr_default@32": {
+    "appr_paint@32": {
       "x": 0,
       "y": 6189,
       "w": 32,
       "h": 32
     },
-    "appr_default@20": {
+    "appr_paint@20": {
       "x": 34,
       "y": 6195,
       "w": 20,
       "h": 20
     },
-    "appr_steel@32": {
+    "appr_default@32": {
       "x": 0,
       "y": 6223,
       "w": 32,
       "h": 32
     },
-    "appr_steel@20": {
+    "appr_default@20": {
       "x": 34,
       "y": 6229,
       "w": 20,
       "h": 20
     },
-    "appr_brass@32": {
+    "appr_steel@32": {
       "x": 0,
       "y": 6257,
       "w": 32,
       "h": 32
     },
-    "appr_brass@20": {
+    "appr_steel@20": {
       "x": 34,
       "y": 6263,
       "w": 20,
       "h": 20
     },
-    "appr_dark@32": {
+    "appr_brass@32": {
       "x": 0,
       "y": 6291,
       "w": 32,
       "h": 32
     },
-    "appr_dark@20": {
+    "appr_brass@20": {
       "x": 34,
       "y": 6297,
       "w": 20,
       "h": 20
     },
-    "poly_triangle@32": {
+    "appr_dark@32": {
       "x": 0,
       "y": 6325,
       "w": 32,
       "h": 32
     },
-    "poly_triangle@20": {
+    "appr_dark@20": {
       "x": 34,
       "y": 6331,
       "w": 20,
       "h": 20
     },
-    "poly_square@32": {
+    "poly_triangle@32": {
       "x": 0,
       "y": 6359,
       "w": 32,
       "h": 32
     },
-    "poly_square@20": {
+    "poly_triangle@20": {
       "x": 34,
       "y": 6365,
       "w": 20,
       "h": 20
     },
-    "poly_pentagon@32": {
+    "poly_square@32": {
       "x": 0,
       "y": 6393,
       "w": 32,
       "h": 32
     },
-    "poly_pentagon@20": {
+    "poly_square@20": {
       "x": 34,
       "y": 6399,
       "w": 20,
       "h": 20
     },
-    "poly_octagon@32": {
+    "poly_pentagon@32": {
       "x": 0,
       "y": 6427,
       "w": 32,
       "h": 32
     },
-    "poly_octagon@20": {
+    "poly_pentagon@20": {
       "x": 34,
       "y": 6433,
       "w": 20,
       "h": 20
     },
-    "poly_star@32": {
+    "poly_octagon@32": {
       "x": 0,
       "y": 6461,
       "w": 32,
       "h": 32
     },
-    "poly_star@20": {
+    "poly_octagon@20": {
       "x": 34,
       "y": 6467,
       "w": 20,
       "h": 20
     },
-    "airfoil@32": {
+    "poly_star@32": {
       "x": 0,
       "y": 6495,
       "w": 32,
       "h": 32
     },
-    "airfoil@20": {
+    "poly_star@20": {
       "x": 34,
       "y": 6501,
       "w": 20,
       "h": 20
     },
-    "cam_face@32": {
+    "airfoil@32": {
       "x": 0,
       "y": 6529,
       "w": 32,
       "h": 32
     },
-    "cam_face@20": {
+    "airfoil@20": {
       "x": 34,
       "y": 6535,
       "w": 20,
       "h": 20
     },
-    "cam_contour2d@32": {
+    "cam_face@32": {
       "x": 0,
       "y": 6563,
       "w": 32,
       "h": 32
     },
-    "cam_contour2d@20": {
+    "cam_face@20": {
       "x": 34,
       "y": 6569,
       "w": 20,
       "h": 20
     },
-    "cam_pocket2d@32": {
+    "cam_contour2d@32": {
       "x": 0,
       "y": 6597,
       "w": 32,
       "h": 32
     },
-    "cam_pocket2d@20": {
+    "cam_contour2d@20": {
       "x": 34,
       "y": 6603,
       "w": 20,
       "h": 20
     },
-    "cam_adaptive2d@32": {
+    "cam_pocket2d@32": {
       "x": 0,
       "y": 6631,
       "w": 32,
       "h": 32
     },
-    "cam_adaptive2d@20": {
+    "cam_pocket2d@20": {
       "x": 34,
       "y": 6637,
       "w": 20,
       "h": 20
     },
-    "cam_slot@32": {
+    "cam_adaptive2d@32": {
       "x": 0,
       "y": 6665,
       "w": 32,
       "h": 32
     },
-    "cam_slot@20": {
+    "cam_adaptive2d@20": {
       "x": 34,
       "y": 6671,
       "w": 20,
       "h": 20
     },
-    "cam_chamfer2d@32": {
+    "cam_slot@32": {
       "x": 0,
       "y": 6699,
       "w": 32,
       "h": 32
     },
-    "cam_chamfer2d@20": {
+    "cam_slot@20": {
       "x": 34,
       "y": 6705,
       "w": 20,
       "h": 20
     },
-    "cam_engrave@32": {
+    "cam_chamfer2d@32": {
       "x": 0,
       "y": 6733,
       "w": 32,
       "h": 32
     },
-    "cam_engrave@20": {
+    "cam_chamfer2d@20": {
       "x": 34,
       "y": 6739,
       "w": 20,
       "h": 20
     },
-    "cam_drill@32": {
+    "cam_engrave@32": {
       "x": 0,
       "y": 6767,
       "w": 32,
       "h": 32
     },
-    "cam_drill@20": {
+    "cam_engrave@20": {
       "x": 34,
       "y": 6773,
       "w": 20,
       "h": 20
     },
-    "cam_thread_mill@32": {
+    "cam_drill@32": {
       "x": 0,
       "y": 6801,
       "w": 32,
       "h": 32
     },
-    "cam_thread_mill@20": {
+    "cam_drill@20": {
       "x": 34,
       "y": 6807,
       "w": 20,
       "h": 20
     },
-    "cam_parallel3d@32": {
+    "cam_thread_mill@32": {
       "x": 0,
       "y": 6835,
       "w": 32,
       "h": 32
     },
-    "cam_parallel3d@20": {
+    "cam_thread_mill@20": {
       "x": 34,
       "y": 6841,
       "w": 20,
       "h": 20
     },
-    "cam_waterline3d@32": {
+    "cam_parallel3d@32": {
       "x": 0,
       "y": 6869,
       "w": 32,
       "h": 32
     },
-    "cam_waterline3d@20": {
+    "cam_parallel3d@20": {
       "x": 34,
       "y": 6875,
       "w": 20,
       "h": 20
     },
-    "cam_scallop3d@32": {
+    "cam_waterline3d@32": {
       "x": 0,
       "y": 6903,
       "w": 32,
       "h": 32
     },
-    "cam_scallop3d@20": {
+    "cam_waterline3d@20": {
       "x": 34,
       "y": 6909,
       "w": 20,
       "h": 20
     },
-    "cam_pocket3d@32": {
+    "cam_scallop3d@32": {
       "x": 0,
       "y": 6937,
       "w": 32,
       "h": 32
     },
-    "cam_pocket3d@20": {
+    "cam_scallop3d@20": {
       "x": 34,
       "y": 6943,
       "w": 20,
       "h": 20
     },
-    "cam_turn_rough@32": {
+    "cam_pocket3d@32": {
       "x": 0,
       "y": 6971,
       "w": 32,
       "h": 32
     },
-    "cam_turn_rough@20": {
+    "cam_pocket3d@20": {
       "x": 34,
       "y": 6977,
       "w": 20,
       "h": 20
     },
-    "cam_turn_finish@32": {
+    "cam_turn_rough@32": {
       "x": 0,
       "y": 7005,
       "w": 32,
       "h": 32
     },
-    "cam_turn_finish@20": {
+    "cam_turn_rough@20": {
       "x": 34,
       "y": 7011,
       "w": 20,
       "h": 20
     },
-    "cam_turn_face@32": {
+    "cam_turn_finish@32": {
       "x": 0,
       "y": 7039,
       "w": 32,
       "h": 32
     },
-    "cam_turn_face@20": {
+    "cam_turn_finish@20": {
       "x": 34,
       "y": 7045,
       "w": 20,
       "h": 20
     },
-    "cam_turn_part@32": {
+    "cam_turn_face@32": {
       "x": 0,
       "y": 7073,
       "w": 32,
       "h": 32
     },
-    "cam_turn_part@20": {
+    "cam_turn_face@20": {
       "x": 34,
       "y": 7079,
       "w": 20,
       "h": 20
     },
-    "cam_cut2d@32": {
+    "cam_turn_part@32": {
       "x": 0,
       "y": 7107,
       "w": 32,
       "h": 32
     },
-    "cam_cut2d@20": {
+    "cam_turn_part@20": {
       "x": 34,
       "y": 7113,
       "w": 20,
       "h": 20
     },
-    "cam_probe@32": {
+    "cam_cut2d@32": {
       "x": 0,
       "y": 7141,
       "w": 32,
       "h": 32
     },
-    "cam_probe@20": {
+    "cam_cut2d@20": {
       "x": 34,
       "y": 7147,
       "w": 20,
       "h": 20
     },
-    "parts_all@32": {
+    "cam_probe@32": {
       "x": 0,
       "y": 7175,
       "w": 32,
       "h": 32
     },
-    "parts_all@20": {
+    "cam_probe@20": {
       "x": 34,
       "y": 7181,
       "w": 20,
       "h": 20
     },
-    "cat_fasteners@32": {
+    "parts_all@32": {
       "x": 0,
       "y": 7209,
       "w": 32,
       "h": 32
     },
-    "cat_fasteners@20": {
+    "parts_all@20": {
       "x": 34,
       "y": 7215,
       "w": 20,
       "h": 20
     },
-    "cat_bearings@32": {
+    "cat_fasteners@32": {
       "x": 0,
       "y": 7243,
       "w": 32,
       "h": 32
     },
-    "cat_bearings@20": {
+    "cat_fasteners@20": {
       "x": 34,
       "y": 7249,
       "w": 20,
       "h": 20
     },
-    "cat_stock_metal@32": {
+    "cat_bearings@32": {
       "x": 0,
       "y": 7277,
       "w": 32,
       "h": 32
     },
-    "cat_stock_metal@20": {
+    "cat_bearings@20": {
       "x": 34,
       "y": 7283,
       "w": 20,
       "h": 20
     },
-    "cat_drivetrain@32": {
+    "cat_stock_metal@32": {
       "x": 0,
       "y": 7311,
       "w": 32,
       "h": 32
     },
-    "cat_drivetrain@20": {
+    "cat_stock_metal@20": {
       "x": 34,
       "y": 7317,
       "w": 20,
       "h": 20
     },
-    "cat_wheels@32": {
+    "cat_drivetrain@32": {
       "x": 0,
       "y": 7345,
       "w": 32,
       "h": 32
     },
-    "cat_wheels@20": {
+    "cat_drivetrain@20": {
       "x": 34,
       "y": 7351,
       "w": 20,
       "h": 20
     },
-    "cat_tools@32": {
+    "cat_wheels@32": {
       "x": 0,
       "y": 7379,
       "w": 32,
       "h": 32
     },
-    "cat_tools@20": {
+    "cat_wheels@20": {
       "x": 34,
       "y": 7385,
       "w": 20,
       "h": 20
     },
-    "cat_cutting_tools@32": {
+    "cat_tools@32": {
       "x": 0,
       "y": 7413,
       "w": 32,
       "h": 32
     },
-    "cat_cutting_tools@20": {
+    "cat_tools@20": {
       "x": 34,
       "y": 7419,
       "w": 20,
       "h": 20
     },
-    "cat_electronics@32": {
+    "cat_cutting_tools@32": {
       "x": 0,
       "y": 7447,
       "w": 32,
       "h": 32
     },
-    "cat_electronics@20": {
+    "cat_cutting_tools@20": {
       "x": 34,
       "y": 7453,
       "w": 20,
       "h": 20
     },
-    "cat_hydraulics@32": {
+    "cat_electronics@32": {
       "x": 0,
       "y": 7481,
       "w": 32,
       "h": 32
     },
-    "cat_hydraulics@20": {
+    "cat_electronics@20": {
       "x": 34,
       "y": 7487,
       "w": 20,
       "h": 20
     },
-    "cat_hardware@32": {
+    "cat_hydraulics@32": {
       "x": 0,
       "y": 7515,
       "w": 32,
       "h": 32
     },
-    "cat_hardware@20": {
+    "cat_hydraulics@20": {
       "x": 34,
       "y": 7521,
       "w": 20,
       "h": 20
     },
-    "vendor_globe@32": {
+    "cat_hardware@32": {
       "x": 0,
       "y": 7549,
       "w": 32,
       "h": 32
     },
-    "vendor_globe@20": {
+    "cat_hardware@20": {
       "x": 34,
       "y": 7555,
       "w": 20,
       "h": 20
     },
-    "browser_panel@32": {
+    "vendor_globe@32": {
       "x": 0,
       "y": 7583,
       "w": 32,
       "h": 32
     },
-    "browser_panel@20": {
+    "vendor_globe@20": {
       "x": 34,
       "y": 7589,
       "w": 20,
       "h": 20
     },
-    "filter_funnel@32": {
+    "browser_panel@32": {
       "x": 0,
       "y": 7617,
       "w": 32,
       "h": 32
     },
-    "filter_funnel@20": {
+    "browser_panel@20": {
       "x": 34,
       "y": 7623,
       "w": 20,
       "h": 20
     },
-    "health_check@32": {
+    "filter_funnel@32": {
       "x": 0,
       "y": 7651,
       "w": 32,
       "h": 32
     },
-    "health_check@20": {
+    "filter_funnel@20": {
       "x": 34,
       "y": 7657,
       "w": 20,
       "h": 20
     },
-    "plan_board@32": {
+    "health_check@32": {
       "x": 0,
       "y": 7685,
       "w": 32,
       "h": 32
     },
-    "plan_board@20": {
+    "health_check@20": {
       "x": 34,
       "y": 7691,
       "w": 20,
       "h": 20
     },
-    "issue_bug@32": {
+    "plan_board@32": {
       "x": 0,
       "y": 7719,
       "w": 32,
       "h": 32
     },
-    "issue_bug@20": {
+    "plan_board@20": {
       "x": 34,
       "y": 7725,
       "w": 20,
       "h": 20
     },
-    "milestone_flag@32": {
+    "issue_bug@32": {
       "x": 0,
       "y": 7753,
       "w": 32,
       "h": 32
     },
-    "milestone_flag@20": {
+    "issue_bug@20": {
       "x": 34,
       "y": 7759,
       "w": 20,
       "h": 20
     },
-    "team@32": {
+    "milestone_flag@32": {
       "x": 0,
       "y": 7787,
       "w": 32,
       "h": 32
     },
-    "team@20": {
+    "milestone_flag@20": {
       "x": 34,
       "y": 7793,
       "w": 20,
       "h": 20
     },
-    "git@32": {
+    "team@32": {
       "x": 0,
       "y": 7821,
       "w": 32,
       "h": 32
     },
-    "git@20": {
+    "team@20": {
       "x": 34,
       "y": 7827,
       "w": 20,
       "h": 20
     },
-    "thread@32": {
+    "git@32": {
       "x": 0,
       "y": 7855,
       "w": 32,
       "h": 32
     },
-    "thread@20": {
+    "git@20": {
       "x": 34,
       "y": 7861,
       "w": 20,
       "h": 20
     },
-    "paperclip@32": {
+    "thread@32": {
       "x": 0,
       "y": 7889,
       "w": 32,
       "h": 32
     },
-    "paperclip@20": {
+    "thread@20": {
       "x": 34,
       "y": 7895,
       "w": 20,
       "h": 20
     },
-    "context_cube@32": {
+    "paperclip@32": {
       "x": 0,
       "y": 7923,
       "w": 32,
       "h": 32
     },
-    "context_cube@20": {
+    "paperclip@20": {
       "x": 34,
       "y": 7929,
+      "w": 20,
+      "h": 20
+    },
+    "context_cube@32": {
+      "x": 0,
+      "y": 7957,
+      "w": 32,
+      "h": 32
+    },
+    "context_cube@20": {
+      "x": 34,
+      "y": 7963,
       "w": 20,
       "h": 20
     }

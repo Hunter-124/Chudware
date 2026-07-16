@@ -186,6 +186,165 @@ class XaiTierDeniedError(RuntimeError):
         super().__init__(msg)
         self.reason = TIER_DENIED_REASON
         self.hint = TIER_DENIED_HINT
+        self.detail = detail or ""
+
+
+# ── Multi-account rotation (403/429 fall-through) ────────────────────────────
+# Process-local: when one SuperGrok account is tier/spending-limit gated or rate-
+# limited, try the next signed-in account before failing the whole provider.
+_account_block_lock = threading.Lock()
+_blocked_accounts: dict[str, float] = {}  # account_id -> unix-seconds unblock time
+_DEFAULT_ACCOUNT_BLOCK_S = 15 * 60
+
+
+def _now_s() -> float:
+    return time.time()
+
+
+def clear_blocked_accounts_for_tests() -> None:
+    """Test hook: drop the process-local account block table."""
+    with _account_block_lock:
+        _blocked_accounts.clear()
+
+
+def mark_account_blocked(
+    account_id: str | None,
+    *,
+    seconds: float | None = None,
+    reason: str = "",
+) -> None:
+    """Soft-block *account_id* for a while so multi-account rotation skips it."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return
+    ttl = float(seconds if seconds is not None else _DEFAULT_ACCOUNT_BLOCK_S)
+    until = _now_s() + max(30.0, ttl)
+    with _account_block_lock:
+        prev = float(_blocked_accounts.get(aid) or 0.0)
+        _blocked_accounts[aid] = max(prev, until)
+    log.info(
+        "xai_sub: blocked account %s for %.0fs (%s)",
+        aid[:12], max(30.0, ttl), (reason or "tier/rate")[:120],
+    )
+
+
+def is_account_blocked(account_id: str | None) -> bool:
+    """True when *account_id* is still inside a soft-block window."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return False
+    now = _now_s()
+    with _account_block_lock:
+        until = float(_blocked_accounts.get(aid) or 0.0)
+        if until <= now:
+            if aid in _blocked_accounts:
+                _blocked_accounts.pop(aid, None)
+            return False
+        return True
+
+
+def _cred_account_id(cred: dict | None) -> str | None:
+    if not isinstance(cred, dict):
+        return None
+    for key in ("account_id", "sub", "user_id"):
+        v = cred.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _has_usable_tokens(cred: dict | None) -> bool:
+    if not isinstance(cred, dict):
+        return False
+    return bool(cred.get("access_token") or cred.get("refresh_token"))
+
+
+def list_candidate_accounts(
+    *,
+    prefer: str | None = None,
+    include_blocked: bool = False,
+) -> list[tuple[str, dict]]:
+    """Ordered (account_id, cred) candidates for chat completion.
+
+    Prefer *prefer* (or the store's active account), then remaining non-blocked
+    signed-in accounts. Empty when no credentials are stored.
+    """
+    accounts = sub_auth.list_accounts(PROVIDER_ID)
+    if not accounts:
+        return []
+    active = prefer or sub_auth.get_active_account_id(PROVIDER_ID)
+    ordered: list[str] = []
+    if active:
+        ordered.append(str(active))
+    for a in accounts:
+        aid = str(a.get("account_id") or "")
+        if aid and aid not in ordered:
+            ordered.append(aid)
+    out: list[tuple[str, dict]] = []
+    for aid in ordered:
+        if not include_blocked and is_account_blocked(aid):
+            continue
+        cred = sub_auth.load_credential(PROVIDER_ID, account_id=aid)
+        if not _has_usable_tokens(cred):
+            continue
+        assert cred is not None
+        # Keep account_id on the dict so rotation + status stay aligned.
+        if not cred.get("account_id"):
+            cred["account_id"] = aid
+        out.append((aid, cred))
+    return out
+
+
+def pick_usable_account(prefer: str | None = None) -> tuple[str, dict] | None:
+    """First non-blocked signed-in account, or None."""
+    cands = list_candidate_accounts(prefer=prefer, include_blocked=False)
+    return cands[0] if cands else None
+
+
+def provider_is_usable() -> bool:
+    """True when at least one signed-in xAI account has tokens (Python usable gate).
+
+    Mirrors the GUI ``providerUsable`` idea for subscription xAI: connected
+    credentials make the provider selectable even without a classic API key.
+    Soft-blocked accounts still count as signed-in (rotation may clear).
+    """
+    if list_candidate_accounts(include_blocked=True):
+        return True
+    # Cold path: legacy flat entry that list_accounts would also see after normalize.
+    cred = sub_auth.load_credential(PROVIDER_ID)
+    return _has_usable_tokens(cred)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "429" in text or "rate limit" in text or "rate_limit" in text:
+        return True
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        return int(code) == 429
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_rotatable_account_error(exc: BaseException) -> bool:
+    """403 tier/spending + 429 are per-account; try the next signed-in account."""
+    if isinstance(exc, XaiTierDeniedError):
+        return True
+    if _is_rate_limit_error(exc):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "tier not api-enabled",
+        "personal-team-blocked",
+        "spending-limit",
+        "spending limit",
+        "run out of credits",
+        "need a grok subscription",
+        "http 403",
+        "http 429",
+    )
+    return any(m in text for m in markers)
+
 
 
 def open_verification_url(url: str) -> bool:
@@ -251,8 +410,23 @@ class XAISubProvider(Provider):
     supports_vision = True
 
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
-        self.model = model
-        self._cred: dict | None = sub_auth.load_credential(PROVIDER_ID)
+        self.model = model or DEFAULT_MODEL
+        # Prefer a non-blocked signed-in account (multi-account cold restore).
+        picked = pick_usable_account()
+        if picked is not None:
+            aid, cred = picked
+            # Align store active pointer when we skip a soft-blocked active account.
+            active = sub_auth.get_active_account_id(PROVIDER_ID)
+            if active and active != aid:
+                try:
+                    sub_auth.set_active_account(PROVIDER_ID, aid)
+                except Exception:  # noqa: BLE001 — best-effort pointer fix
+                    pass
+            self._cred = cred
+        else:
+            # Fall back to whatever is active (may be blocked / expired); complete_ex
+            # will surface a clear multi-account error if nothing works.
+            self._cred = sub_auth.load_credential(PROVIDER_ID)
         self.base_url = API_BASE_URL
 
     # ── Auth flows ───────────────────────────────────────────────────────────
@@ -533,6 +707,11 @@ class XAISubProvider(Provider):
                 else:
                     cred["display_name"] = "Grok"
         sub_auth.save_credential(PROVIDER_ID, cred)
+        # Fresh tokens mean this account is usable again.
+        aid = _cred_account_id(cred) or account_id
+        if aid:
+            with _account_block_lock:
+                _blocked_accounts.pop(str(aid), None)
         self._cred = cred
         return cred
 
@@ -547,7 +726,8 @@ class XAISubProvider(Provider):
             self._cred.get("token_endpoint")
             or XAI_OAUTH_TOKEN_URL_FALLBACK
         )
-        log.info("xai oauth: refresh via %s", endpoint)
+        aid = _cred_account_id(self._cred)
+        log.info("xai oauth: refresh via %s (account=%s)", endpoint, (aid or "")[:12])
         try:
             resp = sub_auth.post_form(
                 endpoint,
@@ -563,13 +743,22 @@ class XAISubProvider(Provider):
             body = exc.read().decode("utf-8", errors="replace")[:400]
             if exc.code == 403:
                 log.error("xai oauth: refresh 403-tier: %s", body)
+                mark_account_blocked(aid, reason=f"refresh 403: {body[:80]}")
                 raise XaiTierDeniedError(body) from exc
             if exc.code in (400, 401):
                 log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
+                mark_account_blocked(
+                    aid, seconds=5 * 60, reason=f"refresh {exc.code}"
+                )
                 raise RuntimeError(
                     "xAI OAuth refresh failed — re-authenticate via "
                     "Settings → Sign in with xAI. "
                     f"(HTTP {exc.code}: {body})"
+                ) from exc
+            if exc.code == 429:
+                mark_account_blocked(aid, seconds=5 * 60, reason="refresh 429")
+                raise RuntimeError(
+                    f"xAI token refresh rate-limited (HTTP 429): {body}"
                 ) from exc
             log.error("xai oauth: refresh failed HTTP %s: %s", exc.code, body)
             raise RuntimeError(
@@ -578,18 +767,90 @@ class XAISubProvider(Provider):
         resp.setdefault("refresh_token", self._cred["refresh_token"])
         return self._store_tokens(resp, token_endpoint=endpoint)
 
+    def _bind_account(self, account_id: str, cred: dict) -> None:
+        """Switch in-memory + store active account to *account_id*/*cred*."""
+        self._cred = dict(cred)
+        if not self._cred.get("account_id"):
+            self._cred["account_id"] = account_id
+        try:
+            if sub_auth.get_active_account_id(PROVIDER_ID) != account_id:
+                sub_auth.set_active_account(PROVIDER_ID, account_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _ensure_auth(self) -> None:
-        if not self._cred:
-            raise RuntimeError(
-                "Not logged in to xAI subscription. "
-                "Run login() first (Settings → Sign in with xAI)."
-            )
-        if sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
+        """Ensure *self._cred* is present and not expired (refresh if needed).
+
+        On cold restore / multi-account, prefers a non-blocked signed-in account
+        over a soft-blocked active pointer. Refresh failures that look
+        per-account (403/429) rotate before giving up.
+        """
+        if not self._cred or not _has_usable_tokens(self._cred):
+            picked = pick_usable_account()
+            if picked is None:
+                raise RuntimeError(
+                    "Not logged in to xAI subscription. "
+                    "Run login() first (Settings → Sign in with xAI)."
+                )
+            self._bind_account(picked[0], picked[1])
+        elif is_account_blocked(_cred_account_id(self._cred)):
+            # Active account soft-blocked — rotate before the request.
+            picked = pick_usable_account(prefer=None)
+            if picked is None:
+                raise RuntimeError(
+                    "All signed-in xAI accounts are temporarily blocked "
+                    "(tier-gate 403 or rate-limit 429). Sign in another SuperGrok "
+                    "account or wait and retry. Hint: " + TIER_DENIED_HINT
+                )
+            self._bind_account(picked[0], picked[1])
+
+        if not sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
+            return
+
+        try:
             self.refresh()
+            return
+        except Exception as exc:  # noqa: BLE001
+            if not _is_rotatable_account_error(exc):
+                raise
+            failed = _cred_account_id(self._cred)
+            mark_account_blocked(failed, reason=f"ensure_auth refresh: {exc}"[:120])
+            if not self._activate_next_account(failed_id=failed):
+                raise
+
+    def _activate_next_account(self, *, failed_id: str | None) -> bool:
+        """Mark *failed_id* blocked and switch to the next candidate. True if switched."""
+        if failed_id:
+            mark_account_blocked(failed_id, reason="complete_ex rotate")
+        for aid, cred in list_candidate_accounts(include_blocked=False):
+            if failed_id and aid == failed_id:
+                continue
+            log.info(
+                "xai_sub: rotating account %s → %s after per-account failure",
+                (failed_id or "?")[:12], aid[:12],
+            )
+            self._bind_account(aid, cred)
+            try:
+                if sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
+                    self.refresh()
+            except Exception as exc:  # noqa: BLE001 — try next account
+                log.warning(
+                    "xai_sub: refresh on rotated account %s failed: %s",
+                    aid[:12], exc,
+                )
+                mark_account_blocked(aid, reason=f"rotate-refresh: {exc}"[:120])
+                continue
+            return True
+        return False
 
     # ── Request helpers ──────────────────────────────────────────────────────
 
     def _headers(self) -> dict:
+        if not self._cred or not self._cred.get("access_token"):
+            raise RuntimeError(
+                "Not logged in to xAI subscription. "
+                "Run login() first (Settings → Sign in with xAI)."
+            )
         return {
             "Authorization": f"Bearer {self._cred['access_token']}",
             "Content-Type": "application/json",
@@ -633,37 +894,30 @@ class XAISubProvider(Provider):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
+            # Attach status for rotation classifiers (urllib HTTPError has .code).
             if exc.code == 401:
-                raise  # caller refreshes + retries
+                raise  # caller refreshes + retries same account
             if exc.code == 403:
                 raise XaiTierDeniedError(body_excerpt) from exc
+            if exc.code == 429:
+                err = RuntimeError(
+                    f"POST {CHAT_COMPLETIONS_URL} returned HTTP 429: {body_excerpt}"
+                )
+                err.status_code = 429  # type: ignore[attr-defined]
+                raise err from exc
             raise RuntimeError(
                 f"POST {CHAT_COMPLETIONS_URL} returned HTTP {exc.code}: "
                 f"{body_excerpt}"
             ) from exc
 
-    # ── Completion ───────────────────────────────────────────────────────────
-
-    def complete_ex(
+    def _complete_once_with_retries(
         self,
-        system: str,
-        messages: list[dict],
-        max_tokens: int = 8000,
-    ) -> tuple[str, str]:
-        self._ensure_auth()
-        msgs = [{"role": "system", "content": system}]
-        for m in messages:
-            msgs.append(self._message(m["role"], m["content"]))
-        body = {
-            "model": self.model,
-            "messages": msgs,
-            "max_tokens": max_tokens,
-        }
-        # Bound concurrent sibling DL calls (mega-2 timeout storm under fan-out).
-        # mega-5: record queue_wait + occupancy so timeouts can be attributed to
-        # serialization vs remote load; one bounded retry on read timeout.
+        body: dict,
+        *,
+        attempts: int,
+    ) -> dict:
+        """POST chat completions for the CURRENT account with timeout/401 retries."""
         sem = _request_semaphore()
-        attempts = 1 + _read_timeout_retries()
         last_exc: BaseException | None = None
         resp: dict | None = None
         for attempt in range(attempts):
@@ -694,10 +948,24 @@ class XAISubProvider(Provider):
                     break
                 except urllib.error.HTTPError as exc:
                     if exc.code != 401:
-                        body_excerpt = exc.read().decode(
-                            "utf-8", errors="replace")[:400]
+                        # _post_once already re-raises non-401 as RuntimeError /
+                        # XaiTierDeniedError; this path is defensive if a bare
+                        # HTTPError bubbles (e.g. tests monkeypatch).
+                        body_excerpt = ""
+                        try:
+                            body_excerpt = exc.read().decode(
+                                "utf-8", errors="replace")[:400]
+                        except Exception:  # noqa: BLE001
+                            body_excerpt = str(exc)
                         if exc.code == 403:
                             raise XaiTierDeniedError(body_excerpt) from exc
+                        if exc.code == 429:
+                            err = RuntimeError(
+                                f"POST {CHAT_COMPLETIONS_URL} returned HTTP "
+                                f"429: {body_excerpt}"
+                            )
+                            err.status_code = 429  # type: ignore[attr-defined]
+                            raise err from exc
                         raise RuntimeError(
                             f"POST {CHAT_COMPLETIONS_URL} returned HTTP "
                             f"{exc.code}: {body_excerpt}"
@@ -709,6 +977,8 @@ class XAISubProvider(Provider):
                         break
                     except Exception as exc2:  # noqa: BLE001
                         last_exc = exc2
+                        if _is_rotatable_account_error(exc2):
+                            raise
                         if not _is_read_timeout(exc2) or attempt + 1 >= attempts:
                             raise
                         log.warning(
@@ -718,6 +988,8 @@ class XAISubProvider(Provider):
                         continue
                 except Exception as exc:  # noqa: BLE001 — retry only read timeouts
                     last_exc = exc
+                    if _is_rotatable_account_error(exc):
+                        raise
                     if not _is_read_timeout(exc) or attempt + 1 >= attempts:
                         raise
                     log.warning(
@@ -731,6 +1003,73 @@ class XAISubProvider(Provider):
                         _sem_in_flight = max(0, _sem_in_flight - 1)
                     sem.release()
         if last_exc is not None:
+            raise last_exc
+        if resp is None:
+            raise RuntimeError("xAI complete_ex produced no response")
+        return resp
+
+    # ── Completion ───────────────────────────────────────────────────────────
+
+    def complete_ex(
+        self,
+        system: str,
+        messages: list[dict],
+        max_tokens: int = 8000,
+    ) -> tuple[str, str]:
+        self._ensure_auth()
+        msgs = [{"role": "system", "content": system}]
+        for m in messages:
+            msgs.append(self._message(m["role"], m["content"]))
+        # Normalize stale hyphen model ids (catalog / gym) to dotted API id.
+        model = str(self.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        if model == "grok-4-5":
+            model = "grok-4.5"
+            self.model = model
+        body = {
+            "model": model,
+            "messages": msgs,
+            "max_tokens": max_tokens,
+        }
+        # Bound concurrent sibling DL calls (mega-2 timeout storm under fan-out).
+        # mega-5: record queue_wait + occupancy so timeouts can be attributed to
+        # serialization vs remote load; one bounded retry on read timeout.
+        # Multi-account: on per-account 403/429 fall through to the next signed-in
+        # account before failing the provider.
+        attempts = 1 + _read_timeout_retries()
+        tried: list[str] = []
+        last_exc: BaseException | None = None
+        resp: dict | None = None
+        max_account_hops = max(1, len(list_candidate_accounts(include_blocked=True)) or 1)
+
+        for _hop in range(max_account_hops):
+            aid = _cred_account_id(self._cred) or sub_auth.get_active_account_id(PROVIDER_ID) or "?"
+            if aid not in tried:
+                tried.append(str(aid))
+            try:
+                resp = self._complete_once_with_retries(body, attempts=attempts)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if not _is_rotatable_account_error(exc):
+                    raise
+                mark_account_blocked(
+                    aid,
+                    seconds=5 * 60 if _is_rate_limit_error(exc) else None,
+                    reason=str(exc)[:120],
+                )
+                if not self._activate_next_account(failed_id=str(aid) if aid != "?" else None):
+                    break
+                continue
+
+        if last_exc is not None and resp is None:
+            if _is_rotatable_account_error(last_exc):
+                n = len(tried)
+                detail = str(last_exc)
+                raise XaiTierDeniedError(
+                    f"all {n} signed-in account(s) failed "
+                    f"(tried {', '.join(t[:8] for t in tried)}): {detail}"
+                ) from last_exc
             raise last_exc
         if resp is None:
             raise RuntimeError("xAI complete_ex produced no response")

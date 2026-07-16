@@ -922,3 +922,155 @@ def test_cpp_settings_allowlist_merge_preserves_subscription_store(tmp_config):
     round_trip = json.loads(tmp_config.read_text())
     assert round_trip["subscription_auth"] == fixture["subscription_auth"]
     assert round_trip["plm"] == {"server": "keep.example"}
+
+
+# ── xAI multi-account rotation + usable gate ─────────────────────────────────
+
+
+def test_xai_provider_usable_with_stored_credentials(tmp_config):
+    """Signed-in xAI credentials make the provider usable (cold restore)."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    assert xsp.provider_is_usable() is False
+    assert sl.status()["xai"]["connected"] is False
+    assert sl.status()["xai"].get("usable") is False
+
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok",
+        "refresh_token": "rt",
+        "account_id": "acct-a",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+    }, account_id="acct-a")
+
+    assert xsp.provider_is_usable() is True
+    st = sl.status()["xai"]
+    assert st["connected"] is True
+    assert st["usable"] is True
+    p = xsp.XAISubProvider()
+    assert p.model == "grok-4.5"
+    assert p._cred["access_token"] == "tok"
+
+
+def test_xai_pick_skips_blocked_account(tmp_config):
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-a", "refresh_token": "r-a",
+        "account_id": "a", "expires_at_ms": now,
+    }, account_id="a", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-b", "refresh_token": "r-b",
+        "account_id": "b", "expires_at_ms": now,
+    }, account_id="b", set_active=False)
+
+    xsp.mark_account_blocked("a", seconds=600, reason="test")
+    picked = xsp.pick_usable_account(prefer="a")
+    assert picked is not None
+    assert picked[0] == "b"
+    assert picked[1]["access_token"] == "tok-b"
+
+    # Constructor also prefers the non-blocked account and flips active.
+    p = xsp.XAISubProvider()
+    assert p._cred["access_token"] == "tok-b"
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "b"
+
+
+def test_xai_complete_ex_rotates_on_tier_denied(tmp_config, monkeypatch):
+    """HTTP 403 on account A falls through to account B before failing."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-a", "refresh_token": "r-a",
+        "account_id": "acct-a", "expires_at_ms": now,
+    }, account_id="acct-a", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-b", "refresh_token": "r-b",
+        "account_id": "acct-b", "expires_at_ms": now,
+    }, account_id="acct-b", set_active=False)
+
+    seen_tokens: list[str] = []
+
+    def fake_post(self, body):
+        tok = (self._cred or {}).get("access_token")
+        seen_tokens.append(tok)
+        if tok == "tok-a":
+            raise xsp.XaiTierDeniedError('{"code":"personal-team-blocked:spending-limit"}')
+        return {
+            "choices": [{"message": {"content": "ok-from-b", "reasoning_content": ""}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
+    # Avoid real refresh paths if anything looks expired.
+    monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+
+    p = xsp.XAISubProvider()
+    # Force start on blocked-path account A.
+    p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    sub_auth.set_active_account(xsp.PROVIDER_ID, "acct-a")
+
+    content, _thinking = p.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    assert content == "ok-from-b"
+    assert "tok-a" in seen_tokens
+    assert "tok-b" in seen_tokens
+    assert xsp.is_account_blocked("acct-a") is True
+    assert sub_auth.get_active_account_id(xsp.PROVIDER_ID) == "acct-b"
+    assert p.model == "grok-4.5"
+
+
+def test_xai_complete_ex_all_accounts_403_clear_error(tmp_config, monkeypatch):
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    for aid, tok in (("a", "t1"), ("b", "t2")):
+        sub_auth.save_credential(xsp.PROVIDER_ID, {
+            "access_token": tok, "refresh_token": f"r-{aid}",
+            "account_id": aid, "expires_at_ms": now,
+        }, account_id=aid)
+
+    def always_403(self, body):
+        raise xsp.XaiTierDeniedError("spending-limit")
+
+    monkeypatch.setattr(xsp.XAISubProvider, "_post_once", always_403)
+    monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+
+    p = xsp.XAISubProvider()
+    with pytest.raises(xsp.XaiTierDeniedError) as ei:
+        p.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    msg = str(ei.value)
+    assert "all 2 signed-in account" in msg or "signed-in account" in msg
+    assert "console.x.ai" in msg or "Hint" in msg
+    assert "traceback" not in msg.lower()
+
+
+def test_xai_model_hyphen_normalized_in_request_body(tmp_config, monkeypatch):
+    """grok-4-5 (gym/hyphen form) is rewritten to dotted API id grok-4.5."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok", "refresh_token": "rt",
+        "account_id": "a",
+        "expires_at_ms": int(time.time() * 1000) + 10 ** 9,
+    }, account_id="a")
+
+    captured = {}
+
+    def fake_post(self, body):
+        captured["body"] = body
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
+    monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+
+    p = xsp.XAISubProvider(model="grok-4-5")
+    out, _ = p.complete_ex("s", [{"role": "user", "content": "x"}])
+    assert out == "ok"
+    assert captured["body"]["model"] == "grok-4.5"
+    assert p.model == "grok-4.5"

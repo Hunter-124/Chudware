@@ -168,14 +168,23 @@ def status() -> dict:
     Backward-compatible shape: top-level fields describe the ACTIVE account.
     Also includes ``accounts`` (list of named accounts with active flags).
     Optional identity fields (display_name, plan) from §4.5 when known.
+    ``usable`` is True when at least one signed-in account has tokens (xAI
+    multi-account may still rotate off a soft-blocked active pointer).
     """
     out: dict[str, dict] = {}
     for friendly, (_name, cred_id, label) in _PROVIDERS.items():
         cred = sub_auth.load_credential(cred_id)  # active account
         accts = sub_auth.list_accounts(cred_id)
+        connected = bool(cred) and bool(
+            (cred or {}).get("access_token") or (cred or {}).get("refresh_token")
+        )
+        # Connected if ANY account has tokens (not only the active pointer).
+        if not connected and accts:
+            connected = True
         entry = {
             "label": label,
-            "connected": bool(cred),
+            "connected": connected,
+            "usable": connected,
             "email": (cred or {}).get("email"),
             "account_id": (cred or {}).get("account_id") or sub_auth.get_active_account_id(cred_id),
             "expires_at_ms": (cred or {}).get("expires_at_ms"),
@@ -186,6 +195,15 @@ def status() -> dict:
                 entry["display_name"] = cred.get("display_name")
             if cred.get("plan"):
                 entry["plan"] = cred.get("plan")
+        if friendly == "xai":
+            try:
+                from .xai_sub_provider import provider_is_usable
+                entry["usable"] = bool(provider_is_usable())
+                # Keep connected true whenever store has any account, even if
+                # all are soft-blocked (user is still signed in).
+                entry["connected"] = entry["usable"] or bool(accts)
+            except Exception:
+                pass
         out[friendly] = entry
     return out
 

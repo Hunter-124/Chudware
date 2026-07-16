@@ -141,11 +141,59 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
                     pass           # keep the default provider, untagged (adapter None)
     except Exception:  # noqa: BLE001 — routing is optional; never break the design loop
         pass
-    run = loop.run_turn(session, request, provider,
-                        on_event=emit_event, max_iters=max_iters,
-                        plan_first=bool(plan),
-                        context_refs=params.get("context_refs"))
-    return asdict(run)
+    try:
+        run = loop.run_turn(session, request, provider,
+                            on_event=emit_event, max_iters=max_iters,
+                            plan_first=bool(plan),
+                            context_refs=params.get("context_refs"))
+    except Exception as e:  # noqa: BLE001 — never swallow the cause for the GUI
+        log.error("agent_design failed: %s\n%s", e, traceback.format_exc())
+        try:
+            from services.agent.agent_turn import (  # noqa: PLC0415
+                classify_provider_error,
+                format_provider_error_detail,
+            )
+            stop_reason, _ = classify_provider_error(e)
+            if stop_reason == "failed":
+                stop_reason = "provider_error"
+            detail = format_provider_error_detail(e, provider)
+        except Exception:  # noqa: BLE001
+            stop_reason = "provider_error"
+            detail = f"{type(e).__name__}: {e}"[:300]
+        try:
+            emit_event({
+                "kind": "status",
+                "phase": "error",
+                "text": detail,
+                "stop_reason": stop_reason,
+                "error_detail": detail,
+                "converged": False,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "request": request,
+            "success": False,
+            "iterations": 0,
+            "final_code": None,
+            "result": None,
+            "contact_sheet": None,
+            "out_dir": "",
+            "session_id": session_id,
+            "turn": getattr(session, "turns", 0) + 1,
+            "log": [],
+            "is_assembly": False,
+            "fit": None,
+            "converged": False,
+            "stop_reason": stop_reason,
+            "error_detail": detail,
+            "plan": getattr(session, "plan", None),
+        }
+    result = asdict(run)
+    # Ensure early-stop fields always present on the RPC result (additive).
+    result.setdefault("stop_reason", getattr(run, "stop_reason", "") or "")
+    result.setdefault("error_detail", getattr(run, "error_detail", "") or "")
+    return result
 
 
 def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
@@ -414,6 +462,7 @@ def serve() -> None:
             result = fn(req.get("params") or {}, emit_event)
             _emit({"id": rid, "ok": True, "result": result})
         except Exception as e:  # noqa: BLE001
+            log.error("method %s failed: %s\n%s", method, e, traceback.format_exc())
             if method in _STRUCTURED_ERROR_METHODS:
                 # Structured envelope {code, message, detail}. The surviving structured-error
                 # surfaces (ECAD, vendor) raise their own OpError exposing to_envelope(); duck-type

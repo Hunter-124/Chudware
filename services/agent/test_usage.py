@@ -671,3 +671,59 @@ def test_status_fraction_mapping():
     assert usage._status_from_fraction(1.0) == "blocked"
     assert usage._status_from_fraction(None) == "unknown"
     assert usage._status_from_fraction(0.1, limit_reached=True) == "blocked"
+
+
+def test_xai_numeric_jwt_tier_maps_to_plan(tmp_config, monkeypatch):
+    """xAI OAuth JWTs carry tier:1 — map to SuperGrok, not leave plan empty."""
+    token = _jwt({
+        "sub": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+        "tier": 1,
+        "scope": "openid profile email offline_access grok-cli:access api:access",
+    })
+    sub_auth.save_credential("xai-sub", {
+        "access_token": token,
+        "refresh_token": "rt",
+        "account_id": "06dc3359-2d20-4cd7-bd84-8c8db560cd4e",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="06dc3359-2d20-4cd7-bd84-8c8db560cd4e")
+
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_JWT)
+    usage.clear_cache()
+    row = usage.fetch_account_usage(
+        "xai", "06dc3359-2d20-4cd7-bd84-8c8db560cd4e", force=True
+    )
+    assert row["plan"] == "SuperGrok"
+    assert row["display_name"]
+    assert not usage._looks_like_uuid(row["display_name"])
+
+    # Persist path also stores the mapped plan for cold restore.
+    cred = sub_auth.load_credential(
+        "xai-sub", account_id="06dc3359-2d20-4cd7-bd84-8c8db560cd4e"
+    )
+    assert cred.get("plan") == "SuperGrok"
+
+
+def test_xai_last_usage_cold_restore(tmp_config, monkeypatch):
+    """Persisted last_usage restores bars when in-process cache is empty (xAI)."""
+    windows = [
+        {"window": "2h", "label": "Grok web", "used_fraction": 0.0,
+         "resets_at": None, "status": "ok"},
+    ]
+    sub_auth.save_credential("xai-sub", {
+        "access_token": _jwt({"sub": "x1", "tier": 1, "email": "g@x.ai"}),
+        "account_id": "x1",
+        "email": "g@x.ai",
+        "plan": "SuperGrok",
+        "display_name": "g@x.ai",
+        "last_usage": windows,
+        "last_usage_fetched_at": time.time(),
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="x1")
+
+    # Force jwt path; it should still surface last_usage from the credential.
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_JWT)
+    usage.clear_cache()
+    row = usage.fetch_account_usage("xai", "x1", force=True)
+    assert row["usage"], "expected last_usage restored for xAI cold path"
+    assert row["usage"][0]["window"] == "2h"
+    assert row["plan"] == "SuperGrok"

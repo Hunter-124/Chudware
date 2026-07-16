@@ -225,10 +225,17 @@ IconUV getIcon(const char* name, int size) {
     }
 
     if (it == gAtlas.cells.end()) {
+#ifdef __EMSCRIPTEN__
+        // Web atlas ships a subset of desktop tiles; workspace chips (ws_model etc.)
+        // already fall through to procedural TbIcon when valid=false. Don't spam the
+        // browser console with first-time-missing warnings during boot.
+        gWarnedMissing.insert(name);
+#else
         if (gWarnedMissing.find(name) == gWarnedMissing.end()) {
             std::fprintf(stderr, "[icons] unknown icon: '%s' (size %d)\n", name, size);
             gWarnedMissing.insert(name);
         }
+#endif
         out.valid = false;
         out.texId = (ImTextureID)(intptr_t)gAtlas.texPlaceholder;
         out.uv0 = {0, 0};

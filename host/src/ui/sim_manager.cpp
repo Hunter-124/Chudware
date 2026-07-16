@@ -5808,6 +5808,17 @@ void SimManager::probeCaps(AppState& st) {
 }
 
 void SimManager::probeFwStatus(AppState& st) {
+#ifdef __EMSCRIPTEN__
+    // fw_status / fw_projects are Python-worker-only; mark unavailable quietly on web.
+    (void)st;
+    if (fwStatus_ == 0) {
+        fwStatus_ = -1;
+        fwCanEmulate_ = false;
+        fwHint_ = "Firmware emulation is unavailable in the web client";
+        fwsim_.projectsLoaded = true;
+    }
+    return;
+#endif
     if (fwStatus_ != 0 || fwProbeInflight_) return;
     fwProbeInflight_ = true;
     st.rpc.call("fw_status", nlohmann::json::object(),

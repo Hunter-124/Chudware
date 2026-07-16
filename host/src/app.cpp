@@ -1665,18 +1665,17 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
 
                 // Rebuild axisDatumIds. Visibility is driven by hasSolidContent
                 // (viewport_panel / applyDocDrivenVisibility) unless axesUserToggled.
-                // Do NOT permanently hide newly-seen synthetic axes — empty/sketch-only
-                // docs must start with axes VISIBLE (FM eye open). When !axesUserToggled
-                // and the doc has no solid content, erase any residual hide so the FM eye
-                // matches. User-created axis features stay whatever the user left them
-                // only after axesUserToggled.
+                // Empty/sketch-only docs start with axes VISIBLE (FM eye open). Once solid
+                // content exists, EVERY injected axis — default X/Y/Z AND plane-intersection
+                // axis.auto:* — must land in hiddenFeatures so they match the default-axis
+                // hide policy. The old erase-only path left newly-minted auto axes drawn on
+                // solid parts (the dashed RGB clutter after many user planes).
                 std::unordered_set<std::string> prevAxisIds = std::move(st.axisDatumIds);
                 st.axisDatumIds.clear();
                 for (const auto& rd : rds) {
                     if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty()) continue;
                     st.axisDatumIds.insert(rd.id);
                 }
-                // Fresh empty inject: ensure default + synthetic axes are not force-hidden.
                 if (!st.axesUserToggled) {
                     // treeHasSolidContent equivalent: any non-ref feature or assembly component.
                     bool solid = false;
@@ -1697,8 +1696,10 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
                                         if (ty == "sketch" || ty == "sketch3d" ||
                                             ty == "ref_plane" || ty == "ref_axis" ||
                                             ty == "ref_point" || ty == "ref_csys" ||
-                                            ty == "plane" || ty == "axis" || ty == "point" ||
-                                            ty == "coordinate_system")
+                                            ty == "plane" || ty == "datum_plane" ||
+                                            ty == "axis" || ty == "datum_axis" ||
+                                            ty == "point" || ty == "datum_point" ||
+                                            ty == "csys" || ty == "coordinate_system")
                                             continue;
                                         solid = true;
                                         break;
@@ -1707,9 +1708,14 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
                             }
                         }
                     }
-                    if (!solid) {
-                        for (const auto& id : st.axisDatumIds)
-                            st.hiddenFeatures.erase(id);
+                    for (const auto& id : st.axisDatumIds) {
+                        if (solid) st.hiddenFeatures.insert(id);
+                        else       st.hiddenFeatures.erase(id);
+                    }
+                    // Defaults always tracked even if somehow missing from axisDatumIds.
+                    for (const char* def : {"axis.x", "axis.y", "axis.z"}) {
+                        if (solid) st.hiddenFeatures.insert(def);
+                        else       st.hiddenFeatures.erase(def);
                     }
                 }
                 // Rebuild display names when axis set membership changes (or first fill).
@@ -1754,6 +1760,15 @@ WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
     //    incl. ones owned by other modules — they all share this one client.
     //  - DocMirror stale_revision auto-resync — the user's action was discarded; tell them.
     st.worker.setErrorSink([&st](const std::string& method, const std::string& err) {
+#ifdef __EMSCRIPTEN__
+        // Browser backend is daemon-only: Python-worker methods (fw_*, some parts_*, etc.)
+        // hit "worker not started" on every boot probe. Don't toast those — panels already
+        // degrade inline. Real daemon/CAD failures surface via their own call sites.
+        (void)method;
+        if (err.find("worker not started") != std::string::npos ||
+            err.find("WASM: worker pipe") != std::string::npos)
+            return;
+#endif
         st.toast(ui::ToastLevel::Error, "Worker error (" + method + "): " + err);
     });
     st.docMirror.setStaleResyncCallback([&st]() {

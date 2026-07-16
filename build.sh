@@ -81,6 +81,9 @@ build_wasm() {
         staged_names="$staged_names $base"
         echo "[build] staged $base -> $stage/"
     done
+    # coi-serviceworker: cross-origin isolation insurance (registered from shell.html).
+    cp -f "$ROOT/host/wasm/coi-serviceworker.js" "$stage/" 2>/dev/null \
+        && echo "[build] staged coi-serviceworker.js -> $stage/"
     # Prefer the canonical shell name index.html for the static server root.
     if [ -f "$stage/Billet.html" ]; then
         cp -f "$stage/Billet.html" "$stage/index.html"

@@ -95,6 +95,17 @@ static const char* kMcuFamilies[] = {"cortex-m4", "cortex-m0", "cortex-m3", "cor
 
 static void loadStatus(AppState& st, bool force = false) {
     FwState& s = S();
+#ifdef __EMSCRIPTEN__
+    // Python-only firmware doctor is not on the wasm daemon path. Mark quiet-unavailable
+    // so the rail shows an inline note instead of Worker error toasts.
+    (void)st; (void)force;
+    if (!s.statusLoaded) {
+        s.statusLoaded = true;
+        s.statusErr = "Firmware tooling is unavailable in the web client";
+        s.canBuild = s.canEmulate = s.canFlash = false;
+    }
+    return;
+#endif
     if (!st.workerStarted || s.statusPending) return;
     const double now = ImGui::GetTime();
     if (!force && s.statusLoaded && now - s.lastStatusT < 15.0) return;
@@ -143,6 +154,15 @@ static void loadStatus(AppState& st, bool force = false) {
 
 static void loadProjects(AppState& st, bool force = false) {
     FwState& s = S();
+#ifdef __EMSCRIPTEN__
+    // fw_projects lives on the Python worker only — never auto-poll under wasm.
+    (void)st; (void)force;
+    if (!s.listedOnce) {
+        s.listedOnce = true;
+        s.listErr = "Firmware projects are unavailable in the web client";
+    }
+    return;
+#endif
     if (!st.workerStarted || s.listPending) return;
     const double now = ImGui::GetTime();
     if (!force && s.listedOnce && now - s.lastListT < 4.0) return;
@@ -799,10 +819,16 @@ bool firmwareTabVisible(AppState& st) {
     if (st.activeWorkspace == AppState::Workspace::Firmware) return true;
     // ECAD in play → firmware is the natural next step (T-FIN24 disclosure rule).
     if (st.activeWorkspace == AppState::Workspace::Electronics) return true;
+#ifdef __EMSCRIPTEN__
+    // No Python worker on web: never probe fw_projects for tab disclosure.
+    (void)st;
+    return false;
+#else
     firmware::FwState& s = firmware::S();
     // Kick the throttled async listing so existing projects disclose the tab at startup.
     firmware::loadProjects(st);
     return s.listedOnce && !s.projects.empty();
+#endif
 }
 
 }  // namespace ui

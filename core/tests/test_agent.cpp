@@ -34,19 +34,85 @@ TEST_CASE("base url normalization") {
     CHECK(openai_normalize_base_url("localhost:1234") == "localhost:1234");
 }
 
-TEST_CASE("anthropic body shape") {
+TEST_CASE("anthropic body shape is model-aware") {
     json messages = json::array();
     messages.push_back(user_message(json::array({text_part("hello")})));
-    BuiltRequest r = anthropic_build_request("claude-opus-4-8", "sys", messages, 8000);
-    CHECK(r.url == "https://api.anthropic.com/v1/messages");
-    CHECK(r.body_json["model"] == "claude-opus-4-8");
-    CHECK(r.body_json["max_tokens"] == 8000);
-    CHECK(r.body_json["system"] == "sys");
-    CHECK(r.body_json["thinking"]["type"] == "adaptive");
-    CHECK(r.body_json["output_config"]["effort"] == "high");
-    CHECK(r.body_json["messages"][0]["role"] == "user");
-    CHECK(r.body_json["messages"][0]["content"][0]["type"] == "text");
-    CHECK(r.body_json["messages"][0]["content"][0]["text"] == "hello");
+
+    // Default / adaptive (opus-4-8): thinking adaptive + effort (default high).
+    {
+        BuiltRequest r = anthropic_build_request("claude-opus-4-8", "sys", messages, 8000);
+        CHECK(r.url == "https://api.anthropic.com/v1/messages");
+        CHECK(r.body_json["model"] == "claude-opus-4-8");
+        CHECK(r.body_json["max_tokens"] == 8000);
+        CHECK(r.body_json["system"] == "sys");
+        CHECK(r.body_json["thinking"]["type"] == "adaptive");
+        CHECK(r.body_json["output_config"]["effort"] == "high");
+        CHECK(r.body_json["messages"][0]["role"] == "user");
+        CHECK(r.body_json["messages"][0]["content"][0]["type"] == "text");
+        CHECK(r.body_json["messages"][0]["content"][0]["text"] == "hello");
+        // effort beta header only when output_config.effort is present.
+        bool has_beta = false;
+        for (const auto& h : r.headers)
+            if (h.first == "anthropic-beta" && h.second == "effort-2025-11-24") has_beta = true;
+        CHECK(has_beta);
+    }
+
+    // Sonnet 4.5: budget_tokens ONLY — no output_config.effort (API 400s it).
+    {
+        BuiltRequest r =
+            anthropic_build_request("claude-sonnet-4-5-20250929", "sys", messages, 8000, "medium");
+        CHECK(anthropic_thinking_mode_for_model("claude-sonnet-4-5-20250929") == "budget");
+        CHECK(r.body_json["thinking"]["type"] == "enabled");
+        CHECK(r.body_json["thinking"]["budget_tokens"] == 4096);
+        CHECK_FALSE(r.body_json.contains("output_config"));
+        bool has_beta = false;
+        for (const auto& h : r.headers)
+            if (h.first == "anthropic-beta") has_beta = true;
+        CHECK_FALSE(has_beta);
+    }
+
+    // Haiku 4.5: same budget-only path.
+    {
+        BuiltRequest r =
+            anthropic_build_request("claude-haiku-4-5", "sys", messages, 8000, "low");
+        CHECK(anthropic_thinking_mode_for_model("claude-haiku-4-5") == "budget");
+        CHECK(r.body_json["thinking"]["type"] == "enabled");
+        CHECK(r.body_json["thinking"]["budget_tokens"] == 1024);
+        CHECK_FALSE(r.body_json.contains("output_config"));
+    }
+
+    // Opus 4.5: budget_tokens + effort.
+    {
+        BuiltRequest r =
+            anthropic_build_request("claude-opus-4-5", "sys", messages, 8000, "high");
+        CHECK(anthropic_thinking_mode_for_model("claude-opus-4-5") == "budget_effort");
+        CHECK(r.body_json["thinking"]["type"] == "enabled");
+        CHECK(r.body_json["thinking"].contains("budget_tokens"));
+        CHECK(r.body_json["output_config"]["effort"] == "high");
+        bool has_beta = false;
+        for (const auto& h : r.headers)
+            if (h.first == "anthropic-beta" && h.second == "effort-2025-11-24") has_beta = true;
+        CHECK(has_beta);
+    }
+
+    // Adaptive honors reasoning_effort (not pinned high).
+    {
+        BuiltRequest r =
+            anthropic_build_request("claude-sonnet-5", "sys", messages, 8000, "low");
+        CHECK(anthropic_thinking_mode_for_model("claude-sonnet-5") == "adaptive");
+        CHECK(r.body_json["thinking"]["type"] == "adaptive");
+        CHECK(r.body_json["output_config"]["effort"] == "low");
+    }
+}
+
+TEST_CASE("concise_http_error: non-429 extracts error.message") {
+    std::string body =
+        R"({"type":"error","error":{"type":"invalid_request_error","message":"This model does not support the effort parameter"}})";
+    std::string e = concise_http_error("anthropic", 400, body);
+    CHECK(e.find("HTTP 400") != std::string::npos);
+    CHECK(e.find("effort parameter") != std::string::npos);
+    // Not a raw JSON dump of the whole body on the last line.
+    CHECK(e.find("invalid_request_error") == std::string::npos);
 }
 
 TEST_CASE("concise_http_error: 429 quota becomes one actionable line") {

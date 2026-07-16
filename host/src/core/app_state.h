@@ -997,6 +997,17 @@ struct AppState {
     // out of the reference-overlay draw immediately. Call after an eye toggle, a tab switch, and
     // every datum rebuild (the datum geometry is otherwise re-pushed only on a document mutation).
     void applyDatumVisibility();
+    // W2-ref: rebuild axisDisplayNames for defaults + auto plane-intersection axes + user
+    // axis features. Auto axes use "<UserPlane> <letter> Axis" (Front→X, Right→Y, Top→Z).
+    // Call from FeatureManager (or after inject) so FM labels stay correct even when the
+    // inject path still seeds the legacy "Axis A ∩ B" string into axisAutoCache.
+    void rebuildAxisDisplayNames(const nlohmann::json& tree);
+    // Pure helper: display name for a plane-pair auto axis (id form axis.auto:<a>|<b>).
+    // planeNameById supplies feature/reserved display names; missing ids fall back to the id.
+    static std::string formatAutoAxisDisplayName(
+        const std::string& planeIdA, const std::string& planeIdB,
+        const std::unordered_map<std::string, std::string>& planeNameById);
+
 
     // ---- Wave-2 shared UI state (cross-panel contracts; each field has one writer + one reader) ----
     // True while SketchMode runs the SolidWorks-style "pick a plane to start the sketch" step.

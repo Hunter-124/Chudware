@@ -478,6 +478,64 @@ def test_no_code_and_budget_carry_error_detail():
     assert "call" in budget.result["error_detail"].lower()
 
 
+def test_provider_raises_not_budget_exhausted():
+    """A provider exception must surface as provider_error with real detail.
+
+    Regression: instant API failures (e.g. invalid Anthropic effort body) were
+    counted as stage retries and shown as 'budget exhausted (N)' on phase cards.
+    """
+    class Boom(Exception):
+        status_code = 400
+        body = {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "This model does not support the effort parameter.",
+            },
+        }
+
+    class Prov:
+        name = "anthropic"
+
+        def complete(self, system, messages, max_tokens=8000):
+            raise Boom(
+                "Error code: 400 - {'type': 'error', 'error': "
+                "{'type': 'invalid_request_error', "
+                "'message': 'This model does not support the effort parameter.'}}"
+            )
+
+    res = agent_turn.run_turn(
+        "make a 48tooth sprocket", Prov(),
+        tool_dispatch=lambda t, a: {},
+        max_tool_calls=4,
+    )
+    assert res.success is False
+    # Non-retryable 400 → provider_auth (or provider_error); never max_iters/budget.
+    assert res.stop_reason in ("provider_auth", "provider_error"), res.stop_reason
+    assert res.stop_reason != "max_iters"
+    detail = (res.result.get("error_detail") or "").lower()
+    assert "budget exhausted" not in detail
+    assert "effort" in detail or "400" in detail or "anthropic" in detail
+    assert res.result.get("error_detail")
+
+
+def test_tool_budget_path_names_tool_call_budget():
+    """Genuine tool-budget exhaustion still names the tool-call budget + limit."""
+    budget = agent_turn.run_turn(
+        "loop",
+        _ScriptedProvider(
+            ['```json\n{"tool": "measure_part", "args": {}}\n```'] * 20),
+        allowed_tools=["measure_part"],
+        max_tool_calls=3,
+        tool_dispatch=lambda t, a: {"ok": True},
+    )
+    assert budget.stop_reason == "max_iters"
+    detail = budget.result.get("error_detail") or ""
+    assert "tool-call budget" in detail.lower()
+    assert "3" in detail  # limit visible
+    assert "budget exhausted" in detail.lower()
+
+
 def test_scrub_secrets_redacts_keys():
     raw = (
         "Authorization: Bearer sk-ant-xyzdeadbeef01 and "

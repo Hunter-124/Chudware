@@ -1,12 +1,15 @@
 // core/agent/providers.cpp — C++ port of agent/providers/*.py (see providers.h).
 #include "agent/providers.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "agent/http.h"
@@ -101,22 +104,294 @@ json anthropic_block(const json& part) {
     };
 }
 
+namespace {
+
+// Lowercase copy (ASCII).
+std::string lower_copy(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Strip provider / date / bedrock prefixes so model ids parse cleanly.
+std::string normalize_claude_model_id(std::string m) {
+    m = lower_copy(std::move(m));
+    // Trim.
+    auto a = m.find_first_not_of(" \t\r\n");
+    auto b = m.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    m = m.substr(a, b - a + 1);
+    // Keep only the last path segment (provider/model).
+    auto slash = m.find_last_of('/');
+    if (slash != std::string::npos) m = m.substr(slash + 1);
+    // anthropic. / au.anthropic. / eu.anthropic. bedrock-style prefixes.
+    const char* prefs[] = {"anthropic.", "au.anthropic.", "eu.anthropic."};
+    for (const char* p : prefs) {
+        size_t n = std::char_traits<char>::length(p);
+        if (m.size() >= n && m.compare(0, n, p) == 0) {
+            m = m.substr(n);
+            break;
+        }
+    }
+    // Drop trailing -vN:M (bedrock version suffix).
+    auto vpos = m.rfind("-v");
+    if (vpos != std::string::npos) {
+        bool ok = true;
+        size_t i = vpos + 2;
+        if (i >= m.size() || !std::isdigit(static_cast<unsigned char>(m[i]))) ok = false;
+        while (ok && i < m.size() && std::isdigit(static_cast<unsigned char>(m[i]))) ++i;
+        if (ok && i < m.size() && m[i] == ':') {
+            ++i;
+            if (i >= m.size() || !std::isdigit(static_cast<unsigned char>(m[i]))) ok = false;
+            while (ok && i < m.size() && std::isdigit(static_cast<unsigned char>(m[i]))) ++i;
+            if (ok && i == m.size()) m = m.substr(0, vpos);
+        }
+    }
+    // Drop trailing YYYYMMDD date stamps so they never become "major".
+    if (m.size() > 9 && m[m.size() - 9] == '-') {
+        bool digits = true;
+        for (size_t i = m.size() - 8; i < m.size(); ++i)
+            if (!std::isdigit(static_cast<unsigned char>(m[i]))) {
+                digits = false;
+                break;
+            }
+        if (digits) m = m.substr(0, m.size() - 9);
+    }
+    return m;
+}
+
+// Parse "kind" + version tuple from a Claude model id.
+// kind: opus|sonnet|haiku|fable|mythos|other
+// version: e.g. (4,5), (4,8), (5,) — empty when unknown.
+struct ClaudeModelId {
+    std::string kind;
+    int major = -1;
+    int minor = -1;  // -1 = absent
+};
+
+bool extract_version_after(const std::string& m, size_t pos, int* major, int* minor) {
+    // pos points at first digit of major.
+    if (pos >= m.size() || !std::isdigit(static_cast<unsigned char>(m[pos]))) return false;
+    size_t i = pos;
+    int maj = 0;
+    while (i < m.size() && std::isdigit(static_cast<unsigned char>(m[i]))) {
+        maj = maj * 10 + (m[i] - '0');
+        ++i;
+    }
+    *major = maj;
+    *minor = -1;
+    if (i < m.size() && (m[i] == '-' || m[i] == '_' || m[i] == '.')) {
+        size_t j = i + 1;
+        if (j < m.size() && std::isdigit(static_cast<unsigned char>(m[j]))) {
+            size_t start = j;
+            int minv = 0;
+            while (j < m.size() && std::isdigit(static_cast<unsigned char>(m[j]))) {
+                minv = minv * 10 + (m[j] - '0');
+                ++j;
+            }
+            // Guard: an 8-digit "minor" is a date that escaped the strip.
+            if ((j - start) < 6) *minor = minv;
+        }
+    }
+    return true;
+}
+
+ClaudeModelId parse_claude_model(const std::string& model) {
+    ClaudeModelId out;
+    out.kind = "other";
+    std::string m = normalize_claude_model_id(model);
+    if (m.empty()) return out;
+
+    const char* kinds[] = {"opus", "sonnet", "haiku", "fable", "mythos"};
+    for (const char* k : kinds) {
+        if (m.find(k) != std::string::npos) {
+            out.kind = k;
+            break;
+        }
+    }
+
+    if (out.kind != "other") {
+        // Legacy: claude-3-5-sonnet / claude-3-opus  →  major before kind.
+        // Look for "claude[-_](\d+)(?:[-_.](\d+))?[-_]<kind>"
+        std::string needle = out.kind;
+        size_t kpos = m.find(needle);
+        // Prefer a match that has digits just before the kind (legacy shape).
+        bool legacy = false;
+        if (kpos != std::string::npos && kpos >= 2) {
+            // Walk back over separator + digits.
+            size_t i = kpos;
+            if (m[i - 1] == '-' || m[i - 1] == '_') {
+                size_t j = i - 1;
+                // optional minor digits
+                size_t dig_end = j;
+                while (j > 0 && std::isdigit(static_cast<unsigned char>(m[j - 1]))) --j;
+                if (j < dig_end) {
+                    // have digits; maybe another separator + major
+                    size_t minor_start = j;
+                    if (j > 0 && (m[j - 1] == '-' || m[j - 1] == '_' || m[j - 1] == '.')) {
+                        size_t j2 = j - 1;
+                        size_t maj_end = j2;
+                        while (j2 > 0 && std::isdigit(static_cast<unsigned char>(m[j2 - 1]))) --j2;
+                        if (j2 < maj_end) {
+                            // legacy with minor: claude-3-5-sonnet
+                            int maj = 0, minv = 0;
+                            for (size_t t = j2; t < maj_end; ++t) maj = maj * 10 + (m[t] - '0');
+                            for (size_t t = minor_start; t < dig_end; ++t)
+                                minv = minv * 10 + (m[t] - '0');
+                            // Require "claude" somewhere before.
+                            if (m.find("claude") != std::string::npos && (dig_end - minor_start) < 6) {
+                                out.major = maj;
+                                out.minor = minv;
+                                legacy = true;
+                            }
+                        }
+                    }
+                    if (!legacy) {
+                        // single version number before kind: claude-3-opus
+                        int maj = 0;
+                        for (size_t t = j; t < dig_end; ++t) maj = maj * 10 + (m[t] - '0');
+                        if (m.find("claude") != std::string::npos) {
+                            out.major = maj;
+                            out.minor = -1;
+                            legacy = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!legacy) {
+            // Modern: claude-sonnet-4-5 / claude-sonnet-5 / claude-opus-4-8
+            // Find kind then digits after separator.
+            size_t p = m.find(out.kind);
+            if (p != std::string::npos) {
+                size_t after = p + out.kind.size();
+                if (after < m.size() && (m[after] == '-' || m[after] == '_')) {
+                    int maj = 0, minv = -1;
+                    if (extract_version_after(m, after + 1, &maj, &minv)) {
+                        out.major = maj;
+                        out.minor = minv;
+                    }
+                }
+            }
+        }
+    }
+
+    if (out.major < 0) {
+        // Fallback: first claude[-_]?N[.N]
+        size_t p = m.find("claude");
+        if (p != std::string::npos) {
+            size_t i = p + 6;
+            if (i < m.size() && (m[i] == '-' || m[i] == '_')) ++i;
+            int maj = 0, minv = -1;
+            if (extract_version_after(m, i, &maj, &minv)) {
+                out.major = maj;
+                out.minor = minv;
+            }
+        }
+    }
+    return out;
+}
+
+std::string normalize_effort(const std::string& raw) {
+    std::string effort = lower_copy(raw.empty() ? "high" : raw);
+    // trim
+    auto a = effort.find_first_not_of(" \t\r\n");
+    auto b = effort.find_last_not_of(" \t\r\n");
+    effort = (a == std::string::npos) ? "" : effort.substr(a, b - a + 1);
+    if (effort == "med") effort = "medium";
+    if (effort == "auto" || effort == "none" || effort == "off" || effort.empty())
+        effort = "high";
+    if (effort != "low" && effort != "medium" && effort != "high" && effort != "max" &&
+        effort != "xhigh")
+        effort = "high";
+    return effort;
+}
+
+int budget_tokens_for(const std::string& effort, int max_tokens) {
+    int want = 4096;
+    if (effort == "low") want = 1024;
+    else if (effort == "medium") want = 4096;
+    else if (effort == "high") want = 8192;
+    else if (effort == "xhigh") want = 16384;
+    else if (effort == "max") want = 24576;
+    int cap = std::max(1, max_tokens - 1);
+    int budget = std::min(want, cap);
+    if (budget < 1024 && cap >= 1024) budget = 1024;
+    return std::max(1, budget);
+}
+
+}  // namespace
+
+std::string anthropic_thinking_mode_for_model(const std::string& model) {
+    ClaudeModelId id = parse_claude_model(model);
+    if (id.kind == "fable" || id.kind == "mythos") return "adaptive";
+    if (id.major < 0) {
+        // Unknown Claude-ish id: prefer adaptive only for clearly modern names.
+        std::string mid = lower_copy(model);
+        const char* adaptive_hints[] = {"opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6",
+                                        "sonnet-4-7", "sonnet-5", "opus-5", "haiku-4-6"};
+        for (const char* h : adaptive_hints)
+            if (mid.find(h) != std::string::npos) return "adaptive";
+        if (mid.find("claude") != std::string::npos) return "budget";
+        return "none";
+    }
+    int major = id.major;
+    int minor = id.minor < 0 ? 0 : id.minor;
+    // Gen 5 (sonnet-5 / opus-5): adaptive.
+    if (major >= 5) return "adaptive";
+    // 4.6+: adaptive for all kinds.
+    if (major == 4 && minor >= 6) return "adaptive";
+    // Opus 4.5: budget_tokens + output_config.effort.
+    if (id.kind == "opus" && major == 4 && minor >= 5) return "budget_effort";
+    // Sonnet/Haiku 4.5 and older: budget_tokens only (effort 400s).
+    if (major >= 3) return "budget";
+    return "none";
+}
+
 BuiltRequest anthropic_build_request(const std::string& model, const std::string& system,
-                                     const json& messages, int max_tokens) {
+                                     const json& messages, int max_tokens,
+                                     const std::string& reasoning_effort) {
     json api_messages = json::array();
     for (const auto& m : messages) {
         json content = json::array();
         for (const auto& p : m.at("content")) content.push_back(anthropic_block(p));
         api_messages.push_back(json{{"role", m.at("role")}, {"content", content}});
     }
+
+    const std::string effort = normalize_effort(reasoning_effort);
+    const std::string mode = anthropic_thinking_mode_for_model(model);
+    int effective_max = max_tokens;
+    bool send_effort = false;
+    std::string wire_effort = effort;
+
     json body = {
         {"model", model},
-        {"max_tokens", max_tokens},
+        {"max_tokens", effective_max},
         {"system", system},
         {"messages", api_messages},
-        {"thinking", {{"type", "adaptive"}}},
-        {"output_config", {{"effort", "high"}}},
     };
+
+    if (mode == "adaptive") {
+        // Adaptive models reject temperature/top_p/budget_tokens; effort rides on output_config.
+        // Map our "xhigh" through as-is (API accepts it).
+        body["thinking"] = json{{"type", "adaptive"}};
+        body["output_config"] = json{{"effort", wire_effort}};
+        send_effort = true;
+    } else if (mode == "budget" || mode == "budget_effort") {
+        int budget = budget_tokens_for(effort, max_tokens);
+        // If the caller's max_tokens is too tight for a real budget, lift it so the
+        // request is legal (budget_tokens must be < max_tokens).
+        if (budget >= effective_max) effective_max = budget + 1024;
+        body["max_tokens"] = effective_max;
+        body["thinking"] = json{{"type", "enabled"}, {"budget_tokens", budget}};
+        if (mode == "budget_effort") {
+            // Opus 4.5: effort alongside budget_tokens. xhigh → max on the wire.
+            if (wire_effort == "xhigh") wire_effort = "max";
+            body["output_config"] = json{{"effort", wire_effort}};
+            send_effort = true;
+        }
+    }
+    // mode == "none": no thinking / effort fields.
+
     BuiltRequest r;
     r.url = "https://api.anthropic.com/v1/messages";
     r.headers = {
@@ -124,6 +399,11 @@ BuiltRequest anthropic_build_request(const std::string& model, const std::string
         {"anthropic-version", "2023-06-01"},
         {"content-type", "application/json"},
     };
+    // omp: output_config.effort requires the effort-2025-11-24 beta header;
+    // without it some endpoints 400 the field even on adaptive-capable models.
+    if (send_effort) {
+        r.headers.push_back({"anthropic-beta", "effort-2025-11-24"});
+    }
     r.body_json = body;
     r.body = body.dump();
     return r;
@@ -436,12 +716,22 @@ HttpResponse http_post_retry(const std::string& url,
 // (which only shows the LAST line — a raw JSON body shows up as a useless "}"). A 429 in particular
 // should tell the user WHAT to do (enable billing / switch to a local model / wait for reset).
 std::string concise_http_error(const std::string& provider, int status, const std::string& body) {
+    // Best-effort: pull human message from {"error":{"message":"..."}} (Anthropic/OpenAI) or
+    // {"error":{"message":"..."}} Gemini shape. Prefer this over a raw JSON body — the run
+    // timeline only shows the last line, so a raw body surfaces as a useless "}".
+    auto extract_msg = [&]() -> std::string {
+        json j = json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) return "";
+        if (j.contains("error") && j["error"].is_object() && j["error"].contains("message") &&
+            j["error"]["message"].is_string())
+            return j["error"]["message"].get<std::string>();
+        if (j.contains("message") && j["message"].is_string())
+            return j["message"].get<std::string>();
+        return "";
+    };
+
     if (status == 429) {
-        std::string msg;
-        json j = json::parse(body, nullptr, false);  // best-effort: pull the human message out
-        if (!j.is_discarded() && j.is_object() && j.contains("error") && j["error"].is_object() &&
-            j["error"].contains("message") && j["error"]["message"].is_string())
-            msg = j["error"]["message"].get<std::string>();
+        std::string msg = extract_msg();
         bool daily = body.find("PerDay") != std::string::npos ||
                      body.find("free_tier") != std::string::npos ||
                      body.find("FreeTier") != std::string::npos;
@@ -457,6 +747,13 @@ std::string concise_http_error(const std::string& provider, int status, const st
             return head + ": " + msg + tail;
         }
         return head + "." + tail;
+    }
+    std::string msg = extract_msg();
+    if (!msg.empty()) {
+        // One clean line: "anthropic HTTP 400: This model does not support the effort parameter"
+        size_t nl = msg.find('\n');
+        if (nl != std::string::npos) msg = msg.substr(0, nl);
+        return provider + " HTTP " + std::to_string(status) + ": " + msg;
     }
     return provider + " HTTP " + std::to_string(status) + ": " + body;
 }
@@ -480,7 +777,10 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     if (provider == "anthropic") {
         std::string model = str_or(cfg, "model", std::string(kAnthropicDefaultModel));
-        BuiltRequest req = anthropic_build_request(model, system, messages, max_tokens);
+        // Honor config/role reasoning_effort (low|medium|high|max|xhigh); empty → high.
+        std::string effort = str_or(cfg, "reasoning_effort");
+        BuiltRequest req =
+            anthropic_build_request(model, system, messages, max_tokens, effort);
         for (auto& h : req.headers)
             if (h.first == "x-api-key") h.second = api_key;
         HttpResponse hr = http_post_retry(req.url, req.headers, req.body);

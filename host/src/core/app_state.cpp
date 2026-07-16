@@ -1675,6 +1675,109 @@ void AppState::applyDatumVisibility() {
     if (renderer) renderer->setHiddenDatums(hiddenFeatures);
 }
 
+// Default-plane → axis letter (Front/X, Right/Y, Top/Z). Empty if not a reserved plane.
+static const char* reservedPlaneAxisLetter(const std::string& planeId) {
+    if (planeId == "plane.front") return "X";
+    if (planeId == "plane.right") return "Y";
+    if (planeId == "plane.top")   return "Z";
+    return nullptr;
+}
+
+static const char* reservedPlaneDisplayName(const std::string& planeId) {
+    if (planeId == "plane.front") return "Front";
+    if (planeId == "plane.top")   return "Top";
+    if (planeId == "plane.right") return "Right";
+    return nullptr;
+}
+
+std::string AppState::formatAutoAxisDisplayName(
+    const std::string& planeIdA, const std::string& planeIdB,
+    const std::unordered_map<std::string, std::string>& planeNameById) {
+    auto nameOf = [&](const std::string& id) -> std::string {
+        auto it = planeNameById.find(id);
+        if (it != planeNameById.end() && !it->second.empty()) return it->second;
+        if (const char* rn = reservedPlaneDisplayName(id)) return rn;
+        return id;
+    };
+    const char* letterA = reservedPlaneAxisLetter(planeIdA);
+    const char* letterB = reservedPlaneAxisLetter(planeIdB);
+    // Prefer the default plane in the pair for the axis letter; the OTHER plane is the user label.
+    if (letterA && !letterB) {
+        return nameOf(planeIdB) + " " + letterA + " Axis";
+    }
+    if (letterB && !letterA) {
+        return nameOf(planeIdA) + " " + letterB + " Axis";
+    }
+    // Both reserved (should not appear as axis.auto) or both user: fall back to a clean pair label.
+    if (letterA && letterB) {
+        // e.g. Front ∩ Top is axis.x already — keep a readable pair name if emitted.
+        return std::string(letterA) + "/" + letterB + " Axis";
+    }
+    return nameOf(planeIdA) + " / " + nameOf(planeIdB) + " Axis";
+}
+
+void AppState::rebuildAxisDisplayNames(const nlohmann::json& tree) {
+    std::unordered_map<std::string, std::string> planeNameById;
+    planeNameById["plane.front"] = "Front";
+    planeNameById["plane.top"]   = "Top";
+    planeNameById["plane.right"] = "Right";
+    if (tree.is_object()) {
+        auto fi = tree.find("features");
+        if (fi != tree.end() && fi->is_array()) {
+            for (const auto& f : *fi) {
+                if (!f.is_object()) continue;
+                const std::string ty = f.value("type", std::string());
+                const std::string id = f.value("id", std::string());
+                if (id.empty()) continue;
+                if (ty == "plane" || ty == "datum_plane" ||
+                    ty == "axis" || ty == "datum_axis" ||
+                    ty == "point" || ty == "datum_point" ||
+                    ty == "csys" || ty == "coordinate_system" ||
+                    ty == "ref_plane" || ty == "ref_axis" ||
+                    ty == "ref_point" || ty == "ref_csys") {
+                    const std::string nm = f.value("name", std::string());
+                    planeNameById[id] = nm.empty() ? id : nm;
+                }
+            }
+        }
+    }
+
+    axisDisplayNames.clear();
+    axisDisplayNames["axis.x"] = "X Axis";
+    axisDisplayNames["axis.y"] = "Y Axis";
+    axisDisplayNames["axis.z"] = "Z Axis";
+
+    // Auto plane-intersection axes from the inject cache (id = axis.auto:<a>|<b>).
+    for (auto& ent : axisAutoCache) {
+        const std::string& id = ent.id;
+        if (id.rfind("axis.auto:", 0) != 0) {
+            if (!ent.name.empty()) axisDisplayNames[id] = ent.name;
+            continue;
+        }
+        const std::string pair = id.substr(std::string("axis.auto:").size());
+        const size_t bar = pair.find('|');
+        if (bar == std::string::npos) {
+            axisDisplayNames[id] = ent.name.empty() ? id : ent.name;
+            continue;
+        }
+        const std::string a = pair.substr(0, bar);
+        const std::string b = pair.substr(bar + 1);
+        ent.name = formatAutoAxisDisplayName(a, b, planeNameById);
+        axisDisplayNames[id] = ent.name;
+    }
+
+    // User-authored axis features (and any other axisDatumIds not already named).
+    for (const auto& id : axisDatumIds) {
+        if (axisDisplayNames.count(id)) continue;
+        auto it = planeNameById.find(id);
+        if (it != planeNameById.end() && !it->second.empty())
+            axisDisplayNames[id] = it->second;
+        else
+            axisDisplayNames[id] = id;
+    }
+}
+
+
 // The three origin planes are renderer-owned overlays rather than datum features in the tree.
 static bool isDefaultPlaneFid(const std::string& fid) {
     return fid == "plane.front" || fid == "plane.top" || fid == "plane.right";

@@ -3290,6 +3290,114 @@ void PropertyManager::drawBody(AppState& st) {
                 const bool textMode = !f.dimExpr.empty() || f.dimTextEntry;
                 if (!textMode) {
                     float v = (float)(f.dimValue * toDisp);
+                    // Value-fraction fill bar / drag track inside the numeric field.
+                    // 0d717a1a ("PM UX + slider fix") fixed Signed() so open-ended dims correctly
+                    // use DragFloat instead of a broken SliderFloat(-1e9..0). That also removed the
+                    // native slider grab/track affordance on fields like plane Offset Distance.
+                    // Restore a theme-colored fill that tracks the value for BOTH bounded sliders
+                    // and open-ended drags, painted under the widget (transparent FrameBg) so
+                    // typing (CTRL+click) + drag still work and the "=" equation button stays.
+                    {
+                        const float Sloc = ui::uiScale;
+                        const ImGuiStyle& stl = ImGui::GetStyle();
+                        const ImVec2 frameMin = ImGui::GetCursorScreenPos();
+                        const float  frameW  = ImGui::CalcItemWidth();
+                        const float  frameH  = ImGui::GetFrameHeight();
+                        const ImVec2 frameMax(frameMin.x + frameW, frameMin.y + frameH);
+                        const float  rnd     = stl.FrameRounding;
+                        ImDrawList*  dl      = ImGui::GetWindowDrawList();
+
+                        // Soft fraction in display units. Bounded = true range; positive open-ended
+                        // grows a soft max with |value|/default/step; Signed (dimMin << 0) is
+                        // zero-centered so negative offsets fill left of mid.
+                        const bool signedOpen = !bounded && f.def->dimMin < -1.0e6;
+                        float t = 0.0f;          // 0..1 (or -1..1 when signedOpen)
+                        float midX = 0.0f, halfW = 0.0f;
+                        if (bounded) {
+                            const float mn = (float)(f.def->dimMin * toDisp);
+                            const float mx = (float)(f.def->dimMax * toDisp);
+                            t = (mx > mn) ? (v - mn) / (mx - mn) : 0.0f;
+                            t = std::max(0.0f, std::min(1.0f, t));
+                        } else if (signedOpen) {
+                            const float defAbs = (float)std::fabs(f.def->dimDefault * toDisp);
+                            const float soft = std::max(std::max(std::fabs(v), defAbs),
+                                                        (float)(step * toDisp) * 16.0f) * 1.5f;
+                            t = (soft > 1e-12f) ? (v / soft) : 0.0f;
+                            t = std::max(-1.0f, std::min(1.0f, t));
+                            midX  = (frameMin.x + frameMax.x) * 0.5f;
+                            halfW = (frameMax.x - frameMin.x) * 0.5f;
+                        } else {
+                            const float mn = (float)(f.def->dimMin * toDisp);
+                            const float defAbs = (float)std::fabs(f.def->dimDefault * toDisp);
+                            const float softMax = std::max(std::max(std::max(v, mn), defAbs),
+                                                           (float)(step * toDisp) * 16.0f) * 1.5f;
+                            t = (softMax > mn) ? (v - mn) / (softMax - mn) : 0.0f;
+                            t = std::max(0.0f, std::min(1.0f, t));
+                        }
+
+                        // Track base (glass tint) — replaces the opaque FrameBg we push transparent.
+                        dl->AddRectFilled(frameMin, frameMax,
+                            ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.18f)), rnd);
+                        // Value fill (accentSoft via palette — theme lint ok).
+                        if (signedOpen) {
+                            const float x0 = (t >= 0.0f) ? midX : (midX + t * halfW);
+                            const float x1 = (t >= 0.0f) ? (midX + t * halfW) : midX;
+                            if (x1 > x0 + 0.5f) {
+                                const ImDrawFlags corners = (t >= 0.0f)
+                                    ? ImDrawFlags_RoundCornersRight
+                                    : ImDrawFlags_RoundCornersLeft;
+                                // Near full-range either side: round both ends of that half.
+                                const ImDrawFlags fl = (std::fabs(t) >= 0.999f)
+                                    ? ImDrawFlags_RoundCornersAll : corners;
+                                dl->AddRectFilled(ImVec2(x0, frameMin.y), ImVec2(x1, frameMax.y),
+                                                  Palette::toU32(pal.accentSoft), rnd, fl);
+                            }
+                            // Zero tick (hairline) so signed direction is readable.
+                            dl->AddLine(ImVec2(midX, frameMin.y + 2.0f * Sloc),
+                                        ImVec2(midX, frameMax.y - 2.0f * Sloc),
+                                        ImGui::ColorConvertFloat4ToU32(
+                                            ImVec4(pal.border[0], pal.border[1], pal.border[2],
+                                                   0.55f)), 1.0f);
+                        } else if (t > 0.001f) {
+                            const float x1 = frameMin.x + (frameMax.x - frameMin.x) * t;
+                            const ImDrawFlags fl = (t >= 0.999f)
+                                ? ImDrawFlags_RoundCornersAll
+                                : ImDrawFlags_RoundCornersLeft;
+                            dl->AddRectFilled(frameMin, ImVec2(x1, frameMax.y),
+                                              Palette::toU32(pal.accentSoft), rnd, fl);
+                        }
+                        // Value-edge tick (draggable-position cue).
+                        {
+                            float tickX;
+                            if (signedOpen) tickX = midX + t * halfW;
+                            else            tickX = frameMin.x + (frameMax.x - frameMin.x) * t;
+                            const float tw = 1.5f * Sloc;
+                            dl->AddRectFilled(ImVec2(tickX - tw, frameMin.y + 2.0f * Sloc),
+                                              ImVec2(tickX + tw, frameMax.y - 2.0f * Sloc),
+                                              Palette::toU32(pal.accent), 1.0f * Sloc);
+                        }
+                        // Subtle track border.
+                        dl->AddRect(frameMin, frameMax,
+                            ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(pal.border[0], pal.border[1], pal.border[2],
+                                       pal.border[3] * 0.65f)),
+                            rnd, 0, 1.0f);
+                    }
+
+                    // Transparent FrameBg so our pre-drawn track/fill is not covered; keep a light
+                    // hover/active wash. Push SliderGrab so bounded sliders still show a knob.
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                        ImVec4(0, 0, 0, 0));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+                        ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.10f));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+                        ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.14f));
+                    ImGui::PushStyleColor(ImGuiCol_SliderGrab,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,
+                        ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1.0f));
+
                     bool widgetEdited;
                     if (bounded) {
                         widgetEdited = ImGui::SliderFloat("##dim", &v,
@@ -3302,6 +3410,7 @@ void PropertyManager::drawBody(AppState& st) {
                                            (float)(f.def->dimMin * toDisp), FLT_MAX,
                                            valFmt, ImGuiSliderFlags_AlwaysClamp);
                     }
+                    ImGui::PopStyleColor(5);
                     if (widgetEdited && enabled && !f.def->comingSoon)
                         commitDim((double)v / toDisp, /*immediate=*/false);
                     if (ImGui::IsItemDeactivatedAfterEdit() && dirty_)

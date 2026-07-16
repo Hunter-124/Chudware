@@ -268,6 +268,12 @@ public:
     // Its normal arrow is drawn only while it's the active edit target — once committed the arrow is
     // dropped so created planes don't carry a persistent normal handle. "" = none.
     void setEditingDatumId(const std::string& id) { editingDatumId_ = id; }
+    // Drawn/picked half-length of a reference axis (world units). Default + user axes
+    // span the origin-plane half-extent e = sceneRadius*1.25; plane-derived auto axes
+    // (id prefix "axis.auto:") span the user-plane quad half-extent ps = e*0.55 so they
+    // terminate on the plane they were born from. Hit-tests MUST use this, not a fixed L.
+    float refAxisHalfLength(const std::string& id) const;
+
 
     // Orbit-center override: while a sketch is open the model bbox (center_) doesn't include the
     // sketch geometry, so an offset sketch would orbit/frame around the origin. The sketch mode sets

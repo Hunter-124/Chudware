@@ -1619,6 +1619,16 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
     glDisable(GL_BLEND);
 }
 
+float Renderer::refAxisHalfLength(const std::string& id) const {
+    // Match drawReferencePlanes / drawRefDatums: e = sceneRadius * 1.25.
+    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+    // Auto axes from a USER plane pair (axis.auto:<a>|<b>) are drawn only across that plane's
+    // quad (half-extent ps = e*0.55), not the full origin-plane span.
+    if (id.rfind("axis.auto:", 0) == 0)
+        return e * 0.55f;
+    return e;
+}
+
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
 // systems (3 axes). These build no body, so the engine ships their geometry out-of-band (setRefDatums
 // from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums depth-test against
@@ -1656,9 +1666,9 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     auto setCol = [&](float r, float g, float b, float a) { glUniform4f(colLoc, r, g, b, a); };
 
     // Soft grey datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
-    // Axis half-length L equals the plane half-extent basis e (NOT e*1.6) so a drawn axis
-    // spans the same distance as a datum plane edge from center to side. Worker C pick must match.
-    const float L = e;            // half-length of an axis line (matches hit-test; was e*1.6)
+    // Default-axis half-length equals origin-plane half-extent e (NOT e*1.6). User-plane auto
+    // axes (axis.auto:*) use ps so they span only the drawn user-plane quad. Pickers must call
+    // refAxisHalfLength(id) so draw and hit-test share one source of truth.
     const float ps = e * 0.55f;   // half-extent of a datum-plane quad (smaller than origin planes)
     const float ms = e * 0.04f;   // half-size of a point marker cross
     const float cs = e * 0.35f;   // csys axis length
@@ -1672,18 +1682,18 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
             case RefDatum::Kind::Axis: {
                 // Dashed reference axis. Drawn AFTER origin planes (axesOnly pass last) so
                 // translucent plane fills never wash the line out. CPU-side dashes (core GL has
-                // no stipple). Endpoints match the axis picker's hit-test (L = e = radius or
-                // kEmptySceneRadius). Unselected = per-principal RGB at high opacity; selected
-                // (selectedDatumId_ from st.selectedFeatureId) = bold full-opacity accent blue.
-                // Normalize dir so a non-unit inject never collapses the segment; skip only true
-                // zero-length directions (all three axes inject as unit vectors).
+                // no stipple). World-space pitch is uniform on the whole span so +/− halves are
+                // identical (same dash length, count, and spacing) and the pattern clips exactly
+                // at ±halfLen — no overshoot past the plane edge. Unselected = per-principal RGB
+                // at high opacity; selected = bold full-opacity accent blue.
                 Vec3 dir = d.dir;
                 const float dlen = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
                 if (dlen < 1e-8f) break;
                 dir = dir * (1.0f / dlen);
-                Vec3 A = d.origin - dir * L, B = d.origin + dir * L;
-                Vec3 AB = B - A;
-                const int cells = 40;   // 20 visible dashes
+                // Plane-derived auto axes are born from a user plane's quad (half-extent ps);
+                // default/user axes span the origin-plane extent e.
+                const float halfLen = refAxisHalfLength(d.id);
+                if (halfLen < 1e-8f) break;
                 // Principal-axis tint from palette.axisX/Y/Z. Arbitrary user axes (not near a
                 // cardinal) get palette.accent-dim cyan so they still read over planes.
                 const float* px = ui::palette.axisX;
@@ -1704,13 +1714,33 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
                     glLineWidth(2.75f);
                     setCol(ar, ag, ab, 0.92f);
                 }
-                for (int i = 0; i < cells; i += 2) {
-                    float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
-                    Vec3 p0 = A + AB * t0, p1 = A + AB * t1;
-                    float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
-                    upload(seg, 6);
-                    glDrawArrays(GL_LINES, 0, 2);
-                }
+                // One world-space pitch for the whole span: dashLen = halfLen/20. Equal dash and
+                // gap; walk outward from the origin on BOTH sides so +/− halves are identical
+                // (same count, same spacing). Final segment clips exactly at ±halfLen — no
+                // overshoot past the plane boundary, no separate tip/arrow past the edge.
+                const float dashLen = halfLen / 20.0f;
+                if (dashLen < 1e-9f) break;
+                auto drawHalf = [&](const Vec3& hdir) {
+                    // Start with a gap at the origin so both halves share a continuous centre
+                    // gap; the final segment is a dash clipped exactly to halfLen (tip on the
+                    // plane edge — full dash when halfLen is an integer multiple of dashLen).
+                    float s = 0.0f;
+                    bool onDash = false;
+                    while (s < halfLen - 1e-7f) {
+                        const float s1 = std::min(s + dashLen, halfLen);
+                        if (onDash && s1 > s) {
+                            const Vec3 p0 = d.origin + hdir * s;
+                            const Vec3 p1 = d.origin + hdir * s1;
+                            float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
+                            upload(seg, 6);
+                            glDrawArrays(GL_LINES, 0, 2);
+                        }
+                        s = s1;
+                        onDash = !onDash;
+                    }
+                };
+                drawHalf(dir);
+                drawHalf(Vec3(-dir.x, -dir.y, -dir.z));
                 break;
             }
             case RefDatum::Kind::Plane: {

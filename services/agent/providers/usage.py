@@ -50,10 +50,20 @@ DASHBOARD_URLS = {
     "xai": "https://grok.com/?_s=usage",
 }
 
-# xAI usage source enum (wave-2: browser_scrape via CEF per-account profiles).
+# xAI usage sources. Live OIDC userinfo + rate-limit headers (from /v1/models
+# when present, else last chat headers / optional 1-token probe) are the
+# primary path — JWT has NO email/name claims (only sub/tier/team_id). Browser
+# scrape is a degrade path when the API path returns empty windows.
 XAI_SOURCE_JWT = "jwt_inference"
 XAI_SOURCE_BROWSER = "browser_scrape"
-XAI_USAGE_SOURCE = XAI_SOURCE_BROWSER  # CEF rate-limits scrape; jwt_inference on failure
+XAI_SOURCE_API = "api"
+# Prefer live API (userinfo + rate-limit headers). Override with env AICAD_XAI_USAGE_SOURCE.
+XAI_USAGE_SOURCE = XAI_SOURCE_API
+
+XAI_USERINFO_URL = "https://auth.x.ai/oauth2/userinfo"
+XAI_ME_URL = "https://api.x.ai/v1/me"
+XAI_MODELS_URL = "https://api.x.ai/v1/models"
+XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 
 # Anthropic OAuth product surfaces
 _ANTHROPIC_OAUTH_BASE = "https://api.anthropic.com/api/oauth"
@@ -204,6 +214,126 @@ def _http_get(
         except json.JSONDecodeError:
             body = None
     return status, body, rh
+
+
+def _http_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    data: bytes | None = None,
+    timeout: float = 20.0,
+) -> tuple[int, Any, dict[str, str]]:
+    """HTTP request; return (status, parsed_json_or_None, response_headers_lower).
+
+    Does not raise on HTTP error statuses. Network-level failures raise.
+    """
+    hdrs = dict(headers or {})
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            status = int(getattr(resp, "status", 200) or 200)
+            rh = {k.lower(): v for k, v in (resp.headers.items() if resp.headers else [])}
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        raw = exc.read() if hasattr(exc, "read") else b""
+        rh = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+    body: Any = None
+    if raw:
+        try:
+            body = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            body = None
+    return status, body, rh
+
+
+def _xai_auth_headers(cred: dict) -> dict[str, str]:
+    token = str(cred.get("access_token") or "").strip()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def _usage_from_ratelimit_headers(headers: dict[str, str]) -> list[dict]:
+    """Map xAI ``x-ratelimit-*`` response headers into §4.5 usage windows.
+
+    Live chat/completions responses carry:
+      x-ratelimit-limit-requests / remaining-requests
+      x-ratelimit-limit-tokens / remaining-tokens
+    Returns [] when no usable pair is present.
+    """
+    if not headers:
+        return []
+    h = {str(k).lower(): str(v) for k, v in headers.items()}
+
+    def _pair(limit_key: str, rem_key: str) -> tuple[float | None, float | None]:
+        return _to_number(h.get(limit_key)), _to_number(h.get(rem_key))
+
+    out: list[dict] = []
+    lim_r, rem_r = _pair("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests")
+    if lim_r is not None and lim_r > 0 and rem_r is not None:
+        used = _clamp_fraction((lim_r - rem_r) / lim_r)
+        resets = None
+        for rk in (
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-tokens",
+        ):
+            if h.get(rk) is None:
+                continue
+            n = _to_number(h.get(rk))
+            if n is None:
+                continue
+            # Heuristic: values > 1e12 look like ms, > 1e9 epoch s, else delta s.
+            if n > 1e12:
+                resets = _iso_from_ms(n)
+            elif n > 1e9:
+                resets = _iso_from_ms(n * 1000.0)
+            else:
+                resets = _iso_from_seconds(n)
+            break
+        out.append(_usage_row("requests", "Request pool", used, resets, None))
+    lim_t, rem_t = _pair("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens")
+    if lim_t is not None and lim_t > 0 and rem_t is not None:
+        used = _clamp_fraction((lim_t - rem_t) / lim_t)
+        out.append(_usage_row("tokens", "Token pool", used, None, None))
+    return out
+
+
+def record_xai_ratelimit_headers(
+    cred: dict | None,
+    headers: dict[str, str] | None,
+    *,
+    account_id: str | None = None,
+) -> list[dict]:
+    """Persist rate-limit headers from a live completion onto the credential.
+
+    Called by :mod:`xai_sub_provider` after each chat round-trip so Settings can
+    show real percentages without a dedicated usage endpoint (xAI has none).
+    Returns the normalized usage rows (may be empty).
+    """
+    if not isinstance(cred, dict) or not headers:
+        return []
+    rows = _usage_from_ratelimit_headers(headers)
+    if not rows:
+        return []
+    aid = (
+        account_id
+        or cred.get("account_id")
+        or sub_auth.get_active_account_id("xai-sub")
+    )
+    try:
+        persist_identity(
+            "xai-sub",
+            str(aid) if aid else None,
+            usage=rows,
+            usage_fetched_at=_now(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xai: persist rate-limit headers failed: %s", exc)
+    return rows
 
 
 def _usage_row(
@@ -969,11 +1099,185 @@ def fetch_xai_usage_browser_scrape(cred: dict) -> dict:
     return out
 
 
+def fetch_xai_usage_api(cred: dict) -> dict:
+    """Live xAI identity + usage from OIDC userinfo + rate-limit headers.
+
+    Root-cause findings (live probe 2026-07-16):
+    - OAuth JWT carries only ``sub`` / ``tier`` / ``team_id`` — never email/name.
+    - ``GET https://auth.x.ai/oauth2/userinfo`` returns real name + email.
+    - ``GET https://api.x.ai/v1/me`` returns user_id/team_id/team_blocked only.
+    - There is NO dedicated usage/quota HTTP endpoint on api.x.ai.
+    - Chat completions return ``x-ratelimit-limit/remaining-{requests,tokens}``.
+    - ``GET /v1/models`` authenticates but usually omits rate-limit headers.
+
+    Strategy: always hit userinfo for identity; pull rate-limit headers from
+    /v1/models when present else last_usage from prior chat; optional 1-token
+    probe via ``AICAD_XAI_USAGE_PROBE=1``.
+    """
+    base = fetch_xai_usage_jwt_inference(cred)
+    token = str(cred.get("access_token") or "").strip()
+    if not token:
+        return base
+
+    headers = _xai_auth_headers(cred)
+    out = dict(base)
+    out["source"] = XAI_SOURCE_API
+    out["dashboard_url"] = DASHBOARD_URLS["xai"]
+
+    # ── Identity: OIDC userinfo (the only reliable name/email source) ────────
+    try:
+        st, body, _rh = _http_get(XAI_USERINFO_URL, headers=headers, timeout=15.0)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("xAI userinfo failed: %s", exc)
+        st, body = -1, None
+    if st == 429:
+        raise _RateLimited("xAI userinfo 429")
+    if st == 200 and isinstance(body, dict):
+        email = body.get("email")
+        if isinstance(email, str) and "@" in email:
+            out["email"] = email.strip().lower()
+        name = body.get("name") or body.get("preferred_username")
+        if isinstance(name, str) and name.strip() and not _looks_like_uuid(name.strip()):
+            out["display_name"] = name.strip()
+        elif out.get("email"):
+            out["display_name"] = out["email"]
+        sub = body.get("sub")
+        if sub is not None and str(sub).strip() and not out.get("account_id"):
+            out["account_id"] = str(sub).strip()
+
+    # ── Team block flag from /v1/me ──────────────────────────────────────────
+    try:
+        st_me, me_body, _ = _http_get(XAI_ME_URL, headers=headers, timeout=15.0)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xAI /v1/me failed: %s", exc)
+        st_me, me_body = -1, None
+    team_blocked = False
+    if st_me == 200 and isinstance(me_body, dict):
+        team_blocked = bool(me_body.get("team_blocked"))
+        if me_body.get("user_id") and not out.get("account_id"):
+            out["account_id"] = str(me_body["user_id"])
+
+    # ── Usage: live rate headers, then last_usage, then optional probe ───────
+    usage_rows: list[dict] = []
+
+    try:
+        st_m, _body_m, rh_m = _http_get(XAI_MODELS_URL, headers=headers, timeout=20.0)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xAI /v1/models for rate headers failed: %s", exc)
+        st_m, rh_m = -1, {}
+    if st_m == 429:
+        raise _RateLimited("xAI models 429")
+    if st_m == 200:
+        usage_rows = _usage_from_ratelimit_headers(rh_m or {})
+
+    if not usage_rows and isinstance(cred.get("last_usage"), list) and cred["last_usage"]:
+        has_frac = any(
+            isinstance(r, dict) and r.get("used_fraction") is not None
+            for r in cred["last_usage"]
+        )
+        if has_frac:
+            # Prefer request/token windows from chat headers over browser scrape
+            # leftovers (window "2h" / "weekly" with no live binding).
+            liveish = [
+                r for r in cred["last_usage"]
+                if isinstance(r, dict) and r.get("window") in ("requests", "tokens")
+            ]
+            usage_rows = list(liveish or cred["last_usage"])
+
+    import os as _os
+    probe = str(_os.environ.get("AICAD_XAI_USAGE_PROBE") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if not usage_rows and probe:
+        try:
+            payload = json.dumps({
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }).encode("utf-8")
+            st_c, _body_c, rh_c = _http_request(
+                "POST",
+                XAI_CHAT_URL,
+                headers={**headers, "Content-Type": "application/json"},
+                data=payload,
+                timeout=45.0,
+            )
+            if st_c == 429:
+                raise _RateLimited("xAI chat probe 429")
+            if st_c == 403:
+                usage_rows = [
+                    _usage_row("requests", "Request pool", 1.0, None, "blocked"),
+                ]
+            elif st_c == 200:
+                usage_rows = _usage_from_ratelimit_headers(rh_c or {})
+        except _RateLimited:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.debug("xAI usage probe failed: %s", exc)
+
+    if team_blocked and not usage_rows:
+        usage_rows = [
+            _usage_row("requests", "Request pool", 1.0, None, "blocked"),
+        ]
+    elif team_blocked and usage_rows:
+        usage_rows = [
+            {
+                **r,
+                "status": "blocked",
+                "used_fraction": (
+                    r.get("used_fraction")
+                    if r.get("used_fraction") is not None
+                    else 1.0
+                ),
+            }
+            for r in usage_rows
+        ]
+
+    if usage_rows:
+        out["usage"] = usage_rows
+    elif not out.get("usage"):
+        out["usage"] = list(cred.get("last_usage") or [])
+
+    # Prefer real human name / email over bare UUID or "Grok (uuid)" leftovers.
+    dn = out.get("display_name")
+    if (
+        not dn
+        or _looks_like_uuid(dn)
+        or _looks_like_acct_slug(dn)
+        or (isinstance(dn, str) and dn.startswith("Grok ("))
+    ):
+        if isinstance(dn, str) and " " in dn and not dn.startswith("Grok"):
+            pass
+        elif out.get("email"):
+            out["display_name"] = out["email"]
+    return out
+
+
 def fetch_xai_usage(cred: dict) -> dict:
-    """Dispatch xAI usage by pluggable source enum."""
-    if XAI_USAGE_SOURCE == XAI_SOURCE_BROWSER:
+    """Dispatch xAI usage by pluggable source enum.
+
+    Default is live API (userinfo + rate-limit headers). Env
+    ``AICAD_XAI_USAGE_SOURCE`` may force ``api`` / ``browser_scrape`` /
+    ``jwt_inference``.
+    """
+    import os as _os
+    src = (
+        str(_os.environ.get("AICAD_XAI_USAGE_SOURCE") or "").strip().lower()
+        or str(XAI_USAGE_SOURCE or "").strip().lower()
+        or XAI_SOURCE_API
+    )
+    if src in (XAI_SOURCE_BROWSER, "browser", "scrape"):
         return fetch_xai_usage_browser_scrape(cred)
-    return fetch_xai_usage_jwt_inference(cred)
+    if src in (XAI_SOURCE_JWT, "jwt", "jwt_inference"):
+        return fetch_xai_usage_jwt_inference(cred)
+    # Default + "api"
+    try:
+        return fetch_xai_usage_api(cred)
+    except _RateLimited:
+        raise
+    except Exception as exc:  # noqa: BLE001 — degrade to jwt + last_usage
+        log.warning("xAI api usage fetch failed; jwt_inference fallback: %s", exc)
+        return fetch_xai_usage_jwt_inference(cred)
 
 
 class _RateLimited(Exception):
@@ -1434,15 +1738,38 @@ def enrich_codex_identity(cred: dict) -> dict:
 
 
 def enrich_xai_identity(cred: dict) -> dict:
-    """Fill display_name + plan from JWT claims at login.
+    """Fill display_name + plan + email for an xAI credential.
 
-    Never leaves display_name as a bare UUID (xAI ``sub``). Prefer email, then
-    JWT name/preferred_username, then ``Grok (<plan>)`` / short-id fallback.
+    xAI OAuth JWTs only carry ``sub`` / ``tier`` / ``team_id`` — never email or
+    name. Live identity comes from ``GET auth.x.ai/oauth2/userinfo`` (OIDC).
+    Falls back to JWT claims / Grok (plan · short-id) when offline.
     """
     token = cred.get("access_token") or cred.get("id_token") or ""
     claims: dict = sub_auth.decode_jwt_payload(token) if token else {}
 
-    # Email from cred or JWT.
+    # Live OIDC userinfo — the only reliable name/email source.
+    # Skip obviously-fake unit-test tokens (no JWT shape) to keep offline tests fast.
+    if token and token.count(".") >= 2 and len(token) > 40:
+        try:
+            st, body, _rh = _http_get(
+                XAI_USERINFO_URL,
+                headers=_xai_auth_headers(cred),
+                timeout=12.0,
+            )
+            if st == 200 and isinstance(body, dict):
+                email_u = body.get("email")
+                if isinstance(email_u, str) and "@" in email_u:
+                    cred["email"] = email_u.strip().lower()
+                name_u = body.get("name") or body.get("preferred_username")
+                if isinstance(name_u, str) and name_u.strip() and not _looks_like_uuid(name_u.strip()):
+                    cred["display_name"] = name_u.strip()
+                sub_u = body.get("sub")
+                if sub_u is not None and str(sub_u).strip() and not cred.get("account_id"):
+                    cred["account_id"] = str(sub_u).strip()
+        except Exception as exc:  # noqa: BLE001 — offline / network; JWT fallback
+            log.debug("xAI userinfo enrich failed: %s", exc)
+
+    # Email from cred or JWT (usually absent on xAI access tokens).
     email = cred.get("email")
     if not email:
         for key in ("email", "preferred_username", "unique_name"):
@@ -1473,10 +1800,8 @@ def enrich_xai_identity(cred: dict) -> dict:
     for key in ("name", "display_name", "preferred_username", "given_name"):
         v = claims.get(key)
         if isinstance(v, str) and v.strip() and not _looks_like_uuid(v.strip()):
-            # Skip email-shaped preferred_username when we already have email as fallback.
             name = v.strip()
             break
-        # Nested profile block
     nested = claims.get("profile") if isinstance(claims.get("profile"), dict) else {}
     if not name:
         for key in ("name", "display_name"):
@@ -1486,8 +1811,12 @@ def enrich_xai_identity(cred: dict) -> dict:
                 break
 
     current = cred.get("display_name")
-    if current and not (_looks_like_uuid(current) or _looks_like_acct_slug(current)):
-        # Keep a good existing label.
+    if current and not (
+        _looks_like_uuid(current)
+        or _looks_like_acct_slug(current)
+        or (isinstance(current, str) and current.startswith("Grok ("))
+    ):
+        # Keep a good existing label (real name or email).
         pass
     elif name and not (_looks_like_uuid(name) or (name == cred.get("account_id"))):
         cred["display_name"] = name

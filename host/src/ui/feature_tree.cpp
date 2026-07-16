@@ -1723,6 +1723,75 @@ static void categoryColorRGB(const std::string& type, bool isCut, float out[3]) 
     out[0] = c.x; out[1] = c.y; out[2] = c.z;
 }
 
+// User-created datum features that belong under FM Reference (Planes/Axes/Points), not Features.
+static bool isUserRefGeomType(const std::string& type) {
+    return type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+           type == "axis"  || type == "datum_axis"  || type == "ref_axis"  ||
+           type == "point" || type == "datum_point" || type == "ref_point" ||
+           type == "csys"  || type == "coordinate_system" || type == "ref_csys";
+}
+static bool isUserPlaneType(const std::string& type) {
+    return type == "plane" || type == "datum_plane" || type == "ref_plane";
+}
+static bool isUserAxisType(const std::string& type) {
+    return type == "axis" || type == "datum_axis" || type == "ref_axis";
+}
+static bool isUserPointType(const std::string& type) {
+    return type == "point" || type == "datum_point" || type == "ref_point" ||
+           type == "csys" || type == "coordinate_system" || type == "ref_csys";
+}
+
+// Collect feature-ids of user datums referenced from a feature's refs (and plane/axis-ish params).
+// Used to nest those datums under the consuming feature's FM dropdown while keeping the primary
+// listing under Reference.
+static void collectUserDatumRefsFromFeature(
+    const nlohmann::json& feature,
+    const std::unordered_set<std::string>& userDatumIds,
+    std::unordered_set<std::string>& out) {
+    if (!feature.is_object() || userDatumIds.empty()) return;
+    std::function<void(const nlohmann::json&, const std::string&)> walk =
+        [&](const nlohmann::json& node, const std::string& key) {
+        if (node.is_string()) {
+            const std::string v = node.get<std::string>();
+            if (userDatumIds.count(v)) out.insert(v);
+            return;
+        }
+        if (node.is_array()) {
+            for (const auto& e : node) walk(e, key);
+            return;
+        }
+        if (!node.is_object()) return;
+        // Selector objects may name the owner feature / datum id.
+        for (const char* k : {"feature", "owner_feature", "datum", "id", "plane", "axis",
+                              "point", "csys", "base", "second", "a", "b", "tool",
+                              "start_ref", "neutral", "pull"}) {
+            auto it = node.find(k);
+            if (it != node.end() && it->is_string()) {
+                const std::string v = it->get<std::string>();
+                if (userDatumIds.count(v)) out.insert(v);
+            }
+        }
+        for (auto it = node.begin(); it != node.end(); ++it)
+            walk(it.value(), it.key());
+    };
+    auto refs = feature.find("refs");
+    if (refs != feature.end()) walk(*refs, std::string());
+    // Params sometimes hold a bare plane/axis id (mirror, split, etc.).
+    auto params = feature.find("params");
+    if (params != feature.end() && params->is_object()) {
+        for (auto it = params->begin(); it != params->end(); ++it) {
+            const std::string& k = it.key();
+            const bool planeish =
+                k.find("plane") != std::string::npos || k.find("axis") != std::string::npos ||
+                k.find("point") != std::string::npos || k == "base" || k == "second" ||
+                k == "tool" || k == "csys" || k == "datum";
+            if (!planeish) continue;
+            walk(it.value(), k);
+        }
+    }
+}
+
+
 // Resolve a component source relative to the active assembly. Nested assembly sources are already
 // normalized by feature_tree_nested.cpp and pass through unchanged.
 static std::string resolveComponentPath(const std::string& srcPath) {
@@ -3657,17 +3726,50 @@ void drawFeatureTreeBody(AppState& st,
             ImGui::Unindent(kSecIndent);
         }   // end filename section
 
-        // ---- References section (Origin / Planes / Axes folders) — its own collapse,
+        // ---- References section (Points / Planes / Axes folders) — its own collapse,
         // independent of the filename above and the Features below. ----
+        // Keep auto-axis FM labels current ("Plane1 X Axis") even if inject still seeds
+        // the legacy "Axis A ∩ B" string into axisAutoCache / axisDisplayNames.
+        st.rebuildAxisDisplayNames(tree);
+
+        // User-created datum features (plane/axis/point/csys) for Reference folders AND for
+        // nesting under consuming Features rows. Collected outside the section collapse so
+        // Features still skips/nests them when Reference is collapsed.
+        struct UserRefFeat { std::string id; std::string name; std::string type; };
+        std::vector<UserRefFeat> userPlanes, userAxes, userPoints;
+        std::unordered_set<std::string> userDatumIds;
+        if (tree.is_object()) {
+            auto rfi = tree.find("features");
+            if (rfi != tree.end() && rfi->is_array()) {
+                for (const auto& f : *rfi) {
+                    if (!f.is_object()) continue;
+                    const std::string ty = jfld(f, "type");
+                    if (!isUserRefGeomType(ty)) continue;
+                    const std::string id = jfld(f, "id");
+                    if (id.empty()) continue;
+                    userDatumIds.insert(id);
+                    UserRefFeat ur;
+                    ur.id = id;
+                    ur.type = ty;
+                    ur.name = jfld(f, "name");
+                    if (ur.name.empty()) ur.name = ty + "·" + id;
+                    if (isUserPlaneType(ty))      userPlanes.push_back(ur);
+                    else if (isUserAxisType(ty))  userAxes.push_back(ur);
+                    else if (isUserPointType(ty)) userPoints.push_back(ur);
+                }
+            }
+        }
+
         const bool refOpenBefore = s_refSecOpen;
         fmSectionDividerCollapse("Reference", &s_refSecOpen);
         if (s_refSecOpen != refOpenBefore) sec.refUserToggled = true;
         if (s_refSecOpen) {
             ImGui::Indent(kSecIndent);
 
-            // ---- Origin folder (holds the origin POINT only) --------------------------------
+            // ---- Points folder (origin point + user ref-point/csys features) -----------------
             // Folder header mirrors Axes (body_folder + DefaultOpen + cascade eye). The origin
             // point is a leaf child so selection / PM point-well routing stay on the point row.
+            // Future intersection-created point features (type point/datum_point) list here too.
             {
                 // Persistent origin visibility (hiddenFeatures) — NOT the viewport-published
                 // originVisEff, which lags the FM by a frame on fresh docs (same fix as planes/axes).
@@ -3679,7 +3781,7 @@ void drawFeatureTreeBody(AppState& st,
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 const bool originFldOpen = ImGui::TreeNodeEx(
-                    "Origin##ref_origin_folder",
+                    "Points##ref_points_folder",
                     ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
                     ImGuiTreeNodeFlags_FramePadding);
                 if (!originShown) ImGui::PopStyleColor();
@@ -3762,6 +3864,56 @@ void drawFeatureTreeBody(AppState& st,
                         if (st.propertyManager && st.propertyManager->active() &&
                             st.propertyManager->activeWellWantsPoint())
                             st.propertyManager->routeDatumPoint("point.origin", "Origin");
+                    }
+
+                    // User ref-point / csys features (intersection points, etc.).
+                    for (const auto& up : userPoints) {
+                        const bool pSel = (st.selectedFeatureId == up.id);
+                        const bool pHidden = st.hiddenFeatures.count(up.id) > 0;
+                        ImGuiTreeNodeFlags uf = ImGuiTreeNodeFlags_Leaf |
+                                                ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                ImGuiTreeNodeFlags_SpanFullWidth |
+                                                ImGuiTreeNodeFlags_FramePadding;
+                        FmRowRect urect = fmRowPill(pSel);
+                        if (pHidden)
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                        ImVec2 uRowPos = ImGui::GetCursorScreenPos();
+                        ImGui::TreeNodeEx((up.name + "##refpt_" + up.id).c_str(), uf);
+                        const char* icon = (up.type == "csys" || up.type == "coordinate_system" ||
+                                            up.type == "ref_csys") ? "ref_csys" : "ref_point";
+                        const char* fb = (up.type == "csys" || up.type == "coordinate_system" ||
+                                          up.type == "ref_csys") ? "[CS]" : "[Pt]";
+                        treeIconInArrowSlot(uRowPos, icon, fb, pHidden ? 0.45f : 1.0f);
+                        if (pHidden) ImGui::PopStyleColor();
+                        fmRowPillEnd(urect, pSel);
+                        ImVec2 uMin = ImGui::GetItemRectMin();
+                        ImVec2 uMax = ImGui::GetItemRectMax();
+                        float  uEyeSz = 14.0f * ui::uiScale, uEyePad = 6.0f * ui::uiScale;
+                        ImVec2 uEyeMin(uMax.x - uEyeSz - uEyePad,
+                                       uMin.y + (uMax.y - uMin.y - uEyeSz) * 0.5f);
+                        ImVec2 uEyeMax(uEyeMin.x + uEyeSz, uEyeMin.y + uEyeSz);
+                        bool   uOverEye = ImGui::IsMouseHoveringRect(uEyeMin, uEyeMax);
+                        drawEyeGlyph(ImGui::GetWindowDrawList(), uEyeMin, uEyeMax,
+                                     !pHidden, uOverEye, fmSurf());
+                        if (uOverEye) {
+                            ImGui::SetTooltip(pHidden ? "Show %s" : "Hide %s", up.name.c_str());
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                if (pHidden) st.hiddenFeatures.erase(up.id);
+                                else {
+                                    st.hiddenFeatures.insert(up.id);
+                                    if (pSel) st.selectedFeatureId.clear();
+                                }
+                                st.applyDatumVisibility();
+                            }
+                        } else if (ImGui::IsItemClicked()) {
+                            st.selection.clear();
+                            st.selectedFeatureId = up.id;
+                            selectFeatureInViewport(st, up.id);
+                            if (st.propertyManager && st.propertyManager->active() &&
+                                st.propertyManager->activeWellWantsPoint())
+                                st.propertyManager->routeDatumPoint(up.id, up.name);
+                        }
                     }
                     ImGui::TreePop();
                 }
@@ -3903,6 +4055,70 @@ void drawFeatureTreeBody(AppState& st,
                                                      ? "Dimension to %s"
                                                      : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
                     }
+                    // User-created datum planes under Reference > Planes.
+                    for (const auto& up : userPlanes) {
+                        const bool pSel = (st.selectedFeatureId == up.id);
+                        const bool pHidden = st.hiddenFeatures.count(up.id) > 0 ||
+                                            st.autoHiddenPlanes.count(up.id) > 0;
+                        ImGuiTreeNodeFlags uf = ImGuiTreeNodeFlags_Leaf |
+                                                ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                ImGuiTreeNodeFlags_SpanFullWidth |
+                                                ImGuiTreeNodeFlags_FramePadding;
+                        FmRowRect urect = fmRowPill(pSel);
+                        if (pHidden)
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                        ImVec2 uRowPos = ImGui::GetCursorScreenPos();
+                        ImGui::TreeNodeEx((up.name + "##refpl_" + up.id).c_str(), uf);
+                        treeIconInArrowSlot(uRowPos, "ref_plane", "[P]", pHidden ? 0.45f : 1.0f);
+                        if (pHidden) ImGui::PopStyleColor();
+                        fmRowPillEnd(urect, pSel);
+                        ImVec2 uMin = ImGui::GetItemRectMin();
+                        ImVec2 uMax = ImGui::GetItemRectMax();
+                        float  uEyeSz = 14.0f * ui::uiScale, uEyePad = 6.0f * ui::uiScale;
+                        ImVec2 uEyeMin(uMax.x - uEyeSz - uEyePad,
+                                       uMin.y + (uMax.y - uMin.y - uEyeSz) * 0.5f);
+                        ImVec2 uEyeMax(uEyeMin.x + uEyeSz, uEyeMin.y + uEyeSz);
+                        bool   uOverEye = ImGui::IsMouseHoveringRect(uEyeMin, uEyeMax);
+                        drawEyeGlyph(ImGui::GetWindowDrawList(), uEyeMin, uEyeMax,
+                                     !pHidden, uOverEye, fmSurf());
+                        if (uOverEye) {
+                            ImGui::SetTooltip(pHidden ? "Show %s" : "Hide %s", up.name.c_str());
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                if (pHidden) {
+                                    st.hiddenFeatures.erase(up.id);
+                                    st.autoHiddenPlanes.erase(up.id);
+                                } else {
+                                    st.hiddenFeatures.insert(up.id);
+                                    st.autoHiddenPlanes.insert(up.id);
+                                    if (pSel) st.selectedFeatureId.clear();
+                                }
+                                st.datumPlanesUserToggled.insert(up.id);
+                                st.applyDatumVisibility();
+                            }
+                        } else if (ImGui::IsItemClicked()) {
+                            if (st.sketchPlanePickActive && st.sketchMode) {
+                                st.sketchPlanePickActive = false;
+                                st.sketchMode->consumePlanePick(st, nlohmann::json(up.id));
+                                st.selectedFeatureId = up.id;
+                                selectFeatureInViewport(st, up.id);
+                            } else if (st.propertyManager && st.propertyManager->active() &&
+                                       st.propertyManager->activeWellWantsPlane()) {
+                                st.propertyManager->routeDatumPlane(up.id, up.name);
+                                st.selectedFeatureId = up.id;
+                                selectFeatureInViewport(st, up.id);
+                            } else {
+                                if (pSel) {
+                                    st.selectedFeatureId.clear();
+                                    clearFeatureHighlight(st);
+                                } else {
+                                    st.selection.clear();
+                                    st.selectedFeatureId = up.id;
+                                    selectFeatureInViewport(st, up.id);
+                                }
+                            }
+                        }
+                    }
                     ImGui::TreePop();
                 }
             }
@@ -3928,23 +4144,30 @@ void drawFeatureTreeBody(AppState& st,
                     if (aid == "axis.x" || aid == "axis.y" || aid == "axis.z") continue;
                     axes.push_back({aid, displayName(aid, aid.c_str())});
                 }
+                // User axis features not yet in axisDatumIds (pre-inject / edge cases).
+                for (const auto& ua : userAxes) {
+                    bool seen = false;
+                    for (const auto& ar : axes)
+                        if (ar.id == ua.id) { seen = true; break; }
+                    if (!seen) axes.push_back({ua.id, displayName(ua.id, ua.name.c_str())});
+                }
                 // Stable order: defaults first (already), then auto, then others by id.
                 std::stable_sort(axes.begin() + 3, axes.end(),
                     [](const AxisRow& a, const AxisRow& b) { return a.id < b.id; });
 
                 // Build the listed set once so the folder cascade eye and the child loop agree.
+                std::unordered_set<std::string> userAxisIds;
+                for (const auto& ua : userAxes) userAxisIds.insert(ua.id);
                 std::vector<AxisRow> listedAxes;
                 listedAxes.reserve(axes.size());
                 for (const auto& ar : axes) {
-                    if (!st.axisDatumIds.count(ar.id) &&
-                        ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
-                        continue;
-                    const bool listed =
-                        st.axisDatumIds.empty()
-                            ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
-                            : (bool)st.axisDatumIds.count(ar.id);
-                    if (!listed) continue;
-                    listedAxes.push_back(ar);
+                    const bool isDefault =
+                        ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z";
+                    const bool inDatum = st.axisDatumIds.count(ar.id) > 0;
+                    const bool isUserAxis = userAxisIds.count(ar.id) > 0;
+                    // Defaults always; injected auto/user axes; user-authored axis features.
+                    if (isDefault || isUserAxis || inDatum)
+                        listedAxes.push_back(ar);
                 }
                 bool anyAxisShown = false;
                 bool allAxesShown = !listedAxes.empty();
@@ -3955,7 +4178,7 @@ void drawFeatureTreeBody(AppState& st,
                 }
                 if (listedAxes.empty()) { anyAxisShown = false; allAxesShown = false; }
 
-                // Axes folder header — same body_folder + fmRowPill pattern as Planes / Origin.
+                // Axes folder header — same body_folder + fmRowPill pattern as Planes / Points.
                 // DefaultOpen so X/Y/Z stay one click away. Cascade eye on the header.
                 FmRowRect axesFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
@@ -4005,7 +4228,13 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_FramePadding;
                         const bool axisSel = (st.selectedFeatureId == ar.id);
                         const bool axisHidden = st.hiddenFeatures.count(ar.id) > 0;
-                        FmRowRect axisRect = fmRowPill(axisSel);
+                        // Layers-style full-row wash: default X/Y/Z get palette.axis* tints
+                        // (F.Cu red / B.Cu blue parity). Auto/user axes keep the neutral accent.
+                        const float* axisTint = nullptr;
+                        if (ar.id == "axis.x")      axisTint = ui::palette.axisX;
+                        else if (ar.id == "axis.y") axisTint = ui::palette.axisY;
+                        else if (ar.id == "axis.z") axisTint = ui::palette.axisZ;
+                        FmRowRect axisRect = fmRowPill(axisSel, axisTint);
                         if (axisHidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -4195,11 +4424,37 @@ void drawFeatureTreeBody(AppState& st,
                             childrenOf[kv.second].push_back(kv.first);
                         }
                     }
+                    // User datums also nest under every feature that references them (AND stay
+                    // under Reference). Unlike sketches, multi-consumer is fine — list under each.
+                    if (!userDatumIds.empty()) {
+                        for (const auto& f : *feat) {
+                            if (!f.is_object()) continue;
+                            const std::string fid = jfld(f, "id");
+                            const std::string fty = jfld(f, "type");
+                            if (fid.empty() || isUserRefGeomType(fty) || fty == "sketch") continue;
+                            std::unordered_set<std::string> drefs;
+                            collectUserDatumRefsFromFeature(f, userDatumIds, drefs);
+                            for (const auto& did : drefs) {
+                                auto& kids = childrenOf[fid];
+                                if (std::find(kids.begin(), kids.end(), did) == kids.end())
+                                    kids.push_back(did);
+                            }
+                        }
+                    }
                     // A sketch is nested (hidden from the flat list, shown under its consumer) iff
                     // it landed in childrenOf (one consumer, and that consumer actually builds).
+                    // User datums always skip the flat Features list via isUserRefGeomType.
                     std::unordered_set<std::string> nestedSketchIds;
-                    for (const auto& kv : childrenOf)
-                        for (const auto& sk : kv.second) nestedSketchIds.insert(sk);
+                    {
+                        std::unordered_set<std::string> sketchIdsOnly;
+                        for (const auto& f : *feat)
+                            if (f.is_object() && jfld(f, "type") == "sketch")
+                                sketchIdsOnly.insert(jfld(f, "id"));
+                        for (const auto& kv : childrenOf)
+                            for (const auto& childId : kv.second)
+                                if (sketchIdsOnly.count(childId))
+                                    nestedSketchIds.insert(childId);
+                    }
                     auto isNestedSketch = [&](const std::string& fid) {
                         return nestedSketchIds.count(fid) != 0;
                     };
@@ -4338,8 +4593,10 @@ void drawFeatureTreeBody(AppState& st,
                         std::string fid    = jfld(f, "id");
                         std::string fname  = jfld(f, "name");
                         std::string ftype  = jfld(f, "type");
-                        // W2-ref: axes live under References only — skip in Features history.
-                        if (ftype == "axis" || ftype == "datum_axis") return true;
+                        // W2-ref: user datums live under References (and nest under consumers).
+                        // Skip the flat Features history listing for plane/axis/point/csys.
+                        // Nested=true rows (under a consumer) still draw via this path.
+                        if (!nested && isUserRefGeomType(ftype)) return true;
                         // Item 9: show the component/part name, not Place_* or a raw instance id.
                         // Multi-source groups use "Name <k>" so the folder owns the base name.
                         if (ftype == "import") {
@@ -4650,6 +4907,8 @@ void drawFeatureTreeBody(AppState& st,
 
                         // Skip nested sketches in the flat pass — they render under their consumer.
                         if (ftype == "sketch" && isNestedSketch(fid)) continue;
+                        // User datums list under Reference (and nest under consumers when referenced).
+                        if (isUserRefGeomType(ftype)) continue;
                         // Item 9: Place_*/import-placement transforms nest under their import body.
                         if (nestedPlacementIds.count(fid)) continue;
                         // Wave 6: non-leader members of a multi-import source group render under

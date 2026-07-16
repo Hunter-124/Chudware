@@ -515,6 +515,10 @@ def test_enrich_helpers_login_time(monkeypatch):
     assert codex["account_id"] == "acc"
     assert codex["display_name"] == "o@x.com"
 
+    # enrich_xai_identity may hit userinfo; stub offline.
+    def fake_xai_http(url, headers=None, timeout=20.0):
+        return 404, None, {}
+    monkeypatch.setattr(usage, "_http_get", fake_xai_http)
     x = usage.enrich_xai_identity({
         "access_token": _jwt({"email": "g@x.ai", "plan": "SuperGrok"}),
         "email": "g@x.ai",
@@ -535,9 +539,8 @@ def test_xai_display_name_never_bare_uuid(tmp_config, monkeypatch):
     }, account_id=uuid)
 
     monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_JWT)
-    monkeypatch.setattr(usage, "_http_get", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("jwt path must not hit network")
-    ))
+    # enrich_xai_identity now probes userinfo — keep offline for this unit test.
+    monkeypatch.setattr(usage, "_http_get", lambda *a, **k: (404, None, {}))
 
     row = usage.fetch_account_usage("xai", uuid, force=True)
     assert row["display_name"]
@@ -688,6 +691,7 @@ def test_xai_numeric_jwt_tier_maps_to_plan(tmp_config, monkeypatch):
     }, account_id="06dc3359-2d20-4cd7-bd84-8c8db560cd4e")
 
     monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_JWT)
+    monkeypatch.setattr(usage, "_http_get", lambda *a, **k: (404, None, {}))
     usage.clear_cache()
     row = usage.fetch_account_usage(
         "xai", "06dc3359-2d20-4cd7-bd84-8c8db560cd4e", force=True
@@ -727,3 +731,103 @@ def test_xai_last_usage_cold_restore(tmp_config, monkeypatch):
     assert row["usage"], "expected last_usage restored for xAI cold path"
     assert row["usage"][0]["window"] == "2h"
     assert row["plan"] == "SuperGrok"
+
+
+def test_xai_api_userinfo_and_ratelimit_headers(tmp_config, monkeypatch):
+    """Live API path: OIDC userinfo for identity + x-ratelimit headers for bars."""
+    token = _jwt({"sub": "u-api-1", "tier": 1})
+    sub_auth.save_credential("xai-sub", {
+        "access_token": token,
+        "refresh_token": "rt",
+        "account_id": "u-api-1",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="u-api-1")
+
+    def fake_http(url, headers=None, timeout=20.0):
+        if "userinfo" in url:
+            return 200, {
+                "sub": "u-api-1",
+                "name": "Ada Lovelace",
+                "email": "ada@example.com",
+                "email_verified": True,
+            }, {}
+        if url.rstrip("/").endswith("/me"):
+            return 200, {
+                "user_id": "u-api-1",
+                "team_id": "team-1",
+                "team_blocked": False,
+            }, {}
+        if url.rstrip("/").endswith("/models"):
+            return 200, {"data": []}, {
+                "x-ratelimit-limit-requests": "1000",
+                "x-ratelimit-remaining-requests": "250",
+                "x-ratelimit-limit-tokens": "100000",
+                "x-ratelimit-remaining-tokens": "80000",
+            }
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "XAI_USAGE_SOURCE", usage.XAI_SOURCE_API)
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    monkeypatch.delenv("AICAD_XAI_USAGE_PROBE", raising=False)
+    usage.clear_cache()
+
+    row = usage.fetch_account_usage("xai", "u-api-1", force=True)
+    assert row["source"] == "api"
+    assert row["email"] == "ada@example.com"
+    assert row["display_name"] == "Ada Lovelace"
+    assert row["plan"] == "SuperGrok"
+    assert len(row["usage"]) >= 1
+    req = next(u for u in row["usage"] if u["window"] == "requests")
+    assert abs(req["used_fraction"] - 0.75) < 1e-9
+    assert req["status"] in ("ok", "warn", "blocked")
+
+    # Identity persisted for Settings restart.
+    cred = sub_auth.load_credential("xai-sub", account_id="u-api-1")
+    assert cred.get("email") == "ada@example.com"
+    assert cred.get("display_name") == "Ada Lovelace"
+    assert cred.get("last_usage")
+
+
+def test_xai_record_ratelimit_headers_from_chat(tmp_config):
+    """Chat response headers seed last_usage without a usage endpoint."""
+    sub_auth.save_credential("xai-sub", {
+        "access_token": "t",
+        "account_id": "u2",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="u2")
+    rows = usage.record_xai_ratelimit_headers(
+        {"access_token": "t", "account_id": "u2"},
+        {
+            "x-ratelimit-limit-requests": "8300",
+            "x-ratelimit-remaining-requests": "8300",
+            "x-ratelimit-limit-tokens": "53000000",
+            "x-ratelimit-remaining-tokens": "53000000",
+        },
+        account_id="u2",
+    )
+    assert len(rows) == 2
+    assert rows[0]["window"] == "requests"
+    assert abs(rows[0]["used_fraction"] - 0.0) < 1e-9
+    cred = sub_auth.load_credential("xai-sub", account_id="u2")
+    assert cred.get("last_usage")
+
+
+def test_xai_enrich_userinfo_live_shape(monkeypatch):
+    """enrich_xai_identity uses OIDC userinfo when JWT lacks email/name."""
+    def fake_http(url, headers=None, timeout=20.0):
+        if "userinfo" in url:
+            return 200, {
+                "sub": "uuid-1",
+                "name": "Hunter Edmonds",
+                "email": "h@example.com",
+            }, {}
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    cred = usage.enrich_xai_identity({
+        "access_token": _jwt({"sub": "uuid-1", "tier": 1}),
+        "account_id": "uuid-1",
+    })
+    assert cred["email"] == "h@example.com"
+    assert cred["display_name"] == "Hunter Edmonds"
+    assert cred["plan"] == "SuperGrok"

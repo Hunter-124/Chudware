@@ -314,29 +314,45 @@ static ChipResult drawChipAt(const char* btnId,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + chipW, p0.y + chipH);
 
-    // Liquid-glass background for a tab/chip rect [p0,p1], corner radius `rnd`.
-    // Same glassRowBackground + coloredRowWash combo the ribbon tab strip uses, so the
-    // whole app reads consistently (rest / hover / active are three wash strengths).
+    // ONE continuous liquid-glass pill background across the whole chip.
+    // Do NOT use coloredRowWash here: its left-cap / MultiColor / right-cap construction
+    // reads as three distinct vertical bands on these short title-bar pills. Instead:
+    // frosted base + a single left→right MultiColor wash over the full rounded rect.
+    // Active glow is applied once (glassRowBackground(selected=false) so we own the glow).
+    const float sChip = ui::uiScale;
     float tint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
-    ui::glassRowBackground(dl, p0, p1, rnd, /*stripe*/false, /*selected*/isActive, /*washAlpha*/0.42f);
-    if (isActive) {
-        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.40f, /*selected*/true);
-        ui::glassSelectionGlow(dl, p0, p1, rnd, ui::palette.accent);
-    } else if (hovered) {
-        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.30f, /*selected*/false);
-    } else {
-        ui::coloredRowWash(dl, p0, p1, rnd, tint, /*strength*/0.18f, /*selected*/false);
+    ui::glassRowBackground(dl, p0, p1, rnd, /*stripe*/false, /*selected*/false, /*washAlpha*/0.42f);
+    {
+        // Match glassRowBackground / coloredRowWash self-inset so the wash sits on the frost.
+        const float inset = 2.0f * sChip;
+        ImVec2 mn(p0.x + inset, p0.y + inset);
+        ImVec2 mx(p1.x - inset, p1.y - inset);
+        if (mx.x > mn.x && mx.y > mn.y) {
+            const float strength = isActive ? 0.40f : (hovered ? 0.30f : 0.18f);
+            const float aL = strength;
+            const float aR = ImMax(0.02f, strength * 0.15f);
+            // rnd is already screen-px for chips (barH fraction); clamp to the inset rect.
+            const float W = mx.x - mn.x, H = mx.y - mn.y;
+            const float rr = ImClamp(rnd, 0.0f, ImMin(W, H) * 0.5f);
+            auto dye = [&](float a) {
+                return ImGui::ColorConvertFloat4ToU32(ImVec4(tint[0], tint[1], tint[2], a));
+            };
+            // Continuous L→R: rounded base in the faint right colour, then one full-width
+            // MultiColor. No left/mid/right segment caps — those were the visible vertical seams.
+            dl->AddRectFilled(mn, mx, dye(aR), rr);
+            dl->AddRectFilledMultiColor(mn, mx, dye(aL), dye(aR), dye(aR), dye(aL));
+        }
     }
+    if (isActive)
+        ui::glassSelectionGlow(dl, p0, p1, rnd, ui::palette.accent);
 
-    // Icon + label group centered in chip. Width is measured with the same reference
-    // font as chipMeasureW (boldFont when present) so chip widths never jitter between
-    // active/inactive frames.
-    ImFont* drawFont = (isActive && boldFont) ? boldFont : ImGui::GetFont();
-    float textW;
-    if (boldFont)
-        textW = boldFont->CalcTextSizeA(boldFont->FontSize, FLT_MAX, 0, label).x;
-    else
-        textW = ImGui::CalcTextSize(label).x;
+    // Icon + label group centered in chip. Measure text ALWAYS with boldFont (when present)
+    // so chipMeasureW and the layout share one width — previously active pills measured with
+    // bold but inactive layout used the regular font, which shifted icon↔label spacing.
+    // Draw weight still tracks active (bold) vs rest (regular) for the visual cue.
+    ImFont* measureFont = boldFont ? boldFont : ImGui::GetFont();
+    ImFont* drawFont    = (isActive && boldFont) ? boldFont : ImGui::GetFont();
+    const float textW = measureFont->CalcTextSizeA(measureFont->FontSize, FLT_MAX, 0, label).x;
 
     const ImVec4 textColV(ui::palette.text[0], ui::palette.text[1],
                           ui::palette.text[2], ui::palette.text[3]);

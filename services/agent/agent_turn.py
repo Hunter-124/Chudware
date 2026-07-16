@@ -95,6 +95,22 @@ def format_provider_error_detail(exc: BaseException, provider: Any = None) -> st
         bits.append(f"HTTP {status_i}")
     head = " ".join(bits)
     msg = str(exc).strip() or type(exc).__name__
+    # Anthropic/OpenAI SDKs often put the useful line in body.error.message.
+    for attr in ("body", "response", "error"):
+        blob = getattr(exc, attr, None)
+        if blob is None:
+            continue
+        try:
+            if hasattr(blob, "json") and callable(blob.json):
+                blob = blob.json()
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(blob, dict):
+            err = blob.get("error") if isinstance(blob.get("error"), dict) else blob
+            nested = err.get("message") if isinstance(err, dict) else None
+            if nested:
+                msg = str(nested).strip()
+                break
     body = f"{head}: {type(exc).__name__}: {msg}" if head else f"{type(exc).__name__}: {msg}"
     return format_error_detail(body)
 
@@ -109,15 +125,27 @@ def error_detail_for_stop(
     provider: Any = None,
     extra: str = "",
 ) -> str:
-    """Build a short human error_detail for a terminal stop_reason."""
+    """Build a short human error_detail for a terminal stop_reason.
+
+    Provider exceptions must NEVER be phrased as budget exhaustion — pass
+    *exc* (or a provider_* *stop_reason*) so the phase card shows the real
+    HTTP status + API message. Budget paths name WHICH budget and the limit.
+    """
     if exc is not None:
         return format_provider_error_detail(exc, provider)
     if stop_reason == "terminated_by_user":
         return format_error_detail("Run cancelled by user.")
-    if stop_reason == "provider_auth":
-        return format_error_detail(extra or "Provider authentication failed.")
-    if stop_reason == "provider_unavailable":
-        return format_error_detail(extra or "Provider unavailable (credits/tier/spending limit).")
+    if stop_reason in ("provider_error", "provider_auth", "provider_unavailable"):
+        # Prefer caller-supplied detail (already formatted); never "budget exhausted".
+        if extra:
+            return format_error_detail(extra)
+        if stop_reason == "provider_auth":
+            return format_error_detail("Provider authentication failed.")
+        if stop_reason == "provider_unavailable":
+            return format_error_detail(
+                "Provider unavailable (credits/tier/spending limit)."
+            )
+        return format_error_detail("Provider error (no detail).")
     if stop_reason in (_RETRY, "max_iters"):
         last_tool_err = ""
         for c in reversed(calls or []):
@@ -126,18 +154,23 @@ def error_detail_for_stop(
                 tname = c.get("tool") or "tool"
                 if last_tool_err:
                     return format_error_detail(
-                        f"Tool budget exhausted after {tool_calls_made} call(s); "
-                        f"last error from {tname}: {last_tool_err}"
+                        f"Tool-call budget exhausted "
+                        f"({tool_calls_made}"
+                        + (f" of {budget}" if budget else "")
+                        + f" call(s)); last error from {tname}: {last_tool_err}"
                     )
                 break
         return format_error_detail(
-            f"Tool budget exhausted after {tool_calls_made}"
+            f"Tool-call budget exhausted "
+            f"({tool_calls_made}"
             + (f" of {budget}" if budget else "")
-            + " call(s) without a clean finish."
+            + " call(s)) without a clean finish."
         )
     if stop_reason == "phase_step_cap":
         return format_error_detail(
-            f"Phase step cap hit after {tool_calls_made} tool call(s)."
+            f"Phase step-cap budget exhausted after {tool_calls_made}"
+            + (f" of {budget}" if budget else "")
+            + " tool call(s)."
         )
     if stop_reason == _NOCODE:
         return format_error_detail(
@@ -829,6 +862,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                     recovered = False
             if not recovered:
                 detail = format_provider_error_detail(exc, provider)
+                # Never return bare "failed" for a provider exception — node_runner
+                # and the GUI stage cards mislabel that as "budget exhausted".
+                if stop == _FAILED:
+                    stop = "provider_error"
                 _log(ledger, actor, {
                     "event": "provider_error",
                     "error": str(exc)[:300],

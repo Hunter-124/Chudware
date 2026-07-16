@@ -445,6 +445,30 @@ static RibbonGroup& ribbon_findOrAddGroup(std::vector<RibbonGroup>& groups,
     return groups.back();
 }
 
+// Prefer stacking `childId` directly under `parentId` in the small-button column packer.
+// Pulls the pair to the front of the smCmds list so rowsPerCol packing places child in the
+// same column under parent (e.g. Sketch▸Draw: "Rotate Ent." under "Move Ent.").
+static void ribbon_preferStackedPair(std::vector<const ui::RibbonCmd*>& cmds,
+                                     const char* parentId, const char* childId) {
+    int iP = -1, iC = -1;
+    for (int i = 0; i < (int)cmds.size(); ++i) {
+        if (cmds[i] && cmds[i]->cmd_id && std::strcmp(cmds[i]->cmd_id, parentId) == 0) iP = i;
+        if (cmds[i] && cmds[i]->cmd_id && std::strcmp(cmds[i]->cmd_id, childId) == 0) iC = i;
+    }
+    if (iP < 0 || iC < 0 || iP == iC) return;
+    const ui::RibbonCmd* p = cmds[(size_t)iP];
+    const ui::RibbonCmd* c = cmds[(size_t)iC];
+    if (iC > iP) {
+        cmds.erase(cmds.begin() + iC);
+        cmds.erase(cmds.begin() + iP);
+    } else {
+        cmds.erase(cmds.begin() + iP);
+        cmds.erase(cmds.begin() + iC);
+    }
+    cmds.insert(cmds.begin(), c);
+    cmds.insert(cmds.begin(), p);
+}
+
 static bool ribbon_hasSubs(const RibbonGroup& grp, const ui::RibbonCmd* cmd) {
     for (const auto* sc : grp.subCmds)
         if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0) return true;
@@ -517,26 +541,33 @@ static float ribbon_captionMinW(const RibbonGroup& grp) {
 }
 
 // Compute natural width (screen px) of a group at a given collapse level.
+// Width is derived from the ACTUAL content extent so left and right padding match:
+//   padX | [big buttons with inter-gaps only] | [inter-zone gap] | [small cols] | padX
+// Previously every big button contributed a trailing 2dp gap (including the last), and an
+// extra kGroupPadX was reserved between big and small zones that the draw path never spent —
+// that piled dead space on the RIGHT of the group pill.
 static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
     float s = ui::uiScale;
     if (level == COL_HIDDEN) return 0.0f;
 
+    const float padX = kGroupPadX * s;
     float content;
     if (level == COL_BIG) {
-        // big-button column: buttons laid out left-to-right
+        // big-button column: buttons laid out left-to-right; gap ONLY between buttons
         float bigColW = 0.0f;
-        for (const auto* cmd : grp.bigCmds) {
-            bool drop = ribbon_hasSubs(grp, cmd);
-            bigColW += ribbon_bigBtnWMax(grp, cmd, drop) + 2.0f * s;  // N1-N5: widest variant
+        for (int i = 0; i < (int)grp.bigCmds.size(); ++i) {
+            bool drop = ribbon_hasSubs(grp, grp.bigCmds[i]);
+            if (i > 0) bigColW += 2.0f * s;
+            bigColW += ribbon_bigBtnWMax(grp, grp.bigCmds[i], drop);
         }
         float smW = ribbon_smZoneW(grp, {});
-        content = kGroupPadX * s + bigColW
-                  + (smW > 0 ? smW + kGroupPadX * s : 0.0f)
-                  + kGroupPadX * s;
+        // Inter-zone gap matches the inter-button gap (2dp), only when both zones are present.
+        const float midGap = (bigColW > 0.0f && smW > 0.0f) ? 2.0f * s : 0.0f;
+        content = padX + bigColW + midGap + smW + padX;
     } else {
         // COL_SMALL / COL_LABEL: big cmds degrade into the small-row stack alongside existing smCmds
         float smW = ribbon_smZoneW(grp, grp.bigCmds);
-        content = kGroupPadX * s + smW + kGroupPadX * s;
+        content = padX + smW + padX;
     }
 
     // Defect 2: never narrower than the caption (unless the label is hidden at COL_LABEL).
@@ -1825,6 +1856,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         else if (!smallIsHidden(*cp)) grp.smCmds.push_back(cp);
     }
 
+    // Sketch▸Draw: stack "Rotate Ent." under "Move Ent." (same column) to save horizontal space.
+    for (auto& g : groups) {
+        if (g.label && std::strcmp(g.label, "Draw") == 0)
+            ribbon_preferStackedPair(g.smCmds, "sk_move_entities", "sk_rotate_entities");
+    }
+
     // --- C25-W3G: priority collapse assignment ---
     // Available body width. Reserve the overflow chevron up front so it never lands off-edge once
     // any group has to be hidden. (The sketch Finish/Cancel controls now live inline in the Sketch
@@ -1949,8 +1986,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
         if (!isSmall) {
             // --- BIG layout: big buttons left-to-right, then the small zone in measured columns ---
+            // Inter-button gap ONLY between bigs (not after the last). When a small zone follows,
+            // a matching 2dp mid-gap separates the zones — same math as ribbon_groupNaturalW so
+            // left/right pill padding stays equal.
             float bx = curX + kGroupPadX * s;
-            for (const auto* cmd : grp.bigCmds) {
+            for (int bi = 0; bi < (int)grp.bigCmds.size(); ++bi) {
+                const auto* cmd = grp.bigCmds[bi];
+                if (bi > 0) bx += 2.0f * s;
                 // Finish Sketch: highlighted big button with a dedicated Cancel-only dropdown — NOT
                 // routed through the generic split-button last-used machinery (a plain click must
                 // always finish; only the flyout cancels). Rendered in the New-Sketch slot.
@@ -1960,7 +2002,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     ribbon_bigBtn(cmd->cmd_id, cmd->icon, cmd->label, true, /*hasDrop=*/true,
                                   wStable, /*highlight=*/true, /*finishBadge=*/true);
                     ribbon_sketchFinishFlyout(cmd);
-                    bx += wStable + 2.0f * s;
+                    bx += wStable;
                     continue;
                 }
                 bool drop = ribbon_hasSubs(grp, cmd);
@@ -1972,11 +2014,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 float wStable = ribbon_bigBtnWMax(grp, cmd, drop);
                 ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, ribbon_cmdEnabled(cmd), drop, wStable);
                 if (drop) runFlyout(cmd);
-                bx += wStable + 2.0f * s;
+                bx += wStable;
             }
 
             // small zone: pack into independently-measured columns (defect 1)
             if (!grp.smCmds.empty()) {
+                if (!grp.bigCmds.empty()) bx += 2.0f * s;  // mid-gap between big and small zones
                 std::vector<float> widths;
                 for (const auto* cmd : grp.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
                 auto cols = ribbon_packColumns(widths, rowsPerCol);

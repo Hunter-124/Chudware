@@ -989,7 +989,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (provider == "anthropic") {
                 std::string model = params.value("model",
                                                  std::string(aicad::agent::kAnthropicDefaultModel));
-                req = aicad::agent::anthropic_build_request(model, system, messages, max_tokens);
+                std::string effort = params.value("reasoning_effort", std::string());
+                req = aicad::agent::anthropic_build_request(model, system, messages, max_tokens,
+                                                           effort);
             } else if (provider == "openai" || provider == "llamacpp") {
                 std::string def = provider == "llamacpp" ? std::string("local-gguf")
                                                          : std::string(aicad::agent::kOpenAIDefaultModel);

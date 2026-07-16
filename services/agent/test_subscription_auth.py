@@ -355,6 +355,10 @@ def test_xai_login_403_is_contract_shaped(tmp_config, monkeypatch):
 
 def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
     from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from agent.providers import usage as usage_mod
+
+    # Offline unit test: no live userinfo.
+    monkeypatch.setattr(usage_mod, "_http_get", lambda *a, **k: (404, None, {}))
 
     p = XAISubProvider()
     # Fake JWT with email claim.
@@ -377,6 +381,9 @@ def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
 def test_xai_store_tokens_uuid_only_gets_friendly_name(tmp_config, monkeypatch):
     """JWT with sub UUID and no email still sets a non-UUID display_name."""
     from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from agent.providers import usage as usage_mod
+
+    monkeypatch.setattr(usage_mod, "_http_get", lambda *a, **k: (404, None, {}))
 
     p = XAISubProvider()
     uuid = "06dc3359-aaaa-bbbb-cccc-ddddeeeeffff"
@@ -1074,3 +1081,46 @@ def test_xai_model_hyphen_normalized_in_request_body(tmp_config, monkeypatch):
     assert out == "ok"
     assert captured["body"]["model"] == "grok-4.5"
     assert p.model == "grok-4.5"
+
+
+def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
+    """Read timeout on account A falls through to account B (pool hang)."""
+    from agent.providers import xai_sub_provider as xsp
+
+    xsp.clear_blocked_accounts_for_tests()
+    now = int(time.time() * 1000) + 10 ** 9
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-a", "refresh_token": "r-a",
+        "account_id": "acct-a", "expires_at_ms": now,
+    }, account_id="acct-a", set_active=True)
+    sub_auth.save_credential(xsp.PROVIDER_ID, {
+        "access_token": "tok-b", "refresh_token": "r-b",
+        "account_id": "acct-b", "expires_at_ms": now,
+    }, account_id="acct-b", set_active=False)
+
+    seen: list[str] = []
+
+    def fake_post(self, body):
+        tok = (self._cred or {}).get("access_token")
+        seen.append(tok)
+        if tok == "tok-a":
+            raise TimeoutError("The read operation timed out")
+        return {
+            "choices": [{"message": {"content": "ok-b"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(xsp.XAISubProvider, "_post_once", fake_post)
+    monkeypatch.setattr(xsp.XAISubProvider, "refresh", lambda self: self._cred or {})
+    # No same-account timeout retries in this unit test — rotate immediately.
+    monkeypatch.setenv("AICAD_XAI_READ_TIMEOUT_RETRIES", "0")
+    xsp._reset_request_semaphore_for_tests()
+
+    p = xsp.XAISubProvider()
+    p._cred = sub_auth.load_credential(xsp.PROVIDER_ID, account_id="acct-a")
+    sub_auth.set_active_account(xsp.PROVIDER_ID, "acct-a")
+
+    content, _ = p.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    assert content == "ok-b"
+    assert "tok-a" in seen and "tok-b" in seen
+    assert xsp.is_account_blocked("acct-a") is True

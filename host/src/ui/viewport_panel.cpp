@@ -1181,15 +1181,15 @@ static bool ppProject(const Renderer& renderer, const ImVec2& vr0, const ImVec2&
 }
 
 // Screen-space hit-test for reference datum axes (model mode). Matches Renderer::drawRefDatums
-// half-length L = effectiveSceneRadius and prefers the closest line within a beefed pick band
-// (~10 px * uiScale) so hairline axes stay clickable even when a translucent plane sits in front.
-// Does not re-solve plane pairs — consumes the same refDatums the renderer draws.
+// half-length via refAxisHalfLength (default axes: sceneRadius*1.25; plane-derived auto axes:
+// that * 0.55 so they only cover the user-plane quad) and prefers the closest line within a
+// beefed pick band (~10 px * uiScale) so hairline axes stay clickable even when a translucent
+// plane sits in front. Does not re-solve plane pairs — consumes the same refDatums the renderer
+// draws.
 static bool hitTestRefAxis(const Renderer& renderer, AppState& st, ImVec2 mouse,
                            const ImVec2& vr0, const ImVec2& vr1, int vw, int vh,
                            ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
     (void)vr1;
-    // Must match Renderer::drawRefDatums: axis half-length = sceneRadius * 1.25 (plane extent).
-    const float L = renderer.effectiveSceneRadius() * 1.25f;
     auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
         float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
         float len2 = vx * vx + vy * vy;
@@ -1225,12 +1225,15 @@ static bool hitTestRefAxis(const Renderer& renderer, AppState& st, ImVec2 mouse,
         add("axis.z", "Z Axis", 0, 0, 0, 0, 0, 1);
     }
 
-    // Beefed pick band: ~10 px * uiScale (hairline axes over translucent planes).
+    // Beefed pick band: ~10 px * uiScale (hairline axes over translucent plane fills).
+    // Line wins inside this band before plane-fill hit-testing consumes the click.
     float best = 10.0f * ui::uiScale;
     bool found = false;
     for (const auto& c : cands) {
-        float aW[3] = {c.ox - c.dx * L, c.oy - c.dy * L, c.oz - c.dz * L};
-        float bW[3] = {c.ox + c.dx * L, c.oy + c.dy * L, c.oz + c.dz * L};
+        // Per-axis half-length: default axes use e; axis.auto:* use the user-plane ps.
+        const float half = renderer.refAxisHalfLength(c.id);
+        float aW[3] = {c.ox - c.dx * half, c.oy - c.dy * half, c.oz - c.dz * half};
+        float bW[3] = {c.ox + c.dx * half, c.oy + c.dy * half, c.oz + c.dz * half};
         ImVec2 sa, sb;
         if (!ppProject(renderer, vr0, vr1, vw, vh, aW, sa)) continue;
         if (!ppProject(renderer, vr0, vr1, vw, vh, bW, sb)) continue;
@@ -3206,60 +3209,22 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // ---- datum-plane picker (ref-axis "Two Planes", ref-plane "Mid Plane", …) ----
-        // Runs when a feature PM with an active plane-accepting well is open. Returns true while the
-        // cursor is over an origin datum plane, so the model-pick click below is suppressed (the
-        // plane click routes a datum ref into the well instead). A click that is NOT over an origin
-        // plane still falls through to model picking, so the same well can also take a planar face.
-        // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
-        bool planePickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !originPickHot)
-            planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
-
-        // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
-        // Runs when a feature PM with an active axis-accepting well is open. Returns true while the
-        // cursor is over a displayed datum-axis line, so the model-pick click is suppressed (the
-        // axis click routes a datum ref into the well). A click off any axis still falls through to
-        // the id-buffer, so the same well can still take a straight model edge.
-        bool axisPickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !originPickHot && !planePickerHot)
-            axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
-
-        // ---- datum-point picker (world origin / user point-datum into a point well) ----
-        // T-BL37: runs when a feature PM with an active point-accepting well is open. Highlights
-        // the origin glyph on hover and routes "point.origin" on click. Model-pick is suppressed.
-        // Wave4: origin-priority block above already claims the synthetic origin; this still
-        // covers user-created point-datums (and is a no-op for origin when originPickHot).
-        bool pointPickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !originPickHot && !planePickerHot && !axisPickerHot)
-            pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
-
-        // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
-        // Runs when a feature PM with an active path/centerline well is open. Returns true while the
-        // cursor is over a drawn curve datum, so the model-pick click below is suppressed (the curve
-        // click routes the feature into the path well via routePathFeature).
-        bool curvePickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot)
-            curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
-
-        // ---- general model-mode reference-axis pick (viewport owns this path) ----
-        // Left-click within the beefed axis pick band selects the axis (st.selectedFeatureId)
-        // and keeps it until the user clicks elsewhere. Prefer axis over plane occlusion — hit
-        // test ignores depth. PM axis/plane wells still own their pickers above; sketch entity
-        // picks and origin grab win first. Face/edge model pick is suppressed while axis-hot so
-        // a bare line click doesn't lose to the body under the cursor.
+        // ---- general model-mode reference-axis pick (BEFORE plane fill) ----
+        // Axes are lines; planes are areas. Inside the ~10 px axis band the line wins so a
+        // translucent datum plane never swallows the click. drawPlanePicker / drawDatumSelect
+        // run AFTER this and skip when axisSelectHot. Sketch entity picks and origin grab win first.
         bool axisSelectHot = false;
+        bool axisPickerHot = false;
         {
             auto* pm = st.propertyManager;
-            const bool pmOwnsDatumPick = pm && pm->active() &&
-                (pm->activeWellWantsAxis() || pm->activeWellWantsPlane());
+            // Only a PM *plane* well owns plane routing. Plain plane-fill select must NOT preempt
+            // axis hits — that was the "can't click axis through a plane" bug (drawPlanePicker
+            // returned hot over the whole quad).
+            const bool pmOwnsPlaneWell = pm && pm->active() && pm->activeWellWantsPlane();
+            const bool pmOwnsAxisWell  = pm && pm->active() && pm->activeWellWantsAxis();
             if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
                 !s_viewSelector.active() && !s_lmbDragActive && !originPickHot &&
-                !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot &&
-                !pmOwnsDatumPick && !s_pp.active && !s_dim.active) {
+                !pmOwnsAxisWell && !pmOwnsPlaneWell && !s_pp.active && !s_dim.active) {
                 ImVec2 a, b;
                 std::string fid, name;
                 if (hitTestRefAxis(renderer, st, io.MousePos, vr0, vr1, vw, vh, a, b, fid, name)) {
@@ -3282,7 +3247,44 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                 }
             }
+            // PM axis well: run axis picker HERE (before plane fill) so a plane quad never
+            // steals the ~10 px axis band while routing into the well.
+            if (pmOwnsAxisWell && sketch != nullptr && !inSketch && !inSketch3d &&
+                !st.sketchPlanePickActive && !originPickHot)
+                axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
         }
+
+        // ---- datum-plane picker (feature PM well OR plain graphics-area select) ----
+        // Runs when a feature PM with an active plane-accepting well is open, OR for plain
+        // plane select. Suppressed while an axis is hot so plane fill never steals the band.
+        // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
+        bool planePickerHot = false;
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !axisSelectHot && !axisPickerHot)
+            planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
+        // Already handled above when a PM axis well is open. Non-well path keeps a no-op call
+        // site for any future non-PM axis-picker consumers (currently always false without a well).
+        if (!axisPickerHot && sketch != nullptr && !inSketch && !inSketch3d &&
+            !st.sketchPlanePickActive && !originPickHot && !planePickerHot)
+            axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- datum-point picker (world origin / user point-datum into a point well) ----
+        // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
+        bool pointPickerHot = false;
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !planePickerHot && !axisPickerHot)
+            pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
+        // Runs when a feature PM with an active path/centerline well is open. Returns true while the
+        // cursor is over a drawn curve datum, so the model-pick click below is suppressed (the curve
+        // click routes the feature into the path well via routePathFeature).
+        bool curvePickerHot = false;
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot)
+            curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- general datum selection: planes / user points (axes handled above) ----
         // Runs in the normal (non-sketch, no-PM-picker) flow. Skipped while an axis is hot so

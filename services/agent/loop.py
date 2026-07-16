@@ -1832,8 +1832,8 @@ def run_turn(session: Session, request: str, provider: Provider,
     if not error_detail:
         if stop_reason == "max_iters":
             error_detail = (
-                f"Stopped after {len(log)} iterations (cap). Ask me to keep going to "
-                f"continue refining."
+                f"Iteration budget exhausted ({len(log)} of {max_iters} "
+                f"iteration(s)). Ask me to keep going to continue refining."
             )
         elif stop_reason == "failed":
             last_err = ""
@@ -1851,12 +1851,18 @@ def run_turn(session: Session, request: str, provider: Provider,
             )
         elif stop_reason in ("confirmed", "stabilized", "refine_cap"):
             error_detail = ""  # normal completion — leave blank
+        elif stop_reason in ("provider_error", "provider_auth",
+                             "provider_unavailable"):
+            # Provider path already set error_detail; keep empty fallback honest.
+            error_detail = error_detail or f"Provider error ({stop_reason})."
         else:
             error_detail = f"Stopped early ({stop_reason})."
 
     if stop_reason == "max_iters":
-        done_text = (f"Stopped after {len(log)} iterations (cap). Ask me to keep going to "
-                     f"continue refining.")
+        done_text = (
+            f"Iteration budget exhausted ({len(log)} of {max_iters} "
+            f"iteration(s)). Ask me to keep going to continue refining."
+        )
     elif stop_reason in ("failed", "no_code", "provider_error", "provider_auth",
                          "provider_unavailable"):
         done_text = error_detail or (

@@ -52,9 +52,11 @@ CHAT_COMPLETIONS_URL = f"{API_BASE_URL}/chat/completions"
 MODELS_URL = f"{API_BASE_URL}/models"
 PROVIDER_ID = "xai-sub"
 DEFAULT_MODEL = "grok-4.5"
-# Access tokens are short-lived (~6h); refresh up to 1h early like hermes
-# (XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600).
-REFRESH_SKEW_MS = 60 * 60 * 1000
+# Access tokens are short-lived (~6h). Client skew: refresh 5 min early
+# (matches omp ACCESS_TOKEN_CLIENT_SKEW_MS). The previous 1h skew forced
+# refresh while the access JWT was still valid — and a failed refresh
+# (rotated RT not persisted by an external probe) killed usable sessions.
+REFRESH_SKEW_MS = 5 * 60 * 1000
 
 # Concurrent chat-completion cap (mega-2 fingerprint: provider_read_timeout_storm).
 # 5-way SPECIFY fan-out + later pairs hammered xAI with parallel long reads →
@@ -327,7 +329,12 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 
 def _is_rotatable_account_error(exc: BaseException) -> bool:
-    """403 tier/spending + 429 are per-account; try the next signed-in account."""
+    """Per-account failures that should fall through to the next signed-in account.
+
+    Includes: 403 tier/spending/credits, 429 rate limits, usage-limit phrasing.
+    Read timeouts are handled separately: same-account retry first (in
+    ``_complete_once_with_retries``), then rotation in ``complete_ex``.
+    """
     if isinstance(exc, XaiTierDeniedError):
         return True
     if _is_rate_limit_error(exc):
@@ -339,9 +346,18 @@ def _is_rotatable_account_error(exc: BaseException) -> bool:
         "spending-limit",
         "spending limit",
         "run out of credits",
+        "out of credits",
         "need a grok subscription",
+        "usage limit",
+        "usage_limit",
+        "quota",
+        "team_blocked",
+        "team blocked",
         "http 403",
         "http 429",
+        "http 503",
+        "http 502",
+        "http 504",
     )
     return any(m in text for m in markers)
 
@@ -778,12 +794,28 @@ class XAISubProvider(Provider):
         except Exception:  # noqa: BLE001
             pass
 
+    def _access_jwt_still_valid(self, *, skew_ms: int = 60_000) -> bool:
+        """True when the access token's JWT ``exp`` is still in the future."""
+        if not self._cred:
+            return False
+        token = str(self._cred.get("access_token") or "")
+        if token.count(".") < 2:
+            return False
+        claims = sub_auth.decode_jwt_payload(token)
+        exp = claims.get("exp")
+        try:
+            exp_f = float(exp)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return exp_f * 1000.0 > (time.time() * 1000.0 + skew_ms)
+
     def _ensure_auth(self) -> None:
         """Ensure *self._cred* is present and not expired (refresh if needed).
 
         On cold restore / multi-account, prefers a non-blocked signed-in account
         over a soft-blocked active pointer. Refresh failures that look
-        per-account (403/429) rotate before giving up.
+        per-account (403/429) rotate before giving up. If refresh fails with
+        invalid_grant but the access JWT is still live, keep using it.
         """
         if not self._cred or not _has_usable_tokens(self._cred):
             picked = pick_usable_account()
@@ -807,11 +839,34 @@ class XAISubProvider(Provider):
         if not sub_auth.is_expired(self._cred, skew_ms=REFRESH_SKEW_MS):
             return
 
+        # Within skew but JWT may still be fully valid — try refresh, fall back.
         try:
             self.refresh()
             return
         except Exception as exc:  # noqa: BLE001
+            if self._access_jwt_still_valid():
+                log.warning(
+                    "xai oauth: refresh failed but access JWT still valid; "
+                    "continuing without refresh: %s",
+                    exc,
+                )
+                return
             if not _is_rotatable_account_error(exc):
+                # Try rotating on invalid_grant too (per-account RT death).
+                text = f"{type(exc).__name__}: {exc}".lower()
+                if (
+                    "invalid_grant" in text
+                    or "revoked" in text
+                    or "re-authenticate" in text
+                ):
+                    failed = _cred_account_id(self._cred)
+                    mark_account_blocked(
+                        failed,
+                        seconds=30 * 60,
+                        reason=f"refresh dead: {exc}"[:120],
+                    )
+                    if self._activate_next_account(failed_id=failed):
+                        return
                 raise
             failed = _cred_account_id(self._cred)
             mark_account_blocked(failed, reason=f"ensure_auth refresh: {exc}"[:120])
@@ -891,7 +946,23 @@ class XAISubProvider(Provider):
         )
         try:
             with urllib.request.urlopen(req, timeout=_read_timeout_s()) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
+                rh = {
+                    k.lower(): v
+                    for k, v in (resp.headers.items() if resp.headers else [])
+                }
+                parsed = json.loads(raw)
+                # Stash rate-limit headers for Settings usage bars (§4.5).
+                try:
+                    from . import usage as usage_mod
+                    usage_mod.record_xai_ratelimit_headers(
+                        self._cred,
+                        rh,
+                        account_id=_cred_account_id(self._cred),
+                    )
+                except Exception:  # noqa: BLE001 — never fail chat on usage persist
+                    pass
+                return parsed
         except urllib.error.HTTPError as exc:
             body_excerpt = exc.read().decode("utf-8", errors="replace")[:400]
             # Attach status for rotation classifiers (urllib HTTPError has .code).
@@ -905,10 +976,14 @@ class XAISubProvider(Provider):
                 )
                 err.status_code = 429  # type: ignore[attr-defined]
                 raise err from exc
-            raise RuntimeError(
+            # Timeouts / 5xx / empty can mean pool exhaustion on SuperGrok —
+            # surface status so multi-account rotation can decide.
+            err = RuntimeError(
                 f"POST {CHAT_COMPLETIONS_URL} returned HTTP {exc.code}: "
                 f"{body_excerpt}"
-            ) from exc
+            )
+            err.status_code = int(exc.code)  # type: ignore[attr-defined]
+            raise err from exc
 
     def _complete_once_with_retries(
         self,
@@ -1051,11 +1126,19 @@ class XAISubProvider(Provider):
                 break
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                if not _is_rotatable_account_error(exc):
+                # Same-account retries already exhausted inside
+                # _complete_once_with_retries. Rotate on per-account limits OR
+                # read timeouts (SuperGrok often hangs instead of returning 429).
+                rotatable = _is_rotatable_account_error(exc) or _is_read_timeout(exc)
+                if not rotatable:
                     raise
+                if _is_rate_limit_error(exc) or _is_read_timeout(exc):
+                    block_s = 5 * 60
+                else:
+                    block_s = None  # default 15 min for tier/spend
                 mark_account_blocked(
                     aid,
-                    seconds=5 * 60 if _is_rate_limit_error(exc) else None,
+                    seconds=block_s,
                     reason=str(exc)[:120],
                 )
                 if not self._activate_next_account(failed_id=str(aid) if aid != "?" else None):
@@ -1063,7 +1146,7 @@ class XAISubProvider(Provider):
                 continue
 
         if last_exc is not None and resp is None:
-            if _is_rotatable_account_error(last_exc):
+            if _is_rotatable_account_error(last_exc) or _is_read_timeout(last_exc):
                 n = len(tried)
                 detail = str(last_exc)
                 raise XaiTierDeniedError(

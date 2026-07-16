@@ -166,14 +166,42 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     };
 
     // ---- run ONE attempt of a stage ----
+    // Tracks the latest failure reason so a budget-exhaust terminal can surface the
+    // real provider HTTP error on the phase card instead of "budget exhausted (N)".
+    std::string last_fail_reason;
+    bool last_was_provider_error = false;
+    // Run-level provider error (MODEL stage terminal) — returned as stop_reason.
+    std::string run_provider_error;
+
+    auto looks_like_provider_error = [](const StageOutcome& o) -> bool {
+        // Stage actions (run.cpp) tag provider failures as:
+        //   reason = "provider error: <detail>"
+        //   error  = "<stage>: <detail>"  / has_error=true
+        // Also match concise_http_error shapes ("… HTTP 400: …").
+        auto has = [](const std::string& s, const char* needle) {
+            return s.find(needle) != std::string::npos;
+        };
+        if (has(o.reason, "provider error")) return true;
+        if (o.has_error && (has(o.error, " HTTP ") || has(o.error, "provider error") ||
+                            has(o.error, "HTTP 4") || has(o.error, "HTTP 5")))
+            return true;
+        if (has(o.reason, " HTTP ") &&
+            (has(o.reason, "HTTP 4") || has(o.reason, "HTTP 5") || has(o.reason, "rate limit") ||
+             has(o.reason, "daily quota")))
+            return true;
+        return false;
+    };
+
     auto run_attempt = [&](const std::string& stage, const Action& action, const std::string& role,
                            int attempt, int budget) -> std::string {
         if (cancelled()) return "cancelled";
         if (over_global_cap()) {
+            last_fail_reason = "global iteration cap reached";
+            last_was_provider_error = false;
             events.emit("stage_result", json{{"stage", stage},
                                              {"attempt", attempt},
                                              {"verdict", "fail"},
-                                             {"reason", "global iteration cap reached"}});
+                                             {"reason", last_fail_reason}});
             return "fail";
         }
         state.ledger.bump(stage);
@@ -186,17 +214,42 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         if (outcome.has_error) {
             int streak = state.ledger.note_sig(stage, err_sig(outcome.error));
             if (streak >= kSameSigLimit) {
+                last_fail_reason =
+                    "identical failure x" + std::to_string(streak) + ": " + err_sig(outcome.error);
+                last_was_provider_error = looks_like_provider_error(outcome);
+                // Prefer the raw provider message on the phase card when it's a provider error.
+                std::string reason = last_was_provider_error && !outcome.reason.empty()
+                                         ? outcome.reason
+                                         : last_fail_reason;
+                if (last_was_provider_error) {
+                    last_fail_reason = reason;
+                    run_provider_error = reason;
+                }
                 events.emit("stage_result",
                             json{{"stage", stage},
                                  {"attempt", attempt},
                                  {"verdict", "fail"},
-                                 {"reason", "identical failure x" + std::to_string(streak) + ": " +
-                                                err_sig(outcome.error)}});
-                return "fail";
+                                 {"reason", reason},
+                                 {"stop_reason", last_was_provider_error ? "provider_error"
+                                                                        : "identical_failure"}});
+                return last_was_provider_error ? "provider_error" : "fail";
             }
         } else {
             state.ledger.note_sig(stage, "");
         }
+
+        // Remember the latest provider-facing reason so a budget-exhaust terminal
+        // can re-emit it instead of "budget exhausted (N)".
+        if (looks_like_provider_error(outcome)) {
+            last_was_provider_error = true;
+            last_fail_reason = !outcome.reason.empty()
+                                   ? outcome.reason
+                                   : (outcome.has_error ? outcome.error : std::string("provider error"));
+        } else {
+            last_was_provider_error = false;
+            last_fail_reason = outcome.reason;
+        }
+
         events.emit("stage_result", json{{"stage", stage},
                                          {"attempt", attempt},
                                          {"verdict", outcome.verdict},
@@ -208,17 +261,34 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     auto run_stage = [&](const std::string& stage, const Action& action,
                          const std::string& role) -> std::string {
         int budget = budget_of(stage);
+        last_fail_reason.clear();
+        last_was_provider_error = false;
         for (int attempt = 1; attempt <= budget; ++attempt) {
             std::string v = run_attempt(stage, action, role, attempt, budget);
-            if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip") return v;
+            if (v == "cancelled" || v == "pass" || v == "fail" || v == "skip" ||
+                v == "provider_error")
+                return v;
             // v == "retry"
             if (attempt >= budget) {
+                // Provider/API failures must NOT masquerade as a budget problem — the GUI
+                // phase card renders stage_result.reason. Surface the real HTTP error.
+                std::string reason;
+                if (last_was_provider_error && !last_fail_reason.empty()) {
+                    reason = last_fail_reason;
+                } else {
+                    reason = "stage retry budget exhausted (" + std::to_string(attempt) + " of " +
+                             std::to_string(budget) + ")";
+                    if (!last_fail_reason.empty()) reason += ": " + last_fail_reason;
+                }
                 events.emit("stage_result",
                             json{{"stage", stage},
                                  {"attempt", attempt},
                                  {"verdict", "fail"},
-                                 {"reason", "budget exhausted (" + std::to_string(budget) + ")"}});
-                return "fail";
+                                 {"reason", reason},
+                                 {"stop_reason", last_was_provider_error ? "provider_error"
+                                                                        : "budget_exhausted"}});
+                if (last_was_provider_error) run_provider_error = reason;
+                return last_was_provider_error ? "provider_error" : "fail";
             }
         }
         return "fail";
@@ -265,6 +335,11 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         ++step_index;
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
+        if (v == "provider_error")
+            return json{{"status", "failed"},
+                       {"stop_reason", "provider_error"},
+                       {"error_detail", run_provider_error.empty() ? last_fail_reason
+                                                                  : run_provider_error}};
         if (v == "fail") return json{{"status", "failed"}, {"stop_reason", "model_failed"}};
         if (state.last_no_progress) {
             stagnant += 1;
@@ -283,11 +358,11 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         std::string v =
             run_attempt("review", actions.review, "reviewer", review_round, review_budget);
         if (v == "cancelled") return cancel_result();
-        if (v == "pass" || v == "skip" || v == "fail") break;
+        if (v == "pass" || v == "skip" || v == "fail" || v == "provider_error") break;
         // v == "retry": run FIX, then re-review.
         std::string fix_v = run_stage("fix", actions.fix, "fixer");
         if (fix_v == "cancelled") return cancel_result();
-        if (fix_v == "fail") break;
+        if (fix_v == "provider_error" || fix_v == "fail") break;
     }
 
     // ---- MEMORY ----

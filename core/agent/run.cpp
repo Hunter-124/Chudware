@@ -848,15 +848,26 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                                     /*dwell_ms=*/0, /*note=*/"", consent);
     }
 
-    events.emit("run_finished", json{{"status", result["status"]},
-                                     {"stop_reason", result["stop_reason"]},
-                                     {"revision", revision}});
+    {
+        json fin = json{{"status", result["status"]},
+                       {"stop_reason", result["stop_reason"]},
+                       {"revision", revision}};
+        // Surface provider HTTP detail on the phase card (never "budget exhausted").
+        if (result.contains("error_detail") && result["error_detail"].is_string() &&
+            !result["error_detail"].get<std::string>().empty())
+            fin["error_detail"] = result["error_detail"];
+        events.emit("run_finished", fin);
+    }
 
-    return json{{"run_id", run_id},
-                {"status", result["status"]},
-                {"stop_reason", result["stop_reason"]},
-                {"revision", revision},
-                {"doc_id", state.doc_id}};
+    json out = json{{"run_id", run_id},
+                    {"status", result["status"]},
+                    {"stop_reason", result["stop_reason"]},
+                    {"revision", revision},
+                    {"doc_id", state.doc_id}};
+    if (result.contains("error_detail") && result["error_detail"].is_string() &&
+        !result["error_detail"].get<std::string>().empty())
+        out["error_detail"] = result["error_detail"];
+    return out;
 }
 
 json run_assembly_design(const std::string& request, const std::string& doc_id,

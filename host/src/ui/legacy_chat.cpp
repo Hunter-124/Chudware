@@ -430,6 +430,85 @@ static ImRect endGlassBubble(const GlassBubble& b) {
     return ImRect(b.origin, p1);
 }
 
+// ---- chat copy/paste affordances ---------------------------------------------------------------
+// Right-click any bubble/card → "Copy text" / "Copy all" via ImGui::SetClipboardText. Optional
+// hover copy glyph on assistant/error prose. Context-menu on EVERY element is the required
+// baseline; selectable InputTextMultiline is used only where wrapping is already handled.
+static void chatOpenCopyPopup(const ImRect& rect, const char* popupId) {
+    if (ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false) &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        ImGui::OpenPopup(popupId);
+}
+
+static void chatDrawCopyPopup(const char* popupId, const std::string& copyText,
+                              const std::string& copyAll = {}) {
+    if (!ImGui::BeginPopup(popupId)) return;
+    const std::string& text = copyText;
+    const std::string& all  = copyAll.empty() ? copyText : copyAll;
+    if (ImGui::MenuItem("Copy text", nullptr, false, !text.empty()))
+        ImGui::SetClipboardText(text.c_str());
+    if (ImGui::MenuItem("Copy all", nullptr, false, !all.empty()))
+        ImGui::SetClipboardText(all.c_str());
+    ImGui::EndPopup();
+}
+
+// Tiny top-right "copy" glyph on hover of assistant/error bubbles (cheap, no atlas dependency).
+static void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
+    if (text.empty()) return;
+    if (!ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false)) return;
+    const float sc = ui::uiScale;
+    const float sz = 14.0f * sc;
+    const float pad = 4.0f * sc;
+    const ImVec2 mn(rect.Max.x - sz - pad, rect.Min.y + pad);
+    const ImVec2 mx(mn.x + sz, mn.y + sz);
+    // Hit target so a click copies without needing the context menu. Restore layout cursor
+    // afterwards so the glyph never opens a gap under the bubble.
+    const ImVec2 saved = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(mn);
+    ImGui::InvisibleButton("##chat_copy_glyph", ImVec2(sz, sz));
+    const bool hov = ImGui::IsItemHovered();
+    const bool clk = ImGui::IsItemClicked();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float a = hov ? 0.95f : 0.55f;
+    const ImU32 col = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textSecondary.x, surf.textSecondary.y, surf.textSecondary.z, a));
+    if (hov)
+        dl->AddRectFilled(mn, mx,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
+                                                  surf.textPrimary.z, 0.12f)),
+            ui::metrics::rounding(3.0f));
+    // Two overlapping rounded rects = clipboard glyph.
+    const float r = 1.6f * sc;
+    const float inset = 2.6f * sc;
+    dl->AddRect(ImVec2(mn.x + inset + 1.2f * sc, mn.y + inset - 0.6f * sc),
+                ImVec2(mx.x - inset + 1.2f * sc, mx.y - inset - 0.6f * sc), col, r, 0,
+                ui::metrics::stroke(1.1f));
+    dl->AddRect(ImVec2(mn.x + inset - 1.2f * sc, mn.y + inset + 0.8f * sc),
+                ImVec2(mx.x - inset - 1.2f * sc, mx.y - inset + 0.8f * sc), col, r, 0,
+                ui::metrics::stroke(1.1f));
+    if (hov) ImGui::SetTooltip("Copy");
+    if (clk) ImGui::SetClipboardText(text.c_str());
+    ImGui::SetCursorScreenPos(saved);
+}
+
+// Compose a flat copy string for an activity / tool card.
+static std::string chatActivityCopyText(const ActivityItem& a) {
+    std::string out;
+    if (!a.title.empty()) out = a.title;
+    if (!a.reason.empty()) {
+        if (!out.empty()) out += "\n";
+        out += a.reason;
+    }
+    if (!a.detail.empty() && a.detail != a.reason) {
+        if (!out.empty()) out += "\n";
+        out += a.detail;
+    }
+    if (out.empty() && !a.stage.empty()) out = a.stage;
+    return out;
+}
+
+
 // The build-plan card: a glass panel listing each planned part with its purpose, committed
 // dimensions (mono) and feature bullets — plus a live status tick per part (spins while the
 // matching orchestrator stage runs, checks when it passes), so it doubles as the todo checklist.
@@ -1242,7 +1321,10 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         drawProseBox("##thinkdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
 
     ImGui::EndChild();
-    endGlassBubble(gb);
+    ImRect thinkRect = endGlassBubble(gb);
+    const std::string thinkCopy = chatActivityCopyText(a);
+    chatOpenCopyPopup(thinkRect, "##think_copy");
+    chatDrawCopyPopup("##think_copy", thinkCopy);
 }
 
 // A glass action card for a tool call / orchestrator build stage: status glyph + tool icon + human
@@ -1343,6 +1425,11 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
         ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                             8.0f * sc, 0, ui::metrics::stroke(1.5f));
     }
+    {
+        const std::string copyTxt = chatActivityCopyText(a);
+        chatOpenCopyPopup(cardRect, "##act_copy");
+        chatDrawCopyPopup("##act_copy", copyTxt);
+    }
 }
 
 // ============================ M12-M14: inline transparency rows ============================
@@ -1371,6 +1458,11 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::TextWrapped("%s", line.c_str());
     ImGui::PopStyleColor();
     ImGui::PopFont();
+    {
+        const ImRect chipRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        chatOpenCopyPopup(chipRect, "##ctx_copy");
+        chatDrawCopyPopup("##ctx_copy", line);
+    }
 }
 
 // M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) the box
@@ -1414,7 +1506,10 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         ImGui::PopStyleColor();
     }
     ImGui::EndChild();
-    endGlassBubble(gb);
+    ImRect thoughtRect = endGlassBubble(gb);
+    const std::string thoughtCopy = chatActivityCopyText(a);
+    chatOpenCopyPopup(thoughtRect, "##thought_copy");
+    chatDrawCopyPopup("##thought_copy", thoughtCopy);
 }
 
 // M14 — one inline row per tool call: ok/fail glyph + tool icon + tool name + latency, with the
@@ -1475,6 +1570,11 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
         ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
                                             ui::Palette::toU32(pal.statusErr),
                                             8.0f * sc, 0, ui::metrics::stroke(1.5f));
+    {
+        const std::string toolCopy = chatActivityCopyText(a);
+        chatOpenCopyPopup(rowRect, "##tool_copy");
+        chatDrawCopyPopup("##tool_copy", toolCopy);
+    }
 }
 
 // The agent timeline: dispatch each activity row to a thinking block or an action card, computing
@@ -2174,14 +2274,17 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Body only — the "You" author label lives in the footer row under the bubble.
+    const std::string userBody = stripMdMarks(m.text);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+    ImGui::TextWrapped("%s", userBody.c_str());
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImRect bubble = endGlassBubble(gb);
     ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
         ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
         8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
+    chatOpenCopyPopup(bubble, "##umsg_copy");
+    chatDrawCopyPopup("##umsg_copy", userBody);
 
     // Footer row: "You" (left) + ◁◁ rewind / pencil edit (right). Tight under the bubble.
     {
@@ -2197,14 +2300,13 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
         const float gap = 4.0f * sc;
         const float totalBtnW = showBtns ? (btnSz + gap + btnSz) : 0.0f;
 
-        // Sit flush under the bubble's bottom edge (1px-scale hairline gap only).
-        ImGui::Dummy(ImVec2(0, 1.0f * sc));
+        // Nearly touch the bubble bottom (~2-3px * uiScale) — no default ItemSpacing gap.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+        // Pin the footer flush under the bubble in screen space so scroll/layout can't open a gap.
+        ImGui::SetCursorScreenPos(ImVec2(bubble.Min.x, bubble.Max.y + 2.5f * sc));
 
-        // Align the footer to the bubble's left edge (same indent as the bubble).
         const float winX = ImGui::GetWindowPos().x - ImGui::GetCurrentWindow()->Scroll.x;
-        const float leftX = bubble.Min.x - winX;
-        ImGui::SetCursorPosX(std::max(0.0f, leftX));
-
         // Capture the start of the row so we can place buttons on the same line, right-aligned.
         const float rowStartY = ImGui::GetCursorPosY();
         const float rowStartX = ImGui::GetCursorPosX();
@@ -2283,6 +2385,7 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
                     ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
             }
         }
+        ImGui::PopStyleVar();  // ItemSpacing.y = 0 for the tight footer
     }
 
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
@@ -2313,15 +2416,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
     // contract H5) keeps body copy legible over the live viewport blur.
     if (!m.text.empty() && m.errKind == ERR_NONE) {
+        const std::string prose = stripMdMarks(m.text);
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           4.0f);
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+        ImGui::TextWrapped("%s", prose.c_str());
         ImGui::PopStyleColor();
         ImGui::EndChild();
-        endGlassBubble(gb);
+        ImRect proseRect = endGlassBubble(gb);
+        chatOpenCopyPopup(proseRect, "##prose_copy");
+        chatDrawCopyPopup("##prose_copy", prose);
+        chatHoverCopyGlyph(proseRect, prose);
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     }
 
@@ -2375,9 +2482,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (8) Error block — a distinct red-bordered glass card carrying the real reason (DESIGN §5).
-    // When the agent stream carried stop_reason / error_detail (stashed on a hidden
-    // __stop_meta__ activity row by feedTurnActivity), prefer a "stopped: <reason> — <detail>"
-    // lead-in; fall back to the existing prose when those fields are absent.
+    // Prefer full multi-line detail from stop_reason / error_detail (stashed on a hidden
+    // __stop_meta__ activity row by feedTurnActivity). When detail is absent, keep m.text.
     if (m.errKind != ERR_NONE && !m.text.empty()) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
@@ -2386,36 +2492,58 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             errorDetail = !a.detail.empty() ? a.detail : a.reason;
             break;
         }
-        std::string body = m.text;
-        if (!stopReason.empty() || !errorDetail.empty()) {
-            // Build "stopped: <reason> — <detail>" lead-in.
-            std::string lead = "stopped: ";
-            lead += stopReason.empty() ? "unknown" : stopReason;
-            if (!errorDetail.empty()) {
-                lead += " \xe2\x80\x94 ";  // em dash
-                lead += errorDetail;
-            }
-            // If the body is the generic early-stop fallback, replace its parenthetical why
-            // with the richer lead; otherwise prepend the lead above the existing prose.
-            const char* kFallback = "I stopped before fully finishing";
-            if (body.find(kFallback) != std::string::npos) {
-                // Keep the guidance after the first sentence when present.
-                std::string rest;
-                const size_t dot = body.find(". ");
-                if (dot != std::string::npos && dot + 2 < body.size())
-                    rest = body.substr(dot + 2);
-                body = lead;
-                if (!rest.empty()) {
-                    body += ". ";
-                    body += rest;
-                } else {
-                    body += ".";
-                }
-            } else if (body.find(errorDetail) == std::string::npos &&
-                       body.find(stopReason) == std::string::npos) {
-                body = lead + "\n\n" + body;
-            }
+        // Also surface any failed activity reason strings (phase errors) that aren't already
+        // folded into the meta row — keeps "budget exhausted (1)" from being the only line.
+        std::string phaseErr;
+        for (const auto& a : m.activity) {
+            if (a.stage == "__stop_meta__") continue;
+            if (a.status != "fail" && a.status != "error") continue;
+            std::string bit;
+            if (!a.reason.empty()) bit = a.reason;
+            else if (!a.detail.empty()) bit = a.detail;
+            else if (!a.title.empty()) bit = a.title;
+            if (bit.empty()) continue;
+            if (errorDetail.find(bit) != std::string::npos) continue;
+            if (m.text.find(bit) != std::string::npos) continue;
+            if (!phaseErr.empty()) phaseErr += "\n";
+            phaseErr += bit;
         }
+
+        // Prefer full detail as the primary body when present; otherwise keep m.text.
+        std::string body;
+        if (!stopReason.empty() || !errorDetail.empty()) {
+            body = "stopped: ";
+            body += stopReason.empty() ? "unknown" : stopReason;
+            if (!errorDetail.empty()) {
+                body += "\n";
+                body += errorDetail;
+            }
+            // Keep original prose when it adds guidance beyond the terse stop fields.
+            const std::string plain = stripMdMarks(m.text);
+            if (!plain.empty() && plain != errorDetail &&
+                (errorDetail.empty() || plain.find(errorDetail) == std::string::npos) &&
+                body.find(plain) == std::string::npos) {
+                // Drop the old parenthetical-only early-stop sentence if detail supersedes it.
+                const char* kFallback = "I stopped before fully finishing";
+                if (plain.find(kFallback) == std::string::npos) {
+                    body += "\n\n";
+                    body += plain;
+                } else {
+                    const size_t dot = plain.find(". ");
+                    if (dot != std::string::npos && dot + 2 < plain.size()) {
+                        body += "\n\n";
+                        body += plain.substr(dot + 2);
+                    }
+                }
+            }
+        } else {
+            body = stripMdMarks(m.text);
+        }
+        if (!phaseErr.empty()) {
+            body += "\n\n";
+            body += phaseErr;
+        }
+
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           8.0f);
@@ -2424,15 +2552,18 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // Error tone retuned for the frost so the reason stays readable over any model.
         const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
         ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(ec, chatSurf()));
-        // Selectable + wrapped so the user can copy the reason/detail from the card.
+        // Multi-line wrapped detail; right-click / hover-copy for clipboard.
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextWrapped("%s", stripMdMarks(body).c_str());
+        ImGui::TextWrapped("%s", body.c_str());
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
         ImGui::EndChild();
         ImRect cardRect = endGlassBubble(gb);
         ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                             8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
+        chatOpenCopyPopup(cardRect, "##err_copy");
+        chatDrawCopyPopup("##err_copy", body);
+        chatHoverCopyGlyph(cardRect, body);
     }
 }
 

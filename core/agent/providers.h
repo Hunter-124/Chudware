@@ -48,8 +48,17 @@ struct BuiltRequest {
 extern const char* kAnthropicDefaultModel;  // "claude-opus-4-8"
 // _block(part): text -> {type,text}; image -> {type,source:{type,media_type,data}}.
 json anthropic_block(const json& part);
+// Classify Claude model → "adaptive" | "budget_effort" | "budget" | "none"
+// (mirrors services/agent/providers/anthropic_provider.py thinking_mode_for_model).
+std::string anthropic_thinking_mode_for_model(const std::string& model);
+// Build Anthropic messages.create body. reasoning_effort: low|medium|high|max|xhigh
+// (empty/"auto"/"off" → high). Thinking + output_config.effort are MODEL-AWARE:
+// adaptive (opus/sonnet ≥4.6 / gen5) gets thinking:adaptive + effort; opus 4.5 gets
+// budget_tokens + effort; sonnet/haiku 4.5 get budget_tokens ONLY (effort 400s).
+// The effort-2025-11-24 beta header is attached only when output_config.effort is sent.
 BuiltRequest anthropic_build_request(const std::string& model, const std::string& system,
-                                     const json& messages, int max_tokens);
+                                     const json& messages, int max_tokens,
+                                     const std::string& reasoning_effort = "");
 struct ParsedReply {
     std::string text;
     std::string thinking;

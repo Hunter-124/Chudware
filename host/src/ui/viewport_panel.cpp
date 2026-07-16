@@ -3190,8 +3190,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Runs when a feature PropertyManager with a profile/sections well is open and no sketch is
         // being edited. Returns true while the cursor is over a sketch region, so the model-pick
         // click below is suppressed (a region click must not also select a model face/edge).
+        // Suppressed while Instant3D depth/push-pull is active — dragging the extrude arrow must
+        // not also toggle profile contours under the cursor.
         bool regionPickerHot = false;
-        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !s_dim.active && !s_pp.active)
             regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- Wave4: origin triad pick priority (before any plane hit-test) ----

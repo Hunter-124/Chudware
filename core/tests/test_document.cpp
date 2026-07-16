@@ -2831,3 +2831,50 @@ TEST_CASE("op-path: two concentric circles extrude to an annular washer (untarge
         CHECK(vol < full_disc * 0.99);
     }
 }
+
+// Reverse direction (params.flip): extrude along -plane.normal so the solid sits on the
+// opposite side of the sketch plane. Regression for the GUI "Reverse direction does nothing"
+// report — engine must actually flip, not just toggle a checkbox.
+TEST_CASE("op-path: extrude flip puts solid on the opposite side of the sketch plane") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    using aicad::doc::doc_bbox;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double R = 8.0, D = 20.0;
+
+    auto z_span = [&](bool flip) -> std::pair<double, double> {
+        json nr = doc_new("part", flip ? "FlipY" : "FlipN");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Sk"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+            json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                 {"entity", {{"type", "circle"}, {"center", json::array({0, 0})}, {"radius", R}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "Ex"},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(D)},
+                             {"flip", flip}}},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"}}})}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        for (const auto& fst : resp["rebuild"]["feature_status"])
+            CHECK_MESSAGE(fst.value("ok", false), "feature " << fst.value("id", std::string())
+                          << " failed: " << fst.value("error", json(nullptr)).dump());
+        json bb = doc_bbox(id);
+        REQUIRE(bb.contains("min"));
+        REQUIRE(bb.contains("max"));
+        return {bb["min"][2].get<double>(), bb["max"][2].get<double>()};
+    };
+
+    auto [z0, z1] = z_span(false);
+    auto [zf0, zf1] = z_span(true);
+    MESSAGE("no-flip Z=[" << z0 << "," << z1 << "] flip Z=[" << zf0 << "," << zf1 << "]");
+    // plane.top is Z=0; no-flip grows +Z, flip grows -Z.
+    CHECK(z1 > 0.5 * D);
+    CHECK(z0 > -1.0);                 // sketch face near 0, solid mostly positive
+    CHECK(zf0 < -0.5 * D);
+    CHECK(zf1 < 1.0);                 // solid mostly negative
+    CHECK(z1 - z0 == doctest::Approx(D).epsilon(0.05));
+    CHECK(zf1 - zf0 == doctest::Approx(D).epsilon(0.05));
+}
+

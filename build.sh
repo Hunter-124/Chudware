@@ -15,6 +15,8 @@
 #    ./build.sh app        Same as default.
 #    ./build.sh core       Only the C++ kernel (linux-core preset).
 #    ./build.sh all        core, then host GUI.
+#    ./build.sh wasm       Emscripten WASM host (full app); stages to
+#                          ~/billet-web/app/. Requires emsdk (~/.emsdk).
 #    ./build.sh stage      Deploy the built engine (libaicad.so + Netgen/lib3mf
 #                          sibling .so files) AND the aicad-hostd daemon from
 #                          core/build-occt-linux/bin into services/dist/AI-CAD/
@@ -40,7 +42,53 @@ build_core() { cmake --preset linux-core && cmake --build --preset linux-core; }
 build_app()  {
     cmake -S "$ROOT/host" -B "$ROOT/host/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release
     ninja -C "$ROOT/host/build-linux" Billet
+    # Host dlopens libaicad next to the executable (cpp_core resolve tier 3). Keep it
+    # in sync with the OCCT engine so core fixes (e.g. extrude flip) actually reach the GUI.
+    stage_libaicad_next_to_host
 }
+# Emscripten web client (full app). Sources emsdk, configures host/ with
+# emcmake (CEF off), builds Billet, stages html/js/wasm/data into
+# ~/billet-web/app/ (served by the gateway /app or host/wasm/coop_server.py).
+build_wasm() {
+    local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
+    if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
+        echo "[build] ERROR: emsdk not found at $emsdk_dir (clone+install https://github.com/emscripten-core/emsdk)"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    source "$emsdk_dir/emsdk_env.sh"
+    command -v emcc >/dev/null 2>&1 || { echo "[build] ERROR: emcc not on PATH after sourcing emsdk"; return 1; }
+    command -v emcmake >/dev/null 2>&1 || { echo "[build] ERROR: emcmake not on PATH"; return 1; }
+    echo "[build] emcc: $(emcc -v 2>&1 | head -1)"
+    emcmake cmake -S "$ROOT/host" -B "$ROOT/host/build-wasm" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DAI_CAD_ENABLE_CEF=OFF
+    cmake --build "$ROOT/host/build-wasm" --target Billet
+    local out="$ROOT/host/build-wasm/bin"
+    local stage="${BILLET_WEB_APP:-$HOME/billet-web/app}"
+    mkdir -p "$stage"
+    # Stage the emscripten bundle (html/js/wasm + any .data preload packs).
+    # emcc 6.x with PROXY_TO_PTHREAD embeds workers in Billet.js (no separate
+    # Billet.worker.js); still stage any *worker*.js if a future toolchain emits one.
+    local staged_names=""
+    for f in "$out"/Billet.html "$out"/Billet.js "$out"/Billet.wasm \
+             "$out"/Billet.data "$out"/Billet.worker.js "$out"/*worker*.js; do
+        [ -e "$f" ] || continue
+        local base
+        base="$(basename "$f")"
+        case " $staged_names " in *" $base "*) continue ;; esac
+        cp -f "$f" "$stage/"
+        staged_names="$staged_names $base"
+        echo "[build] staged $base -> $stage/"
+    done
+    # Prefer the canonical shell name index.html for the static server root.
+    if [ -f "$stage/Billet.html" ]; then
+        cp -f "$stage/Billet.html" "$stage/index.html"
+        echo "[build] staged index.html (copy of Billet.html)"
+    fi
+    echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py)"
+}
+
 
 # Full-engine OCCT tree (libaicad.so + aicad-hostd) — the binaries the LIVE
 # daemon actually serves. Not covered by `core` (slim linux-core preset) or
@@ -54,6 +102,29 @@ build_daemon() {
         return 1
     fi
     cmake --build "$ROOT/core/build-occt-linux" --target aicad aicad-hostd
+    stage_libaicad_next_to_host
+}
+
+# Copy the full-engine libaicad.so next to host/build-linux/bin/Billet so the
+# running GUI's in-process cpp_core (resolve tier 3: next to executable) picks up
+# the latest engine. Without this, ./build.sh core/daemon updates trees the host
+# never loads. Atomic tmp+mv — never cp over a live mmap'd .so (SIGBUS risk).
+stage_libaicad_next_to_host() {
+    local src=""
+    if [ -f "$ROOT/core/build-occt-linux/bin/libaicad.so" ]; then
+        src="$ROOT/core/build-occt-linux/bin/libaicad.so"
+    elif [ -f "$ROOT/core/build-linux/bin/libaicad.so" ]; then
+        src="$ROOT/core/build-linux/bin/libaicad.so"
+    else
+        return 0
+    fi
+    local dst_dir="$ROOT/host/build-linux/bin"
+    if [ -d "$dst_dir" ]; then
+        local tmp="$dst_dir/.libaicad.so.staging.$$"
+        cp "$src" "$tmp"
+        mv -f "$tmp" "$dst_dir/libaicad.so"
+        echo "[stage] libaicad.so -> $dst_dir/ (host in-process engine)"
+    fi
 }
 
 # Stage the engine + hostd daemon into services/dist/AI-CAD (the $AI_CAD_DIST
@@ -96,6 +167,7 @@ stage_dist() {
         echo "[stage] $f -> $dst/"
     done
     echo "[stage] staged $staged file(s) from $src"
+    stage_libaicad_next_to_host
 }
 
 case "$MODE" in
@@ -110,10 +182,11 @@ case "$MODE" in
   core)         build_core ;;
   app|default)  build_app ;;
   daemon)       build_daemon ;;
+  wasm)         build_wasm; echo ""; echo "[build] DONE (wasm)."; exit 0 ;;
   all)          build_core; build_app; build_daemon ;;
   stage)        stage_dist; echo ""; echo "[build] DONE (stage)."; exit 0 ;;
   *)
-    echo "[build] ERROR: unknown mode '$MODE' (use: default|app|core|daemon|all|stage|clean)"
+    echo "[build] ERROR: unknown mode '$MODE' (use: default|app|core|daemon|wasm|all|stage|clean)"
     exit 1
     ;;
 esac

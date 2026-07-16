@@ -513,6 +513,12 @@ private:
     // Replaces the prior-frame, ANY-window ImGui::IsAnyItemActive() read that let Enter in unrelated
     // panels commit the PM.
     bool pmWidgetActivePrevFrame_ = false;
+    // After endProfileSelection() (user clicked empty space / non-well UI while picks exist),
+    // skip the always-on "keep a visible well active" re-home so the select session stays ended
+    // until the user re-arms by clicking a well chip or a region. Cleared on any well click /
+    // setProfilePicks.
+    bool suppressWellAutoArm_ = false;
+
 
     // Select-with-AI state. Responses are request-sequenced so a late result from a closed or
     // superseded form cannot patch the wrong command.

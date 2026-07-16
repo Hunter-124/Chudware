@@ -1723,6 +1723,7 @@ void PropertyManager::setProfilePicks(AppState& st, const std::vector<nlohmann::
             o.def->kind == PMFieldKind::FeatureWell)
             o.wellActive = false;
     w->wellActive = true;
+    suppressWellAutoArm_ = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
 }
 
@@ -1733,7 +1734,10 @@ void PropertyManager::endProfileSelection() {
             f.def->kind == PMFieldKind::FeatureWell)
             f.wellActive = false;
     }
+    // Stop the always-on re-home from re-arming next frame (would undo the dismiss).
+    suppressWellAutoArm_ = true;
 }
+
 
 bool PropertyManager::hasActiveSelectorWell() const {
     if (!active_) return false;
@@ -3019,24 +3023,29 @@ void PropertyManager::drawBody(AppState& st) {
     // active, so it never steals a well the user is actively filling. (Lives in drawBody, not
     // draw(), because the tabbed left pane calls drawBody() directly — see layout.cpp.)
     {
-        bool haveVisibleActive = false;
-        for (const auto& f : fields_)
-            if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
-                fieldVisible(*f.def, fields_)) { haveVisibleActive = true; break; }
-        if (!haveVisibleActive) {
-            PMField* target = nullptr;
-            for (auto& f : fields_) {
-                if (f.def->kind != PMFieldKind::SelectorWell || !fieldVisible(*f.def, fields_))
-                    continue;
-                if (!target) target = &f;                       // fallback: first visible well
-                if (f.picks.empty()) { target = &f; break; }    // prefer the first empty well
-            }
-            if (target) {
-                for (auto& o : fields_)
-                    if (o.def->kind == PMFieldKind::SelectorWell ||
-                        o.def->kind == PMFieldKind::FeatureWell)
-                        o.wellActive = false;
-                target->wellActive = true;
+        // After a deliberate endProfileSelection(), leave wells inactive until the user
+        // re-arms (well chip click / region pick). Without this, the re-home undoes dismiss
+        // every frame and empty-space click appears to do nothing.
+        if (!suppressWellAutoArm_) {
+            bool haveVisibleActive = false;
+            for (const auto& f : fields_)
+                if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+                    fieldVisible(*f.def, fields_)) { haveVisibleActive = true; break; }
+            if (!haveVisibleActive) {
+                PMField* target = nullptr;
+                for (auto& f : fields_) {
+                    if (f.def->kind != PMFieldKind::SelectorWell || !fieldVisible(*f.def, fields_))
+                        continue;
+                    if (!target) target = &f;                       // fallback: first visible well
+                    if (f.picks.empty()) { target = &f; break; }    // prefer the first empty well
+                }
+                if (target) {
+                    for (auto& o : fields_)
+                        if (o.def->kind == PMFieldKind::SelectorWell ||
+                            o.def->kind == PMFieldKind::FeatureWell)
+                            o.wellActive = false;
+                    target->wellActive = true;
+                }
             }
         }
     }
@@ -3232,6 +3241,9 @@ void PropertyManager::drawBody(AppState& st) {
 
     // C37-F: track which Dim field is first/editable for SetKeyboardFocusHere.
     bool firstEditableDimSeen = false;
+    // True if the user clicked any SelectorWell chip this frame (re-arm). Exempts that click
+    // from the post-loop "click elsewhere in PM ends profile select" dismiss.
+    bool wellClickedThisFrame = false;
 
     auto closeGroupCard = [&]() {
         if (!groupCardOpen) return;
@@ -3584,6 +3596,8 @@ void PropertyManager::drawBody(AppState& st) {
                     for (auto& o : fields_)
                         if (o.def->kind == PMFieldKind::SelectorWell) o.wellActive = false;
                     f.wellActive = true;
+                    suppressWellAutoArm_ = false;  // user re-armed a well
+                    wellClickedThisFrame = true;
                 }
                 if (wr.rightClicked) {
                     f.picks.clear(); f.wellDangling = false;
@@ -3631,6 +3645,7 @@ void PropertyManager::drawBody(AppState& st) {
                                 o.def->kind == PMFieldKind::FeatureWell)
                                 o.wellActive = false;
                         reveal->wellActive = true;
+                        suppressWellAutoArm_ = false;
                     }
                 };
                 if (f.def->segmented && labels.size() == 2) {
@@ -3847,6 +3862,17 @@ void PropertyManager::drawBody(AppState& st) {
     if (wantFocusFirstField_) {
         if (firstEditableDimSeen) focusedOnOpen_ = true;
         wantFocusFirstField_ = false;
+    }
+
+    // Click elsewhere in the PM (dim/check/combo/header) while a profile is chosen and the
+    // select session is still armed → end select (keep picks). Well-chip clicks re-arm above
+    // and are exempted. Empty profile well stays armed (first-pick UX).
+    if (!wellClickedThisFrame && hasActiveSelectorWell() && !profilePicks().empty() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive()) {
+        // Hovered window is the PM (or its children) but no well chip claimed the click.
+        endProfileSelection();
     }
 
     // C37-F: Inline preview error block (red text, shown when the last preview RPC failed).

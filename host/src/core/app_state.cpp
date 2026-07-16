@@ -1388,6 +1388,9 @@ void AppState::clearViewportForNewDoc() {
     // W2-ref: axes start clean on tab/new-doc; refilled by inject path next rebuild.
     // Seed default axes as hidden (and into axisDatumIds so force-show works pre-inject).
     axisDatumIds.clear();
+    axisAutoCache.clear();
+    axisInjectPlaneFp.clear();
+    axisDisplayNames.clear();
     // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
     // behavior). The FM eye toggle removes this entry to show it.
     hiddenFeatures.insert("point.origin");

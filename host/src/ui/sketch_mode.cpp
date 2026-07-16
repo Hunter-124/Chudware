@@ -4778,11 +4778,9 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
 // datum-axis picker for feature PM wells (revolve / circular-pattern axis)
 // ---------------------------------------------------------------------------
 
-// Hit-test the displayed datum-axis lines in screen space. Sources:
-//   - user-created axes from docMirror::refDatums (kind=="axis")
-//   - W2-ref synthetic defaults (axis.x/y/z) + auto plane-intersection axes (same geometry
-//     the DocMirror listener injects into the renderer in app.cpp)
-// Returns true + the hovered axis's screen endpoints + feature id/name when the cursor is within the
+// Hit-test the displayed datum-axis lines in screen space. Consumes renderer-injected axes
+// (defaults + auto cache + user) — never re-solves plane pairs. Returns true + the hovered
+// axis's screen endpoints + feature id/name when the cursor is within the
 // pick radius. Shared by the PM axis picker (route into a well) and general datum selection. The
 // endpoints use L = radius*1.6 so the clickable segment coincides with the drawn dashed amber line.
 static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
@@ -4825,74 +4823,19 @@ static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, i
         seen.insert(id);
     };
 
-    // 1) User-created / engine-shipped axes from the mirror.
-    const nlohmann::json& datums = st.docMirror.refDatums();
-    if (datums.is_array()) {
-        for (const auto& d : datums) {
-            if (!d.is_object() || d.value("kind", std::string()) != "axis") continue;
-            const auto& pj = d.contains("point") ? d["point"] : nlohmann::json();
-            const auto& dj = d.contains("dir") ? d["dir"] : nlohmann::json();
-            if (!pj.is_array() || pj.size() < 3 || !dj.is_array() || dj.size() < 3) continue;
-            Vec3 P((float)pj[0].get<double>(), (float)pj[1].get<double>(),
-                   (float)pj[2].get<double>());
-            Vec3 D((float)dj[0].get<double>(), (float)dj[1].get<double>(),
-                   (float)dj[2].get<double>());
-            addCand(d.value("id", std::string()), d.value("name", std::string()), P, D);
-        }
+    // Prefer inject geometry already on the renderer (defaults + auto + user axes).
+    const auto& rds = r.refDatums();
+    bool anyAxis = false;
+    for (const auto& d : rds) {
+        if (d.kind != Renderer::RefDatum::Kind::Axis) continue;
+        anyAxis = true;
+        addCand(d.id, d.name, d.origin, d.dir);
     }
-
-    // 2) Reserved world axes (GUI-synthetic; may already be occupied by a user feature).
-    addCand("axis.x", "X Axis", Vec3(0, 0, 0), Vec3(1, 0, 0));
-    addCand("axis.y", "Y Axis", Vec3(0, 0, 0), Vec3(0, 1, 0));
-    addCand("axis.z", "Z Axis", Vec3(0, 0, 0), Vec3(0, 0, 1));
-
-    // 3) Auto plane-intersection axes — same normals/ids as app.cpp inject
-    //    (front=−Y, top=+Z, right=+X; id "axis.auto:<a>|<b>" with a,b sorted).
-    {
-        struct PlaneSrc { std::string id; std::string name; Vec3 origin; Vec3 normal; };
-        std::vector<PlaneSrc> planes;
-        planes.push_back({"plane.front", "Front", Vec3(0, 0, 0), Vec3(0, -1, 0)});
-        planes.push_back({"plane.top",   "Top",   Vec3(0, 0, 0), Vec3(0,  0, 1)});
-        planes.push_back({"plane.right", "Right", Vec3(0, 0, 0), Vec3(1,  0, 0)});
-        if (datums.is_array()) {
-            for (const auto& d : datums) {
-                if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
-                const std::string pid = d.value("id", std::string());
-                if (pid.empty() || pid == "plane.front" || pid == "plane.top" ||
-                    pid == "plane.right")
-                    continue;
-                const auto& oj = d.contains("origin") ? d["origin"] : nlohmann::json();
-                const auto& nj = d.contains("normal") ? d["normal"] : nlohmann::json();
-                if (!oj.is_array() || oj.size() < 3 || !nj.is_array() || nj.size() < 3) continue;
-                Vec3 o((float)oj[0].get<double>(), (float)oj[1].get<double>(),
-                       (float)oj[2].get<double>());
-                Vec3 n((float)nj[0].get<double>(), (float)nj[1].get<double>(),
-                       (float)nj[2].get<double>());
-                if (length(n) < 1e-9f) continue;
-                planes.push_back({pid, d.value("name", pid), o, normalize(n)});
-            }
-        }
-        const float kParEps = 1e-6f;
-        for (size_t i = 0; i < planes.size(); ++i) {
-            for (size_t j = i + 1; j < planes.size(); ++j) {
-                const PlaneSrc& a = planes[i];
-                const PlaneSrc& b = planes[j];
-                Vec3 dir = cross(a.normal, b.normal);
-                const float dirLen = length(dir);
-                if (dirLen < kParEps) continue;
-                dir = dir * (1.0f / dirLen);
-                const float d1 = dot(a.normal, a.origin);
-                const float d2 = dot(b.normal, b.origin);
-                const float det2 = dirLen * dirLen;
-                Vec3 pt = (cross(b.normal, dir * dirLen) * d1 +
-                           cross(dir * dirLen, a.normal) * d2) * (1.0f / det2);
-                std::string idA = a.id, idB = b.id;
-                if (idB < idA) std::swap(idA, idB);
-                const std::string aid = "axis.auto:" + idA + "|" + idB;
-                const std::string aname = "Axis " + a.name + " \u2229 " + b.name;
-                addCand(aid, aname, pt, dir);
-            }
-        }
+    // Pre-inject / empty-renderer fallback: only predefined X/Y/Z (never re-solve autos).
+    if (!anyAxis) {
+        addCand("axis.x", "X Axis", Vec3(0, 0, 0), Vec3(1, 0, 0));
+        addCand("axis.y", "Y Axis", Vec3(0, 0, 0), Vec3(0, 1, 0));
+        addCand("axis.z", "Z Axis", Vec3(0, 0, 0), Vec3(0, 0, 1));
     }
 
     float best = 9.0f * ui::uiScale;   // pixel pick radius around the line

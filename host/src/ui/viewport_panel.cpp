@@ -2071,6 +2071,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.setHiddenDatums(st.hiddenFeatures);
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }
+        // Planes force-hidden in sketch (grid owns the view). Axes honor hiddenFeatures only —
+        // an unhidden axis stays drawn grey while sketching (no force-hide on sketch enter).
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)
             // Plane-pick: the hovered plane (from last frame's overlay hit-test) gets the

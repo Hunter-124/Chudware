@@ -244,6 +244,10 @@ public:
         std::string name;
     };
     void setRefDatums(std::vector<RefDatum> datums) { refDatums_ = std::move(datums); }
+    // Read-only view of currently injected reference datums (axes/planes/points/…). Used by
+    // hit-testing / PM routing so they consume the same geometry inject already solved — never
+    // re-pair planes on the pick path.
+    const std::vector<RefDatum>& refDatums() const { return refDatums_; }
     // True when a datum with this feature id is currently loaded (e.g. "point.origin", injected on
     // every doc rebuild). Lets screen-space overlays (the origin +X/+Y/+Z labels) gate on the same
     // set drawRefDatums draws from, so labels never float without their geometry.

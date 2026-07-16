@@ -1121,6 +1121,19 @@ struct AppState {
     // viewport to FORCE-SHOW every axis while a Revolve/axis PropertyManager well is active,
     // and by the FeatureManager to list them under References. Recomputed each rebuild.
     std::unordered_set<std::string> axisDatumIds;
+    // Cached auto plane-intersection axes (USER planes only; reserved pairs map to axis.x/y/z).
+    // Recomputed only when the user-plane set fingerprint changes — hitTest/route consume this
+    // (or renderer refDatums) and never re-solve plane pairs.
+    struct AutoAxisCache {
+        std::string id;    // axis.auto:<a>|<b> sorted
+        std::string name;
+        float origin[3];
+        float dir[3];
+    };
+    std::vector<AutoAxisCache> axisAutoCache;
+    std::string axisInjectPlaneFp;  // fingerprint of user planes that built axisAutoCache
+    // Tree display-name cache: id -> display name, rebuilt when axisDatumIds membership changes.
+    std::unordered_map<std::string, std::string> axisDisplayNames;
     // W2-ref: one-shot request to animate Zoom-to-Fit after the next real mesh commit for the
     // active doc (set on file open / new doc; consumed + cleared once by the viewport when
     // geometry with a known model radius exists, so rebuilds/tab switches never re-fit).

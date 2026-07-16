@@ -3619,64 +3619,24 @@ void drawFeatureTreeBody(AppState& st,
             // W2-ref: default X/Y/Z axes + every other axis in st.axisDatumIds (auto plane-
             // intersection + user-created) under a collapsible Axes folder inside Reference.
             // Eyes write hiddenFeatures; body click selects / routes into an active axis well.
-            // Axes no longer appear in Features.
+            // Axes no longer appear in Features. Names come from st.axisDisplayNames (rebuilt
+            // on inject when membership changes) — no per-frame tree.features scan.
             {
                 struct AxisRow { std::string id; std::string name; };
                 std::vector<AxisRow> axes;
-                axes.push_back({"axis.x", "X Axis"});
-                axes.push_back({"axis.y", "Y Axis"});
-                axes.push_back({"axis.z", "Z Axis"});
+                axes.reserve(st.axisDatumIds.size() + 3);
+                auto displayName = [&](const std::string& id, const char* fallback) -> std::string {
+                    auto it = st.axisDisplayNames.find(id);
+                    if (it != st.axisDisplayNames.end() && !it->second.empty()) return it->second;
+                    return fallback ? std::string(fallback) : id;
+                };
+                axes.push_back({"axis.x", displayName("axis.x", "X Axis")});
+                axes.push_back({"axis.y", displayName("axis.y", "Y Axis")});
+                axes.push_back({"axis.z", displayName("axis.z", "Z Axis")});
                 // Auto + user axes currently injected (skip the three defaults already listed).
                 for (const auto& aid : st.axisDatumIds) {
                     if (aid == "axis.x" || aid == "axis.y" || aid == "axis.z") continue;
-                    std::string name = aid;
-                    if (aid.rfind("axis.auto:", 0) == 0) {
-                        // "axis.auto:<a>|<b>" → "Axis <a> ∩ <b>" with short reserved labels.
-                        auto shortPlane = [](std::string p) -> std::string {
-                            if (p == "plane.front") return "Front";
-                            if (p == "plane.top")   return "Top";
-                            if (p == "plane.right") return "Right";
-                            // Prefer the feature's display name when it's a user plane.
-                            return p;
-                        };
-                        const std::string pair = aid.substr(std::string("axis.auto:").size());
-                        const auto bar = pair.find('|');
-                        if (bar != std::string::npos) {
-                            std::string a = pair.substr(0, bar), b = pair.substr(bar + 1);
-                            // Resolve user-plane names from the live tree when possible.
-                            auto planeName = [&](const std::string& pid) -> std::string {
-                                if (pid == "plane.front" || pid == "plane.top" ||
-                                    pid == "plane.right")
-                                    return shortPlane(pid);
-                                if (tree.is_object() && tree.contains("features") &&
-                                    tree["features"].is_array()) {
-                                    for (const auto& f : tree["features"]) {
-                                        if (!f.is_object()) continue;
-                                        if (jfld(f, "id") == pid) {
-                                            std::string n = jfld(f, "name");
-                                            return n.empty() ? pid : n;
-                                        }
-                                    }
-                                }
-                                return pid;
-                            };
-                            name = "Axis " + planeName(a) + " \u2229 " + planeName(b);
-                        }
-                    } else {
-                        // User-created axis feature: prefer its feature name.
-                        if (tree.is_object() && tree.contains("features") &&
-                            tree["features"].is_array()) {
-                            for (const auto& f : tree["features"]) {
-                                if (!f.is_object()) continue;
-                                if (jfld(f, "id") == aid) {
-                                    std::string n = jfld(f, "name");
-                                    if (!n.empty()) name = n;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    axes.push_back({aid, name});
+                    axes.push_back({aid, displayName(aid, aid.c_str())});
                 }
                 // Stable order: defaults first (already), then auto, then others by id.
                 std::stable_sort(axes.begin() + 3, axes.end(),

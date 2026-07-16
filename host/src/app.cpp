@@ -1450,6 +1450,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             }
             // W2-ref: inject default X/Y/Z axes + auto plane-intersection axes (GUI-synthetic,
             // like point.origin). User axis features already present in refDatums win on id.
+            // Default axis.x/y/z are PREDEFINED constants — never "solved". Reserved plane-pair
+            // intersections ARE those three axes; never emit axis.auto for reserved-only pairs.
+            // User-plane auto axes are cached by plane-set fingerprint (skip O(P²) when unchanged).
             {
                 std::unordered_set<std::string> occupied;
                 for (const auto& rd : rds)
@@ -1468,24 +1471,22 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     occupied.insert(id);
                 };
 
-                // Reserved world axes through origin (contracts/doc_schema.md §5).
+                // Reserved world axes through origin (contracts/doc_schema.md §5) — constants.
                 pushAxis("axis.x", "X Axis", Vec3(0, 0, 0), Vec3(1, 0, 0));
                 pushAxis("axis.y", "Y Axis", Vec3(0, 0, 0), Vec3(0, 1, 0));
                 pushAxis("axis.z", "Z Axis", Vec3(0, 0, 0), Vec3(0, 0, 1));
 
-                // Planes for pairwise intersection: 3 reserved + every kind==plane in mirror.
-                // Normals match document.cpp / doc_schema (front=−Y, top=+Z, right=+X).
-                struct PlaneSrc { std::string id; std::string name; Vec3 origin; Vec3 normal; };
-                std::vector<PlaneSrc> planes;
-                planes.push_back({"plane.front", "Front", Vec3(0, 0, 0), Vec3(0, -1, 0)});
-                planes.push_back({"plane.top",   "Top",   Vec3(0, 0, 0), Vec3(0,  0, 1)});
-                planes.push_back({"plane.right", "Right", Vec3(0, 0, 0), Vec3(1,  0, 0)});
+                // User planes only for the auto-axis fingerprint. Reserved Front/Top/Right are
+                // pair partners for user planes but never pair with each other as axis.auto
+                // (those three intersections are axis.x/y/z).
+                struct PlaneSrc { std::string id; std::string name; Vec3 origin; Vec3 normal; bool reserved = false; };
+                std::vector<PlaneSrc> userPlanes;
                 for (const auto& d : st.docMirror.refDatums()) {
                     if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
                     const std::string pid = d.value("id", std::string());
                     if (pid.empty() || pid == "plane.front" || pid == "plane.top" ||
                         pid == "plane.right")
-                        continue;  // reserved already seeded
+                        continue;
                     PlaneSrc ps;
                     ps.id     = pid;
                     ps.name   = d.value("name", pid);
@@ -1493,30 +1494,73 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     ps.normal = v3(d.value("normal", nlohmann::json()), Vec3(0, 0, 1));
                     if (length(ps.normal) < 1e-9f) continue;
                     ps.normal = normalize(ps.normal);
-                    planes.push_back(std::move(ps));
+                    userPlanes.push_back(std::move(ps));
                 }
 
-                const float kParEps = 1e-6f;
-                for (size_t i = 0; i < planes.size(); ++i) {
-                    for (size_t j = i + 1; j < planes.size(); ++j) {
-                        const PlaneSrc& a = planes[i];
-                        const PlaneSrc& b = planes[j];
-                        Vec3 dir = cross(a.normal, b.normal);
-                        const float dirLen = length(dir);
-                        if (dirLen < kParEps) continue;  // parallel — no unique line
-                        dir = dir * (1.0f / dirLen);
-                        // Plane-plane line: n·x = n·o for each; point in n_a/n_b span.
-                        const float d1 = dot(a.normal, a.origin);
-                        const float d2 = dot(b.normal, b.origin);
-                        const float det2 = dirLen * dirLen;
-                        Vec3 pt = (cross(b.normal, dir * dirLen) * d1 +
-                                   cross(dir * dirLen, a.normal) * d2) * (1.0f / det2);
-                        std::string idA = a.id, idB = b.id;
-                        if (idB < idA) std::swap(idA, idB);
-                        const std::string aid = "axis.auto:" + idA + "|" + idB;
-                        const std::string aname = "Axis " + a.name + " \u2229 " + b.name;
-                        pushAxis(aid, aname, pt, dir);
+                // Fingerprint = sorted "id@ox,oy,oz,nx,ny,nz" joined with ';' for user planes.
+                std::vector<std::string> fpParts;
+                fpParts.reserve(userPlanes.size());
+                for (const auto& p : userPlanes) {
+                    char buf[192];
+                    std::snprintf(buf, sizeof(buf),
+                                  "%s@%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+                                  p.id.c_str(),
+                                  (double)p.origin.x, (double)p.origin.y, (double)p.origin.z,
+                                  (double)p.normal.x, (double)p.normal.y, (double)p.normal.z);
+                    fpParts.emplace_back(buf);
+                }
+                std::sort(fpParts.begin(), fpParts.end());
+                std::string fp;
+                for (size_t i = 0; i < fpParts.size(); ++i) {
+                    if (i) fp += ';';
+                    fp += fpParts[i];
+                }
+
+                if (fp != st.axisInjectPlaneFp) {
+                    // Recompute: reserved + user, skip reserved-only pairs and parallel pairs.
+                    st.axisAutoCache.clear();
+                    std::vector<PlaneSrc> planes;
+                    planes.reserve(3 + userPlanes.size());
+                    planes.push_back({"plane.front", "Front", Vec3(0, 0, 0), Vec3(0, -1, 0), true});
+                    planes.push_back({"plane.top",   "Top",   Vec3(0, 0, 0), Vec3(0,  0, 1), true});
+                    planes.push_back({"plane.right", "Right", Vec3(0, 0, 0), Vec3(1,  0, 0), true});
+                    for (const auto& up : userPlanes)
+                        planes.push_back(up);
+
+                    const float kParEps = 1e-6f;
+                    for (size_t i = 0; i < planes.size(); ++i) {
+                        for (size_t j = i + 1; j < planes.size(); ++j) {
+                            const PlaneSrc& a = planes[i];
+                            const PlaneSrc& b = planes[j];
+                            // Reserved∩reserved → axis.x/y/z; never emit axis.auto.
+                            if (a.reserved && b.reserved) continue;
+                            Vec3 dir = cross(a.normal, b.normal);
+                            const float dirLen = length(dir);
+                            if (dirLen < kParEps) continue;  // parallel — no unique line
+                            dir = dir * (1.0f / dirLen);
+                            const float d1 = dot(a.normal, a.origin);
+                            const float d2 = dot(b.normal, b.origin);
+                            const float det2 = dirLen * dirLen;
+                            Vec3 pt = (cross(b.normal, dir * dirLen) * d1 +
+                                       cross(dir * dirLen, a.normal) * d2) * (1.0f / det2);
+                            std::string idA = a.id, idB = b.id;
+                            if (idB < idA) std::swap(idA, idB);
+                            AppState::AutoAxisCache ent;
+                            ent.id = "axis.auto:" + idA + "|" + idB;
+                            // Name uses original a/b display names (not id-sorted).
+                            ent.name = "Axis " + a.name + " \u2229 " + b.name;
+                            ent.origin[0] = pt.x; ent.origin[1] = pt.y; ent.origin[2] = pt.z;
+                            ent.dir[0] = dir.x;   ent.dir[1] = dir.y;   ent.dir[2] = dir.z;
+                            st.axisAutoCache.push_back(std::move(ent));
+                        }
                     }
+                    st.axisInjectPlaneFp = std::move(fp);
+                }
+
+                for (const auto& ent : st.axisAutoCache) {
+                    pushAxis(ent.id, ent.name,
+                             Vec3(ent.origin[0], ent.origin[1], ent.origin[2]),
+                             Vec3(ent.dir[0], ent.dir[1], ent.dir[2]));
                 }
 
                 // Rebuild axisDatumIds; auto-hide any newly-seen synthetic axis (default + auto).
@@ -1533,6 +1577,22 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                         rd.id.rfind("axis.auto:", 0) == 0;
                     if (isSynthetic && !prevAxisIds.count(rd.id))
                         st.hiddenFeatures.insert(rd.id);
+                }
+                // Rebuild display names when axis set membership changes (or first fill).
+                bool membershipChanged =
+                    st.axisDisplayNames.empty() ||
+                    st.axisDatumIds.size() != prevAxisIds.size();
+                if (!membershipChanged) {
+                    for (const auto& id : st.axisDatumIds) {
+                        if (!prevAxisIds.count(id)) { membershipChanged = true; break; }
+                    }
+                }
+                if (membershipChanged) {
+                    st.axisDisplayNames.clear();
+                    for (const auto& rd : rds) {
+                        if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty()) continue;
+                        st.axisDisplayNames[rd.id] = rd.name.empty() ? rd.id : rd.name;
+                    }
                 }
             }
             st.renderer->setRefDatums(std::move(rds));

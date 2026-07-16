@@ -26,6 +26,7 @@
 #include "engine_backend.h"   // Phase 4: daemon edit_hold/edit_release (services/worker)
 #include "ipc_client.h"       // services/ipc EngineClient
 #include "../render/id_pass.h"
+#include "../renderer.h"     // Renderer::refDatums() for axis.auto geometry lookup
 #include "../vec_math.h"     // W2-ref: explicit auto-axis geometry (Vec3 / cross / normalize)
 
 namespace ui {
@@ -1338,68 +1339,40 @@ bool PropertyManager::routeDatumAxis(AppState& st, const std::string& fid,
 
     // Host-only auto plane-intersection axes (axis.auto:…) are NOT in the engine reserved
     // set — store explicit geometry so document.cpp:axis_from_explicit can resolve them.
-    // Geometry mirrors the inject algorithm in app.cpp (same normals / id sort).
+    // Geometry comes from the inject cache / renderer (never re-solve plane pairs here).
     if (fid.rfind("axis.auto:", 0) == 0) {
-        auto planeOf = [&](const std::string& pid, Vec3& o, Vec3& n) -> bool {
-            if (pid == "plane.front") { o = Vec3(0, 0, 0); n = Vec3(0, -1, 0); return true; }
-            if (pid == "plane.top")   { o = Vec3(0, 0, 0); n = Vec3(0,  0, 1); return true; }
-            if (pid == "plane.right") { o = Vec3(0, 0, 0); n = Vec3(1,  0, 0); return true; }
-            // User-created plane: resolved geometry lives in docMirror.refDatums.
-            const nlohmann::json& datums = st.docMirror.refDatums();
-            if (datums.is_array()) {
-                for (const auto& d : datums) {
-                    if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
-                    if (d.value("id", std::string()) != pid) continue;
-                    const auto& oj = d.contains("origin") ? d["origin"] : nlohmann::json();
-                    const auto& nj = d.contains("normal") ? d["normal"] : nlohmann::json();
-                    if (!oj.is_array() || oj.size() < 3 || !nj.is_array() || nj.size() < 3)
-                        return false;
-                    o = Vec3((float)oj[0].get<double>(), (float)oj[1].get<double>(),
-                             (float)oj[2].get<double>());
-                    n = Vec3((float)nj[0].get<double>(), (float)nj[1].get<double>(),
-                             (float)nj[2].get<double>());
-                    if (length(n) < 1e-9f) return false;
-                    n = normalize(n);
-                    return true;
-                }
-            }
-            return false;
+        auto emitExplicit = [&](float ox, float oy, float oz,
+                                float dx, float dy, float dz) {
+            e.selector = {
+                {"kind", "axis"},
+                {"feature", fid},
+                {"point", {ox, oy, oz}},
+                {"axis",  {dx, dy, dz}}
+            };
+            well->picks.push_back(e);
+            well->wellDangling = false;
+            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+            advanceWellAfterFill(well);
         };
-
-        const std::string pair = fid.substr(std::string("axis.auto:").size());
-        const auto bar = pair.find('|');
-        Vec3 oA, nA, oB, nB;
         bool ok = false;
-        if (bar != std::string::npos) {
-            const std::string a = pair.substr(0, bar), b = pair.substr(bar + 1);
-            ok = planeOf(a, oA, nA) && planeOf(b, oB, nB);
+        for (const auto& ent : st.axisAutoCache) {
+            if (ent.id != fid) continue;
+            emitExplicit(ent.origin[0], ent.origin[1], ent.origin[2],
+                         ent.dir[0], ent.dir[1], ent.dir[2]);
+            ok = true;
+            break;
         }
-        if (ok) {
-            Vec3 dir = cross(nA, nB);
-            const float dirLen = length(dir);
-            if (dirLen > 1e-6f) {
-                dir = dir * (1.0f / dirLen);
-                const float d1 = dot(nA, oA);
-                const float d2 = dot(nB, oB);
-                const float det2 = dirLen * dirLen;
-                Vec3 pt = (cross(nB, dir * dirLen) * d1 +
-                           cross(dir * dirLen, nA) * d2) * (1.0f / det2);
-                // axis_from_explicit reads "axis" (dir) + point/centroid/origin.
-                // Tag with feature so re-pick toggle matches.
-                e.selector = {
-                    {"kind", "axis"},
-                    {"feature", fid},
-                    {"point", {pt.x, pt.y, pt.z}},
-                    {"axis",  {dir.x, dir.y, dir.z}}
-                };
-                well->picks.push_back(e);
-                well->wellDangling = false;
-                dirty_ = true; lastEditTime_ = ImGui::GetTime();
-                advanceWellAfterFill(well);
-                return true;
+        if (!ok && st.renderer) {
+            for (const auto& d : st.renderer->refDatums()) {
+                if (d.kind != Renderer::RefDatum::Kind::Axis || d.id != fid) continue;
+                emitExplicit(d.origin.x, d.origin.y, d.origin.z,
+                             d.dir.x, d.dir.y, d.dir.z);
+                ok = true;
+                break;
             }
         }
-        // If plane geometry is unavailable, fall through to datum form (chip still shows).
+        if (ok) return true;
+        // If geometry is unavailable, fall through to datum form (chip still shows).
     }
 
     // Reserved axis.x/y/z + user axis features: engine axis_from_datum / resolve_axis_ref.

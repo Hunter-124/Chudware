@@ -1631,7 +1631,9 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 // RGB colors at high opacity; selectedDatumId_ draws bold/bright (set each frame from selection).
 void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     if (refDatums_.empty() || planeProg_ == 0) return;
-    const float e = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
+    // Same half-extent as drawReferencePlanes (radius*1.25) so a datum axis spans exactly as far
+    // as the datum-plane edges and its dashes reach the plane boundary. Picker must match.
+    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
 
     glUseProgram(planeProg_);
     glUniformMatrix4fv(glGetUniformLocation(planeProg_, "uMVP"), 1, GL_FALSE, mvp.m);

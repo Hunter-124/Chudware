@@ -1188,7 +1188,8 @@ static bool hitTestRefAxis(const Renderer& renderer, AppState& st, ImVec2 mouse,
                            const ImVec2& vr0, const ImVec2& vr1, int vw, int vh,
                            ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
     (void)vr1;
-    const float L = renderer.effectiveSceneRadius();
+    // Must match Renderer::drawRefDatums: axis half-length = sceneRadius * 1.25 (plane extent).
+    const float L = renderer.effectiveSceneRadius() * 1.25f;
     auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
         float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
         float len2 = vx * vx + vy * vy;

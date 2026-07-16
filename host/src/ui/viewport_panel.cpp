@@ -2602,7 +2602,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         st.overlays->drawSegments(renderer.camera(), arrow, pl.rgba, 2.4f, true);
                     }
                 }
-                // Whole-body translucency while mass markers / interference view are active.
+                // Whole-body translucency while mass markers / section / interference are active.
                 if (st.renderer)
                     st.renderer->setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
             }
@@ -4484,7 +4484,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         // Evaluate Mass Properties value chips (COM + per-plane I/J) — world → screen glass chips
-        // with hover tooltips. Mass text lives only in massMarkers_ (overlayLabels_ is measure-only).
+        // with hover tooltips. Independent of Section (both may be open concurrently).
         if (st.evaluateDialogs && !st.evaluateDialogs->massMarkers().empty()) {
             const float* m = renderer.camera().mvp.m;
             auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
@@ -4523,7 +4523,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // Evaluate Section Props: plane labels + draggable tip handles (screen-space).
+        // Evaluate Section Props: prominent per-plane I labels + draggable tip handles.
+        // Independent of Mass chips above — both render when both windows are open.
         // World quads/arrows are drawn earlier via overlays; this pass is the HUD chrome + grab.
         if (st.evaluateDialogs && st.evaluateDialogs->sectionDragActive()) {
             const float* m = renderer.camera().mvp.m;
@@ -4538,29 +4539,46 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             };
             const float sc = ui::uiScale;
             const float handleHalf = 5.0f * sc;
+            // Slightly larger than default HUD so per-plane moment-of-inertia reads at a glance.
+            const float fontSz = ImGui::GetFontSize() * 1.14f;
+            ImFont* font = ImGui::GetFont();
             for (const auto& pl : st.evaluateDialogs->sectionPlanes()) {
                 if (!pl.active) continue;
 
-                // Label chip near plane origin.
+                // Label chip near plane origin. Dialogs put the section I in pl.label
+                // (e.g. "Sec 1  I=…"); fallback names still show while waiting.
                 if (!pl.label.empty()) {
                     ImVec2 osp;
                     if (project(pl.origin[0], pl.origin[1], pl.origin[2], osp)) {
-                        ImVec2 ts = ImGui::CalcTextSize(pl.label.c_str());
-                        ImVec2 q0(osp.x - ts.x * 0.5f - 6.0f * sc,
-                                  osp.y - ts.y - 10.0f * sc);
-                        ImVec2 q1(q0.x + ts.x + 12.0f * sc, q0.y + ts.y + 6.0f * sc);
+                        const float padX = 9.0f * sc;
+                        const float padY = 5.0f * sc;
+                        ImVec2 ts = font->CalcTextSizeA(fontSz, FLT_MAX, 0.0f, pl.label.c_str());
+                        // Fan labels by plane index so three centroid-origin planes don't stack.
+                        // Step = measured chip height + margin so larger I strings stay clear.
+                        const float chipH = ts.y + padY * 2.0f;
+                        const float stepY = chipH + 6.0f * sc;
+                        const float nudgeX = (float)(pl.index - 1) * 30.0f * sc;
+                        const float nudgeY = -12.0f * sc - (float)pl.index * stepY;
+                        osp.x += nudgeX;
+                        osp.y += nudgeY;
+
+                        ImVec2 q0(osp.x - ts.x * 0.5f - padX, osp.y - ts.y - padY - 4.0f * sc);
+                        ImVec2 q1(q0.x + ts.x + padX * 2.0f, q0.y + ts.y + padY * 2.0f);
+                        char panelKey[40];
+                        std::snprintf(panelKey, sizeof(panelKey), "vp_eval_sec_lab_%d", pl.index);
                         const ui::AdaptiveSurface& ls =
-                            ui::adaptivePanel(ui::panelId("vp_eval_sec_lab"), ImRect(q0, q1),
+                            ui::adaptivePanel(ui::panelId(panelKey), ImRect(q0, q1),
                                               ui::GlassGroup::Hud);
-                        ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ls);
+                        ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 5.0f, ls);
+                        // Stronger plane-color wash so I chips read as belonging to each cut.
                         ImU32 bord = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
-                                             (int)(pl.rgba[2] * 255), (int)(0.95f * 255));
+                                             (int)(pl.rgba[2] * 255), (int)(0.98f * 255));
                         ImU32 fill = IM_COL32((int)(pl.rgba[0] * 255), (int)(pl.rgba[1] * 255),
-                                             (int)(pl.rgba[2] * 255), (int)(0.28f * 255));
-                        vdl->AddRectFilled(q0, q1, fill, 4.0f * sc);
-                        vdl->AddRect(q0, q1, bord, 4.0f * sc, 0, 1.5f * sc);
-                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
-                                      ImVec2(q0.x + 6.0f * sc, q0.y + 3.0f * sc), ls,
+                                             (int)(pl.rgba[2] * 255), (int)(0.38f * 255));
+                        vdl->AddRectFilled(q0, q1, fill, 5.0f * sc);
+                        vdl->AddRect(q0, q1, bord, 5.0f * sc, 0, 2.0f * sc);
+                        ui::glassText(vdl, font, fontSz,
+                                      ImVec2(q0.x + padX, q0.y + padY), ls,
                                       pl.label.c_str());
                     }
                 }

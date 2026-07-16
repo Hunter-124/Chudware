@@ -197,14 +197,32 @@ static void drawColorChipRow(const char* text, const float rgba[4]) {
 static const char* kPlaneNames[] = {"plane.top", "plane.front", "plane.right"};
 
 void EvaluateDialogs::clearOverlays() {
+    // Shared exclusive-tool overlays only. Mass markers / section planes have independent
+    // lifetimes tied to massOpen_ / sectionOpen_ so concurrent windows survive measure clears.
     overlaySegs_.clear();
     overlayLabels_.clear();
     overlayHighlights_.clear();
     overlayCallouts_.clear();
-    massMarkers_.clear();
-    sectionPlanes_.clear();
     interferenceView_ = InterferenceView{};
-    massBodyAlpha_ = 1.0f;
+    // Preserve massBodyAlpha_ when mass or section is still open (their rebuilders own it).
+    if (!massOpen_ && !sectionOpen_) massBodyAlpha_ = 1.0f;
+}
+
+const std::vector<float>& EvaluateDialogs::overlaySegments() const {
+    // Compose measure segs + mass COM/axis segs without thrashing either source buffer.
+    if (massSegs_.empty()) return overlaySegs_;
+    if (overlaySegs_.empty()) return massSegs_;
+    composedSegs_.clear();
+    composedSegs_.reserve(overlaySegs_.size() + massSegs_.size());
+    composedSegs_.insert(composedSegs_.end(), overlaySegs_.begin(), overlaySegs_.end());
+    composedSegs_.insert(composedSegs_.end(), massSegs_.begin(), massSegs_.end());
+    return composedSegs_;
+}
+
+float EvaluateDialogs::requestedBodyAlpha() const {
+    if (sectionOpen_) return 0.45f;
+    if (massOpen_ && !massMarkers_.empty()) return 0.45f;
+    return massBodyAlpha_;  // interference translucency path
 }
 
 void EvaluateDialogs::clearFieldColormap(AppState& st) {
@@ -234,6 +252,7 @@ void EvaluateDialogs::seedMassFromDoc(AppState& st) {
 // C39: evals run async on st.rpc — heavy methods (interference, thickness on a dense model)
 // used to freeze the window for their full duration. The callback runs on the GL thread
 // inside the per-frame drain; gen_ guards against a newer eval superseding a pending one.
+// Exclusive-tool slot (measure/check/interference/symmetry) — not mass/section.
 void EvaluateDialogs::runEval(AppState& st, const std::string& method,
                               const nlohmann::json& extra) {
     errorText_.clear();
@@ -263,9 +282,7 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
             return;
         }
         result_ = r.result;
-        if (openWindow_ == "mass") designSectionsDirty_ = true;
         if (openWindow_ == "measure") rebuildMeasureOverlays(st);
-        if (openWindow_ == "mass") rebuildMassOverlays(st);
         if (openWindow_ == "interference") {
             // Seed member checklist from parts[] once (preserve checks on re-run when names match).
             std::vector<std::string> names;
@@ -277,11 +294,44 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
                 }
             }
             if (names != interferencePartNames_) {
-                // Rebuild checklist; default all checked.
                 interferencePartNames_ = names;
                 interferencePartChecked_.assign(names.size(), 1);
             }
             rebuildInterferenceView(st);
+        }
+    }, 60000);
+}
+
+// Dedicated mass eval slot so Mass Properties can stay open while exclusive tools use result_.
+void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
+    massErrorText_.clear();
+    massResult_ = nlohmann::json::object();
+    massPending_ = false;
+    if (!st.docMirror.hasDoc()) {
+        massErrorText_ = "No document loaded.";
+        return;
+    }
+    nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
+    massPending_ = true;
+    const int gen = ++massGen_;
+    ++st.rebuildsInFlight;
+    st.rpc.call("eval_mass", params, [this, &st, gen](const core::RpcResult& r) {
+        --st.rebuildsInFlight;
+        if (gen != massGen_) return;
+        massPending_ = false;
+        if (!r.ok) {
+            massErrorText_ = r.err.empty() ? "worker call failed: eval_mass" : r.err;
+            return;
+        }
+        if (r.result.is_object() && r.result.contains("code")) {
+            massErrorText_ = r.result.value("message", std::string("evaluate error"));
+            return;
+        }
+        massResult_ = r.result;
+        if (massOpen_) {
+            designSectionsDirty_ = true;
+            rebuildMassOverlays(st);
         }
     }, 60000);
 }
@@ -550,25 +600,24 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
 }
 
 void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
-    overlaySegs_.clear();
+    // Mass geometry lives in massSegs_ (never thrash measure's overlaySegs_).
+    massSegs_.clear();
     massMarkers_.clear();
-    // Leave overlayLabels_ for measure only — do not push mass text here.
-    if (openWindow_ != "measure") {
-        overlayLabels_.clear();
-        overlayHighlights_.clear();
-        overlayCallouts_.clear();
+    if (!massOpen_) {
+        if (!sectionOpen_ && openWindow_ != "interference") massBodyAlpha_ = 1.0f;
+        return;
     }
-    massBodyAlpha_ = 1.0f;
-    if (openWindow_ != "mass") return;
 
     const bool anyMark = showCom_ || showI_ || showJ_;
     if (anyMark) massBodyAlpha_ = 0.45f;
+    else if (!sectionOpen_ && openWindow_ != "interference") massBodyAlpha_ = 1.0f;
 
-    if (!result_.contains("com") || !result_["com"].is_array() || result_["com"].size() != 3)
+    if (!massResult_.contains("com") || !massResult_["com"].is_array() ||
+        massResult_["com"].size() != 3)
         return;
-    const double cx = result_["com"][0].get<double>();
-    const double cy = result_["com"][1].get<double>();
-    const double cz = result_["com"][2].get<double>();
+    const double cx = massResult_["com"][0].get<double>();
+    const double cy = massResult_["com"][1].get<double>();
+    const double cz = massResult_["com"][2].get<double>();
 
     // Cross size ~ 5% of a typical part; fall back to 5 mm.
     float arm = 5.0f;
@@ -586,12 +635,12 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
     }
 
     auto pushSeg = [&](float ax, float ay, float az, float bx, float by, float bz) {
-        overlaySegs_.push_back(ax);
-        overlaySegs_.push_back(ay);
-        overlaySegs_.push_back(az);
-        overlaySegs_.push_back(bx);
-        overlaySegs_.push_back(by);
-        overlaySegs_.push_back(bz);
+        massSegs_.push_back(ax);
+        massSegs_.push_back(ay);
+        massSegs_.push_back(az);
+        massSegs_.push_back(bx);
+        massSegs_.push_back(by);
+        massSegs_.push_back(bz);
     };
     auto pushMarker = [&](float x, float y, float z, const std::string& label,
                           const std::string& tip, const float rgba[4]) {
@@ -611,9 +660,9 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
     }
 
     // Principal axes through COM for I/J markers (geometry in overlaySegs_, values in massMarkers_).
-    if ((showI_ || showJ_) && result_.contains("principal_axes") &&
-        result_["principal_axes"].is_array() && result_["principal_axes"].size() == 3) {
-        const auto& Pa = result_["principal_axes"];
+    if ((showI_ || showJ_) && massResult_.contains("principal_axes") &&
+        massResult_["principal_axes"].is_array() && massResult_["principal_axes"].size() == 3) {
+        const auto& Pa = massResult_["principal_axes"];
         for (int i = 0; i < 3; ++i) {
             if (!Pa[i].is_array() || Pa[i].size() != 3) continue;
             float nx = (float)Pa[i][0].get<double>();
@@ -835,23 +884,24 @@ void EvaluateDialogs::tickLiveMeasure(AppState& st) {
 }
 
 void EvaluateDialogs::tickMassDesignSections(AppState& st) {
-    if (openWindow_ != "mass") return;
+    if (!massOpen_) return;
     if (!designSectionsDirty_) return;
-    if (pending_ || designSectionsPending_ > 0) return;
-    if (!result_.contains("com") || !result_["com"].is_array() || result_["com"].size() != 3)
+    if (massPending_ || designSectionsPending_ > 0) return;
+    if (!massResult_.contains("com") || !massResult_["com"].is_array() ||
+        massResult_["com"].size() != 3)
         return;
-    if (!result_.contains("principal_axes") || !result_["principal_axes"].is_array() ||
-        result_["principal_axes"].size() != 3)
+    if (!massResult_.contains("principal_axes") || !massResult_["principal_axes"].is_array() ||
+        massResult_["principal_axes"].size() != 3)
         return;
 
     designSectionsDirty_ = false;
     designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
     const int batch = ++designSectionGen_;
     designSectionsPending_ = 3;
-    const double cx = result_["com"][0].get<double>();
-    const double cy = result_["com"][1].get<double>();
-    const double cz = result_["com"][2].get<double>();
-    const auto Pa = result_["principal_axes"];
+    const double cx = massResult_["com"][0].get<double>();
+    const double cy = massResult_["com"][1].get<double>();
+    const double cz = massResult_["com"][2].get<double>();
+    const auto Pa = massResult_["principal_axes"];
 
     for (int i = 0; i < 3; ++i) {
         if (!Pa[i].is_array() || Pa[i].size() != 3) {
@@ -974,7 +1024,7 @@ void EvaluateDialogs::initSectionSession(AppState& st) {
 
 void EvaluateDialogs::rebuildSectionPlaneViews(AppState& st) {
     sectionPlanes_.clear();
-    if (openWindow_ != "section") return;
+    if (!sectionOpen_) return;
     const float hs = sectionHalfSize_ * 0.6f;
     for (int i = 0; i < 3; ++i) {
         SectionPlaneView pv;
@@ -997,11 +1047,14 @@ void EvaluateDialogs::rebuildSectionPlaneViews(AppState& st) {
         if (sectionResults_.is_array() && (size_t)i < sectionResults_.size() &&
             sectionResults_[i].is_object()) {
             const auto& sec = sectionResults_[i];
-            double A = sec.value("area_mm2", 0.0);
-            double Ixx = sec.value("Ixx", 0.0);
-            std::snprintf(lab, sizeof(lab), "Sec %d  A=%s Ixx=%s", i + 1,
-                          pmFormatArea(A, st.ips()).c_str(),
-                          pmFormatAreaMoment(Ixx, st.ips()).c_str());
+            if (sec.contains("error") && sec["error"].is_string()) {
+                std::snprintf(lab, sizeof(lab), "Sec %d  %s", i + 1, kSectionNames[i]);
+            } else {
+                double Ixx = sec.value("Ixx", 0.0);
+                // Viewport label: plane index + bending I (clear per-plane moment callout).
+                std::snprintf(lab, sizeof(lab), "Sec %d  I=%s", i + 1,
+                              pmFormatAreaMoment(Ixx, st.ips()).c_str());
+            }
         } else {
             std::snprintf(lab, sizeof(lab), "Sec %d  %s", i + 1, kSectionNames[i]);
         }
@@ -1012,7 +1065,13 @@ void EvaluateDialogs::rebuildSectionPlaneViews(AppState& st) {
 
 void EvaluateDialogs::fireSectionEval(AppState& st, int idx) {
     if (idx < 0 || idx > 2) return;
-    if (!st.docMirror.hasDoc()) return;
+    if (!st.docMirror.hasDoc()) {
+        sectionErrorText_ = "No document loaded.";
+        if (sectionResults_.is_array() && (size_t)idx < sectionResults_.size())
+            sectionResults_[idx] = nlohmann::json{{"error", "No document loaded."}};
+        rebuildSectionPlaneViews(st);
+        return;
+    }
     const float* n = kSectionNormals[idx];
     const double ox = sectionCentroid_[0] + n[0] * sectionOffset_[idx];
     const double oy = sectionCentroid_[1] + n[1] * sectionOffset_[idx];
@@ -1032,13 +1091,36 @@ void EvaluateDialogs::fireSectionEval(AppState& st, int idx) {
             // Always book-keep pending count, even for superseded gens (avoid sticky leak).
             if (sectionPendingCount_ > 0) --sectionPendingCount_;
             if (batch != sectionEvalGen_) return;
-            if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+            if (!r.ok) {
+                std::string msg = r.err.empty() ? "worker call failed: eval_section_props" : r.err;
+                sectionErrorText_ = msg;
+                if (sectionResults_.is_array() && (size_t)idx < sectionResults_.size())
+                    sectionResults_[idx] = nlohmann::json{{"error", msg}};
+            } else if (r.result.is_object() && r.result.contains("code")) {
+                std::string msg = r.result.value("message", std::string("evaluate error"));
+                sectionErrorText_ = msg;
+                if (sectionResults_.is_array() && (size_t)idx < sectionResults_.size())
+                    sectionResults_[idx] = nlohmann::json{{"error", msg}};
+            } else if (r.ok && r.result.is_object()) {
                 nlohmann::json sec = r.result;
                 double Ixx = sec.value("Ixx", 0.0);
                 double Iyy = sec.value("Iyy", 0.0);
                 sec["J"] = Ixx + Iyy;
                 if (sectionResults_.is_array() && (size_t)idx < sectionResults_.size())
                     sectionResults_[idx] = std::move(sec);
+                // Clear window-level error once any plane succeeds (per-plane errors stay).
+                if (!sectionErrorText_.empty()) {
+                    bool anyErr = false;
+                    if (sectionResults_.is_array()) {
+                        for (const auto& s : sectionResults_) {
+                            if (s.is_object() && s.contains("error")) {
+                                anyErr = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!anyErr) sectionErrorText_.clear();
+                }
             }
             rebuildSectionPlaneViews(st);
         },
@@ -1047,10 +1129,10 @@ void EvaluateDialogs::fireSectionEval(AppState& st, int idx) {
 
 void EvaluateDialogs::fireAllSectionEvals(AppState& st) {
     if (!st.docMirror.hasDoc()) {
-        errorText_ = "No document loaded.";
+        sectionErrorText_ = "No document loaded.";
         return;
     }
-    errorText_.clear();
+    sectionErrorText_.clear();
     sectionResults_ = nlohmann::json::array({nullptr, nullptr, nullptr});
     const int batch = ++sectionEvalGen_;
     sectionPendingCount_ = 0;
@@ -1081,13 +1163,13 @@ void EvaluateDialogs::applySectionOffset(AppState& st, int idx, float newOffset,
 }
 
 void EvaluateDialogs::dragSectionPlane(AppState& st, int idx, float deltaAlongNormal) {
-    if (openWindow_ != "section") return;
+    if (!sectionOpen_) return;
     if (idx < 0 || idx > 2) return;
     applySectionOffset(st, idx, sectionOffset_[idx] + deltaAlongNormal, true);
 }
 
 void EvaluateDialogs::tickSectionDrag(AppState& st) {
-    if (openWindow_ != "section") return;
+    if (!sectionOpen_) return;
     if (sectionPendingIdx_ < 0) return;
     const double now = ImGui::GetTime();
     if (now - sectionDragLastT_ < 0.08) return;  // ~80 ms debounce
@@ -1105,9 +1187,8 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
         seedMassFromDoc(st);
         designSections_ = nlohmann::json::array({nullptr, nullptr, nullptr});
         designSectionsDirty_ = false;
-        runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
-        openWindow_ = "mass";
-        title_ = "Mass Properties";
+        massOpen_ = true;
+        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         return true;
     }
     if (cmdId == "eval_measure") {
@@ -1131,11 +1212,8 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
         return true;
     }
     if (cmdId == "eval_section_props") {
-        openWindow_ = "section";
-        title_ = "Section Properties";
-        errorText_.clear();
-        result_ = nlohmann::json::object();
-        pending_ = false;
+        sectionOpen_ = true;
+        sectionErrorText_.clear();
         initSectionSession(st);
         fireAllSectionEvals(st);
         return true;
@@ -1203,22 +1281,329 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     return false;
 }
 
-void EvaluateDialogs::draw(AppState& st) {
-    if (openWindow_.empty()) {
-        if (massBodyAlpha_ < 0.999f || !overlaySegs_.empty() || interferenceView_.active ||
-            !overlayHighlights_.empty() || !massMarkers_.empty() || !sectionPlanes_.empty())
-            clearOverlays();
-        return;
-    }
+void EvaluateDialogs::drawMassWindow(AppState& st) {
+    if (!massOpen_) return;
 
-    // Live measure re-eval + mass design section chain + section plane drag debounce.
-    tickLiveMeasure(st);
-    tickMassDesignSections(st);
-    tickSectionDrag(st);
-    if (openWindow_ == "mass" && !pending_) rebuildMassOverlays(st);
-    if (openWindow_ == "section") rebuildSectionPlaneViews(st);
+    ui::setNextCommandDialogPlacement();
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(360), 0), ImGuiCond_Always);
 
+    const auto& gpal = ui::palette;
+    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
     bool open = true;
+    const bool vis = ImGui::Begin("Mass Properties##eval_mass", &open);
+    ImGui::PopStyleColor(3);
+    if (vis) {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const float contentTopY =
+            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId("host_eval_mass_glass"), winRect, ui::GlassGroup::Global);
+        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+        static const struct {
+            const char* name;
+            float d;
+        } kPresets[] = {
+            {"Steel", 7.85f},      {"Stainless", 8.00f}, {"Aluminum", 2.70f},
+            {"Titanium", 4.51f},   {"Brass", 8.50f},     {"ABS plastic", 1.05f},
+            {"PLA", 1.24f},        {"Custom", 0.0f},
+        };
+        const int kPresetN = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
+        const int kCustom = kPresetN;
+
+        if (!massDocKey_.empty())
+            ImGui::Text("Document: %s", massDocName_.c_str());
+        else
+            ImGui::TextDisabled("Document material: not set");
+
+        ImGui::SetNextItemWidth(180 * ui::uiScale);
+        int comboIdx = massMaterial_;
+        std::string comboLabel;
+        if (comboIdx == 0 && !massDocKey_.empty())
+            comboLabel = "Document: " + massDocName_;
+        else if (comboIdx >= 1 && comboIdx <= kPresetN)
+            comboLabel = kPresets[comboIdx - 1].name;
+        else
+            comboLabel = "Custom";
+        if (ImGui::BeginCombo("Material", comboLabel.c_str())) {
+            if (!massDocKey_.empty()) {
+                bool sel = (massMaterial_ == 0);
+                if (ImGui::Selectable(("Document: " + massDocName_).c_str(), sel)) {
+                    massMaterial_ = 0;
+                    massDensity_ = materialDensityGcm3(massDocKey_);
+                    runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            for (int i = 0; i < kPresetN; ++i) {
+                int idx = i + 1;
+                bool sel = (massMaterial_ == idx);
+                if (ImGui::Selectable(kPresets[i].name, sel)) {
+                    massMaterial_ = idx;
+                    if (i != kPresetN - 1) {
+                        massDensity_ = kPresets[i].d;
+                        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+                    }
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        if (ImGui::DragFloat("Density", &massDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3",
+                             ImGuiSliderFlags_AlwaysClamp))
+            massMaterial_ = kCustom;
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+
+        if (!massErrorText_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                       gpal.statusErr[2], gpal.statusErr[3]));
+            ImGui::TextWrapped("%s", massErrorText_.c_str());
+            ImGui::PopStyleColor();
+        } else if (massPending_) {
+            ImGui::TextDisabled("Computing…");
+        } else {
+            ImGui::Separator();
+            ImGui::Text("Volume:  %s",
+                        pmFormatVolume(massResult_.value("volume_mm3", 0.0), st.ips()).c_str());
+            ImGui::Text("Mass:    %s",
+                        pmFormatMass(massResult_.value("mass_g", 0.0), st.ips()).c_str());
+            ImGui::Text("Density: %.3f g/cm3", massDensity_);
+            if (massResult_.contains("com") && massResult_["com"].is_array() &&
+                massResult_["com"].size() == 3) {
+                ImGui::SeparatorText("Center of gravity");
+                ImGui::Text("X: %s   Y: %s   Z: %s",
+                            evalLen(st, massResult_["com"][0].get<double>()).c_str(),
+                            evalLen(st, massResult_["com"][1].get<double>()).c_str(),
+                            evalLen(st, massResult_["com"][2].get<double>()).c_str());
+            }
+
+            // ---- Moment of inertia (bending area I + polar J) — clear callout ----
+            ImGui::SeparatorText("Moment of inertia");
+            ImGui::TextWrapped(
+                "Area moments about centroidal planes through CG: I resists bending; "
+                "polar J = Imax+Imin resists torsion. Units follow document (in⁴ / mm⁴).");
+            bool cb = false;
+            cb |= ImGui::Checkbox("Show COM in viewport", &showCom_);
+            cb |= ImGui::Checkbox("Area moment I (bending)", &showI_);
+            cb |= ImGui::Checkbox("Polar moment J (torsion)", &showJ_);
+            cb |= ImGui::Checkbox("Axial stiffness k (EA/L est.)", &showK_);
+            if (cb) rebuildMassOverlays(st);
+
+            if (designSectionsPending_ > 0)
+                ImGui::TextDisabled("Computing section I/J…");
+            if (designSections_.is_array()) {
+                for (int i = 0; i < 3; ++i) {
+                    if ((size_t)i >= designSections_.size() || !designSections_[i].is_object())
+                        continue;
+                    const auto& sec = designSections_[i];
+                    ImGui::Separator();
+                    double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
+                    double Imax = std::max(Ixx, Iyy), Imin = std::min(Ixx, Iyy);
+                    double J = sec.value("J", Ixx + Iyy);
+                    ImGui::Text("Principal axis %d", i + 1);
+                    if (showI_) {
+                        ImGui::Text("  Imax: %s", pmFormatAreaMoment(Imax, st.ips()).c_str());
+                        ImGui::Text("  Imin: %s", pmFormatAreaMoment(Imin, st.ips()).c_str());
+                    }
+                    if (showJ_)
+                        ImGui::Text("  Polar J: %s", pmFormatAreaMoment(J, st.ips()).c_str());
+                    if (showK_ && sec.contains("EA") && sec["EA"].is_number()) {
+                        ImGui::TextDisabled("  EA: %.4g N  (divide by length L for k)",
+                                            sec["EA"].get<double>());
+                        ImGui::Text("  EA:  %.4g N", sec["EA"].get<double>());
+                    }
+                    if (sec.contains("area_mm2"))
+                        ImGui::Text("  Section area: %s",
+                                    pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
+                }
+            }
+
+            if (ImGui::TreeNode("Advanced mass inertia")) {
+                const char* mmUnit = st.ips() ? "lb·in²" : "g·mm²";
+                if (massResult_.contains("inertia") && massResult_["inertia"].is_array() &&
+                    massResult_["inertia"].size() == 9) {
+                    ImGui::TextDisabled("Inertia tensor (%s, about origin)", mmUnit);
+                    const auto& I = massResult_["inertia"];
+                    for (int r = 0; r < 3; ++r)
+                        ImGui::Text("%s  %s  %s",
+                                    pmFormatMassMoment(I[r * 3 + 0].get<double>(), st.ips())
+                                        .c_str(),
+                                    pmFormatMassMoment(I[r * 3 + 1].get<double>(), st.ips())
+                                        .c_str(),
+                                    pmFormatMassMoment(I[r * 3 + 2].get<double>(), st.ips())
+                                        .c_str());
+                }
+                if (massResult_.contains("principal_moments") &&
+                    massResult_["principal_moments"].is_array() &&
+                    massResult_["principal_moments"].size() == 3) {
+                    ImGui::TextDisabled("Principal mass moments (%s)", mmUnit);
+                    const auto& Pm = massResult_["principal_moments"];
+                    for (int i = 0; i < 3; ++i)
+                        ImGui::Text("  P%d  %s", i + 1,
+                                    pmFormatMassMoment(Pm[i].get<double>(), st.ips()).c_str());
+                }
+                ImGui::TreePop();
+            }
+        }
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();  // WindowBg
+
+    if (!open) {
+        massOpen_ = false;
+        massMarkers_.clear();
+        massSegs_.clear();
+        massPending_ = false;
+        massErrorText_.clear();
+        designSectionsDirty_ = false;
+        // Restore body alpha only if section/interference also gone.
+        if (!sectionOpen_ && openWindow_ != "interference") {
+            massBodyAlpha_ = 1.0f;
+            if (st.renderer) st.renderer->setBodyAlpha(1.0f);
+        } else if (sectionOpen_) {
+            massBodyAlpha_ = 0.45f;
+        }
+    }
+}
+
+void EvaluateDialogs::drawSectionWindow(AppState& st) {
+    if (!sectionOpen_) return;
+
+    ui::setNextCommandDialogPlacement();
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(420), 0), ImGuiCond_Always);
+
+    const auto& gpal = ui::palette;
+    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    bool open = true;
+    const bool vis = ImGui::Begin("Section Properties##eval_section", &open);
+    ImGui::PopStyleColor(3);
+    if (vis) {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const float contentTopY =
+            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const ui::AdaptiveSurface& surf = ui::adaptivePanel(ui::panelId("host_eval_section_glass"),
+                                                            winRect, ui::GlassGroup::Global);
+        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+        if (!sectionErrorText_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                       gpal.statusErr[2], gpal.statusErr[3]));
+            ImGui::TextWrapped("%s", sectionErrorText_.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (sectionPendingCount_ > 0)
+            ImGui::TextDisabled("Computing section properties…");
+        ImGui::TextDisabled("Drag a plane in the viewport or use the offset sliders.");
+
+        // 3-card layout: one card per orthogonal section.
+        for (int i = 0; i < 3; ++i) {
+            const float* col = kEvalPalette[i % 10];
+            char header[64];
+            std::snprintf(header, sizeof(header), "Sec %d · %s", i + 1, kSectionNames[i]);
+            ImGui::SeparatorText(header);
+            drawColorChipRow(header, col);
+
+            ImGui::PushID(i);
+            // Hidden label + explicit width so "Offset" text never clips the right edge.
+            ImGui::TextUnformatted("Offset");
+            const float avail = ImGui::GetContentRegionAvail().x;
+            ImGui::SetNextItemWidth(std::max(80.0f * ui::uiScale, avail - 4.0f * ui::uiScale));
+            float off = sectionOffset_[i];
+            char sliderId[32];
+            std::snprintf(sliderId, sizeof(sliderId), "##sec%d", i);
+            if (ImGui::SliderFloat(sliderId, &off, -sectionHalfSize_, sectionHalfSize_,
+                                   "%.2f mm")) {
+                applySectionOffset(st, i, off, true);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                sectionPendingIdx_ = i;
+                sectionDragLastT_ = ImGui::GetTime() - 1.0;
+            }
+
+            if (sectionResults_.is_array() && (size_t)i < sectionResults_.size() &&
+                sectionResults_[i].is_object()) {
+                const auto& sec = sectionResults_[i];
+                if (sec.contains("error") && sec["error"].is_string()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImVec4(gpal.statusErr[0], gpal.statusErr[1],
+                                                 gpal.statusErr[2], gpal.statusErr[3]));
+                    ImGui::TextWrapped("%s", sec["error"].get<std::string>().c_str());
+                    ImGui::PopStyleColor();
+                } else {
+                    // Compact two-column rows so values fit ~420 px.
+                    ImGui::Text("Area  %s",
+                                pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
+                    if (sec.contains("centroid") && sec["centroid"].is_array() &&
+                        sec["centroid"].size() == 3)
+                        ImGui::Text("CG   %s, %s, %s",
+                                    evalLen(st, sec["centroid"][0].get<double>()).c_str(),
+                                    evalLen(st, sec["centroid"][1].get<double>()).c_str(),
+                                    evalLen(st, sec["centroid"][2].get<double>()).c_str());
+                    double Ixx = sec.value("Ixx", 0.0);
+                    double Iyy = sec.value("Iyy", 0.0);
+                    double Ixy = sec.value("Ixy", 0.0);
+                    double J = sec.value("J", Ixx + Iyy);
+                    if (ImGui::BeginTable("##secI", 2,
+                                          ImGuiTableFlags_SizingStretchProp |
+                                              ImGuiTableFlags_NoPadOuterX)) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("Ixx  %s", pmFormatAreaMoment(Ixx, st.ips()).c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("Iyy  %s", pmFormatAreaMoment(Iyy, st.ips()).c_str());
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("Ixy  %s", pmFormatAreaMoment(Ixy, st.ips()).c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("J    %s", pmFormatAreaMoment(J, st.ips()).c_str());
+                        ImGui::EndTable();
+                    }
+                }
+            } else if (sectionPendingCount_ > 0) {
+                ImGui::TextDisabled("Waiting for section…");
+            } else {
+                ImGui::TextDisabled("No section data.");
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();  // WindowBg
+
+    if (!open) {
+        sectionOpen_ = false;
+        sectionPlanes_.clear();
+        sectionPendingCount_ = 0;
+        sectionPendingIdx_ = -1;
+        sectionErrorText_.clear();
+        ++sectionEvalGen_;  // supersede in-flight
+        if (!massOpen_ || massMarkers_.empty()) {
+            if (openWindow_ != "interference") {
+                massBodyAlpha_ = 1.0f;
+                if (st.renderer) st.renderer->setBodyAlpha(1.0f);
+            }
+        }
+    }
+}
+
+void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
+    if (openWindow_.empty()) return;
 
     // Geometry tools pin into the Evaluate ribbon dead-space strip when available.
     const bool dockWindows =
@@ -1234,9 +1619,7 @@ void EvaluateDialogs::draw(AppState& st) {
             ImGuiCond_Always);
     } else {
         ui::setNextCommandDialogPlacement();
-        // Section 3-card layout needs more width; mass/measure stay ~360.
-        float w = (openWindow_ == "section") ? ui::metrics::px(420) : ui::metrics::px(360);
-        ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(360), 0), ImGuiCond_Always);
     }
 
     const auto& gpal = ui::palette;
@@ -1245,7 +1628,12 @@ void EvaluateDialogs::draw(AppState& st) {
     ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
     ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
-    const bool evVis = ImGui::Begin(title_.c_str(), &open);
+    bool open = true;
+    // Unique id so exclusive window never collides with mass/section.
+    char winTitle[128];
+    std::snprintf(winTitle, sizeof(winTitle), "%s##eval_excl",
+                  title_.empty() ? "Evaluate" : title_.c_str());
+    const bool evVis = ImGui::Begin(winTitle, &open);
     ImGui::PopStyleColor(3);
     if (evVis) {
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
@@ -1258,18 +1646,15 @@ void EvaluateDialogs::draw(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
         const bool interactivePending =
-            openWindow_ == "measure" || openWindow_ == "mass" || openWindow_ == "section" ||
-            openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature" ||
-            openWindow_ == "zebra" || openWindow_ == "symmetry";
+            openWindow_ == "measure" || openWindow_ == "draft" || openWindow_ == "thickness" ||
+            openWindow_ == "curvature" || openWindow_ == "zebra" || openWindow_ == "symmetry";
         if (pending_ && !interactivePending) {
-            // Measure/mass/section/field docks stay interactive while computing.
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted("Computing");
             ImGui::SameLine(0, 0);
             ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
             ImGui::PopStyleColor();
-        } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "mass" &&
-                   openWindow_ != "section" && openWindow_ != "draft" &&
+        } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "draft" &&
                    openWindow_ != "thickness" && openWindow_ != "curvature" &&
                    openWindow_ != "field_err") {
             ImGui::PushStyleColor(
@@ -1277,154 +1662,6 @@ void EvaluateDialogs::draw(AppState& st) {
                 ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
-        } else if (openWindow_ == "mass") {
-            // ---- Material seed + override ----
-            // Combo: 0 = Document material (if any), then Steel…PLA, Custom.
-            static const struct {
-                const char* name;
-                float d;
-            } kPresets[] = {
-                {"Steel", 7.85f},      {"Stainless", 8.00f}, {"Aluminum", 2.70f},
-                {"Titanium", 4.51f},   {"Brass", 8.50f},     {"ABS plastic", 1.05f},
-                {"PLA", 1.24f},        {"Custom", 0.0f},
-            };
-            const int kPresetN = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
-            const int kCustom = kPresetN;  // after Document slot: indices 1..kPresetN are presets
-            // Build items: [0]=Document, [1..]=presets
-            if (!massDocKey_.empty())
-                ImGui::Text("Document: %s", massDocName_.c_str());
-            else
-                ImGui::TextDisabled("Document material: not set");
-
-            ImGui::SetNextItemWidth(180 * ui::uiScale);
-            // Simplified combo: Document | presets
-            int comboIdx = massMaterial_;
-            std::string comboLabel;
-            if (comboIdx == 0 && !massDocKey_.empty())
-                comboLabel = "Document: " + massDocName_;
-            else if (comboIdx >= 1 && comboIdx <= kPresetN)
-                comboLabel = kPresets[comboIdx - 1].name;
-            else
-                comboLabel = "Custom";
-            if (ImGui::BeginCombo("Material", comboLabel.c_str())) {
-                if (!massDocKey_.empty()) {
-                    bool sel = (massMaterial_ == 0);
-                    if (ImGui::Selectable(("Document: " + massDocName_).c_str(), sel)) {
-                        massMaterial_ = 0;
-                        massDensity_ = materialDensityGcm3(massDocKey_);
-                        runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                for (int i = 0; i < kPresetN; ++i) {
-                    int idx = i + 1;
-                    bool sel = (massMaterial_ == idx);
-                    if (ImGui::Selectable(kPresets[i].name, sel)) {
-                        massMaterial_ = idx;
-                        if (i != kPresetN - 1) {  // not Custom
-                            massDensity_ = kPresets[i].d;
-                            runEval(st, "eval_mass",
-                                    {{"density_g_cm3", (double)massDensity_}});
-                        }
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::SetNextItemWidth(140 * ui::uiScale);
-            if (ImGui::DragFloat("Density", &massDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3",
-                                 ImGuiSliderFlags_AlwaysClamp))
-                massMaterial_ = kCustom;  // force custom when dragging
-            if (ImGui::IsItemDeactivatedAfterEdit())
-                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
-
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            } else if (pending_) {
-                ImGui::TextDisabled("Computing…");
-            } else {
-                ImGui::Separator();
-                ImGui::Text("Volume:  %s",
-                            pmFormatVolume(result_.value("volume_mm3", 0.0), st.ips()).c_str());
-                ImGui::Text("Mass:    %s",
-                            pmFormatMass(result_.value("mass_g", 0.0), st.ips()).c_str());
-                ImGui::Text("Density: %.3f g/cm3", massDensity_);
-                if (result_.contains("com") && result_["com"].is_array() &&
-                    result_["com"].size() == 3) {
-                    ImGui::SeparatorText("Center of gravity");
-                    ImGui::Text("X: %s   Y: %s   Z: %s",
-                                evalLen(st, result_["com"][0].get<double>()).c_str(),
-                                evalLen(st, result_["com"][1].get<double>()).c_str(),
-                                evalLen(st, result_["com"][2].get<double>()).c_str());
-                }
-
-                ImGui::SeparatorText("Design properties");
-                bool cb = false;
-                cb |= ImGui::Checkbox("Show COM in viewport", &showCom_);
-                cb |= ImGui::Checkbox("Area moment I (bending)", &showI_);
-                cb |= ImGui::Checkbox("Polar moment J (torsion)", &showJ_);
-                cb |= ImGui::Checkbox("Axial stiffness k (EA/L est.)", &showK_);
-                if (cb) rebuildMassOverlays(st);
-
-                if (designSectionsPending_ > 0)
-                    ImGui::TextDisabled("Computing section I/J…");
-                if (designSections_.is_array()) {
-                    for (int i = 0; i < 3; ++i) {
-                        if ((size_t)i >= designSections_.size() || !designSections_[i].is_object())
-                            continue;
-                        const auto& sec = designSections_[i];
-                        ImGui::Separator();
-                        double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
-                        double J = sec.value("J", Ixx + Iyy);
-                        if (showI_) {
-                            ImGui::Text("Bending I about plane %d: Imax %s  /  Imin %s", i + 1,
-                                        pmFormatAreaMoment(std::max(Ixx, Iyy), st.ips()).c_str(),
-                                        pmFormatAreaMoment(std::min(Ixx, Iyy), st.ips()).c_str());
-                        }
-                        if (showJ_)
-                            ImGui::Text("Polar J (torsion): %s",
-                                        pmFormatAreaMoment(J, st.ips()).c_str());
-                        if (showK_ && sec.contains("EA") && sec["EA"].is_number()) {
-                            ImGui::TextDisabled("  EA: %.4g N  (divide by length L for k)",
-                                                sec["EA"].get<double>());
-                            ImGui::Text("  EA:  %.4g N", sec["EA"].get<double>());
-                        }
-                        if (sec.contains("area_mm2"))
-                            ImGui::Text("  Section area: %s",
-                                        pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
-                    }
-                }
-
-                if (ImGui::TreeNode("Advanced mass inertia")) {
-                    const char* mmUnit = st.ips() ? "lb·in²" : "g·mm²";
-                    if (result_.contains("inertia") && result_["inertia"].is_array() &&
-                        result_["inertia"].size() == 9) {
-                        ImGui::TextDisabled("Inertia tensor (%s, about origin)", mmUnit);
-                        const auto& I = result_["inertia"];
-                        for (int r = 0; r < 3; ++r)
-                            ImGui::Text("%s  %s  %s",
-                                        pmFormatMassMoment(I[r * 3 + 0].get<double>(), st.ips())
-                                            .c_str(),
-                                        pmFormatMassMoment(I[r * 3 + 1].get<double>(), st.ips())
-                                            .c_str(),
-                                        pmFormatMassMoment(I[r * 3 + 2].get<double>(), st.ips())
-                                            .c_str());
-                    }
-                    if (result_.contains("principal_moments") &&
-                        result_["principal_moments"].is_array() &&
-                        result_["principal_moments"].size() == 3) {
-                        ImGui::TextDisabled("Principal mass moments (%s)", mmUnit);
-                        const auto& Pm = result_["principal_moments"];
-                        for (int i = 0; i < 3; ++i)
-                            ImGui::Text("  P%d  %s", i + 1,
-                                        pmFormatMassMoment(Pm[i].get<double>(), st.ips()).c_str());
-                    }
-                    ImGui::TreePop();
-                }
-            }
         } else if (openWindow_ == "measure") {
             if (pending_) {
                 ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
@@ -1473,7 +1710,6 @@ void EvaluateDialogs::draw(AppState& st) {
                 measureLog_.push_back(summary);
             }
 
-            // Color-coded summary chip + per-ref chips.
             if (!summary.empty() && !measureRefColors_.empty()) {
                 drawColorChipRow(summary.c_str(), measureRefColors_[0].data());
             } else if (!summary.empty()) {
@@ -1481,7 +1717,6 @@ void EvaluateDialogs::draw(AppState& st) {
             }
             ImGui::Text("Kind: %s", kind.c_str());
 
-            // One chip per resolved selection ref.
             int ri = 0;
             for (const auto& it : st.selection.items()) {
                 if (it.selector.empty() && !it.hit.valid()) continue;
@@ -1552,66 +1787,6 @@ void EvaluateDialogs::draw(AppState& st) {
                     ImGui::TextUnformatted(measureLog_[i].c_str());
                 ImGui::EndChild();
             }
-        } else if (openWindow_ == "section") {
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            }
-            if (sectionPendingCount_ > 0)
-                ImGui::TextDisabled("Computing section properties…");
-            ImGui::TextDisabled("Drag a plane in the viewport or use the offset sliders.");
-            ImGui::Separator();
-
-            // 3-card layout: one card per orthogonal section.
-            for (int i = 0; i < 3; ++i) {
-                const float* col = kEvalPalette[i % 10];
-                char header[64];
-                std::snprintf(header, sizeof(header), "Sec %d · %s", i + 1, kSectionNames[i]);
-                drawColorChipRow(header, col);
-
-                // Offset slider along the plane normal (± halfSize).
-                ImGui::PushID(i);
-                ImGui::SetNextItemWidth(-1);
-                float off = sectionOffset_[i];
-                char sliderLab[48];
-                std::snprintf(sliderLab, sizeof(sliderLab), "Offset##sec%d", i);
-                if (ImGui::SliderFloat(sliderLab, &off, -sectionHalfSize_, sectionHalfSize_,
-                                       "%.2f mm")) {
-                    applySectionOffset(st, i, off, true);
-                }
-                if (ImGui::IsItemDeactivatedAfterEdit()) {
-                    // Force immediate re-eval on release (don't wait full debounce).
-                    sectionPendingIdx_ = i;
-                    sectionDragLastT_ = ImGui::GetTime() - 1.0;
-                }
-
-                if (sectionResults_.is_array() && (size_t)i < sectionResults_.size() &&
-                    sectionResults_[i].is_object()) {
-                    const auto& sec = sectionResults_[i];
-                    ImGui::Text("Area: %s",
-                                pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
-                    if (sec.contains("centroid") && sec["centroid"].is_array() &&
-                        sec["centroid"].size() == 3)
-                        ImGui::Text("Centroid: %s, %s, %s",
-                                    evalLen(st, sec["centroid"][0].get<double>()).c_str(),
-                                    evalLen(st, sec["centroid"][1].get<double>()).c_str(),
-                                    evalLen(st, sec["centroid"][2].get<double>()).c_str());
-                    double Ixx = sec.value("Ixx", 0.0);
-                    double Iyy = sec.value("Iyy", 0.0);
-                    double Ixy = sec.value("Ixy", 0.0);
-                    double J = sec.value("J", Ixx + Iyy);
-                    ImGui::Text("Ixx: %s   Iyy: %s", pmFormatAreaMoment(Ixx, st.ips()).c_str(),
-                                pmFormatAreaMoment(Iyy, st.ips()).c_str());
-                    ImGui::Text("Ixy: %s   J: %s", pmFormatAreaMoment(Ixy, st.ips()).c_str(),
-                                pmFormatAreaMoment(J, st.ips()).c_str());
-                } else {
-                    ImGui::TextDisabled("Waiting for section…");
-                }
-                ImGui::PopID();
-                if (i < 2) ImGui::Separator();
-            }
         } else if (openWindow_ == "check") {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];
@@ -1631,7 +1806,6 @@ void EvaluateDialogs::draw(AppState& st) {
                 }
             }
         } else if (openWindow_ == "interference") {
-            // Member subset multiselect — re-runs with members=[checked...] when toggled.
             if (!interferencePartNames_.empty()) {
                 ImGui::SeparatorText("Members");
                 bool anyChange = false;
@@ -1671,7 +1845,6 @@ void EvaluateDialogs::draw(AppState& st) {
                     std::string b = p.value("b", std::string("?"));
                     double vol = p.value("overlap_volume_mm3",
                                          p.value("volume", p.value("volume_mm3", 0.0)));
-                    // BBox WxDxH from overlap_bbox [[min],[max]].
                     std::string bboxTxt;
                     if (p.contains("overlap_bbox") && p["overlap_bbox"].is_array() &&
                         p["overlap_bbox"].size() == 2 && p["overlap_bbox"][0].is_array() &&
@@ -1717,10 +1890,8 @@ void EvaluateDialogs::draw(AppState& st) {
                 ImGui::TextColored(ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2], 1),
                                    "No interference.");
         } else if (openWindow_ == "symmetry") {
-            // Compact horizontal layout for ribbon-dock strip.
             ImGui::SetNextItemWidth(100 * ui::uiScale);
             if (ImGui::Combo("Plane", &symmetryPlane_, "Front\0Top\0Right\0")) {
-                // Map UI order front/top/right → kPlaneNames front=1, top=0, right=2
                 static const int map[] = {1, 0, 2};
                 int pi = (symmetryPlane_ >= 0 && symmetryPlane_ < 3) ? map[symmetryPlane_] : 1;
                 runEval(st, "eval_symmetry", {{"plane", kPlaneNames[pi]}});
@@ -1734,7 +1905,6 @@ void EvaluateDialogs::draw(AppState& st) {
                             pmFormatVolume(result_.value("deviation_mm3", 0.0), st.ips()).c_str());
             }
         } else if (openWindow_ == "zebra") {
-            // Compact horizontal layout for ribbon-dock strip.
             ImGui::TextWrapped(
                 "Smooth even stripes = fair surface; kinks = G1 break; jogs = G2 break.");
             ImGui::SetNextItemWidth(160 * ui::uiScale);
@@ -1747,7 +1917,6 @@ void EvaluateDialogs::draw(AppState& st) {
                 openWindow_.clear();
             }
         } else if (openWindow_ == "draft") {
-            // Compact dock: pull direction + angle + Update / Turn Off.
             if (!errorText_.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
                                                            gpal.statusErr[2], gpal.statusErr[3]));
@@ -1854,12 +2023,42 @@ void EvaluateDialogs::draw(AppState& st) {
         if (openWindow_ == "draft" || openWindow_ == "thickness" || openWindow_ == "curvature" ||
             openWindow_ == "field_wait" || openWindow_ == "field_err")
             clearFieldColormap(st);
-        sectionPlanes_.clear();
-        massMarkers_.clear();
+        // Exclusive close does NOT clear mass/section — only exclusive overlays.
         clearOverlays();
         openWindow_.clear();
-        if (st.renderer) st.renderer->setBodyAlpha(1.0f);
+        // Body alpha: leave translucent if mass/section still open.
+        if (!massOpen_ && !sectionOpen_) {
+            massBodyAlpha_ = 1.0f;
+            if (st.renderer) st.renderer->setBodyAlpha(1.0f);
+        }
     }
+}
+
+void EvaluateDialogs::draw(AppState& st) {
+    // Live measure re-eval + mass design section chain + section plane drag debounce.
+    tickLiveMeasure(st);
+    tickMassDesignSections(st);
+    tickSectionDrag(st);
+    if (massOpen_ && !massPending_) rebuildMassOverlays(st);
+    if (sectionOpen_) rebuildSectionPlaneViews(st);
+
+    // Nothing open → clear leftover exclusive overlays (mass/section have their own close paths).
+    if (openWindow_.empty() && !massOpen_ && !sectionOpen_) {
+        if (massBodyAlpha_ < 0.999f || !overlaySegs_.empty() || !massSegs_.empty() ||
+            interferenceView_.active || !overlayHighlights_.empty() || !massMarkers_.empty() ||
+            !sectionPlanes_.empty())
+            clearOverlays();
+        massMarkers_.clear();
+        massSegs_.clear();
+        sectionPlanes_.clear();
+        massBodyAlpha_ = 1.0f;
+        return;
+    }
+
+    // Independent windows — order: mass, section, exclusive.
+    drawMassWindow(st);
+    drawSectionWindow(st);
+    drawExclusiveWindow(st);
 }
 
 }  // namespace ui

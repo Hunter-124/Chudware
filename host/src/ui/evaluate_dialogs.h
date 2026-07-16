@@ -91,21 +91,21 @@ public:
     // re-eval and mass-design section fetches.
     void draw(AppState& st);
 
-    // Which result window is currently open ("mass","measure","section",...; empty = none). Used by
-    // the AI_CAD_SHOT=multidoc scenario to assert that a measurement opened on one document does not
-    // bleed into another's (per-document EvaluateDialogs).
+    // Which exclusive result window is open ("measure","check",...; empty = none). Mass and
+    // Section use independent flags (massOpen_/sectionOpen_) so they can coexist.
     const std::string& openWindowKind() const { return openWindow_; }
 
     // Viewport overlay batches (world-space). Consumed by viewport_panel after sim overlays.
-    const std::vector<float>& overlaySegments() const { return overlaySegs_; }
+    // Composes measure segs + mass COM/axis segs so both can coexist.
+    const std::vector<float>& overlaySegments() const;
     const std::vector<std::pair<std::array<float, 3>, std::string>>& overlayLabels() const {
         return overlayLabels_;
     }
     const std::vector<EvalHighlight>& overlayHighlights() const { return overlayHighlights_; }
     const std::vector<EvalCallout>& overlayCallouts() const { return overlayCallouts_; }
     const InterferenceView& interferenceView() const { return interferenceView_; }
-    // Whole-body alpha to apply while mass markers / interference view are visible (1.0 = leave alone).
-    float requestedBodyAlpha() const { return massBodyAlpha_; }
+    // Whole-body alpha while mass markers, section planes, or interference are visible.
+    float requestedBodyAlpha() const;
 
     // Mass Properties value chips (COM + bending I / polar J). Viewport-owned draw; dialogs own data.
     const std::vector<MassMarker>& massMarkers() const { return massMarkers_; }
@@ -114,10 +114,11 @@ public:
     // Viewport drag: move plane `idx` by `deltaAlongNormal` (world mm), debounce re-eval.
     void dragSectionPlane(AppState& st, int idx, float deltaAlongNormal);
     // True while the Section Properties window is open (viewport enables plane hit-test / drag).
-    bool sectionDragActive() const { return openWindow_ == "section"; }
+    bool sectionDragActive() const { return sectionOpen_; }
 
 private:
     void runEval(AppState& st, const std::string& method, const nlohmann::json& extra);
+    void runMassEval(AppState& st, const nlohmann::json& extra);
     void runFieldEval(AppState& st, const std::string& method, const nlohmann::json& extra,
                       const std::string& legendTitle, const std::string& units);
     void clearOverlays();
@@ -134,13 +135,30 @@ private:
     void fireAllSectionEvals(AppState& st);
     void rebuildSectionPlaneViews(AppState& st);
     void applySectionOffset(AppState& st, int idx, float newOffset, bool scheduleEval);
+    void drawMassWindow(AppState& st);
+    void drawSectionWindow(AppState& st);
+    void drawExclusiveWindow(AppState& st);
 
-    std::string openWindow_;     // which result window is showing ("mass","measure",…); empty=none
+    // Exclusive tools (measure/check/interference/draft/thickness/curvature/zebra/symmetry).
+    // Mass and Section are independent so both can be open at once.
+    std::string openWindow_;
     std::string title_;
-    nlohmann::json result_;      // last eval result object
-    std::string errorText_;      // set when the eval failed
-    bool pending_ = false;       // C39: an eval is in flight (window shows "Computing...")
-    int  gen_ = 0;               // C39: bumped per eval; stale callbacks are ignored
+    nlohmann::json result_;      // last exclusive-tool eval result
+    std::string errorText_;      // exclusive-tool error
+    bool pending_ = false;
+    int  gen_ = 0;
+
+    // Independent Mass Properties window + its own result slot (survives exclusive tools).
+    bool massOpen_ = false;
+    nlohmann::json massResult_ = nlohmann::json::object();
+    std::string massErrorText_;
+    bool massPending_ = false;
+    int  massGen_ = 0;
+
+    // Independent Section Properties window.
+    bool sectionOpen_ = false;
+    std::string sectionErrorText_;
+
 
     // Mass Properties material override: combo index into the density preset table + the live
     // density (g/cm3) sent to eval_mass. Changing either re-runs the evaluation.
@@ -196,7 +214,11 @@ private:
     std::vector<char> interferencePartChecked_;  // parallel to names; 1 = included
 
     // Viewport overlays (world XYZ segments + labels + highlights + callouts).
+    // overlaySegs_ holds exclusive-tool (measure) segments; massSegs_ holds COM/axis segments.
+    // overlaySegments() composes both into composedSegs_.
     std::vector<float> overlaySegs_;
+    std::vector<float> massSegs_;
+    mutable std::vector<float> composedSegs_;
     std::vector<std::pair<std::array<float, 3>, std::string>> overlayLabels_;
     std::vector<EvalHighlight> overlayHighlights_;
     std::vector<EvalCallout> overlayCallouts_;
@@ -204,7 +226,7 @@ private:
 
     // Mass COM / I / J value chips (separate from measure-only overlayLabels_).
     std::vector<MassMarker> massMarkers_;
-    // Live section cutting planes (populated while openWindow_ == "section").
+    // Live section cutting planes (populated while sectionOpen_).
     std::vector<SectionPlaneView> sectionPlanes_;
 };
 

@@ -102,6 +102,172 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
     }).detach();
 }
 
+// --- Cursor / legacy Python agent_design launcher ---
+// Packs worker event data into AgentEvent fields the way the historical launchJob did
+// (status / plan / iteration → chat steps + livePhase). NOT orch_-prefixed: app.cpp routes
+// bare kinds to the legacy chat path; ActivityPanel only consumes orch_*.
+void launchAgentDesign(WorkerClient& w, JobState& job,
+                       const std::string& request, const std::string& docId,
+                       const nlohmann::json& extra) {
+    if (job.running.exchange(true)) return;
+    job.ready = false;
+    job.kind = JOB_DESIGN;
+    {
+        std::lock_guard<std::mutex> lk(job.mtx);
+        job.error.clear(); job.stl.clear(); job.info.clear();
+        job.errorIsCad = false;
+        job.isAssembly = false; job.parts.clear(); job.fit = FitReport{};
+        job.converged = true; job.stopReason.clear();
+        job.createdDocPath.clear();
+        job.drawingDocId.clear(); job.drawingName.clear(); job.drawingSourceId.clear();
+        job.camDocId.clear();
+        job.isMission = false; job.missionVerdict.clear();
+    }
+    { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
+
+    // Failure honesty: Cursor needs the Python subprocess (CursorSubProvider lives there).
+    // With C++ agent default-on, agent_run_v2 never hits Python; if the worker was never
+    // started, fail loud instead of "worker not started" silence later.
+    if (!w.started()) {
+        {
+            std::lock_guard<std::mutex> lk(job.mtx);
+            job.error = "Cursor runs require the Python worker — not available";
+            job.errorIsCad = false;
+            job.converged = false;
+            job.stopReason = "provider_unavailable";
+        }
+        job.ready = true;
+        job.running = false;
+        return;
+    }
+
+    std::thread([&w, &job, request, docId, extra]() {
+        nlohmann::json result;
+        std::string err;
+
+        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
+            AgentEvent e;
+            e.kind = jstr(d, "kind");
+            e.index = jint(d, "index");
+            e.ok = jbool(d, "ok");
+            e.done = jbool(d, "done");
+            e.phase = jstr(d, "phase");
+            e.text = jstr(d, "text");
+            e.notes = jstr(d, "notes");
+            e.thinking = jstr(d, "thinking");
+            e.code = jstr(d, "code");
+            e.diff = jstr(d, "diff");
+            e.dims = jstr(d, "dims");
+            e.error = jstr(d, "error");
+            // Prefer error_detail when the loop surfaces a classified provider failure.
+            if (e.error.empty()) e.error = jstr(d, "error_detail");
+            e.contactSheet = jstr(d, "contact_sheet");
+            e.stlPath = jstr(d, "stl_path");
+            e.stdoutText = jstr(d, "stdout");
+            e.isAssembly = jbool(d, "is_assembly");
+            if (auto it = d.find("parts"); it != d.end()) e.parts = parseParts(*it);
+            if (auto it = d.find("fit"); it != d.end()) e.fit = parseFit(*it);
+            if (auto it = d.find("plan"); it != d.end()) e.plan = parsePlan(*it);
+            // status with phase=error: surface stop_reason in notes for the live line.
+            if (e.kind == "status" && e.phase == "error") {
+                std::string sr = jstr(d, "stop_reason");
+                if (!sr.empty() && e.notes.empty()) e.notes = sr;
+            }
+            std::lock_guard<std::mutex> lk(job.evMtx);
+            job.events.push_back(std::move(e));
+        };
+
+        nlohmann::json params = {
+            {"request", request},
+            {"name", "gui_design"},
+            {"session_id", "gui_design"},
+            {"reset", true},
+            {"plan", true},
+        };
+        // doc_id is accepted by the contract (context) even though the legacy loop is
+        // build123d-scoped; harmless if ignored.
+        if (!docId.empty()) params["doc_id"] = docId;
+        if (extra.is_object())
+            for (auto it = extra.begin(); it != extra.end(); ++it)
+                if (!params.contains(it.key())) params[it.key()] = it.value();
+
+        bool ok = w.call("agent_design", params, result, err, 900000, onEvent);
+        std::lock_guard<std::mutex> lk(job.mtx);
+        if (!ok) {
+            // Transport / "worker not started" / write failure.
+            if (err.find("worker not started") != std::string::npos)
+                job.error = "Cursor runs require the Python worker — not available";
+            else
+                job.error = err.empty() ? "agent_design call failed" : err;
+            job.errorIsCad = false;
+            job.converged = false;
+        } else if (result.is_object() && result.contains("code") && !result.value("ok", true)) {
+            // Structured protocol-2 method error envelope.
+            job.error = result.value("message", std::string("agent_design error"));
+            job.errorIsCad = false;
+            job.converged = false;
+        } else if (result.is_object() && result.contains("success") &&
+                   !result.value("success", true)) {
+            // Provider / loop failure returned as a normal RPC result (success:false).
+            std::string detail = result.value("error_detail", std::string());
+            if (detail.empty()) detail = result.value("error", std::string("agent_design failed"));
+            job.error = detail;
+            job.errorIsCad = false;
+            job.converged = false;
+            job.stopReason = result.value("stop_reason", std::string("provider_error"));
+        } else {
+            nlohmann::json mr = (result.contains("result") && result["result"].is_object())
+                                    ? result["result"] : nlohmann::json::object();
+            if (!mr.empty() && !mr.value("ok", true) && mr.contains("error")) {
+                // CAD script didn't build — modeling problem, not app failure.
+                job.error = mr.value("error", "The CAD code didn't produce a solid.");
+                job.errorIsCad = true;
+                job.converged = result.value("converged", false);
+                job.stopReason = result.value("stop_reason", std::string());
+            } else {
+                job.stl = mr.value("stl_path", std::string());
+                char buf[256] = "";
+                auto bb = mr.value("bbox", nlohmann::json::object());
+                if (bb.is_object() && bb.contains("size") && bb["size"].is_array() &&
+                    bb["size"].size() >= 3) {
+                    auto sz = bb["size"];
+                    std::snprintf(buf, sizeof(buf),
+                                  "%.1f x %.1f x %.1f mm  |  %.0f mm\xc2\xb3",
+                                  sz[0].get<double>(), sz[1].get<double>(),
+                                  sz[2].get<double>(), mr.value("volume", 0.0));
+                }
+                job.info = buf;
+                if (!job.info.empty())
+                    job.info += "  |  " + std::to_string(result.value("iterations", 0)) +
+                                " iters";
+                else
+                    job.info = std::to_string(result.value("iterations", 0)) + " iters";
+                job.converged = result.value("converged", true);
+                job.stopReason = result.value("stop_reason", std::string());
+                job.isAssembly = mr.value("is_assembly", false);
+                if (job.isAssembly) {
+                    job.parts = parseParts(mr.value("parts", nlohmann::json::array()));
+                    job.fit = parseFit(mr.value("fit", nlohmann::json::object()));
+                }
+                // success:true but no solid (e.g. no_code / max_iters with empty result)
+                if (job.stl.empty() && !job.converged) {
+                    std::string detail = result.value("error_detail", std::string());
+                    if (detail.empty() && !job.stopReason.empty())
+                        detail = "stopped: " + job.stopReason;
+                    if (!detail.empty()) {
+                        job.error = detail;
+                        job.errorIsCad = (job.stopReason == "failed" ||
+                                          job.stopReason == "no_code" ||
+                                          job.stopReason == "max_iters");
+                    }
+                }
+            }
+        }
+        job.ready = true;
+        job.running = false;
+    }).detach();
+}
+
 // --- Mission orchestrator launcher (see jobs.h) ---
 // A near-clone of launchAgentRunV2: same background thread + "orch_"-prefixed event streaming,
 // but calls agent_mission_v1 and captures the verdict + any assembly tab to open. The mission

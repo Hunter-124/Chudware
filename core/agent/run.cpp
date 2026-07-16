@@ -58,7 +58,9 @@ int call_budget_for(const json& provider_cfg) {
     std::string name = provider_cfg.value("name", std::string());
     std::string effort = provider_cfg.value("reasoning_effort", std::string());
     int base = 4096;  // local / unknown
-    if (name == "anthropic" || name == "gemini" || name == "openai") base = 8192;
+    if (name == "anthropic" || name == "anthropic-sub" || name == "gemini" || name == "openai" ||
+        name == "xai" || name == "xai-sub")
+        base = 8192;
     if (effort == "high" || effort == "max") base += 4096;  // reasoning headroom before content
     return base;
 }
@@ -856,6 +858,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         if (result.contains("error_detail") && result["error_detail"].is_string() &&
             !result["error_detail"].get<std::string>().empty())
             fin["error_detail"] = result["error_detail"];
+        if (result.contains("error_human") && result["error_human"].is_string() &&
+            !result["error_human"].get<std::string>().empty())
+            fin["error_human"] = result["error_human"];
         events.emit("run_finished", fin);
     }
 
@@ -867,6 +872,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
         !result["error_detail"].get<std::string>().empty())
         out["error_detail"] = result["error_detail"];
+    if (result.contains("error_human") && result["error_human"].is_string() &&
+        !result["error_human"].get<std::string>().empty())
+        out["error_human"] = result["error_human"];
     return out;
 }
 

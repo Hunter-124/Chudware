@@ -616,7 +616,26 @@ void AppState::toast(ui::ToastLevel level, std::string msg) {
 }
 
 // W1-B (item 4): shared undo/redo. Both the tree toolbar and the global keys call these.
+// Multi-document: undo stacks are per-doc and shared across clients — always target the document
+// the user is CURRENTLY viewing (active tab). Drawing/ECAD tabs leave DocMirror pointed at the
+// previous part/asm; async tab switches update activeTab before the mirror rebinds. Refuse those
+// paths so we never doc_undo/doc_redo a hidden or stale doc_id.
+static bool activeCadDocMatchesMirror(const AppState& st) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return false;
+    const auto& t = st.docTabs[st.activeTab];
+    if (t.kind != AppState::DocTab::TabKind::Part &&
+        t.kind != AppState::DocTab::TabKind::Assembly) return false;
+    if (t.docId.empty() || !st.docMirror.hasDoc()) return false;
+    return t.docId == st.docMirror.docId();
+}
+
 core::OpsResponse AppState::docUndo() {
+    if (!activeCadDocMatchesMirror(*this)) {
+        core::OpsResponse r;
+        r.error_code = "no_doc";
+        r.error_message = "no active CAD document";
+        return r;
+    }
     core::OpsResponse r = docMirror.undo(worker);
     if (r.ok) {
         addLog("[doc] undo  rev=" + std::to_string(r.revision));
@@ -638,6 +657,12 @@ core::OpsResponse AppState::docUndo() {
 }
 
 core::OpsResponse AppState::docRedo() {
+    if (!activeCadDocMatchesMirror(*this)) {
+        core::OpsResponse r;
+        r.error_code = "no_doc";
+        r.error_message = "no active CAD document";
+        return r;
+    }
     core::OpsResponse r = docMirror.redo(worker);
     if (r.ok) {
         addLog("[doc] redo  rev=" + std::to_string(r.revision));

@@ -98,6 +98,19 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
     # turn — get_provider(name=...) beats the ambient AI_CAD_PROVIDER env / config.json default.
     # An explicit pick also skips the IP-1 routing override below (the user's choice wins).
     explicit_provider = params.get("provider") or None
+    # GUI wire id is "cursor"; config.get_provider registers the subscription adapter as
+    # "cursor-sub". Normalize so a Design send with provider=cursor actually constructs
+    # CursorSubProvider (not ValueError: Unknown provider).
+    if isinstance(explicit_provider, str):
+        _prov_l = explicit_provider.strip().lower()
+        if _prov_l in ("cursor", "cursor-sub"):
+            explicit_provider = "cursor-sub"
+    # Explicit model from the picker must win over ambient config.json "model".
+    # Cursor registry ids (cursor/claude-sonnet-5, composer-2.5, …) are accepted by
+    # CursorSubProvider.model_map (strips cursor/ prefix).
+    if params.get("model"):
+        cfg = dict(cfg or {})
+        cfg["model"] = params.get("model")
     # Per-role thinking (Settings → AI → Model roles): when the GUI did not pass an
     # explicit reasoning_effort, resolve Default-role thinking (Auto → classifier).
     if not (cfg or {}).get("reasoning_effort") and not params.get("reasoning_effort"):

@@ -345,6 +345,7 @@ bool is_cut(const Step& step) {
 struct ProvReply {
     std::string text;
     bool has_error = false;
+    std::string error;
 };
 
 using ProviderFn = std::function<ProvReply(const std::string& system, const json& messages,
@@ -364,16 +365,23 @@ ProviderFn make_provider(const json& provider_cfg) {
     return [name, cfg](const std::string& system, const json& messages, int max_tokens) -> ProvReply {
         ProvReply r;
         CompleteResult cr = complete(name, cfg, system, messages, max_tokens);
-        if (!cr.error.empty()) { r.has_error = true; r.text = cr.text; return r; }
+        if (!cr.error.empty()) {
+            r.has_error = true;
+            r.error = cr.error;
+            r.text = cr.text;
+            return r;
+        }
         r.text = cr.text;
         return r;
     };
 }
 
-// _provider_call: one bounded call; returns (reply, duration_ms). Never raises.
+// _provider_call: one bounded call; returns (reply, duration_ms, error). Never raises.
 struct CallResult {
     std::string reply;
     int duration_ms = 0;
+    bool has_error = false;
+    std::string error;
 };
 CallResult provider_call(const ProviderFn& provider, const std::string& system,
                          const json& messages, int max_tokens) {
@@ -383,7 +391,13 @@ CallResult provider_call(const ProviderFn& provider, const std::string& system,
     CallResult cr;
     cr.duration_ms =
         static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-    cr.reply = rep.has_error ? std::string() : rep.text;
+    if (rep.has_error) {
+        cr.has_error = true;
+        cr.error = rep.error;
+        cr.reply = "";
+    } else {
+        cr.reply = rep.text;
+    }
     return cr;
 }
 
@@ -821,6 +835,30 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
         events.emit("agent_output", ev);
     }
 
+    if (dcall.has_error) {
+        std::string reason = "provider error: " + dcall.error;
+        std::string human = humanize_provider_error(reason);
+        events.emit("stage_result", json{{"stage", "decompose"},
+                                         {"attempt", 1},
+                                         {"verdict", "fail"},
+                                         {"reason", reason},
+                                         {"stop_reason", "provider_error"},
+                                         {"error_detail", reason},
+                                         {"error_human", human}});
+        int rev = rev_now();
+        events.emit("run_finished", json{{"status", "failed"},
+                                         {"stop_reason", "provider_error"},
+                                         {"error_detail", reason},
+                                         {"error_human", human},
+                                         {"revision", rev}});
+        return json{{"run_id", run_id},
+                    {"status", "failed"},
+                    {"stop_reason", "provider_error"},
+                    {"error_detail", reason},
+                    {"error_human", human},
+                    {"revision", rev},
+                    {"doc_id", doc_id}};
+    }
     if (steps.empty()) {
         events.emit("stage_result", json{{"stage", "decompose"}, {"attempt", 1},
                                          {"verdict", "fail"},

@@ -3334,8 +3334,15 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         doSaveDoc(st, /*forceDialog=*/ImGui::GetIO().KeyShift);   // C41
     // W1-B (item 4): route through the shared AppState helper so the toolbar buttons and the global
     // Ctrl+Z / Ctrl+Y keys take the identical path (mesh refresh + owner map + confirmation toast).
-    if (toolBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) st.docUndo();
-    if (toolBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) st.docRedo();
+    // Only enable when the active tab is the CAD doc currently bound in DocMirror — Drawing/ECAD
+    // tabs leave the previous part loaded behind the sheet, and async tab rebind can lag activeTab.
+    const bool canHistory = canDoc && st.docMirror.hasDoc() &&
+        !st.activeTabIsDrawing() && !st.activeTabIsEcad() &&
+        st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        st.docTabs[st.activeTab].docId == st.docMirror.docId() &&
+        !st.docTabs[st.activeTab].historyCleared;
+    if (toolBtn("fm_undo", "undo", "Undo", canHistory) && canHistory) st.docUndo();
+    if (toolBtn("fm_redo", "redo", "Redo", canHistory) && canHistory) st.docRedo();
     ImGui::PopID();
     ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
     ImGui::Dummy(ImVec2(availW, 0));

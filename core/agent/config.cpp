@@ -23,10 +23,41 @@ namespace {
 // models are large; a LOCAL/unknown server is assumed 8192 — a common LM Studio / Ollama
 // default — so input+output budgeting never overruns a small window by accident.
 int default_context_window(const std::string& name) {
-    if (name == "anthropic") return 200000;
+    if (name == "anthropic" || name == "anthropic-sub") return 200000;
     if (name == "gemini") return 1048576;
-    if (name == "openai") return 128000;
+    if (name == "openai" || name == "xai" || name == "xai-sub") return 128000;
     return 8192;  // local / unknown — conservative
+}
+
+// Read the ACTIVE account's access_token from config.subscription_auth[provider_id].
+// READ-ONLY: never refreshes or writes tokens. xAI rotates refresh tokens on every
+// exchange — only the Python xai_sub_provider may refresh+persist. If the access
+// token is expired the call will 401; the user re-signs in via Settings.
+std::string subscription_access_token(const json& cfg, const char* provider_id) {
+    if (!cfg.is_object() || !cfg.contains("subscription_auth") ||
+        !cfg["subscription_auth"].is_object())
+        return {};
+    const json& sa = cfg["subscription_auth"];
+    auto it = sa.find(provider_id);
+    if (it == sa.end() || !it->is_object()) return {};
+    const json& entry = *it;
+    // Multi-account shape: {active, accounts:{id:{access_token,...}}}
+    if (entry.contains("accounts") && entry["accounts"].is_object()) {
+        std::string aid;
+        if (entry.contains("active") && entry["active"].is_string())
+            aid = entry["active"].get<std::string>();
+        if (aid.empty() && !entry["accounts"].empty())
+            aid = entry["accounts"].begin().key();
+        auto ac = entry["accounts"].find(aid);
+        if (ac == entry["accounts"].end() || !ac->is_object()) return {};
+        if (ac->contains("access_token") && (*ac)["access_token"].is_string())
+            return (*ac)["access_token"].get<std::string>();
+        return {};
+    }
+    // Legacy flat credential.
+    if (entry.contains("access_token") && entry["access_token"].is_string())
+        return entry["access_token"].get<std::string>();
+    return {};
 }
 }  // namespace
 
@@ -170,8 +201,10 @@ bool provider_offline_safe(const json& provider) {
     if (provider.contains("name") && provider["name"].is_string())
         name = provider["name"].get<std::string>();
     if (name == "mock" || name == "mock-roles" || name == "base") return true;
-    if (name == "anthropic") return false;
+    if (name == "anthropic" || name == "anthropic-sub") return false;
     if (name == "gemini") return false;  // always cloud (generativelanguage API)
+    if (name == "xai" || name == "xai-sub" || name == "cursor" || name == "cursor-sub")
+        return false;
     std::optional<std::string> base_url;
     if (provider.contains("base_url") && provider["base_url"].is_string())
         base_url = provider["base_url"].get<std::string>();
@@ -203,11 +236,12 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
     };
 
     // Offline refusals BEFORE constructing anything (security-critical path).
-    if (offline && name == "gemini")
+    if (offline && (name == "gemini" || name == "xai" || name == "xai-sub" ||
+                    name == "anthropic-sub" || name == "cursor" || name == "cursor-sub"))
         return refusal(
             std::string("offline mode is enabled (config '") + kOfflineSetting +
-            "': true): the Google Gemini cloud provider is refused. Use a local "
-            "(loopback) model server instead.");
+            "': true): the cloud provider '" + name +
+            "' is refused. Use a local (loopback) model server instead.");
     if (offline && (name == "anthropic" || name == "openai") && !name.empty()) {
         if (name == "anthropic")
             return refusal(
@@ -283,16 +317,59 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
         desc = json{{"name", "mock"}, {"model", nullptr}, {"base_url", nullptr},
                     {"supports_vision", false}, {"api_key", nullptr}};
     } else if (name == "anthropic") {
+        // Prefer a classic API key; fall back to the active Claude subscription OAuth token.
+        std::string key = py_or(cfg_str(cfg, "api_key"),
+                                env_get(env, "ANTHROPIC_API_KEY").value_or(""));
+        if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
+            cfg["keys"].contains("anthropic") && cfg["keys"]["anthropic"].is_string())
+            key = cfg["keys"]["anthropic"].get<std::string>();
+        bool oauth = false;
+        if (key.empty()) {
+            key = subscription_access_token(cfg, "anthropic-sub");
+            oauth = !key.empty();
+        } else if (key.rfind("sk-ant-oat", 0) == 0) {
+            oauth = true;
+        }
+        // Global cfg.model may be a Grok id when the active provider is xAI — never send
+        // a non-Claude model id to the Anthropic Messages API.
+        std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-4-8");
+        {
+            std::string ml = lower(model);
+            if (ml.find("claude") == std::string::npos && ml.find("opus") == std::string::npos &&
+                ml.find("sonnet") == std::string::npos && ml.find("haiku") == std::string::npos)
+                model = "claude-opus-4-8";
+        }
         desc = json{
-            {"name", "anthropic"},
-            {"model", py_or(cfg_str(cfg, "model"), "claude-opus-4-8")},
+            {"name", oauth ? "anthropic-sub" : "anthropic"},
+            {"model", model},
             {"base_url", nullptr},
             {"supports_vision", true},
-            {"api_key", py_or(cfg_str(cfg, "api_key"),
-                              env_get(env, "ANTHROPIC_API_KEY").value_or(""))},
+            {"api_key", key},
         };
+        if (oauth) desc["auth_mode"] = "oauth";
         if (desc["api_key"].is_string() && desc["api_key"].get<std::string>().empty())
             desc["api_key"] = nullptr;  // key may be None when unset (mirrors Python).
+    } else if (name == "anthropic-sub") {
+        std::string key = subscription_access_token(cfg, "anthropic-sub");
+        if (key.empty())
+            return refusal(
+                "Claude subscription not signed in. Open Settings → AI → Accounts and "
+                "sign in with Claude (Pro/Max).");
+        std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-4-8");
+        {
+            std::string ml = lower(model);
+            if (ml.find("claude") == std::string::npos && ml.find("opus") == std::string::npos &&
+                ml.find("sonnet") == std::string::npos && ml.find("haiku") == std::string::npos)
+                model = "claude-opus-4-8";
+        }
+        desc = json{
+            {"name", "anthropic-sub"},
+            {"model", model},
+            {"base_url", nullptr},
+            {"supports_vision", true},
+            {"api_key", key},
+            {"auth_mode", "oauth"},
+        };
     } else if (name == "gemini") {
         // Google Gemini (cloud). Key from cfg.api_key or GEMINI_API_KEY / GOOGLE_API_KEY env.
         std::string key = py_or(cfg_str(cfg, "api_key"), env_get(env, "GEMINI_API_KEY").value_or(""));
@@ -318,6 +395,51 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
         };
         if (desc["api_key"].is_string() && desc["api_key"].get<std::string>().empty())
             desc["api_key"] = nullptr;
+    } else if (name == "xai" || name == "xai-sub") {
+        // xAI Grok: classic console.x.ai API key OR SuperGrok OAuth access_token.
+        // Completions are OpenAI-compatible at https://api.x.ai/v1/chat/completions.
+        // C++ NEVER refreshes the OAuth token (xAI rotates RTs; only Python persists).
+        std::string key = py_or(cfg_str(cfg, "api_key"), env_get(env, "XAI_API_KEY").value_or(""));
+        if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
+            cfg["keys"].contains("xai") && cfg["keys"]["xai"].is_string())
+            key = cfg["keys"]["xai"].get<std::string>();
+        bool oauth = false;
+        if (key.empty() || name == "xai-sub") {
+            std::string sub = subscription_access_token(cfg, "xai-sub");
+            if (!sub.empty()) {
+                key = sub;
+                oauth = true;
+            }
+        }
+        if (key.empty()) {
+            return refusal(
+                "xAI not configured. Sign in with SuperGrok (Settings → AI → Accounts) "
+                "or set an API key from console.x.ai.");
+        }
+        std::string model = py_or(cfg_str(cfg, "model"), "grok-4.5");
+        {
+            std::string ml = lower(model);
+            // Reject Claude/OpenAI/etc. ids left over when the active provider was switched.
+            if (ml.find("grok") == std::string::npos && ml.rfind("xai", 0) != 0)
+                model = "grok-4.5";
+            if (model == "grok-4-5") model = "grok-4.5";
+        }
+        desc = json{
+            {"name", oauth ? "xai-sub" : "xai"},
+            {"model", model},
+            {"base_url", "https://api.x.ai/v1"},
+            {"supports_vision", true},
+            {"api_key", key},
+        };
+        if (oauth) desc["auth_mode"] = "oauth";
+    } else if (name == "cursor" || name == "cursor-sub") {
+        // Cursor auth is stored (subscription_auth.cursor) but there is NO REST
+        // completions transport in C++ or Python — Cursor's agent backend is
+        // Connect-RPC/protobuf over HTTP/2. Route via a different provider.
+        return refusal(
+            "Cursor has no C++ chat completions transport (its agent API is Connect-RPC/"
+            "protobuf, not REST). Cursor Design runs route through the Python worker — "
+            "this refusal firing means that routing was bypassed or the worker is down.");
     } else if (name == "llamacpp" || name == "llama.cpp" || name == "llama-cpp") {
         desc = json{
             {"name", "llamacpp"},

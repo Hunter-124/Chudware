@@ -451,6 +451,7 @@ struct ChatMsg {
     bool fromUser = false;
     std::string text;              // user prompt, or the assistant's final summary
     bool running = false;          // assistant turn still streaming
+    std::string model;             // assistant turn: model id at run start (label); empty = plain "Assistant"
     int errKind = ERR_NONE;        // ERR_CAD = generated code didn't build (calm, amber);
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
     std::string liveStatus;        // transient "Iteration N: building..." while running
@@ -638,6 +639,9 @@ struct AppState {
         // reason "last_writer_detached"). If this is the active tab we keep it on screen; it
         // becomes eligible for auto-close on the next switch-away (unless adopted/dirty).
         bool        agentDone = false;
+        // True after doc.history_cleared for this doc (human save wiped undo/redo). Greys the
+        // undo/redo toolbar until a local edit re-enables history. Cleared on local mutation.
+        bool        historyCleared = false;
 
         // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
         // thing the user actually opened/saved) over the internal tree "name" — an opened .step+
@@ -1612,7 +1616,9 @@ struct AppState {
     // the global Ctrl+Z / Ctrl+Y keys route through here, so behavior stays identical. Performs the
     // DocMirror mutation, refreshes the viewport mesh + owner map on success, logs, and posts a
     // brief confirmation toast ("Undo: ok" / "Undo: nothing to undo"). Returns the response so the
-    // caller can branch further if it wants. No-op (returns a no_doc response) when no doc is open.
+    // caller can branch further if it wants. No-op (returns a no_doc response) when no doc is open,
+    // when the active tab is Drawing/ECAD (DocMirror still holds the previous part/asm), or when
+    // the live mirror has not yet rebound to the active tab after a switch.
     core::OpsResponse docUndo();
     core::OpsResponse docRedo();
 };

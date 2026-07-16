@@ -2,10 +2,19 @@
 
 #include "util/aicm_handoff.h"
 
+#ifdef __EMSCRIPTEN__
+#include "core/web_fetch.h"
+#endif
+
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#ifndef __EMSCRIPTEN__
 #include <filesystem>
 #include <fstream>
+#endif
 
 namespace render {
 
@@ -200,14 +209,90 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
     return true;
 }
 
+bool loadAicmBytes(const uint8_t* data, size_t size, DocMesh& out, std::string& err) {
+    return parseAicm(data, size, out, err);
+}
+
+#ifdef __EMSCRIPTEN__
+namespace {
+
+// Percent-encode for query values (RFC 3986 unreserved left alone).
+std::string urlEncode(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
+    // Browser has no /dev/shm or daemon FS — pull bytes from the gateway.
+    const bool is_shm = aicad::aicm_handoff::is_shm_uri(path);
+    std::string url;
+    if (is_shm) {
+        // aicm-shm://[/]aicad_<key> → ?shm=aicad_<key> (gateway rejects a leading '/').
+        std::string name = path.substr(std::strlen("aicm-shm://"));
+        while (!name.empty() && name.front() == '/') name.erase(name.begin());
+        if (name.empty()) {
+            err = "malformed aicm-shm uri";
+            return false;
+        }
+        url = "/files/aicm?shm=" + urlEncode(name);
+    } else {
+        if (path.empty()) {
+            err = "empty AICM path";
+            return false;
+        }
+        url = "/files/aicm?path=" + urlEncode(path);
+    }
+
+    std::string ferr;
+    std::vector<uint8_t> bytes = billet::webFetch(url, ferr);
+    if (bytes.empty()) {
+        err = ferr.empty() ? ("empty AICM response for " + path) : ferr;
+        return false;
+    }
+
+    if (is_shm) {
+        // Gateway serves the raw shm object: uint64 LE size header + AICM payload
+        // (same layout map_shm strips on native).
+        if (bytes.size() < 8) {
+            err = "shm payload too short";
+            return false;
+        }
+        uint64_t sz = 0;
+        std::memcpy(&sz, bytes.data(), 8);
+        if (8ull + sz > static_cast<uint64_t>(bytes.size())) {
+            err = "shm payload size exceeds response";
+            return false;
+        }
+        return loadAicmBytes(bytes.data() + 8, static_cast<size_t>(sz), out, err);
+    }
+    return loadAicmBytes(bytes.data(), bytes.size(), out, err);
+}
+#else  // !__EMSCRIPTEN__
+
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
     // T-PERF10: aicm-shm:// URIs (and same-process cache) via aicm_handoff. File paths
     // still use the handoff map_file path so one code path covers both.
     aicad::aicm_handoff::Mapping m;
     if (!aicad::aicm_handoff::map(path, m, err)) return false;
-    const bool ok = parseAicm(m.data, m.size, out, err);
+    const bool ok = loadAicmBytes(m.data, m.size, out, err);
     aicad::aicm_handoff::unmap(m);
     return ok;
 }
+
+#endif  // __EMSCRIPTEN__
 
 }  // namespace render

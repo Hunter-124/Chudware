@@ -77,6 +77,14 @@ _CODEX_UA = "codex-cli"
 # Cursor personal OAuth
 _CURSOR_USAGE_URL = "https://api2.cursor.sh/auth/usage"
 _CURSOR_STRIPE_URL = "https://api2.cursor.sh/auth/full_stripe_profile"
+# Real period spend / included limits (Connect JSON unary) — /auth/usage often
+# returns gpt-4 buckets with maxRequestUsage=null, which leaves Settings empty.
+_CURSOR_PERIOD_USAGE_URL = (
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+)
+_CURSOR_PLAN_INFO_URL = (
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
+)
 
 # In-process cache: key -> {fetched_at, rate_limited_until, row}
 _cache: dict[str, dict[str, Any]] = {}
@@ -703,18 +711,132 @@ def fetch_codex_usage(cred: dict) -> dict:
     }
 
 
+def _ms_epoch_to_iso(value: Any) -> str | None:
+    """Parse Cursor dashboard epoch fields (ms as int/str) to ISO-Z."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().isdigit():
+        return _iso_from_ms(int(value.strip()))
+    if isinstance(value, (int, float)):
+        return _iso_from_ms(value)
+    if isinstance(value, str):
+        return _parse_iso_to_iso(value)
+    return None
+
+
+def _parse_cursor_period_usage(body: dict) -> list[dict]:
+    """Map DashboardService/GetCurrentPeriodUsage JSON → §4.5 usage windows.
+
+    Live fields (2026): planUsage.totalPercentUsed / autoPercentUsed /
+    apiPercentUsed (0..100), planUsage.includedSpend vs limit (cents),
+    billingCycleEnd as epoch-ms string.
+    """
+    if not isinstance(body, dict):
+        return []
+    resets = (
+        _ms_epoch_to_iso(body.get("billingCycleEnd"))
+        or _ms_epoch_to_iso(body.get("billingCycleStart"))
+    )
+    plan_usage = body.get("planUsage") if isinstance(body.get("planUsage"), dict) else {}
+    rows: list[dict] = []
+
+    def _pct_field(key: str, window: str, label: str) -> None:
+        pct = _to_number(plan_usage.get(key))
+        if pct is None:
+            return
+        # Server sends 0..100 percentages (sometimes already 0..1).
+        frac = pct / 100.0 if pct > 1.0 else pct
+        rows.append(_usage_row(window, label, _clamp_fraction(frac), resets))
+
+    _pct_field("totalPercentUsed", "plan", "Plan usage")
+    _pct_field("autoPercentUsed", "auto", "Auto models")
+    _pct_field("apiPercentUsed", "api", "API / premium models")
+
+    # Spend cents when percent fields absent: includedSpend / limit.
+    if not rows:
+        used_cents = (
+            _to_number(plan_usage.get("includedSpend"))
+            or _to_number(plan_usage.get("totalSpend"))
+        )
+        limit_cents = _to_number(plan_usage.get("limit"))
+        if used_cents is not None and limit_cents and limit_cents > 0:
+            rows.append(
+                _usage_row(
+                    "plan",
+                    "Plan usage",
+                    _clamp_fraction(used_cents / limit_cents),
+                    resets,
+                )
+            )
+
+    # Optional on-demand / spend-limit bucket.
+    spend = body.get("spendLimitUsage") if isinstance(body.get("spendLimitUsage"), dict) else {}
+    if spend:
+        used = (
+            _to_number(spend.get("used"))
+            or _to_number(spend.get("spendUsed"))
+            or _to_number(spend.get("totalSpend"))
+        )
+        limit = (
+            _to_number(spend.get("limit"))
+            or _to_number(spend.get("spendLimit"))
+            or _to_number(spend.get("amountLimit"))
+        )
+        if used is not None and limit and limit > 0:
+            rows.append(
+                _usage_row(
+                    "spend_limit",
+                    "Spend limit",
+                    _clamp_fraction(used / limit),
+                    resets,
+                )
+            )
+
+    return rows
+
+
+def _fetch_cursor_period_usage(token: str) -> list[dict]:
+    """POST DashboardService/GetCurrentPeriodUsage (Connect JSON unary)."""
+    if not token:
+        return []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Connect-Protocol-Version": "1",
+        "x-cursor-client-version": "cli-2026.01.09-231024f",
+        "x-cursor-client-type": "cli",
+    }
+    try:
+        status, body, _ = _http_request(
+            "POST",
+            _CURSOR_PERIOD_USAGE_URL,
+            headers,
+            data=b"{}",
+            timeout=20.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("cursor period usage POST failed: %s", exc)
+        return []
+    if status != 200 or not isinstance(body, dict):
+        log.debug("cursor period usage HTTP %s", status)
+        return []
+    return _parse_cursor_period_usage(body)
+
+
 def fetch_cursor_usage(cred: dict) -> dict:
-    """Cursor Pro: /auth/usage + optional /auth/full_stripe_profile for plan.
+    """Cursor Pro usage for Settings.
 
-    Usage endpoint needs a live personal OAuth access token:
-      GET https://api2.cursor.sh/auth/usage
-      Authorization: Bearer <access_token>
-      Accept: application/json
+    Primary quota: POST DashboardService/GetCurrentPeriodUsage (real
+    total/auto/api percent used + billing cycle end).
 
-    Some tokens (stale refresh, enterprise SSO, CLI-exchanged keys) return 401/403
-    on /auth/usage even while /auth/full_stripe_profile still answers — in that
-    case we still return a human display_name/plan and an empty usage list so
-    Settings never shows a bare ``acct-…`` row.
+    Secondary: GET /auth/usage request buckets when they include limits.
+
+    Identity: GET /auth/full_stripe_profile for plan/email/display_name.
+
+    Some tokens return 401/403 on one endpoint while another still answers —
+    we still return a human display_name/plan so Settings never shows bare
+    ``acct-…``.
     """
     token = cred.get("access_token") or ""
     headers = {
@@ -849,6 +971,27 @@ def fetch_cursor_usage(cred: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         usage_error = str(exc)
         log.debug("cursor usage fetch failed: %s", exc)
+
+    # Prefer Dashboard period usage — /auth/usage often returns gpt-4 with
+    # maxRequestUsage=null (no fraction → Settings "usage unavailable").
+    period_rows: list[dict] = []
+    try:
+        period_rows = _fetch_cursor_period_usage(token)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("cursor period usage failed: %s", exc)
+    if period_rows:
+        # Keep any /auth/usage buckets that already have fractions, then add
+        # period windows (period wins on window id collision).
+        by_window: dict[str, dict] = {}
+        for row in usage:
+            if isinstance(row, dict) and row.get("used_fraction") is not None:
+                by_window[str(row.get("window") or row.get("label") or "")] = row
+        for row in period_rows:
+            if isinstance(row, dict):
+                by_window[str(row.get("window") or row.get("label") or "")] = row
+        usage = [r for r in by_window.values() if r]
+        usage_error = None
+        source = "api"
 
     # Plan/identity from stripe profile (best-effort, unstable internal endpoint).
     try:

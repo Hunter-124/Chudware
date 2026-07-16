@@ -220,6 +220,75 @@ def test_cursor_usage_and_stripe_plan(tmp_config, monkeypatch):
     assert any(abs(f - 0.25) < 1e-9 for f in fracs)
 
 
+def test_cursor_period_usage_provides_fractions(tmp_config, monkeypatch):
+    """When /auth/usage has null maxRequestUsage, dashboard period fills fractions."""
+    sub_auth.save_credential("cursor", {
+        "access_token": "ctok",
+        "refresh_token": "rt",
+        "account_id": "c1",
+        "expires_at_ms": int(time.time() * 1000) + 10**9,
+    }, account_id="c1")
+
+    def fake_http(url, headers=None, timeout=20.0):
+        if url.endswith("/auth/usage"):
+            return 200, {
+                "gpt-4": {
+                    "numRequests": 0,
+                    "maxRequestUsage": None,
+                },
+                "startOfMonth": "2026-06-19T08:52:01.000Z",
+            }, {}
+        if url.endswith("/full_stripe_profile"):
+            return 200, {
+                "membershipType": "pro",
+                "email": "dev@cursor.com",
+                "name": "Dev",
+            }, {}
+        return 404, None, {}
+
+    def fake_request(method, url, headers=None, data=None, timeout=20.0):
+        if "GetCurrentPeriodUsage" in url:
+            return 200, {
+                "billingCycleStart": "1781859121000",
+                "billingCycleEnd": "1784451121000",
+                "planUsage": {
+                    "totalSpend": 9288,
+                    "includedSpend": 2000,
+                    "limit": 2000,
+                    "autoPercentUsed": 40,
+                    "apiPercentUsed": 100,
+                    "totalPercentUsed": 75,
+                },
+            }, {}
+        return 404, None, {}
+
+    monkeypatch.setattr(usage, "_http_get", fake_http)
+    monkeypatch.setattr(usage, "_http_request", fake_request)
+    row = usage.fetch_account_usage("cursor", "c1", force=True)
+    fracs = {
+        u["window"]: u["used_fraction"]
+        for u in row["usage"]
+        if u.get("used_fraction") is not None
+    }
+    assert abs(fracs.get("plan", -1) - 0.75) < 1e-9
+    assert abs(fracs.get("auto", -1) - 0.40) < 1e-9
+    assert abs(fracs.get("api", -1) - 1.0) < 1e-9
+    assert any(u.get("resets_at") for u in row["usage"])
+
+
+def test_parse_cursor_period_usage_spend_fallback():
+    rows = usage._parse_cursor_period_usage({
+        "billingCycleEnd": "1784451121000",
+        "planUsage": {
+            "includedSpend": 500,
+            "limit": 2000,
+        },
+    })
+    assert len(rows) == 1
+    assert abs(rows[0]["used_fraction"] - 0.25) < 1e-9
+    assert rows[0]["window"] == "plan"
+
+
 # ── xAI degrade ──────────────────────────────────────────────────────────────
 
 

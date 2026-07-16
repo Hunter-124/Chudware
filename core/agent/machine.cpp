@@ -1,6 +1,8 @@
 // core/agent/machine.cpp — see machine.h. Mirrors agent/orchestrator/machine.py.
 #include "agent/machine.h"
 
+#include "agent/providers.h"
+
 #include <vector>
 
 namespace aicad {
@@ -225,13 +227,17 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                     last_fail_reason = reason;
                     run_provider_error = reason;
                 }
-                events.emit("stage_result",
-                            json{{"stage", stage},
-                                 {"attempt", attempt},
-                                 {"verdict", "fail"},
-                                 {"reason", reason},
-                                 {"stop_reason", last_was_provider_error ? "provider_error"
-                                                                        : "identical_failure"}});
+                json sr = json{{"stage", stage},
+                              {"attempt", attempt},
+                              {"verdict", "fail"},
+                              {"reason", reason},
+                              {"stop_reason", last_was_provider_error ? "provider_error"
+                                                                     : "identical_failure"}};
+                if (last_was_provider_error) {
+                    sr["error_detail"] = reason;
+                    sr["error_human"] = humanize_provider_error(reason);
+                }
+                events.emit("stage_result", sr);
                 return last_was_provider_error ? "provider_error" : "fail";
             }
         } else {
@@ -280,14 +286,18 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                              std::to_string(budget) + ")";
                     if (!last_fail_reason.empty()) reason += ": " + last_fail_reason;
                 }
-                events.emit("stage_result",
-                            json{{"stage", stage},
-                                 {"attempt", attempt},
-                                 {"verdict", "fail"},
-                                 {"reason", reason},
-                                 {"stop_reason", last_was_provider_error ? "provider_error"
-                                                                        : "budget_exhausted"}});
-                if (last_was_provider_error) run_provider_error = reason;
+                json sr = json{{"stage", stage},
+                              {"attempt", attempt},
+                              {"verdict", "fail"},
+                              {"reason", reason},
+                              {"stop_reason", last_was_provider_error ? "provider_error"
+                                                                     : "budget_exhausted"}};
+                if (last_was_provider_error) {
+                    run_provider_error = reason;
+                    sr["error_detail"] = reason;
+                    sr["error_human"] = humanize_provider_error(reason);
+                }
+                events.emit("stage_result", sr);
                 return last_was_provider_error ? "provider_error" : "fail";
             }
         }
@@ -311,6 +321,14 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     {
         std::string plan_v = run_stage("plan", actions.plan, "planner");
         if (plan_v == "cancelled") return cancel_result();
+        if (plan_v == "provider_error") {
+            const std::string detail =
+                run_provider_error.empty() ? last_fail_reason : run_provider_error;
+            return json{{"status", "failed"},
+                       {"stop_reason", "provider_error"},
+                       {"error_detail", detail},
+                       {"error_human", humanize_provider_error(detail)}};
+        }
     }
 
     // ---- MODEL (loop per plan step) ----
@@ -335,11 +353,14 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         ++step_index;
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
-        if (v == "provider_error")
+        if (v == "provider_error") {
+            const std::string detail =
+                run_provider_error.empty() ? last_fail_reason : run_provider_error;
             return json{{"status", "failed"},
                        {"stop_reason", "provider_error"},
-                       {"error_detail", run_provider_error.empty() ? last_fail_reason
-                                                                  : run_provider_error}};
+                       {"error_detail", detail},
+                       {"error_human", humanize_provider_error(detail)}};
+        }
         if (v == "fail") return json{{"status", "failed"}, {"stop_reason", "model_failed"}};
         if (state.last_no_progress) {
             stagnant += 1;

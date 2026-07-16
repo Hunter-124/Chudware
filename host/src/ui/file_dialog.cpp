@@ -2,7 +2,176 @@
 // Windows: the common dialogs (GetSaveFileNameW / GetOpenFileNameW).
 // Other (Linux/macOS): shell out to kdialog (KDE) or zenity (GTK), parsing the same
 // NUL-separated Win32 filter into the chosen tool's syntax.
-#ifdef _WIN32
+// Emscripten: browser <input type=file> + gateway /workspace/upload for open;
+//             filename prompt under the server workspace for save; afterFileWritten
+//             triggers a browser download of the server path.
+
+#ifdef __EMSCRIPTEN__
+// ---------------------------------------------------------------------------
+// Web (Emscripten): browser pick + gateway workspace.
+// ---------------------------------------------------------------------------
+#include <emscripten.h>
+#include <string>
+
+#include "file_dialog.h"
+#include "../core/fs_backend.h"
+#include "../core/web_file_pick.h"
+
+// Compile-unit inclusion until the integrator lists web_file_pick.cpp in CMake.
+#ifndef BILLET_WEB_FILE_PICK_TU
+#define BILLET_WEB_FILE_PICK_TU
+#include "../core/web_file_pick.cpp"
+#endif
+
+namespace ui {
+namespace {
+
+// Convert a NUL-separated Win32 filter into an HTML accept= string
+// ("desc\0*.step+;*.step\0...\0\0" -> ".step+,.step,...").
+std::string filterToAccept(const char* filter) {
+    if (!filter) return {};
+    std::string out;
+    const char* p = filter;
+    while (p && *p) {
+        // skip description
+        p += std::char_traits<char>::length(p) + 1;
+        if (!*p) break;
+        std::string pat(p);
+        p += pat.size() + 1;
+        // patterns may be "a;b;c"
+        size_t i = 0;
+        while (i < pat.size()) {
+            size_t j = pat.find(';', i);
+            if (j == std::string::npos) j = pat.size();
+            std::string one = pat.substr(i, j - i);
+            // strip leading "*."
+            if (one.size() >= 2 && one[0] == '*' && one[1] == '.') {
+                one = one.substr(1);  // keep ".ext"
+            } else if (one == "*.*") {
+                one.clear();
+            }
+            if (!one.empty()) {
+                if (!out.empty()) out += ',';
+                out += one;
+            }
+            i = j + 1;
+        }
+    }
+    return out;
+}
+
+std::string pathJoinWs(const std::string& dir, const std::string& name) {
+    if (dir.empty() || dir == "/") return dir == "/" ? ("/" + name) : name;
+    char last = dir.back();
+    if (last == '/' || last == '\\') return dir + name;
+    return dir + "/" + name;
+}
+
+std::string ensureExt(std::string path, const char* defExt) {
+    if (!defExt || !*defExt || path.empty()) return path;
+    size_t slash = path.find_last_of('/');
+    size_t dot = path.find_last_of('.');
+    bool hasExt = dot != std::string::npos && (slash == std::string::npos || dot > slash);
+    if (!hasExt) {
+        path += '.';
+        path += defExt;
+    }
+    return path;
+}
+
+// Remember last save/open folder (server abs) across dialogs.
+std::string s_lastDir;
+
+}  // namespace
+
+std::string saveFileDialog(const char* /*filter*/, const char* defExt, const char* suggestedName) {
+    std::string suggest = (suggestedName && *suggestedName) ? suggestedName : "untitled";
+    if (defExt && *defExt) {
+        // ensure suggest has the extension so the prompt shows it
+        size_t slash = suggest.find_last_of('/');
+        size_t dot = suggest.find_last_of('.');
+        bool hasExt = dot != std::string::npos && (slash == std::string::npos || dot > slash);
+        if (!hasExt) {
+            suggest += '.';
+            suggest += defExt;
+        }
+    }
+    std::string name = billet::promptSaveFilename(suggest.c_str());
+    if (name.empty()) return {};
+    // Strip any client-side directories from the typed name.
+    size_t cut = name.find_last_of("/\\");
+    if (cut != std::string::npos) name = name.substr(cut + 1);
+    if (name.empty() || name[0] == '.') return {};
+    name = ensureExt(name, defExt);
+
+    auto& fsb = billet::fsBackend();
+    std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
+    if (root.empty() || root == "/") {
+        // Prefer abs root once known.
+        root = fsb.defaultRoot();
+    }
+    std::string path = pathJoinWs(root, name);
+    s_lastDir = root;
+    return path;
+}
+
+std::string openFileDialog(const char* filter) {
+    billet::PickedFile picked;
+    std::string err;
+    std::string accept = filterToAccept(filter);
+    if (!billet::pickFile(accept.c_str(), picked, err) || picked.name.empty()) {
+        return {};  // cancel or error
+    }
+    // Upload into the workspace root (or last dir).
+    auto& fsb = billet::fsBackend();
+    std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
+    // Gateway wants a relative dir under the workspace; "" = root.
+    std::string dirRel;
+    if (!root.empty() && root != "/") {
+        // If root is the abs workspace root, upload dir is "".
+        // If user had a subfolder, strip abs root — best-effort: use "".
+        dirRel = "";
+    }
+    std::string upErr;
+    std::string abs = billet::fsUpload(dirRel, picked.name, picked.data.data(),
+                                       picked.data.size(), upErr);
+    if (abs.empty()) return {};
+    // Remember parent for next dialog.
+    size_t cut = abs.find_last_of('/');
+    if (cut != std::string::npos && cut > 0) s_lastDir = abs.substr(0, cut);
+    return abs;
+}
+
+std::string openFolderDialog() {
+    // No folder picker in the browser; return the workspace root.
+    auto& fsb = billet::fsBackend();
+    std::string root = fsb.defaultRoot();
+    s_lastDir = root;
+    return root;
+}
+
+int promptImportMeshAsSolid() {
+    // window.confirm is Yes/No only (no Cancel) — map Cancel-less to Yes=1 / No=0.
+    int r = MAIN_THREAD_EM_ASM_INT({
+        var msg = "Import this mesh as a solid body?\n\n" +
+                  "OK  — convert it into a solid (editable B-rep)\n" +
+                  "Cancel — keep it as a graphics mesh";
+        return window.confirm(msg) ? 1 : 0;
+    });
+    return r ? 1 : 0;
+}
+
+void afterFileWritten(const std::string& path) {
+    if (!path.empty()) billet::fsTriggerDownload(path);
+}
+
+}  // namespace ui
+
+
+#elif defined(_WIN32)
+// ---------------------------------------------------------------------------
+// Windows common dialogs.
+// ---------------------------------------------------------------------------
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -151,6 +320,10 @@ int promptImportMeshAsSolid() {
         L"Import Mesh", MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return -1;
     return (r == IDYES) ? 1 : 0;
+}
+
+void afterFileWritten(const std::string& /*path*/) {
+    // Desktop: the file is already on the user's disk.
 }
 
 }  // namespace ui
@@ -362,6 +535,10 @@ int promptImportMeshAsSolid() {
     return 1;  // no dialog tool: default to solid (the more useful import)
 }
 
+void afterFileWritten(const std::string& /*path*/) {
+    // Desktop: the file is already on the user's disk.
+}
+
 }  // namespace ui
 
-#endif  // _WIN32
+#endif  // platform

@@ -95,7 +95,11 @@ struct DocMesh {
 // truncated/overrunning chunk; tolerant of trailing junk and unknown chunks otherwise.
 bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err);
 
-// Convenience: read the whole file then parse. Returns false on open failure or parse error.
+// Parse AICM bytes already in memory (alias of parseAicm; shared by file/mmap and web fetch).
+bool loadAicmBytes(const uint8_t* data, size_t size, DocMesh& out, std::string& err);
+
+// Convenience: map/read (native) or HTTP-fetch (web) the path/URI then parse.
+// Web: plain paths → GET /files/aicm?path=…; aicm-shm://name → GET /files/aicm?shm=….
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err);
 
 }  // namespace render

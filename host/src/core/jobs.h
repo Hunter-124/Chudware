@@ -22,6 +22,17 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                       const std::string& request, const std::string& docId, bool cam = false,
                       const nlohmann::json& extra = nlohmann::json::object());
 
+// --- Cursor / legacy Python agent_design launcher ---
+// The C++ agent_run_v2 path has no Cursor completions transport. When the GUI picks
+// provider=cursor, Design sends route here instead: call the Python worker's agent_design
+// on a background thread and stream LEGACY events (status / plan / iteration) into
+// job.events WITHOUT the "orch_" prefix so app.cpp's existing drain fills chat steps +
+// live phase. `extra` carries provider/model/reasoning_effort (+ attachments/context_refs).
+// If the Python worker subprocess is not running, surfaces a clear job.error (no silence).
+void launchAgentDesign(WorkerClient& w, JobState& job,
+                       const std::string& request, const std::string& docId,
+                       const nlohmann::json& extra = nlohmann::json::object());
+
 // --- Mission orchestrator launcher ---
 // Runs agent_mission_v1 on a background thread: the core decomposes the request into an ordered
 // capability chain (design/assembly -> CFD -> verdict), threads the working doc forward, and

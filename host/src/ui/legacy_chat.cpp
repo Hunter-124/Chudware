@@ -211,6 +211,14 @@ static bool drawChatInput(const char* id, std::vector<char>& buf, const char* pl
     return submit;
 }
 
+// Forward decls — drawCodeBox/drawDiffBox sit above the chat-copy helper block but need
+// the shared "Copied" toast + context menu (every copy path must light the same indicator).
+static void chatNotifyCopied();
+static void chatCopyContext(const ImRect& rect, const char* popupId,
+                            const std::string& copyText,
+                            const std::string& copyAll = {},
+                            const std::string& selText = {});
+
 // Read-only, copyable monospace code view; height fits the content up to maxH. The ink is
 // paired with the box's OWN fill (codeBg) rather than inherited — a caller's adaptive glass
 // textPrimary (near-black over the light viewport) on the dark-theme codeBg was black-on-black.
@@ -227,11 +235,41 @@ void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float ma
     const ImVec4 bg(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]);
     ImGui::PushStyleColor(ImGuiCol_FrameBg, bg);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(bg));
-    ImGui::InputTextMultiline(id, (char*)code.c_str(), code.size() + 1, ImVec2(-1, h),
-                              ImGuiInputTextFlags_ReadOnly);
+    // Mutable buffer required by InputText; ReadOnly prevents edits. Cast-away-const is unsafe
+    // if the widget ever wrote — keep a local copy so a const source string is never mutated.
+    std::vector<char> buf(code.size() + 1);
+    if (!code.empty()) std::memcpy(buf.data(), code.data(), code.size());
+    buf[code.size()] = '\0';
+    ImGui::InputTextMultiline(id, buf.data(), buf.size(), ImVec2(-1, h),
+                              ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo);
+    const ImGuiID itemId = ImGui::GetItemID();
+    const ImRect boxRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    // Ctrl+C toast — InputText already put the selection on the clipboard.
+    if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+        const bool copyChord =
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) ||
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Insert, false));
+        if (copyChord) {
+            ImGuiInputTextState* st = ImGui::GetInputTextState(itemId);
+            if (st && st->HasSelection())
+                chatNotifyCopied();
+        }
+    }
+    const std::string sel = [&]() -> std::string {
+        ImGuiInputTextState* st = ImGui::GetInputTextState(itemId);
+        if (!st || !st->HasSelection() || !st->TextA.Data) return {};
+        int a = st->GetSelectionStart(), b = st->GetSelectionEnd();
+        if (a > b) { int t = a; a = b; b = t; }
+        if (a < 0) a = 0;
+        if (b > st->TextLen) b = st->TextLen;
+        if (b <= a) return {};
+        return std::string(st->TextA.Data + a, st->TextA.Data + b);
+    }();
+    chatCopyContext(boxRect, (std::string(id) + "_copy").c_str(), code, code, sel);
     ImGui::PopStyleColor(2);
     if (mono) ImGui::PopFont();
 }
+
 
 // Colored unified-diff view (+ green / - red / @@ blue) in a scrolling box.
 void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float maxH) {
@@ -264,9 +302,15 @@ void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float ma
         start = nl + 1;
     }
     ImGui::EndChild();
+    {
+        const ImRect r(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        // Unique popup id per call site (id already unique: "##actdiff" / "##actcode" etc.).
+        chatCopyContext(r, (std::string(id) + "_copy").c_str(), diff);
+    }
     ImGui::PopStyleColor();
     if (mono) ImGui::PopFont();
 }
+
 
 // Dim, wrapped prose (reasoning / notes) in a scrolling box.
 void drawProseBox(const char* id, const std::string& text, float maxH) {
@@ -431,25 +475,183 @@ static ImRect endGlassBubble(const GlassBubble& b) {
 }
 
 // ---- chat copy/paste affordances ---------------------------------------------------------------
-// Right-click any bubble/card → "Copy text" / "Copy all" via ImGui::SetClipboardText. Optional
-// hover copy glyph on assistant/error prose. Context-menu on EVERY element is the required
-// baseline; selectable InputTextMultiline is used only where wrapping is already handled.
-static void chatOpenCopyPopup(const ImRect& rect, const char* popupId) {
-    if (ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false) &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-        ImGui::OpenPopup(popupId);
+// Right-click any bubble/card → "Copy text" / "Copy all" (and "Copy" when a selection is active).
+// Prefer BeginPopupContextItem on the owning item (child/bubble) so right-click isn't stolen by
+// later OpenPopup calls and so the popup is submitted every frame (gating BeginPopup behind the
+// click closes it instantly next frame). Selectable assistant/error bodies use a read-only
+// InputTextMultiline (soft-wrapped) so click-drag + Ctrl+C works. Every copy path shares one
+// "Copied" fade near the cursor.
+
+struct ChatCopyFlash {
+    double born = -1e9;
+    ImVec2 pos{};
+};
+static ChatCopyFlash s_copyFlash;
+
+// Shared confirmation: ~0.8s fade near the cursor (or last mouse pos).
+static void chatNotifyCopied() {
+    s_copyFlash.born = ImGui::GetTime();
+    s_copyFlash.pos  = ImGui::GetIO().MousePos;
 }
 
-static void chatDrawCopyPopup(const char* popupId, const std::string& copyText,
-                              const std::string& copyAll = {}) {
+static void chatCopyToClipboard(const std::string& text) {
+    if (text.empty()) return;
+    ImGui::SetClipboardText(text.c_str());
+    chatNotifyCopied();
+}
+
+// Draw the shared "Copied" fade (foreground — sits above the chat). Call once per frame from
+// the chat log / panel path so every copy affordance lights the same indicator.
+static void chatDrawCopyFlash() {
+    const double age = ImGui::GetTime() - s_copyFlash.born;
+    if (age < 0.0 || age > 0.80) return;
+    const float t = (float)(age / 0.80);          // 0..1
+    const float a = (1.0f - t) * (1.0f - t);      // ease-out fade
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImVec2 p = s_copyFlash.pos;
+    p.y -= 14.0f * sc * t;                        // drift up as it fades
+    const char* label = "Copied";
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    const ImVec2 pad(6.0f * sc, 3.0f * sc);
+    const ImVec2 mn(p.x + 10.0f * sc, p.y - ts.y - pad.y * 2.0f);
+    const ImVec2 mx(mn.x + ts.x + pad.x * 2.0f, mn.y + ts.y + pad.y * 2.0f);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImU32 bg = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.darkText ? 0.12f : 0.92f,
+               surf.darkText ? 0.12f : 0.92f,
+               surf.darkText ? 0.12f : 0.92f, 0.88f * a));
+    const ImU32 fg = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, a));
+    const ImU32 edge = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textSecondary.x, surf.textSecondary.y, surf.textSecondary.z, 0.55f * a));
+    const float rnd = ui::metrics::rounding(4.0f);
+    dl->AddRectFilled(mn, mx, bg, rnd);
+    dl->AddRect(mn, mx, edge, rnd, 0, ui::metrics::stroke(1.0f));
+    dl->AddText(ImVec2(mn.x + pad.x, mn.y + pad.y), fg, label);
+}
+
+// Soft-wrap preserving hard newlines (paragraph breaks). InputTextMultiline does not wrap, so
+// we reflow each hard line into the available width the same way the composer does.
+static std::string chatSoftWrap(const std::string& in, float wrapW) {
+    if (in.empty() || wrapW <= 1.0f) return in;
+    std::string out;
+    out.reserve(in.size() + 16);
+    size_t i = 0;
+    while (i <= in.size()) {
+        size_t nl = in.find('\n', i);
+        const size_t end = (nl == std::string::npos) ? in.size() : nl;
+        // Copy one hard line into a mutable buffer and rewrap it.
+        std::string line = in.substr(i, end - i);
+        if (!line.empty()) {
+            std::vector<char> buf(line.begin(), line.end());
+            buf.push_back('\0');
+            rewrapInPlace(buf.data(), (int)line.size(), wrapW);
+            out.append(buf.data(), line.size());
+        }
+        if (nl == std::string::npos) break;
+        out.push_back('\n');
+        i = nl + 1;
+    }
+    return out;
+}
+
+// Pull the active selection (UTF-8) from an InputText id, if any.
+static std::string chatInputSelection(ImGuiID id) {
+    if (id == 0) return {};
+    ImGuiInputTextState* state = ImGui::GetInputTextState(id);
+    if (!state || !state->HasSelection() || !state->TextA.Data) return {};
+    int a = state->GetSelectionStart();
+    int b = state->GetSelectionEnd();
+    if (a > b) { int t = a; a = b; b = t; }
+    if (a < 0) a = 0;
+    if (b > state->TextLen) b = state->TextLen;
+    if (b <= a) return {};
+    return std::string(state->TextA.Data + a, state->TextA.Data + b);
+}
+
+// Context menu attached to the last item AND/OR an explicit rect. Submit BeginPopup every
+// frame (never gate it). Uses AllowWhenBlockedByActiveItem so a focused selectable InputText
+// does not swallow the right-click that should open the menu on the bubble.
+static void chatCopyContext(const ImRect& rect, const char* popupId,
+                            const std::string& copyText,
+                            const std::string& copyAll,
+                            const std::string& selText) {
+    const ImGuiHoveredFlags hovFlags =
+        ImGuiHoveredFlags_AllowWhenBlockedByPopup |
+        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem;
+    const bool overItem = ImGui::IsItemHovered(hovFlags);
+    const bool overRect = ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false);
+    if ((overItem || overRect) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+        ImGui::OpenPopup(popupId);
+
     if (!ImGui::BeginPopup(popupId)) return;
-    const std::string& text = copyText;
-    const std::string& all  = copyAll.empty() ? copyText : copyAll;
-    if (ImGui::MenuItem("Copy text", nullptr, false, !text.empty()))
-        ImGui::SetClipboardText(text.c_str());
+    const std::string& all = copyAll.empty() ? copyText : copyAll;
+    if (!selText.empty()) {
+        if (ImGui::MenuItem("Copy"))
+            chatCopyToClipboard(selText);
+        ImGui::Separator();
+    }
+    if (ImGui::MenuItem("Copy text", nullptr, false, !copyText.empty()))
+        chatCopyToClipboard(copyText);
     if (ImGui::MenuItem("Copy all", nullptr, false, !all.empty()))
-        ImGui::SetClipboardText(all.c_str());
+        chatCopyToClipboard(all);
     ImGui::EndPopup();
+}
+
+
+
+// Read-only, soft-wrapped, selectable multiline body. Returns the InputText item id so the
+// outer bubble can offer a selection-aware context menu. Ctrl+C (native) triggers the toast.
+static ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
+                                      const ImVec4& col) {
+    if (plain.empty()) return 0;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f;
+    if (wrapW < 1.0f) wrapW = 1.0f;
+    const std::string soft = chatSoftWrap(plain, wrapW);
+    int lines = 1;
+    for (char c : soft) if (c == '\n') ++lines;
+    const float lh = ImGui::GetTextLineHeight();
+    // Match TextWrapped visual density: no extra frame padding beyond a hairline.
+    const float padY = 1.0f * ui::uiScale;
+    float h = lh * (float)lines + padY * 2.0f;
+    if (h < lh + padY * 2.0f) h = lh + padY * 2.0f;
+
+    // Mutable buffer for InputText (contents are read-only via flags). While the widget is
+    // active ImGui keeps its own TextA copy, so a stack buffer is fine frame-to-frame.
+    std::vector<char> buf(soft.size() + 1);
+    if (!soft.empty())
+        std::memcpy(buf.data(), soft.data(), soft.size());
+    buf[soft.size()] = '\0';
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Border,         ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text,           col);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, padY));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::InputTextMultiline(id, buf.data(), buf.size(), ImVec2(-1.0f, h),
+                              ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo |
+                              ImGuiInputTextFlags_NoHorizontalScroll);
+
+    const ImGuiID itemId = ImGui::GetItemID();
+    // Ctrl+C toast — InputText already put the selection on the clipboard.
+    if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+        const bool copyChord =
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) ||
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Insert, false));
+        if (copyChord) {
+            ImGuiInputTextState* st = ImGui::GetInputTextState(itemId);
+            if (st && st->HasSelection())
+                chatNotifyCopied();
+        }
+    }
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(5);
+    return itemId;
 }
 
 // Tiny top-right "copy" glyph on hover of assistant/error bubbles (cheap, no atlas dependency).
@@ -488,7 +690,7 @@ static void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
                 ImVec2(mx.x - inset - 1.2f * sc, mx.y - inset + 0.8f * sc), col, r, 0,
                 ui::metrics::stroke(1.1f));
     if (hov) ImGui::SetTooltip("Copy");
-    if (clk) ImGui::SetClipboardText(text.c_str());
+    if (clk) chatCopyToClipboard(text);
     ImGui::SetCursorScreenPos(saved);
 }
 
@@ -507,6 +709,7 @@ static std::string chatActivityCopyText(const ActivityItem& a) {
     if (out.empty() && !a.stage.empty()) out = a.stage;
     return out;
 }
+
 
 
 // The build-plan card: a glass panel listing each planned part with its purpose, committed
@@ -582,8 +785,27 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
     }
     ImGui::PopStyleColor();
     ImGui::EndChild();
-    endGlassBubble(gb);
+    ImRect planRect = endGlassBubble(gb);
+    // Flat copy string of the whole plan checklist.
+    {
+        std::string copyTxt = "Build plan";
+        if (!plan.name.empty()) { copyTxt += ": "; copyTxt += plan.name; }
+        if (!plan.summary.empty()) { copyTxt += "\n"; copyTxt += plan.summary; }
+        for (const auto& p : plan.parts) {
+            copyTxt += "\n- ";
+            copyTxt += p.name;
+            if (!p.purpose.empty()) { copyTxt += " — "; copyTxt += p.purpose; }
+            if (!p.dims.empty()) { copyTxt += "  ["; copyTxt += p.dims; copyTxt += " mm]"; }
+            for (const auto& f : p.features) {
+                copyTxt += "\n  • ";
+                copyTxt += f;
+            }
+        }
+        if (!plan.fit.empty()) { copyTxt += "\nFit: "; copyTxt += plan.fit; }
+        chatCopyContext(planRect, "##plan_copy", copyTxt);
+    }
 }
+
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts) {
@@ -1159,6 +1381,12 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 if (!ed.empty()) meta->detail = ed;
                 if (!ed.empty()) meta->reason = ed;
             }
+            // Prefer a model id carried on the terminal event over the stamp at run start.
+            {
+                std::string mid = jstr(data, "model");
+                if (mid.empty()) mid = jstr(data, "model_id");
+                if (!mid.empty()) m.model = std::move(mid);
+            }
         }
     } else if (kind == "status") {
         // Live status/phase envelope: phase=done|error may carry the same additive fields.
@@ -1531,12 +1759,6 @@ static void launchDesignRun(AppState& st, const std::string& request,
         return;
     }
     st.clearViewportForNewDoc();
-    st.addLog("[..] designing (v2): " + request);
-    st.status = "Designing...";  st.statusKind = 0;
-    st.agentV2Running = true;
-    st.agentV2 = true;
-    if (st.activityPanel)
-        st.activityPanel->clearLive();
     // O1: pin the picker's provider/model/effort explicitly in the RPC payload (beats an
     // ambient AI_CAD_PROVIDER env override in the core's resolve_provider). Merge call-site
     // extras (attachments / context_refs) on top.
@@ -1545,6 +1767,30 @@ static void launchDesignRun(AppState& st, const std::string& request,
         for (auto it = extra.begin(); it != extra.end(); ++it)
             payload[it.key()] = it.value();
     }
+    // Cursor has no C++ chat completions transport (Connect-RPC lives only in the Python
+    // CursorSubProvider). Route Design to the Python worker's legacy agent_design loop so the
+    // run actually completes; every other provider keeps agent_run_v2.
+    const bool cursorDesign =
+        (st.settings.provider == ui::PROV_CURSOR) ||
+        (payload.value("provider", std::string()) == "cursor");
+    if (cursorDesign) {
+        st.addLog("[..] designing (cursor/python agent_design): " + request);
+        st.status = "Designing...";  st.statusKind = 0;
+        // Legacy path: build123d + STL, not the C++ doc-ops orchestrator — do NOT arm the
+        // agentV2 drain (doc_activate / assembly-tab adopt). Chat still updates via job.events.
+        st.agentV2Running = false;
+        st.agentV2 = false;
+        if (st.activityPanel)
+            st.activityPanel->clearLive();
+        launchAgentDesign(st.worker, st.job, request, st.docMirror.docId(), payload);
+        return;
+    }
+    st.addLog("[..] designing (v2): " + request);
+    st.status = "Designing...";  st.statusKind = 0;
+    st.agentV2Running = true;
+    st.agentV2 = true;
+    if (st.activityPanel)
+        st.activityPanel->clearLive();
     launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId(),
                      st.ribbonTab == AppState::RT_Manufacture, payload);
 }
@@ -1666,6 +1912,7 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
         m.clarify.questions.clear();
         m.clarify.assumptions.clear();
         m.running = true;
+        if (st.settings.model[0]) m.model = st.settings.model;
         m.liveStatus = "Building...";
         launchDesignRun(st, aug);
     }
@@ -1768,8 +2015,8 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     ImGui::EndChild();
     ImRect thinkRect = endGlassBubble(gb);
     const std::string thinkCopy = chatActivityCopyText(a);
-    chatOpenCopyPopup(thinkRect, "##think_copy");
-    chatDrawCopyPopup("##think_copy", thinkCopy);
+    chatCopyContext(thinkRect, "##think_copy", thinkCopy);
+
 }
 
 // A glass action card for a tool call / orchestrator build stage: status glyph + tool icon + human
@@ -1872,8 +2119,8 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     }
     {
         const std::string copyTxt = chatActivityCopyText(a);
-        chatOpenCopyPopup(cardRect, "##act_copy");
-        chatDrawCopyPopup("##act_copy", copyTxt);
+        chatCopyContext(cardRect, "##act_copy", copyTxt);
+
     }
 }
 
@@ -1905,8 +2152,8 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::PopFont();
     {
         const ImRect chipRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        chatOpenCopyPopup(chipRect, "##ctx_copy");
-        chatDrawCopyPopup("##ctx_copy", line);
+        chatCopyContext(chipRect, "##ctx_copy", line);
+
     }
 }
 
@@ -1953,8 +2200,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     ImGui::EndChild();
     ImRect thoughtRect = endGlassBubble(gb);
     const std::string thoughtCopy = chatActivityCopyText(a);
-    chatOpenCopyPopup(thoughtRect, "##thought_copy");
-    chatDrawCopyPopup("##thought_copy", thoughtCopy);
+    chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
+
 }
 
 // M14 — one inline row per tool call: ok/fail glyph + tool icon + tool name + latency, with the
@@ -2017,15 +2264,15 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
                                             8.0f * sc, 0, ui::metrics::stroke(1.5f));
     {
         const std::string toolCopy = chatActivityCopyText(a);
-        chatOpenCopyPopup(rowRect, "##tool_copy");
-        chatDrawCopyPopup("##tool_copy", toolCopy);
+        chatCopyContext(rowRect, "##tool_copy", toolCopy);
+
     }
 }
 
 // ============================ Corporate Roles timeline cards ============================
 // Compact glass cards for org chart / meetings / steering; muted one-liners for route rejections
-// and wind-down. Colors only via ui::palette + semanticOnGlass. Right-click Copy via existing
-// chatOpenCopyPopup path.
+// and wind-down. Colors only via ui::palette + semanticOnGlass. Right-click Copy via chatCopyContext.
+
 
 static void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
@@ -2114,8 +2361,8 @@ static void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts) {
                 copyTxt += std::to_string(wc);
             }
         }
-        chatOpenCopyPopup(cardRect, "##corp_org_copy");
-        chatDrawCopyPopup("##corp_org_copy", copyTxt);
+        chatCopyContext(cardRect, "##corp_org_copy", copyTxt);
+
     }
 }
 
@@ -2204,8 +2451,8 @@ static void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts) {
     }
     {
         const std::string copyTxt = chatActivityCopyText(a);
-        chatOpenCopyPopup(cardRect, "##corp_meet_copy");
-        chatDrawCopyPopup("##corp_meet_copy", copyTxt);
+        chatCopyContext(cardRect, "##corp_meet_copy", copyTxt);
+
     }
 }
 
@@ -2241,8 +2488,8 @@ static void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) 
     ImRect cardRect = endGlassBubble(gb);
     {
         const std::string copyTxt = chatActivityCopyText(a);
-        chatOpenCopyPopup(cardRect, "##corp_steer_copy");
-        chatDrawCopyPopup("##corp_steer_copy", copyTxt);
+        chatCopyContext(cardRect, "##corp_steer_copy", copyTxt);
+
     }
 }
 
@@ -2262,8 +2509,8 @@ static void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::PopFont();
     {
         const ImRect r(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        chatOpenCopyPopup(r, "##corp_mute_copy");
-        chatDrawCopyPopup("##corp_mute_copy", line);
+        chatCopyContext(r, "##corp_mute_copy", line);
+
     }
 }
 
@@ -2982,8 +3229,8 @@ static void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts
     ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
         ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
         8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
-    chatOpenCopyPopup(bubble, "##umsg_copy");
-    chatDrawCopyPopup("##umsg_copy", userBody);
+    chatCopyContext(bubble, "##umsg_copy", userBody);
+
 
     // Footer row: "You" (left) + ◁◁ rewind / pencil edit (right). Tight under the bubble.
     {
@@ -3096,15 +3343,31 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, turnSurf);
+    const float sc = ui::uiScale;
 
-    // Adaptive ink for the turn name — the theme's assistantName tone (near-white in dark
-    // theme) washed out over the light frost.
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(turnSurf.textSecondary, "Assistant");
-    ImGui::PopFont();
-    // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
-    if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m))
-        drawAiVcTurnRestore(st, msgIdx, turnNum);
+    // Author label tight above the turn content (mirrors the You-row tight gap). Prefer the
+    // model stamped on the turn at run start; only fall back to the live picker for an
+    // in-flight turn that somehow has no stamp. Old sessions with empty model → "Assistant".
+    {
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+        std::string label = "Assistant";
+        const char* mid = nullptr;
+        if (!m.model.empty()) mid = m.model.c_str();
+        else if (m.running && st.settings.model[0]) mid = st.settings.model;
+        if (mid && mid[0]) {
+            label += " : ";
+            label += shortModelName(mid);
+        }
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(turnSurf.textSecondary, "%s", label.c_str());
+        ImGui::PopFont();
+        // Subtle restore affordance on mutating turns (hover / inline confirm — no modal).
+        if (msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m))
+            drawAiVcTurnRestore(st, msgIdx, turnNum);
+        ImGui::Dummy(ImVec2(0, 2.5f * sc));
+        ImGui::PopStyleVar();
+    }
 
     // (1) Plan / todo block — a live checklist that ticks off as stages complete (DESIGN §5).
     if (m.plan.present) drawPlanCard(m.plan, m.activity, fonts);
@@ -3113,23 +3376,23 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     drawAgentTimeline(m, fonts, logW, gShowThinking);
 
     // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
-    // contract H5) keeps body copy legible over the live viewport blur.
+    // contract H5) keeps body copy legible over the live viewport blur. Selectable for
+    // click-drag + Ctrl+C; right-click copies selection or full text.
     if (!m.text.empty() && m.errKind == ERR_NONE) {
         const std::string prose = stripMdMarks(m.text);
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           4.0f);
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-        ImGui::TextWrapped("%s", prose.c_str());
-        ImGui::PopStyleColor();
+        const ImGuiID textId = chatDrawSelectableText("##prose_sel", prose, chatSurf().textPrimary);
         ImGui::EndChild();
         ImRect proseRect = endGlassBubble(gb);
-        chatOpenCopyPopup(proseRect, "##prose_copy");
-        chatDrawCopyPopup("##prose_copy", prose);
+        const std::string sel = chatInputSelection(textId);
+        chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
         chatHoverCopyGlyph(proseRect, prose);
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     }
+
 
     // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);
@@ -3250,20 +3513,17 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         // Error tone retuned for the frost so the reason stays readable over any model.
         const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
-        ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(ec, chatSurf()));
-        // Multi-line wrapped detail; right-click / hover-copy for clipboard.
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-        ImGui::TextWrapped("%s", body.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
+        const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
+        const ImGuiID textId = chatDrawSelectableText("##err_sel", body, errCol);
         ImGui::EndChild();
         ImRect cardRect = endGlassBubble(gb);
         ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                             8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
-        chatOpenCopyPopup(cardRect, "##err_copy");
-        chatDrawCopyPopup("##err_copy", body);
+        const std::string sel = chatInputSelection(textId);
+        chatCopyContext(cardRect, "##err_copy", body, body, sel);
         chatHoverCopyGlyph(cardRect, body);
     }
+
 }
 
 // ---- header: outline cube + "Billet" wordmark + Sessions + status dot ----
@@ -3588,7 +3848,9 @@ void persistChatHistory(AppState& st) {
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
             if (m.text.empty()) continue;  // skip running/placeholder turns with no content yet
-            jm.push_back({{"u", m.fromUser}, {"t", m.text}, {"e", m.errKind}});
+            nlohmann::json entry = {{"u", m.fromUser}, {"t", m.text}, {"e", m.errKind}};
+            if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
+            jm.push_back(std::move(entry));
         }
         convs.push_back({{"id", st.conversations[i].id},
                          {"title", st.conversations[i].title},
@@ -3660,6 +3922,7 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key) {
                 cm.fromUser = m.value("u", false);
                 cm.text = m.value("t", std::string());
                 cm.errKind = m.value("e", 0);
+                if (!cm.fromUser) cm.model = m.value("m", std::string());
                 cm.running = false;
                 c.msgs.push_back(std::move(cm));
             }
@@ -6833,7 +7096,7 @@ static void submitTurn(AppState& st, const std::string& text) {
         }
         st.chat.push_back(u);
     }
-    { ChatMsg a; a.running = true; st.chat.push_back(a); }
+    { ChatMsg a; a.running = true; if (st.settings.model[0]) a.model = st.settings.model; st.chat.push_back(a); }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
 
     // Name the conversation tab after its first prompt; persist so the turn survives a restart.
@@ -8146,7 +8409,9 @@ static void drawChatLogWindowed(AppState& st) {
         m.uiCachedW = logW;
         ImGui::PopID();
     }
+    chatDrawCopyFlash();
 }
+
 
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----
 // The pane is a PINNED, full-height, rounded glass column overlaid on the viewport's right edge

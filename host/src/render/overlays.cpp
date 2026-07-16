@@ -1,6 +1,8 @@
 #include "overlays.h"
 
 #include <glad/gl.h>
+#include "ui/viewport/glsl_compat.h"
+
 
 #include <cstdio>
 #include <cstring>
@@ -30,7 +32,13 @@ void main(){
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
+#ifdef BILLET_GLES3
+    const std::string rewritten = shaderSrc(src);
+    const char* p = rewritten.c_str();
+#else
+    const char* p = shaderSrc(src);
+#endif
+    glShaderSource(s, 1, &p, nullptr);
     glCompileShader(s);
     int ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
@@ -245,17 +253,23 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         glBufferData(GL_ARRAY_BUFFER, 3 * sizeof(float), xyz, GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+#ifndef BILLET_GLES3
         glEnable(GL_PROGRAM_POINT_SIZE);
+#endif
         glDepthRange(0.0, 0.997);
         // Contrast rim first (a larger dark point behind), then the highlight dot on top — the
         // bare 9px point downsampled to ~3px used to be the weakest highlight kind.
         float rim[4] = {0.06f, 0.07f, 0.09f, 1.0f};
         glUniform4fv(uColor_, 1, rim);
+#ifndef BILLET_GLES3
         glPointSize(13.0f * widthScale_);
+#endif
         glDrawArrays(GL_POINTS, 0, 1);
         float opaque[4] = {rgba[0], rgba[1], rgba[2], 1.0f};
         glUniform4fv(uColor_, 1, opaque);
+#ifndef BILLET_GLES3
         glPointSize(9.0f * widthScale_);
+#endif
         glDrawArrays(GL_POINTS, 0, 1);
         glDepthRange(0.0, 1.0);
     }

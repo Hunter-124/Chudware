@@ -2,6 +2,9 @@
 #include "agent/providers.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cctype>
 #include <chrono>
 #include <fstream>
@@ -373,8 +376,9 @@ BuiltRequest anthropic_build_request(const std::string& model, const std::string
     if (mode == "adaptive") {
         // Adaptive models reject temperature/top_p/budget_tokens; effort rides on output_config.
         // Map our "xhigh" through as-is (API accepts it).
-        body["thinking"] = json{{"type", "adaptive"}};
-        body["output_config"] = json{{"effort", wire_effort}};
+        // MUST be an object — json{{"type","adaptive"}} is an array under nlohmann.
+        body["thinking"] = json::object({{"type", "adaptive"}});
+        body["output_config"] = json::object({{"effort", wire_effort}});
         send_effort = true;
     } else if (mode == "budget" || mode == "budget_effort") {
         int budget = budget_tokens_for(effort, max_tokens);
@@ -382,11 +386,11 @@ BuiltRequest anthropic_build_request(const std::string& model, const std::string
         // request is legal (budget_tokens must be < max_tokens).
         if (budget >= effective_max) effective_max = budget + 1024;
         body["max_tokens"] = effective_max;
-        body["thinking"] = json{{"type", "enabled"}, {"budget_tokens", budget}};
+        body["thinking"] = json::object({{"type", "enabled"}, {"budget_tokens", budget}});
         if (mode == "budget_effort") {
             // Opus 4.5: effort alongside budget_tokens. xhigh → max on the wire.
             if (wire_effort == "xhigh") wire_effort = "max";
-            body["output_config"] = json{{"effort", wire_effort}};
+            body["output_config"] = json::object({{"effort", wire_effort}});
             send_effort = true;
         }
     }
@@ -758,6 +762,76 @@ std::string concise_http_error(const std::string& provider, int status, const st
     return provider + " HTTP " + std::to_string(status) + ": " + body;
 }
 
+std::string humanize_provider_error(const std::string& raw) {
+    if (raw.empty()) return "The model provider failed.";
+    std::string s = raw;
+    // Strip leading "provider error: " so we classify the payload.
+    const char* pref = "provider error: ";
+    if (s.size() >= 16 && s.compare(0, 16, pref) == 0) s = s.substr(16);
+    std::string low = s;
+    for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    auto has = [&](const char* n) { return low.find(n) != std::string::npos; };
+
+    // Transport / connectivity
+    if (has("could not connect") || has("connection refused") || has("failed to connect") ||
+        has("couldn't connect") || has("name or service not known") || has("resolve host") ||
+        has("network is unreachable") || has("no route to host") || has("curl error") ||
+        (has("ssl") && has("error")) || has("tls")) {
+        if (has("refused") || has("127.0.0.1") || has("localhost"))
+            return "Could not reach the model server (connection refused).";
+        return "Could not reach the model provider (network error).";
+    }
+    if (has("timeout") || has("timed out") || has("deadline exceeded"))
+        return "The model provider timed out. Try again or lower reasoning effort.";
+
+    // Auth
+    if (has("http 401") || has("unauthorized") || has("invalid_api_key") ||
+        has("invalid x-api-key") || has("authentication"))
+        return "Authentication failed — sign in again or check the API key in Settings.";
+    if (has("http 403") || has("forbidden") || has("tier not") || has("not api-enabled") ||
+        has("permission"))
+        return "Access denied by the provider (forbidden / tier). Check subscription status.";
+
+    // Rate / quota
+    if (has("daily quota") || has("free tier") || has("freetier") || has("perday"))
+        return "Daily free-tier quota exhausted. Enable billing or switch providers.";
+    if (has("http 429") || has("rate limit") || has("rate_limit") || has("too many requests") ||
+        has("spending-limit") || has("spending limit") || has("out of credits") ||
+        has("run out of credits"))
+        return "Rate limit or spending limit hit. Wait and retry, or switch providers.";
+
+    // Model / request shape
+    if (has("http 404") && has("model"))
+        return "That model id is not available on this account. Pick another model in Settings.";
+    if (has("http 400") || has("invalid_request") || has("does not support"))
+        return "The provider rejected the request (bad parameters or unsupported model feature).";
+    if (has("http 5") || has("internal server") || has("bad gateway") || has("service unavailable") ||
+        has("http 502") || has("http 503") || has("http 504"))
+        return "The model provider had a server error. Retry in a moment.";
+
+    // Cursor / missing transport
+    if ((has("no c++") && has("transport")) || has("connect-rpc"))
+        return "This provider has no in-app chat transport. Pick xAI, Claude, or OpenAI.";
+
+    // Generic HTTP
+    if (has("http 4") || has("http 5"))
+        return "The model provider returned an error. See details below.";
+
+    // Resolution / config
+    if (has("not signed in") || has("not configured") || has("missing api_key") ||
+        has("missing access_token"))
+        return "Provider not signed in. Open Settings → AI → Accounts.";
+    if (has("unknown provider") || has("offline mode"))
+        return s;  // already human
+
+    // Fallback: first line of the raw message, capped.
+    size_t nl = s.find('\n');
+    if (nl != std::string::npos) s = s.substr(0, nl);
+    if (s.size() > 160) s = s.substr(0, 157) + "...";
+    return s.empty() ? "The model provider failed." : s;
+}
+
 // --------------------------------------------------------------------------- complete
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens) {
@@ -774,22 +848,220 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     std::string api_key = str_or(cfg, "api_key");
     std::string base_url = str_or(cfg, "base_url");
+    std::string auth_mode = str_or(cfg, "auth_mode");
+    auto is_oauth_key = [](const std::string& k) {
+        return k.rfind("sk-ant-oat", 0) == 0;
+    };
 
-    if (provider == "anthropic") {
+    // Anthropic Messages API — classic x-api-key OR Claude Pro/Max OAuth bearer.
+    // OAuth requires the Claude-Code-shaped system array + CCH billing hash + betas.
+    // C++ never refreshes OAuth tokens (Python anthropic_sub_provider owns that).
+    if (provider == "anthropic" || provider == "anthropic-sub") {
         std::string model = str_or(cfg, "model", std::string(kAnthropicDefaultModel));
-        // Honor config/role reasoning_effort (low|medium|high|max|xhigh); empty → high.
         std::string effort = str_or(cfg, "reasoning_effort");
+        const bool oauth = (provider == "anthropic-sub") || auth_mode == "oauth" ||
+                           is_oauth_key(api_key);
+        if (api_key.empty()) {
+            res.error = oauth ? "anthropic-sub: no access_token (sign in via Settings → Accounts)"
+                              : "anthropic: missing api_key";
+            return res;
+        }
+
         BuiltRequest req =
             anthropic_build_request(model, system, messages, max_tokens, effort);
-        for (auto& h : req.headers)
-            if (h.first == "x-api-key") h.second = api_key;
+
+        if (oauth) {
+            // OAuth: Authorization Bearer + Claude Code betas (not x-api-key).
+            // System must be the 3-block array with billing header + CCH integrity.
+            std::string first_user;
+            for (const auto& m : messages) {
+                if (m.value("role", std::string()) != "user") continue;
+                if (!m.contains("content") || !m["content"].is_array()) break;
+                for (const auto& p : m["content"]) {
+                    if (pstr(p, "type") == "text") first_user += pstr(p, "text");
+                }
+                break;
+            }
+            // billing suffix + CCH (mirrors anthropic_sub_provider.py)
+            auto ch = [&](size_t i) -> char {
+                return i < first_user.size() ? first_user[i] : '0';
+            };
+            const char* kClaudeCodeVer = "2.1.165";
+            std::string k;
+            k.push_back(ch(4));
+            k.push_back(ch(7));
+            k.push_back(ch(20));
+            // SHA-256 truncated — use a simple FNV-ish fallback if we lack OpenSSL;
+            // match Python: sha256("59cf53e54c78"+k+ver).hexdigest()[:3]
+            std::string suffix_src = std::string("59cf53e54c78") + k + kClaudeCodeVer;
+            // Portable SHA-256 via openssl command is too heavy; use the same
+            // xxh-independent approach as a compact FNV64 then hex[:3] only if
+            // needed. Prefer real sha256 when available via system crypto.
+            // Inline SHA-256 (public domain compact).
+            auto sha256_hex = [](const std::string& s) -> std::string {
+                // Minimal SHA-256 implementation.
+                static const uint32_t K[64] = {
+                    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+                    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+                    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+                    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+                    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+                    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+                    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+                    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+                auto rotr = [](uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); };
+                uint32_t h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,
+                         h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
+                std::vector<uint8_t> data(s.begin(), s.end());
+                uint64_t bitlen = static_cast<uint64_t>(data.size()) * 8;
+                data.push_back(0x80);
+                while ((data.size() % 64) != 56) data.push_back(0);
+                for (int i = 7; i >= 0; --i) data.push_back(static_cast<uint8_t>((bitlen >> (i * 8)) & 0xff));
+                for (size_t chunk = 0; chunk < data.size(); chunk += 64) {
+                    uint32_t w[64];
+                    for (int i = 0; i < 16; ++i)
+                        w[i] = (data[chunk+i*4]<<24)|(data[chunk+i*4+1]<<16)|(data[chunk+i*4+2]<<8)|data[chunk+i*4+3];
+                    for (int i = 16; i < 64; ++i) {
+                        uint32_t s0 = rotr(w[i-15],7)^rotr(w[i-15],18)^(w[i-15]>>3);
+                        uint32_t s1 = rotr(w[i-2],17)^rotr(w[i-2],19)^(w[i-2]>>10);
+                        w[i] = w[i-16] + s0 + w[i-7] + s1;
+                    }
+                    uint32_t a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
+                    for (int i = 0; i < 64; ++i) {
+                        uint32_t S1 = rotr(e,6)^rotr(e,11)^rotr(e,25);
+                        uint32_t chv = (e&f)^((~e)&g);
+                        uint32_t t1 = h + S1 + chv + K[i] + w[i];
+                        uint32_t S0 = rotr(a,2)^rotr(a,13)^rotr(a,22);
+                        uint32_t maj = (a&b)^(a&c)^(b&c);
+                        uint32_t t2 = S0 + maj;
+                        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+                    }
+                    h0+=a; h1+=b; h2+=c; h3+=d; h4+=e; h5+=f; h6+=g; h7+=h;
+                }
+                char buf[65];
+                std::snprintf(buf, sizeof(buf), "%08x%08x%08x%08x%08x%08x%08x%08x",
+                              h0,h1,h2,h3,h4,h5,h6,h7);
+                return std::string(buf);
+            };
+            std::string suffix = sha256_hex(suffix_src).substr(0, 3);
+
+            // xxhash64 CCH with seed 0x4D659218E32A3268 (Anthropic subscription integrity).
+            auto xxh64 = [](const std::string& input, uint64_t seed) -> uint64_t {
+                const uint64_t PRIME1 = 11400714785074694791ULL;
+                const uint64_t PRIME2 = 14029467366897019727ULL;
+                const uint64_t PRIME3 = 1609587929392839161ULL;
+                const uint64_t PRIME4 = 9650029242287828579ULL;
+                const uint64_t PRIME5 = 2870177450012600261ULL;
+                auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(input.data());
+                const uint8_t* const end = p + input.size();
+                uint64_t h;
+                if (input.size() >= 32) {
+                    uint64_t v1 = seed + PRIME1 + PRIME2;
+                    uint64_t v2 = seed + PRIME2;
+                    uint64_t v3 = seed + 0;
+                    uint64_t v4 = seed - PRIME1;
+                    const uint8_t* const limit = end - 32;
+                    do {
+                        auto get64 = [](const uint8_t* q) {
+                            uint64_t r;
+                            std::memcpy(&r, q, 8);
+                            return r;
+                        };
+                        v1 = rotl(v1 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
+                        v2 = rotl(v2 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
+                        v3 = rotl(v3 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
+                        v4 = rotl(v4 + get64(p) * PRIME2, 31) * PRIME1; p += 8;
+                    } while (p <= limit);
+                    h = rotl(v1,1)+rotl(v2,7)+rotl(v3,12)+rotl(v4,18);
+                    auto round_merge = [&](uint64_t acc, uint64_t v) {
+                        v = rotl(v * PRIME2, 31) * PRIME1;
+                        acc ^= v;
+                        return acc * PRIME1 + PRIME4;
+                    };
+                    h = round_merge(h, v1);
+                    h = round_merge(h, v2);
+                    h = round_merge(h, v3);
+                    h = round_merge(h, v4);
+                } else {
+                    h = seed + PRIME5;
+                }
+                h += static_cast<uint64_t>(input.size());
+                auto get64 = [](const uint8_t* q) {
+                    uint64_t r; std::memcpy(&r, q, 8); return r;
+                };
+                auto get32 = [](const uint8_t* q) {
+                    uint32_t r; std::memcpy(&r, q, 4); return r;
+                };
+                while (p + 8 <= end) {
+                    uint64_t k1 = rotl(get64(p) * PRIME2, 31) * PRIME1;
+                    h = rotl(h ^ k1, 27) * PRIME1 + PRIME4;
+                    p += 8;
+                }
+                if (p + 4 <= end) {
+                    h = rotl(h ^ (static_cast<uint64_t>(get32(p)) * PRIME1), 23) * PRIME2 + PRIME3;
+                    p += 4;
+                }
+                while (p < end) {
+                    h = rotl(h ^ (*p * PRIME5), 11) * PRIME1;
+                    ++p;
+                }
+                h ^= h >> 33; h *= PRIME2; h ^= h >> 29; h *= PRIME3; h ^= h >> 32;
+                return h;
+            };
+
+            // Rebuild body: system as array with billing placeholder, adaptive thinking.
+            json body = req.body_json;
+            body["system"] = json::array({
+                {{"type", "text"},
+                 {"text", std::string("x-anthropic-billing-header: cc_version=") + kClaudeCodeVer +
+                              "." + suffix + "; cc_entrypoint=local-agent; cch=00000;"}},
+                {{"type", "text"},
+                 {"text", "You are a Claude agent, built on Anthropic's Claude Agent SDK."}},
+                {{"type", "text"}, {"text", system}},
+            });
+            // OAuth path: adaptive thinking (budget_tokens 400s on opus 4.8).
+            // Object, not array — see anthropic_build_request note.
+            body["thinking"] = json::object({{"type", "adaptive"}});
+            body.erase("output_config");  // optional; adaptive alone is valid
+
+            std::string body_str = body.dump();  // compact? nlohmann default is compact
+            // nlohmann dump() is compact by default (no spaces) — matches separators=(',',':')
+            uint64_t cch_val = xxh64(body_str, 0x4D659218E32A3268ULL);
+            char cch_buf[8];
+            std::snprintf(cch_buf, sizeof(cch_buf), "%05x",
+                          static_cast<unsigned>((cch_val & 0xFFFFFULL)));
+            std::string patched = body_str;
+            auto pos = patched.find("cch=00000;");
+            if (pos != std::string::npos)
+                patched.replace(pos, 10, std::string("cch=") + cch_buf + ";");
+            req.body = patched;
+            req.body_json = json::parse(patched, nullptr, false);
+            req.headers = {
+                {"Authorization", "Bearer " + api_key},
+                {"anthropic-version", "2023-06-01"},
+                {"content-type", "application/json"},
+                {"anthropic-beta", "interleaved-thinking-2025-05-14,oauth-2025-04-20"},
+                {"anthropic-dangerous-direct-browser-access", "true"},
+                {"x-app", "cli"},
+                {"User-Agent",
+                 "claude-cli/2.1.165 (external, local-agent, agent-sdk/0.3.165)"},
+                {"X-Stainless-Retry-Count", "0"},
+                {"X-Stainless-Timeout", "900"},
+            };
+        } else {
+            for (auto& h : req.headers)
+                if (h.first == "x-api-key") h.second = api_key;
+        }
+
         HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
         if (!hr.error.empty()) {
             res.error = hr.error;
             return res;
         }
         if (hr.status < 200 || hr.status >= 300) {
-            res.error = concise_http_error("anthropic", hr.status, hr.body);
+            res.error = concise_http_error(oauth ? "anthropic-sub" : "anthropic", hr.status,
+                                           hr.body);
             return res;
         }
         ParsedReply pr = anthropic_parse_response(json::parse(hr.body, nullptr, false));
@@ -798,10 +1070,23 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         return res;
     }
 
-    if (provider == "openai" || provider == "llamacpp") {
+    // OpenAI-compatible family: openai / llamacpp / xai / xai-sub.
+    // billet's Python XAISubProvider posts to /v1/chat/completions with Bearer
+    // (OAuth access_token or API key). C++ never refreshes OAuth tokens.
+    if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
+        provider == "xai-sub") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")
-                                                    : std::string(kOpenAIDefaultModel);
+                          : (provider == "xai" || provider == "xai-sub")
+                              ? std::string("grok-4.5")
+                              : std::string(kOpenAIDefaultModel);
         std::string model = str_or(cfg, "model", def);
+        if (model == "grok-4-5") model = "grok-4.5";  // normalize hyphen alias
+        if ((provider == "xai" || provider == "xai-sub") && base_url.empty())
+            base_url = "https://api.x.ai/v1";
+        if (api_key.empty() && (provider == "xai" || provider == "xai-sub")) {
+            res.error = "xai: missing access_token/api_key (sign in via Settings → Accounts)";
+            return res;
+        }
         BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
         for (auto& h : req.headers)
             if (h.first == "Authorization")
@@ -811,18 +1096,32 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             res.error = hr.error;
             return res;
         }
+        const char* err_name =
+            (provider == "xai" || provider == "xai-sub")
+                ? (provider == "xai-sub" ? "xai-sub" : "xai")
+                : "openai";
         if (hr.status < 200 || hr.status >= 300) {
-            res.error = concise_http_error("openai", hr.status, hr.body);
+            res.error = concise_http_error(err_name, hr.status, hr.body);
             return res;
         }
         json parsed = json::parse(hr.body, nullptr, false);
         ParsedReply pr = openai_parse_response(parsed);
         if (pr.text.empty()) {
-            // Mirror the oracle: no choices -> surface an error (caller decides).
-            if (!parsed.contains("choices") || !parsed["choices"].is_array() ||
-                parsed["choices"].empty()) {
-                res.error = "openai endpoint returned no completion";
-                return res;
+            // Grok reasoning variants may put CoT only in reasoning_content.
+            if (parsed.contains("choices") && parsed["choices"].is_array() &&
+                !parsed["choices"].empty()) {
+                const auto& msg = parsed["choices"][0].value("message", json::object());
+                if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string())
+                    pr.text = msg["reasoning_content"].get<std::string>();
+                else if (msg.contains("reasoning") && msg["reasoning"].is_string())
+                    pr.text = msg["reasoning"].get<std::string>();
+            }
+            if (pr.text.empty()) {
+                if (!parsed.contains("choices") || !parsed["choices"].is_array() ||
+                    parsed["choices"].empty()) {
+                    res.error = std::string(err_name) + " endpoint returned no completion";
+                    return res;
+                }
             }
         }
         res.text = pr.text;
@@ -852,7 +1151,6 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         }
         ParsedReply pr = gemini_parse_response(parsed);
         if (pr.text.empty()) {
-            // Surface a blocked/empty completion so the caller can retry/report.
             if (!parsed.contains("candidates") || !parsed["candidates"].is_array() ||
                 parsed["candidates"].empty()) {
                 std::string why;
@@ -861,9 +1159,6 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                             (why.empty() ? std::string() : (": " + why));
                 return res;
             }
-            // Candidates exist but carry no answer text — almost always finishReason MAX_TOKENS
-            // with the whole output budget consumed by thinking. Report it as a real error so the
-            // run shows the cause instead of a silent "no JSON ops in reply".
             std::string fr = parsed["candidates"][0].value("finishReason", std::string());
             res.error = "gemini: empty completion (finishReason " +
                         (fr.empty() ? std::string("unknown") : fr) + ")" +
@@ -875,6 +1170,13 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         }
         res.text = pr.text;
         res.thinking = pr.thinking;
+        return res;
+    }
+
+    if (provider == "cursor" || provider == "cursor-sub") {
+        res.error =
+            "cursor: no C++ chat completions transport (Connect-RPC/protobuf only). "
+            "Pick xAI, Claude, or OpenAI.";
         return res;
     }
 

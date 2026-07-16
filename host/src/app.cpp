@@ -636,6 +636,7 @@ static void exportFlatDxf(AppState& st) {
     if (!written.empty()) {
         st.addLog("[sm] exported flat " + fmt + ": " + written);
         st.toast(ui::ToastLevel::Info, "Exported " + written);
+        ui::afterFileWritten(written);
     } else {
         st.addLog("[sm] export flat failed: " + err);
         st.toast(ui::ToastLevel::Warn,
@@ -701,6 +702,7 @@ static void exportFile3d(AppState& st, const std::string& fmt) {
     if (!written.empty()) {
         st.addLog("[export] " + fmt + ": " + written);
         st.toast(ui::ToastLevel::Info, "Exported " + written);
+        ui::afterFileWritten(written);
     } else {
         st.addLog("[export] " + fmt + " failed: " + err);
         st.toast(ui::ToastLevel::Warn,
@@ -3140,7 +3142,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         //     uses), so we never mutate the doc under a running worker call,
         //   - skip while the ECAD editor window is focused — that window owns Ctrl+Z for its own
         //     history (ecadUndo/ecadRedo, gated inside drawEcadEditor) and must not also drive the
-        //     CAD doc's undo.
+        //     CAD doc's undo,
+        //   - skip Drawing / Schematic / PCB tabs and any moment the live DocMirror is not the
+        //     active tab's doc (tab switch parks the previous part behind the sheet; async rebind
+        //     can lag activeTab). docUndo/docRedo also refuse those cases as a second gate.
         {
             const bool canDoc = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
             const bool textFocus = io.WantTextInput;
@@ -3150,8 +3155,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 for (ImGuiWindow* w = g->NavWindow; w; w = w->ParentWindow)
                     if (std::strcmp(w->Name, "ECAD") == 0) { ecadFocused = true; break; }
             }
+            const bool activeCad =
+                !st.activeTabIsDrawing() && !st.activeTabIsEcad() &&
+                st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                st.docTabs[st.activeTab].docId == st.docMirror.docId() &&
+                st.docMirror.hasDoc();
             if (canDoc && !textFocus && !st.showWeb && !inSketchNow && !ecadFocused &&
-                st.docMirror.hasDoc() && (io.KeyCtrl || io.KeySuper)) {
+                activeCad && (io.KeyCtrl || io.KeySuper)) {
                 if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
                     st.docRedo();
                 } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {

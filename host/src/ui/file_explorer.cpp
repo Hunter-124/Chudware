@@ -8,13 +8,15 @@
 // route through the same request flag and app.cpp's pump dispatches them to the ECAD open path).
 // Right-click yields Open / Rename / Copy / Paste / Delete / New Folder. F2 renames inline,
 // Del deletes (with a confirm modal). All filesystem mutations are clamped to the workspace root.
+//
+// Filesystem ops go through billet::FsBackend (desktop = std::filesystem; web = gateway
+// /workspace/*) so the WASM client browses the server workspace.
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <map>
 #include <string>
-#include <system_error>
 #include <vector>
 
 #include "imgui.h"
@@ -27,11 +29,49 @@
 #include "layout.h"         // kLeftPaneExplorer
 
 #include "../core/app_state.h"
+#include "../core/fs_backend.h"
 #include "../ui_theme.h"    // ui::uiScale, ui::palette
 
-namespace fs = std::filesystem;
+// Compile-unit inclusion until the integrator lists fs_backend.cpp in CMake.
+#ifndef BILLET_FS_BACKEND_TU
+#define BILLET_FS_BACKEND_TU
+#include "../core/fs_backend.cpp"
+#endif
 
 namespace ui {
+
+// ---- path string helpers (no FS I/O) ----------------------------------------
+static std::string pathFilename(const std::string& p) {
+    size_t cut = p.find_last_of("/\\");
+    return cut == std::string::npos ? p : p.substr(cut + 1);
+}
+static std::string pathParent(const std::string& p) {
+    size_t cut = p.find_last_of("/\\");
+    if (cut == std::string::npos) return {};
+    if (cut == 0) return p.substr(0, 1);
+    return p.substr(0, cut);
+}
+static std::string pathJoin(const std::string& a, const std::string& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    char last = a.back();
+    if (last == '/' || last == '\\') return a + b;
+#ifdef _WIN32
+    return a + "\\" + b;
+#else
+    return a + "/" + b;
+#endif
+}
+static std::string pathStem(const std::string& name) {
+    size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) return name;
+    return name.substr(0, dot);
+}
+static std::string pathExtension(const std::string& name) {
+    size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0) return {};
+    return name.substr(dot);
+}
 
 // ---- module state (single Explorer instance) ----
 // Row styling comes from feature_tree.h's shared FM helpers (fmRowPill / fmRowPillEnd /
@@ -60,7 +100,7 @@ static bool        s_renameFocus = false;
 static std::string s_pendingDelete;    // path queued for the delete-confirm modal ("" = none)
 static std::string s_clipboardPath;    // Explorer copy/paste stash (a file path)
 static std::string s_pendingNewFolder; // a just-created folder to auto-enter inline-rename next frame
-// Recent-row existence cache: fs::exists per entry per frame is real filesystem traffic while the
+// Recent-row existence cache: fs exists per entry per frame is real filesystem traffic while the
 // Recent list is visible. Refresh at most every ~2s; a path not yet cached (a just-added recent)
 // is probed once on first sight, so a list change still paints correctly the same frame.
 static std::map<std::string, bool> s_recentExists;
@@ -78,11 +118,9 @@ static bool isEcadExt(const std::string& e) {
 }
 static bool isKnownExt(const std::string& e) { return isCadExt(e) || isEcadExt(e); }
 
-// Lower-cased extension of a path, INCLUDING the leading dot. Handles our double-dot ".step+" /
-// ".ecad+" (fs::path::extension stops at the last dot, so "x.step+" -> ".step+" is fine; but
-// "x.kicad_sch" -> ".kicad_sch" too). Returns "" when there is no extension.
-static std::string lowerExt(const fs::path& p) {
-    std::string e = p.extension().string();
+// Lower-cased extension of a path, INCLUDING the leading dot.
+static std::string lowerExt(const std::string& p) {
+    std::string e = pathExtension(pathFilename(p));
     std::transform(e.begin(), e.end(), e.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     return e;
@@ -90,18 +128,19 @@ static std::string lowerExt(const fs::path& p) {
 
 // True when `child` is inside (or equal to) `root` — the guard for every destructive op so the
 // Explorer can never rename/delete/paste outside the workspace. Compares lexically-normal paths.
-static bool withinWorkspace(const fs::path& root, const fs::path& child) {
-    std::error_code ec;
-    fs::path r = fs::weakly_canonical(root, ec);
-    if (ec) r = root.lexically_normal();
-    fs::path c = fs::weakly_canonical(child, ec);
-    if (ec) c = child.lexically_normal();
-    auto rs = r.string(), cs = c.string();
+static bool withinWorkspace(const std::string& root, const std::string& child) {
+    auto norm = [](std::string s) {
+        for (char& c : s)
+            if (c == '\\') c = '/';
+        // strip trailing slash (except root "/")
+        while (s.size() > 1 && s.back() == '/') s.pop_back();
+        return s;
+    };
+    std::string rs = norm(root), cs = norm(child);
     if (cs.size() < rs.size()) return false;
-    // case-insensitive prefix (Windows)
     for (size_t i = 0; i < rs.size(); ++i)
         if (std::tolower((unsigned char)cs[i]) != std::tolower((unsigned char)rs[i])) return false;
-    return cs.size() == rs.size() || cs[rs.size()] == '\\' || cs[rs.size()] == '/';
+    return cs.size() == rs.size() || cs[rs.size()] == '/';
 }
 
 // Pick a per-extension atlas icon name (verified against host/assets/icons/atlas.json). Folders use
@@ -122,18 +161,18 @@ static const char* fileIconFallback(const std::string& ext) {
 
 // ---- workspace resolution ------------------------------------------------
 void ensureWorkspaceDir(AppState& st) {
+    auto& fsb = billet::fsBackend();
     if (st.workspaceDir.empty()) {
-        // Prefer the persisted setting, else the Documents default (an existing
-        // Documents/AI-CAD wins per the alias rule, otherwise Documents/Billet —
-        // see defaultWorkspaceDir() in app_state.cpp).
+        // Prefer the persisted setting, else the backend default (desktop Documents/AI-CAD
+        // or Documents/Billet; web = server workspace abs root).
         if (!st.settings.workspaceDir.empty()) {
             st.workspaceDir = st.settings.workspaceDir;
         } else {
-            st.workspaceDir = defaultWorkspaceDir();
+            st.workspaceDir = fsb.defaultRoot();
         }
     }
-    std::error_code ec;
-    fs::create_directories(st.workspaceDir, ec);   // idempotent; ignore "already exists"
+    std::string err;
+    fsb.mkdir(st.workspaceDir, err);   // idempotent; ignore "already exists"
     if (s_currentFolder.empty()) s_currentFolder = st.workspaceDir;
     // Root-change detection: Settings -> General's "Workspace folder" Apply resets st.workspaceDir
     // (possibly to empty = re-resolve default, handled above) while the app is live. Re-root the
@@ -146,84 +185,87 @@ void ensureWorkspaceDir(AppState& st) {
 }
 
 // ---- inline rename commit -------------------------------------------------
-static void commitRename(AppState& st, const fs::path& root) {
+static void commitRename(AppState& st, const std::string& root) {
     if (s_renameId.empty()) return;
-    fs::path oldP = s_renameId;
+    auto& fsb = billet::fsBackend();
+    std::string oldP = s_renameId;
     std::string newName = s_renameBuf;
     // trim
     while (!newName.empty() && (newName.front() == ' ')) newName.erase(newName.begin());
     while (!newName.empty() && (newName.back()  == ' ')) newName.pop_back();
     s_renameId.clear();
-    if (newName.empty() || newName == oldP.filename().string()) return;
+    if (newName.empty() || newName == pathFilename(oldP)) return;
     if (newName.find_first_of("\\/:*?\"<>|") != std::string::npos) {
         st.toast(ui::ToastLevel::Warn, "Invalid characters in name");
         return;
     }
-    fs::path newP = oldP.parent_path() / newName;
+    std::string newP = pathJoin(pathParent(oldP), newName);
     if (!withinWorkspace(root, oldP) || !withinWorkspace(root, newP)) {
         st.toast(ui::ToastLevel::Warn, "Rename blocked outside the workspace");
         return;
     }
-    std::error_code ec;
-    if (fs::exists(newP, ec)) { st.toast(ui::ToastLevel::Warn, "A file with that name exists"); return; }
-    fs::rename(oldP, newP, ec);
-    if (ec) st.toast(ui::ToastLevel::Error, "Rename failed: " + ec.message());
+    std::string err;
+    if (fsb.exists(newP)) { st.toast(ui::ToastLevel::Warn, "A file with that name exists"); return; }
+    if (!fsb.rename(oldP, newP, err)) st.toast(ui::ToastLevel::Error, "Rename failed: " + err);
     else {
-        st.addLog("[explorer] renamed " + oldP.filename().string() + " -> " + newName);
-        if (s_selectedPath == oldP.string()) s_selectedPath = newP.string();
+        st.addLog("[explorer] renamed " + pathFilename(oldP) + " -> " + newName);
+        if (s_selectedPath == oldP) s_selectedPath = newP;
     }
 }
 
 // ---- copy / paste (filesystem) -------------------------------------------
 // Build a collision-free destination by appending " (copy)" (then " (copy 2)", ...) before the
 // extension until the name is free.
-static fs::path uniqueDest(const fs::path& dir, const fs::path& src) {
-    std::string stem = src.stem().string();
-    std::string ext  = src.extension().string();
-    fs::path cand = dir / src.filename();
-    std::error_code ec;
-    if (!fs::exists(cand, ec)) return cand;
+static std::string uniqueDest(const std::string& dir, const std::string& src) {
+    auto& fsb = billet::fsBackend();
+    std::string fname = pathFilename(src);
+    std::string stem = pathStem(fname);
+    std::string ext  = pathExtension(fname);
+    std::string cand = pathJoin(dir, fname);
+    if (!fsb.exists(cand)) return cand;
     for (int n = 1; n < 1000; ++n) {
         std::string suffix = (n == 1) ? " (copy)" : (" (copy " + std::to_string(n) + ")");
-        cand = dir / (stem + suffix + ext);
-        if (!fs::exists(cand, ec)) return cand;
+        cand = pathJoin(dir, stem + suffix + ext);
+        if (!fsb.exists(cand)) return cand;
     }
     return cand;
 }
 
-static bool doPaste(AppState& st, const fs::path& root, const fs::path& destDir) {
+static bool doPaste(AppState& st, const std::string& root, const std::string& destDir) {
+    auto& fsb = billet::fsBackend();
     if (s_clipboardPath.empty()) { st.toast(ui::ToastLevel::Info, "Nothing copied"); return false; }
-    fs::path src = s_clipboardPath;
-    std::error_code ec;
-    if (!fs::exists(src, ec)) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
+    std::string src = s_clipboardPath;
+    if (!fsb.exists(src)) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
     if (!withinWorkspace(root, destDir)) { st.toast(ui::ToastLevel::Warn, "Paste blocked outside the workspace"); return false; }
-    fs::path dest = uniqueDest(destDir, src);
-    if (fs::is_directory(src, ec))
-        fs::copy(src, dest, fs::copy_options::recursive, ec);
-    else
-        fs::copy_file(src, dest, fs::copy_options::none, ec);
-    if (ec) { st.toast(ui::ToastLevel::Error, "Paste failed: " + ec.message()); return false; }
-    st.addLog("[explorer] pasted -> " + dest.string());
-    st.toast(ui::ToastLevel::Info, "Pasted " + dest.filename().string());
-    s_selectedPath = dest.string();
+    std::string dest = uniqueDest(destDir, src);
+    std::string err;
+    const bool isDir = fsb.isDirectory(src);
+    if (!fsb.copy(src, dest, /*recursive=*/isDir, err)) {
+        st.toast(ui::ToastLevel::Error, "Paste failed: " + err);
+        return false;
+    }
+    st.addLog("[explorer] pasted -> " + dest);
+    st.toast(ui::ToastLevel::Info, "Pasted " + pathFilename(dest));
+    s_selectedPath = dest;
     return true;
 }
 
-static void createNewFolder(AppState& st, const fs::path& root, const fs::path& dir) {
+static void createNewFolder(AppState& st, const std::string& root, const std::string& dir) {
+    auto& fsb = billet::fsBackend();
     if (!withinWorkspace(root, dir)) {
         st.toast(ui::ToastLevel::Warn, "New Folder blocked outside the workspace");
         return;
     }
-    std::error_code e2;
     int n = 1;
-    fs::path cand = dir / "New Folder";
-    while (fs::exists(cand, e2)) cand = dir / ("New Folder " + std::to_string(++n));
-    if (fs::create_directory(cand, e2)) {
-        s_pendingNewFolder = cand.string();
-        s_currentFolder = dir.string();
-        st.addLog("[explorer] new folder " + cand.string());
+    std::string cand = pathJoin(dir, "New Folder");
+    while (fsb.exists(cand)) cand = pathJoin(dir, "New Folder " + std::to_string(++n));
+    std::string err;
+    if (fsb.mkdir(cand, err)) {
+        s_pendingNewFolder = cand;
+        s_currentFolder = dir;
+        st.addLog("[explorer] new folder " + cand);
     } else {
-        st.toast(ui::ToastLevel::Error, "New Folder failed");
+        st.toast(ui::ToastLevel::Error, "New Folder failed" + (err.empty() ? "" : (": " + err)));
     }
 }
 
@@ -232,18 +274,20 @@ static void createNewFolder(AppState& st, const fs::path& root, const fs::path& 
 // app.cpp's request pump inspects the extension and dispatches (CAD -> featureTreeOpenPath, ECAD ->
 // the ECAD open path). Keeping the actual open on the GL-thread pump avoids re-entrant doc swaps
 // mid-tree-walk.
-static void requestOpen(AppState& st, const fs::path& p) {
+static void requestOpen(AppState& st, const std::string& p) {
     std::string e = lowerExt(p);
     if (!isKnownExt(e)) return;
-    st.requestOpenPath = p.string();
+    st.requestOpenPath = p;
 }
 
 // ---- tree node rendering --------------------------------------------------
 // A file row: icon + name, selectable, double-click opens, F2/Del/context-menu act on it.
-static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, const std::string& ext) {
-    const std::string pathStr = p.string();
+static void drawFileRow(AppState& st, const std::string& root, const std::string& p,
+                        const std::string& ext) {
+    const std::string& pathStr = p;
     const bool isRenaming = (s_renameId == pathStr);
     const bool selected = (s_selectedPath == pathStr);
+    const std::string fname = pathFilename(p);
     ImGui::PushID(pathStr.c_str());
     if (isRenaming) {
         // Inline rename: pill + icon + InputText (same frame height as a normal row).
@@ -263,14 +307,14 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
         // unused leaf-arrow slot so icon + label share the FM's exact metrics and centering.
         ui::FmRowRect rr = ui::fmRowPill(selected);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        ImGui::TreeNodeEx(p.filename().string().c_str(),
+        ImGui::TreeNodeEx(fname.c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
         ui::fmRowPillEnd(rr, selected);
         if (ImGui::IsItemClicked()) {
             s_selectedPath = pathStr;
-            s_currentFolder = p.parent_path().string();
+            s_currentFolder = pathParent(p);
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
         }
         // Drag SOURCE: dragging a known-extension row onto the viewport opens it (the viewport is the
@@ -278,23 +322,23 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
         // target can read it straight back as a C string. Drag preview = the filename.
         if (isKnownExt(ext) && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             ImGui::SetDragDropPayload(kFileDragPayload, pathStr.c_str(), pathStr.size() + 1);
-            ImGui::TextUnformatted(p.filename().string().c_str());
+            ImGui::TextUnformatted(fname.c_str());
             ImGui::EndDragDropSource();
         }
         // context menu
         if (ImGui::BeginPopupContextItem("##fctx")) {
             s_selectedPath = pathStr;
-            s_currentFolder = p.parent_path().string();
+            s_currentFolder = pathParent(p);
             if (ImGui::MenuItem("Open"))   requestOpen(st, p);
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
                 s_renameId = pathStr;
-                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", p.filename().string().c_str());
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
                 s_renameFocus = true;
             }
             if (ImGui::MenuItem("Copy", "Ctrl+C")) s_clipboardPath = pathStr;
             if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
-                doPaste(st, root, p.parent_path());
+                doPaste(st, root, pathParent(p));
             if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = pathStr;
             ImGui::EndPopup();
         }
@@ -304,21 +348,23 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
 
 // Recursively draw a directory: a tree node that lazy-lists its children on open. Folders first
 // (sorted), then known files (sorted). Hidden/dot entries and unknown extensions are skipped.
-static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir, bool isRoot) {
-    std::error_code ec;
+static void drawDirNode(AppState& st, const std::string& root, const std::string& dir, bool isRoot) {
+    auto& fsb = billet::fsBackend();
     // The "Workspace" section rule above the tree already names the section; the root row just
     // shows the workspace folder's own name (FM-style: divider carries the section label).
-    std::string label = dir.filename().string();
+    std::string label = pathFilename(dir);
+    if (label.empty() || label == "/" || (label.size() == 2 && label[1] == ':'))
+        label = dir;  // root-ish
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
                                ImGuiTreeNodeFlags_FramePadding;   // pill-height node
     if (isRoot) flags |= ImGuiTreeNodeFlags_DefaultOpen;
-    const bool dirSelected = (s_selectedPath == dir.string());
+    const bool dirSelected = (s_selectedPath == dir);
 
-    ImGui::PushID(dir.string().c_str());
+    ImGui::PushID(dir.c_str());
 
     // A non-root folder being inline-renamed shows an InputText in place of its tree node; its
     // children stay collapsed during the rename (kept simple — folder rename is a leaf interaction).
-    if (!isRoot && s_renameId == dir.string()) {
+    if (!isRoot && s_renameId == dir) {
         ui::FmRowRect rr = ui::fmRowPill(dirSelected);
         ui::fmTreeIcon("body_folder", "[D]");
         ImGui::SameLine(0, 4.0f * ui::uiScale);
@@ -341,13 +387,13 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
     bool open = ImGui::TreeNodeEx(label.c_str(), flags);
     ui::fmRowPillEnd(rr, dirSelected);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        s_selectedPath = dir.string();
-        s_currentFolder = dir.string();
+        s_selectedPath = dir;
+        s_currentFolder = dir;
     }
     // folder context menu (New Folder / Paste / Rename / Delete — root only allows New Folder/Paste)
     if (ImGui::BeginPopupContextItem("##dctx")) {
-        s_selectedPath = dir.string();
-        s_currentFolder = dir.string();
+        s_selectedPath = dir;
+        s_currentFolder = dir;
         if (ImGui::MenuItem("New Folder")) {
             createNewFolder(st, root, dir);
         }
@@ -356,30 +402,28 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
         if (!isRoot) {
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
-                s_renameId = dir.string();
-                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", dir.filename().string().c_str());
+                s_renameId = dir;
+                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(dir).c_str());
                 s_renameFocus = true;
             }
-            if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = dir.string();
+            if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = dir;
         }
         ImGui::EndPopup();
     }
 
     if (open) {
         // gather + sort children (folders first, then known files)
-        std::vector<fs::path> dirs, files;
-        for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-             it != end; it.increment(ec)) {
-            if (ec) break;
-            const fs::path& c = it->path();
-            std::string name = c.filename().string();
-            if (!name.empty() && name[0] == '.') continue;   // skip dotfiles
-            std::error_code e2;
-            if (fs::is_directory(c, e2)) dirs.push_back(c);
-            else if (isKnownExt(lowerExt(c))) files.push_back(c);
+        std::string listErr;
+        auto entries = fsb.list(dir, listErr);
+        std::vector<std::string> dirs, files;
+        for (const auto& e : entries) {
+            if (e.name.empty() || e.name[0] == '.') continue;
+            std::string full = pathJoin(dir, e.name);
+            if (e.isDir) dirs.push_back(full);
+            else if (isKnownExt(lowerExt(e.name))) files.push_back(full);
         }
-        auto byName = [](const fs::path& a, const fs::path& b) {
-            std::string an = a.filename().string(), bn = b.filename().string();
+        auto byName = [](const std::string& a, const std::string& b) {
+            std::string an = pathFilename(a), bn = pathFilename(b);
             std::transform(an.begin(), an.end(), an.begin(), ::tolower);
             std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
             return an < bn;
@@ -398,6 +442,7 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
 // ---- Recent section -------------------------------------------------------
 static void drawRecentSection(AppState& st) {
     if (st.recentFiles.empty()) return;
+    auto& fsb = billet::fsBackend();
     // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
     ui::fmSectionDivider("Recent");
     if (ImGui::GetTime() - s_recentExistsAt > 2.0) {
@@ -407,20 +452,19 @@ static void drawRecentSection(AppState& st) {
     int idx = 0;
     for (const std::string& rp : st.recentFiles) {
         ImGui::PushID(idx++);
-        fs::path p(rp);
         auto exIt = s_recentExists.find(rp);
         if (exIt == s_recentExists.end()) {
-            std::error_code ec;
-            exIt = s_recentExists.emplace(rp, fs::exists(p, ec)).first;
+            exIt = s_recentExists.emplace(rp, fsb.exists(rp)).first;
         }
         const bool exists = exIt->second;
-        const std::string ext = lowerExt(p);
+        const std::string ext = lowerExt(rp);
+        const std::string fname = pathFilename(rp);
         // Same FM leaf-row pattern as the tree's file rows; a missing file keeps a readable dim
         // state (dim text + faded icon), like the FM's hidden planes.
         ui::FmRowRect rr = ui::fmRowPill(false);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
         if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-        ImGui::TreeNodeEx(p.filename().string().c_str(),
+        ImGui::TreeNodeEx(fname.c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         if (!exists) ImGui::PopStyleColor();
@@ -428,12 +472,12 @@ static void drawRecentSection(AppState& st) {
                                   exists ? 1.0f : 0.45f);
         ui::fmRowPillEnd(rr, false);
         if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
-            requestOpen(st, p);
+            requestOpen(st, rp);
         // Drag a Recent row onto the viewport to open it (same payload as the tree rows).
         if (exists && isKnownExt(ext) &&
             ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             ImGui::SetDragDropPayload(kFileDragPayload, rp.c_str(), rp.size() + 1);
-            ImGui::TextUnformatted(p.filename().string().c_str());
+            ImGui::TextUnformatted(fname.c_str());
             ImGui::EndDragDropSource();
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
@@ -442,26 +486,25 @@ static void drawRecentSection(AppState& st) {
 }
 
 // ---- delete confirm modal -------------------------------------------------
-static void drawDeleteModal(AppState& st, const fs::path& root) {
+static void drawDeleteModal(AppState& st, const std::string& root) {
+    auto& fsb = billet::fsBackend();
     if (!s_pendingDelete.empty() && !ImGui::IsPopupOpen("Delete?"))
         ImGui::OpenPopup("Delete?");
     bool open = !s_pendingDelete.empty();
     if (ImGui::BeginPopupModal("Delete?", &open, ImGuiWindowFlags_AlwaysAutoResize)) {
-        fs::path p(s_pendingDelete);
-        ImGui::Text("Delete \"%s\"?", p.filename().string().c_str());
-        std::error_code ec;
-        if (fs::is_directory(p, ec)) ImGui::TextDisabled("This folder and its contents.");
+        std::string p = s_pendingDelete;
+        ImGui::Text("Delete \"%s\"?", pathFilename(p).c_str());
+        if (fsb.isDirectory(p)) ImGui::TextDisabled("This folder and its contents.");
         ImGui::Spacing();
         if (ImGui::Button("Delete", ImVec2(110 * ui::uiScale, 0))) {
             if (!withinWorkspace(root, p)) {
                 st.toast(ui::ToastLevel::Warn, "Delete blocked outside the workspace");
             } else {
-                std::error_code de;
-                std::uintmax_t n = fs::remove_all(p, de);
-                if (de) st.toast(ui::ToastLevel::Error, "Delete failed: " + de.message());
+                std::string err;
+                if (!fsb.remove(p, err)) st.toast(ui::ToastLevel::Error, "Delete failed: " + err);
                 else {
-                    st.addLog("[explorer] deleted " + p.string() + " (" + std::to_string(n) + " items)");
-                    st.toast(ui::ToastLevel::Info, "Deleted " + p.filename().string());
+                    st.addLog("[explorer] deleted " + p);
+                    st.toast(ui::ToastLevel::Info, "Deleted " + pathFilename(p));
                     if (s_selectedPath == s_pendingDelete) s_selectedPath.clear();
                 }
             }
@@ -480,32 +523,32 @@ static void drawDeleteModal(AppState& st, const fs::path& root) {
 
 // ---- body -----------------------------------------------------------------
 void drawFileExplorerBody(AppState& st) {
+    auto& fsb = billet::fsBackend();
     ui::fmRowStripeReset();   // restart the FM stripe phase + refresh the shared FM palette
     ensureWorkspaceDir(st);
-    fs::path root(st.workspaceDir);
+    const std::string root = st.workspaceDir;
 
     // A just-created folder enters inline rename on the next frame (after the tree expands it).
     if (!s_pendingNewFolder.empty()) {
         s_renameId = s_pendingNewFolder;
         std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s",
-                      fs::path(s_pendingNewFolder).filename().string().c_str());
+                      pathFilename(s_pendingNewFolder).c_str());
         s_renameFocus = true;
         s_selectedPath = s_pendingNewFolder;
         s_pendingNewFolder.clear();
     }
 
-    fs::path current = s_currentFolder.empty() ? root : fs::path(s_currentFolder);
-    std::error_code curEc;
-    if (!fs::is_directory(current, curEc)) current = current.parent_path();
+    std::string current = s_currentFolder.empty() ? root : s_currentFolder;
+    if (!fsb.isDirectory(current)) current = pathParent(current);
     if (current.empty() || !withinWorkspace(root, current)) current = root;
 
     const bool selectedFile = !s_selectedPath.empty() &&
-        fs::is_regular_file(fs::path(s_selectedPath), curEc) &&
-        isKnownExt(lowerExt(fs::path(s_selectedPath)));
+        fsb.isRegularFile(s_selectedPath) &&
+        isKnownExt(lowerExt(s_selectedPath));
 
     // Toolbar: the exact FeatureManager top-strip button (24px glass pill, 18px crisp glyph).
     if (ui::fmToolbarIconBtn("fx_open", "open", "Open selected file", selectedFile) && selectedFile)
-        requestOpen(st, fs::path(s_selectedPath));
+        requestOpen(st, s_selectedPath);
     ImGui::SameLine(0, 3.0f * ui::uiScale);
     if (ui::fmToolbarIconBtn("fx_new_folder", "folder_new", "New folder", true))
         createNewFolder(st, root, current);
@@ -519,8 +562,8 @@ void drawFileExplorerBody(AppState& st) {
 
     // Breadcrumb: the current folder, in an FM row pill (secondary ink, frame-padded centering).
     {
-        std::string folderName = current.filename().string();
-        if (folderName.empty()) folderName = current.string();
+        std::string folderName = pathFilename(current);
+        if (folderName.empty()) folderName = current;
         ui::FmRowRect bc = ui::fmRowPill(false);
         ImGui::SetCursorScreenPos(ImVec2(bc.mn.x + 6.0f * ui::uiScale, bc.mn.y));
         ImGui::AlignTextToFramePadding();
@@ -528,7 +571,7 @@ void drawFileExplorerBody(AppState& st) {
         ImGui::TextUnformatted(folderName.c_str());
         ImGui::PopStyleColor();
         ui::fmRowPillEnd(bc, false);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.string().c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.c_str());
     }
 
     drawRecentSection(st);
@@ -539,9 +582,9 @@ void drawFileExplorerBody(AppState& st) {
     if (!s_selectedPath.empty() && !ImGui::GetIO().WantTextInput &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) {
-            fs::path sp(s_selectedPath);
             s_renameId = s_selectedPath;
-            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", sp.filename().string().c_str());
+            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s",
+                          pathFilename(s_selectedPath).c_str());
             s_renameFocus = true;
         } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
             s_pendingDelete = s_selectedPath;
@@ -550,8 +593,7 @@ void drawFileExplorerBody(AppState& st) {
 
     ui::fmSectionDivider("Workspace");
     ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None);
-    std::error_code ec;
-    if (fs::exists(root, ec))
+    if (fsb.exists(root))
         drawDirNode(st, root, root, /*isRoot=*/true);
     else
         ImGui::TextDisabled("Workspace folder missing");
@@ -568,17 +610,17 @@ bool fileExplorerActive(const AppState& st) {
 bool fileExplorerCopySelection(AppState& st) {
     if (s_selectedPath.empty()) return false;
     s_clipboardPath = s_selectedPath;
-    st.toast(ui::ToastLevel::Info, "Copied " + fs::path(s_selectedPath).filename().string());
+    st.toast(ui::ToastLevel::Info, "Copied " + pathFilename(s_selectedPath));
     return true;
 }
 
 bool fileExplorerPaste(AppState& st) {
     if (s_clipboardPath.empty()) return false;
+    auto& fsb = billet::fsBackend();
     ensureWorkspaceDir(st);
-    fs::path root(st.workspaceDir);
-    fs::path dest = s_currentFolder.empty() ? root : fs::path(s_currentFolder);
-    std::error_code ec;
-    if (!fs::is_directory(dest, ec)) dest = dest.parent_path();   // selection was a file -> its folder
+    std::string root = st.workspaceDir;
+    std::string dest = s_currentFolder.empty() ? root : s_currentFolder;
+    if (!fsb.isDirectory(dest)) dest = pathParent(dest);   // selection was a file -> its folder
     return doPaste(st, root, dest);
 }
 

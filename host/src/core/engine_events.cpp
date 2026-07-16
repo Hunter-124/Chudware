@@ -1,6 +1,7 @@
 #include "engine_events.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -224,6 +225,28 @@ void handleEvent(AppState& st, const json& evt) {
             pendingChanged[docId] = d;
             return;
         }
+        // Multi-user authorship: toast when another seat edited this doc.
+        // Local single-seat GUIs leave user empty — no toast.
+        if (d.contains("user") && d["user"].is_object()) {
+            const std::string display = d["user"].value("display", std::string());
+            const std::string uid = d["user"].value("id", std::string());
+            if (!display.empty()) {
+                // This client's own identity (if any) is not stored on AppState yet —
+                // toast whenever a non-empty foreign display is present and the source
+                // client is not us (source_kind gui with empty local identity still
+                // surfaces other seats; skip when display matches $USER as a soft filter).
+                const char* self = std::getenv("USER");
+                const bool own = self && *self && display == self;
+                if (!own) {
+                    st.toast(ui::ToastLevel::Info, "edited by " + display);
+                    st.addLog("[daemon] doc.changed by " + display +
+                              (uid.empty() ? std::string() : (" (" + uid + ")")) +
+                              " on " + docId);
+                }
+            }
+            // A remote edit reintroduces history (their undo stack); un-grey local buttons.
+            st.docTabs[idx].historyCleared = false;
+        }
         if (idx != st.activeTab) {
             AppState::DocTab& tab = st.docTabs[idx];
             tab.aiPulse = true;  // background activity remains visible in the tab strip
@@ -288,6 +311,16 @@ void handleEvent(AppState& st, const json& evt) {
             return;
         }
         st.closeDocTab(idx);  // closed/gc/discarded/daemon — the doc is gone; drop the mirror
+        return;
+    }
+    if (name == "doc.history_cleared") {
+        // Human save wiped undo/redo for this doc — grey the toolbar until a new edit.
+        if (docId.empty()) return;
+        const int idx = tabIndexForDoc(st, docId);
+        if (idx >= 0) {
+            st.docTabs[idx].historyCleared = true;
+            st.addLog("[daemon] history cleared for " + docId);
+        }
         return;
     }
     if (name == "doc.lease_change") {

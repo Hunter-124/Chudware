@@ -33,4 +33,8 @@ std::string openFolderDialog();
 // graphics mesh). Only meaningful for mesh formats. Returns 1 (yes/solid), 0 (no/mesh), -1 (cancel).
 int promptImportMeshAsSolid();
 
+// After the engine has written `path` (export/save), desktop no-ops; under
+// __EMSCRIPTEN__ triggers a browser download via GET /workspace/download.
+void afterFileWritten(const std::string& path);
+
 }  // namespace ui

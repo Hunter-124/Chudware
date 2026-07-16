@@ -683,6 +683,9 @@ void AppState::markActiveTabDirty() {
     if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
         docTabs[activeTab].docId == docMirror.docId()) {
         docTabs[activeTab].dirty = true;
+        // Local mutation re-seeds the undo stack — un-grey the toolbar after a
+        // prior doc.history_cleared (human save wiped history).
+        docTabs[activeTab].historyCleared = false;
         // First user edit on an AI mirror tab ADOPTS it: it becomes user-owned, so it is
         // never auto-closed when the agent finishes and IS covered by the quit warning. The
         // agent keeps co-editing the same live doc (the mirror's ro attach silently upgraded

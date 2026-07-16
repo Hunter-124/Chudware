@@ -94,6 +94,11 @@ ParsedReply gemini_parse_response(const json& resp);
 // classified as a hard daily/free-tier quota vs a transient rate-limit and given matching advice.
 std::string concise_http_error(const std::string& provider, int status, const std::string& body);
 
+// Derive a short human sentence from a raw provider error string (complete().error or
+// "provider error: …"). Does NOT mutate the raw string — emit as error_human alongside
+// error_detail so the phase card can show "Claude rejected the request" + the HTTP line.
+std::string humanize_provider_error(const std::string& raw);
+
 // --- mock_provider.py -------------------------------------------------------
 // MockProvider: scripted replies in order; the last repeats once exhausted.
 class MockProvider {

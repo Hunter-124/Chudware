@@ -3,6 +3,8 @@
 #include "re_points.h"
 
 #include <glad/gl.h>
+#include "ui/viewport/glsl_compat.h"
+
 
 #include <cmath>
 #include <cstdio>
@@ -36,7 +38,13 @@ void main() { frag = vColor; })";
 
 unsigned int compileShader(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
+#ifdef BILLET_GLES3
+    const std::string rewritten = shaderSrc(src);
+    const char* p = rewritten.c_str();
+#else
+    const char* p = shaderSrc(src);
+#endif
+    glShaderSource(s, 1, &p, nullptr);
     glCompileShader(s);
     int ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
@@ -169,7 +177,9 @@ void RePoints::draw(const Renderer::CameraXform& cam) {
     if (!ptVerts_.empty()) {
         glUniform1i(uUsePVC_, 1);
         glBindVertexArray(ptVao_);
+#ifndef BILLET_GLES3
         glPointSize(pointSize_ * widthScale_);
+#endif
         glDrawArrays(GL_POINTS, 0, (GLsizei)(ptVerts_.size() / 6));
         glBindVertexArray(0);
     }

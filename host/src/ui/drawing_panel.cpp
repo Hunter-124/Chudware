@@ -75,6 +75,7 @@ static void exportActiveDrawing(AppState& st, const char* fmt) {
     if (!written.empty()) {
         st.addLog("[draw] exported " + ext + ": " + written);
         st.toast(ui::ToastLevel::Info, "Exported " + written);
+        ui::afterFileWritten(written);
     } else {
         st.addLog("[draw] export " + ext + " failed: " + err);
         st.toast(ui::ToastLevel::Error,

@@ -4015,7 +4015,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+        // Tight gap logo → buttons (default ItemSpacing.y is ~8px and wastes header height).
+        ImGui::Dummy(ImVec2(0, 1.0f * sc));
     }
 
     // ---- Row 2: collapse | Chat | Sessions | Settings | status ----
@@ -9476,7 +9477,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // The doc-tab strip now floats over the viewport (fix 2), not above these columns, so the
         // Copilot column starts flush at the top of the viewport band — same rule as drawLeftPane,
         // keeping the two pinned columns sharing their top edge.
-        const float colY = band.minY + 4.0f * ui::uiScale;   // hug the ribbon (moved up per design)
+        const float colY = band.minY + 4.0f * ui::uiScale;   // match left-pane top (doc_tabs / FM)
         const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
         if (ui::takeOverlayColumnReset(1)) {
@@ -9586,8 +9587,15 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
     }
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
-    drawCopilotHeader(st, busy);
+    // Tight top: hug the ribbon/glass edge — was U(1.5) (~6dp) of dead air above the logo.
+    ImGui::Dummy(ImVec2(0, 1.0f * ui::uiScale));
+    {
+        // Collapse ItemSpacing.y for the header stack so logo↔buttons don't pick up the theme gap.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+        drawCopilotHeader(st, busy);
+        ImGui::PopStyleVar();
+    }
     ImGui::Separator();
 
     // T-G21: the title row + separator above IS the header strip a vertical collapse rolls up to

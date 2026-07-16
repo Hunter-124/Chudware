@@ -321,6 +321,78 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"doc_id", doc_id}};
     }
 
+    // ---- Copilot mode options (agent|plan|swarm|edit|ask) ----
+    // Absent mode = today's byte-identical path. plan_only / approved_plan / scope /
+    // advisor only engage when explicitly set by the host.
+    const std::string copilot_mode = options.value("mode", std::string());
+    // plan_only: explicit flag OR mode==plan. Resume with approved_plan is NOT plan_only
+    // (host keeps mode=plan while re-sending the approved plan to execute).
+    bool plan_only = options.value("plan_only", false) || copilot_mode == "plan";
+    const bool corporate_force = options.value("corporate_force", false) ||
+                                 copilot_mode == "swarm";
+    const std::string execute_as = options.value("execute_as", std::string());
+    // advisor defaults ON; only an explicit false disables the seam.
+    const bool advisor_on = !options.contains("advisor") ? true : options.value("advisor", true);
+    // scope: edit-mode feature targeting (whole-doc when absent/empty).
+    json scope = (options.contains("scope") && options["scope"].is_object())
+                     ? options["scope"]
+                     : json::object();
+    std::vector<std::string> scope_feature_ids;
+    if (scope.contains("feature_ids") && scope["feature_ids"].is_array()) {
+        for (const auto& fid : scope["feature_ids"])
+            if (fid.is_string() && !fid.get<std::string>().empty())
+                scope_feature_ids.push_back(fid.get<std::string>());
+    }
+    // Item 3: scope engages when mode==edit AND feature_ids present (whole-doc otherwise).
+    const bool edit_scoped = (copilot_mode == "edit") && !scope_feature_ids.empty();
+    // approved_plan: string (JSON text) or object — skip re-planning when set.
+    ojson approved_plan = nullptr;
+    if (options.contains("approved_plan") && !options["approved_plan"].is_null()) {
+        const auto& ap = options["approved_plan"];
+        if (ap.is_object()) {
+            approved_plan = ojson::parse(ap.dump());
+        } else if (ap.is_string()) {
+            const std::string& s = ap.get_ref<const std::string&>();
+            if (!s.empty()) {
+                ojson parsed = ojson::parse(s, nullptr, false);
+                if (!parsed.is_discarded() && parsed.is_object())
+                    approved_plan = std::move(parsed);
+                else {
+                    // Non-JSON plan text: wrap as a single-part plan so plan_steps still works.
+                    approved_plan = ojson::object();
+                    approved_plan["name"] = "Approved plan";
+                    approved_plan["summary"] = s;
+                    approved_plan["parts"] = ojson::array({ojson{{"name", "part"},
+                                                                {"purpose", s},
+                                                                {"dimensions", ojson::object()},
+                                                                {"features", ojson::array()}}});
+                }
+            }
+        }
+    }
+    const bool has_approved_plan =
+        !approved_plan.is_null() && approved_plan.is_object() &&
+        approved_plan.contains("parts") && approved_plan["parts"].is_array() &&
+        !approved_plan["parts"].empty();
+    // Resume after Plan approve: execute the approved plan (do not stop at plan_ready).
+    if (has_approved_plan) plan_only = false;
+
+    // Advisor seam: reserved. C++ has no foreman battery — leave empty (no fabricated
+    // advisories). Host/Python may later push text via options.advisory_text.
+    clear_context_advisory();
+    if (advisor_on) {
+        std::string adv_text;
+        if (options.contains("advisory_text") && options["advisory_text"].is_string())
+            adv_text = options["advisory_text"].get<std::string>();
+        if (!adv_text.empty()) set_context_advisory(adv_text);
+        // else: seam armed but empty → no ADVISORY block (legacy-identical body).
+    }
+    struct AdvisoryGuard {
+        ~AdvisoryGuard() { clear_context_advisory(); }
+    } advisory_guard;
+    (void)corporate_force;  // stamped for host/Python; C++ stage path has no swarm spawn
+    (void)execute_as;
+
     RunEvents events(run_id, emit);
     // Live provider_call debug events (endpoint/status/latency) land on the same
     // emit stream as stage events so the host can orch_-prefix them into chat.
@@ -474,6 +546,30 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     state.memory = ojson::object();
     state.update_tree(tree_to_ojson(tree0.contains("tree") ? tree0["tree"] : json::object()));
 
+    // Seed an approved plan so the plan stage is skipped (host Plan-mode resume).
+    if (has_approved_plan) state.plan = approved_plan;
+
+    // Edit-mode scope directive: constrain modeler to listed feature ids.
+    std::string edit_scope_directive;
+    if (edit_scoped) {
+        std::ostringstream ss;
+        ss << "[EDIT SCOPE] Constrain changes to these feature id(s) only: ";
+        for (size_t i = 0; i < scope_feature_ids.size(); ++i) {
+            if (i) ss << ", ";
+            ss << scope_feature_ids[i];
+        }
+        ss << ". Prefer edit_feature / delete_feature on those ids. Do NOT add unrelated "
+              "features or mutate features outside this set unless the request explicitly "
+              "requires a new supporting feature.";
+        if (scope.contains("section") && scope["section"].is_string() &&
+            !scope["section"].get<std::string>().empty())
+            ss << " Section focus: " << scope["section"].get<std::string>() << ".";
+        if (scope.contains("selection") && scope["selection"].is_array() &&
+            !scope["selection"].empty())
+            ss << " Selection: " << scope["selection"].dump() << ".";
+        edit_scope_directive = ss.str();
+    }
+
     json stages = json::array({"intake", "plan", "model", "review", "fix", "memory"});
     events.emit("run_started",
                 json{{"request", request}, {"doc_id", state.doc_id}, {"stages", stages}});
@@ -547,7 +643,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     };
 
     // ---- PLAN ----
+    // When approved_plan was seeded, skip the planner LLM call (host Plan-mode resume).
     actions.plan = [&](DesignState& st, int) -> StageOutcome {
+        if (has_approved_plan && !st.plan.is_null()) {
+            StageOutcome o;
+            o.verdict = "pass";
+            o.reason = "approved_plan (re-plan skipped)";
+            o.parsed_ok = true;
+            return o;
+        }
         AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap);
         ojson p = extract_json_obj(ac.reply);
         StageOutcome o;
@@ -639,12 +743,41 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     };
 
     // ---- MODEL ----
+    // Combine experimental cad-sequence + edit-scope directives for the modeler body.
+    auto modeler_directive = [&]() -> std::string {
+        if (cad_seq_directive.empty()) return edit_scope_directive;
+        if (edit_scope_directive.empty()) return cad_seq_directive;
+        return cad_seq_directive + "\n\n" + edit_scope_directive;
+    };
+    // Soft-filter applied ops when edit scope is active: drop edit/delete targeting
+    // features outside the allowlist (prompt is the primary constraint; this is belt).
+    auto filter_ops_to_scope = [&](const json& ops) -> json {
+        if (!edit_scoped || scope_feature_ids.empty()) return ops;
+        std::set<std::string> allow(scope_feature_ids.begin(), scope_feature_ids.end());
+        json out = json::array();
+        for (const auto& op : ops) {
+            if (!op.is_object()) {
+                out.push_back(op);
+                continue;
+            }
+            const std::string opn = op.value("op", std::string());
+            if (opn == "edit_feature" || opn == "delete_feature" || opn == "suppress_feature" ||
+                opn == "unsuppress_feature") {
+                std::string id = op.value("id", std::string());
+                if (id.empty() && op.contains("feature") && op["feature"].is_object())
+                    id = op["feature"].value("id", std::string());
+                if (!id.empty() && !allow.count(id)) continue;  // drop out-of-scope mutation
+            }
+            out.push_back(op);
+        }
+        return out;
+    };
     actions.model = [&](DesignState& st, int attempt) -> StageOutcome {
         st.last_no_progress = false;
         if (attempt > kEscapeAfter) return model_escape(st);
         AgentCall ac =
             agent_call(use_implement_provider(), st, "modeler", prompts_dir, implement_budget,
-                       implement_vision, implement_ctx_cap, cad_seq_directive);
+                       implement_vision, implement_ctx_cap, modeler_directive());
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -669,7 +802,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.error = "model: " + perr;
             return o;
         }
-        const json& ops = *ores.ops;
+        json ops = filter_ops_to_scope(*ores.ops);
         if (ops.empty()) {
             st.last_no_progress = true;
             o.verdict = "pass";
@@ -808,7 +941,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             o.error = "fix: " + perr;
             return o;
         }
-        const json& ops = *ores.ops;
+        json ops = filter_ops_to_scope(*ores.ops);
         if (ops.empty()) {
             o.verdict = "pass";
             o.reason = "fix: no change";
@@ -930,6 +1063,83 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ----------------------------------------------------------------- drive
     const auto t_run0 = std::chrono::steady_clock::now();
+
+    // plan_only: run intake + plan, emit plan/plan_state, STOP before model (no mutation).
+    // approved_plan clears plan_only above so resume falls through to full run_machine.
+    if (plan_only) {
+        auto run_one_stage = [&](const std::string& stage, const Action& action,
+                                 const std::string& role, int budget) -> std::string {
+            std::string last_v = "fail";
+            for (int attempt = 1; attempt <= budget; ++attempt) {
+                state.ledger.bump(stage);
+                events.emit("stage_started",
+                            json{{"stage", stage},
+                                 {"role", role},
+                                 {"attempt", attempt},
+                                 {"budget", budget}});
+                StageOutcome outcome = action(state, attempt);
+                events.emit("stage_result", json{{"stage", stage},
+                                                 {"attempt", attempt},
+                                                 {"verdict", outcome.verdict},
+                                                 {"reason", outcome.reason}});
+                last_v = outcome.verdict;
+                if (last_v == "pass" || last_v == "skip" || last_v == "fail") return last_v;
+                // retry
+            }
+            return last_v;
+        };
+        json budgets = options.value("budgets", json::object());
+        int intake_b = budgets.value("intake", 2);
+        int plan_b = budgets.value("plan", 2);
+        (void)run_one_stage("intake", actions.intake, "intake", intake_b);  // non-fatal
+        std::string plan_v = run_one_stage("plan", actions.plan, "planner", plan_b);
+
+        json plan_j = nullptr;
+        if (!state.plan.is_null() && state.plan.is_object()) plan_j = state.plan;
+
+        // Surface plan to the copilot Plan section (same as machine post-plan emit).
+        if (plan_j.is_object() && plan_j.contains("parts") && plan_j["parts"].is_array() &&
+            !plan_j["parts"].empty()) {
+            std::string title, summary;
+            plan_display_meta(state.plan, title, summary);
+            json part_items = plan_state_items_from_build_plan(plan_j, "pending");
+            emit_plan_state(events, "build_plan", title, summary, /*revision=*/1, part_items);
+            json obj_items = plan_state_items_from_objectives(plan_j);
+            if (!obj_items.empty())
+                emit_plan_state(events, "objectives", "Objectives", summary, /*revision=*/1,
+                                obj_items);
+            // Python parity: kind:"plan" for the Plan card consumers.
+            events.emit("plan", json{{"plan", plan_j}, {"title", title}, {"summary", summary}});
+        }
+
+        json tree_now = doc::doc_tree(doc_id);
+        int revision = tree_now.value("revision", state.revision);
+        const bool have_plan =
+            plan_j.is_object() && plan_j.contains("parts") && plan_j["parts"].is_array() &&
+            !plan_j["parts"].empty();
+        // Provider hard-fail on plan with nothing usable → failed; else plan_ready
+        // (even a degraded/empty plan is returned so the host can still present UI).
+        std::string status = "plan_ready";
+        std::string stop = "plan_only";
+        if (plan_v == "fail" && !have_plan) {
+            status = "failed";
+            stop = "plan_failed";
+        }
+        events.emit("run_finished",
+                    json{{"status", status}, {"stop_reason", stop}, {"revision", revision}});
+        json out = json{{"run_id", run_id},
+                        {"status", status},
+                        {"stop_reason", stop},
+                        {"revision", revision},
+                        {"doc_id", state.doc_id}};
+        if (have_plan) out["plan"] = plan_j;
+        else if (!state.plan.is_null()) out["plan"] = state.plan;
+        else out["plan"] = nullptr;
+        if (!copilot_mode.empty()) out["mode"] = copilot_mode;
+        (void)t_run0;
+        return out;
+    }
+
     json result = run_machine(state, actions, events, options.value("budgets", json::object()));
 
     // revision = session.revision (re-read live; matches run.py getattr(session,"revision")).
@@ -983,6 +1193,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                     {"stop_reason", result["stop_reason"]},
                     {"revision", revision},
                     {"doc_id", state.doc_id}};
+    if (!copilot_mode.empty()) out["mode"] = copilot_mode;
     if (result.contains("error_detail") && result["error_detail"].is_string() &&
         !result["error_detail"].get<std::string>().empty())
         out["error_detail"] = result["error_detail"];
@@ -999,6 +1210,20 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     if (run_id.empty())
         run_id = "asm-" + std::to_string(static_cast<unsigned long long>(
                               std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    // Plan gate / approved resume: always use the single-doc run_design path so
+    // plan_only stops once (plan_ready) and approved_plan skips re-planning. Multi-
+    // part assembly builds would otherwise re-plan and mutate child docs.
+    {
+        bool plan_only = options.value("plan_only", false) ||
+                         options.value("mode", std::string()) == "plan";
+        bool has_ap = options.contains("approved_plan") && !options["approved_plan"].is_null() &&
+                      !(options["approved_plan"].is_string() &&
+                        options["approved_plan"].get<std::string>().empty());
+        if (has_ap) plan_only = false;
+        if (plan_only || has_ap)
+            return run_design(request, doc_id, provider_cfg, emit, options);
+    }
 
     // 1) Plan the request to learn the parts + whether it's an assembly. One intake + one planner
     //    call (cheap relative to a full build); the per-part run_design re-plans its own part.
@@ -1345,6 +1570,14 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     events.emit("mission_started", json{{"request", request},
                                         {"task_count", static_cast<int>(tasks.size())},
                                         {"tasks", task_list}});
+    // Additive plan_state for the copilot Plan section (phased_todo under "Mission").
+    // Statuses update on mission_task_started / mission_task_result.
+    int mission_plan_rev = 1;
+    json mission_plan_tasks = task_list;  // mutable status mirror
+    for (auto& t : mission_plan_tasks)
+        if (t.is_object()) t["status"] = "pending";
+    emit_plan_state(events, "phased_todo", "Mission", /*summary=*/"", mission_plan_rev,
+                    plan_state_items_from_mission(mission_plan_tasks, "Mission"));
 
     // 2) Execute tasks in order, threading the working document forward.
     std::string current_doc = doc_id;  // "previous" target resolves to this
@@ -1371,6 +1604,12 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                          {"capability", tk.capability},
                          {"title", tk.title},
                          {"doc_id", target_doc}});
+        // Mark this task running in plan_state.
+        if (i < mission_plan_tasks.size() && mission_plan_tasks[i].is_object())
+            mission_plan_tasks[i]["status"] = "running";
+        ++mission_plan_rev;
+        emit_plan_state(events, "phased_todo", "Mission", "", mission_plan_rev,
+                        plan_state_items_from_mission(mission_plan_tasks, "Mission"));
 
         std::string status = "skipped";
         std::string summary;
@@ -1494,6 +1733,13 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
                                                  {"status", status},
                                                  {"doc_id", current_doc},
                                                  {"summary", summary}});
+        if (i < mission_plan_tasks.size() && mission_plan_tasks[i].is_object()) {
+            mission_plan_tasks[i]["status"] = status;
+            if (!summary.empty()) mission_plan_tasks[i]["summary"] = summary;
+        }
+        ++mission_plan_rev;
+        emit_plan_state(events, "phased_todo", "Mission", "", mission_plan_rev,
+                        plan_state_items_from_mission(mission_plan_tasks, "Mission"));
         task_results.push_back(json{{"capability", tk.capability},
                                     {"title", tk.title},
                                     {"status", status},

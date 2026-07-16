@@ -100,6 +100,10 @@ std::vector<std::string> feature_status_errors(const ojson& feature_status);
 
 extern const char* kEditBiasText;
 
+// Display helpers for plan_state emission (title/summary from planner JSON).
+// title defaults to "Build plan" when plan has no name; summary may be empty.
+void plan_display_meta(const ojson& plan, std::string& title_out, std::string& summary_out);
+
 // --------------------------------------------------------------------------- context
 
 struct BuiltContext {
@@ -117,6 +121,11 @@ struct BuiltContext {
 BuiltContext build_context(const DesignState& state, const std::string& role,
                            const std::string& prompts_dir = "",
                            int context_cap = kContextTokenCap);
+
+// Advisor inject seam (mode overhaul). Empty text = no block (legacy-identical).
+// thread_local storage in state.cpp; clear at end of each run.
+void set_context_advisory(const std::string& text);
+void clear_context_advisory();
 
 }  // namespace agent
 }  // namespace aicad

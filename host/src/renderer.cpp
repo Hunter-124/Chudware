@@ -2425,6 +2425,11 @@ void Renderer::reduceLumaPbo(int slot) const {
     if (sw <= 0 || sh <= 0) return;
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[slot]);
+#ifdef __EMSCRIPTEN__
+    // WebGL2 has no MAP_READ on PIXEL_PACK_BUFFER. Leave prior luma grid.
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    return;
+#else
     const void* mapped =
         glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (size_t)sw * (size_t)sh * 4, GL_MAP_READ_BIT);
     if (mapped) {
@@ -2457,6 +2462,7 @@ void Renderer::reduceLumaPbo(int slot) const {
     }
     // A5: never leave the PACK buffer bound past this call.
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+#endif
 }
 
 unsigned int Renderer::resolvedColorTexture() const {

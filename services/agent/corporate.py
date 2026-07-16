@@ -469,6 +469,10 @@ def should_use_corporate(
     return len(depts) >= 2
 
 
+# Public alias used by host/mode plumbing (mode overhaul C3).
+should_activate_corporate = should_use_corporate
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -2110,10 +2114,14 @@ def auto_activate_corporate(
     runs_dir: Path | None = None,
     delegate_fn: Callable[..., Any] | None = None,
     seat_heads: bool = True,
+    force: bool | None = None,
 ) -> dict[str, Any]:
     """Mission-start auto-activate: mode on AND ≥2 depts → build + hire heads.
 
-    Never forces past the dept-count gate. Single-dept missions stay flat.
+    When *force* is True (Swarm / options.corporate_force), skips the config
+    ``corporate_mode`` gate — still requires ≥2 departments.
+    When *force* is None (default), never forces past the dept-count gate;
+    single-dept missions stay flat.
     """
     return build_corporate_org(
         run_id,
@@ -2121,7 +2129,7 @@ def auto_activate_corporate(
         cfg=cfg,
         board=board,
         mission_goals=mission_goals,
-        force=None,  # respect corporate_mode + ≥2 depts
+        force=force,  # None → respect corporate_mode; True → swarm force
         on_event=on_event,
         provider=provider,
         runs_dir=runs_dir,

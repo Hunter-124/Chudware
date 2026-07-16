@@ -1638,6 +1638,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::string request = jstr(params, "request");
             std::string doc_id = jstr(params, "doc_id");
             json options = params.contains("options") ? params["options"] : json::object();
+            // Copilot mode overhaul: host stamps options.{mode, plan_only, approved_plan,
+            // execute_as, corporate_force, scope, advisor}. Normalize defaults here so
+            // run_design / run_assembly_design / run_micro_design always see a consistent
+            // shape. Absent mode = legacy byte-identical behavior.
+            if (!options.is_object()) options = json::object();
+            if (!options.contains("advisor")) options["advisor"] = true;  // default ON
+            // mode ∈ agent|plan|swarm|edit|ask — leave absent when unset (legacy).
+            // plan mode implies plan_only unless an approved_plan is already attached.
+            if (options.value("mode", std::string()) == "plan" &&
+                !options.value("plan_only", false) &&
+                !(options.contains("approved_plan") && !options["approved_plan"].is_null() &&
+                  !(options["approved_plan"].is_string() &&
+                    options["approved_plan"].get<std::string>().empty()))) {
+                options["plan_only"] = true;
+            }
+            // swarm mode implies corporate_force for the Python mission path.
+            if (options.value("mode", std::string()) == "swarm" &&
+                !options.value("corporate_force", false))
+                options["corporate_force"] = true;
 
             // ---- W17 drawing-intent fast-path ----
             // "make a drawing / blueprint of this part" doesn't need the modeler: build the 2D
@@ -1803,7 +1822,15 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // should_engage reads provider.{name,base_url,context_tokens} + cfg
             // .{micro_mode,context_tokens}. The resolved descriptor carries name/
             // base_url; cfg is the ambient config.json (so micro_mode is honored).
-            bool micro = aicad::agent::should_engage(provider, cfg);
+            // Plan gate: plan_only / mode=plan / approved_plan MUST use run_design
+            // (not micro) so plan_ready / approved_plan skip-replan semantics hold.
+            bool force_design_path =
+                options.value("plan_only", false) ||
+                options.value("mode", std::string()) == "plan" ||
+                (options.contains("approved_plan") && !options["approved_plan"].is_null() &&
+                 !(options["approved_plan"].is_string() &&
+                   options["approved_plan"].get<std::string>().empty()));
+            bool micro = !force_design_path && aicad::agent::should_engage(provider, cfg);
 
             auto captured = std::make_shared<json>(json::array());
             json result;
@@ -1812,6 +1839,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                     captured->push_back(ev);
                 };
                 result = aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
+            } else if (force_design_path) {
+                // Skip assembly multi-part driver for plan_only / approved_plan so we get
+                // exactly one plan_ready (or one execute) instead of per-part side effects.
+                aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+                result = aicad::agent::run_design(request, doc_id, provider, cb, options);
             } else {
                 aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
                 // run_assembly_design plans first: a true multi-part assembly builds each part in

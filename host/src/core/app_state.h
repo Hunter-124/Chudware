@@ -73,6 +73,16 @@ enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
+// Copilot composer interaction mode (Agent | Plan | Swarm | Edit | Ask).
+// Integer values match Settings::copilotMode / AppState::aiInteraction for persistence.
+enum class CopilotMode : int {
+    Agent = 0,
+    Plan  = 1,
+    Swarm = 2,
+    Edit  = 3,
+    Ask   = 4,
+};
+
 struct Settings {
     int provider = 6;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
                        // 5=Cloud OpenAI-compat 6=xAI. Default xAI grok-4.5 (owner directive
@@ -95,6 +105,9 @@ struct Settings {
     // build-critical clarify questions before modeling); planMode=false is "Autopilot" (model
     // straight from the prompt, no plan/clarify). Persisted as "plan_mode".
     bool planMode = true;
+    // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
+    // Values match AppState::aiInteraction / CopilotMode.
+    int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     int maxTokens = 0;           // max output tokens per model call; 0 = automatic (per-provider
                                  // default). Raise this if a reasoning model returns "no JSON ops"
@@ -376,6 +389,34 @@ struct PlanInfo {
 
 PlanInfo parsePlan(const nlohmann::json& p);
 
+// ---------------- multi-shape plan / objectives (copilot Plan section) ----------------
+// Additive plan_state event surface. Host also normalizes legacy kind:"plan"/PlanInfo →
+// shape=build_plan, and derives checklist/phased_todo from plan_steps / model_step / mission_*.
+// kind on items: part|step|task|objective|node|subagent
+// status: pending|running|pass|fail|done|abandoned
+struct PlanItem {
+    std::string id, title, desc, status, kind, phase, parent_id;
+};
+struct PlanEdge {
+    std::string from, to;
+};
+struct PlanState {
+    bool present = false;
+    std::string shape;     // build_plan|checklist|phased_todo|objectives|dag
+    std::string title, summary;
+    int revision = 0;
+    std::vector<PlanItem> items;
+    std::vector<PlanEdge> edges;  // shape=dag only
+    // Provenance: true when filled by an explicit kind:"plan_state" event (do not clobber
+    // with weaker derived normalizers unless revision is higher).
+    bool fromEvent = false;
+};
+
+// Parse a plan_state JSON object (SHARED CONTRACT). Returns present=false on bad input.
+PlanState parsePlanState(const nlohmann::json& p);
+// Map legacy PlanInfo → PlanState shape=build_plan (back-compat).
+PlanState planStateFromPlanInfo(const PlanInfo& plan);
+
 // ---------------- small ui helpers ----------------
 // A caption button (minimize / maximize-restore / close) drawn with a crisp vector glyph
 // and a full-height hover fill — close hovers red, the others a soft white wash.
@@ -469,11 +510,17 @@ struct ChatMsg {
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
     std::string liveStatus;        // transient "Iteration N: building..." while running
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
+    PlanState planState;           // multi-shape Plan/Objectives section (plan_state + normalizers)
     std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)
     int curMissionTask = -1;       // index of the mission task currently running (-1 = not a mission);
                                    // namespaces sub-run stage keys so per-task stages don't collide
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
-    ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
+    ClarifyState clarify;          // pre-flight clarify gate (Agent/Design) — see ClarifyState
+    // Plan-mode approve gate: a plan_only run finished; show Execute as Agent/Swarm / Cancel.
+    // Set when submitTurn launches Plan mode; cleared on execute or cancel.
+    bool planApprovePending = false;
+    std::string planApproveRequest;   // original user request to re-launch with approved_plan
+    nlohmann::json planApproveExtras = nlohmann::json::object();  // attachments/context_refs
     // ---- M19 render-windowing cache (GUI-only, not persisted) ----
     // Height this message occupied last time it was actually drawn at uiCachedW width. Lets the
     // chat log emit a same-height Dummy for messages far outside the scroll viewport instead of
@@ -532,8 +579,12 @@ void drawProseBox(const char* id, const std::string& text, float maxH);
 void drawFitReadout(const FitReport& fit, bool detailed);
 
 // The build-plan card: an accent-edged panel listing each planned part.
+// Back-compat adapter — normalizes PlanInfo → PlanState and draws the Plan/Objectives section.
 void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
                   const ui::Fonts& fonts);
+// Multi-shape Plan / Objectives section (tiles + todos tree + subagents).
+void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
+                     const ui::Fonts& fonts);
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts);
@@ -1221,7 +1272,10 @@ struct AppState {
     // doc.equations.globals; opened by double-clicking the FeatureManager "Equations" node or the
     // View > Equations menu toggle. Add/edit -> eq_set, delete -> eq_delete (drawn in equations_dialog.cpp).
     bool showEquations = false;
-    int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
+    // Copilot composer mode (dropdown). Mirrors Settings::copilotMode for live UI;
+    // both are kept in sync on change + at first composer frame after loadSettings.
+    // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask  (see CopilotMode)
+    int  aiInteraction = 0;
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;
     int frame = 0;

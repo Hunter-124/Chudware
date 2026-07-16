@@ -1772,6 +1772,31 @@ def auto_pick_model(
 # Public resolve
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Copilot mode → harness role (mode overhaul)
+# ---------------------------------------------------------------------------
+
+# agent→default, plan→planning, swarm→default (+ corporate seats),
+# edit→task, ask→default (read-only tools; no dedicated role card).
+_MODE_TO_HARNESS_ROLE: dict[str, str] = {
+    "agent": "default",
+    "plan": "planning",
+    "swarm": "default",
+    "edit": "task",
+    "ask": "default",
+}
+
+
+def role_for_copilot_mode(mode: str | None) -> str:
+    """Map a copilot ``options.mode`` string to a harness ``ai_roles`` key.
+
+    Returns one of :data:`KNOWN_ROLES` (never empty). Unknown / empty mode →
+    ``\"default\"`` (Agent).
+    """
+    m = (mode or "agent").strip().lower() or "agent"
+    return _MODE_TO_HARNESS_ROLE.get(m, "default")
+
+
 
 def resolve_role_model(
     role: str,

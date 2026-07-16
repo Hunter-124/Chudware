@@ -152,13 +152,24 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
 
         // options.cam (true when launched from the Manufacture workspace) lets the core's
         // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
+        // Mode overhaul: merge extra["options"] (mode/plan_only/approved_plan/execute_as/
+        // corporate_force/scope/advisor) under params["options"] so host routing stamps reach core.
+        nlohmann::json opts = nlohmann::json::object();
+        opts["cam"] = cam;
+        opts["advisor"] = true;  // default-on; extra may override
+        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
+            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
+                opts[it.key()] = it.value();
+        }
         nlohmann::json params = {{"request", request}, {"doc_id", docId},
-                                 {"options", {{"cam", cam}}}};
+                                 {"options", std::move(opts)}};
         // O1/M23: merge the GUI's extra fields (provider/model/reasoning_effort override,
-        // attachments) as top-level params. Core keys above always win.
+        // attachments) as top-level params. Core keys above always win. Skip "options" —
+        // already folded into params["options"].
         if (extra.is_object())
             for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (!params.contains(it.key())) params[it.key()] = it.value();
+                if (it.key() != "options" && !params.contains(it.key()))
+                    params[it.key()] = it.value();
         bool ok = w.call("agent_run_v2", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
@@ -309,9 +320,18 @@ void launchAgentDesign(WorkerClient& w, JobState& job,
         // doc_id is accepted by the contract (context) even though the legacy loop is
         // build123d-scoped; harmless if ignored.
         if (!docId.empty()) params["doc_id"] = docId;
+        // Mode overhaul: options.mode / plan_only / corporate_force / … under options.
+        nlohmann::json opts = nlohmann::json::object();
+        opts["advisor"] = true;
+        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
+            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
+                opts[it.key()] = it.value();
+        }
+        params["options"] = std::move(opts);
         if (extra.is_object())
             for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (!params.contains(it.key())) params[it.key()] = it.value();
+                if (it.key() != "options" && !params.contains(it.key()))
+                    params[it.key()] = it.value();
 
         // Cursor (and any other sub provider on this path) — refresh before design.
         if (!ensureSubscriptionFreshBeforeRun(w, job, extra)) {
@@ -450,9 +470,18 @@ void launchMissionRun(WorkerClient& w, JobState& job,
         };
 
         nlohmann::json params = {{"request", request}, {"doc_id", docId}};
+        // Mode overhaul: stamp mode/corporate_force/… under options (Swarm/mission path).
+        nlohmann::json opts = nlohmann::json::object();
+        opts["advisor"] = true;
+        if (extra.is_object() && extra.contains("options") && extra["options"].is_object()) {
+            for (auto it = extra["options"].begin(); it != extra["options"].end(); ++it)
+                opts[it.key()] = it.value();
+        }
+        params["options"] = std::move(opts);
         if (extra.is_object())
             for (auto it = extra.begin(); it != extra.end(); ++it)
-                if (!params.contains(it.key())) params[it.key()] = it.value();
+                if (it.key() != "options" && !params.contains(it.key()))
+                    params[it.key()] = it.value();
         bool ok = w.call("agent_mission_v1", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {

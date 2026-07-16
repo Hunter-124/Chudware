@@ -182,6 +182,34 @@ def get_corporate_config(cfg: dict | None = None) -> dict:
         "director_review": _bool("director_review", DEFAULT_CORPORATE_DIRECTOR_REVIEW),
     }
 
+# --------------------------------------------------------------------------- advisor (foreman)
+# GUI Settings / host options write ``agent.advisor`` (bool, default True).
+# Env ``AI_CAD_ADVISOR`` still honored (0/false disables). Used by loop.py and
+# MissionDispatch so every agent/subagent can reach the advisor.
+
+ADVISOR_KEY = "advisor"
+DEFAULT_ADVISOR: bool = True
+
+
+def advisor_enabled(cfg: dict | None = None) -> bool:
+    """Return whether the foreman advisor is on (default True).
+
+    Precedence:
+      1. Env ``AI_CAD_ADVISOR`` — when set to 0/false/False, force off.
+         When set to 1/true/True, force on (overrides config).
+      2. ``agent.advisor`` in config.json (bool, default True).
+    """
+    import os
+
+    env = os.environ.get("AI_CAD_ADVISOR")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() not in ("0", "false", "no", "off")
+    agent = _agent_block(cfg)
+    if ADVISOR_KEY in agent:
+        return bool(agent.get(ADVISOR_KEY))
+    return DEFAULT_ADVISOR
+
+
 # --------------------------------------------------------------------------- compaction / session cmds
 # Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
 #

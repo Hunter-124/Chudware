@@ -15,9 +15,11 @@ struct JobState;
 // main-thread drain can route them to the ActivityPanel separately from legacy events.
 // `cam` (set when the copilot is launched from the Manufacture workspace) routes generic
 // "make a program"-style requests to the core's CAM fast-path on the current part.
-// `extra` (O1/M23): additional top-level params merged into the RPC payload — the GUI threads
-// the model picker's provider/model/reasoning_effort override and the composer attachments
-// through here. Empty object = no extra fields (byte-identical payload to before).
+// `extra` (O1/M23 + mode overhaul): additional top-level params merged into the RPC payload —
+// the GUI threads the model picker's provider/model/reasoning_effort override, composer
+// attachments, and an `options` object (mode/plan_only/approved_plan/execute_as/
+// corporate_force/scope/advisor) which is deep-merged under params["options"]. Empty object
+// = no extra fields.
 void launchAgentRunV2(WorkerClient& w, JobState& job,
                       const std::string& request, const std::string& docId, bool cam = false,
                       const nlohmann::json& extra = nlohmann::json::object());

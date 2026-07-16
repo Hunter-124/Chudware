@@ -185,6 +185,25 @@ void loadSettings(Settings& s) {
         }
         s.offlineMode = j.value("offline_mode", false);
         s.planMode = j.value("plan_mode", true);
+        {
+            // Accept string names or int 0..4; map legacy Design/Edit/Ask if present.
+            int cm = 0;
+            if (j.contains("copilot_mode")) {
+                const auto& v = j["copilot_mode"];
+                if (v.is_number_integer()) {
+                    cm = v.get<int>();
+                } else if (v.is_string()) {
+                    const std::string m = v.get<std::string>();
+                    if (m == "agent" || m == "design") cm = 0;
+                    else if (m == "plan") cm = 1;
+                    else if (m == "swarm") cm = 2;
+                    else if (m == "edit") cm = 3;
+                    else if (m == "ask" || m == "chat") cm = 4;
+                }
+            }
+            if (cm < 0 || cm > 4) cm = 0;
+            s.copilotMode = cm;
+        }
         s.maxIters = j.value("max_iters", 0);
         s.maxTokens = j.value("max_output_tokens", 0);
         s.contextWindow = j.value("context_window", 0);
@@ -353,6 +372,12 @@ void saveSettings(const Settings& s) {
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
     j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;
+    {
+        static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask"};
+        int cm = s.copilotMode;
+        if (cm < 0 || cm > 4) cm = 0;
+        j["copilot_mode"] = kModeNames[cm];
+    }
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
     if (s.contextWindow > 0) j["context_window"] = s.contextWindow;
@@ -562,6 +587,7 @@ PlanInfo parsePlan(const nlohmann::json& p) {
     return pi;
 }
 
+
 void freeChatTextures(std::vector<ChatMsg>& chat) {
     for (auto& m : chat)
         for (auto& s : m.steps)
@@ -716,6 +742,17 @@ void AppState::startSetup(bool force) {
 
 // Start the kernel worker; if it can't start, self-heal once instead of dead-ending.
 void AppState::tryStartWorker() {
+#ifdef __EMSCRIPTEN__
+    // Browser client: the shared aicad-hostd (daemon mode) is the ONLY backend — there is no
+    // Python worker to spawn and no in-process libaicad to dlopen. The ~50 workerStarted gates
+    // (FeatureManager toolbar / doc ops / panels) must pass so the UI is live; engine::call
+    // routes to the daemon over the WS bridge with reconnect backoff (engine_events tick).
+    workerStarted = true;
+    status = "Ready.";
+    statusKind = 0;
+    addLog("[ok] daemon mode (web): shared aicad-hostd is the backend");
+    return;
+#endif
     workerStarted = worker.start(werr);
     if (workerStarted) {
         status = "Ready.";

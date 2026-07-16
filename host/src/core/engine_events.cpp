@@ -419,6 +419,11 @@ bool tryBootstrap(AppState& st, aicad_ipc::EngineClient& c) {
 
 void engineEventsTick(AppState& st) {
     if (!engine::daemonMode()) return;
+#ifdef __EMSCRIPTEN__
+    // Let a few ASYNCIFY UI frames settle before the first gateway connect (deep call stack).
+    static int s_wasmWarmup = 0;
+    if (s_wasmWarmup < 30) { ++s_wasmWarmup; return; }
+#endif
     auto* c = engine::client();
     if (!c) return;
 

@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
-
+#include <vector>
 #include <nlohmann/json.hpp>
 
 namespace aicad {
@@ -74,6 +74,56 @@ json emit_agent_tool_call(RunEvents& ev,
                           int latency_ms,
                           const std::string& parent_id = "",
                           const std::string& actor = "");
+
+// ---------------------------------------------------------------------------
+// plan_state — additive multi-shape plan surface for the copilot Plan section.
+// shape: build_plan | checklist | phased_todo | objectives | dag
+// items[].status: pending|running|pass|fail|done|abandoned
+// items[].kind:   part|step|task|objective|node|subagent
+// revision increments on each update of a given shape stream.
+// ---------------------------------------------------------------------------
+
+// ≤ max_words words (default 10) for tile titles.
+std::string plan_item_title(const std::string& text, int max_words = 10);
+
+// Build one plan_state payload (no emit). edges may be null/omitted for non-dag.
+json make_plan_state(const std::string& shape,
+                     const std::string& title,
+                     const std::string& summary,
+                     int revision,
+                     const json& items,
+                     const json& edges = nullptr);
+
+// Persist + live-emit kind:"plan_state".
+json emit_plan_state(RunEvents& ev,
+                     const std::string& shape,
+                     const std::string& title,
+                     const std::string& summary,
+                     int revision,
+                     const json& items,
+                     const json& edges = nullptr);
+
+// DesignState.plan parts → kind=part items (status defaults pending).
+// plan is the planner JSON object {name, summary, parts:[{name,purpose,dimensions,features}]}.
+json plan_state_items_from_build_plan(const json& plan,
+                                      const std::string& default_status = "pending");
+
+// Linear model steps → kind=step checklist items.
+// running_index: current step (0-based); all < index become done; > index pending.
+// If all_done, every item is done. fail_index (if >=0) marks that step fail.
+json plan_state_items_from_steps(const std::vector<std::string>& steps,
+                                 int running_index = -1,
+                                 bool all_done = false,
+                                 int fail_index = -1);
+
+// Extract objectives/acceptance from planner JSON if present; empty array if none.
+// Accepts arrays of strings or objects with title/name/text + optional desc.
+json plan_state_items_from_objectives(const json& plan);
+
+// Mission task rows → kind=task items (optional phase for phased_todo).
+// tasks: [{capability, title, status?}] ; status defaults pending.
+json plan_state_items_from_mission(const json& tasks,
+                                   const std::string& phase = "Mission");
 
 // ---------------------------------------------------------------------------
 // Telemetry helpers — emit the standard ai_artifact / ai_artifact_action /

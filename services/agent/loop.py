@@ -37,7 +37,8 @@ _LEDGER_ENABLED = os.environ.get("AI_CAD_LEDGER", "1") not in ("0", "false", "Fa
 
 # Advisory engine / foreman (T-W5, Pillar 20): after each build, the foreman runs
 # the stage battery over the result and prepends an [ADVISORY] block to the next
-# model turn.  Gated by AI_CAD_ADVISOR (default on); best-effort like the ledger.
+# model turn.  Default ON via config.advisor_enabled() (agent.advisor + AI_CAD_ADVISOR).
+# Module-level snapshot for import-time tests; _advisory_block re-reads config.
 _ADVISOR_ENABLED = os.environ.get("AI_CAD_ADVISOR", "1") not in ("0", "false", "False")
 
 from . import config as agent_config
@@ -944,8 +945,13 @@ def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
     T-W21: ``output_text`` / ``tool_names`` / ``cooldown_state`` are threaded
     into the Observation so trigger-based context injection fires on this turn.
     """
-    if not _ADVISOR_ENABLED:
-        return ""
+    try:
+        from services.agent.config import advisor_enabled as _adv_on  # noqa: PLC0415
+        if not _adv_on():
+            return ""
+    except Exception:  # noqa: BLE001 — fall back to env snapshot
+        if not _ADVISOR_ENABLED:
+            return ""
     try:
         from services.agent.advisor import adapters as _adv_adapters
         from services.agent.advisor import engine as _adv_engine
@@ -1948,6 +1954,7 @@ def run_mission(
     autonomy_default: str = "approve",
     execute_dag: bool = True,
     agent_fn: "Callable | None" = None,
+    options: dict | None = None,
 ) -> MissionRun:
     """Run a full mission through the 8-phase pipeline (T-W19).
 
@@ -2164,6 +2171,10 @@ def run_mission(
         if _corp_tasks:
             from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
             from services.agent import config as _agent_cfg  # noqa: PLC0415
+            from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                mode_options_from_mapping,
+            )
+            _mo = mode_options_from_mapping(options if isinstance(options, dict) else {})
             auto_activate_corporate(
                 run_id,
                 _corp_tasks,
@@ -2172,6 +2183,7 @@ def run_mission(
                 on_event=on_event,
                 provider=provider,
                 seat_heads=True,
+                force=True if _mo.get("corporate_force") else None,
             )
     except Exception:  # noqa: BLE001 — corporate is opt-in overlay
         pass

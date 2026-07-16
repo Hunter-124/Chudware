@@ -2709,25 +2709,37 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
 
 // ---- C24: small icon-button used in the FeatureManager top toolbar (24px square) ----
 // Returns true on click. Disabled buttons render dimmed and don't fire.
+// Rail-tab chrome (frosted pill + accent wash + high-contrast glyph). The previous ultra-light
+// wash left only a dash/dot smudge under the FeatureManager title over light glass.
 static bool toolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
                            bool enabled) {
-    float btn = 24.0f * ui::uiScale;
+    const float S = ui::uiScale;
+    const float btn = 24.0f * S;
     ImGui::PushID(id);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + btn, p0.y + btn);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Always-on subtle pill; stronger wash on hover (draw-only — must not affect hit-test).
-    ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false, 0.22f);
     bool clicked = ImGui::InvisibleButton("##tb", ImVec2(btn, btn)) && enabled;
     bool hov = ImGui::IsItemHovered();
-    if (hov && enabled)
-        ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false, 0.38f);
-    float iz = 18.0f * ui::uiScale;
+
+    // Opaque-enough frosted chip so the control never dissolves into the glass column. Stronger
+    // on hover; selection glow only while hovered+enabled so resting state stays calm.
+    const float wash = !enabled ? 0.32f : ((hov) ? 0.55f : 0.42f);
+    ui::glassRowBackground(dl, p0, p1, 6.0f, false, /*selected=*/false, wash);
+    const float tintStrength = !enabled ? 0.10f : ((hov) ? 0.30f : 0.18f);
+    ui::coloredRowWash(dl, p0, p1, 6.0f, fmPalette().accent, tintStrength,
+                       /*selected=*/hov && enabled);
+
+    const float iz = 15.0f * S;
     const ui::AdaptiveSurface& surf = fmSurf();
-    ImVec4 tintV = enabled ? surf.textPrimary
-                           : ImVec4(surf.textTertiary.x, surf.textTertiary.y,
-                                    surf.textTertiary.z, surf.textTertiary.w * (150.0f / 255.0f));
+    // Enabled icons always use primary ink (secondary was too close to the light glass wash and
+    // read as the "weird" faint marks under the title). Disabled stays clearly muted, not ghosted.
+    ImVec4 tintV = enabled
+        ? surf.textPrimary
+        : ImVec4(surf.textTertiary.x, surf.textTertiary.y,
+                 surf.textTertiary.z, 0.55f);
     drawIconGlass(dl, iconName, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), iz,
-                 ImGui::ColorConvertFloat4ToU32(tintV), fmHalo(surf));
+                  ImGui::ColorConvertFloat4ToU32(tintV), fmHalo(surf));
     if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
     ImGui::PopID();
     return clicked;
@@ -3370,13 +3382,14 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     // Name & group moved OUT of this toolbar down to the Features section header (fmFeaturesHeader),
     // so the toolbar is now 6 buttons (new / new-asm / open / save / undo / redo).
     (void)canNameGroup;
-    const float bw = 24.0f * S, gap = 2.0f * S, nBtns = 6.0f;
+    const float bw = 24.0f * S, gap = 4.0f * S, nBtns = 6.0f;
     const float toolW = nBtns * bw + (nBtns - 1) * gap;
     ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
     const float availW = ImGui::GetContentRegionAvail().x;
-    ui::glassRowBackground(ImGui::GetWindowDrawList(), toolRowMin,
-                           ImVec2(toolRowMin.x + availW, toolRowMin.y + bw),
-                           3.5f, false, false, 0.24f);
+    // Reserve the toolbar row in the layout FIRST (glass/icons are draw-list only). A zero-height
+    // Dummy previously left only a Spacing gap under the header, so the row read as a faint
+    // dash/dot smudge crushed against the filter field.
+    ImGui::Dummy(ImVec2(availW, bw));
     float bx = toolRowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
     const float by = toolRowMin.y;
     auto toolBtn = [&](const char* id, const char* icon, const char* tip, bool en) -> bool {
@@ -3429,8 +3442,9 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     if (toolBtn("fm_undo", "undo", "Undo", canHistory) && canHistory) st.docUndo();
     if (toolBtn("fm_redo", "redo", "Redo", canHistory) && canHistory) st.docRedo();
     ImGui::PopID();
+    // Restore the layout cursor after absolute-positioned buttons (they leave it mid-row).
     ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
-    ImGui::Dummy(ImVec2(availW, 0));
+    ImGui::Dummy(ImVec2(0, 0));
 
     ImGui::Spacing();
     {
@@ -3446,8 +3460,8 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         ImGui::SetCursorScreenPos(ImVec2(fMin.x, fMin.y + filterH));
         ImGui::Dummy(ImVec2(0, 0));
     }
-
-    ImGui::Separator();
+    // No Separator() under the filter — the hairline read as another orphaned mark under the
+    // title/filter stack on light glass. Spacing alone separates filter from the tree body.
 }
 
 // ---- main draw function ----

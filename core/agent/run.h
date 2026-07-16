@@ -44,11 +44,21 @@ using EmitFn = std::function<void(const json&)>;
 //               OR, for the parity gate, the role-scripted mock:
 //                 {name:"mock", replies:{<role>:[reply,...], ...}}
 // emit          optional event callback (may be empty).
-// options       {run_id?, budgets?, prompts_dir?}. run_id overrides the generated
-//               uuid hex[:12]; prompts_dir overrides AI_CAD_PROMPTS_DIR (the gate
-//               points both engines at the same agent/prompts).
+// options       {run_id?, budgets?, prompts_dir?, offline?, prewalk?, prewalk_target?,
+//                capability?, cam?,
+//                // Copilot mode overhaul (agent|plan|swarm|edit|ask):
+//                mode?,            // "agent"|"plan"|"swarm"|"edit"|"ask" (absent = legacy)
+//                plan_only?,       // bool: intake+plan then STOP (status plan_ready)
+//                approved_plan?,   // string|object: skip re-plan; seed DesignState.plan
+//                execute_as?,      // "agent"|"swarm" (host resume after plan approve)
+//                corporate_force?, // bool: force swarm/corporate (Python mission path)
+//                scope?,           // {doc_id?, feature_ids?:[], selection?:[], section?}
+//                advisor?          // bool, default true — advisory inject seam (no-op if empty)
+//               }. run_id overrides the generated uuid hex[:12]; prompts_dir overrides
+//               AI_CAD_PROMPTS_DIR (the gate points both engines at the same agent/prompts).
 //
-// Returns {run_id, status, stop_reason, revision, doc_id}.
+// Returns {run_id, status, stop_reason, revision, doc_id} — or on plan_only success
+// {status:"plan_ready", plan, stop_reason:"plan_only", ...}.
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                 EmitFn emit = nullptr, const json& options = json::object());
 

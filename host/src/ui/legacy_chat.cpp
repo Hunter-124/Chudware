@@ -9629,7 +9629,7 @@ static void submitTurn(AppState& st, const std::string& text) {
         if (st.docMirror.hasDoc()) scope["doc_id"] = st.docMirror.docId();
         nlohmann::json fids = nlohmann::json::array();
         if (st.propertyManager && st.propertyManager->active() &&
-            __omp_shell("st.propertyManager->targetId().empty()) {")
+            !st.propertyManager->targetId().empty()) {
             fids.push_back(st.propertyManager->targetId());
         } else if (!st.selectedFeatureId.empty()) {
             fids.push_back(st.selectedFeatureId);
@@ -10025,7 +10025,7 @@ static void submitTurn(AppState& st, const std::string& text) {
                 r.result["interaction"].is_object() &&
                 r.result["interaction"].contains("questions") &&
                 r.result["interaction"]["questions"].is_array() &&
-                __omp_shell("r.result[\"interaction\"][\"questions\"].empty()) {")
+                !r.result["interaction"]["questions"].empty()) {
                 usedInteraction = true;
                 for (const auto& q : r.result["interaction"]["questions"])
                     parseInteractionQ(q);

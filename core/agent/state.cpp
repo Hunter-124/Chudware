@@ -12,6 +12,17 @@
 namespace aicad {
 namespace agent {
 
+
+// Advisor inject seam (mode overhaul D). C++ has no foreman battery; run.cpp may
+// set a non-empty advisory text when options.advisor is true AND an advisory is
+// available. Empty = no-op (byte-identical context to pre-overhaul).
+// thread_local: concurrent agent runs must not bleed advisory text across threads.
+namespace {
+thread_local std::string g_context_advisory;
+}  // namespace
+
+void set_context_advisory(const std::string& text) { g_context_advisory = text; }
+void clear_context_advisory() { g_context_advisory.clear(); }
 // Python truthiness for a JSON value (used where Python does `if x`).
 static bool truthy(const ojson& v) {
     if (v.is_null()) return false;
@@ -572,6 +583,7 @@ std::string plan_text(const ojson& plan, bool compact) {
     return "PLAN:\n" + py_json_dumps_indent0(plan);
 }
 
+
 bool has_features(const DesignState& state) {
     if (state.tree_digest.empty()) return false;
     return state.tree_digest.rfind("(empty", 0) != 0;
@@ -598,27 +610,31 @@ std::vector<std::pair<std::string, std::string>> role_blocks(const DesignState& 
     std::string issues =
         !state.last_issues.empty() ? "REVIEW ISSUES:\n" + join_lines(state.last_issues) : "";
     std::string bias = (has_features(state) && looks_like_edit(state.request)) ? kEditBiasText : "";
+    // Advisor seam: only when run.cpp set a non-empty advisory (options.advisor path).
+    std::string adv =
+        g_context_advisory.empty() ? "" : ("ADVISORY:\n" + g_context_advisory);
 
     std::vector<std::pair<std::string, std::string>> blocks;
     if (role == "intake") {
         blocks = {{"opt:mem", mem}, {"req", req}};
     } else if (role == "planner") {
         std::string spec = jtruthy(state.spec) ? spec_text(state.spec) : "";
-        blocks = {{"opt:mem", mem}, {"req", req}, {"spec", spec}};
+        blocks = {{"opt:mem", mem}, {"opt:advisor", adv}, {"req", req}, {"spec", spec}};
     } else if (role == "modeler") {
         std::string plan = jtruthy(state.plan) ? plan_text(state.plan, false) : "";
         std::string step =
             !state.current_step.empty() ? "STEP TO IMPLEMENT NOW:\n" + state.current_step : "";
-        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"req", req},
+        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"opt:advisor", adv}, {"req", req},
                   {"tree", tree},   {"bias", bias},     {"step", step},
                   {"errors", errs}};
     } else if (role == "reviewer") {
         std::string plan = jtruthy(state.plan) ? plan_text(state.plan, true) : "";
-        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"req", req}, {"tree", tree}};
+        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"opt:advisor", adv}, {"req", req},
+                  {"tree", tree}};
     } else if (role == "fixer") {
         std::string plan = jtruthy(state.plan) ? plan_text(state.plan, true) : "";
         std::string prob = !errs.empty() ? errs : issues;
-        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"req", req},
+        blocks = {{"opt:mem", mem}, {"opt:plan", plan}, {"opt:advisor", adv}, {"req", req},
                   {"tree", tree},   {"bias", bias},     {"problem", prob}};
     } else if (role == "memory") {
         std::string plan = jtruthy(state.plan) ? plan_text(state.plan, true) : "";
@@ -645,6 +661,22 @@ std::string join_body(const std::vector<std::pair<std::string, std::string>>& bl
 }
 
 }  // namespace
+
+void plan_display_meta(const ojson& plan, std::string& title_out, std::string& summary_out) {
+    title_out = "Build plan";
+    summary_out.clear();
+    if (!plan.is_object()) return;
+    if (plan.contains("name") && !plan["name"].is_null()) {
+        if (plan["name"].is_string()) {
+            const std::string& n = plan["name"].get_ref<const std::string&>();
+            if (!n.empty()) title_out = n;
+        } else {
+            title_out = plan["name"].dump();
+        }
+    }
+    if (plan.contains("summary") && plan["summary"].is_string())
+        summary_out = plan["summary"].get<std::string>();
+}
 
 BuiltContext build_context(const DesignState& state, const std::string& role,
                            const std::string& prompts_dir, int context_cap) {

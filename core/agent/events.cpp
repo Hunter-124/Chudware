@@ -183,6 +183,267 @@ json emit_agent_tool_call(RunEvents& ev,
     return ev.emit("agent.tool_call", data);
 }
 
+// ---------------------------------------------------------------------------
+// plan_state helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string trim_ws(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n\f\v");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n\f\v");
+    return s.substr(a, b - a + 1);
+}
+
+std::string join_desc_parts(const std::vector<std::string>& parts) {
+    std::string out;
+    for (const auto& p : parts) {
+        if (p.empty()) continue;
+        if (!out.empty()) out += " · ";
+        out += p;
+    }
+    return out;
+}
+
+std::string dims_to_desc(const json& dims) {
+    if (dims.is_null()) return "";
+    if (dims.is_string()) return dims.get<std::string>();
+    if (dims.is_number() || dims.is_boolean()) return dims.dump();
+    if (dims.is_object()) {
+        std::string s;
+        bool first = true;
+        for (auto it = dims.begin(); it != dims.end(); ++it) {
+            if (!first) s += ", ";
+            first = false;
+            s += it.key();
+            s += "=";
+            if (it.value().is_string()) s += it.value().get<std::string>();
+            else s += it.value().dump();
+        }
+        return s;
+    }
+    if (dims.is_array()) return dims.dump();
+    return "";
+}
+
+std::string features_to_desc(const json& feats) {
+    if (!feats.is_array() || feats.empty()) return "";
+    std::string s;
+    for (size_t i = 0; i < feats.size(); ++i) {
+        if (i) s += "; ";
+        if (feats[i].is_string()) s += feats[i].get<std::string>();
+        else s += feats[i].dump();
+    }
+    return s;
+}
+
+}  // namespace
+
+std::string plan_item_title(const std::string& text, int max_words) {
+    std::string t = trim_ws(text);
+    if (t.empty() || max_words <= 0) return t;
+    // Collapse internal whitespace while counting words.
+    std::string out;
+    int words = 0;
+    bool in_word = false;
+    for (char c : t) {
+        const bool ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v');
+        if (ws) {
+            if (in_word) {
+                in_word = false;
+                if (words >= max_words) break;
+            }
+            continue;
+        }
+        if (!in_word) {
+            in_word = true;
+            ++words;
+            if (words > max_words) break;
+            if (!out.empty()) out.push_back(' ');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+json make_plan_state(const std::string& shape,
+                     const std::string& title,
+                     const std::string& summary,
+                     int revision,
+                     const json& items,
+                     const json& edges) {
+    json data = json::object();
+    data["shape"] = shape;
+    data["title"] = title;
+    if (!summary.empty()) data["summary"] = summary;
+    data["revision"] = revision;
+    data["items"] = items.is_array() ? items : json::array();
+    if (!edges.is_null()) data["edges"] = edges;
+    return data;
+}
+
+json emit_plan_state(RunEvents& ev,
+                     const std::string& shape,
+                     const std::string& title,
+                     const std::string& summary,
+                     int revision,
+                     const json& items,
+                     const json& edges) {
+    return ev.emit("plan_state",
+                   make_plan_state(shape, title, summary, revision, items, edges));
+}
+
+json plan_state_items_from_build_plan(const json& plan, const std::string& default_status) {
+    json items = json::array();
+    if (!plan.is_object() || !plan.contains("parts") || !plan["parts"].is_array()) return items;
+    int i = 0;
+    for (const auto& p : plan["parts"]) {
+        if (!p.is_object()) continue;
+        std::string name = p.value("name", std::string("part"));
+        if (name.empty()) name = "part";
+        std::string purpose = p.value("purpose", std::string());
+        // dimensions key (PlanInfo) — also accept dims
+        std::string dim_s;
+        if (p.contains("dimensions")) dim_s = dims_to_desc(p["dimensions"]);
+        else if (p.contains("dims")) dim_s = dims_to_desc(p["dims"]);
+        std::string feat_s;
+        if (p.contains("features")) feat_s = features_to_desc(p["features"]);
+        std::vector<std::string> desc_parts;
+        if (!purpose.empty()) desc_parts.push_back(purpose);
+        if (!dim_s.empty()) desc_parts.push_back(dim_s);
+        if (!feat_s.empty()) desc_parts.push_back(feat_s);
+        std::string id = name;
+        // Keep ids unique if names collide.
+        for (const auto& existing : items) {
+            if (existing.is_object() && existing.value("id", std::string()) == id) {
+                id = name + "-" + std::to_string(i);
+                break;
+            }
+        }
+        items.push_back(json{{"id", id},
+                             {"title", plan_item_title(name)},
+                             {"desc", join_desc_parts(desc_parts)},
+                             {"status", default_status},
+                             {"kind", "part"}});
+        ++i;
+    }
+    return items;
+}
+
+json plan_state_items_from_steps(const std::vector<std::string>& steps,
+                                 int running_index,
+                                 bool all_done,
+                                 int fail_index) {
+    json items = json::array();
+    for (size_t i = 0; i < steps.size(); ++i) {
+        std::string status = "pending";
+        if (all_done) {
+            status = "done";
+        } else if (fail_index >= 0 && static_cast<int>(i) == fail_index) {
+            status = "fail";
+        } else if (running_index >= 0) {
+            if (static_cast<int>(i) < running_index) status = "done";
+            else if (static_cast<int>(i) == running_index) status = "running";
+            else status = "pending";
+        }
+        // After a fail, later steps stay pending; earlier stay done (set above).
+        if (fail_index >= 0 && static_cast<int>(i) < fail_index) status = "done";
+        const std::string& step = steps[i];
+        items.push_back(json{{"id", "step-" + std::to_string(i)},
+                             {"title", plan_item_title(step)},
+                             {"desc", step},
+                             {"status", status},
+                             {"kind", "step"}});
+    }
+    return items;
+}
+
+json plan_state_items_from_objectives(const json& plan) {
+    json items = json::array();
+    if (!plan.is_object()) return items;
+    const json* arr = nullptr;
+    if (plan.contains("objectives") && plan["objectives"].is_array())
+        arr = &plan["objectives"];
+    else if (plan.contains("acceptance") && plan["acceptance"].is_array())
+        arr = &plan["acceptance"];
+    else if (plan.contains("success_criteria") && plan["success_criteria"].is_array())
+        arr = &plan["success_criteria"];
+    if (!arr) return items;
+    int i = 0;
+    for (const auto& o : *arr) {
+        std::string title, desc, status = "pending";
+        if (o.is_string()) {
+            title = o.get<std::string>();
+            desc = title;
+        } else if (o.is_object()) {
+            if (o.contains("title") && o["title"].is_string()) title = o["title"].get<std::string>();
+            else if (o.contains("name") && o["name"].is_string()) title = o["name"].get<std::string>();
+            else if (o.contains("text") && o["text"].is_string()) title = o["text"].get<std::string>();
+            else if (o.contains("objective") && o["objective"].is_string())
+                title = o["objective"].get<std::string>();
+            if (o.contains("desc") && o["desc"].is_string()) desc = o["desc"].get<std::string>();
+            else if (o.contains("description") && o["description"].is_string())
+                desc = o["description"].get<std::string>();
+            else
+                desc = title;
+            if (o.contains("status") && o["status"].is_string())
+                status = o["status"].get<std::string>();
+        } else {
+            continue;
+        }
+        title = trim_ws(title);
+        if (title.empty()) continue;
+        std::string id = "obj-" + std::to_string(i);
+        if (o.is_object() && o.contains("id") && o["id"].is_string() &&
+            !o["id"].get_ref<const std::string&>().empty())
+            id = o["id"].get<std::string>();
+        items.push_back(json{{"id", id},
+                             {"title", plan_item_title(title)},
+                             {"desc", desc.empty() ? title : desc},
+                             {"status", status},
+                             {"kind", "objective"}});
+        ++i;
+    }
+    return items;
+}
+
+json plan_state_items_from_mission(const json& tasks, const std::string& phase) {
+    json items = json::array();
+    if (!tasks.is_array()) return items;
+    int i = 0;
+    for (const auto& t : tasks) {
+        if (!t.is_object()) continue;
+        std::string title = t.value("title", std::string());
+        std::string cap = t.value("capability", std::string());
+        if (title.empty()) title = cap.empty() ? ("Task " + std::to_string(i + 1)) : cap;
+        std::string status = t.value("status", std::string("pending"));
+        // Map mission result statuses onto plan_state vocabulary.
+        if (status == "done" || status == "ok" || status == "pass") status = "done";
+        else if (status == "failed" || status == "fail" || status == "error") status = "fail";
+        else if (status == "skipped" || status == "skip") status = "abandoned";
+        else if (status == "running" || status == "started") status = "running";
+        else if (status.empty()) status = "pending";
+        std::string desc = cap;
+        if (t.contains("summary") && t["summary"].is_string()) {
+            const std::string& sum = t["summary"].get_ref<const std::string&>();
+            if (!sum.empty()) desc = desc.empty() ? sum : (cap + " · " + sum);
+        } else if (t.contains("req") && t["req"].is_string()) {
+            desc = t["req"].get<std::string>();
+        }
+        json item = json{{"id", "mission-" + std::to_string(i)},
+                         {"title", plan_item_title(title)},
+                         {"desc", desc.empty() ? title : desc},
+                         {"status", status},
+                         {"kind", "task"}};
+        if (!phase.empty()) item["phase"] = phase;
+        if (!cap.empty()) item["meta"] = json{{"capability", cap}};
+        items.push_back(std::move(item));
+        ++i;
+    }
+    return items;
+}
+
 fs::path run_dir(const std::string& run_id) {
     fs::path d = paths_cache() / "runs" / run_id;
     std::error_code ec;

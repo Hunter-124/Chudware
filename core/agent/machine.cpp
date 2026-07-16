@@ -346,6 +346,25 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                        {"error_detail", detail},
                        {"error_human", humanize_provider_error(detail)}};
         }
+        // After a successful plan stage, surface plan_state(build_plan) so the copilot
+        // Plan section fills on the default C++ path (Python already emits kind:plan).
+        // Additive only — no emit when plan is absent (off/no-plan runs unchanged).
+        if (!state.plan.is_null() && state.plan.is_object() && state.plan.contains("parts") &&
+            state.plan["parts"].is_array() && !state.plan["parts"].empty()) {
+            // nlohmann::json accepts ordered_json via conversion.
+            json plan_j = state.plan;
+            std::string title, summary;
+            plan_display_meta(state.plan, title, summary);
+            json part_items = plan_state_items_from_build_plan(plan_j, "pending");
+            emit_plan_state(events, "build_plan", title, summary, /*revision=*/1, part_items);
+
+            // Objectives / acceptance criteria — only when the planner provided them.
+            json obj_items = plan_state_items_from_objectives(plan_j);
+            if (!obj_items.empty()) {
+                emit_plan_state(events, "objectives", "Objectives", summary, /*revision=*/1,
+                                obj_items);
+            }
+        }
     }
 
     // ---- MODEL (loop per plan step) ----
@@ -353,11 +372,24 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     if (steps.empty()) steps.push_back("");
     // Surface the ordered task list so the UI can show a live build checklist (long-horizon
     // planning). Unknown event kinds are ignored by consumers, so this is forward-compatible.
+    // Also emit plan_state shape=checklist (additive; keep raw plan_steps).
+    // Skip plan_state when the only step is blank (no-plan / default empty step) so off/no-plan
+    // runs stay free of an empty Plan card; raw plan_steps still fires for back-compat.
+    auto steps_have_content = [&]() {
+        for (const auto& s : steps)
+            if (!s.empty()) return true;
+        return false;
+    };
+    const bool emit_checklist = steps_have_content();
     {
         json task_arr = json::array();
         for (const std::string& s : steps) task_arr.push_back(s);
         events.emit("plan_steps", json{{"steps", task_arr}, {"total", (int)steps.size()}});
+        if (emit_checklist)
+            emit_plan_state(events, "checklist", "Model steps", /*summary=*/"", /*revision=*/1,
+                            plan_state_items_from_steps(steps, /*running_index=*/-1));
     }
+    int checklist_rev = 1;
     int stagnant = 0;
     int step_index = 0;
     for (const std::string& step : steps) {
@@ -367,10 +399,21 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
         events.emit("model_step", json{{"index", step_index},
                                        {"total", (int)steps.size()},
                                        {"step", step}});
-        ++step_index;
+        // Live checklist: prior steps done, current running.
+        if (emit_checklist) {
+            ++checklist_rev;
+            emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
+                            plan_state_items_from_steps(steps, step_index));
+        }
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
         if (v == "provider_error") {
+            if (emit_checklist) {
+                ++checklist_rev;
+                emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
+                                plan_state_items_from_steps(steps, /*running_index=*/-1,
+                                                            /*all_done=*/false, step_index));
+            }
             const std::string detail =
                 run_provider_error.empty() ? last_fail_reason : run_provider_error;
             return json{{"status", "failed"},
@@ -378,12 +421,45 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
                        {"error_detail", detail},
                        {"error_human", humanize_provider_error(detail)}};
         }
-        if (v == "fail") return json{{"status", "failed"}, {"stop_reason", "model_failed"}};
+        if (v == "fail") {
+            if (emit_checklist) {
+                ++checklist_rev;
+                emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
+                                plan_state_items_from_steps(steps, /*running_index=*/-1,
+                                                            /*all_done=*/false, step_index));
+            }
+            return json{{"status", "failed"}, {"stop_reason", "model_failed"}};
+        }
+        ++step_index;
         if (state.last_no_progress) {
             stagnant += 1;
             if (stagnant >= kStagnationLimit) break;
         } else {
             stagnant = 0;
+        }
+    }
+    // Mark remaining checklist complete after a successful model loop (or early stagnation break).
+    if (emit_checklist && !steps.empty()) {
+        ++checklist_rev;
+        // step_index == count of successfully completed steps (incremented after pass).
+        if (step_index >= static_cast<int>(steps.size())) {
+            emit_plan_state(events, "checklist", "Model steps", "", checklist_rev,
+                            plan_state_items_from_steps(steps, /*running_index=*/-1,
+                                                        /*all_done=*/true));
+        } else {
+            // Completed steps done; never-attempted steps abandoned (stagnation stop).
+            json items = json::array();
+            for (size_t i = 0; i < steps.size(); ++i) {
+                const std::string& s = steps[i];
+                const char* st =
+                    (static_cast<int>(i) < step_index) ? "done" : "abandoned";
+                items.push_back(json{{"id", "step-" + std::to_string(i)},
+                                     {"title", plan_item_title(s)},
+                                     {"desc", s},
+                                     {"status", st},
+                                     {"kind", "step"}});
+            }
+            emit_plan_state(events, "checklist", "Model steps", "", checklist_rev, items);
         }
     }
     state.current_step = "";

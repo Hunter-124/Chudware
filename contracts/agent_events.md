@@ -241,3 +241,16 @@ Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host
 ## plan_state (batch 2c, additive; C++ agent harness)
 Event `kind:"plan_state"` { shape:"build_plan"|"checklist"|"phased_todo"|"objectives"|"dag", title, summary?, revision, items:[{id, title(<=10 words), desc(tooltip: purpose/dims/assignment), status:"pending"|"running"|"pass"|"fail"|"done"|"abandoned", kind:"part"|"step"|"task"|"objective"|"node"|"subagent", phase?, parent_id?, meta?}], edges?:[{from,to}] (dag only) }
 Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from plan_steps live; objectives when plan JSON has objectives/acceptance/success_criteria); core/agent/run.cpp mission loop (phased_todo). DAG not emitted from C++ (host reads buildgraph sidecar/RPC). Back-compat: kind:"plan"+PlanInfo kept; host normalizes PlanInfo→plan_state build_plan when planState empty. Raw plan_steps/model_step/mission_* remain. GUI: copilot Plan/Objectives section (tiles+hover tooltips, todos tree, subagents) above the activity timeline.
+
+## options.mode — copilot mode overhaul (Agent/Plan/Swarm/Edit/Ask)
+`options` on agent_run/agent_run_v2/agent_design/agent_mission_v1:
+| key | type | default | meaning |
+|-----|------|---------|--------|
+| mode | agent|plan|swarm|edit|ask | agent | copilot composer mode (persisted host-side as config copilot_mode) |
+| plan_only | bool | false (true when mode=plan) | intake+plan → emit plan_state → stop before mutation; returns {status:plan_ready} |
+| approved_plan | string|obj | null | seed plan; skip re-plan; clears plan_only (execute pass) |
+| execute_as | agent|swarm | — | how an approved plan resumes |
+| corporate_force | bool | false (true when mode=swarm) | force subagent-manager/corporate |
+| scope | obj | {} | edit targeting {doc_id, feature_ids?, selection?, section?} |
+| advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env AI_CAD_ADVISOR honored |
+Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (run.cpp/libaicad.cpp) parses these; absent mode = legacy byte-identical.

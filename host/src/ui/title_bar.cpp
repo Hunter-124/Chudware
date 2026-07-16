@@ -500,7 +500,9 @@ struct FilMenuDrawer {
         // ---- Formerly Help menu essentials ----
         if (ImGui::MenuItem("AI Help")) {
             st.showAIPanel = true;
-            st.aiInteraction = 2;  // Ask
+            st.aiInteraction = (int)CopilotMode::Ask;
+            st.settings.copilotMode = (int)CopilotMode::Ask;
+            saveSettings(st.settings);
         }
         if (ImGui::MenuItem("About Billet")) st.showAbout = true;
         ImGui::Separator();

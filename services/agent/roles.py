@@ -284,6 +284,27 @@ class RoleCard:
         registry.set_policy(allow=tokens)
         return tokens
 
+    def tools_for_mode(
+        self,
+        mode: str | None = None,
+        *,
+        plan_only: bool | None = None,
+    ) -> list[str] | None:
+        """Intersect this role's concrete tools with a copilot mode allowlist.
+
+        Returns None when the mode is unrestricted and the role has no tools
+        (caller treats as full). Otherwise a concrete list.
+        """
+        try:
+            from services.agent.copilot_mode_tools import apply_mode_tools  # noqa: PLC0415
+            return apply_mode_tools(
+                mode,
+                self.concrete_tools,
+                plan_only=plan_only,
+            )
+        except Exception:  # noqa: BLE001
+            return list(self.concrete_tools)
+
     # -- ledger scoping ----------------------------------------------------
     @property
     def read_sections(self) -> list[str]:

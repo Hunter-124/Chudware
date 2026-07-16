@@ -466,7 +466,10 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              task_class: str | None = None,
              msg_idx: int | None = None,
              doc_id: str | None = None,
-             context_refs=None) -> TurnResult:
+             context_refs=None,
+             mode: str | None = None,
+             plan_only: bool | None = None,
+             options: dict | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -532,6 +535,42 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     else:
         dispatch = _dispatch_tool
     allow = set(allowed_tools or [])
+    # Copilot mode → tools: intersect caller allowlist with mode policy.
+    # Precedence: explicit arg → options key if present → mission_dispatch → default.
+    try:
+        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+            apply_mode_tools,
+            normalize_mode,
+        )
+        _mode = mode
+        _plan_only = plan_only
+        if isinstance(options, dict):
+            if _mode is None and "mode" in options:
+                _mode = options.get("mode")
+            if _plan_only is None and "plan_only" in options:
+                _plan_only = bool(options.get("plan_only"))
+        if _mode is None and mission_dispatch is not None:
+            _mode = getattr(mission_dispatch, "mode", None)
+        if _plan_only is None and mission_dispatch is not None:
+            _plan_only = getattr(mission_dispatch, "plan_only", None)
+        # Normalize only after all sources considered (default agent).
+        _mode = normalize_mode(_mode)
+        # plan_only may also couple from mode==plan via mode_options_from_mapping
+        # when options carried mode=plan without plan_only.
+        if isinstance(options, dict) and options.get("mode") == "plan" and _plan_only is None:
+            _plan_only = True
+        if _mode == "plan" and _plan_only is None:
+            _plan_only = True
+        narrowed = apply_mode_tools(
+            _mode,
+            allowed_tools,
+            plan_only=bool(_plan_only) if _plan_only is not None else None,
+        )
+        if narrowed is not None:
+            allow = set(narrowed)
+            allowed_tools = list(narrowed)
+    except Exception:  # noqa: BLE001 — mode gate never breaks a turn
+        pass
     actor = actor or name
     # WI-8: inject reference builds into the user request for A/B specify.
     _req = request

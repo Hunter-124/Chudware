@@ -15,10 +15,9 @@
 // Worker stderr often never reaches the page console under PROXY_TO_PTHREAD;
 // always mirror the last checkpoint onto #status via the browser main thread.
 inline void wasmBootDom(const char* msg) {
-    // EM_ASM runs on the current thread; with PROXY_TO_PTHREAD this is a worker
-    // so prefer MAIN_THREAD_EM_ASM. Without proxy, both are the browser thread.
-#if defined(__EMSCRIPTEN_PTHREADS__)
-    MAIN_THREAD_EM_ASM({
+    // Always EM_ASM: we run on the browser main thread (no PROXY_TO_PTHREAD).
+    // MAIN_THREAD_EM_ASM from the main thread + ASYNCIFY can re-enter and blow the stack.
+    EM_ASM({
         var el = document.getElementById('status');
         if (el) el.textContent = UTF8ToString($0);
         try {
@@ -28,17 +27,6 @@ inline void wasmBootDom(const char* msg) {
             console.log('boot: ' + UTF8ToString($0));
         } catch (e) {}
     }, msg);
-#else
-    EM_ASM({
-        var el = document.getElementById('status');
-        if (el) el.textContent = UTF8ToString($0);
-        try {
-            if (!window.__billetLogs) window.__billetLogs = [];
-            window.__billetLogs.push('boot: ' + UTF8ToString($0));
-            console.log('boot: ' + UTF8ToString($0));
-        } catch (e) {}
-    }, msg);
-#endif
 }
 #define WASM_BOOT_LOG(...) do { \
     std::fprintf(stderr, __VA_ARGS__); std::fflush(stderr); \
@@ -880,8 +868,9 @@ static void wasmSyncCanvasSize(GLFWwindow* win) {
     if (fbW == sLastW && fbH == sLastH) return;
     sLastW = fbW; sLastH = fbH;
     emscripten_set_canvas_element_size("#canvas", fbW, fbH);
-    // Keep GLFW's notion of the window in CSS pixels so ImGui io.DisplaySize matches layout.
-    glfwSetWindowSize(win, (int)(cssW + 0.5), (int)(cssH + 0.5));
+    // Do NOT call glfwSetWindowSize every resize — under emscripten/contrib.glfw3 it can
+    // re-enter framebuffer callbacks and stack-blow. Size the drawing buffer only; ImGui
+    // reads CSS size via the GLFW emscripten path / DisplaySize later.
     WASM_BOOT_LOG("[wasm-boot] canvas size css=%.0fx%.0f dpr=%.2f fb=%dx%d\n", cssW, cssH, dpr, fbW, fbH);
 }
 #endif
@@ -908,6 +897,7 @@ WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    // Do not request CORE_PROFILE — that is desktop-GL and confuses WebGL.
 #else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -2286,9 +2276,33 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
     while (!glfwWindowShouldClose(win)) {
 #ifdef __EMSCRIPTEN__
         static int s_wasmFrames = 0;
-        if (s_wasmFrames < 3) WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
         ++s_wasmFrames;
+        if (s_wasmFrames <= 3) WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
         wasmSyncCanvasSize(win);
+        // First frames: minimal paint only — full UI path is too deep for ASYNCIFY
+        // until the rewind stack has settled after a few yields.
+        if (s_wasmFrames <= 2) {
+            glfwPollEvents();
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
+            ImGui::Begin("Billet WASM", nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+            ImGui::Text("Billet WASM boot — frame %d", s_wasmFrames);
+            ImGui::Text("ASYNCIFY warmup (full UI next)");
+            ImGui::End();
+            ImGui::Render();
+            int dw = 0, dh = 0;
+            glfwGetFramebufferSize(win, &dw, &dh);
+            glViewport(0, 0, dw, dh);
+            glClearColor(0.07f, 0.09f, 0.11f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(win);
+            emscripten_sleep(0);
+            continue;
+        }
 #endif
         // T-PERF10: idle render throttle. When nothing needs continuous redraw (no animation,
         // no async RPCs, no camera tween, no headless shot), wait up to 50ms for an event

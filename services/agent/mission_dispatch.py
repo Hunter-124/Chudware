@@ -183,7 +183,12 @@ class MissionDispatch:
                  task_class: str | None = None,
                  coordination_board=None,
                  org_chart=None,
-                 corporate_agent_id: str | None = None) -> None:
+                 corporate_agent_id: str | None = None,
+                 options: dict | None = None,
+                 mode: str | None = None,
+                 corporate_force: bool | None = None,
+                 plan_only: bool | None = None,
+                 advisor: bool | None = None) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
@@ -218,6 +223,35 @@ class MissionDispatch:
         # Identity of the agent currently using this dispatch (for corporate
         # channel posts / spawn authority). Root/director when unset.
         self.corporate_agent_id = corporate_agent_id
+        # Copilot mode overhaul: options.mode / corporate_force / plan_only /
+        # advisor threaded from host/core so tool + org policy can honor them.
+        try:
+            from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                mode_options_from_mapping,
+            )
+            # Merge explicit kwargs into options BEFORE normalize so
+            # mode==swarm → corporate_force and mode==plan → plan_only couple.
+            _raw = dict(options) if isinstance(options, dict) else {}
+            if mode is not None:
+                _raw["mode"] = mode
+            if corporate_force is not None:
+                _raw["corporate_force"] = bool(corporate_force)
+            if plan_only is not None:
+                _raw["plan_only"] = bool(plan_only)
+            if advisor is not None:
+                _raw["advisor"] = bool(advisor)
+            _opts = mode_options_from_mapping(_raw)
+            self.options = _opts
+            self.mode = _opts["mode"]
+            self.corporate_force = bool(_opts["corporate_force"])
+            self.plan_only = bool(_opts["plan_only"])
+            self.advisor = bool(_opts.get("advisor", True))
+        except Exception:  # noqa: BLE001 — never break dispatch construction
+            self.options = {}
+            self.mode = (mode or "agent")
+            self.corporate_force = bool(corporate_force) if corporate_force is not None else False
+            self.plan_only = bool(plan_only) if plan_only is not None else False
+            self.advisor = True if advisor is None else bool(advisor)
         self._handlers: dict[str, Callable[..., Any]] = {
             "ledger_get": self.ledger_get,
             "ledger_note": self.ledger_note,
@@ -811,8 +845,26 @@ class MissionDispatch:
                     "risk": risk,
                     "node_inputs": {"task_class": self.task_class, "depth": depth},
                 }
-                # Map harness roles: subagent worker → task; planner-ish → planning.
+                # Harness role for model resolve:
+                #  - leaf workers stay on "task" (cheap) under agent/swarm
+                #  - plan mode → planning; edit → task
+                #  - node role overrides for orchestrator/advisor seats
+                # Top-level turns use role_for_copilot_mode at the entry path;
+                # do NOT upgrade every subagent to "default" in agent mode.
                 harness_role = "task"
+                try:
+                    from services.agent.role_models import (  # noqa: PLC0415
+                        role_for_copilot_mode,
+                    )
+                    _m = (
+                        getattr(self, "mode", None)
+                        or (self.options or {}).get("mode")
+                        or "agent"
+                    )
+                    if _m in ("plan", "edit"):
+                        harness_role = role_for_copilot_mode(_m)
+                except Exception:  # noqa: BLE001
+                    pass
                 if role in ("overseer", "orchestrator", "department_manager"):
                     harness_role = "planning"
                 elif role in ("advisor", "reviewer"):
@@ -956,6 +1008,49 @@ class MissionDispatch:
                         pass
             except Exception:  # noqa: BLE001 — never block subagent on role_models
                 provider = self.provider
+            # Mode → tools: intersect role allowlist with copilot mode policy.
+            try:
+                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                    apply_mode_tools,
+                )
+                mode_allowed = apply_mode_tools(
+                    getattr(self, "mode", None),
+                    allowed,
+                    plan_only=bool(getattr(self, "plan_only", False)),
+                )
+                if mode_allowed is not None:
+                    allowed = list(mode_allowed)
+                    # Re-render tools_text against the narrowed set.
+                    if allowed:
+                        try:
+                            from services.agent.tool_schemas import (  # noqa: PLC0415
+                                render_tools_block,
+                            )
+                            tools_text, _meta = render_tools_block(
+                                allowed, resolver=_at.resolver_for(self))
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001 — mode gate is best-effort
+                pass
+            # Advisor default-on for subagents: ensure advisor role is resolvable
+            # and advise helper stays reachable when advisor is enabled.
+            try:
+                from services.agent.config import advisor_enabled  # noqa: PLC0415
+                adv_on = bool(getattr(self, "advisor", True))
+                if adv_on and advisor_enabled():
+                    if allowed is not None and "advise" not in allowed:
+                        # Keep allowlist small: only inject when not plan/ask-restricted
+                        # without advise already in mode set.
+                        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                            normalize_mode,
+                        )
+                        _m = normalize_mode(getattr(self, "mode", None))
+                        if _m not in ("ask",) and "advise" not in (allowed or []):
+                            # Prefer not bloating ask; plan/edit/agent/swarm may use advise.
+                            if _m in ("plan", "edit", "agent", "swarm"):
+                                allowed = list(allowed or []) + ["advise"]
+            except Exception:  # noqa: BLE001
+                pass
             result = _at.run_turn(
                 brief, provider, name=role, actor=role,
                 system_prompt=system_prompt,
@@ -1469,11 +1564,14 @@ class MissionDispatch:
         self,
         tasks: list | None = None,
         mission_goals: list | None = None,
+        force: bool | None = None,
         **_ignored: Any,
     ) -> dict:
         """Mission-start hook: auto-activate when mode on and ≥2 departments.
 
-        Never force-activates. Single-dept missions stay flat.
+        When ``self.corporate_force`` / mode==swarm, *force* defaults True so
+        Swarm mode activates the org even if config.corporate_mode is off.
+        Single-dept missions still stay flat (dept-count gate in corporate).
         """
         try:
             from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
@@ -1488,17 +1586,29 @@ class MissionDispatch:
             def _delegate(**kwargs: Any) -> Any:
                 return self.delegate(**kwargs)
 
-            result = auto_activate_corporate(
-                self.run_id,
-                tasks or [],
-                cfg=cfg,
-                board=self.coordination_board,
-                mission_goals=list(goals or []) or None,
-                on_event=self.on_event,
-                provider=self.provider,
-                delegate_fn=_delegate if self.delegation_tree is not None else None,
-                seat_heads=True,
-            )
+            # Swarm / options.corporate_force → force org activation path.
+            force_flag = force
+            if force_flag is None:
+                force_flag = True if getattr(self, "corporate_force", False) else None
+            if force_flag is True:
+                result = self.corporate_activate(
+                    tasks=tasks or [],
+                    mission_goals=list(goals or []) or None,
+                    force=True,
+                    seat_heads=True,
+                )
+            else:
+                result = auto_activate_corporate(
+                    self.run_id,
+                    tasks or [],
+                    cfg=cfg,
+                    board=self.coordination_board,
+                    mission_goals=list(goals or []) or None,
+                    on_event=self.on_event,
+                    provider=self.provider,
+                    delegate_fn=_delegate if self.delegation_tree is not None else None,
+                    seat_heads=True,
+                )
             if result.get("active"):
                 from services.agent.corporate import get_org_chart  # noqa: PLC0415
                 self.org_chart = get_org_chart(

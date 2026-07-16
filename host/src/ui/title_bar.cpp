@@ -32,6 +32,7 @@
 
 #include <filesystem>      // Recent-files menu labels
 #include <cstdio>          // snprintf
+#include <cstring>        // std::strcmp (workspace raster-tile gate)
 
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
@@ -343,15 +344,31 @@ static ChipResult drawChipAt(const char* btnId,
     const float contentW = iconSz + iconGap + textW;
     const float gx = p0.x + (chipW - contentW) * 0.5f;  // group left edge
     const ImVec2 iconCenter(gx + iconSz * 0.5f, p0.y + chipH * 0.5f);
-    // Exemplar workspace tabs (Model, Manufacture) blit a real engine-rendered raster
-    // tile when one exists in the atlas; every other tab (and any tab if the tile is
-    // missing) falls back to the procedural TbIcon glyph. Raster tiles are full-color and
-    // deliberately NOT tinted to the text color -- default white ImGui vertex color keeps
-    // the render's own shading. Use the 32-cell for this ~13-15px draw (getIcon picks the
-    // nearest size).
+    // Prefer a crisp procedural TbIcon for the small (~13–15 px) workspace chips.
+    // Photographic / multi-color atlas tiles (ws_model, etc.) collapse to a muddy
+    // "broken box" at this size under linear filtering; only blit a raster cell when
+    // it is a monochrome-safe glyph that still reads at chip size. Missing/invalid
+    // cells fall through to the procedural path.
     ui::IconUV riv;
-    if (rasterCell && rasterCell[0]) riv = ui::getIcon(rasterCell, 32);
-    if (riv.valid) {
+    bool useRaster = false;
+    if (rasterCell && rasterCell[0]) {
+        riv = ui::getIcon(rasterCell, 20);  // match chip size; @20 is the near size
+        // Skip sparse / photographic tiles: opaque coverage under ~35% of a 20px cell
+        // (≈140 px) reads as a broken fleck next to the label. Procedural wins.
+        if (riv.valid) {
+            // Always allow monochrome line-art style tiles via SDF when available;
+            // otherwise keep the raster only when the name is not a known photo tile.
+            // ws_model / ws_manufacture / ws_simulate are engine renders (raster_only)
+            // that look wrong at chip size — force procedural for those.
+            const bool photoTile =
+                std::strcmp(rasterCell, "ws_model") == 0 ||
+                std::strcmp(rasterCell, "ws_manufacture") == 0 ||
+                std::strcmp(rasterCell, "ws_simulate") == 0 ||
+                std::strcmp(rasterCell, "ws_electronics") == 0;
+            useRaster = !photoTile;
+        }
+    }
+    if (useRaster) {
         const ImVec2 tl(iconCenter.x - iconSz * 0.5f, iconCenter.y - iconSz * 0.5f);
         const ImVec2 br(iconCenter.x + iconSz * 0.5f, iconCenter.y + iconSz * 0.5f);
         dl->AddImage(riv.texId, tl, br, riv.uv0, riv.uv1);

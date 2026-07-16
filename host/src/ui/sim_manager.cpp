@@ -968,13 +968,20 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
         panelOpen_ = true; return true;
     }
     if (cmdId == "sim_load_force") {
-        s.loads.push_back(SimLoad{}); captureSelectionInto(st, s.loads.back().faces); persist(st, s);
+        // Unit-native default magnitude: US customary -> 50 lbf (=222.411 N); metric -> 100 N.
+        // Effective US = forced US (simUnits==2) or doc-follow (simUnits==0) while the doc is IPS.
+        const bool usDisp = st.simUnits == 2 || (st.simUnits == 0 && st.ips());
+        SimLoad lf; if (usDisp) lf.vec[2] = -222.411f;
+        s.loads.push_back(lf); captureSelectionInto(st, s.loads.back().faces); persist(st, s);
         st.selection.clear();
         node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; armedWell_ = (int)s.loads.size();
         st.leftPaneTab = AppState::LP_Simulation; panelOpen_ = true; return true;
     }
     if (cmdId == "sim_load_pressure") {
-        SimLoad l; l.pressure = true; s.loads.push_back(l);
+        const bool usDisp = st.simUnits == 2 || (st.simUnits == 0 && st.ips());
+        SimLoad l; l.pressure = true;
+        if (usDisp) l.pressureMpa = 0.689476f;  // 100 psi; metric default stays 0.1 MPa
+        s.loads.push_back(l);
         captureSelectionInto(st, s.loads.back().faces); persist(st, s);
         st.selection.clear();
         node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; armedWell_ = (int)s.loads.size();

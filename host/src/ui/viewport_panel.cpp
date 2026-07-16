@@ -3831,23 +3831,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                          ImVec2(p0.x + 19 * ui::uiScale, p0.y + 4 * ui::uiScale), busySurf, lt.c_str());
             vdl->PopClipRect();
         }
-        if (st.rebuildsInFlight > 0) {
-            // Stale-preview chip: async engine work (doc_rebuild / eval_*) is in flight, so the
-            // mesh on screen may lag the model. Same glass pill as the agent phase above; sits
-            // just below it when both show.
-            const char* rt = "Rebuilding...";
-            ImVec2 ts = ImGui::CalcTextSize(rt);
-            float ry = cr0.y + 8 * ui::uiScale;
-            if (busy) ry += ts.y + 14.0f * ui::uiScale;
-            ImVec2 p0(cr0.x + 8 * ui::uiScale, ry);
-            ImVec2 p1(p0.x + ts.x + 14.0f * ui::uiScale, p0.y + ts.y + 8.0f * ui::uiScale);
-            const ui::AdaptiveSurface& rbSurf =
-                ui::adaptivePanel(ui::panelId("vp_rebuilding"), ImRect(p0, p1), ui::GlassGroup::Hud);
-            ui::glassPanel(vdl, ImRect(p0, p1), ui::GlassLevel::UltraThin,
-                          (p1.y - p0.y) * 0.5f / ui::uiScale, rbSurf);
-            ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
-                         ImVec2(p0.x + 7 * ui::uiScale, p0.y + 4 * ui::uiScale), rbSurf, rt);
-        }
         if (st.hasDocMesh && !st.pickStatus.empty()) {
             // pick readout, top-right ("Face 12 of Body1") — anchored LEFT of the pinned Copilot
             // column, like the heads-up toolbar, so the text never ghosts under the glass column.

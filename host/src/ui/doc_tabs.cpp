@@ -184,8 +184,18 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     dl->PushClipRect(p0, p1, true);
     const ImU32 textCol = ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary : surf.textSecondary);
     const float iy = p0.y + (tabH - iconSz) * 0.5f;
-    ui::drawIconGlass(dl, docIconName(t), ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
-                      iconSz * 0.5f, textCol, ui::glassIconHalo(surf));
+    // drawIconGlass sizePx is the FULL square size (not radius). Multi-color raster tiles
+    // (part/assembly/…) keep white vertex color so atlas shading survives; SDF line-art
+    // glyphs take the surface text role so they match the label.
+    {
+        const char* iname = docIconName(t);
+        const ImU32 icol = ui::hasIconSdf(iname)
+            ? textCol
+            : IM_COL32(255, 255, 255, (active ? 255 : 210));
+        ui::drawIconGlass(dl, iname,
+                          ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
+                          iconSz, icol, ui::glassIconHalo(surf));
+    }
     dl->AddText(ImVec2(p0.x + padX + iconSz + iconGap,
                        p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
                 textCol, label.c_str());
@@ -198,11 +208,14 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     bool xHover = ImGui::IsItemHovered();
     ImVec2 xc(cx + closeW * 0.5f, p0.y + tabH * 0.5f);
     if (xHover)
-        dl->AddCircleFilled(xc, closeW * 0.5f, IM_COL32(232, 17, 35, 200));  // semantic red — kept literal
-    float g = closeW * 0.22f;
-    const ImU32 xCol = ImGui::ColorConvertFloat4ToU32(xHover ? surf.textPrimary : surf.textTertiary);
-    dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, 1.6f * s);
-    dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, 1.6f * s);
+        dl->AddCircleFilled(xc, closeW * 0.42f, IM_COL32(232, 17, 35, 200));  // semantic red — kept literal
+    // Crisp × : slightly longer arms + thicker stroke so it doesn't read as a broken fleck
+    // next to the doc-type icon at HiDPI.
+    float g = closeW * 0.26f;
+    const ImU32 xCol = ImGui::ColorConvertFloat4ToU32(xHover ? surf.textPrimary : surf.textSecondary);
+    const float xThick = std::max(1.5f, 1.8f * s);
+    dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, xThick);
+    dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, xThick);
     dl->PopClipRect();
 
     if (hovered && !t.path.empty())

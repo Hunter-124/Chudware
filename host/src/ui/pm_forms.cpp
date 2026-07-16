@@ -16,6 +16,10 @@ static PMFieldDef Dim(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Dim; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; return f;
 }
+// Metric defaults only — IPS uses clean native imperial seeds (0.25 in, 0.125 in, …)
+// applied at form open by property_manager.cpp (applyIpsNativeDefaults). Do NOT convert
+// these mm values for display; the dual-default path picks a separate imperial number.
+
 // Dim that is enabled only when a sibling Combo (named enableKey) holds one of enableVals.
 // omit=true => the param is dropped from the op entirely while disabled (so the engine's
 // table/defaults drive it) rather than emitted-and-ignored.

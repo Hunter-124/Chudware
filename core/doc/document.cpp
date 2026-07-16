@@ -3804,13 +3804,27 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (auto_closed)
                     st.warning = "revolve: profile was open; auto-closed to the axis";
 
-                // Build the revolve tool (union all profile region revolves).
-                TopoDS_Shape tool;
+                // Build the revolve tool. Single region: one MakeRevol (no boolean). Multi-
+                // region: revolve each face then fuse_many in ONE BOPDS pass (not pairwise
+                // O(N²) fuse fold — same T-PERF pattern as hole/bolt_circle tool unions).
+                // Normalize axis once for thin offset + revolve_face (revolve_face also
+                // normalizes, but we need the unit for the thin radial shift).
+                const Eigen::Vector3d axis_dir_u = axis_dir.normalized();
+                std::vector<TopoDS_Shape> revs;
+                revs.reserve(rev_faces.size());
                 for (const TopoDS_Face& f : rev_faces) {
-                    TopoDS_Shape rev = ::geom::revolve_face(f, axis_pt, axis_dir, angle);
+                    TopoDS_Shape rev = ::geom::revolve_face(f, axis_pt, axis_dir_u, angle);
                     if (rev.IsNull())
                         throw std::runtime_error("revolve produced an empty solid");
-                    tool = tool.IsNull() ? rev : ::geom::fuse(tool, rev);
+                    revs.push_back(std::move(rev));
+                }
+                TopoDS_Shape tool;
+                if (revs.size() == 1) {
+                    tool = std::move(revs.front());
+                } else {
+                    tool = ::geom::fuse_many(
+                        revs.front(),
+                        std::vector<TopoDS_Shape>(revs.begin() + 1, revs.end()));
                     if (tool.IsNull())
                         throw std::runtime_error("revolve region fuse failed");
                 }
@@ -3840,7 +3854,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         throw std::runtime_error("revolve: thin requires a positive thin_thickness");
                     const std::string side = feat.value("thin_side", std::string("inside"));
                     const double per_t = (side == "both") ? thin_thk / 2.0 : thin_thk;
-                    TopoDS_Shape inner;
+                    std::vector<TopoDS_Shape> inrevs;
+                    inrevs.reserve(rev_faces.size());
                     for (const TopoDS_Face& f : rev_faces) {
                         // Radial direction = (face centroid - axis) projected perpendicular
                         // to the axis; shift the face TOWARD the axis by per_t (matches
@@ -3848,18 +3863,25 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         GProp_GProps g; BRepGProp::SurfaceProperties(f, g);
                         gp_Pnt cm = g.CentreOfMass();
                         Eigen::Vector3d c(cm.X(), cm.Y(), cm.Z());
-                        Eigen::Vector3d ad = axis_dir.normalized();
                         Eigen::Vector3d diff = c - axis_pt;
-                        Eigen::Vector3d radial = diff - ad * diff.dot(ad);
+                        Eigen::Vector3d radial = diff - axis_dir_u * diff.dot(axis_dir_u);
                         if (!(radial.norm() > 1e-9)) continue;
                         radial.normalize();
                         Eigen::Vector3d shift = radial * (-per_t);
                         gp_Trsf tr; tr.SetTranslation(gp_Vec(shift.x(), shift.y(), shift.z()));
                         TopoDS_Face inf = TopoDS::Face(
                             BRepBuilderAPI_Transform(f, tr, true).Shape());
-                        TopoDS_Shape inrev = ::geom::revolve_face(inf, axis_pt, axis_dir, angle);
+                        TopoDS_Shape inrev = ::geom::revolve_face(inf, axis_pt, axis_dir_u, angle);
                         if (inrev.IsNull()) continue;
-                        inner = inner.IsNull() ? inrev : ::geom::fuse(inner, inrev);
+                        inrevs.push_back(std::move(inrev));
+                    }
+                    TopoDS_Shape inner;
+                    if (inrevs.size() == 1) {
+                        inner = std::move(inrevs.front());
+                    } else if (inrevs.size() > 1) {
+                        inner = ::geom::fuse_many(
+                            inrevs.front(),
+                            std::vector<TopoDS_Shape>(inrevs.begin() + 1, inrevs.end()));
                     }
                     if (!inner.IsNull()) {
                         TopoDS_Shape hollow = ::geom::cut(tool, inner);

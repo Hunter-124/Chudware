@@ -7,6 +7,9 @@
 
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
+#include <GeomAbs_CurveType.hxx>
 #include <Geom_Surface.hxx>
 #include <BRepBuilderAPI_TransitionMode.hxx>
 #include <Standard_Failure.hxx>
@@ -103,85 +106,175 @@ Eigen::Vector3d face_plane_normal(const TopoDS_Face& face) {
     return Eigen::Vector3d(nv.X(), nv.Y(), nv.Z());
 }
 
-// Min/max of (point - axis_pt)·v over the face's outer wire, sampling each edge so a
-// circular/spline edge (whose extent is NOT captured by its vertices) is measured too.
+// Min/max of (point - axis_pt)·v over the face's outer wire. Lines use endpoints only;
+// circles/ellipses use 8 samples; freeform curves use 12 — enough for a reliable
+// straddle test without the old fixed 24 samples on every edge (common rect/arc
+// profiles drop from ~100 curve evals to a handful).
 void face_v_extent(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                    const Eigen::Vector3d& v, double& vmin, double& vmax) {
     vmin = 1e300; vmax = -1e300;
+    auto accum = [&](const gp_Pnt& p) {
+        const double d = (Eigen::Vector3d(p.X(), p.Y(), p.Z()) - axis_pt).dot(v);
+        vmin = std::min(vmin, d);
+        vmax = std::max(vmax, d);
+    };
     for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {
         BRepAdaptor_Curve ac(TopoDS::Edge(ex.Current()));
         const double t0 = ac.FirstParameter(), t1 = ac.LastParameter();
-        const int N = 24;
-        for (int i = 0; i <= N; ++i) {
-            gp_Pnt p = ac.Value(t0 + (t1 - t0) * (double(i) / N));
-            const double d = (Eigen::Vector3d(p.X(), p.Y(), p.Z()) - axis_pt).dot(v);
-            vmin = std::min(vmin, d);
-            vmax = std::max(vmax, d);
+        const GeomAbs_CurveType ct = ac.GetType();
+        if (ct == GeomAbs_Line) {
+            accum(ac.Value(t0));
+            accum(ac.Value(t1));
+            continue;
         }
+        // Circles/arcs need samples (endpoints alone miss the apex); freeform a few more.
+        const int N = (ct == GeomAbs_Circle || ct == GeomAbs_Ellipse) ? 8 : 12;
+        for (int i = 0; i <= N; ++i)
+            accum(ac.Value(t0 + (t1 - t0) * (double(i) / N)));
     }
+}
+
+// True when the outer wire has adjacent collinear LINE edges — the case where
+// revolve produces coplanar/cocylindrical phantom seams that UnifySameDomain must
+// collapse. Circles, single arcs, and ordinary rectangles have none; skipping the
+// unify walk there is a pure win (ShapeUpgrade_UnifySameDomain is O(faces+edges)).
+bool outer_wire_has_collinear_lines(const TopoDS_Face& face) {
+    const TopoDS_Wire ow = BRepTools::OuterWire(face);
+    if (ow.IsNull()) return false;
+    gp_Dir first_dir;
+    gp_Dir prev_dir;
+    bool has_first = false;
+    bool has_prev = false;
+    int line_edges = 0;
+    for (BRepTools_WireExplorer wx(ow); wx.More(); wx.Next()) {
+        BRepAdaptor_Curve ac(wx.Current());
+        if (ac.GetType() != GeomAbs_Line) {
+            has_prev = false;  // break the adjacent-line chain
+            continue;
+        }
+        const gp_Dir d = ac.Line().Direction();
+        if (has_prev && prev_dir.IsParallel(d, 1e-9)) return true;
+        if (!has_first) { first_dir = d; has_first = true; }
+        prev_dir = d;
+        has_prev = true;
+        ++line_edges;
+    }
+    // Closed wire: first and last line edges are also adjacent.
+    if (line_edges >= 2 && has_first && has_prev && first_dir.IsParallel(prev_dir, 1e-9))
+        return true;
+    return false;
 }
 }  // namespace
 
 TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                           const Eigen::Vector3d& axis_dir, double angle_rad) {
-    gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
-                gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
+    if (face.IsNull() || !(std::abs(angle_rad) > 0.0)) return TopoDS_Shape();
+    Eigen::Vector3d ad = axis_dir;
+    const double adn = ad.norm();
+    if (!(adn > 1e-12)) return TopoDS_Shape();
+    ad /= adn;
+    const gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
+                      gp_Dir(ad.x(), ad.y(), ad.z()));
 
     // When the profile STRADDLES the axis (e.g. a full circle centered on the axis, the
     // sphere case), revolving it sweeps each half through the other → a self-intersecting,
     // degenerate solid. The kernel-correct CAD behavior (SolidWorks parity) is to revolve a
     // profile that lies on ONE side of the axis. So if the face crosses the axis line, clip
     // it to its larger half-plane first: a half-disk revolved 360° is a clean sphere.
+    //
+    // Fast path: project the face AABB onto the in-plane axis-perp. If the box is entirely
+    // on one side, the face cannot straddle — skip curve sampling + the common() clip
+    // (the common case for every offset rectangle/annulus profile).
     TopoDS_Face prof = face;
     const Eigen::Vector3d N = face_plane_normal(face);
     if (N.squaredNorm() > 0.5) {
         // In-plane basis: u along the axis (projected into the face plane), v perpendicular
         // to the axis within the plane. v is the direction the profile is split across.
-        Eigen::Vector3d u = axis_dir - N * axis_dir.dot(N);
+        Eigen::Vector3d u = ad - N * ad.dot(N);
         if (u.norm() > 1e-9) {
             u.normalize();
             Eigen::Vector3d v = N.cross(u);
             if (v.norm() > 1e-9) {
                 v.normalize();
-                double vmin, vmax;
-                face_v_extent(face, axis_pt, v, vmin, vmax);
-                const double tol = 1e-7 * std::max(1.0, std::abs(vmax) + std::abs(vmin));
-                if (vmin < -tol && vmax > tol) {
-                    // Straddles the axis — keep the larger side (b>=0 vs b<=0). Build a big
-                    // coplanar half-plane rectangle on that side and intersect the profile.
-                    const bool keep_pos = (vmax >= -vmin);
-                    const double big = (std::abs(vmax) + std::abs(vmin)) * 4.0 + 1.0;
-                    const double b0 = keep_pos ? 0.0 : -big;
-                    const double b1 = keep_pos ? big : 0.0;
-                    auto P = [&](double a, double b) {
-                        Eigen::Vector3d q = axis_pt + u * a + v * b;
-                        return gp_Pnt(q.x(), q.y(), q.z());
-                    };
-                    BRepBuilderAPI_MakePolygon poly;
-                    poly.Add(P(-big, b0));
-                    poly.Add(P(big, b0));
-                    poly.Add(P(big, b1));
-                    poly.Add(P(-big, b1));
-                    poly.Close();
-                    TopoDS_Shape half = BRepBuilderAPI_MakeFace(poly.Wire()).Shape();
-                    TopoDS_Shape clipped = common(face, half);
-                    // Take the resulting (largest) face; fall back to the raw face if the
-                    // intersection failed so a non-degenerate profile is never lost.
-                    double best = 0.0;
-                    for (TopExp_Explorer fx(clipped, TopAbs_FACE); fx.More(); fx.Next()) {
-                        TopoDS_Face cf = TopoDS::Face(fx.Current());
-                        GProp_GProps g; BRepGProp::SurfaceProperties(cf, g);
-                        if (g.Mass() > best) { best = g.Mass(); prof = cf; }
+                bool maybe_straddle = true;
+                {
+                    Bnd_Box bb;
+                    BRepBndLib::Add(face, bb);
+                    if (!bb.IsVoid()) {
+                        Standard_Real x0, y0, z0, x1, y1, z1;
+                        bb.Get(x0, y0, z0, x1, y1, z1);
+                        double bmin = 1e300, bmax = -1e300;
+                        const double xs[2] = {x0, x1}, ys[2] = {y0, y1}, zs[2] = {z0, z1};
+                        for (int ix = 0; ix < 2; ++ix)
+                            for (int iy = 0; iy < 2; ++iy)
+                                for (int iz = 0; iz < 2; ++iz) {
+                                    const double d =
+                                        (Eigen::Vector3d(xs[ix], ys[iy], zs[iz]) - axis_pt)
+                                            .dot(v);
+                                    bmin = std::min(bmin, d);
+                                    bmax = std::max(bmax, d);
+                                }
+                        const double btol =
+                            1e-7 * std::max(1.0, std::abs(bmax) + std::abs(bmin));
+                        // AABB one-sided ⇒ face one-sided. AABB both-sided is only a maybe
+                        // (conservative); precise sampling decides.
+                        if (bmin >= -btol || bmax <= btol) maybe_straddle = false;
+                    }
+                }
+                if (maybe_straddle) {
+                    double vmin, vmax;
+                    face_v_extent(face, axis_pt, v, vmin, vmax);
+                    const double tol = 1e-7 * std::max(1.0, std::abs(vmax) + std::abs(vmin));
+                    if (vmin < -tol && vmax > tol) {
+                        // Straddles the axis — keep the larger side (b>=0 vs b<=0). Build a
+                        // big coplanar half-plane rectangle on that side and intersect.
+                        const bool keep_pos = (vmax >= -vmin);
+                        const double big = (std::abs(vmax) + std::abs(vmin)) * 4.0 + 1.0;
+                        const double b0 = keep_pos ? 0.0 : -big;
+                        const double b1 = keep_pos ? big : 0.0;
+                        auto P = [&](double a, double b) {
+                            Eigen::Vector3d q = axis_pt + u * a + v * b;
+                            return gp_Pnt(q.x(), q.y(), q.z());
+                        };
+                        BRepBuilderAPI_MakePolygon poly;
+                        poly.Add(P(-big, b0));
+                        poly.Add(P(big, b0));
+                        poly.Add(P(big, b1));
+                        poly.Add(P(-big, b1));
+                        poly.Close();
+                        TopoDS_Shape half = BRepBuilderAPI_MakeFace(poly.Wire()).Shape();
+                        TopoDS_Shape clipped = common(face, half);
+                        // Take the resulting (largest) face; fall back to the raw face if
+                        // the intersection failed so a non-degenerate profile is never lost.
+                        double best = 0.0;
+                        for (TopExp_Explorer fx(clipped, TopAbs_FACE); fx.More(); fx.Next()) {
+                            TopoDS_Face cf = TopoDS::Face(fx.Current());
+                            GProp_GProps g; BRepGProp::SurfaceProperties(cf, g);
+                            if (g.Mass() > best) { best = g.Mass(); prof = cf; }
+                        }
                     }
                 }
             }
         }
     }
 
-    TopoDS_Shape solid = BRepPrimAPI_MakeRevol(prof, axis, angle_rad).Shape();
-    // Same collinear-segment cleanup as extrude_face: collinear profile runs revolve into
-    // separate cocylindrical/coplanar faces split by a phantom edge — merge them so the
-    // revolved body has one face per real wall and no spurious edges to confuse fillet.
+    // Copy=true: never mutate the caller's profile face (sketch faces live in the
+    // compile cache / FeatureResult map and must stay intact across rebuilds).
+    // Full +360° uses the dedicated complete-revolution constructor — no partial-
+    // angle bookkeeping, the canonical closed solid-of-revolution path. Negative
+    // full angles keep the angled form so orientation is preserved.
+    constexpr double kTwoPi = 6.28318530717958647692;
+    TopoDS_Shape solid;
+    if (angle_rad > 0.0 && std::abs(angle_rad - kTwoPi) <= 1e-7) {
+        solid = BRepPrimAPI_MakeRevol(prof, axis, /*Copy=*/Standard_True).Shape();
+    } else {
+        solid = BRepPrimAPI_MakeRevol(prof, axis, angle_rad, /*Copy=*/Standard_True).Shape();
+    }
+    if (solid.IsNull()) return solid;
+    // Collinear profile runs revolve into separate cocylindrical/coplanar faces split by
+    // a phantom edge — merge them so the body has one face per real wall. Skip the unify
+    // walk when the outer wire has no adjacent collinear lines (rect/circle/arc profiles).
+    if (!outer_wire_has_collinear_lines(prof)) return solid;
     return unify_same_domain(solid);
 }
 

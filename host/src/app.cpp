@@ -771,14 +771,25 @@ static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
 // starter is silently discarded (AppState::dropBlankStarterTabs, called from the open path); if they
 // edit it, it sticks. Fires at most once (st.starterTried). No-op in shot/scenario mode (scenarios
 // create their own docs) and once a doc/design already exists.
+// ITEM 15: wait one painted frame after the worker becomes ready so the status bar can show
+// "Ready" / clear the warmup chip before the (still-sync) doc_new hitch, and so the first
+// interactive frames are not blocked by starter creation.
 static void ensureStarterDoc(AppState& st, bool shot) {
     if (shot || st.starterTried) return;
     if (!st.workerStarted || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted) return;
+    static int s_readyFrame = -1;
+    if (s_readyFrame < 0) s_readyFrame = ImGui::GetFrameCount();
+    if (ImGui::GetFrameCount() < s_readyFrame + 1) {
+        st.startupPhase = "Opening starter part\xe2\x80\xa6";
+        return;
+    }
     st.starterTried = true;
+    st.startupPhase = "Opening starter part\xe2\x80\xa6";
     ui::createNewDoc(st, 0);   // New Part — same path as the chooser (incl. per-doc session setup)
     if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
         st.docTabs[st.activeTab].isStarter = true;
     st.wantFocusViewport = 6;
+    st.startupPhase.clear();
     st.addLog("[startup] opened default starter part");
 }
 
@@ -1623,21 +1634,41 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     });
 
     // ---------- runtime + worker ----------
+    // ITEM 15: on interactive launches, DEFER tryStartWorker (libaicad dlopen + OCCT + daemon
+    // hello) off the pre-loop path so the first frames can paint chrome and become interactive.
+    // Shot/scenario mode still boots synchronously so captures stay deterministic.
     st.rtReady = runtimeReady();
 
 #ifndef _WIN32
     // On Linux/macOS the backend is the in-process C++ core (libaicad), not a managed Python
     // venv — route through tryStartWorker, whose libaicad guard reports readiness and only
     // falls back to Python provisioning if libaicad is genuinely unavailable.
-    st.tryStartWorker();
+    if (shot) {
+        st.tryStartWorker();
+    } else {
+        st.workerBootPending = true;
+        st.startupPhase = "Starting engine\xe2\x80\xa6";
+        st.status = "Starting engine...";
+        st.statusKind = 0;
+    }
 #else
     if (st.rtReady) {
-        st.tryStartWorker();
+        if (shot) {
+            st.tryStartWorker();
+        } else {
+            st.workerBootPending = true;
+            st.startupPhase = "Starting engine\xe2\x80\xa6";
+            st.status = "Starting engine...";
+            st.statusKind = 0;
+        }
     } else {
         st.status = "Runtime not installed";
         st.statusKind = 2;
         st.addLog("[!] runtime not found at %APPDATA%\\AI-CAD\\runtime");
         st.autoSetupTried = true;
+        // Provisioning is already on a background thread; mark the status-bar startup chip
+        // so the left loading readout shows while the first-run venv is built.
+        st.startupPhase = "Provisioning runtime\xe2\x80\xa6";
         st.startSetup(false);  // self-provision from the payload next to the exe / source tree
     }
 #endif
@@ -2178,12 +2209,54 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             }
             if (ok) {
                 st.addLog("[ok] " + msg);
+                st.startupPhase = "Warming up kernel\xe2\x80\xa6";
+                st.status = "Warming up kernel...";
                 st.tryStartWorker();
+                if (st.workerStarted &&
+                    (st.starterTried || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted))
+                    st.startupPhase.clear();
             } else {
                 st.addLog("[err] " + msg);
                 st.status = "Setup needed";
                 st.statusKind = 2;
+                st.startupPhase.clear();
             }
+        }
+
+        // ITEM 15: deferred engine bootstrap. Interactive launches set workerBootPending so
+        // the first frames can paint chrome before tryStartWorker (libaicad/OCCT/daemon hello)
+        // blocks the UI thread. Wait ~2 frames so at least one swap has presented.
+        // Daemon reconnect lifecycle is untouched (engineEventsTick / workerStarted gates).
+        if (st.workerBootPending) {
+            static int s_bootDeferFrames = 0;
+            ++s_bootDeferFrames;
+            if (s_bootDeferFrames >= 2) {
+                st.workerBootPending = false;
+                st.startupPhase = "Warming up kernel\xe2\x80\xa6";
+                st.status = "Warming up kernel...";
+                st.statusKind = 0;
+                st.tryStartWorker();
+                if (st.setupRunning.load()) {
+                    st.startupPhase = "Provisioning runtime\xe2\x80\xa6";
+                } else if (st.workerStarted) {
+                    if (st.starterTried || st.docMirror.hasDoc() || !st.docTabs.empty() ||
+                        st.designStarted)
+                        st.startupPhase.clear();
+                    else
+                        st.startupPhase = "Opening starter part\xe2\x80\xa6";
+                } else {
+                    // tryStartWorker already set status / statusKind for the failure path.
+                    st.startupPhase.clear();
+                }
+            }
+        }
+
+        // Clear the startup loading chip once the engine is ready and we are past the
+        // starter-doc gate (starter created, skipped, or user already opened something).
+        if (!st.startupPhase.empty() && !st.workerBootPending && !st.setupRunning.load() &&
+            st.workerStarted &&
+            (st.starterTried || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted)) {
+            st.startupPhase.clear();
         }
 
         // C39: deliver finished async worker calls — their callbacks run HERE, on the GL

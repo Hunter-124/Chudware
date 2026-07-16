@@ -1044,6 +1044,14 @@ struct AppState {
     bool autoSetupTried = false;    // guard so startup auto-heal runs once, not in a loop
     bool importRepairTried = false; // guard so per-job ModuleNotFoundError repair runs once
     bool starterTried = false;      // guard so the launch default-part creation runs once
+    // ITEM 15: deferred engine bootstrap. When true, tryStartWorker has not yet run on the
+    // interactive path — the first frames paint chrome, then the frame loop boots the kernel.
+    // Shot/scenario mode still boots synchronously before the loop (deterministic captures).
+    bool workerBootPending = false;
+    // Human-readable stage for the left status-bar loading chip during startup/warmup
+    // (e.g. "Starting engine…", "Warming up kernel…", "Opening starter part…"). Cleared
+    // once the app is interactive (worker ready + starter settled / no boot pending).
+    std::string startupPhase;
 
     // ---- job + chat model ----
     JobState job;
@@ -1075,7 +1083,8 @@ struct AppState {
     std::string modelInfo;
     std::string livePhase;        // what the agent is doing right now (viewport overlay)
     // Async engine calls (doc_rebuild / eval_*) queued or undrained on st.rpc: while > 0 the
-    // mesh on screen may lag the model, so the viewport draws a small "Rebuilding..." chip.
+    // mesh on screen may lag the model. Status bar left loading chip shows detailed rebuild
+    // progress (feature N/M / ops-in-flight); the old viewport "Rebuilding..." HUD is gone.
     // Bump at every st.rpc.call that mutates/evaluates the model; drop in its drain callback.
     int rebuildsInFlight = 0;
     // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops

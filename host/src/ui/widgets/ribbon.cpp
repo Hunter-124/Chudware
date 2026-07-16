@@ -856,10 +856,22 @@ static const float* ribbon_matSwatchColor(const char* cmd_id) {
 static void ribbon_vGradRounded(ImDrawList* dl, ImVec2 a, ImVec2 b, float rnd, ImU32 top, ImU32 bot) {
     if (b.x <= a.x || b.y <= a.y) return;
     rnd = ImClamp(rnd, 0.0f, ImMin((b.x - a.x), (b.y - a.y)) * 0.5f);
+    // Full rounded base in the bottom colour — owns every corner (incl. the top ones).
     dl->AddRectFilled(a, b, bot, rnd);
-    dl->AddRectFilled(a, ImVec2(b.x, a.y + rnd), top, rnd, ImDrawFlags_RoundCornersTop);
-    if (b.y - rnd > a.y + rnd)
-        dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + rnd), ImVec2(b.x, b.y - rnd), top, top, bot, bot);
+    // Top rounded strip so the top corners carry the bright colour. Height is at least
+    // the corner radius so ImGui's rounded-AA path doesn't collapse into square corner
+    // pips (the "small red/orange rectangle at top corners" glitch when height ≈ rnd).
+    const float topH = ImMax(rnd, 1.0f);
+    dl->AddRectFilled(a, ImVec2(b.x, a.y + topH), top, rnd, ImDrawFlags_RoundCornersTop);
+    // Interior vertical fade. AddRectFilledMultiColor is SQUARE-cornered — keep it strictly
+    // inside the rounded outline (inset by rnd on left/right and below the top strip) so its
+    // square corners never poke past the curve as bright corner flecks.
+    const float y0 = a.y + topH;
+    const float y1 = b.y - rnd;
+    if (y1 > y0 && (b.x - a.x) > 2.0f * rnd) {
+        dl->AddRectFilledMultiColor(ImVec2(a.x + rnd, y0), ImVec2(b.x - rnd, y1),
+                                    top, top, bot, bot);
+    }
 }
 
 static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled,

@@ -444,6 +444,104 @@ static const PMThreadSize kPmThreadSizes[] = {
     {"1/2-13", 12.700, 1.95385, false},
 };
 
+// Unit-system-aware default (canonical mm). Imperial is authored as clean inches, then
+// converted to mm once at form open — NEVER metric-default / 25.4 (which yields 0.3937").
+static double pmUnitDefaultMm(double metricMm, double imperialIn, bool ips) {
+    return ips ? (imperialIn * 25.4) : metricMm;
+}
+
+// Clean native imperial defaults (inches) for PM Dim fields, keyed by feature type + param.
+// Returns <0 when the field has no IPS-specific default (use the form's metric dimDefault).
+// Angles / unit-less / counts are intentionally absent — they are unit-agnostic.
+static double pmImperialDefaultInches(const char* type, const char* key) {
+    if (!type || !key) return -1.0;
+    struct Entry { const char* type; const char* key; double inches; };
+    // Keep in sync with the Dim defaults in pm_forms.cpp (metric stays as authored there).
+    static const Entry kTab[] = {
+        // primitives
+        {"box",            "length",             0.75},
+        {"box",            "width",              0.75},
+        {"box",            "height",             0.75},
+        {"cylinder",       "radius",             0.5},
+        {"cylinder",       "height",             0.75},
+        // extrude / revolve thin
+        {"extrude",        "depth",              0.25},
+        {"extrude",        "depth2",             0.25},
+        {"extrude",        "thin_thickness",     0.125},
+        {"revolve",        "thin_thickness",     0.125},
+        // dress-up
+        {"fillet",         "radius",             0.125},
+        {"fillet",         "radius2",            0.125},
+        {"chamfer",        "length",             0.0625},
+        {"chamfer",        "length2",            0.0625},
+        {"shell",          "thickness",          0.125},
+        // hole / thread
+        {"hole",           "diameter",           0.25},
+        {"hole",           "depth",              0.25},
+        {"hole",           "dx",                 0.75},
+        {"hole",           "dy",                 0.75},
+        {"thread",         "major_dia",          0.5},
+        {"thread",         "pitch",              0.05},
+        {"thread",         "length",             0.5},
+        // patterns
+        {"linear_pattern", "spacing1",           0.75},
+        {"linear_pattern", "spacing2",           0.75},
+        // helix
+        {"helix",          "radius",             0.5},
+        {"helix",          "pitch",              0.25},
+        {"helix",          "height",             0.75},
+        // datum plane
+        {"plane",          "offset",             0.25},
+        // sheet metal
+        {"sm_base_flange", "thickness",          0.0625},
+        {"sm_base_flange", "default_bend_radius",0.0625},
+        {"sm_edge_flange", "length",             0.75},
+        {"sm_edge_flange", "radius",             0.0625},
+        {"sm_hem",         "length",             0.25},
+        {"sm_hem",         "radius",             0.0625},
+        {"sm_jog",         "offset",             0.25},
+        {"sm_jog",         "length",             0.75},
+        {"sm_jog",         "radius",             0.0625},
+        // weldments
+        {"weld_member",    "size",               0.75},
+        {"weld_member",    "w",                  1.5},
+        {"weld_member",    "h",                  0.75},
+        {"weld_member",    "od",                 1.0},
+        {"weld_member",    "leg",                1.0},
+        {"weld_member",    "thickness",          0.125},
+        {"weld_gusset",    "thickness",          0.25},
+        {"weld_gusset",    "d1",                 1.25},
+        {"weld_gusset",    "d2",                 1.25},
+        {"weld_end_cap",   "thickness",          0.25},
+        // rib
+        {"rib",            "thickness",          0.125},
+        // surfacing
+        {"surf_extrude",   "depth",              0.25},
+        {"surf_offset",    "distance",           0.25},
+        {"surf_thicken",   "thickness",          0.125},
+    };
+    for (const auto& e : kTab) {
+        if (std::strcmp(e.type, type) == 0 && std::strcmp(e.key, key) == 0)
+            return e.inches;
+    }
+    return -1.0;
+}
+
+// After initField seeded metric dimDefault, swap in native imperial defaults when IPS is active.
+static void applyIpsNativeDefaults(const PMFormDef* form, std::vector<PMField>& fields) {
+    if (!form || !form->type) return;
+    for (auto& f : fields) {
+        if (!f.def || f.def->kind != PMFieldKind::Dim) continue;
+        if (pmFieldIsAngle(f.def) || pmFieldUnitless(f.def)) continue;
+        const double inches = pmImperialDefaultInches(form->type, f.def->key);
+        if (inches < 0.0) continue;
+        f.dimValue = pmUnitDefaultMm(f.def->dimDefault, inches, /*ips=*/true);
+        std::string disp = pmFieldValueText(f.def, f.dimValue, /*ips=*/true);
+        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+        f.dimBuf[f.dimBuf.size() - 1] = '\0';
+    }
+}
+
 static void initField(PMField& f, const PMFieldDef& d, bool ips) {
     f.def = &d;
     switch (d.kind) {
@@ -515,6 +613,10 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
         initField(fields_[i], form->fields[i], ips_);
+    // IPS: replace metric-seeded Dim defaults with clean native imperial values (0.25 in, not
+    // 0.3937 in from 10 mm / 25.4). Metric mode keeps the form table defaults unchanged.
+    if (ips_) applyIpsNativeDefaults(form_, fields_);
+
 
     // Thread form in an IPS document defaults to an SAE size (1/4-20 UNC) instead of
     // the metric first option; metric docs keep the M-series default (combo index 0).

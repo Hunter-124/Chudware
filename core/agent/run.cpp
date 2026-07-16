@@ -366,6 +366,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     bool review_vision = vision;
     int review_budget = call_budget;
     int review_ctx_cap = ctx_cap;
+    bool review_provider_specialized = false;
     if (provider_cfg.contains("review_provider") && provider_cfg["review_provider"].is_object()) {
         const json& rpc = provider_cfg["review_provider"];
         review_provider = make_provider(rpc);
@@ -373,6 +374,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const CallBudget rb = fit_call_budget(rpc, call_budget_for(rpc));
         review_budget = rb.output;
         review_ctx_cap = rb.input_cap;
+        review_provider_specialized = true;
         events.emit("run_note",
                     json{{"note", "experimental: separate vision-review provider"},
                          {"review_provider", rpc.value("name", std::string())},
@@ -389,6 +391,78 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                   "then fillet/chamfer/hole/pattern/mirror) that reconstructs a clean design history. "
                   "Avoid a single fused/imported solid; each feature must stay separately editable.")
             : std::string();
+
+    // ---- PREWALK (strong plan → cheap implement) ----
+    // When agent.prewalk is true and the target resolves, model/fix stages use a
+    // separate cheap provider. Planning stages (intake/plan) keep the strong main
+    // provider. One-way: first implementation stage emits a run_note and stays on
+    // the cheap model for the rest of the run. Null target = safe no-op (identical
+    // to prewalk off).
+    ProviderFn implement_provider = provider;
+    int implement_budget = call_budget;
+    int implement_ctx_cap = ctx_cap;
+    bool implement_vision = vision;
+    bool prewalk_armed = false;
+    bool prewalk_switched = false;
+    std::string prewalk_model_label;
+    {
+        // options.prewalk / options.prewalk_target override ambient config (tests + host).
+        json cfg_pw = load_config();
+        if (!cfg_pw.is_object()) cfg_pw = json::object();
+        if (!cfg_pw.contains("agent") || !cfg_pw["agent"].is_object())
+            cfg_pw["agent"] = json::object();
+        if (options.contains("prewalk")) cfg_pw["agent"]["prewalk"] = options["prewalk"];
+        if (options.contains("prewalk_target") && options["prewalk_target"].is_string())
+            cfg_pw["agent"]["prewalk_target"] = options["prewalk_target"].get<std::string>();
+        // Also honor a pre-resolved descriptor the host/gate may attach.
+        json pw_desc = json(nullptr);
+        if (provider_cfg.contains("prewalk_provider") &&
+            provider_cfg["prewalk_provider"].is_object() &&
+            !provider_cfg["prewalk_provider"].contains("error")) {
+            pw_desc = provider_cfg["prewalk_provider"];
+        } else {
+            pw_desc = resolve_prewalk_provider(cfg_pw, json::object());
+        }
+        if (pw_desc.is_object() && !pw_desc.contains("error") && !pw_desc.empty()) {
+            // Same provider+model as main → nothing to switch (disarm silently).
+            const std::string main_name = provider_cfg.value("name", std::string());
+            const std::string main_model =
+                provider_cfg.contains("model") && provider_cfg["model"].is_string()
+                    ? provider_cfg["model"].get<std::string>()
+                    : std::string();
+            const std::string pw_name = pw_desc.value("name", std::string());
+            const std::string pw_model = pw_desc.contains("model") && pw_desc["model"].is_string()
+                                            ? pw_desc["model"].get<std::string>()
+                                            : std::string();
+            if (!(pw_name == main_name && pw_model == main_model && !pw_model.empty())) {
+                implement_provider = make_provider(pw_desc);
+                implement_provider =
+                    aicad::agent::wrap_logging(std::move(implement_provider), run_id, run_consent,
+                                               &lp_state);
+                const CallBudget ib = fit_call_budget(pw_desc, call_budget_for(pw_desc));
+                implement_budget = ib.output;
+                implement_ctx_cap = ib.input_cap;
+                implement_vision = pw_desc.value("supports_vision", false);
+                prewalk_armed = true;
+                prewalk_model_label =
+                    pw_model.empty() ? pw_name : (pw_name.empty() ? pw_model : pw_name + "/" + pw_model);
+            }
+        }
+    }
+    // Lazy one-shot notice on first implementation-stage call.
+    auto use_implement_provider = [&]() -> const ProviderFn& {
+        if (prewalk_armed && !prewalk_switched) {
+            prewalk_switched = true;
+            events.emit("run_note",
+                        json{{"note", "Prewalk: switched to " + prewalk_model_label +
+                                          " for implementation"},
+                             {"text", "Prewalk: switched to " + prewalk_model_label +
+                                          " for implementation"},
+                             {"prewalk", true},
+                             {"model", prewalk_model_label}});
+        }
+        return prewalk_armed ? implement_provider : provider;
+    };
 
     // Seed the DesignState from the live session: doc_tree(doc_id) gives {revision, tree}.
     json tree0 = doc::doc_tree(doc_id);
@@ -521,7 +595,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             appended = (a == std::string::npos) ? "" : appended.substr(a, b - a + 1);
         }
         st.current_step = appended;
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision, ctx_cap);
+        AgentCall ac =
+            agent_call(use_implement_provider(), st, "modeler", prompts_dir, implement_budget,
+                       implement_vision, implement_ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -566,8 +642,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     actions.model = [&](DesignState& st, int attempt) -> StageOutcome {
         st.last_no_progress = false;
         if (attempt > kEscapeAfter) return model_escape(st);
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision, ctx_cap,
-                                  cad_seq_directive);
+        AgentCall ac =
+            agent_call(use_implement_provider(), st, "modeler", prompts_dir, implement_budget,
+                       implement_vision, implement_ctx_cap, cad_seq_directive);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -690,8 +767,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- FIX ----
     actions.fix = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(review_provider, st, "fixer", prompts_dir, review_budget,
-                                  review_vision, review_ctx_cap);
+        // Fix is an implementation stage: when prewalk is armed and there is no separate
+        // vision-review provider, use the cheap implement provider (one-way switch notice).
+        const bool use_prewalk_fix = prewalk_armed && !review_provider_specialized;
+        AgentCall ac =
+            use_prewalk_fix
+                ? agent_call(use_implement_provider(), st, "fixer", prompts_dir, implement_budget,
+                             implement_vision, implement_ctx_cap)
+                : agent_call(review_provider, st, "fixer", prompts_dir, review_budget, review_vision,
+                             review_ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;

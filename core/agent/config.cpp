@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -569,6 +570,171 @@ CallBudget fit_call_budget(const json& provider_cfg, int desired_output) {
     if (input_cap < min_input) input_cap = min_input;
     if (input_cap > kContextTokenCap) input_cap = kContextTokenCap;  // big windows: keep prompts lean
     return CallBudget{input_cap, out};
+}
+
+PrewalkConfig load_prewalk_config(const json& cfg_in) {
+    PrewalkConfig out;
+    json cfg = cfg_in.is_null() ? load_config() : cfg_in;
+    if (!cfg.is_object() || !cfg.contains("agent") || !cfg["agent"].is_object()) return out;
+    const json& agent = cfg["agent"];
+    // agent.prewalk bool — accept truthy numbers/strings like offline_enabled.
+    if (agent.contains("prewalk")) {
+        const json& v = agent["prewalk"];
+        if (v.is_boolean())
+            out.enabled = v.get<bool>();
+        else if (v.is_number())
+            out.enabled = v.get<double>() != 0.0;
+        else if (v.is_string())
+            out.enabled = !v.get<std::string>().empty() && v.get<std::string>() != "0" &&
+                          lower(v.get<std::string>()) != "false" &&
+                          lower(v.get<std::string>()) != "off";
+    }
+    if (agent.contains("prewalk_target") && agent["prewalk_target"].is_string()) {
+        std::string t = agent["prewalk_target"].get<std::string>();
+        // strip
+        size_t a = t.find_first_not_of(" \t\r\n");
+        size_t b = t.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos) out.target = t.substr(a, b - a + 1);
+    }
+    if (out.target.empty()) out.target = "@smol";
+    return out;
+}
+
+namespace {
+
+// Strip a leading '@' role-marker and lower-case for alias compare.
+std::string role_alias_key(std::string s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    s = s.substr(a, b - a + 1);
+    if (!s.empty() && s[0] == '@') s = s.substr(1);
+    return lower(s);
+}
+
+// Split "provider/model" or "provider:model" (first separator only). Empty model ok.
+bool split_provider_model(const std::string& target, std::string& provider, std::string& model) {
+    size_t slash = target.find('/');
+    size_t colon = target.find(':');
+    size_t sep = std::string::npos;
+    if (slash != std::string::npos && colon != std::string::npos)
+        sep = std::min(slash, colon);
+    else if (slash != std::string::npos)
+        sep = slash;
+    else if (colon != std::string::npos)
+        sep = colon;
+    if (sep == std::string::npos || sep == 0) return false;
+    provider = target.substr(0, sep);
+    model = (sep + 1 < target.size()) ? target.substr(sep + 1) : std::string();
+    // Drop a trailing thinking suffix like ":high" when the provider used '/'
+    // (e.g. openai/gpt-4.1-mini:low) — keep model as-is for simple cases.
+    return !provider.empty();
+}
+
+}  // namespace
+
+json resolve_prewalk_provider(const json& cfg, const json& env) {
+    PrewalkConfig pw = load_prewalk_config(cfg);
+    if (!pw.enabled) return json(nullptr);
+
+    std::string target = pw.target;
+    if (target.empty()) target = "@smol";
+    const std::string alias = role_alias_key(target);
+
+    // Try a concrete ai_roles entry first (role → {provider, model}).
+    auto from_ai_role = [&](const std::string& role_key) -> json {
+        if (!cfg.is_object() || !cfg.contains("ai_roles") || !cfg["ai_roles"].is_object())
+            return json(nullptr);
+        const json& roles = cfg["ai_roles"];
+        if (!roles.contains(role_key)) return json(nullptr);
+        const json& entry = roles[role_key];
+        if (entry.is_object() && entry.contains("provider") && entry["provider"].is_string() &&
+            !entry["provider"].get<std::string>().empty()) {
+            std::string pname = entry["provider"].get<std::string>();
+            json desc = resolve_provider(pname, cfg, env);
+            if (!desc.is_object() || desc.contains("error")) return json(nullptr);
+            if (entry.contains("model") && entry["model"].is_string() &&
+                !entry["model"].get<std::string>().empty())
+                desc["model"] = entry["model"].get<std::string>();
+            return desc;
+        }
+        return json(nullptr);  // "auto" / unknown → caller falls through
+    };
+
+    // @smol / smol / empty → ai_roles.smol, then task, then local default when ambient
+    // is already a loopback provider (safe no-op otherwise — never invent a broken target).
+    auto resolve_smol = [&]() -> json {
+        for (const char* key : {"smol", "task", "tiny"}) {
+            json d = from_ai_role(key);
+            if (!d.is_null()) return d;
+        }
+        json cfg_use = cfg.is_object() ? cfg : json::object();
+        std::string ambient = lower(cfg_str(cfg_use, "provider").value_or(""));
+        // Only fall back to a local descriptor when the ambient provider is already local /
+        // empty (empty → openai-local default). Cloud ambient + no ai_roles.smol → null
+        // (prewalk no-ops rather than routing build stages at a random loopback server).
+        std::optional<std::string> name;
+        if (ambient.empty() || ambient == "llamacpp" || ambient == "llama.cpp" ||
+            ambient == "llama-cpp" || ambient == "openai") {
+            if (ambient == "llamacpp" || ambient == "llama.cpp" || ambient == "llama-cpp")
+                name = std::string("llamacpp");
+            // For openai: only accept if loopback; otherwise null.
+            if (ambient == "openai") {
+                json probe = resolve_provider(std::string("openai"), cfg_use, env);
+                if (!probe.is_object() || probe.contains("error")) return json(nullptr);
+                if (!provider_offline_safe(probe) &&
+                    !(probe.contains("base_url") && probe["base_url"].is_string() &&
+                      host_is_loopback(probe["base_url"].get<std::string>())))
+                    return json(nullptr);
+                return probe;
+            }
+            json desc = resolve_provider(name, cfg_use, env);
+            if (!desc.is_object() || desc.contains("error")) return json(nullptr);
+            // Empty-name default is always loopback (kDefaultLocalBaseUrl).
+            return desc;
+        }
+        return json(nullptr);
+    };
+
+    if (alias.empty() || alias == "smol" || alias == "tiny" || alias == "cheap" ||
+        alias == "local") {
+        return resolve_smol();
+    }
+
+    // Bare role name → ai_roles.<role> fixed assignment.
+    {
+        json d = from_ai_role(alias);
+        if (!d.is_null()) return d;
+        // auto / missing concrete assignment for a known cheap-ish role → smol fallback
+        if (alias == "task" || alias == "default" || alias == "planning") return resolve_smol();
+    }
+
+    // provider/model or provider:model pattern.
+    std::string prov, model;
+    if (split_provider_model(target, prov, model)) {
+        if (!prov.empty() && prov[0] == '@') prov = prov.substr(1);
+        json desc = resolve_provider(prov, cfg, env);
+        if (!desc.is_object() || desc.contains("error")) return json(nullptr);
+        if (!model.empty()) {
+            // Drop trailing thinking selector if present (openai/gpt-4.1-mini:low).
+            static const char* kThink[] = {":minimal", ":low", ":medium", ":high", ":xhigh",
+                                           ":max"};
+            for (const char* suf : kThink) {
+                const size_t n = std::strlen(suf);
+                if (model.size() >= n && lower(model.substr(model.size() - n)) == suf) {
+                    model = model.substr(0, model.size() - n);
+                    break;
+                }
+            }
+            if (!model.empty()) desc["model"] = model;
+        }
+        return desc;
+    }
+
+    // Bare provider name (anthropic, openai, xai, llamacpp, …).
+    json desc = resolve_provider(target, cfg, env);
+    if (!desc.is_object() || desc.contains("error")) return json(nullptr);
+    return desc;
 }
 
 }  // namespace agent

@@ -130,5 +130,14 @@ try:
 except Exception:  # noqa: BLE001 — optional seam; core methods still register
     pass
 
+# Session commands: compact / shake / handoff / btw (batch 2b).
+try:
+    from ..parts_hub.session_rpc import SESSION_METHODS as _SESSION_METHODS
+    WORKER_METHODS.update(_SESSION_METHODS)
+except Exception as _session_err:  # noqa: BLE001 — optional seam; core methods still register
+    import logging
+    logging.getLogger("ai-cad.worker").warning(
+        "session_rpc unavailable — session_* methods not registered: %s", _session_err)
+
 
 

@@ -4,6 +4,7 @@
 
 #include "agent/providers.h"
 #include "agent/config.h"
+#include "agent/machine.h"
 #include "agent/state.h"
 
 using namespace aicad::agent;
@@ -266,6 +267,53 @@ TEST_CASE("apply_experimental: cad_sequence_mode flag flows through") {
     json cfg = json{{"experimental", {{"cad_sequence_mode", true}}}};
     json out = apply_experimental(json{{"name", "openai"}}, cfg, json::object());
     CHECK(out.value("cad_sequence_mode", false) == true);
+}
+
+TEST_CASE("load_prewalk_config: defaults off / @smol") {
+    PrewalkConfig d = load_prewalk_config(json::object());
+    CHECK(d.enabled == false);
+    CHECK(d.target == "@smol");
+
+    PrewalkConfig on = load_prewalk_config(json{{"agent", {{"prewalk", true},
+                                                          {"prewalk_target", "openai/gpt-4.1-mini"}}}});
+    CHECK(on.enabled == true);
+    CHECK(on.target == "openai/gpt-4.1-mini");
+}
+
+TEST_CASE("resolve_prewalk_provider: off is null; on resolves target") {
+    // Off → null (safe no-op).
+    CHECK(resolve_prewalk_provider(json::object(), json::object()).is_null());
+
+    // Explicit provider/model pattern.
+    json cfg = json{{"agent", {{"prewalk", true}, {"prewalk_target", "openai/gpt-4.1-mini"}}},
+                    {"api_key", "sk-test"},
+                    {"openai", {{"base_url", "http://localhost:1234/v1"}}}};
+    json pw = resolve_prewalk_provider(cfg, json::object());
+    REQUIRE(pw.is_object());
+    CHECK_FALSE(pw.contains("error"));
+    CHECK(pw.value("name", std::string()) == "openai");
+    CHECK(pw.value("model", std::string()) == "gpt-4.1-mini");
+
+    // ai_roles.smol concrete assignment wins for @smol.
+    json cfg2 = json{{"agent", {{"prewalk", true}, {"prewalk_target", "@smol"}}},
+                     {"ai_roles",
+                      {{"smol", {{"provider", "openai"}, {"model", "cheap-local"}}}}},
+                     {"api_key", "sk-test"},
+                     {"openai", {{"base_url", "http://127.0.0.1:1234/v1"}}}};
+    json pw2 = resolve_prewalk_provider(cfg2, json::object());
+    REQUIRE(pw2.is_object());
+    CHECK(pw2.value("model", std::string()) == "cheap-local");
+}
+
+TEST_CASE("is_implementation_stage / is_planning_stage classify prewalk switch") {
+    CHECK(is_planning_stage("intake"));
+    CHECK(is_planning_stage("plan"));
+    CHECK(is_planning_stage("review"));
+    CHECK_FALSE(is_planning_stage("model"));
+    CHECK(is_implementation_stage("model"));
+    CHECK(is_implementation_stage("fix"));
+    CHECK(is_implementation_stage("execute"));
+    CHECK_FALSE(is_implementation_stage("plan"));
 }
 
 TEST_CASE("build_context honors a small cap and reports trimming") {

@@ -12,6 +12,18 @@ const std::map<std::string, int> kDefaultBudgets = {
     {"intake", 1}, {"plan", 2}, {"model", 4}, {"review", 2}, {"fix", 4}, {"memory", 1},
 };
 
+bool is_planning_stage(const std::string& stage) {
+    // Strong-model stages under prewalk: understand / plan / review / memory.
+    // NOT implementation (model apply / fix / micro execute).
+    return stage == "intake" || stage == "plan" || stage == "decompose" || stage == "review" ||
+           stage == "memory" || stage == "mission_plan";
+}
+
+bool is_implementation_stage(const std::string& stage) {
+    // Cheap-model stages under prewalk: first BUILD/model-apply onward.
+    return stage == "model" || stage == "fix" || stage == "execute" || stage == "build";
+}
+
 // --------------------------------------------------------------------------- err_sig
 namespace {
 

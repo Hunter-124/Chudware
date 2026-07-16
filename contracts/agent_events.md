@@ -222,3 +222,18 @@ Effective depth rule (binding): team-lead→worker spawns use effective_cap = ma
 C++ agent_run path now emits agent-level kinds previously Python-only:
 - `agent.thought`: after each provider completion when CompleteResult.thinking is non-empty. Fields: `id`, `text` (cap 4000 on C++; Python thought_event still caps 500), optional `model`, `stage`, `attempt`, `parent_id`, `actor`, `node_id` (=stage or `run`). Batched post-run on in-proc C++ path (no live stream refactor).
 - `agent.tool_call` **args_preview** (optional string, <=~2KB): capped JSON of tool/op args for the Doing drawer. Digests (`args_digest`/`result_digest`) unchanged. Producers: Python `tool_call_event`; C++ synthetic emit after `doc_apply_ops` with `tool_name` = op type (homogeneous) or `doc_apply_ops`, `target` best-effort, `ok`, `latency_ms`. Consumers MUST tolerate unknown fields (additive; no schema bump).
+
+## agent compaction / session settings (batch 2b)
+Config keys under `agent` (Python services/agent/config.py; C++ config.cpp mirrors agent.prewalk*):
+- `agent.compaction_strategy` string default "off" — off|snapcompact|shake|summary
+- `agent.compaction.supersede_reads` bool true; `agent.compaction.drop_useless` bool true; `agent.compaction.keep_recent_tokens` int 20000
+- `agent.prewalk` bool false; `agent.prewalk_target` string "@smol"; `agent.handoff_save_to_disk` bool false
+Engines (pure): services.agent.compaction — serialize_transcript, snapcompact_archive (text-phase; frames=[] future), shake_messages ('[shaken ~N tokens — recover: artifact://<id> (region K)]'), reinject_archive.
+Prewalk (C++): planning stages (intake|plan|decompose|review|memory) keep the strong model; implementation stages (model|fix|execute|build) switch once to agent.prewalk_target; run_note on switch; off = byte-identical.
+
+## Session command RPCs (batch 2b)
+Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host applies result. engine_oracle/parts_hub/session_rpc.py SESSION_METHODS merged into worker_rpc.py WORKER_METHODS.
+- session_compact {messages, strategy, keep_recent_tokens?, supersede_reads?, drop_useless?, prior_archive?} -> {ok, kept_messages, archive?, summary, short_summary}
+- session_shake {messages, mode(elide|images), aggressive?} -> {ok, messages, saved_tokens, notice}
+- session_handoff {messages, focus?, provider, model} -> {ok, document} (## Goal/Constraints/Progress/Key Decisions/Critical Context/Next Steps; new-session is host-side)
+- session_btw {messages, question, provider, model} -> {ok, answer} (ephemeral; never mutates history)

@@ -182,6 +182,104 @@ def get_corporate_config(cfg: dict | None = None) -> dict:
         "director_review": _bool("director_review", DEFAULT_CORPORATE_DIRECTOR_REVIEW),
     }
 
+# --------------------------------------------------------------------------- compaction / session cmds
+# Shared with host + session_cmds (omp port). Nested under ``agent`` unless noted.
+#
+#   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"  (default "off")
+#   agent.compaction.supersede_reads bool (default true)
+#   agent.compaction.drop_useless bool (default true)
+#   agent.compaction.keep_recent_tokens int (default 20000)
+#   agent.prewalk bool (default false)
+#   agent.prewalk_target str (default "@smol")
+#   agent.handoff_save_to_disk bool (default false)
+
+COMPACTION_STRATEGY_KEY = "compaction_strategy"
+COMPACTION_KEY = "compaction"
+PREWALK_KEY = "prewalk"
+PREWALK_TARGET_KEY = "prewalk_target"
+HANDOFF_SAVE_TO_DISK_KEY = "handoff_save_to_disk"
+
+DEFAULT_COMPACTION_STRATEGY: str = "off"
+VALID_COMPACTION_STRATEGIES = frozenset({"off", "snapcompact", "shake", "summary"})
+DEFAULT_COMPACTION_SUPERSEDE_READS: bool = True
+DEFAULT_COMPACTION_DROP_USELESS: bool = True
+DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: int = 20_000
+DEFAULT_PREWALK: bool = False
+DEFAULT_PREWALK_TARGET: str = "@smol"
+DEFAULT_HANDOFF_SAVE_TO_DISK: bool = False
+
+
+def _agent_block(cfg: dict | None = None) -> dict:
+    c = cfg if cfg is not None else load_config()
+    if not isinstance(c, dict):
+        return {}
+    agent = c.get(AGENT_CONFIG_KEY)
+    return agent if isinstance(agent, dict) else {}
+
+
+def get_compaction_strategy(cfg: dict | None = None) -> str:
+    """Return ``agent.compaction_strategy`` (default ``\"off\"``).
+
+    Values: ``off`` | ``snapcompact`` | ``shake`` | ``summary``.
+    Unknown values fall back to :data:`DEFAULT_COMPACTION_STRATEGY`.
+    """
+    agent = _agent_block(cfg)
+    raw = agent.get(COMPACTION_STRATEGY_KEY, DEFAULT_COMPACTION_STRATEGY)
+    s = str(raw or DEFAULT_COMPACTION_STRATEGY).strip().lower()
+    return s if s in VALID_COMPACTION_STRATEGIES else DEFAULT_COMPACTION_STRATEGY
+
+
+def get_compaction_config(cfg: dict | None = None) -> dict:
+    """Return normalized ``agent.compaction`` nested settings.
+
+    Keys (with defaults):
+      supersede_reads (bool, default True)
+      drop_useless (bool, default True)
+      keep_recent_tokens (int, default 20000, clamped ≥ 0)
+    """
+    agent = _agent_block(cfg)
+    raw = agent.get(COMPACTION_KEY)
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _bool(key: str, default: bool) -> bool:
+        if key not in raw:
+            return default
+        return bool(raw.get(key))
+
+    try:
+        keep = int(raw.get("keep_recent_tokens", DEFAULT_COMPACTION_KEEP_RECENT_TOKENS))
+    except (TypeError, ValueError):
+        keep = DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
+    keep = max(0, keep)
+
+    return {
+        "supersede_reads": _bool("supersede_reads", DEFAULT_COMPACTION_SUPERSEDE_READS),
+        "drop_useless": _bool("drop_useless", DEFAULT_COMPACTION_DROP_USELESS),
+        "keep_recent_tokens": keep,
+    }
+
+
+def prewalk_enabled(cfg: dict | None = None) -> bool:
+    """Return ``agent.prewalk`` (bool, default False)."""
+    agent = _agent_block(cfg)
+    return bool(agent.get(PREWALK_KEY, DEFAULT_PREWALK))
+
+
+def get_prewalk_target(cfg: dict | None = None) -> str:
+    """Return ``agent.prewalk_target`` (str, default ``\"@smol\"``)."""
+    agent = _agent_block(cfg)
+    raw = agent.get(PREWALK_TARGET_KEY, DEFAULT_PREWALK_TARGET)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_PREWALK_TARGET
+    return str(raw).strip()
+
+
+def handoff_save_to_disk(cfg: dict | None = None) -> bool:
+    """Return ``agent.handoff_save_to_disk`` (bool, default False)."""
+    agent = _agent_block(cfg)
+    return bool(agent.get(HANDOFF_SAVE_TO_DISK_KEY, DEFAULT_HANDOFF_SAVE_TO_DISK))
+
+
 
 
 

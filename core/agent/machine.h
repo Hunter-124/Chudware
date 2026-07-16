@@ -29,6 +29,12 @@ constexpr int kGlobalIterCap = 60;
 constexpr int kSameSigLimit = 3;
 constexpr int kStagnationLimit = 3;
 
+// Stage classification for prewalk (strong-plan / cheap-implement) and similar
+// per-stage model routing. Planning stages keep the strong model; implementation
+// stages switch to agent.prewalk_target when armed.
+bool is_planning_stage(const std::string& stage);       // intake|plan|decompose|review|memory
+bool is_implementation_stage(const std::string& stage);  // model|fix|execute|build
+
 // A stable signature for an error string: the exception line if present, else
 // the last nonempty line. Hand-rolled regex check (no std::regex).
 std::string err_sig(const std::string& err);

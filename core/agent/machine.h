@@ -62,6 +62,9 @@ struct StageOutcome {
     bool has_tokens = false;
     json tokens = nullptr;
     bool no_progress = false;
+    // Provider reasoning (CompleteResult.thinking) — emitted as agent.thought.
+    std::string thinking;
+    std::string model;  // optional provider model id for the thought row
 };
 
 // Action takes (state, attempt) -> StageOutcome (mutating state as a side effect).

@@ -18,9 +18,16 @@ namespace agent {
 using nlohmann::json;
 
 constexpr int kRawCap = 16 * 1024;  // 16 KB.
+// Caps for agent.thought / agent.tool_call stream fields (copilot Thinking/Doing).
+constexpr int kThoughtCap = 4000;
+constexpr int kArgsPreviewCap = 2048;
 
 // "" if falsy; text if len<=cap; else text[:cap] + truncation marker.
 std::string cap_raw(const std::string& text);
+// Truncate to n chars with a single "…" when longer (agent-level event fields).
+std::string cap_text(const std::string& text, int n);
+// Opaque 16-hex span id for agent-level events (contract §2.1).
+std::string new_span_id();
 
 // CACHE/"runs"/run_id (mkdir -p).
 std::filesystem::path run_dir(const std::string& run_id);
@@ -46,6 +53,27 @@ private:
     std::filesystem::path jsonl_;
     Callback cb_;
 };
+
+// Emit agent.thought when text is non-empty (no-op if empty). Additive stream field
+// for model reasoning that CompleteResult already parses but used to drop.
+json emit_agent_thought(RunEvents& ev,
+                        const std::string& text,
+                        const std::string& model = "",
+                        const std::string& stage = "",
+                        int attempt = 0,
+                        const std::string& parent_id = "",
+                        const std::string& actor = "");
+
+// Synthetic agent.tool_call after a successful op apply (Doing row with args_preview).
+// args may be an ops array or a single-op object; tool_name/target may be empty to derive.
+json emit_agent_tool_call(RunEvents& ev,
+                          const std::string& tool_name,
+                          const std::string& target,
+                          const json& args,
+                          bool ok,
+                          int latency_ms,
+                          const std::string& parent_id = "",
+                          const std::string& actor = "");
 
 // ---------------------------------------------------------------------------
 // Telemetry helpers — emit the standard ai_artifact / ai_artifact_action /

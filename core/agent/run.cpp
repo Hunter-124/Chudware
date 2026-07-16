@@ -173,8 +173,9 @@ void store_memory(const std::string& run_id, const ojson& mem) {
 // A reply + duration + meta, exactly like run.py _agent_call returns.
 struct AgentCall {
     std::string reply;
+    std::string thinking;
+    std::string model;
     int duration_ms = 0;
-    // event meta fields:
     std::string prompt_file;
     std::string prompt_hash;
     int context_chars = 0;
@@ -187,6 +188,8 @@ struct AgentCall {
 // A reply + error from one provider completion (mirrors complete_ex).
 struct ProvReply {
     std::string text;
+    std::string thinking;
+    std::string model;
     bool has_error = false;
     std::string error;
 };
@@ -215,6 +218,8 @@ ProviderFn make_provider(const json& provider_cfg) {
     return [name, cfg](const std::string& system, const json& messages, int max_tokens) -> ProvReply {
         ProvReply r;
         CompleteResult cr = complete(name, cfg, system, messages, max_tokens);
+        r.thinking = cr.thinking;
+        r.model = !cr.model.empty() ? cr.model : cfg.value("model", std::string());
         if (!cr.error.empty()) {
             r.has_error = true;
             r.error = cr.error;
@@ -259,6 +264,8 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
     auto t1 = std::chrono::steady_clock::now();
     ac.duration_ms =
         static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    ac.thinking = rep.thinking;
+    ac.model = rep.model;
     if (rep.has_error) {
         ac.reply = "";
         ac.has_call_error = true;
@@ -408,17 +415,27 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.context_tokens_est = ac.context_tokens_est;
         o.inputs_digest = ac.inputs_digest;
         o.duration_ms = ac.duration_ms;
+        o.thinking = ac.thinking;
+        o.model = ac.model;
     };
 
     // _apply(ops): doc_apply_ops at state.revision; update rev + tree; collect status errors.
+    // On success (and on apply-with-status-errors) emit synthetic agent.tool_call Doing row.
     auto apply_ops = [&](DesignState& st, const json& ops) -> std::vector<std::string> {
+        auto t0 = std::chrono::steady_clock::now();
         json resp = doc::doc_apply_ops(doc_id, st.revision, ops, /*coalesce=*/false);
+        auto t1 = std::chrono::steady_clock::now();
+        int lat = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
         st.update_revision(resp.value("revision", st.revision));
         st.update_tree(tree_to_ojson(resp.contains("tree") ? resp["tree"] : json::object()));
         json fs = json::array();
         if (resp.contains("rebuild") && resp["rebuild"].contains("feature_status"))
             fs = resp["rebuild"]["feature_status"];
-        return status_errors(fs);
+        std::vector<std::string> errs = status_errors(fs);
+        emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops,
+                             /*ok=*/errs.empty(), lat, /*parent_id=*/"", /*actor=*/"modeler");
+        return errs;
     };
 
     // ---- INTAKE ----
@@ -632,14 +649,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         if (review_vision && st.last_render.is_string() && !st.last_render.get<std::string>().empty())
             review_parts.push_back(image_part(st.last_render.get<std::string>()));
         json messages = json::array({user_message(review_parts)});
-        // run.py review() does NOT prepend "ROLE:" — it passes the bare build_context
-        // system. The RoleScriptedProvider sniffs "you are the reviewer" from the prompt's
-        // first line, so routing is correct without the marker (matching Python byte-for-byte).
         auto t0 = std::chrono::steady_clock::now();
         ProvReply rep = review_provider(bc.system, messages, review_budget);  // review-scaled budget
         auto t1 = std::chrono::steady_clock::now();
         o.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        o.thinking = rep.thinking;
+        o.model = rep.model;
         std::string reply = rep.has_error ? std::string() : rep.text;
         o.raw = reply;
         ojson verdict = extract_json_obj(reply);

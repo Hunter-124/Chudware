@@ -352,15 +352,38 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 
 int main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN__
+    // Web client: skip desktop CLI modes entirely. Report progress via Module.setStatus
+    // (shell.html) which is reliable from the browser main thread.
+    EM_ASM({
+        try {
+            if (Module.setStatus) Module.setStatus('main enter');
+            if (!window.__billetLogs) window.__billetLogs = [];
+            window.__billetLogs.push('boot: main enter');
+            console.log('boot: main enter');
+        } catch (e) { console.error(e); }
+    });
     std::fprintf(stderr, "[wasm-boot] main enter\n");
     std::fflush(stderr);
-    MAIN_THREAD_EM_ASM({
-        var el = document.getElementById('status');
-        if (el) el.textContent = 'main enter';
-        if (!window.__billetLogs) window.__billetLogs = [];
-        window.__billetLogs.push('boot: main enter');
+    propagateBilletEnv();
+    ensurePromptsDir();
+    EM_ASM({
+        try {
+            if (Module.setStatus) Module.setStatus('calling run_gui');
+            if (!window.__billetLogs) window.__billetLogs = [];
+            window.__billetLogs.push('boot: calling run_gui');
+            console.log('boot: calling run_gui');
+        } catch (e) { console.error(e); }
     });
-#endif
+    const int rc = run_gui(nullptr);
+    EM_ASM({
+        try {
+            if (Module.setStatus) Module.setStatus('run_gui returned ' + $0);
+            if (!window.__billetLogs) window.__billetLogs = [];
+            window.__billetLogs.push('boot: run_gui returned ' + $0);
+        } catch (e) {}
+    }, rc);
+    return rc;
+#else
     // FIRST: mirror BILLET_* env vars onto the legacy AI_CAD_*/AICAD_* names every
     // subsystem (and every child process we spawn) actually reads.
     propagateBilletEnv();
@@ -470,6 +493,15 @@ int main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN__
     std::fprintf(stderr, "[wasm-boot] calling run_gui\n");
     std::fflush(stderr);
+    EM_ASM({
+        var el = document.getElementById('status');
+        if (el) el.textContent = 'calling run_gui';
+        if (!window.__billetLogs) window.__billetLogs = [];
+        window.__billetLogs.push('boot: calling run_gui');
+        console.log('boot: calling run_gui');
+    });
 #endif
     return run_gui(nullptr);
+#endif  // !__EMSCRIPTEN__
+
 }

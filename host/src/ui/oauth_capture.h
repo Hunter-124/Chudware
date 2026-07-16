@@ -9,6 +9,10 @@
 //   4. watches status (and URL heuristics) until the Python poll completes
 //   5. offers "Add another account" with a cookie wipe so the next login is isolated
 //
+// First login of a session skips the pre-wipe (start device-code RPC immediately).
+// Subsequent "Add another" still isolates via clearSession, with a hard timeout so
+// isolationPending_ can never wedge the modal on "Resetting browser session…".
+//
 // Fallback: when makeWebView()->available() is false (SDK-less build / CEF init
 // failed), callers keep the external-browser subscription_login path.
 #pragma once
@@ -86,10 +90,12 @@ private:
     bool   loginRpcInFlight_ = false;
     bool   statusPollInFlight_ = false;
     bool   browserOpened_ = false;
-    bool   isolationPending_ = false;  // wipe cookies before next add
-    bool   pendingWipeThenLogin_ = false;  // open about:blank first, then wipe+login
+    bool   isolationPending_ = false;  // wipe cookies before next add (2nd+)
+    bool   needsIsolationBeforeLogin_ = false;  // true after a completed login
+    double isolationStartedAt_ = -1.0; // ImGui time when wipe began; for UI timeout
     double lastStatusPoll_ = -1e9;
     int    sessionGen_ = 0;            // bumps on each begin / add-another
+    std::function<void()> isolationThen_;  // continuation after wipe (or timeout)
 };
 
 // Process-wide singleton used by Settings → Accounts (function-static in .cpp

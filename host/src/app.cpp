@@ -15,6 +15,9 @@
 // Worker stderr often never reaches the page console under PROXY_TO_PTHREAD;
 // always mirror the last checkpoint onto #status via the browser main thread.
 inline void wasmBootDom(const char* msg) {
+    // EM_ASM runs on the current thread; with PROXY_TO_PTHREAD this is a worker
+    // so prefer MAIN_THREAD_EM_ASM. Without proxy, both are the browser thread.
+#if defined(__EMSCRIPTEN_PTHREADS__)
     MAIN_THREAD_EM_ASM({
         var el = document.getElementById('status');
         if (el) el.textContent = UTF8ToString($0);
@@ -22,8 +25,20 @@ inline void wasmBootDom(const char* msg) {
             if (!window.__billetLogs) window.__billetLogs = [];
             window.__billetLogs.push('boot: ' + UTF8ToString($0));
             if (window.__billetLogs.length > 400) window.__billetLogs.shift();
+            console.log('boot: ' + UTF8ToString($0));
         } catch (e) {}
     }, msg);
+#else
+    EM_ASM({
+        var el = document.getElementById('status');
+        if (el) el.textContent = UTF8ToString($0);
+        try {
+            if (!window.__billetLogs) window.__billetLogs = [];
+            window.__billetLogs.push('boot: ' + UTF8ToString($0));
+            console.log('boot: ' + UTF8ToString($0));
+        } catch (e) {}
+    }, msg);
+#endif
 }
 #define WASM_BOOT_LOG(...) do { \
     std::fprintf(stderr, __VA_ARGS__); std::fflush(stderr); \
@@ -889,9 +904,10 @@ WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
     if (!glfwInit()) return 1;
 #endif
 #ifdef __EMSCRIPTEN__
+    // CLIENT_API must be set before version hints (contrib.glfw3 / WebGL).
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
 #else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -4324,6 +4340,10 @@ WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
             break;
         }
         glfwSwapBuffers(win);
+#ifdef __EMSCRIPTEN__
+        // ASYNCIFY: yield to the browser event loop so WebSocket/timer callbacks run.
+        emscripten_sleep(0);
+#endif
     }
 
     // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE exit.

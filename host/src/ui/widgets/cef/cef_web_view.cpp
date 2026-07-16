@@ -24,6 +24,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <atomic>
+
 
 #include <glad/gl.h>
 
@@ -534,7 +536,14 @@ public:
                      ErrorCode errorCode, const CefString& errorText,
                      const CefString& failedUrl) override {
         if (!frame->IsMain()) return;                 // sub-resource error — ignore
-        if (errorCode == ERR_ABORTED) return;         // navigation superseded — not fatal
+        // ERR_ABORTED = navigation superseded. Still release any armed one-shot
+        // load-end waiter so multi-hop chains cannot hang forever.
+        if (errorCode == ERR_ABORTED) {
+            std::function<void(const std::string&, bool)> cb;
+            { std::lock_guard<std::mutex> lk(s_->mtx); cb.swap(s_->onMainLoadEnd); }
+            if (cb) cb(failedUrl.ToString(), false);
+            return;
+        }
         const std::string msg = errorText.ToString();
         CEF_TRACE("OnLoadError code=%d '%s' url=%s", (int)errorCode, msg.c_str(),
                   failedUrl.ToString().c_str());
@@ -983,12 +992,13 @@ private:
 };
 
 void CefWebView::clearSession(AppState& /*st*/, std::function<void()> done) {
-    // Multi-account OAuth isolation (Settings → Accounts "Add another" / begin):
-    // 1. Delete ALL cookies on the live request context (panel_profile_dir jar).
-    // 2. Navigate to the xAI auth origin, wait for OnLoadEnd, then inject
-    //    localStorage/sessionStorage clear IN THAT ORIGIN, park on about:blank,
-    //    and finally invoke done. Gating on load end is required — injects that
-    //    fire before the origin loads clear the wrong sandbox.
+    // Multi-account OAuth isolation (Settings → Accounts "Add another"):
+    // Delete x.ai cookies on the live request context, park on about:blank, and
+    // invoke done. Prefer a reliable cookie wipe over multi-hop SPA navigations
+    // (logout + auth.x.ai) that could miss OnLoadEnd / hang forever.
+    //
+    // HARD DEADLINE (~4s): if DeleteCookies OnComplete never arrives, still call
+    // done() so OauthCapture cannot wedge on "Resetting browser session…".
     Client* c = impl_->client.get();
     if (!c || !c->browser()) {
         CEF_TRACE("clearSession: no live browser — nothing to wipe");
@@ -998,71 +1008,57 @@ void CefWebView::clearSession(AppState& /*st*/, std::function<void()> done) {
     CEF_REQUIRE_UI_THREAD();
     CefRefPtr<CefBrowser> browser = c->browser();
     auto shared = impl_->s;
+    // Drop any prior load-end waiter (stale hop from a previous wipe attempt).
+    {
+        std::lock_guard<std::mutex> lk(shared->mtx);
+        shared->onMainLoadEnd = nullptr;
+    }
+
     CefRefPtr<CefRequestContext> rctx = browser->GetHost()->GetRequestContext();
     CefRefPtr<CefCookieManager> mgr = rctx ? rctx->GetCookieManager(nullptr) : nullptr;
 
-    static const char* kClearJs = R"JS(
-(function(){
-  try { localStorage.clear(); } catch(e) {}
-  try { sessionStorage.clear(); } catch(e) {}
-  try {
-    var cookies = document.cookie ? document.cookie.split(';') : [];
-    for (var i = 0; i < cookies.length; i++) {
-      var eq = cookies[i].indexOf('=');
-      var name = (eq > -1 ? cookies[i].substr(0, eq) : cookies[i]).replace(/^\s+|\s+$/g, '');
-      if (!name) continue;
-      document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
-      document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.x.ai';
-      document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.accounts.x.ai';
-      document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.auth.x.ai';
-    }
-  } catch(e) {}
-})();
-)JS";
-
-    // After cookies are gone: load auth origin → on load inject clear → blank → done.
-    auto afterCookies = [browser, shared, done]() {
-        if (!browser || !browser->GetMainFrame()) {
-            if (done) done();
-            return;
-        }
-        // Arm one-shot BEFORE LoadURL so a fast cache hit cannot race past us.
-        {
-            std::lock_guard<std::mutex> lk(shared->mtx);
-            shared->onMainLoadEnd =
-                [browser, shared, done](const std::string& url, bool /*ok*/) {
-                CEF_TRACE("clearSession: auth origin loaded %s — clearing storage",
-                          url.c_str());
-                if (browser && browser->GetMainFrame()) {
-                    browser->GetMainFrame()->ExecuteJavaScript(
-                        kClearJs, browser->GetMainFrame()->GetURL(), 0);
-                    // Second hop: auth.x.ai (OIDC issuer may hold its own storage).
-                    std::lock_guard<std::mutex> lk2(shared->mtx);
-                    shared->onMainLoadEnd =
-                        [browser, done](const std::string& url2, bool /*ok2*/) {
-                        CEF_TRACE("clearSession: second origin loaded %s", url2.c_str());
-                        if (browser && browser->GetMainFrame()) {
-                            browser->GetMainFrame()->ExecuteJavaScript(
-                                kClearJs, browser->GetMainFrame()->GetURL(), 0);
-                            browser->GetMainFrame()->LoadURL("about:blank");
-                        }
-                        if (done) done();
-                    };
-                }
-                if (browser && browser->GetMainFrame())
-                    browser->GetMainFrame()->LoadURL("https://auth.x.ai/");
-            };
-        }
-        CEF_TRACE("clearSession: LoadURL accounts.x.ai for storage wipe");
-        browser->GetMainFrame()->LoadURL("https://accounts.x.ai/logout");
+    // Once-only finish: timeout and cookie-complete race; first wins.
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    auto finish = [finished, done, browser](const char* why) {
+        bool expected = false;
+        if (!finished->compare_exchange_strong(expected, true)) return;
+        CEF_TRACE("clearSession: done (%s)", why ? why : "?");
+        if (browser && browser->GetMainFrame())
+            browser->GetMainFrame()->LoadURL("about:blank");
+        if (done) done();
     };
 
+    // Delayed timeout task on TID_UI (same thread as DeleteCookies callbacks).
+    class ClearSessionTimeout : public CefTask {
+    public:
+        explicit ClearSessionTimeout(std::function<void()> fn) : fn_(std::move(fn)) {}
+        void Execute() override {
+            if (fn_) {
+                auto f = std::move(fn_);
+                fn_ = nullptr;
+                f();
+            }
+        }
+    private:
+        std::function<void()> fn_;
+        IMPLEMENT_REFCOUNTING(ClearSessionTimeout);
+    };
+    constexpr int kClearSessionTimeoutMs = 4000;
+    CefPostDelayedTask(TID_UI,
+                       new ClearSessionTimeout([finish]() {
+                           finish("timeout 4s — proceeding without full wipe");
+                       }),
+                       kClearSessionTimeoutMs);
+
     if (!mgr) {
-        CEF_TRACE("clearSession: no cookie manager — storage wipe only");
-        afterCookies();
+        CEF_TRACE("clearSession: no cookie manager — finish immediately");
+        finish("no cookie manager");
         return;
     }
-    CEF_TRACE("clearSession: DeleteCookies for x.ai hosts only (preserve vendor jar)");
+
+    CEF_TRACE("clearSession: DeleteCookies for x.ai hosts only (preserve vendor jar; "
+              "timeout %dms)",
+              kClearSessionTimeoutMs);
     // Do NOT wipe the whole panel profile — it is shared with the Web tab and
     // Parts Library (Google/Cloudflare/reCAPTCHA trust). Scope to xAI auth hosts.
     static const char* kXaiCookieUrls[] = {
@@ -1072,26 +1068,18 @@ void CefWebView::clearSession(AppState& /*st*/, std::function<void()> done) {
         "https://grok.x.ai/",
         "https://api.x.ai/",
     };
-    // Chain deletes; fire afterCookies once the last completes.
     const int nUrls = (int)(sizeof(kXaiCookieUrls) / sizeof(kXaiCookieUrls[0]));
     auto remaining = std::make_shared<int>(nUrls);
-    auto afterAll = std::make_shared<std::function<void()>>(afterCookies);
     for (int i = 0; i < nUrls; ++i) {
         CefRefPtr<CefDeleteCookiesCallback> cb = new CookieDeleteDone(
-            [remaining, afterAll]() {
-                if (--(*remaining) == 0 && *afterAll) {
-                    auto fn = std::move(*afterAll);
-                    *afterAll = nullptr;
-                    fn();
-                }
+            [remaining, finish]() {
+                if (--(*remaining) == 0)
+                    finish("cookies deleted");
             });
         if (!mgr->DeleteCookies(CefString(kXaiCookieUrls[i]), CefString(), cb)) {
-            // Refused — count it as done so we never hang.
-            if (--(*remaining) == 0 && *afterAll) {
-                auto fn = std::move(*afterAll);
-                *afterAll = nullptr;
-                fn();
-            }
+            // Refused — count it as done so we never hang on this host alone.
+            if (--(*remaining) == 0)
+                finish("cookies deleted (partial refuse)");
         }
     }
     mgr->FlushStore(nullptr);

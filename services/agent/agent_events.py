@@ -151,6 +151,7 @@ def tool_call_event(
     node_id: str, tool_name: str, args: dict | None, result: Any, *,
     ok: bool, latency_ms: float, span_id: str | None = None,
     parent_id: str | None = None, actor: str | None = None,
+    args_preview: str | None = None,
 ) -> tuple[str, dict]:
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
@@ -162,6 +163,15 @@ def tool_call_event(
         "ok": bool(ok),
         "latency_ms": round(float(latency_ms), 2),
     })
+    # Additive: optional capped args JSON for Doing drawer (consumers ignore if unknown).
+    preview = args_preview
+    if preview is None and args is not None:
+        try:
+            preview = json.dumps(args, default=str, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            preview = str(args)
+    if preview:
+        payload["args_preview"] = _cap(preview, 2048)
     return "agent.tool_call", payload
 
 

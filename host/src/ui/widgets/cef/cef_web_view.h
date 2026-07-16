@@ -59,9 +59,8 @@ public:
     void exportSession(AppState& st, const std::string& site,
                        std::function<void(bool)> done) override;
 
-    // Multi-account OAuth isolation: delete cookies on the live request context
-    // and clear localStorage/sessionStorage on the auth origin before the next
-    // sign-in (see clearSession in .cpp). GL/UI thread.
+    // Multi-account OAuth isolation: delete x.ai cookies on the live request
+    // context (hard ~4s timeout — always invokes done). GL/UI thread.
     void clearSession(AppState& st, std::function<void()> done = nullptr) override;
 
 private:

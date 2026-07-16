@@ -101,6 +101,8 @@ void OauthCapture::onLoginSucceeded(AppState& st, const std::string& email,
     lastError_.clear();
     lastHint_.clear();
     loginRpcInFlight_ = false;
+    // Next beginXai / Add account must wipe so multi-account stays isolated.
+    needsIsolationBeforeLogin_ = true;
     // Toast only — membership re-poll is driven by Settings status edge.
     st.toast(ui::ToastLevel::Success,
              email.empty() ? "xAI account connected"
@@ -158,13 +160,24 @@ void OauthCapture::openVerifyInCef(AppState& st) {
 
 void OauthCapture::resetBrowserSession(AppState& st, std::function<void()> then) {
     if (!web_) {
+        isolationPending_ = false;
+        isolationThen_ = nullptr;
+        isolationStartedAt_ = -1.0;
         if (then) then();
         return;
     }
     isolationPending_ = true;
-    web_->clearSession(st, [this, then]() {
+    isolationStartedAt_ = ImGui::GetTime();
+    isolationThen_ = std::move(then);
+    const int gen = sessionGen_;
+    web_->clearSession(st, [this, gen]() {
+        if (gen != sessionGen_) return;  // superseded by close / restart
+        if (!isolationPending_) return;  // already finished via UI timeout
         isolationPending_ = false;
-        if (then) then();
+        isolationStartedAt_ = -1.0;
+        auto cont = std::move(isolationThen_);
+        isolationThen_ = nullptr;
+        if (cont) cont();
     });
 }
 
@@ -176,7 +189,6 @@ void OauthCapture::beginXai(AppState& st) {
                       "Use the external browser sign-in path.");
         return;
     }
-    phase_ = Phase::StartingLogin;
     lastError_.clear();
     lastHint_.clear();
     userCode_.clear();
@@ -184,12 +196,27 @@ void OauthCapture::beginXai(AppState& st) {
     browserOpened_ = false;
     connectedEmail_.clear();
     connectedAccountId_.clear();
-    isolationPending_ = true;
-    pendingWipeThenLogin_ = true;
-    // clearSession needs a live CefBrowser. Seed about:blank so CreateBrowser
-    // runs; draw() finishes the wipe+login once active/starting settles.
-    // Wipe is scoped to x.ai hosts only (shared panel profile with Web tab).
-    web_->open(st, "about:blank", /*isUrl=*/true);
+
+    // First login: start device-code RPC immediately (no pre-wipe).
+    // 2nd+ add (after a completed login, or explicit "Add another"): wipe first
+    // with timeout guard so isolationPending_ cannot wedge the modal.
+    if (!needsIsolationBeforeLogin_) {
+        isolationPending_ = false;
+        isolationStartedAt_ = -1.0;
+        isolationThen_ = nullptr;
+        startLoginRpc(st);
+        return;
+    }
+    phase_ = Phase::StartingLogin;
+    // clearSession needs a live CefBrowser when possible; seed about:blank if
+    // none yet, then wipe. Timeout in draw()/clearSession always continues.
+    if (!web_->active() && !web_->starting())
+        web_->open(st, "about:blank", /*isUrl=*/true);
+    const int gen = sessionGen_;
+    resetBrowserSession(st, [this, &st, gen]() {
+        if (gen != sessionGen_) return;
+        startLoginRpc(st);
+    });
 }
 
 void OauthCapture::close(AppState& st) {
@@ -198,7 +225,8 @@ void OauthCapture::close(AppState& st) {
     loginRpcInFlight_ = false;
     statusPollInFlight_ = false;
     isolationPending_ = false;
-    pendingWipeThenLogin_ = false;
+    isolationStartedAt_ = -1.0;
+    isolationThen_ = nullptr;
     userCode_.clear();
     verifyUrl_.clear();
     lastError_.clear();
@@ -234,7 +262,7 @@ void OauthCapture::pollStatus(AppState& st, bool force) {
         std::string vurl = optStr(x, "verification_url");
         if (vurl.empty()) vurl = optStr(x, "verification_uri");
         if (vurl.empty() && !code.empty())
-            vurl = "https://accounts.x.ai/activate";
+            vurl = "https://accounts.x.ai/oauth2/device?user_code=" + code;
 
         if (!code.empty()) userCode_ = code;
         if (!vurl.empty()) verifyUrl_ = vurl;
@@ -287,32 +315,27 @@ void OauthCapture::draw(AppState& st, float sc) {
 
     if (web_) web_->update(st);
 
-    // beginXai opened about:blank first; once the browser exists, wipe x.ai
-    // session then start subscription_login. Without this gate clearSession
-    // early-returns on a null browser and isolation is a no-op.
-    if (pendingWipeThenLogin_ && web_ && (web_->active() || !web_->starting())) {
-        // active() true → OnPaint landed; !starting after open means either
-        // ready or failed. Prefer active; also proceed if url is about:blank
-        // and not starting (create finished).
-        const bool browserReady = web_->active() ||
-            (!web_->starting() && !web_->url().empty());
-        // While still "starting" with empty url, keep waiting.
-        if (web_->starting() && !web_->active()) {
-            // still creating
-        } else if (browserReady || !web_->starting()) {
-            pendingWipeThenLogin_ = false;
-            const int gen = sessionGen_;
-            resetBrowserSession(st, [this, &st, gen]() {
-                if (gen != sessionGen_) return;
-                startLoginRpc(st);
-            });
-        }
+    // Isolation wipe timeout escape hatch (UI-thread). clearSession also has a
+    // CEF-side ~4s deadline; this catches the rare case where even that path
+    // stalls before invoking done, so "Resetting…" can never stick forever.
+    constexpr double kIsolationUiTimeoutSec = 4.5;
+    if (isolationPending_ && isolationStartedAt_ >= 0.0 &&
+        (ImGui::GetTime() - isolationStartedAt_) >= kIsolationUiTimeoutSec) {
+        std::fprintf(stderr,
+                     "[oauth] isolation wipe UI timeout (%.1fs) — proceeding with login\n",
+                     kIsolationUiTimeoutSec);
+        std::fflush(stderr);
+        isolationPending_ = false;
+        isolationStartedAt_ = -1.0;
+        auto cont = std::move(isolationThen_);
+        isolationThen_ = nullptr;
+        if (cont) cont();
     }
 
     // Always poll while modal is open (except pure Success/Error idle).
-    if (!pendingWipeThenLogin_ &&
-        (phase_ == Phase::StartingLogin || phase_ == Phase::AwaitingCode ||
-         phase_ == Phase::Browsing))
+    // isolationPending_ still allows poll so a concurrent wipe can't hide progress.
+    if (phase_ == Phase::StartingLogin || phase_ == Phase::AwaitingCode ||
+        phase_ == Phase::Browsing)
         pollStatus(st, /*force=*/false);
 
     // Soft URL intercept: approval-success page is a UX hint; Python remains source of truth.
@@ -343,7 +366,9 @@ void OauthCapture::draw(AppState& st, float sc) {
     ImGui::TextUnformatted("xAI SuperGrok");
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.textDim));
-    if (phase_ == Phase::StartingLogin || isolationPending_)
+    if (isolationPending_)
+        ImGui::TextUnformatted("— resetting browser session\xe2\x80\xa6");
+    else if (phase_ == Phase::StartingLogin)
         ImGui::TextUnformatted("— preparing sign-in\xe2\x80\xa6");
     else if (phase_ == Phase::AwaitingCode)
         ImGui::TextUnformatted("— waiting for device code\xe2\x80\xa6");
@@ -426,7 +451,8 @@ void OauthCapture::draw(AppState& st, float sc) {
     const float footerH = 36.0f * sc;
     const ImVec2 body(avail.x, std::max(120.0f * sc, avail.y - footerH));
 
-    if (web_ && (phase_ == Phase::Browsing || web_->starting() || web_->active())) {
+    if (!isolationPending_ && web_ &&
+        (phase_ == Phase::Browsing || web_->starting() || web_->active())) {
         if (web_->starting() && !web_->active()) {
             ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.textDim));
             ImGui::TextUnformatted("Loading approve page\xe2\x80\xa6");
@@ -453,6 +479,22 @@ void OauthCapture::draw(AppState& st, float sc) {
                 ? "Resetting browser session\xe2\x80\xa6"
                 : "Requesting device code from xAI\xe2\x80\xa6");
         ImGui::PopStyleColor();
+        if (isolationPending_) {
+            ImGui::Dummy(ImVec2(0, 8.0f * sc));
+            if (ImGui::Button("Skip reset & continue", ImVec2(180.0f * sc, 0))) {
+                isolationPending_ = false;
+                isolationStartedAt_ = -1.0;
+                auto cont = std::move(isolationThen_);
+                isolationThen_ = nullptr;
+                if (cont) cont();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Proceed with sign-in without waiting for the browser session wipe.");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel reset", ImVec2(120.0f * sc, 0)))
+                close(st);
+        }
         ImGui::Dummy(body);
     }
 

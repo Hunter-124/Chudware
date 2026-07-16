@@ -344,6 +344,8 @@ bool is_cut(const Step& step) {
 
 struct ProvReply {
     std::string text;
+    std::string thinking;
+    std::string model;
     bool has_error = false;
     std::string error;
 };
@@ -365,6 +367,8 @@ ProviderFn make_provider(const json& provider_cfg) {
     return [name, cfg](const std::string& system, const json& messages, int max_tokens) -> ProvReply {
         ProvReply r;
         CompleteResult cr = complete(name, cfg, system, messages, max_tokens);
+        r.thinking = cr.thinking;
+        r.model = !cr.model.empty() ? cr.model : cfg.value("model", std::string());
         if (!cr.error.empty()) {
             r.has_error = true;
             r.error = cr.error;
@@ -379,6 +383,8 @@ ProviderFn make_provider(const json& provider_cfg) {
 // _provider_call: one bounded call; returns (reply, duration_ms, error). Never raises.
 struct CallResult {
     std::string reply;
+    std::string thinking;
+    std::string model;
     int duration_ms = 0;
     bool has_error = false;
     std::string error;
@@ -391,6 +397,8 @@ CallResult provider_call(const ProviderFn& provider, const std::string& system,
     CallResult cr;
     cr.duration_ms =
         static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    cr.thinking = rep.thinking;
+    cr.model = rep.model;
     if (rep.has_error) {
         cr.has_error = true;
         cr.error = rep.error;
@@ -847,6 +855,10 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                        {"duration_ms", dcall.duration_ms}};
         events.emit("agent_output", ev);
     }
+    if (!dcall.thinking.empty()) {
+        emit_agent_thought(events, dcall.thinking, dcall.model, "decompose", 1,
+                           /*parent_id=*/"", /*actor=*/"decomposer");
+    }
 
     if (dcall.has_error) {
         std::string reason = "provider error: " + dcall.error;
@@ -930,6 +942,10 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
             CallResult ecall = provider_call(provider, system, user_body(ep.body), micro_budget);  // reasoning headroom (see decompose)
             std::string sc = events.write_sidecar("execute_" + std::to_string(i), attempt,
                                                   ecall.reply);
+            if (!ecall.thinking.empty()) {
+                emit_agent_thought(events, ecall.thinking, ecall.model, "execute", attempt,
+                                   /*parent_id=*/"", /*actor=*/"executor");
+            }
             OpsResult ores = extract_ops(ecall.reply);
             if (!ores.ops) {
                 std::string perr = ores.error.value_or("");
@@ -969,7 +985,11 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                 continue;
             }
             try {
+                auto t0 = std::chrono::steady_clock::now();
                 json resp = doc::doc_apply_ops(doc_id, cur.revision, ops, /*coalesce=*/false);
+                auto t1 = std::chrono::steady_clock::now();
+                int lat = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
                 applied = true;
                 json fs = json::array();
                 if (resp.contains("rebuild") && resp["rebuild"].contains("feature_status"))
@@ -981,6 +1001,8 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                         ok = false;
                         break;
                     }
+                emit_agent_tool_call(events, /*tool_name=*/"", /*target=*/"", ops, ok, lat,
+                                     /*parent_id=*/"", /*actor=*/"executor");
                 break;
             } catch (const std::exception& e) {
                 last_err = std::string("apply failed: ") + e.what();

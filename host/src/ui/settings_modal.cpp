@@ -788,7 +788,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 }
                 const std::string fallbackUrl =
                     prog.verifyUrl.empty()
-                        ? (std::string(prov) == "xai" ? "https://accounts.x.ai/activate"
+                        ? (std::string(prov) == "xai" ? "https://accounts.x.ai/oauth2/device"
                                                       : prog.verifyUrl)
                         : prog.verifyUrl;
                 if (!fallbackUrl.empty()) {

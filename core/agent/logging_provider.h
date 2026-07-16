@@ -105,10 +105,11 @@ ProviderFn wrap_logging(
                 }
                 input_ref = req_p.string();
 
-                // Response sidecar (text capped per kRawCap; thinking not captured at C++ level)
+                // Response sidecar (text + thinking, both capped).
                 std::filesystem::path resp_p = dir / (stem + "_resp.jsonl");
                 {
-                    json resp = {{"text", cap_raw(reply.text)}, {"thinking", ""}};
+                    json resp = {{"text", cap_raw(reply.text)},
+                                 {"thinking", cap_raw(reply.thinking)}};
                     std::ofstream sf(resp_p, std::ios::trunc);
                     sf << resp.dump() << "\n";
                 }

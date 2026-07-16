@@ -146,6 +146,11 @@ void emit_call_events(RunEvents& events, const std::string& stage, const std::st
     out["duration_ms"] = o.duration_ms;
     out["tokens"] = o.has_tokens ? o.tokens : json(nullptr);
     events.emit("agent_output", out);
+    // Thinking / Doing stream: surface provider reasoning as agent.thought (rowKind 2).
+    if (!o.thinking.empty()) {
+        emit_agent_thought(events, o.thinking, o.model, stage, attempt,
+                           /*parent_id=*/"", /*actor=*/role);
+    }
 }
 
 }  // namespace

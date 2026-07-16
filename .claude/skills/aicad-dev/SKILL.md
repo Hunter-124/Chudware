@@ -103,6 +103,28 @@ judgment).
 - Notable multi-file efforts get a one-paragraph handoff appended to `docs/REFACTOR_LOG.md`
   (files touched, deferred items, gotchas).
 
+## Daemon / mission lifecycle (don't regress these)
+
+- **hostd control:** `aicad-hostd --status` / `--stop` / `--stop --force`. Bare `--stop`
+  refuses while agent children run; `--force` stops children (TERM → grace → KILL) first.
+  If the control socket is dead but the pidfile process still lives, `--stop` escalates
+  via pidfile: SIGTERM → 3 s → SIGKILL (`core/hostd/main.cpp`).
+- **Doc-GC:** abandoned docs: `AICAD_DOC_GC_GRACE_S` (default 90 s); agent/mcp-origin
+  docs use floor `AICAD_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
+  openable from the GUI after the agent detaches; `AICAD_DOC_GC=0` disables
+  (`core/hostd/doc_registry.*`).
+- **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
+  with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
+  (`AI_CAD_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
+- **Mission terminal:** loop autosaves mission-minted geometry as `.step+` into the run
+  `parts/` dir + GUI workspace, then closes those docs (GUI-adopted exempt)
+  (`services/agent/loop.py` `_terminal_autosave_close_docs`).
+- **config.json keys:** `saveSettings` merge-overlays `keys`/`experimental` — never
+  full-replace them (harness `keys.openrouter` must survive a GUI save).
+- **agent_turn edits:** standing mega-24 offline planning-node repro gate
+  (`FINAL_OFFLINE_OK` / `services/agent/test_mega24_fixes.py`) plus mega regression suites
+  before any live mission spend.
+
 ## Commit / push template
 
 ```bash

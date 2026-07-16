@@ -1,0 +1,13 @@
+{
+  "status": "needs_correction",
+  "phase": "correct",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "plan",
+    "build"
+  ],
+  "findings": [],
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3']",
+  "mode": "real"
+}

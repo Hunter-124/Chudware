@@ -1,0 +1,89 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "gym_C1_local_ollama:llama3.2:latest_s2",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC4']",
+  "saved": [],
+  "closed": [],
+  "skipped": [
+    {
+      "doc_id": "new_part(name='flanged_bushing')",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact new_part(name='flanged_bushing'): no such document: new_part(name='flanged_bushing')",
+        "save workspace new_part(name='flanged_bushing'): no such document: new_part(name='flanged_bushing')"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000011",
+      "reason": "no_geometry",
+      "name": "flanged_bushing3",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "cpp00000009",
+      "reason": "no_geometry",
+      "name": null,
+      "origin_kind": null
+    },
+    {
+      "doc_id": "doc-cpp00000013",
+      "reason": "no_geometry",
+      "name": "new part for flanged_bushing",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "d3eeedc39e73",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact d3eeedc39e73: no such document: d3eeedc39e73",
+        "save workspace d3eeedc39e73: no such document: d3eeedc39e73"
+      ]
+    },
+    {
+      "doc_id": "62448b1a3e3a",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 62448b1a3e3a: no such document: 62448b1a3e3a",
+        "save workspace 62448b1a3e3a: no such document: 62448b1a3e3a"
+      ]
+    },
+    {
+      "doc_id": "doc-cpp0000000b",
+      "reason": "no_geometry",
+      "name": "flanged_bushing",
+      "origin_kind": "unknown"
+    },
+    {
+      "doc_id": "doc-cpp0000000c",
+      "reason": "no_geometry",
+      "name": "flanged_bushing2",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp0000000d",
+      "reason": "no_geometry",
+      "name": "part",
+      "origin_kind": "mcp"
+    },
+    {
+      "doc_id": "doc-cpp0000000e",
+      "reason": "no_geometry",
+      "name": "part2",
+      "origin_kind": "mcp"
+    }
+  ],
+  "errors": [
+    "save artifact new_part(name='flanged_bushing'): no such document: new_part(name='flanged_bushing')",
+    "save workspace new_part(name='flanged_bushing'): no such document: new_part(name='flanged_bushing')",
+    "save artifact d3eeedc39e73: no such document: d3eeedc39e73",
+    "save workspace d3eeedc39e73: no such document: d3eeedc39e73",
+    "save artifact 62448b1a3e3a: no such document: 62448b1a3e3a",
+    "save workspace 62448b1a3e3a: no such document: 62448b1a3e3a"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/gym_C1_local_ollama:llama3.2:latest_s2/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

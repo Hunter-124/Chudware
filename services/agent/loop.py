@@ -2516,6 +2516,21 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         status=status, stop_reason=stop_reason,
     )
 
+    # mega-28: grading is authoritative for the terminal label. Soft-join
+    # deliver used to leave ``status=blocked`` / ``stop_reason=deliver_partial``
+    # even when every declared AC PASSed (live mega-28 9/9). When all criteria
+    # are gate-ok (PASS|SKIP|waived), promote to done + mission_complete.
+    # Partial / FAIL / NOT-CHECKED verdicts keep existing deliver_partial
+    # semantics (mega-8 soft-join contract).
+    if stop_reason == "deliver_partial" and status in (
+        "done", "blocked", "running",
+    ):
+        ids = list(ac_ids or []) or _manifest_ac_ids(manifest)
+        if ids and not _failing_criteria(manifest, ledger, ids):
+            status = "done"
+            stop_reason = "mission_complete"
+            reached = Phase.DELIVER.value
+
     # Lane S / mega-22: at mission terminal, persist mission-minted geometry docs
     # (native .step+) into the run artifact dir + GUI workspace, then close them.
     # GUI-adopted docs (origin_kind=gui) are exempt. Best-effort — never blocks

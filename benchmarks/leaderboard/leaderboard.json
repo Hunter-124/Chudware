@@ -1,6 +1,6 @@
 {
   "schema": "aicad.leaderboard/1",
-  "generated": "2026-07-15T04:09:26Z",
+  "generated": "2026-07-16T02:41:29Z",
   "task_suite": "gym-C1..C15 + diag-v1",
   "models": [
     {
@@ -8,7 +8,7 @@
       "label": "gemma3-4b-qat",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-15T04:09:26Z",
+      "evaluated": "2026-07-16T02:41:29Z",
       "cycles": 1,
       "primary": {
         "pass_rate": 0.0,
@@ -73,11 +73,11 @@
       "label": "Grok 4.5",
       "provider": "xai",
       "kind": "paid",
-      "evaluated": "2026-07-15T04:09:26Z",
-      "cycles": 4,
+      "evaluated": "2026-07-16T02:41:29Z",
+      "cycles": 5,
       "primary": {
         "pass_rate": 0.0,
-        "cells_total": 12,
+        "cells_total": 15,
         "cells_passed": 0
       },
       "axes": {
@@ -90,13 +90,13 @@
         "checkpoint_util": 0.0
       },
       "failure_taxonomy": {
-        "incoherent_geometry": 12,
-        "grind": 11
+        "incoherent_geometry": 15,
+        "grind": 12
       },
       "cost": {
         "usd_per_task_med": null,
         "latency_s_med": null,
-        "tokens_per_task_med": 367.0
+        "tokens_per_task_med": 584.0
       },
       "per_challenge": [
         {
@@ -104,7 +104,7 @@
           "division": "open",
           "tier": "xai:grok-4-5",
           "pass_rate": 0.0,
-          "seeds": 12
+          "seeds": 15
         }
       ],
       "divisions": {
@@ -116,7 +116,71 @@
         },
         "open": {
           "pass_rate": 0.0,
-          "cells_total": 12,
+          "cells_total": 15,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        }
+      },
+      "calibration": {
+        "local_pass_rate": 0.0,
+        "open_pass_rate": 0.0,
+        "bridge_delta": 0.0
+      },
+      "instrumentation_summary": {
+        "phase_mortality_top": {
+          "intake": 0.0
+        },
+        "top_misuse_fingerprint": "ledger_get:wrong-face-ref"
+      }
+    },
+    {
+      "id": "llama3.2:latest",
+      "label": "llama3.2:latest",
+      "provider": "ollama",
+      "kind": "local",
+      "evaluated": "2026-07-16T02:41:29Z",
+      "cycles": 1,
+      "primary": {
+        "pass_rate": 0.0,
+        "cells_total": 3,
+        "cells_passed": 0
+      },
+      "axes": {
+        "tool_validity": null,
+        "vision_fix": null,
+        "feature_id": null,
+        "vc_hygiene": null,
+        "discipline_index": 0.8889,
+        "verify_efficacy": 1.0,
+        "checkpoint_util": 0.0
+      },
+      "failure_taxonomy": {
+        "incoherent_geometry": 3
+      },
+      "cost": {
+        "usd_per_task_med": null,
+        "latency_s_med": null,
+        "tokens_per_task_med": 641.0
+      },
+      "per_challenge": [
+        {
+          "challenge": "C1",
+          "division": "local",
+          "tier": "ollama:llama3.2:latest",
+          "pass_rate": 0.0,
+          "seeds": 3
+        }
+      ],
+      "divisions": {
+        "local": {
+          "pass_rate": 0.0,
+          "cells_total": 3,
+          "cells_passed": 0,
+          "discipline_index": 0.0
+        },
+        "open": {
+          "pass_rate": 0.0,
+          "cells_total": 0,
           "cells_passed": 0,
           "discipline_index": 0.0
         }
@@ -138,7 +202,7 @@
       "label": "openrouter:google/gemma-4-31b-it:free",
       "provider": "error",
       "kind": "local",
-      "evaluated": "2026-07-15T04:09:26Z",
+      "evaluated": "2026-07-16T02:41:29Z",
       "cycles": 1,
       "primary": {
         "pass_rate": 0.0,
@@ -192,7 +256,7 @@
       "label": "openrouter:qwen/qwen3-coder:free",
       "provider": "error",
       "kind": "local",
-      "evaluated": "2026-07-15T04:09:26Z",
+      "evaluated": "2026-07-16T02:41:29Z",
       "cycles": 1,
       "primary": {
         "pass_rate": 0.0,
@@ -246,7 +310,7 @@
       "label": "qwen3-4b",
       "provider": "llamacpp",
       "kind": "local",
-      "evaluated": "2026-07-15T04:09:26Z",
+      "evaluated": "2026-07-16T02:41:29Z",
       "cycles": 11,
       "primary": {
         "pass_rate": 0.3469,

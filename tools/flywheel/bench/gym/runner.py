@@ -445,8 +445,12 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     # overrides), and snapshots it into the cell ledger like a real mission.
     from services.agent.tiers import resolve_effort, effort_tier_for
     from services.agent.effort import record_effort_snapshot
-    # openrouter:<model-id> reuses the frontier budget profile for effort.
-    effort_profile = resolve_effort(effort_tier_for(tier) or tier)
+    # openrouter:<model-id> / xai:<model-id> reuse frontier; ollama:<model> reuses
+    # the local-24k budget profile (small local context class).
+    et = effort_tier_for(tier) or tier
+    if _parse_ollama_tier(tier) is not None:
+        et = "local-24k"
+    effort_profile = resolve_effort(et)
     record_effort_snapshot(ledger, active_tier=effort_profile.tier)
 
     if real_mode:
@@ -543,6 +547,20 @@ _DEFAULT_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benc
 # NO "council" tier is added; a stub would only produce meaningless benchmark data.
 
 
+def _parse_ollama_tier(tier: str) -> str | None:
+    """Return the Ollama model id when *tier* is ``ollama:<model-id>``.
+
+    Model ids may themselves contain colons (e.g. ``llama3.2:latest``), so only
+    the first ``ollama:`` prefix is stripped. Returns ``None`` for other tiers.
+    """
+    if not tier or not isinstance(tier, str):
+        return None
+    prefix = "ollama:"
+    if not tier.startswith(prefix):
+        return None
+    model_id = tier[len(prefix):].strip()
+    return model_id or None
+
 def _provider_for_tier(tier: str):
     """Resolve the provider a gym cell runs on (cached per model id for VRAM reuse).
 
@@ -555,6 +573,10 @@ def _provider_for_tier(tier: str):
     that model (multi-provider leaderboard path). Cached by model id so paid cells
     share the same adapter instance across the matrix. Same for ``xai:<model-id>``
     (subscription OAuth when connected, else API key).
+
+    ``ollama:<model-id>`` resolves to the local Ollama OpenAI-compatible endpoint
+    (default ``http://127.0.0.1:11434/v1``) — the workstation local tier when the
+    bundled llama.cpp model is not the target under test.
 
     An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
@@ -578,7 +600,14 @@ def _provider_for_tier(tier: str):
         cache_key = f"openrouter:{or_model}"
         prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
         if prov is None:
-            prov = provider_for_tier(tier)
+            # Load disk config so keys.openrouter is present (provider_for_tier
+            # does not auto-load when cfg is omitted).
+            disk = {}
+            try:
+                disk = config.load_config() or {}
+            except Exception:  # noqa: BLE001
+                disk = {}
+            prov = provider_for_tier(tier, cfg=disk)
             _LOCAL_PROVIDER_CACHE[cache_key] = prov
         return prov
     # xAI paid tiers: cache by model id (sub or API-key provider).
@@ -588,6 +617,42 @@ def _provider_for_tier(tier: str):
         prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
         if prov is None:
             prov = provider_for_tier(tier)
+            _LOCAL_PROVIDER_CACHE[cache_key] = prov
+        return prov
+    # Ollama local tiers: OpenAI-compatible loopback (no GBNF / no llamacpp server).
+    ollama_model = _parse_ollama_tier(tier)
+    if ollama_model is not None:
+        cache_key = f"ollama:{ollama_model}"
+        prov = _LOCAL_PROVIDER_CACHE.get(cache_key)
+        if prov is None:
+            disk = {}
+            try:
+                disk = config.load_config() or {}
+            except Exception:  # noqa: BLE001
+                disk = {}
+            ocfg = dict(disk.get("ollama") or {})
+            base = (
+                ocfg.get("base_url")
+                or (disk.get("openai") or {}).get("base_url")
+                or "http://127.0.0.1:11434/v1"
+            )
+            if not str(base).rstrip("/").endswith("/v1"):
+                base = str(base).rstrip("/") + "/v1"
+            merged = dict(disk)
+            merged["model"] = ollama_model
+            merged["api_key"] = ocfg.get("api_key") or "ollama"
+            merged["openai"] = {
+                **(merged.get("openai") or {}),
+                "base_url": base,
+                "api_key": merged["api_key"],
+            }
+            merged["ollama"] = {**ocfg, "base_url": base, "model": ollama_model}
+            prov = config.get_provider("openai", cfg=merged)
+            # Tag for leaderboard / ledger attribution.
+            try:
+                prov.name = "ollama"  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
             _LOCAL_PROVIDER_CACHE[cache_key] = prov
         return prov
     if not tier.startswith("local"):
@@ -705,7 +770,7 @@ def _default_divisions_for_tier(tier: str) -> list[str]:
     challenge.divisions filter + explicit --division CLI).
     """
     t = (tier or "").lower()
-    if t.startswith("local") or t.startswith("llamacpp"):
+    if t.startswith("local") or t.startswith("llamacpp") or t.startswith("ollama"):
         return ["local"]
     if t.startswith("openrouter:") or t.startswith("xai:") or "frontier" in t or t == "mid":
         return ["open"]

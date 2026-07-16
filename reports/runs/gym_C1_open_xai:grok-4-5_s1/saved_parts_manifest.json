@@ -1,0 +1,92 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "gym_C1_open_xai:grok-4-5_s1",
+  "status": "needs_correction",
+  "stop_reason": "verify_failed: ['AC1', 'AC2', 'AC3', 'AC4']",
+  "saved": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "name": "flanged_bushing",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing_-cpp00000001.step+",
+        "/home/hunter/Documents/AI-CAD/flanged_bushing_-cpp00000001.step+"
+      ],
+      "bytes": [
+        37877,
+        37877
+      ]
+    },
+    {
+      "doc_id": "doc-cpp00000008",
+      "name": "flanged_bushing2",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing2_-cpp00000008.step+",
+        "/home/hunter/Documents/AI-CAD/flanged_bushing2_-cpp00000008.step+"
+      ],
+      "bytes": [
+        37728,
+        37728
+      ]
+    },
+    {
+      "doc_id": "doc-cpp0000000a",
+      "name": "flanged_bushing3",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts/flanged_bushing3_-cpp0000000a.step+",
+        "/home/hunter/Documents/AI-CAD/flanged_bushing3_-cpp0000000a.step+"
+      ],
+      "bytes": [
+        37727,
+        37727
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp00000008",
+      "closed": true,
+      "detached": false
+    },
+    {
+      "doc_id": "doc-cpp0000000a",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "8a66153c5ac3",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact 8a66153c5ac3: no such document: 8a66153c5ac3",
+        "save workspace 8a66153c5ac3: no such document: 8a66153c5ac3"
+      ]
+    },
+    {
+      "doc_id": "1d082f6c800f",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact 1d082f6c800f: no such document: 1d082f6c800f",
+        "save workspace 1d082f6c800f: no such document: 1d082f6c800f"
+      ]
+    }
+  ],
+  "errors": [
+    "save artifact 8a66153c5ac3: no such document: 8a66153c5ac3",
+    "save workspace 8a66153c5ac3: no such document: 8a66153c5ac3",
+    "save artifact 1d082f6c800f: no such document: 1d082f6c800f",
+    "save workspace 1d082f6c800f: no such document: 1d082f6c800f"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/gym_C1_open_xai:grok-4-5_s1/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

@@ -32,7 +32,8 @@ the frame loop in `host/src/app.cpp`.
 
 `host/src/ui/doc_tabs.cpp` (multi-document tab strip) · `file_explorer.cpp` (workspace
 browser, recents) · `console_panel.cpp` (worker/debug log) · `status_bar.cpp` (job status,
-spinner) · `title_bar.cpp` (window chrome + File/Edit/View/Help menus) · `config_panel.cpp`,
+spinner, sticky "Engine daemon unreachable — retrying" chip while `AppState::daemonUnreachable`;
+tabs re-bootstrap via `engine_events` after hostd reconnect) · `title_bar.cpp` (window chrome + File/Edit/View/Help menus) · `config_panel.cpp`,
 `design_table_panel.cpp`, `cutlist_panel.cpp` (configurations & tables) · `toast.cpp`
 (notifications) · `scenarios.cpp` (scripted test harness — add a scenario if your workspace
 gains a major new flow).

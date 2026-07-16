@@ -64,6 +64,14 @@ def model_id_for_tier(tier: str) -> dict[str, str]:
             "provider": "xai",
             "kind": "paid",
         }
+    if isinstance(tier, str) and tier.startswith("ollama:"):
+        mid = tier[len("ollama:"):].strip() or "ollama"
+        return {
+            "id": mid,
+            "label": mid,
+            "provider": "ollama",
+            "kind": "local",
+        }
     if tier.startswith("local"):
         try:
             fanout = load_local_models().get("fanout") or "qwen3-4b"

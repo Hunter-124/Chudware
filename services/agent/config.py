@@ -463,7 +463,11 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         from .providers.anthropic_provider import AnthropicProvider, DEFAULT_MODEL
 
         key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
-        return AnthropicProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL))
+        return AnthropicProvider(
+            api_key=key,
+            model=cfg.get("model", DEFAULT_MODEL),
+            reasoning_effort=cfg.get("reasoning_effort"),
+        )
 
     if name == "gemini":
         from .providers.gemini_provider import GeminiProvider, DEFAULT_MODEL

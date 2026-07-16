@@ -221,6 +221,8 @@ class DelegationNode:
 
     *id* is always a ``dg_<hex>`` string — explicit, never shared-mutable.
     *parent* is None for the root orchestrator node.
+    *effort*: optional low|medium|high assigned by the dispatcher for Auto
+              thinking on the subagent role (None = harness judges).
     """
     id: str
     parent: Optional[str]
@@ -234,9 +236,10 @@ class DelegationNode:
     budget: Budget
     docs: list[DocLease] = field(default_factory=list)
     status: str = "pending"
+    effort: Optional[str] = None  # low|medium|high when dispatcher assigns
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "parent": self.parent,
             "role": self.role,
@@ -254,6 +257,11 @@ class DelegationNode:
             "docs": [d.to_dict() for d in self.docs],
             "status": self.status,
         }
+        if self.effort:
+            d["effort"] = self.effort
+            d["thinking"] = self.effort
+            d["reasoning_effort"] = self.effort
+        return d
 
 
 class DelegationError(ValueError):
@@ -365,6 +373,7 @@ class DelegationTree:
         kind: str = "worker",
         docs: list[dict] | None = None,
         availability: dict[str, bool] | None = None,
+        effort: str | None = None,
     ) -> DelegationNode:
         """Request a new sub-agent delegation.
 
@@ -373,6 +382,8 @@ class DelegationTree:
         *docs*: list of ``{"doc_id": str, "lease": "write"|"read"}`` requests (T-W16
                 request shape only — actual leasing lives in T-W16).
         *availability*: passed to routing for source availability probing.
+        *effort*: optional low|medium|high reasoning effort for the subagent when
+                 its role thinking is Auto (dispatcher assignment).
 
         Hard errors (DelegationError):
           - Invalid arguments (kind, role, brief, budget_tokens).
@@ -460,6 +471,14 @@ class DelegationTree:
         node_id = _fresh_id()
         doc_leases = [DocLease(doc_id=d["doc_id"], lease=d["lease"])
                       for d in (docs or []) if "doc_id" in d and "lease" in d]
+        # Normalize optional dispatcher effort (low|medium|high).
+        effort_s: str | None = None
+        if effort is not None and str(effort).strip():
+            e = str(effort).strip().lower()
+            if e in ("med",):
+                e = "medium"
+            if e in ("low", "medium", "high"):
+                effort_s = e
         node = DelegationNode(
             id=node_id,
             parent=parent_id,
@@ -474,6 +493,7 @@ class DelegationTree:
             budget=Budget(tokens_granted=budget_tokens),
             docs=doc_leases,
             status="pending",
+            effort=effort_s,
         )
         self._nodes[node_id] = node
         self._emit_transition(node, "pending", "delegation requested")
@@ -828,12 +848,17 @@ def delegate(
     kind: str = "worker",
     docs: list[dict] | None = None,
     availability: dict[str, bool] | None = None,
+    effort: str | None = None,
 ) -> dict:
     """The ``delegate`` tool exposed to role cards per contract §12 + roles.py allowlist.
 
     Validates and delegates via *tree*.  Returns a serialised node dict on success or
     an error dict on failure (the tool never raises — errors surface in the result so
     the calling role can decide to retry, replan, or escalate).
+
+    *effort* (optional): low|medium|high — when the subagent role's Settings thinking
+    is Auto, the dispatcher uses this as the assigned reasoning effort. Omit to let
+    the harness judge complexity (default medium).
 
     Usage by a role card::
 
@@ -850,10 +875,12 @@ def delegate(
             kind=kind,
             docs=docs,
             availability=availability,
+            effort=effort,
         )
         return node.to_dict()
     except DelegationError as exc:
         return {"error": str(exc), "status": "failed"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +909,7 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
         kind: str = "worker",
         parent_id: Optional[str] = None,
         docs: Optional[list] = None,
+        effort: Optional[str] = None,
     ) -> dict:
         if tree is None:
             return {"error": "delegate tool: no delegation tree available in this context",
@@ -892,6 +920,7 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
             parent_id=parent_id,
             kind=kind,
             docs=docs,
+            effort=effort,
         )
 
     def _kill_tree_tool() -> dict:
@@ -922,6 +951,9 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                 "'ponder' kind is auto-approved at any depth (read-only + budget-bounded). "
                 "A depth_warning or agent_limit_warning advisory is emitted when soft limits "
                 "are reached, but the spawn still proceeds. "
+                "Optional 'effort' (low|medium|high): when the subagent role's Thinking is "
+                "Auto, the dispatcher uses this as reasoning effort; omit to let the harness "
+                "judge complexity (default medium). "
                 "Returns the delegation node dict including status and model assignment."
             ),
             parameters={
@@ -939,6 +971,14 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                                   "description": "Parent node id (defaults to orchestrator root)"},
                     "docs": {"type": "array",
                              "description": "Doc lease requests [{doc_id, lease}] (T-W16)"},
+                    "effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": (
+                            "Optional reasoning effort for the subagent when its role "
+                            "Thinking is Auto. Omit for harness judgment (default medium)."
+                        ),
+                    },
                 },
             },
         )

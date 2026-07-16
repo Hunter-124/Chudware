@@ -296,3 +296,20 @@ Producers: `services/agent/providers/usage.py` fetchers — anthropic `GET api.a
 `GET api2.cursor.sh/auth/usage`; xai: none (infer from 403 tier-gate; link dashboard). Poll <=5min,
 never retry a 429'd usage fetch inside the window. Exposed via `subscription_status`/`subscription_accounts`
 and new `subscription_usage {provider?} -> {ok, rows:[{provider, account_id, display_name, plan, usage}]}`.
+
+## ai_roles thinking (additive)
+
+`config.json` key `ai_roles` (WS2) role values may be:
+- `"auto"` — model auto-pick; thinking defaults to `auto`
+- `{ "provider", "model", "thinking?" }` — fixed model; optional thinking
+- `{ "mode": "auto", "thinking?" }` — model auto with optional thinking
+
+`thinking`: `auto` | `low` | `medium` | `high` (default `auto`).
+
+Semantics (services/agent/role_models.py):
+- Concrete level → that role's LLM calls use `reasoning_effort` at that level.
+- `auto` on **default** (main chat) → prompt classifier (`classify_task` + effort map) assigns per prompt.
+- `auto` on subagent roles (task/planning/advisor/plm/redaction/…) → dispatcher may pass optional `effort` on `delegate` / node; else complexity heuristics (rank/task_class/depth), default **medium**.
+- Absent config → Auto → prior behavior plus these assignment paths.
+
+RPCs `ai_roles_get` / `ai_roles_set` echo the full map including `thinking`.

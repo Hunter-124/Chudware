@@ -17,12 +17,19 @@ DEFAULT_MODEL = "claude-opus-4-8"
 class AnthropicProvider(Provider):
     name = "anthropic"
 
-    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = DEFAULT_MODEL,
+        reasoning_effort: str | None = None,
+    ):
         import anthropic
 
         # Empty/None api_key → SDK resolves ANTHROPIC_API_KEY from the environment.
         self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
         self.model = model
+        # low|medium|high|max|auto/None — maps to output_config.effort (default high).
+        self.reasoning_effort = reasoning_effort
 
     def _block(self, part: dict) -> dict:
         if part["type"] == "text":
@@ -42,13 +49,18 @@ class AnthropicProvider(Provider):
             {"role": m["role"], "content": [self._block(p) for p in m["content"]]}
             for m in messages
         ]
+        effort = (self.reasoning_effort or "high").strip().lower()
+        if effort in ("med",):
+            effort = "medium"
+        if effort not in ("low", "medium", "high", "max"):
+            effort = "high"
         resp = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
             system=system,
             messages=api_messages,
             thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
+            output_config={"effort": effort},
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
         # Adaptive thinking returns `thinking` blocks (and possibly redacted ones); collect

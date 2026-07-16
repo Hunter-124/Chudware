@@ -881,6 +881,8 @@ struct RoleAssign {
     bool isAuto = true;
     std::string provider;
     std::string model;
+    // Per-role reasoning effort: "auto" | "low" | "medium" | "high" (default auto).
+    std::string thinking = "auto";
 };
 struct ModelRankingRow {
     std::string modelId;
@@ -1161,16 +1163,23 @@ static void pollModelRoles(AppState& st, bool force) {
         for (int i = 0; i < kRoleCount; ++i) {
             RoleAssign a;
             a.isAuto = true;
+            a.thinking = "auto";
             auto it = roles.find(kRoleKeys[i]);
             if (it != roles.end()) {
                 if (it->is_string()) {
                     std::string v = it->get<std::string>();
                     a.isAuto = (v == "auto" || v.empty());
                 } else if (it->is_object()) {
-                    a.isAuto = false;
                     a.provider = it->value("provider", std::string());
                     a.model = it->value("model", std::string());
-                    if (a.provider.empty() && a.model.empty()) a.isAuto = true;
+                    // Model auto when provider+model absent (or explicit mode=auto).
+                    const std::string mode = it->value("mode", std::string());
+                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    // thinking: auto|low|medium|high (default auto).
+                    std::string th = it->value("thinking", std::string("auto"));
+                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
+                        th = "auto";
+                    a.thinking = th;
                 }
             }
             s_roles.roles[kRoleKeys[i]] = std::move(a);
@@ -1235,11 +1244,18 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
     s_roles.roles[roleKey] = a;
     nlohmann::json p;
     nlohmann::json roles = nlohmann::json::object();
+    // Always object form so thinking can ride alongside model auto/fixed.
+    nlohmann::json entry = nlohmann::json::object();
     if (a.isAuto) {
-        roles[roleKey] = "auto";
+        entry["mode"] = "auto";
     } else {
-        roles[roleKey] = nlohmann::json{{"provider", a.provider}, {"model", a.model}};
+        entry["provider"] = a.provider;
+        entry["model"] = a.model;
     }
+    std::string th = a.thinking.empty() ? "auto" : a.thinking;
+    if (th != "low" && th != "medium" && th != "high" && th != "auto") th = "auto";
+    entry["thinking"] = th;
+    roles[roleKey] = std::move(entry);
     p["roles"] = roles;
     s_roles.rolesSaveInFlight = true;
     st.rpc.call("ai_roles_set", p, [](const core::RpcResult& r) {
@@ -1255,12 +1271,18 @@ static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a
                 auto it = roles.find(kRoleKeys[i]);
                 if (it == roles.end()) continue;
                 RoleAssign a;
+                a.thinking = "auto";
                 if (it->is_string()) {
                     a.isAuto = (it->get<std::string>() == "auto");
                 } else if (it->is_object()) {
-                    a.isAuto = false;
                     a.provider = it->value("provider", std::string());
                     a.model = it->value("model", std::string());
+                    const std::string mode = it->value("mode", std::string());
+                    a.isAuto = (mode == "auto") || (a.provider.empty() && a.model.empty());
+                    std::string th = it->value("thinking", std::string("auto"));
+                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
+                        th = "auto";
+                    a.thinking = th;
                 }
                 s_roles.roles[kRoleKeys[i]] = a;
             }
@@ -1563,7 +1585,8 @@ static void drawModelRolesSection(AppState& st, float sc) {
     pollModelRankings(st, /*force=*/false);
     ensureDefaultRoles();
 
-    dimText("Per-role model assignment. Auto picks from rankings within enabled providers. "
+    dimText("Per-role model + thinking effort. Auto model picks from rankings within enabled "
+            "providers. Thinking Auto lets the classifier (Default) or dispatcher (subagents) choose. "
             "Redaction is hard-locked to local (loopback) providers.");
 
     if (s_roles.rolesRpcMissing) {
@@ -1581,11 +1604,12 @@ static void drawModelRolesSection(AppState& st, float sc) {
     const auto allPicks = buildRolePickList(st, /*localOnly=*/false);
     const auto localPicks = buildRolePickList(st, /*localOnly=*/true);
 
-    if (ImGui::BeginTable("##model_roles", 2,
+    if (ImGui::BeginTable("##model_roles", 3,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableSetupColumn("Thinking", ImGuiTableColumnFlags_WidthFixed, 110.0f * sc);
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < kRoleCount; ++i) {
@@ -1648,9 +1672,11 @@ static void drawModelRolesSection(AppState& st, float sc) {
                 for (int pi = 0; pi < (int)picks.size(); ++pi) {
                     const bool selected = (pi == sel) || (pi == 0 && a.isAuto);
                     if (ImGui::Selectable(picks[pi].label.c_str(), selected)) {
-                        RoleAssign next;
+                        RoleAssign next = a;  // preserve thinking
                         if (picks[pi].isAuto) {
                             next.isAuto = true;
+                            next.provider.clear();
+                            next.model.clear();
                         } else {
                             next.isAuto = false;
                             next.provider = roleProviderWire(picks[pi].provider);
@@ -1668,6 +1694,41 @@ static void drawModelRolesSection(AppState& st, float sc) {
                     if (selected) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
+            }
+            if (ro) ImGui::EndDisabled();
+
+            // Thinking effort combo (Auto / Low / Medium / High).
+            ImGui::TableNextColumn();
+            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High"};
+            static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
+            int thinkSel = 0;
+            for (int ti = 0; ti < 4; ++ti) {
+                if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
+            }
+            if (ro) ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##role_think", kThinkLabels[thinkSel])) {
+                for (int ti = 0; ti < 4; ++ti) {
+                    const bool selT = (ti == thinkSel);
+                    if (ImGui::Selectable(kThinkLabels[ti], selT)) {
+                        RoleAssign next = a;
+                        next.thinking = kThinkValues[ti];
+                        setRoleAssign(st, key, next);
+                    }
+                    if (selT) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (std::strcmp(key, "default") == 0) {
+                    ImGui::SetTooltip(
+                        "Auto: chat classifier assigns effort per prompt.\n"
+                        "Low/Medium/High: force that level for Default-role calls.");
+                } else {
+                    ImGui::SetTooltip(
+                        "Auto: dispatcher assigns effort by task complexity.\n"
+                        "Low/Medium/High: force that level for this role's calls.");
+                }
             }
             if (ro) ImGui::EndDisabled();
 

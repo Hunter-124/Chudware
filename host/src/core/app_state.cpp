@@ -1395,10 +1395,11 @@ void AppState::clearViewportForNewDoc() {
     axisAutoCache.clear();
     axisInjectPlaneFp.clear();
     axisDisplayNames.clear();
-    // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
-    // behavior). The FM eye toggle removes this entry to show it. Origin auto-show on
-    // empty docs is applied per-frame in viewport_panel (erases this until hasSolidContent).
-    hiddenFeatures.insert("point.origin");
+    // Origin point: VISIBLE by default on an empty doc (same rule as planes/axes). It is NOT
+    // seeded into hiddenFeatures; applyDocDrivenVisibility inserts/erases it with hasSolidContent
+    // (unless originUserToggled), so the FM eye — which reads hiddenFeatures — is correct from
+    // frame 0. (Replaces the old T-BL37 hidden-by-default seed.)
+    hiddenFeatures.erase("point.origin");
     // Default reference axes: visible on empty/sketch-only docs (FM eye OPEN).
     hiddenFeatures.erase("axis.x");
     hiddenFeatures.erase("axis.y");
@@ -1406,6 +1407,11 @@ void AppState::clearViewportForNewDoc() {
     axisDatumIds.insert("axis.x");
     axisDatumIds.insert("axis.y");
     axisDatumIds.insert("axis.z");
+    // Fresh empty doc: planes + origin are VISIBLE by default. Seed the FM-eye flags so the
+    // FeatureManager (drawn before the viewport publishes these each frame) shows OPEN eyes from
+    // frame 0 instead of a stale "hidden" glyph on planes/origin that are actually drawn.
+    planeVisEff[0] = planeVisEff[1] = planeVisEff[2] = true;
+    originVisEff = true;
     applyBodyVisibility();
     applyDatumVisibility();
     asmParts.clear();
@@ -1738,6 +1744,18 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     // Shared hasSolidContent signal (mirrors viewport origin/axis/plane auto-hide): a solid/3D
     // feature or any assembly component means references should auto-hide. Sketches alone do not.
     const bool hasSolidContent = treeHasSolidContent(tree);
+    // Seed the FM-eye visibility flags (planeVisEff/originVisEff) from the state computed HERE, so
+    // the FeatureManager eye is correct on the very first frame after a doc loads/rebuilds — the FM
+    // draws BEFORE the viewport publishes these each frame, so without this a fresh doc showed a
+    // stale "hidden" eye on planes/origin that are actually drawn.
+    auto syncEffFlags = [&]() {
+        static const char* kPF[3] = {"plane.front", "plane.top", "plane.right"};
+        for (int i = 0; i < 3; ++i)
+            planeVisEff[i] = planesUserToggled ? showPlane[i]
+                                               : (autoHiddenPlanes.count(kPF[i]) == 0);
+        originVisEff = originUserToggled ? (hiddenFeatures.count("point.origin") == 0)
+                                         : !hasSolidContent;
+    };
     auto fi = tree.find("features");
 
     if (isAsm) {
@@ -1786,6 +1804,12 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
             for (const auto& id : axisDatumIds) syncAxis(id);
             if (changed) applyDatumVisibility();
         }
+        // Origin: same persistent sync (FM eye reads hiddenFeatures).
+        if (!originUserToggled) {
+            if (hasSolidContent) hiddenFeatures.insert("point.origin");
+            else                 hiddenFeatures.erase("point.origin");
+        }
+        syncEffFlags();
         return;
     }
 
@@ -1891,7 +1915,16 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         syncAxis("axis.z");
         for (const auto& id : axisDatumIds) syncAxis(id);
     }
+    // Origin: same persistent sync as axes (FM eye reads hiddenFeatures).
+    if (!originUserToggled) {
+        if (hasSolidContent) {
+            if (hiddenFeatures.insert("point.origin").second) datumVisibilityChanged = true;
+        } else {
+            if (hiddenFeatures.erase("point.origin") != 0) datumVisibilityChanged = true;
+        }
+    }
 
+    syncEffFlags();
     if (datumVisibilityChanged) applyDatumVisibility();
 }
 

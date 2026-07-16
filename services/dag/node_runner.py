@@ -233,20 +233,60 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
         if assignment is not None:
             cfg_pick = dict(cfg)
             cfg_pick["model"] = assignment.model
-            # Cap reasoning effort for non-frontier ranks (quota + cost).
+            # Cap reasoning effort for non-frontier ranks (quota + cost) unless
+            # the role has a concrete thinking level or dispatcher set effort.
             rank = int(assignment.rank or min_rank or 3)
-            if rank <= 2:
-                cfg_pick["reasoning_effort"] = "low"
-            elif rank <= 3:
-                cfg_pick["reasoning_effort"] = "medium"
-            # Retries are cheaper: drop one effort band.
+            dispatch_effort = (
+                context_pack.get("thinking")
+                or context_pack.get("reasoning_effort")
+                or node_inputs.get("thinking")
+                or node_inputs.get("reasoning_effort")
+            )
+            try:
+                from services.agent.role_models import (  # noqa: PLC0415
+                    resolve_role_thinking,
+                )
+                resolved_effort = resolve_role_thinking(
+                    harness_role,
+                    cfg,
+                    request=str(
+                        context_pack.get("request")
+                        or node_inputs.get("request")
+                        or node_inputs.get("brief")
+                        or ""
+                    ),
+                    task_class=str(task_class) if task_class else None,
+                    node_depth=depth,
+                    risk=str(risk) if risk else None,
+                    min_rank=min_rank,
+                    dispatch_effort=(
+                        str(dispatch_effort) if dispatch_effort else None
+                    ),
+                    rank=rank,
+                )
+                if resolved_effort:
+                    cfg_pick["reasoning_effort"] = resolved_effort
+            except Exception:  # noqa: BLE001 — legacy rank heuristic
+                if rank <= 2:
+                    cfg_pick["reasoning_effort"] = "low"
+                elif rank <= 3:
+                    cfg_pick["reasoning_effort"] = "medium"
+            # Retries are cheaper: drop one effort band (only when not pinned
+            # to a concrete role thinking level).
+            try:
+                from services.agent.role_models import get_role_thinking  # noqa: PLC0415
+                role_think = get_role_thinking(harness_role, cfg)
+            except Exception:  # noqa: BLE001
+                role_think = "auto"
             try:
                 retry_rem = int(context_pack.get("retry_remaining") or 0)
             except (TypeError, ValueError):
                 retry_rem = 0
             # Heuristic: if already retried (retry_remaining small relative to
-            # typical budget 2+), force low effort.
-            if retry_rem == 1 or context_pack.get("retry_cheap"):
+            # typical budget 2+), force low effort — unless role pins thinking.
+            if role_think == "auto" and (
+                retry_rem == 1 or context_pack.get("retry_cheap")
+            ):
                 cfg_pick["reasoning_effort"] = "low"
             if assignment.provider == "ollama":
                 # OpenAI-compatible local Ollama endpoint.

@@ -585,27 +585,33 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     };
     // Translucent left->right tint over the frosted glass, bounded to the rounded pill: bright at
     // the left edge (`strength`), fading to a faint right edge (~15% of strength, min 0.02).
-    // Same class of fix as ribbon_vGradRounded: never draw a rounded cap of width==radius
-    // (ImGui clamps corner radius to half the short side → square corner pips) and never let
-    // square-cornered AddRectFilledMultiColor poke past the rounded outline.
+    // Rounded-cap + full-height band construction (no margin ring, no corner pips):
+    //   - base fill owns every rounded corner (faint right colour);
+    //   - LEFT/RIGHT rounded caps are 2·rnd wide, so ImGui's radius clamp (min(w,h)/2) never
+    //     collapses their corner arc into square pips (the width==rnd bug);
+    //   - the square-cornered MultiColor band spans the FULL height BETWEEN the caps — its
+    //     corners land at x=±2·rnd, inside the straight top/bottom edges (arcs end at rnd),
+    //     so nothing pokes past the outline and no faint margin ring is left inside it.
     const float aL = strength;
     const float aR = std::max(0.02f, strength * 0.15f);
     const float W  = mx.x - mn.x;
     const float H  = mx.y - mn.y;
     const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
+    auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
 
-    // Full rounded base in the faint (right) colour — owns every corner. The left->right accent is
-    // a SUBTLE gradient band INSET by the corner radius: NO full-height bright left strip (that read
-    // as a thick light border/outline on every pill — regression), and the square-cornered
-    // MultiColor stays strictly inside the rounded outline so it never pokes as corner flecks.
     dl->AddRectFilled(mn, mx, dye(aR), rnd);
-    const float x0 = mn.x + rnd, x1 = mx.x - rnd;
-    const float y0 = mn.y + rnd, y1 = mx.y - rnd;
-    if (x1 > x0 && y1 > y0) {
-        dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1),
-                                    dye(aL), dye(aR), dye(aR), dye(aL));
+    const float capW = ImMin(2.0f * rnd, W * 0.45f);
+    const float xa = mn.x + capW, xb = mx.x - capW;
+    if (xb > xa && capW > 0.5f) {
+        const float tA = capW / W, tB = (W - capW) / W;
+        dl->AddRectFilled(mn, ImVec2(xa, mx.y), mixAt(tA * 0.5f), rnd,
+                          ImDrawFlags_RoundCornersLeft);
+        dl->AddRectFilledMultiColor(ImVec2(xa, mn.y), ImVec2(xb, mx.y),
+                                    mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
+        dl->AddRectFilled(ImVec2(xb, mn.y), mx, mixAt((tB + 1.0f) * 0.5f), rnd,
+                          ImDrawFlags_RoundCornersRight);
     } else {
-        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too small for an inset band
+        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too narrow for caps+band
     }
 
     if (selected) {

@@ -863,13 +863,15 @@ static void ribbon_vGradRounded(ImDrawList* dl, ImVec2 a, ImVec2 b, float rnd, I
     // pips (the "small red/orange rectangle at top corners" glitch when height ≈ rnd).
     const float topH = ImMax(rnd, 1.0f);
     dl->AddRectFilled(a, ImVec2(b.x, a.y + topH), top, rnd, ImDrawFlags_RoundCornersTop);
-    // Interior vertical fade. AddRectFilledMultiColor is SQUARE-cornered — keep it strictly
-    // inside the rounded outline (inset by rnd on left/right and below the top strip) so its
-    // square corners never poke past the curve as bright corner flecks.
+    // Interior vertical fade. AddRectFilledMultiColor is SQUARE-cornered — but between the
+    // top strip (height ≥ rnd) and the bottom arc (last rnd px) the rounded rect's sides are
+    // STRAIGHT, so the band can span the FULL width with zero corner overflow. The old rnd
+    // left/right inset left faint margin strips inside the outline (the "white inner border"
+    // artifact) — margins showed only the faint `bot` base while the interior was tinted.
     const float y0 = a.y + topH;
     const float y1 = b.y - rnd;
-    if (y1 > y0 && (b.x - a.x) > 2.0f * rnd) {
-        dl->AddRectFilledMultiColor(ImVec2(a.x + rnd, y0), ImVec2(b.x - rnd, y1),
+    if (y1 > y0) {
+        dl->AddRectFilledMultiColor(ImVec2(a.x, y0), ImVec2(b.x, y1),
                                     top, top, bot, bot);
     }
 }
@@ -878,9 +880,12 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
                             bool inset = false, bool hovered = false) {
     const float* t = ui::palette.text;
     const float* a = ui::palette.accent;   // colored-glass tint (goes with the app color scheme)
-    // Resting outline removed — frosted fill + accent wash alone define the button.
-    // Hover still brightens the wash; active tools use ribbon_btnActive's accent outline.
+    // Keep a clearly-visible border at rest (not just on hover) so every button reads as a discrete
+    // key, and keep the top shine restrained so the gradient never blows out to near-white.
+    float lineA    = !enabled ? 0.24f : (hovered ? 0.72f : 0.55f);
     float shineMul = !enabled ? 0.35f : (hovered ? 0.95f : 0.55f);
+    ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
+                             (int)(lineA * 255));
     if (inset) {
         // Scale-aware 1px vertical inset so stacked rows don't share an edge pixel at any DPI.
         // (Was hard-coded 1.0f — under-inset at 125%/150% and left a fractional mismatch vs
@@ -918,6 +923,7 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
             ribbon_vGradRounded(dl, g0, g1, rIn, top, btm);
         }
     }
+    dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
 }
 
 // Fwd decl: procedural Finish check badge, drawn over the big button icon (defined below).
@@ -1726,6 +1732,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                                    isAct ? 0.42f : (tabHov ? 0.34f : 0.20f));
             const float strength = isAct ? 0.30f : (tabHov ? 0.20f : 0.12f);
             ui::coloredRowWash(dl, tp0, tp1, 4.0f, palette.accent, strength, /*selected*/isAct);
+            if (!isAct) {
+                // Resting border on every non-active tab so each tool tab reads as a discrete
+                // button even when not selected/highlighted. A thin hairline, clearly lighter and
+                // thinner than the active tab's colored glow frame (coloredRowWash selected=true).
+                float bc[4];
+                Palette::withAlpha(palette.border, bc, tabHov ? 0.60f : 0.42f);
+                dl->AddRect(tp0, tp1, Palette::toU32(bc), 4.0f, 0, ui::metrics::stroke(1.0f));
+            }
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])

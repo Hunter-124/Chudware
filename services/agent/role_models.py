@@ -3,6 +3,10 @@
 Contract (AI_HARNESS_ROADMAP WS2 + wave Contract):
   * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"auto"``
     for: advisor | task | planning | default | plm | redaction.
+  * Each role entry MAY also carry ``thinking``: ``"auto"|"low"|"medium"|"high"``
+    (default ``"auto"``). Concrete levels pin that role's LLM reasoning effort;
+    ``auto`` on default/main lets the prompt classifier assign effort, and on
+    subagent roles lets the dispatcher assign effort from task complexity.
   * Rankings live in ``model_rankings.yaml`` (shipped) + measured leaderboard
     + user overrides. Precedence: user > measured > shipped.
   * ``resolve_role_model(role, cfg, ...)`` honours ``ai_roles``; ``"auto"`` picks
@@ -42,6 +46,12 @@ KNOWN_ROLES = (
     "plm",
     "redaction",
 )
+
+# Per-role reasoning / thinking effort levels (Settings → AI → Model roles).
+THINKING_LEVELS = ("auto", "low", "medium", "high")
+DEFAULT_THINKING = "auto"
+# Concrete levels that pin provider reasoning_effort (excludes auto).
+CONCRETE_THINKING = frozenset({"low", "medium", "high"})
 
 _RANKINGS_YAML = Path(__file__).resolve().parent / "model_rankings.yaml"
 _DEFAULT_LEADERBOARD = (
@@ -472,8 +482,27 @@ def rankings_as_dict(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_thinking(value: Any) -> str:
+    """Coerce a thinking field to auto|low|medium|high (default auto)."""
+    if value is None or value == "":
+        return DEFAULT_THINKING
+    s = str(value).strip().lower()
+    if s in ("med",):
+        return "medium"
+    if s in THINKING_LEVELS:
+        return s
+    return DEFAULT_THINKING
+
+
 def _normalize_role_value(value: Any) -> str | dict[str, str]:
-    """Coerce a config ai_roles entry to ``"auto"`` or ``{provider, model}``."""
+    """Coerce a config ai_roles entry to ``"auto"`` or a role dict.
+
+    Dict form carries ``thinking`` ONLY when concrete (low|medium|high) — auto is
+    the default and is omitted so legacy ``{provider, model}`` entries round-trip
+    unchanged. When model is auto but thinking is concrete, return
+    ``{mode: "auto", thinking}`` so both knobs persist.
+    Legacy string ``"auto"`` / ``"provider/model"`` are accepted.
+    """
     if value is None or value == "" or value == "auto":
         return "auto"
     if isinstance(value, str):
@@ -482,14 +511,202 @@ def _normalize_role_value(value: Any) -> str | dict[str, str]:
             return {"provider": prov.strip(), "model": model.strip()}
         return "auto"
     if isinstance(value, Mapping):
-        if str(value.get("mode") or "").lower() == "auto":
-            return "auto"
+        thinking = _normalize_thinking(value.get("thinking"))
+        mode = str(value.get("mode") or "").lower()
         prov = str(value.get("provider") or "").strip()
         model = str(value.get("model") or "").strip()
-        if not prov and not model:
-            return "auto"
-        return {"provider": prov, "model": model}
+        is_auto = mode == "auto" or (not prov and not model)
+        if is_auto:
+            if thinking == DEFAULT_THINKING:
+                return "auto"
+            return {"mode": "auto", "thinking": thinking}
+        out: dict[str, str] = {"provider": prov, "model": model}
+        if thinking != DEFAULT_THINKING:
+            out["thinking"] = thinking
+        return out
     return "auto"
+
+
+def get_role_thinking(
+    role: str,
+    cfg: Mapping[str, Any] | None = None,
+) -> str:
+    """Return the configured thinking level for *role* (auto|low|medium|high).
+
+    Missing role / missing thinking → ``\"auto\"``. Never raises.
+    """
+    role_s = (role or "default").strip().lower() or "default"
+    try:
+        roles = get_ai_roles(cfg)
+        entry = roles.get(role_s)
+        if entry is None:
+            entry = roles.get("default", "auto")
+        if isinstance(entry, Mapping):
+            return _normalize_thinking(entry.get("thinking"))
+        return DEFAULT_THINKING
+    except Exception:  # noqa: BLE001
+        return DEFAULT_THINKING
+
+
+def resolve_role_thinking(
+    role: str,
+    cfg: Mapping[str, Any] | None = None,
+    *,
+    request: str | None = None,
+    task_class: str | None = None,
+    node_depth: int = 0,
+    risk: str | None = None,
+    min_rank: int | None = None,
+    dispatch_effort: str | None = None,
+    rank: int | None = None,
+) -> str | None:
+    """Resolve concrete reasoning_effort for *role*, or None to leave unset.
+
+    Semantics:
+      * concrete low|medium|high on the role → that level.
+      * auto on default/main → classifier assigns from *request* / *task_class*
+        (prompt complexity). Falls back to medium when no signal.
+      * auto on subagent roles (task/planning/advisor/plm/redaction/…) → use
+        *dispatch_effort* when the dispatcher set one; else complexity heuristics
+        from task_class / rank / depth; default medium.
+      * Absent config → auto → same paths (current behavior extended, not broken).
+
+    Returns None only when intentionally leaving provider default (should be rare;
+    auto paths return a concrete level, defaulting to medium).
+    """
+    role_s = (role or "default").strip().lower() or "default"
+    level = get_role_thinking(role_s, cfg)
+    if level in CONCRETE_THINKING:
+        return level
+
+    # Auto path.
+    if role_s == "default":
+        return classify_prompt_thinking(
+            request or "",
+            task_class=task_class,
+        )
+
+    # Subagent / other roles: dispatcher override first.
+    if dispatch_effort is not None:
+        de = _normalize_thinking(dispatch_effort)
+        if de in CONCRETE_THINKING:
+            return de
+
+    return classify_subagent_thinking(
+        task_class=task_class,
+        node_depth=node_depth,
+        risk=risk,
+        min_rank=min_rank,
+        rank=rank,
+        brief=request,
+    )
+
+
+def classify_prompt_thinking(
+    request: str,
+    *,
+    task_class: str | None = None,
+) -> str:
+    """Assign thinking effort for the main/default chat role (Auto).
+
+    Extends the workflow_router task classifier with an effort field:
+    simple → low, multi-feature/mod → medium, assembly/cam/analysis → high.
+    """
+    cls = (task_class or "").strip().lower()
+    if not cls:
+        try:
+            from services.agent.pipeline.workflow_router import (  # noqa: PLC0415
+                classify_task,
+            )
+            cls = classify_task(request or "").value
+        except Exception:  # noqa: BLE001
+            cls = "unknown"
+    return _task_class_to_thinking(cls, request=request)
+
+
+def classify_subagent_thinking(
+    *,
+    task_class: str | None = None,
+    node_depth: int = 0,
+    risk: str | None = None,
+    min_rank: int | None = None,
+    rank: int | None = None,
+    brief: str | None = None,
+) -> str:
+    """Dispatcher-side effort for subagent roles when thinking is Auto.
+
+    Prefer explicit complexity signals; fall back to medium.
+    """
+    # Rank-based (matches existing mission_dispatch / node_runner heuristics).
+    try:
+        r = int(rank) if rank is not None else None
+    except (TypeError, ValueError):
+        r = None
+    try:
+        mr = int(min_rank) if min_rank is not None else None
+    except (TypeError, ValueError):
+        mr = None
+    eff_rank = r if r is not None else mr
+    if eff_rank is not None:
+        if eff_rank <= 2:
+            return "low"
+        if eff_rank <= 3:
+            return "medium"
+        return "high"
+
+    cls = (task_class or "").strip().lower()
+    if not cls and brief:
+        try:
+            from services.agent.pipeline.workflow_router import (  # noqa: PLC0415
+                classify_task,
+            )
+            cls = classify_task(brief).value
+        except Exception:  # noqa: BLE001
+            cls = ""
+    if cls:
+        return _task_class_to_thinking(cls, request=brief or "")
+
+    risk_s = (risk or "").strip().lower()
+    if risk_s in ("high", "critical"):
+        return "high"
+    if risk_s in ("low",):
+        return "low"
+
+    # Deeper spawns tend to be narrower — slightly lower effort.
+    try:
+        depth = int(node_depth or 0)
+    except (TypeError, ValueError):
+        depth = 0
+    if depth >= 3:
+        return "low"
+
+    return "medium"
+
+
+def _task_class_to_thinking(task_class: str, *, request: str = "") -> str:
+    """Map a TaskClass string to low|medium|high."""
+    cls = (task_class or "unknown").strip().lower()
+    if cls in ("simple_part", "simple", "leaf"):
+        return "low"
+    if cls in ("modification", "multi_feature_part", "unknown"):
+        # Unknown: peek at request length / complexity keywords.
+        if cls == "unknown" and request:
+            lo = request.lower()
+            if any(k in lo for k in (
+                "assembl", "fea", "cfd", "cam", "mission", "full design",
+                "optimize", "prove", "validate",
+            )):
+                return "high"
+            if len(request) < 80 and not any(
+                k in lo for k in ("and then", "then ", "also ", "with ")
+            ):
+                return "low"
+        return "medium"
+    if cls in ("enclosure",):
+        return "medium"
+    if cls in ("assembly", "cam_program", "analysis"):
+        return "high"
+    return "medium"
 
 
 def get_ai_roles(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -515,6 +732,8 @@ def set_ai_roles(
     """Merge *roles_partial* into config ai_roles. Returns the full map.
 
     When *persist* is True, writes via ``config.save_config`` (shallow merge).
+    Partial updates merge *thinking* onto the existing role entry when the
+    caller only sends one side of the assignment.
     """
     current = dict((cfg or {}).get(AI_ROLES_KEY) or {})
     if not isinstance(current, dict):
@@ -523,6 +742,24 @@ def set_ai_roles(
         role_s = str(role).strip()
         if not role_s:
             continue
+        # Merge thinking onto existing entry when partial update omits model
+        # fields but includes thinking (or vice versa).
+        if isinstance(value, Mapping) and role_s in current:
+            prev = current[role_s]
+            if isinstance(prev, Mapping):
+                merged = dict(prev)
+                for k, v in value.items():
+                    if v is not None and v != "":
+                        merged[k] = v
+                # Explicit mode=auto clears fixed provider/model.
+                if str(value.get("mode") or "").lower() == "auto":
+                    merged.pop("provider", None)
+                    merged.pop("model", None)
+                    merged["mode"] = "auto"
+                elif value.get("provider") or value.get("model"):
+                    merged.pop("mode", None)
+                current[role_s] = _normalize_role_value(merged)
+                continue
         current[role_s] = _normalize_role_value(value)
     if persist:
         from services.agent import config as agent_config  # noqa: PLC0415
@@ -532,6 +769,7 @@ def set_ai_roles(
     merged_cfg = dict(cfg or {})
     merged_cfg[AI_ROLES_KEY] = current
     return get_ai_roles(merged_cfg)
+
 
 
 def set_user_rankings(

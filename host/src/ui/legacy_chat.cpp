@@ -2,8 +2,8 @@
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
-// the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
-// + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
+// the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (outline
+// cube + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
 // timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact Design/
 // Edit/Ask dropdown + context meter; transparent prompt with in-box send; graduated-width segmented
 // model/thinking/paperclip/cube/New toolbar — model biggest, icons smallest).
@@ -2298,7 +2298,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 }
 
-// ---- header: logo + "AI-CAD Copilot" + Sessions + status dot ----
+// ---- header: outline cube + "Billet" wordmark + Sessions + status dot ----
 // Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
 // height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
 // strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
@@ -2328,7 +2328,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
 
-    // Collapse chevron LEADS the header row (in-flow, so it never overlaps the logo). "»" tucks
+    // Collapse chevron LEADS the header row (in-flow, so it never overlaps the cube). "»" tucks
     // the column's body away, rolling the column up to just this header row (T-G21); the same
     // chevron toggles it back open.
     {
@@ -2358,9 +2358,15 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
 
-    if (st.logoIcon.id) {
+    // Outline Billet cube (same glyph as the composer context picker) — theme-tinted line art
+    // over the adaptive header ink, not the multi-color app logo (reads better on glass).
+    {
         centerY(lh);
-        ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(lh, lh));
+        IconUV cube = ui::getIcon("context_cube", 20);
+        if (cube.valid) {
+            const ImVec4 tint = chatSurf().textPrimary;
+            ImGui::Image(cube.texId, ImVec2(lh, lh), cube.uv0, cube.uv1, tint);
+        }
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
     // Right-side control cluster: [Sessions|< Chat] [Settings] [status],
@@ -6499,7 +6505,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     }
 
     // (Collapse chevron now leads the Copilot header row — see drawCopilotHeader — so it can't
-    // overlap the logo the way a top-left corner chip did.)
+    // overlap the cube the way a top-left corner chip did.)
 
     // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
     // strip left widens the column; clamped at the top of the next frame.

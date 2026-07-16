@@ -98,6 +98,24 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
     # turn — get_provider(name=...) beats the ambient AI_CAD_PROVIDER env / config.json default.
     # An explicit pick also skips the IP-1 routing override below (the user's choice wins).
     explicit_provider = params.get("provider") or None
+    # Per-role thinking (Settings → AI → Model roles): when the GUI did not pass an
+    # explicit reasoning_effort, resolve Default-role thinking (Auto → classifier).
+    if not (cfg or {}).get("reasoning_effort") and not params.get("reasoning_effort"):
+        try:
+            from services.agent.role_models import resolve_role_thinking  # noqa: PLC0415
+            _eff = resolve_role_thinking(
+                "default",
+                cfg,
+                request=str(params.get("request") or ""),
+            )
+            if _eff:
+                cfg = dict(cfg or {})
+                cfg["reasoning_effort"] = _eff
+        except Exception:  # noqa: BLE001 — never block a turn on thinking resolve
+            pass
+    if params.get("reasoning_effort"):
+        cfg = dict(cfg or {})
+        cfg["reasoning_effort"] = params.get("reasoning_effort")
     provider = config.get_provider(explicit_provider, cfg)
     # T-BL22: per-insertion-point adapter routing (T-H9 seam, IP-1 = the design loop).
     # When config.json carries a "routing" entry for IP-1, resolve which brain answers:

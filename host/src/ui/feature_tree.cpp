@@ -3669,7 +3669,9 @@ void drawFeatureTreeBody(AppState& st,
             // Folder header mirrors Axes (body_folder + DefaultOpen + cascade eye). The origin
             // point is a leaf child so selection / PM point-well routing stay on the point row.
             {
-                const bool originShown = st.originVisEff;
+                // Persistent origin visibility (hiddenFeatures) — NOT the viewport-published
+                // originVisEff, which lags the FM by a frame on fresh docs (same fix as planes/axes).
+                const bool originShown = st.hiddenFeatures.count("point.origin") == 0;
                 FmRowRect originFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
@@ -3777,11 +3779,18 @@ void drawFeatureTreeBody(AppState& st,
                     for (int i = 0; i < 3; ++i) st.showPlane[i] = st.planeVisEff[i];
                     st.planesUserToggled = true;
                 };
-                // Folder eye glyph: shown when ALL children are shown; "any hidden" otherwise.
+                // Eye state from the PERSISTENT plane visibility (showPlane / autoHiddenPlanes) —
+                // NOT planeVisEff, which the viewport publishes AFTER the FM draws, so a fresh doc
+                // showed a stale "hidden" glyph for one frame. Axes read persistent hiddenFeatures
+                // the same way. Force-shows (sketch/PM) are transient and not reflected in the eye.
+                auto planeShownPersist = [&st](int pi) -> bool {
+                    return st.planesUserToggled ? st.showPlane[pi]
+                                                : (st.autoHiddenPlanes.count(kPlaneId[pi]) == 0);
+                };
                 const bool allPlanesShown =
-                    st.planeVisEff[0] && st.planeVisEff[1] && st.planeVisEff[2];
+                    planeShownPersist(0) && planeShownPersist(1) && planeShownPersist(2);
                 const bool anyPlaneShown =
-                    st.planeVisEff[0] || st.planeVisEff[1] || st.planeVisEff[2];
+                    planeShownPersist(0) || planeShownPersist(1) || planeShownPersist(2);
 
                 FmRowRect planesFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
@@ -3831,7 +3840,7 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_FramePadding;
                         // T-G18: selection is shown by fmRowPill's glass card (like feature rows);
                         // the ImGui Selected/Header paint on top read heavier than a feature row.
-                        bool hidden = !st.planeVisEff[pi];
+                        bool hidden = !planeShownPersist(pi);
                         // Pill FIRST (at the row's true left edge — drawing it after the icon left
                         // a misaligned slab starting right of the indent), then the node, then the
                         // icon into the leaf arrow slot. Hidden planes keep a readable dim state.

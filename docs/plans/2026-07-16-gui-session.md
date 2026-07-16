@@ -144,3 +144,10 @@ tests, theme+icon lint clean, m1 boot smoke. Only pre-existing failure: test_doc
 eval_mass tessellation (unrelated, fails on clean master).
 RUNTIME NOTE: washer/revolve core fixes require the daemon to reload the rebuilt libaicad
 (staged to services/dist + core/build-occt-linux). User restarts the app to pick them up.
+
+## Batch 8 (final) — border/eyes + role thinking + copilot logo
+- ribbon.cpp: `ribbon_vGradRounded` band spans full width (killed the white inner-margin strips); resting button outline + non-active tab hairline RESTORED (styling regression from e5c4db0a undone).
+- ui_theme.cpp: `coloredRowWash` rebuilt as rounded caps (2·rnd) + full-height band — no margin ring, no corner pips.
+- FM eyes: planes/axes/origin all read PERSISTENT state; origin now default-visible on empty docs and auto-hides with solid content (`applyDocDrivenVisibility` sync, `originUserToggled` sticky). Verified via m1 screenshots (all eyes open frame 0).
+- Per-role thinking effort: Settings → AI → Model roles gains Thinking column (Auto/Low/Medium/High); `ai_roles.<role>.thinking` in config.json (omitted when auto). Auto ⇒ main chat: prompt classifier assigns; subagents: dispatcher `effort=` on delegate/node else complexity heuristics (default medium). AnthropicProvider honors reasoning_effort (was pinned high). Contract appended to contracts/providers.md.
+- Copilot header: colored logo → outline context_cube glyph (adaptive ink), matches menu theme.

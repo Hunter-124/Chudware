@@ -48,7 +48,8 @@ def _ai_roles_set(params: dict, _emit: Callable) -> dict:
                 "reason": "roles mapping required",
                 "hint": (
                     "Pass roles: {advisor|task|planning|default|plm|redaction: "
-                    "{provider, model} | \"auto\"}"
+                    "{provider, model, thinking?} | {mode:\"auto\", thinking?} | \"auto\"}. "
+                    "thinking: auto|low|medium|high (default auto)."
                 ),
             }
 

@@ -735,10 +735,51 @@ class MissionDispatch:
                     cfg_pick = dict(cfg)
                     cfg_pick["model"] = assignment.model
                     rank = int(assignment.rank or (min_rank_i or 3))
-                    if rank <= 2:
-                        cfg_pick["reasoning_effort"] = "low"
-                    elif rank <= 3:
-                        cfg_pick["reasoning_effort"] = "medium"
+                    # Per-role thinking: concrete level wins; Auto → dispatch
+                    # complexity heuristics (rank/task_class). Dispatcher may
+                    # also pass an explicit effort on the node.
+                    dispatch_effort = None
+                    if isinstance(node, dict):
+                        dispatch_effort = (
+                            node.get("thinking")
+                            or node.get("reasoning_effort")
+                            or node.get("effort")
+                            or (node.get("role_model") or {}).get("reasoning_effort")
+                        )
+                    else:
+                        dispatch_effort = (
+                            getattr(node, "effort", None)
+                            or getattr(node, "thinking", None)
+                            or getattr(node, "reasoning_effort", None)
+                        )
+                    try:
+                        from services.agent.role_models import (  # noqa: PLC0415
+                            resolve_role_thinking,
+                        )
+                        resolved_effort = resolve_role_thinking(
+                            harness_role,
+                            cfg,
+                            request=str(
+                                (node.get("brief") if isinstance(node, dict) else None)
+                                or (node.get("request") if isinstance(node, dict) else None)
+                                or ""
+                            ),
+                            task_class=self.task_class,
+                            node_depth=depth,
+                            risk=risk,
+                            min_rank=min_rank_i,
+                            dispatch_effort=(
+                                str(dispatch_effort) if dispatch_effort else None
+                            ),
+                            rank=rank,
+                        )
+                        if resolved_effort:
+                            cfg_pick["reasoning_effort"] = resolved_effort
+                    except Exception:  # noqa: BLE001 — keep rank heuristic
+                        if rank <= 2:
+                            cfg_pick["reasoning_effort"] = "low"
+                        elif rank <= 3:
+                            cfg_pick["reasoning_effort"] = "medium"
                     if assignment.provider == "ollama":
                         ocfg = dict(cfg_pick.get("ollama") or {})
                         ocfg.setdefault(

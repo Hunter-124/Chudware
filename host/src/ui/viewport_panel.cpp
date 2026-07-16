@@ -2225,13 +2225,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // !axesUserToggled — the FeatureManager eye reads hiddenFeatures.count(id) directly (unlike
         // origin which uses originVisEff). Without this, empty docs can draw axes while the FM eye
         // still shows "hidden" if applyDocDrivenVisibility never ran or left a stale entry.
-        bool pmWantsAxis = !inSketch && st.propertyManager && st.propertyManager->active() &&
+        // PM axis wells only apply outside sketch/sketch3d — while sketching the grid owns the view.
+        bool pmWantsAxis = !inSketch && !inSketch3d && st.propertyManager &&
+                           st.propertyManager->active() &&
                            st.propertyManager->activeWellWantsAxis();
+        // Sketch force-hide: once a part has solid geometry, axes stay hidden while sketching
+        // unless the user took sticky FM-eye control (axesUserToggled). Empty/sketch-only docs
+        // keep axes as a first-sketch reference (matches normal auto-hide policy).
+        const bool sketchHideAxes =
+            (inSketch || inSketch3d) && hasSolidContent && !st.axesUserToggled;
         const bool needEffDatums =
-            !st.originUserToggled || !st.axesUserToggled || pmWantsAxis;
+            !st.originUserToggled || !st.axesUserToggled || pmWantsAxis || sketchHideAxes;
         if (needEffDatums) {
             // Persist auto axis visibility into hiddenFeatures so FM eyes match the draw path.
             // Only while the user has not taken sticky control (axesUserToggled).
+            // hasSolidContent (incl. while sketching a solid part) auto-hides; empty docs show.
             if (!st.axesUserToggled) {
                 auto syncAxisHid = [&](const std::string& id) {
                     if (id.empty()) return;
@@ -2262,12 +2270,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             } else if (!st.axesUserToggled) {
                 // Mirror the just-synced hiddenFeatures (belt + braces with the sync above).
+                // Same gate as sketchHideAxes: solid content hides axes (sketch or not).
                 if (hasSolidContent) {
+                    effDatums.insert("axis.x");
+                    effDatums.insert("axis.y");
+                    effDatums.insert("axis.z");
                     for (const auto& id : st.axisDatumIds) effDatums.insert(id);
                 } else {
+                    effDatums.erase("axis.x");
+                    effDatums.erase("axis.y");
+                    effDatums.erase("axis.z");
                     for (const auto& id : st.axisDatumIds) effDatums.erase(id);
                 }
             }
+            // axesUserToggled: leave effDatums as hiddenFeatures (user eye state sticks in sketch).
             renderer.setHiddenDatums(std::move(effDatums));
         } else {
             // User took control of origin AND axes, no axis well: resync to hiddenFeatures so
@@ -2275,8 +2291,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.setHiddenDatums(st.hiddenFeatures);
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
         }
-        // Planes force-hidden in sketch (grid owns the view). Axes honor hiddenFeatures only —
-        // an unhidden axis stays drawn grey while sketching (no force-hide on sketch enter).
+        // Planes force-hidden in sketch (grid owns the view). Axes follow the same auto-hide
+        // policy as outside sketch: with solid content they stay hidden unless the user unhid
+        // them via the FeatureManager eye (axesUserToggled + hiddenFeatures). Empty/sketch-only
+        // docs keep axes drawn as a first-sketch reference.
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)
             // Plane-pick: the hovered plane (from last frame's overlay hit-test) gets the
@@ -3758,6 +3776,62 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness)
             && !s_vpKey.empty())
             applyAppearanceFromViewport(st, s_vpKey, s_vpColor, s_vpMetallic, s_vpRoughness);
+
+        // ---- in-context component-edit banner (SolidWorks "Edit Component") ----
+        // Drawn as a true viewport HUD on the visible 3D surface — right of the FeatureManager
+        // glass column, below the floating doc-tab strip — same dodge pattern as the heads-up
+        // view toolbar / orientation triad. The early BeginChild at content origin sat under the
+        // FM header and was clipped. Compact auto-width glass pill; button exits component edit.
+        if (st.inComponentEdit()) {
+            const float s = ui::uiScale;
+            const auto& palC = ui::palette;
+            const std::string& cid = st.componentEdit.componentId;
+            const char* label = cid.empty() ? "(component)" : cid.c_str();
+
+            // Left edge: just past the FM pinned column (fallback to content left / cr0).
+            float bx0 = cr0.x + 10.0f * s;
+            {
+                const float fe = ui::overlayColumnEdge(0);
+                if (fe > cr0.x) bx0 = fe + 10.0f * s;
+            }
+            // Top edge: below the doc-tab file strip.
+            float by0 = cr0.y + 6.0f * s;
+            {
+                const float dtb = ui::docTabBandBottom();
+                if (dtb > by0) by0 = dtb + 6.0f * s;
+            }
+            // Never run under the Copilot column — clamp max width to its left edge.
+            float maxRight = cr1.x - 10.0f * s;
+            {
+                const float e = ui::overlayColumnEdge(1);
+                if (e > bx0 + 80.0f * s && e < cr1.x) maxRight = e - 10.0f * s;
+            }
+            const float maxW = std::max(1.0f, maxRight - bx0);
+            const float pillW = std::min(300.0f * s, maxW);
+
+            ImGui::SetCursorScreenPos(ImVec2(bx0, by0));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                ImVec4(palC.overlayBg[0], palC.overlayBg[1], palC.overlayBg[2], palC.overlayBg[3]));
+            ImGui::PushStyleColor(ImGuiCol_Border,
+                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 0.55f));
+            ImGui::BeginChild("##compEditHud", ImVec2(pillW, 0),
+                              ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY,
+                              ImGuiWindowFlags_NoScrollbar);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palC.overlayText[0], palC.overlayText[1], palC.overlayText[2], 1.0f));
+            ImGui::Text("Editing model: %s", label);
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palC.accentDim[0], palC.accentDim[1], palC.accentDim[2], 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(palC.accent[0], palC.accent[1], palC.accent[2], 1.0f));
+            if (ImGui::Button("Return to assembly", ImVec2(0, 0)))
+                st.exitComponentEdit();
+            ImGui::PopStyleColor(2);
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+        }
 
         // ---- C25 W3-J: heads-up view toolbar (SolidWorks-style, fully functional) ----
         // Top-right row-only glass pills; fades when idle so the central workspace stays clear.

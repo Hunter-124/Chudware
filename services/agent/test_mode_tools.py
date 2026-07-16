@@ -78,6 +78,60 @@ class TestModeToolAllowlists:
         assert "new_part" not in tools
         assert "edit_feature" not in tools
 
+    def test_plan_is_broad_non_mutator(self):
+        """Plan = agent-broad minus commit mutators (not a locked-down read set)."""
+        tools = cmt.tools_for_mode("plan")
+        assert tools is not None
+        for name in (
+            "run_fea_static",
+            "run_cfd_flow",
+            "research_web_search",
+            "delegate",
+            "part_source",
+            "ask_user",
+            "inspect_part",
+            "design_review",
+            "fit_calc",
+            "bom_rollup",
+            "layout_plan",
+            "preflight_ops",
+        ):
+            assert name in tools, name
+        # Commit mutators must never appear in the mode set.
+        for name in (
+            "add_features",
+            "new_part",
+            "new_assembly",
+            "edit_feature",
+            "asm_add_component",
+            "cam_generate",
+            "ecad_place_symbol",
+        ):
+            assert name not in tools, name
+            assert name not in cmt.PLAN_TOOLS
+
+    def test_plan_role_card_does_not_intersect_narrow_set(self):
+        # Role card may include mutators; plan strips them but keeps the rest
+        # (no intersection with a locked-down PLAN_TOOLS).
+        role = [
+            "describe_part",
+            "add_features",
+            "run_fea_static",
+            "delegate",
+            "new_part",
+            "research_web_search",
+            "edit_feature",
+        ]
+        out = cmt.apply_mode_tools("plan", role)
+        assert out is not None
+        assert "describe_part" in out
+        assert "run_fea_static" in out
+        assert "delegate" in out
+        assert "research_web_search" in out
+        assert "add_features" not in out
+        assert "new_part" not in out
+        assert "edit_feature" not in out
+
     def test_edit_excludes_new_part(self):
         tools = cmt.tools_for_mode("edit")
         assert tools is not None
@@ -114,15 +168,19 @@ class TestModeToolAllowlists:
         assert "new_part" not in out
 
     def test_plan_only_forces_plan_tools(self):
-        # Even under agent mode, plan_only narrows to plan set.
+        # Even under agent mode, plan_only uses plan semantics (strip mutators;
+        # keep non-mutators from the role card — no narrow PLAN_TOOLS intersect).
         out = cmt.apply_mode_tools(
             "agent",
-            ["add_features", "describe_part", "buildgraph_plan", "new_part"],
+            ["add_features", "describe_part", "buildgraph_plan", "new_part",
+             "run_fea_static", "delegate"],
             plan_only=True,
         )
         assert out is not None
         assert "buildgraph_plan" in out
         assert "describe_part" in out
+        assert "run_fea_static" in out
+        assert "delegate" in out
         assert "add_features" not in out
         assert "new_part" not in out
 
@@ -133,6 +191,21 @@ class TestModeToolAllowlists:
         assert cmt.is_tool_allowed("new_part", "edit") is False
         assert cmt.is_tool_allowed("new_part", "agent") is True
         assert cmt.is_tool_allowed("delegate", "swarm") is True
+
+    def test_is_tool_allowed_plan_broad(self):
+        assert cmt.is_tool_allowed("run_fea_static", "plan") is True
+        assert cmt.is_tool_allowed("research_web_search", "plan") is True
+        assert cmt.is_tool_allowed("delegate", "plan") is True
+        assert cmt.is_tool_allowed("part_source", "plan") is True
+        assert cmt.is_tool_allowed("ask_user", "plan") is True
+        assert cmt.is_tool_allowed("inspect_part", "plan") is True
+        assert cmt.is_tool_allowed("add_features", "plan") is False
+        assert cmt.is_tool_allowed("new_part", "plan") is False
+        assert cmt.is_tool_allowed("edit_feature", "plan") is False
+        assert cmt.is_tool_allowed("new_assembly", "plan") is False
+        assert cmt.is_tool_allowed("asm_mate", "plan") is False
+        assert cmt.is_tool_allowed("cam_generate", "plan") is False
+        assert cmt.is_tool_allowed("ecad_place_symbol", "plan") is False
 
 
 # ---------------------------------------------------------------------------

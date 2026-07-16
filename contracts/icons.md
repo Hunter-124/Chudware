@@ -111,3 +111,6 @@ Composer copilot toolbar icons for the chat context-reference feature:
 
 ## 2026-07-16 append (batch 9)
 - `msg_edit` — General: chat user-bubble edit pencil (procedural, shared draw_pencil).
+- `ask` — General/copilot: speech bubble with question mark for Copilot Ask mode
+  (read-only Q&A). Procedural line-art; no baked plate.
+

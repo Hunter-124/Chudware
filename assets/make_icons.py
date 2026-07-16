@@ -107,6 +107,8 @@ CONTRACT_NAMES: list[str] = [
     "thread",
     # ---- Chat context refs (Wave 4, append-only): composer attach + context picker ----
     "paperclip", "context_cube",
+    # ---- Copilot modes (append-only): mode-picker Ask glyph ----
+    "ask",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -2281,6 +2283,45 @@ def draw_msg_edit(d, cell, p):
     s = cell * SS
     # Reuse the shared detailed pencil: bottom-left tip → top-right eraser.
     draw_pencil(d, s, p, s * 0.22, s * 0.78, s * 0.80, s * 0.20, s * 0.055)
+
+@icon("ask")
+def draw_ask(d, cell, p):
+    """Speech bubble with a question mark — Copilot Ask mode (read-only Q&A)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # Rounded bubble body (stroke only — no fill, works on glass both themes).
+    d.rounded_rectangle(
+        [s * 0.14, s * 0.12, s * 0.86, s * 0.68],
+        radius=int(s * 0.12),
+        outline=p.stroke,
+        width=lw,
+    )
+    # Tail pointing down-left (outline triangle, no fill).
+    d.line(
+        [(s * 0.30, s * 0.68), (s * 0.44, s * 0.68), (s * 0.24, s * 0.86), (s * 0.30, s * 0.68)],
+        fill=p.stroke,
+        width=lw,
+        joint="curve",
+    )
+    # Question mark: curved top + stem + accent dot.
+    # PIL arcs: 0° = 3 o'clock, angles increase clockwise.
+    # Arc 200°→90° ends at bottom-center so the stem joins cleanly.
+    cx = s * 0.50
+    arc_r = s * 0.13
+    arc_cy = s * 0.34
+    d.arc(
+        [cx - arc_r, arc_cy - arc_r, cx + arc_r, arc_cy + arc_r],
+        start=200,
+        end=90,
+        fill=p.accent,
+        width=lw,
+    )
+    # Stem from the bottom of the hook.
+    d.line([(cx, arc_cy + arc_r), (cx, s * 0.52)], fill=p.accent, width=lw)
+    # Dot under the stem.
+    filled_circle(d, cx, s * 0.58, max(1, int(lw * 0.85)), p.accent)
+
+
 
 @icon("copy")
 def draw_copy(d, cell, p):

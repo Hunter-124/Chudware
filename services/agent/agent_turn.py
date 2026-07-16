@@ -561,9 +561,15 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             _plan_only = True
         if _mode == "plan" and _plan_only is None:
             _plan_only = True
+        # Plan keeps the planning MODEL (role_for_copilot_mode) but MUST NOT be
+        # narrowed by a role tool-card — plan = agent-broad minus commit mutators.
+        # Pass None so apply_mode_tools returns the broad PLAN_TOOLS denylist form.
+        _role_tools_for_mode = allowed_tools
+        if _mode == "plan" or _plan_only:
+            _role_tools_for_mode = None
         narrowed = apply_mode_tools(
             _mode,
-            allowed_tools,
+            _role_tools_for_mode,
             plan_only=bool(_plan_only) if _plan_only is not None else None,
         )
         if narrowed is not None:

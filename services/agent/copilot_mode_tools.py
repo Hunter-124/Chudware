@@ -7,14 +7,15 @@ Contract (mode-overhaul):
 
 Policies:
   * ask   — read-only Q&A (describe/measure/research/cad_guide)
-  * plan  — read + plan tools; NO mutation (no add_features/new_part) until
-            approved_plan executes under agent|swarm
+  * plan  — agent-broad tool access MINUS geometry/document commit mutators;
+            plan_only run gate blocks commits, not a locked-down allowlist.
+            open-ended ask_user + delegate stay available.
   * edit  — doc-scoped mutating tools; NO new_part / mission / broad corporate
   * agent — full (None = unrestricted at mode layer; role card still applies)
   * swarm — full + explicit corporate/delegate tools kept in the set
 
-Subagents remain available in every mode that is not ask/plan-strict: ``delegate``
-stays in agent/swarm (and edit keeps a narrow set without mission spawn).
+Subagents (``delegate``) stay available in agent/swarm/edit/plan. Ask is the
+only mode that excludes them.
 """
 from __future__ import annotations
 
@@ -63,9 +64,15 @@ ASK_TOOLS: frozenset[str] = frozenset({
     "parts_taxonomy",
 })
 
-# Plan: read + plan/ledger tools. No geometry mutation until approve.
+# Plan: same breadth as agent for research/sim/inspect/sourcing/delegate, but
+# NEVER geometry/document commit mutators. Used when role_tools is empty (a
+# concrete list is required because None cannot express a denylist). When a
+# role card is present, apply_mode_tools subtracts mutators from that card
+# instead of intersecting with this set — callers that must stay broad should
+# pass role_tools=None for plan.
 PLAN_TOOLS: frozenset[str] = frozenset({
     *ASK_TOOLS,
+    # Plan / ledger / status
     "buildgraph_plan",
     "buildgraph_status",
     "dag_plan",
@@ -77,16 +84,71 @@ PLAN_TOOLS: frozenset[str] = frozenset({
     "layout_plan_report",
     "preflight_ops",
     "ask_user",
+    "delegate",
     "workspace_status",
     "intake_status",
     "suggest_dimension_scheme",
-    "check_sketch",
-    "check_sketch_d",
-    "sketch_health",
-    "sketch_preview_text",
+    "advise",
+    # Describe / inspect / look
+    "inspect_part",
+    "inspect_feature",
+    "inspect_section",
+    "look_around",
+    "contact_sheet",
+    "render_part",
+    "render_views",
+    "render_sketch",
     "render_ascii",
     "render_sketch_ascii",
-    "advise",
+    "wall_thickness",
+    "draft_analysis",
+    # Checks / compare / fit
+    "check_sketch",
+    "check_sketch_d",
+    "check_interference",
+    "check_symmetry",
+    "check_feature_overlap",
+    "check_metadata",
+    "interference_check",
+    "interface_check",
+    "compare_parts",
+    "stackup_analyze",
+    "fit_calc",
+    "fit_report",
+    "recommend_fit",
+    "gear_check",
+    "bearing_life",
+    "tap_drill",
+    "feeds_speeds",
+    "sketch_health",
+    "sketch_preview_text",
+    # Sourcing / BOM
+    "part_source",
+    "bom_rollup",
+    "bom_price",
+    # Design review
+    "design_review",
+    "dfm_check",
+    "verify_battery",
+    # Sim read/run (analysis is non-commit)
+    "run_fea_static",
+    "run_fea_modal",
+    "run_fea_frequency_response",
+    "run_fea_fatigue",
+    "run_fea_thermal",
+    "run_fea_buckling",
+    "run_fea_contact",
+    "run_cfd_flow",
+    "run_cfd_accurate",
+    "get_job",
+    "simulate_motion",
+    # Corporate / coordinate read helpers
+    "corporate_channel_read",
+    "corporate_chart",
+    "coordinate_board",
+    "coordinate_progress",
+    "coordinate_claim",
+    "coordinate_release",
 })
 
 # Edit: mutate current doc; no new_part / mission / corporate activate.
@@ -233,7 +295,11 @@ def apply_mode_tools(
       * list  — concrete allowed tool names (sorted for stability in tests).
 
     Rules:
-      * ``plan_only=True`` forces the plan allowlist even if mode is agent.
+      * ``plan_only=True`` forces plan semantics even if mode is agent.
+      * plan = agent-broad minus commit mutators (never a narrow read-only
+        intersection). Empty role → broad ``PLAN_TOOLS``; non-empty role →
+        that set with mutators stripped (callers that need full plan breadth
+        should pass role_tools=None).
       * When *role_tools* is None/empty and mode is restricted → mode list.
       * When *role_tools* is None/empty and mode is open → None (unrestricted).
       * swarm unions SWARM_EXTRA_TOOLS onto the role set (or leaves unrestricted).
@@ -259,7 +325,18 @@ def apply_mode_tools(
             return None
         return sorted(role_set)
 
-    # Restricted modes: ask / plan / edit
+    # Plan: open like agent minus geometry/doc commit mutators. Do NOT
+    # intersect a role card with the (legacy narrow) plan set — that was the
+    # over-restriction. Empty role → broad PLAN_TOOLS denylist form.
+    if m == "plan":
+        _plan_deny = _MUTATING_TOOLS | {"new_part", "new_assembly", "edit_feature"}
+        if role_set:
+            allowed = role_set - _plan_deny
+        else:
+            allowed = set(PLAN_TOOLS) - _plan_deny
+        return sorted(allowed)
+
+    # Restricted modes: ask / edit
     assert mode_set is not None
     if not role_set:
         allowed = set(mode_set)
@@ -268,12 +345,8 @@ def apply_mode_tools(
 
     if m == "edit":
         allowed -= _EDIT_DENIED
-    if m in ("ask", "plan"):
+    if m == "ask":
         allowed -= _MUTATING_TOOLS
-        # plan already excludes mutators via PLAN_TOOLS, but belt-and-suspenders
-        # if a role card smuggled them in before intersect.
-        if m == "plan":
-            allowed -= {"new_part", "new_assembly", "edit_feature"}
 
     return sorted(allowed)
 

@@ -219,6 +219,9 @@ struct SubAccountsUi {
     std::string lastError;
 };
 static SubAccountsUi s_subAccts;
+// CEF add-account disabled — device/browser Python flow (xai_sub_provider)
+// handles multi-account storage+rotation. Leave oauth_capture compiled but dormant.
+static constexpr bool kXaiUseCef = false;
 
 static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor"};
 static const char* kSubProviderLabels[] = {
@@ -761,7 +764,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         // When the in-app CEF modal owns the xAI flow, suppress the inline
         // external-browser progress (modal shows code + page instead).
         SubLoginProgress& prog = s_subAccts.login[prov];
-        const bool cefOwnsXai = (std::string(prov) == "xai") && ui::oauthCapture().active();
+        const bool cefOwnsXai = (std::string(prov) == "xai") && kXaiUseCef && ui::oauthCapture().active();
         if (cefOwnsXai) {
             // Modal owns the flow; Python status still drives prog via the normal
             // poll above. Do not force-poll every frame (TTL + in-flight guard
@@ -812,10 +815,10 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             std::snprintf(addId, sizeof(addId), "Add account##%s", prov);
             if (ImGui::SmallButton(addId)) {
                 const bool isXai = std::string(prov) == "xai";
-                // xAI: prefer in-app CEF device-code approve surface (multi-account
-                // isolation via clearSession). Fallback to external browser when CEF
-                // is unavailable (SDK-less build / cold-init failure).
-                if (isXai && ui::OauthCapture::cefAvailable()) {
+                // xAI: CEF path is gated by kXaiUseCef (currently off — Python
+                // device/browser token store+rotation handles multi-account).
+                // When enabled, prefer in-app CEF; fallback is external browser.
+                if (isXai && kXaiUseCef && ui::OauthCapture::cefAvailable()) {
                     prog.inProgress = true;
                     prog.lastError.clear();
                     prog.userCode.clear();
@@ -854,7 +857,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                 }
             }
             if (ImGui::IsItemHovered()) {
-                if (std::string(prov) == "xai" && ui::OauthCapture::cefAvailable())
+                if (std::string(prov) == "xai" && kXaiUseCef && ui::OauthCapture::cefAvailable())
                     ImGui::SetTooltip(
                         "Add another %s account in the embedded browser "
                         "(session isolated for multi-account).", plabel);

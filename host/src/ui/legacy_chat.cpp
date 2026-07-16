@@ -10169,6 +10169,45 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
 }
 
+// One row in the drop-up mode menu: glass wash on hover/selection + atlas icon + label.
+// Mirrors modelRow styling (glassRowBackground + tinted atlas image). Returns true when
+// clicked and enabled. Header colors are pushed transparent by the caller so the wash is
+// the only row background.
+static bool modeMenuRow(const char* iconName, const char* label, bool selected,
+                        bool disabled, int uid) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeight() + 2.0f * sc;
+    const float fh = ImGui::GetFontSize();
+    ImGui::PushID(uid);
+    if (disabled) ImGui::BeginDisabled();
+    const bool clicked = ImGui::Selectable("##moderow", selected,
+                                           ImGuiSelectableFlags_AllowItemOverlap, ImVec2(0, rowH));
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    ui::glassRowBackground(dl, mn, mx, ui::metrics::rounding(4.0f),
+                           /*stripe=*/false, /*selected=*/(selected || hov),
+                           /*washAlpha=*/selected ? 0.42f : 0.30f);
+    const float midY = (mn.y + mx.y) * 0.5f;
+    const float pad = 8.0f * sc;
+    const float isz = fh * 1.02f;
+    const ImU32 ink = ui::Palette::toU32(disabled ? pal.textDisabled
+                                                  : (selected ? pal.text : pal.textDim));
+    float textX = mn.x + pad;
+    IconUV ic = ui::getIcon(iconName, 20);
+    if (ic.valid) {
+        const ImVec2 i0(mn.x + pad, midY - isz * 0.5f);
+        dl->AddImage(ic.texId, i0, ImVec2(i0.x + isz, i0.y + isz), ic.uv0, ic.uv1, ink);
+        textX = i0.x + isz + 7.0f * sc;
+    }
+    dl->AddText(ImVec2(textX, midY - fh * 0.5f),
+                ui::Palette::toU32(disabled ? pal.textDisabled : pal.text), label);
+    if (disabled) ImGui::EndDisabled();
+    ImGui::PopID();
+    return clicked && !disabled;
+}
+
 // Prelude row above the prompt: Agent/Plan/Swarm/Edit/Ask dropdown (left) + context meter (right).
 // Permissions live only in the Settings overlay (not the composer).
 static void drawComposerPrelude(AppState& st, bool /*busy*/) {
@@ -10198,41 +10237,82 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]));
 
-    // Agent / Plan / Swarm / Edit / Ask — combo (single active mode).
-    const char* modes[] = {"Agent", "Plan", "Swarm", "Edit", "Ask"};
-    const char* modeTips[] = {
+    // Agent / Plan / Swarm / Edit / Ask — drop-UP menu that propagates upward like the model
+    // picker, with an atlas icon + glass row styling per entry.
+    static const char* modes[]     = {"Agent", "Plan", "Swarm", "Edit", "Ask"};
+    static const char* modeIcons[] = {"ai_panel", "plan_board", "team", "msg_edit", "ask"};
+    static const char* modeTips[]  = {
         "Agent — full tools; auto-routes (may plan, swarm, or edit).",
         "Plan — draft a plan only; approve before building.",
         "Swarm — force multi-agent / corporate mission execution.",
         "Edit — change the open part (scoped to selection when set).",
         "Ask — questions about the part; nothing changes."};
     int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 4) ? st.aiInteraction : 0;
-    // Width from longest label so the box doesn't clip text at any scale.
-    float modeW = 0.0f;
-    for (const char* m : modes)
-        modeW = ImMax(modeW, ImGui::CalcTextSize(m).x);
-    modeW += ImGui::GetFrameHeight() + 12.0f * sc;  // caret + compact padding
-    ImGui::SetNextItemWidth(modeW);
-    if (ImGui::BeginCombo("##aimode", modes[mode], ImGuiComboFlags_HeightSmall)) {
+    // Trigger chip: icon + longest label + up-caret. Custom-drawn (InvisibleButton + glass wash)
+    // so the leading atlas icon sits inline, matching the composer's other chips.
+    const float fh = ImGui::GetFontSize();
+    float labelW = 0.0f;
+    for (const char* m : modes) labelW = ImMax(labelW, ImGui::CalcTextSize(m).x);
+    const float iconSz = fh * 1.02f;
+    const float caretW = fh * 0.7f;
+    const float triggerW = 8.0f * sc + iconSz + 7.0f * sc + labelW + 8.0f * sc + caretW + 6.0f * sc;
+    const float segH = ImGui::GetFrameHeight();
+    const bool trigClick = ImGui::InvisibleButton("##aimode", ImVec2(triggerW, segH));
+    const bool trigHov = ImGui::IsItemHovered();
+    ImDrawList* pdl = ImGui::GetWindowDrawList();
+    const ImVec2 tmn = ImGui::GetItemRectMin(), tmx = ImGui::GetItemRectMax();
+    ui::glassRowBackground(pdl, tmn, tmx, ui::metrics::rounding(6.0f),
+                           /*stripe=*/false, /*selected=*/trigHov, /*washAlpha=*/0.30f);
+    const float tMidY = (tmn.y + tmx.y) * 0.5f;
+    const ImU32 tink = ImGui::GetColorU32(surf.textPrimary);
+    {
+        float tx = tmn.x + 8.0f * sc;
+        IconUV ic = ui::getIcon(modeIcons[mode], 20);
+        if (ic.valid) {
+            const ImVec2 i0(tmn.x + 8.0f * sc, tMidY - iconSz * 0.5f);
+            pdl->AddImage(ic.texId, i0, ImVec2(i0.x + iconSz, i0.y + iconSz), ic.uv0, ic.uv1, tink);
+            tx = i0.x + iconSz + 7.0f * sc;
+        }
+        pdl->AddText(ImVec2(tx, tMidY - fh * 0.5f), tink, modes[mode]);
+    }
+    {   // up-caret — signals the menu opens upward
+        const float cx = tmx.x - caretW - 4.0f * sc, cy = tMidY;
+        const float r = fh * 0.24f;
+        pdl->AddTriangleFilled(ImVec2(cx + r * 0.8f, cy - r * 0.7f),
+                               ImVec2(cx, cy + r * 0.6f),
+                               ImVec2(cx + r * 1.6f, cy + r * 0.6f), tink);
+    }
+    if (trigClick) ImGui::OpenPopup("##aimodemenu");
+    if (trigHov && !ImGui::IsPopupOpen("##aimodemenu"))
+        ImGui::SetTooltip("%s", modeTips[mode]);
+
+    // Drop-UP: anchor the popup's bottom-left just above the trigger (pivot 0,1) so entries
+    // propagate upward — same fixed-anchor trick as the model picker.
+    {
+        const float popW = ImMax(triggerW, 150.0f * sc);
+        const float gap = 4.0f * sc;
+        ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
+        ImGui::SetNextWindowPos(ImVec2(tmn.x, tmn.y - gap), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    }
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+    if (ImGui::BeginPopup("##aimodemenu",
+                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
         for (int i = 0; i < 5; ++i) {
-            // Only Edit requires an open document; Agent/Plan/Swarm/Ask do not.
             const bool needDoc = (i == (int)CopilotMode::Edit && !hasDoc);
-            if (needDoc) ImGui::BeginDisabled();
-            const bool sel = (mode == i);
-            if (ImGui::Selectable(modes[i], sel) && !needDoc) {
+            if (modeMenuRow(modeIcons[i], modes[i], mode == i, needDoc, i)) {
                 st.aiInteraction = i;
                 st.settings.copilotMode = i;
                 saveSettings(st.settings);  // survive restart without waiting for next send
+                ImGui::CloseCurrentPopup();
             }
-            if (sel) ImGui::SetItemDefaultFocus();
-            if (needDoc) ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
         }
-        ImGui::EndCombo();
+        ImGui::EndPopup();
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", modeTips[mode]);
+    ImGui::PopStyleColor(3);
 
     // Context meter on the SAME row, right-aligned.
     ImGui::SameLine();

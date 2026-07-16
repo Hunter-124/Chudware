@@ -1424,3 +1424,13 @@ Tab switching onto docs the shared daemon already built (the audit-the-AI's-part
 
 ## 2026-07-16 — empty AI-part recovery auto-discard
 Recover? prompt was filling with dozens of blank "AI part" tabs (no features/sketches). Empty docs are now discarded at every recovery boundary: `doc_list` exposes `empty`/`feature_count`/`component_count`; autosave skips empties; `retireDoc`/doc-GC refuse to orphan them; crash-tier register + `recovery_list` purge empty `.step+` via miniz document.json peek. Files: `core/doc/session.cpp`, `core/hostd/autosave.{h,cpp}`, `core/hostd/server.cpp`, `core/CMakeLists.txt` (hostd↔miniz), `contracts/worker_rpc.md`. Verified with a disposable hostd instance (empty orphan purged, real retained; new part reports `empty:true`). Restart hostd/GUI to pick up the new binary.
+
+## 2026-07-16 — Schematic/sim ASCII + cell-addressed apply edits
+
+Added deterministic ASCII translators for electrical schematics and SPICE/sim
+decks, and a shared grid contract + `apply_ascii_edits` so models can move/swap/
+section-replace on PCB and schematic sheets (and sketch entity add/delete) using
+col/row from the ruled ASCII + `index`. Files: `services/mcp/ascii2d.py`,
+`services/mcp/ecad_tools.py` (schematic mutation readbacks), `test_ascii2d.py`.
+Deferred: live sketch apply path still depends on core bridge; full ERC-backed
+schematic findings stay on `ecad_run_erc`.

@@ -481,6 +481,30 @@ def _apply(session, ops: list[dict]) -> dict:
     return ecad_session.apply_ops(session, session.revision, ops)
 
 
+
+def _attach_schematic_ascii_readback(payload: dict, doc_id: str = "",
+                                    focus: Optional[list] = None) -> dict:
+    """Best-effort compact schematic ASCII + grid/index on mutation responses."""
+    if not isinstance(payload, dict) or not payload.get("ok", True):
+        return payload
+    try:
+        from mcp_server.ascii2d import (  # noqa: PLC0415
+            attach_schematic_readback, _load_schematic,
+        )
+        did = doc_id or payload.get("doc_id") or ""
+        sch = _load_schematic(str(did) if did else "")
+        kwargs: dict = {}
+        if focus is not None:
+            kwargs["focus"] = focus
+        attach_schematic_readback(payload, sch, **kwargs)
+    except Exception:  # noqa: BLE001
+        payload.setdefault(
+            "ascii_readback",
+            {"ok": False, "error": "schematic readback unavailable"},
+        )
+    return payload
+
+
 def _attach_board_ascii_readback(payload: dict, doc_id: str = "",
                                  focus: Optional[list] = None,
                                  layer: str = "") -> dict:
@@ -745,7 +769,7 @@ def register_ecad_tools(mcp) -> None:
         this_unconnected = [p for p in unconnected if p["ref"] == sym.get("ref")]
         warnings = list(resp.get("warnings", []))
         pin_labels = ", ".join(f"{p['number']}({p['name']}/{p['type']})" for p in pins)
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "ref": sym.get("ref"), "id": sid, "libid": libid,
             "value": sym.get("value", ""), "pos": sym.get("pos"),
@@ -762,8 +786,12 @@ def register_ecad_tools(mcp) -> None:
                 [f"ecad_wire('{sym.get('ref')}', '{pins[0]['number']}', '<otherRef>', "
                  f"'<otherPin>')  # connect pin {pins[0]['number']}"]
                 if pins else []
-            ) + ["ecad_status()  # see the whole design + what's still unconnected"],
-        })
+            ) + ["ecad_status()  # see the whole design + what's still unconnected",
+                 "render_schematic_ascii()  # full sheet ASCII + grid for edits"],
+        }
+        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id,
+                                         focus=list(sym.get("pos") or []))
+        return _dumps(payload)
 
     # ---------------------------------------------------------------- wire
 
@@ -816,7 +844,7 @@ def register_ecad_tools(mcp) -> None:
         members = nl.get("nets", {}).get(net, [])
         member_refs = [f"{m.get('ref')}.{m.get('pin')}" for m in members]
         unconnected = _unconnected_pins(doc, nl)
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "net": net or None, "net_members": member_refs, "net_size": len(members),
             "total_unconnected": len(unconnected),
@@ -832,9 +860,12 @@ def register_ecad_tools(mcp) -> None:
                 [f"ecad_wire('{unconnected[0]['ref']}', '{unconnected[0]['pin']}', "
                  "'<ref>', '<pin>')"] if unconnected else
                 ["ecad_run_erc()  # verify the design electrically",
-                 "ecad_simulate('op')  # solve DC node voltages"]
+                 "ecad_simulate('op')  # solve DC node voltages",
+                 "render_schematic_ascii()  # full sheet ASCII + grid"]
             ),
-        })
+        }
+        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
 
     # ---------------------------------------------------------------- power / label
 
@@ -861,7 +892,7 @@ def register_ecad_tools(mcp) -> None:
         members = nl.get("nets", {}).get(net, [])
         member_refs = [f"{m.get('ref')}.{m.get('pin')}" for m in members]
         unconnected = _unconnected_pins(doc, nl)
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "net": net, "pos": [float(x), float(y)],
             "net_size": len(members),
@@ -876,8 +907,12 @@ def register_ecad_tools(mcp) -> None:
                         "(see a symbol's pin list) or run a wire to it.")),
             "next_actions": ["ecad_status()",
                              "ecad_run_erc()  # power_not_driven errors disappear once a rail "
-                             "is sourced"],
-        })
+                             "is sourced",
+                             "render_schematic_ascii()"],
+        }
+        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id,
+                                         focus=[float(x), float(y)])
+        return _dumps(payload)
 
     @mcp.tool()
     def ecad_label(text: str, x: float = 0.0, y: float = 0.0, scope: str = "local",
@@ -899,7 +934,7 @@ def register_ecad_tools(mcp) -> None:
         doc = session.doc
         nl = netlist_mod.build_netlist(doc)
         members = nl.get("nets", {}).get(text, [])
-        return _dumps({
+        payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
             "label": text, "scope": scope, "pos": [float(x), float(y)],
             "net_size": len(members),
@@ -910,8 +945,11 @@ def register_ecad_tools(mcp) -> None:
                         if members else
                         "It is not on any wire/pin yet — place it ON a wire or a pin's world xy "
                         "to name that net.")),
-            "next_actions": ["ecad_status()"],
-        })
+            "next_actions": ["ecad_status()", "render_schematic_ascii()"],
+        }
+        _attach_schematic_ascii_readback(payload, doc_id=session.doc_id,
+                                         focus=[float(x), float(y)])
+        return _dumps(payload)
 
     # ---------------------------------------------------------------- status (THE context tool)
 

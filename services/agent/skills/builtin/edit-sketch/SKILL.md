@@ -4,7 +4,7 @@ description: 2D sketch workflow — close profiles, constrain to DOF 0, smart-di
 inject: auto
 triggers:
   keywords: [sketch, profile, constrain, dimension, dof, rectangle, circle sketch, ascii]
-  tools: [check_sketch, sketch_health, sketch_auto_constrain, render_sketch_ascii]
+  tools: [check_sketch, sketch_health, sketch_auto_constrain, render_sketch_ascii, apply_ascii_edits]
   phases: [sketch]
 ---
 
@@ -48,3 +48,4 @@ triggers:
 - `cad_guide('gsl')` for text-only geometry read
 - Explicit full ASCII: `render_sketch_ascii` / compact auto-readback on mutation tools
 - Feature build: `skill://edit-feature`
+- Targeted cell edits: `apply_ascii_edits(kind='sketch', sketch_id=..., edits=[...])` using `grid`/`index` from the ASCII render.

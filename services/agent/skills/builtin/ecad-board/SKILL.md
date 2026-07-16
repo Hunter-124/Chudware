@@ -4,7 +4,7 @@ description: Schematic + PCB workflow — symbols from library first, net integr
 inject: auto
 triggers:
   keywords: [schematic, pcb, ecad, board outline, footprint, netlist, kicad, ascii board]
-  tools: [ecad_new_schematic, ecad_to_3d, render_board_ascii, ecad_autoroute, ecad_autoplace]
+  tools: [ecad_new_schematic, ecad_to_3d, render_board_ascii, render_schematic_ascii, render_sim_ascii, apply_ascii_edits, ecad_autoroute, ecad_autoplace]
   phases: [feature, deliver]
 ---
 
@@ -46,3 +46,7 @@ triggers:
 - `cad_guide('ecad')` when available; cheatsheet under agent prompts ECAD
 - Explicit full ASCII: `render_board_ascii` / compact auto-readback on board mutation tools
 - Mechanical mate workflow: `skill://edit-assembly`
+
+- Schematic sheet ASCII: `render_schematic_ascii` (grid + cell index).
+- SPICE/sim plaintext: `render_sim_ascii`.
+- Targeted layout/schematic edits from the grid: `apply_ascii_edits(kind='pcb'|'schematic', edits=[...])` with `grid_json`/`index_json` from the last render (move/swap/delete/replace_section/place).

@@ -511,7 +511,7 @@ from mcp_server.sketch3d_tools import register_sketch3d_tools
 register_sketch3d_tools(_reg.view(mcp, "cad"))
 
 # ASCII / plaintext 2D representations for non-vision models (owner item 5):
-# render_board_ascii, render_sketch_ascii, experimental render_ascii silhouette.
+# render_board/sketch/schematic/sim_ascii, apply_ascii_edits, experimental render_ascii.
 from mcp_server.ascii2d import register_ascii2d_tools
 register_ascii2d_tools(_reg.view(mcp, "gsl"))
 

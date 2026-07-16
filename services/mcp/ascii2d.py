@@ -1,16 +1,19 @@
 """Deterministic ASCII / plaintext 2D representations for non-vision models.
 
-Owner item 5 (2D translation half) — PCB layer grids, sketch polylines, and an
-experimental single-view 3D silhouette. Every tool returns both an ASCII block
-and an English summary, plus structured ``findings``.
+Owner item 5 (2D translation half) — PCB layer grids, schematic sheets, sketch
+polylines, SPICE/sim decks, and an experimental single-view 3D silhouette. Every
+render returns an ASCII block + English summary + structured ``findings`` plus a
+stable ``grid`` contract (origin, pitch, y-flip) so models can address cells and
+apply targeted edits via :func:`apply_ascii_edits` / the MCP tool of the same name.
 
 Pure helpers accept plain dicts so tests run offline; MCP wrappers optionally
 load live ECAD / sketch sessions when a doc_id is given.
 
-Mutation tools (``add_features`` sketch ops, board place/route/via) auto-append a
-**compact** readback via :func:`sketch_mutation_readback` /
-:func:`board_mutation_readback` so non-vision models get an immediate ASCII + NL
-loop without a second tool call. Full renders stay on the explicit tools.
+Mutation tools (``add_features`` sketch ops, board place/route/via, schematic
+place/wire/label) auto-append a **compact** readback so non-vision models get an
+immediate ASCII + NL loop without a second tool call. Full renders stay on the
+explicit tools. Edit tools accept cell coords from those grids and emit engine
+ops (sch_*/pcb_*/sketch_*) for surgical component swaps and section replaces.
 """
 from __future__ import annotations
 
@@ -72,6 +75,108 @@ def _xy(p: Any) -> tuple[float, float]:
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(v))))
+
+
+def make_grid_meta(*, xmin: float, ymin: float, xmax: float, ymax: float,
+                   pitch: float, width: int, height: int,
+                   unit: str = "mm", y_up: bool = True,
+                   kind: str = "", layer: str = "") -> dict:
+    """Stable cell↔world contract for render + apply-edit round-trips.
+
+    World (x,y) with y increasing UP maps to cell (col,row) with row 0 at the
+    TOP of the printed ASCII (image coords). Cell centres are:
+        x = xmin + (col + 0.5) * pitch
+        y = ymax - (row + 0.5) * pitch   when y_up
+    """
+    meta = {
+        "kind": kind or None,
+        "unit": unit,
+        "pitch": float(pitch),
+        "width": int(width),
+        "height": int(height),
+        "origin_world": [float(xmin), float(ymin)],
+        "bbox": [float(xmin), float(ymin), float(xmax), float(ymax)],
+        "y_up": bool(y_up),
+        "y_flip": True,  # row 0 is north/top of the printed block
+        "cell_addressing": "col_row_0_based",
+        "cell_to_world": (
+            "x = bbox[0] + (col + 0.5) * pitch; "
+            "y = bbox[3] - (row + 0.5) * pitch  # y_up, row0=top"
+        ),
+        "world_to_cell": (
+            "col = round((x - bbox[0]) / pitch - 0.5) clamped; "
+            "row = round((bbox[3] - y) / pitch - 0.5) clamped"
+        ),
+    }
+    if layer:
+        meta["layer"] = layer
+    return meta
+
+
+def cell_to_world(col: int, row: int, grid: dict) -> tuple[float, float]:
+    """Map ASCII cell (col,row) → world (x,y) using a render ``grid`` dict."""
+    pitch = float(grid.get("pitch") or grid.get("pitch_mm") or 1.0)
+    bbox = grid.get("bbox") or grid.get("bbox_mm") or [0, 0, 10, 10]
+    xmin, ymin, xmax, ymax = map(float, bbox[:4])
+    x = xmin + (float(col) + 0.5) * pitch
+    y = ymax - (float(row) + 0.5) * pitch
+    return x, y
+
+
+def world_to_cell(x: float, y: float, grid: dict) -> tuple[int, int]:
+    """Map world (x,y) → ASCII cell (col,row) using a render ``grid`` dict."""
+    pitch = float(grid.get("pitch") or grid.get("pitch_mm") or 1.0)
+    bbox = grid.get("bbox") or grid.get("bbox_mm") or [0, 0, 10, 10]
+    xmin, ymin, xmax, ymax = map(float, bbox[:4])
+    w = int(grid.get("width") or 1)
+    h = int(grid.get("height") or 1)
+    col = _clamp_int((float(x) - xmin) / pitch - 0.5, 0, max(0, w - 1))
+    row = _clamp_int((ymax - float(y)) / pitch - 0.5, 0, max(0, h - 1))
+    return col, row
+
+
+def annotate_ascii_with_rulers(ascii_block: str, *, every: int = 10,
+                              max_w_label: int = 200) -> str:
+    """Prefix a 0-based col ruler + row numbers so models can address cells.
+
+    Example first lines::
+
+        col 0    5    10
+        0 | ....R1....
+        1 | ..........
+    """
+    rows = (ascii_block or "").split("\n")
+    if not rows or (len(rows) == 1 and rows[0] == ""):
+        return ascii_block or ""
+    w = max(len(r) for r in rows)
+    if w > max_w_label:
+        # still label, but keep cheap
+        every = max(every, 20)
+    # tens ruler
+    tens = []
+    ones = []
+    for i in range(w):
+        if i % every == 0:
+            label = str(i)
+            tens.append(label[0] if len(label) > 1 else " ")
+            # multi-digit: write remaining digits into following ones row only for ones
+            ones.append(label[-1])
+        else:
+            tens.append(" ")
+            ones.append(str(i % 10) if (i % every) < every else " ")
+    # simpler ones: mark every cell's ones digit sparsely
+    ones = [("." if i % every else str(i % 10)) for i in range(w)]
+    for i in range(0, w, every):
+        s = str(i)
+        for k, ch in enumerate(s):
+            if i + k < w:
+                ones[i + k] = ch
+    row_w = max(2, len(str(max(0, len(rows) - 1))))
+    out = [f"{'':>{row_w}}  {''.join(ones)}", f"{'':>{row_w}} +{'-' * w}"]
+    for ri, r in enumerate(rows):
+        out.append(f"{ri:>{row_w}} |{r}")
+    return "\n".join(out)
+
 
 
 # =========================================================================== PCB
@@ -403,14 +508,94 @@ def render_board_layer_ascii(board: dict, layer: str = "F.Cu",
 
     rows = ["".join(r) for r in grid]
     ascii_block = "\n".join(rows)
+    gmeta = make_grid_meta(
+        xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax,
+        pitch=pitch, width=w, height=h, unit="mm",
+        kind="pcb", layer=layer,
+    )
     return {
         "layer": layer,
         "pitch_mm": pitch,
+        "pitch": pitch,
         "width": w,
         "height": h,
         "bbox_mm": [xmin, ymin, xmax, ymax],
+        "bbox": [xmin, ymin, xmax, ymax],
         "ascii": ascii_block,
+        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
+        "grid": gmeta,
+        "index": _board_cell_index(board, layer, xmin, ymax, pitch, w, h),
     }
+
+
+
+def _board_cell_index(board: dict, layer: str, xmin: float, ymax: float,
+                      pitch: float, w: int, h: int) -> dict:
+    """Map cell "col,row" -> object ids on *layer* for targeted edits."""
+    cells: dict[str, list[dict]] = {}
+
+    def add(cx: int, cy: int, item: dict) -> None:
+        if not (0 <= cx < w and 0 <= cy < h):
+            return
+        key = f"{cx},{cy}"
+        cells.setdefault(key, []).append(item)
+
+    for tr in board.get("tracks") or []:
+        if (tr.get("layer") or "F.Cu") != layer:
+            continue
+        p1 = tr.get("p1"); p2 = tr.get("p2")
+        if not (p1 and p2):
+            continue
+        x0, y0 = _to_cell(float(p1[0]), float(p1[1]), xmin, ymax, pitch, w, h)
+        x1, y1 = _to_cell(float(p2[0]), float(p2[1]), xmin, ymax, pitch, w, h)
+        for cx, cy in _bresenham(x0, y0, x1, y1):
+            add(cx, cy, {
+                "kind": "track",
+                "id": tr.get("id"),
+                "net": tr.get("net"),
+                "layer": layer,
+                "p1": list(p1),
+                "p2": list(p2),
+            })
+    for v in board.get("vias") or []:
+        pos = v.get("pos") or v.get("at")
+        if not pos:
+            continue
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "via",
+            "id": v.get("id"),
+            "net": v.get("net"),
+            "pos": list(pos),
+        })
+    for fp in board.get("footprints") or []:
+        pos = fp.get("pos") or [0.0, 0.0]
+        ox, oy = float(pos[0]), float(pos[1])
+        cx, cy = _to_cell(ox, oy, xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "footprint",
+            "id": fp.get("id"),
+            "ref": fp.get("ref"),
+            "fpid": fp.get("fpid"),
+            "pos": [ox, oy],
+            "side": fp.get("side") or "top",
+            "value": fp.get("value"),
+        })
+        for pad in fp.get("pads") or []:
+            try:
+                px, py = _xy(pad.get("pos") or [0, 0])
+            except Exception:
+                px = py = 0.0
+            pcx, pcy = _to_cell(ox + px, oy + py, xmin, ymax, pitch, w, h)
+            add(pcx, pcy, {
+                "kind": "pad",
+                "footprint_id": fp.get("id"),
+                "ref": fp.get("ref"),
+                "pad": str(pad.get("number") or pad.get("pin") or pad.get("id") or "?"),
+                "net": pad.get("net"),
+                "pos": [ox + px, oy + py],
+            })
+    return {k: v for k, v in sorted(cells.items())}
 
 
 def _pad_nodes(board: dict) -> dict[str, list[str]]:
@@ -675,14 +860,26 @@ def board_ascii_report(board: dict, layer: Optional[str] = None,
     findings = check_board(board)
     summary = summarize_board(board, findings, layers)
     ascii_all = "\n\n".join(ascii_parts)
+    primary = layer_blocks[0] if layer_blocks else {}
     return {
         "ok": True,
         "kind": "pcb",
         "ascii": ascii_all,
+        "ascii_ruled": primary.get("ascii_ruled") or annotate_ascii_with_rulers(
+            primary.get("ascii") or ""),
         "summary": summary,
         "findings": findings,
         "layers": layer_blocks,
         "pitch_mm": pitch_mm,
+        "grid": primary.get("grid"),
+        "index": primary.get("index") or {},
+        "width": primary.get("width"),
+        "height": primary.get("height"),
+        "bbox": primary.get("bbox") or primary.get("bbox_mm"),
+        "hint": (
+            "Use grid + index for cell-addressed edits via apply_ascii_edits "
+            "(kind='pcb'). Col/row are 0-based; row 0 is top of the ASCII block."
+        ),
     }
 
 
@@ -853,13 +1050,37 @@ def render_sketch_ascii(entities: list[dict], pitch: float = 0.5,
                 grid[y][x] = "."
 
     ascii_block = "\n".join("".join(r) for r in grid)
+    gmeta = make_grid_meta(
+        xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax,
+        pitch=pitch, width=w, height=h, unit="mm", kind="sketch",
+    )
+    # entity index at first-point cells
+    index: dict[str, list[dict]] = {}
+    for ent in entities:
+        if not isinstance(ent, dict) or ent.get("construction"):
+            continue
+        pl = _entity_polyline(ent)
+        if not pl:
+            continue
+        cx, cy = cell(pl[0][0], pl[0][1])
+        key = f"{cx},{cy}"
+        index.setdefault(key, []).append({
+            "kind": "entity",
+            "id": ent.get("id"),
+            "type": ent.get("type"),
+            "p1": list(pl[0]),
+            "p2": list(pl[-1]) if len(pl) > 1 else list(pl[0]),
+        })
     return {
         "ascii": ascii_block,
+        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
         "pitch": pitch,
         "width": w,
         "height": h,
         "bbox": [xmin, ymin, xmax, ymax],
         "entity_count": len(polys),
+        "grid": gmeta,
+        "index": index,
     }
 
 
@@ -1244,16 +1465,21 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
         "sketch_id": sid or None,
         "ascii": ascii_txt,
         "ascii_block": f"{header}\n{ascii_txt}",
+        "ascii_ruled": annotate_ascii_with_rulers(ascii_txt),
         "summary": summary,
         "findings": compact_findings,
         "findings_total": len(findings),
         "width": w,
         "height": h,
         "pitch": rendered.get("pitch"),
+        "grid": rendered.get("grid"),
+        "index": rendered.get("index") or {},
         "truncated": truncated,
         "caps": {"max_h": max_h, "max_w": max_w},
         "hint": ("READ this ASCII + summary before the next sketch edit. "
-                 "Call render_sketch_ascii + sketch_health before declaring the sketch done."),
+                 "Use apply_ascii_edits(kind='sketch', sketch_id=..., edits=[...]) "
+                 "for cell-targeted entity add/delete. Call render_sketch_ascii + "
+                 "sketch_health before declaring the sketch done."),
     }
 
 
@@ -1316,6 +1542,7 @@ def board_mutation_readback(board: dict, *, layer: Optional[str] = None,
         "layer": L,
         "ascii": ascii_txt,
         "ascii_block": f"{header}\n{ascii_txt}",
+        "ascii_ruled": annotate_ascii_with_rulers(ascii_txt),
         "summary": summary,
         "findings": compact_findings,
         "findings_total": len(findings),
@@ -1323,10 +1550,13 @@ def board_mutation_readback(board: dict, *, layer: Optional[str] = None,
         "width": w,
         "height": h,
         "pitch_mm": block.get("pitch_mm"),
+        "grid": block.get("grid"),
+        "index": block.get("index") or {},
         "truncated": truncated,
         "caps": {"max_h": max_h, "max_w": max_w},
         "hint": ("READ this ASCII + net_delta before the next board edit. "
-                 "Call render_board_ascii before declaring the board done."),
+                 "Use apply_ascii_edits(kind='pcb', edits=[...]) for cell-targeted "
+                 "moves/swaps/section replaces. Call render_board_ascii before done."),
     }
 
 
@@ -1482,13 +1712,1273 @@ def sketch_ascii_report(sketch: dict, *, pitch: float = 0.5,
         "ok": True,
         "kind": "sketch",
         "ascii": rendered["ascii"],
+        "ascii_ruled": rendered.get("ascii_ruled") or annotate_ascii_with_rulers(
+            rendered["ascii"]),
         "summary": summary,
         "findings": findings,
         "pitch": rendered["pitch"],
         "width": rendered["width"],
         "height": rendered["height"],
         "bbox": rendered["bbox"],
+        "grid": rendered.get("grid"),
+        "index": rendered.get("index") or {},
+        "hint": (
+            "Use grid + index for cell-addressed sketch edits via apply_ascii_edits "
+            "(kind='sketch'). Prefer entity ids from the summary when available."
+        ),
     }
+
+
+
+# ===================================================================== SCHEMATIC
+# Sheet ASCII grid: symbols as refdes boxes, wires as path chars, labels/power.
+
+_SCH_EMPTY = "."
+_SCH_WIRE_H = "-"
+_SCH_WIRE_V = "|"
+_SCH_WIRE_J = "+"
+_SCH_POWER = "P"
+_SCH_LABEL = "L"
+_SCH_JUNCT = "*"
+_SCH_PIN = "o"
+
+
+def _sch_bbox(sch: dict) -> tuple[float, float, float, float]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for sym in sch.get("symbols") or []:
+        pos = sym.get("pos") or [0.0, 0.0]
+        if len(pos) >= 2:
+            xs.append(float(pos[0])); ys.append(float(pos[1]))
+        # pin extents if available on instance (rare) — else fixed half-box
+        xs.extend([float(pos[0]) - 5.0, float(pos[0]) + 5.0])
+        ys.extend([float(pos[1]) - 5.0, float(pos[1]) + 5.0])
+    for w in sch.get("wires") or []:
+        for pt in w.get("pts") or []:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                xs.append(float(pt[0])); ys.append(float(pt[1]))
+    for lb in sch.get("labels") or []:
+        pos = lb.get("pos") or [0, 0]
+        if len(pos) >= 2:
+            xs.append(float(pos[0])); ys.append(float(pos[1]))
+    for pw in sch.get("power") or []:
+        pos = pw.get("pos") or [0, 0]
+        if len(pos) >= 2:
+            xs.append(float(pos[0])); ys.append(float(pos[1]))
+    for j in sch.get("junctions") or []:
+        pos = j.get("pos") or [0, 0]
+        if len(pos) >= 2:
+            xs.append(float(pos[0])); ys.append(float(pos[1]))
+    if not xs:
+        return (0.0, 0.0, 40.0, 30.0)
+    pad = 2.54  # one pin grid unit
+    return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+
+def _sch_cell_index(sch: dict, xmin: float, ymax: float, pitch: float,
+                    w: int, h: int) -> dict:
+    cells: dict[str, list[dict]] = {}
+
+    def add(cx: int, cy: int, item: dict) -> None:
+        if not (0 <= cx < w and 0 <= cy < h):
+            return
+        key = f"{cx},{cy}"
+        cells.setdefault(key, []).append(item)
+
+    for sym in sch.get("symbols") or []:
+        pos = sym.get("pos") or [0.0, 0.0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "symbol",
+            "id": sym.get("id"),
+            "ref": sym.get("ref"),
+            "libid": sym.get("libid"),
+            "value": sym.get("value"),
+            "pos": [float(pos[0]), float(pos[1])],
+            "angle": sym.get("angle", 0.0),
+            "footprint": sym.get("footprint"),
+        })
+    for wire in sch.get("wires") or []:
+        pts = wire.get("pts") or []
+        if len(pts) < 2:
+            continue
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            x0, y0 = _to_cell(float(a[0]), float(a[1]), xmin, ymax, pitch, w, h)
+            x1, y1 = _to_cell(float(b[0]), float(b[1]), xmin, ymax, pitch, w, h)
+            for cx, cy in _bresenham(x0, y0, x1, y1):
+                add(cx, cy, {
+                    "kind": "wire",
+                    "id": wire.get("id"),
+                    "pts": [[float(p[0]), float(p[1])] for p in pts
+                            if isinstance(p, (list, tuple)) and len(p) >= 2],
+                })
+    for lb in sch.get("labels") or []:
+        pos = lb.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "label",
+            "id": lb.get("id"),
+            "text": lb.get("text"),
+            "scope": lb.get("scope", "local"),
+            "pos": [float(pos[0]), float(pos[1])],
+        })
+    for pw in sch.get("power") or []:
+        pos = pw.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "power",
+            "id": pw.get("id"),
+            "net": pw.get("net"),
+            "pos": [float(pos[0]), float(pos[1])],
+        })
+    for j in sch.get("junctions") or []:
+        pos = j.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        add(cx, cy, {
+            "kind": "junction",
+            "id": j.get("id"),
+            "pos": [float(pos[0]), float(pos[1])],
+        })
+    return {k: v for k, v in sorted(cells.items())}
+
+
+def render_schematic_ascii(sch: dict, pitch_mm: float = 2.54,
+                           max_dim: int = 80) -> dict:
+    """Deterministic schematic sheet ASCII grid with cell index + rulers."""
+    if pitch_mm <= 0:
+        pitch_mm = 2.54
+    xmin, ymin, xmax, ymax = _sch_bbox(sch)
+    bw = max(xmax - xmin, pitch_mm)
+    bh = max(ymax - ymin, pitch_mm)
+    pitch = pitch_mm
+    w = max(1, int(math.ceil(bw / pitch)) + 1)
+    h = max(1, int(math.ceil(bh / pitch)) + 1)
+    if max(w, h) > max_dim:
+        scale = max(w, h) / max_dim
+        pitch = pitch * scale
+        w = max(1, int(math.ceil(bw / pitch)) + 1)
+        h = max(1, int(math.ceil(bh / pitch)) + 1)
+
+    grid = [[_SCH_EMPTY for _ in range(w)] for _ in range(h)]
+
+    def paint(cx: int, cy: int, ch: str, force: bool = False) -> None:
+        if not (0 <= cx < w and 0 <= cy < h):
+            return
+        prev = grid[cy][cx]
+        if force or prev == _SCH_EMPTY:
+            grid[cy][cx] = ch
+        elif prev != ch and prev not in (_SCH_JUNCT,):
+            if ch in (_SCH_WIRE_H, _SCH_WIRE_V) and prev in (_SCH_WIRE_H, _SCH_WIRE_V):
+                grid[cy][cx] = _SCH_WIRE_J
+            # keep stronger markers (symbols/labels/power)
+
+    # wires first
+    for wire in sch.get("wires") or []:
+        pts = wire.get("pts") or []
+        if len(pts) < 2:
+            continue
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            x0, y0 = _to_cell(float(a[0]), float(a[1]), xmin, ymax, pitch, w, h)
+            x1, y1 = _to_cell(float(b[0]), float(b[1]), xmin, ymax, pitch, w, h)
+            ch = _trace_char(x0, y0, x1, y1)
+            for cx, cy in _bresenham(x0, y0, x1, y1):
+                paint(cx, cy, ch)
+
+    for j in sch.get("junctions") or []:
+        pos = j.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        paint(cx, cy, _SCH_JUNCT, force=True)
+
+    for lb in sch.get("labels") or []:
+        pos = lb.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        paint(cx, cy, _SCH_LABEL, force=True)
+        text = str(lb.get("text") or "")[:6]
+        for i, ch in enumerate(text):
+            if 0 <= cx + 1 + i < w and grid[cy][cx + 1 + i] == _SCH_EMPTY:
+                grid[cy][cx + 1 + i] = ch
+
+    for pw in sch.get("power") or []:
+        pos = pw.get("pos") or [0, 0]
+        cx, cy = _to_cell(float(pos[0]), float(pos[1]), xmin, ymax, pitch, w, h)
+        paint(cx, cy, _SCH_POWER, force=True)
+        net = str(pw.get("net") or "")[:4]
+        for i, ch in enumerate(net):
+            if 0 <= cx + 1 + i < w and grid[cy][cx + 1 + i] == _SCH_EMPTY:
+                grid[cy][cx + 1 + i] = ch
+
+    # symbols as small boxes with refdes
+    for sym in sch.get("symbols") or []:
+        pos = sym.get("pos") or [0.0, 0.0]
+        ox, oy = float(pos[0]), float(pos[1])
+        # half-size ~2.5 mm each side in world → cells
+        half = max(1, int(round(2.54 / pitch)))
+        cx, cy = _to_cell(ox, oy, xmin, ymax, pitch, w, h)
+        x_lo, x_hi = max(0, cx - half), min(w - 1, cx + half)
+        y_lo, y_hi = max(0, cy - half), min(h - 1, cy + half)
+        for x in range(x_lo, x_hi + 1):
+            for y in range(y_lo, y_hi + 1):
+                edge = x in (x_lo, x_hi) or y in (y_lo, y_hi)
+                if edge and grid[y][x] == _SCH_EMPTY:
+                    grid[y][x] = "+"
+        ref = str(sym.get("ref") or sym.get("id") or "?")
+        for i, ch in enumerate(ref[: max(1, x_hi - x_lo)]):
+            x = x_lo + i
+            if 0 <= x < w:
+                grid[y_lo][x] = ch
+        val = str(sym.get("value") or "")
+        if val:
+            for i, ch in enumerate(val[: max(1, x_hi - x_lo)]):
+                x = x_lo + i
+                y = min(h - 1, y_lo + 1)
+                if 0 <= x < w and grid[y][x] in (_SCH_EMPTY, "+"):
+                    grid[y][x] = ch
+
+    ascii_block = "\n".join("".join(r) for r in grid)
+    gmeta = make_grid_meta(
+        xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax,
+        pitch=pitch, width=w, height=h, unit="mm", kind="schematic",
+    )
+    index = _sch_cell_index(sch, xmin, ymax, pitch, w, h)
+    return {
+        "ascii": ascii_block,
+        "ascii_ruled": annotate_ascii_with_rulers(ascii_block),
+        "pitch_mm": pitch,
+        "pitch": pitch,
+        "width": w,
+        "height": h,
+        "bbox": [xmin, ymin, xmax, ymax],
+        "bbox_mm": [xmin, ymin, xmax, ymax],
+        "grid": gmeta,
+        "index": index,
+        "symbol_count": len(sch.get("symbols") or []),
+        "wire_count": len(sch.get("wires") or []),
+        "label_count": len(sch.get("labels") or []),
+        "power_count": len(sch.get("power") or []),
+    }
+
+
+def check_schematic(sch: dict) -> list[dict]:
+    """Lightweight geometry/ERC-ish findings without requiring a live session."""
+    findings: list[dict] = []
+    refs = {}
+    for sym in sch.get("symbols") or []:
+        ref = sym.get("ref") or ""
+        if not ref:
+            findings.append({
+                "code": "missing_ref",
+                "severity": "warning",
+                "id": sym.get("id"),
+                "message": f"Symbol {sym.get('id')} has no refdes",
+            })
+            continue
+        if ref in refs:
+            findings.append({
+                "code": "duplicate_ref",
+                "severity": "error",
+                "refs": [ref],
+                "ids": [refs[ref], sym.get("id")],
+                "message": f"Duplicate refdes {ref!r}",
+            })
+        else:
+            refs[ref] = sym.get("id")
+        if not sym.get("libid"):
+            findings.append({
+                "code": "missing_libid",
+                "severity": "error",
+                "ref": ref,
+                "message": f"{ref} has no libid",
+            })
+    # floating labels (not near any wire/symbol within 1 mm) — soft
+    pts = []
+    for w in sch.get("wires") or []:
+        for pt in w.get("pts") or []:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                pts.append((float(pt[0]), float(pt[1])))
+    for sym in sch.get("symbols") or []:
+        pos = sym.get("pos") or [0, 0]
+        pts.append((float(pos[0]), float(pos[1])))
+    for lb in sch.get("labels") or []:
+        pos = lb.get("pos") or [0, 0]
+        lx, ly = float(pos[0]), float(pos[1])
+        if pts and min(math.hypot(lx - x, ly - y) for x, y in pts) > 1.0:
+            findings.append({
+                "code": "floating_label",
+                "severity": "warning",
+                "text": lb.get("text"),
+                "id": lb.get("id"),
+                "message": (f"Label {lb.get('text')!r} is >1 mm from any wire/symbol "
+                            f"— may not name a net"),
+            })
+    if not (sch.get("symbols") or []):
+        findings.append({
+            "code": "empty_schematic",
+            "severity": "warning",
+            "message": "Schematic has no symbols",
+        })
+    # optional netlist-backed unconnected pins
+    try:
+        from engine.ecad.netlist import build_netlist  # noqa: PLC0415
+        nl = build_netlist(sch)
+        by_pin = nl.get("by_pin") or {}
+        # count pins that never appear in by_pin if components list available
+        for comp in nl.get("components") or []:
+            ref = comp.get("ref")
+            for pin in comp.get("pins") or []:
+                # pins may be dicts or numbers
+                if isinstance(pin, dict):
+                    num = str(pin.get("number") or pin.get("name") or "")
+                else:
+                    num = str(pin)
+                if not num:
+                    continue
+                # component id may be in by_pin as id.num
+                sid = comp.get("id") or ""
+                if sid and f"{sid}.{num}" not in by_pin and f"{ref}.{num}" not in by_pin:
+                    # only flag if nets empty for that pin — soft
+                    pass
+        nets = nl.get("nets") or {}
+        single = [n for n, members in nets.items()
+                  if isinstance(members, list) and len(members) == 1
+                  and not str(n).upper().startswith(("GND", "VCC", "VDD", "+"))]
+        for n in single[:12]:
+            findings.append({
+                "code": "single_pin_net",
+                "severity": "hint",
+                "net": n,
+                "message": f"Net {n!r} has only one pin member",
+            })
+    except Exception:
+        pass
+    findings.sort(key=lambda f: (f.get("code", ""), f.get("message", "")))
+    return findings
+
+
+def summarize_schematic(sch: dict, findings: list[dict]) -> str:
+    syms = sch.get("symbols") or []
+    wires = sch.get("wires") or []
+    labels = sch.get("labels") or []
+    power = sch.get("power") or []
+    lines = [
+        f"Schematic: {len(syms)} symbol(s), {len(wires)} wire(s), "
+        f"{len(labels)} label(s), {len(power)} power port(s).",
+    ]
+    if syms:
+        lines.append("Symbols:")
+        for s in syms[:24]:
+            lines.append(
+                f"  {s.get('ref') or '?'}  libid={s.get('libid') or '?'}  "
+                f"value={s.get('value')!r}  pos={s.get('pos')}  id={s.get('id')}"
+            )
+        if len(syms) > 24:
+            lines.append(f"  … +{len(syms) - 24} more")
+    if labels:
+        lines.append("Labels: " + ", ".join(
+            f"{lb.get('text')}@{lb.get('pos')}" for lb in labels[:12]))
+    if power:
+        lines.append("Power: " + ", ".join(
+            f"{pw.get('net')}@{pw.get('pos')}" for pw in power[:12]))
+    if findings:
+        lines.append(f"Findings ({len(findings)}):")
+        for f in findings[:12]:
+            lines.append(f"  [{f.get('severity','?')}] {f.get('message')}")
+    else:
+        lines.append("Findings: none")
+    return "\n".join(lines)
+
+
+def schematic_ascii_report(sch: dict, pitch_mm: float = 2.54) -> dict:
+    rendered = render_schematic_ascii(sch, pitch_mm=pitch_mm)
+    findings = check_schematic(sch)
+    summary = summarize_schematic(sch, findings)
+    return {
+        "ok": True,
+        "kind": "schematic",
+        "ascii": rendered["ascii"],
+        "ascii_ruled": rendered["ascii_ruled"],
+        "summary": summary,
+        "findings": findings,
+        "pitch_mm": rendered["pitch_mm"],
+        "pitch": rendered["pitch"],
+        "width": rendered["width"],
+        "height": rendered["height"],
+        "bbox": rendered["bbox"],
+        "grid": rendered["grid"],
+        "index": rendered["index"],
+        "hint": (
+            "READ the ruled ASCII + index before the next schematic edit. "
+            "Use apply_ascii_edits(kind='schematic', edits=[...]) to move/swap "
+            "symbols, delete wires, or place labels/power at cell coords. "
+            "Call render_schematic_ascii before declaring the schematic done."
+        ),
+    }
+
+
+def schematic_mutation_readback(sch: dict, *, pitch_mm: float = 2.54,
+                                max_h: int = READBACK_MAX_H,
+                                max_w: int = READBACK_MAX_W,
+                                focus: Optional[Sequence[float]] = None,
+                                focus_radius_mm: float = 30.0) -> dict:
+    view = sch
+    if focus is not None and len(focus) >= 2:
+        fx, fy = float(focus[0]), float(focus[1])
+        r = float(focus_radius_mm)
+        r2 = r * r
+
+        def near(p) -> bool:
+            try:
+                x, y = _xy(p)
+            except Exception:
+                return False
+            return (x - fx) ** 2 + (y - fy) ** 2 <= r2
+
+        view = dict(sch)
+        view["symbols"] = [s for s in (sch.get("symbols") or [])
+                           if near(s.get("pos") or [0, 0])]
+        view["wires"] = [w for w in (sch.get("wires") or [])
+                         if any(near(pt) for pt in (w.get("pts") or []))]
+        view["labels"] = [lb for lb in (sch.get("labels") or [])
+                          if near(lb.get("pos") or [0, 0])]
+        view["power"] = [pw for pw in (sch.get("power") or [])
+                         if near(pw.get("pos") or [0, 0])]
+        view["junctions"] = [j for j in (sch.get("junctions") or [])
+                             if near(j.get("pos") or [0, 0])]
+    max_dim = max(8, min(max_h, max_w))
+    # temporarily render with max_dim via pitch coarsen inside renderer
+    rendered = render_schematic_ascii(view, pitch_mm=pitch_mm, max_dim=max_dim)
+    ascii_txt, h, w, truncated = _cap_ascii(rendered["ascii"], max_h=max_h, max_w=max_w)
+    findings = check_schematic(sch)
+    summary = summarize_schematic(sch, findings)
+    compact = [{"code": f.get("code"), "severity": f.get("severity"),
+                "message": f.get("message")} for f in findings[:READBACK_MAX_FINDINGS]]
+    header = f"[schematic_readback {w}x{h}"
+    if truncated:
+        header += " truncated=1"
+    if focus is not None and len(focus) >= 2:
+        header += f" focus=({float(focus[0]):g},{float(focus[1]):g})"
+    header += "]"
+    return {
+        "ok": True,
+        "kind": "schematic_readback",
+        "ascii": ascii_txt,
+        "ascii_block": f"{header}\n{ascii_txt}",
+        "summary": summary,
+        "findings": compact,
+        "findings_total": len(findings),
+        "width": w,
+        "height": h,
+        "pitch_mm": rendered.get("pitch_mm"),
+        "grid": rendered.get("grid"),
+        "index": rendered.get("index") or {},
+        "truncated": truncated,
+        "caps": {"max_h": max_h, "max_w": max_w},
+        "hint": ("READ this ASCII + summary before the next schematic edit. "
+                 "Call render_schematic_ascii before declaring the schematic done. "
+                 "Targeted edits: apply_ascii_edits(kind='schematic', ...)."),
+    }
+
+
+def attach_schematic_readback(response: dict, sch: dict, **kwargs: Any) -> dict:
+    try:
+        rb = schematic_mutation_readback(sch, **kwargs)
+        response["ascii_readback"] = rb
+        response["ascii"] = rb["ascii"]
+        response["ascii_block"] = rb["ascii_block"]
+        response["schematic_summary"] = rb["summary"]
+        if "summary" not in response or not response.get("summary"):
+            response["summary"] = rb["summary"]
+        response.setdefault("findings", rb["findings"])
+        response["grid"] = rb.get("grid")
+        response["index"] = rb.get("index")
+        response["readback_hint"] = rb["hint"]
+    except Exception as e:  # noqa: BLE001
+        response["ascii_readback"] = {
+            "ok": False, "error": f"schematic readback unavailable: {e}",
+        }
+    return response
+
+
+# =========================================================================== SIM
+# SPICE deck + circuit device roster as deterministic plaintext (not a 2D grid).
+
+
+def render_sim_ascii(circuit: Optional[dict] = None,
+                     spice_text: str = "",
+                     netlist: Optional[dict] = None,
+                     results: Optional[dict] = None) -> dict:
+    """Deterministic plaintext of a SPICE circuit / deck for non-vision models.
+
+    Not a spatial grid — simulation state is topological. Returns a stable
+    multi-section ASCII block + summary + findings.
+    """
+    lines: list[str] = []
+    findings: list[dict] = []
+    devices = []
+    nodes: list[str] = []
+    if circuit and isinstance(circuit, dict):
+        devices = list(circuit.get("devices") or [])
+        nodes = list(circuit.get("nodes") or [])
+        lines.append(f"[circuit devices={len(devices)} nodes={len(nodes)}]")
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            kind = d.get("kind") or d.get("type") or "?"
+            name = d.get("name") or d.get("ref") or "?"
+            nlist = d.get("nodes") or d.get("pins") or []
+            params = d.get("params") or {}
+            # stable param order
+            if isinstance(params, dict):
+                ptxt = " ".join(f"{k}={params[k]}" for k in sorted(params))
+            else:
+                ptxt = str(params)
+            ntxt = ",".join(str(n) for n in nlist)
+            lines.append(f"  {kind} {name} nodes=[{ntxt}] {ptxt}".rstrip())
+        if not devices:
+            findings.append({
+                "code": "no_devices",
+                "severity": "error",
+                "message": "Circuit has no simulatable devices",
+            })
+    if spice_text:
+        lines.append("[spice_deck]")
+        # strip blank trailing lines, keep deterministic
+        deck_lines = [ln.rstrip() for ln in str(spice_text).splitlines()]
+        while deck_lines and not deck_lines[-1]:
+            deck_lines.pop()
+        lines.extend(deck_lines if deck_lines else ["  (empty deck)"])
+    if netlist and isinstance(netlist, dict):
+        comps = netlist.get("components") or []
+        nets = netlist.get("nets") or {}
+        lines.append(f"[netlist components={len(comps)} nets={len(nets)}]")
+        for c in comps[:40]:
+            if not isinstance(c, dict):
+                continue
+            lines.append(
+                f"  {c.get('ref') or '?'} libid={c.get('libid') or '?'} "
+                f"value={c.get('value')!r}"
+            )
+        for nname in sorted(nets)[:40]:
+            members = nets[nname] or []
+            mtxt = ",".join(
+                f"{m.get('ref')}.{m.get('pin')}" if isinstance(m, dict) else str(m)
+                for m in members[:8]
+            )
+            lines.append(f"  net {nname}: {mtxt}"
+                         + (f" +{len(members)-8}" if len(members) > 8 else ""))
+    if results and isinstance(results, dict):
+        lines.append("[results]")
+        # common shapes: op voltages, probes
+        probes = results.get("probes") or results.get("values") or results.get("op") or results
+        if isinstance(probes, dict):
+            for k in sorted(probes):
+                v = probes[k]
+                if isinstance(v, (int, float)):
+                    lines.append(f"  {k} = {v:.6g}")
+                else:
+                    lines.append(f"  {k} = {v}")
+        elif isinstance(probes, list):
+            for item in probes[:40]:
+                lines.append(f"  {item}")
+    ascii_block = "\n".join(lines) if lines else "(empty simulation view)"
+    summary_bits = []
+    if devices:
+        summary_bits.append(f"{len(devices)} device(s)")
+    if nodes:
+        summary_bits.append(f"{len(nodes)} node(s)")
+    if spice_text:
+        summary_bits.append(f"deck {len(str(spice_text).splitlines())} line(s)")
+    if results:
+        summary_bits.append("results present")
+    summary = "Simulation: " + (", ".join(summary_bits) if summary_bits else "empty") + "."
+    if findings:
+        summary += " " + "; ".join(f.get("message", "") for f in findings[:4])
+    return {
+        "ok": True,
+        "kind": "sim",
+        "ascii": ascii_block,
+        "summary": summary,
+        "findings": findings,
+        "device_count": len(devices),
+        "node_count": len(nodes),
+        "grid": None,  # topological, not spatial
+        "hint": (
+            "Simulation view is topological (device/node list + SPICE deck), not a "
+            "2D grid. Edit the schematic (render_schematic_ascii / apply_ascii_edits "
+            "kind='schematic') then re-run ecad_simulate."
+        ),
+    }
+
+
+# ============================================================== APPLY EDITS
+# Cell-addressed / id-addressed surgical edits → engine op batches.
+
+
+def _parse_cell(cell: Any) -> Optional[tuple[int, int]]:
+    if cell is None:
+        return None
+    if isinstance(cell, (list, tuple)) and len(cell) >= 2:
+        return int(cell[0]), int(cell[1])
+    if isinstance(cell, str) and "," in cell:
+        a, b = cell.split(",", 1)
+        return int(a.strip()), int(b.strip())
+    if isinstance(cell, dict) and "col" in cell and "row" in cell:
+        return int(cell["col"]), int(cell["row"])
+    return None
+
+
+def _index_hits(index: dict, col: int, row: int,
+                kinds: Optional[Sequence[str]] = None) -> list[dict]:
+    hits = list(index.get(f"{col},{row}") or [])
+    if kinds:
+        want = set(kinds)
+        hits = [h for h in hits if h.get("kind") in want]
+    return hits
+
+
+def plan_ascii_edits(kind: str, edits: Sequence[dict], *,
+                     grid: Optional[dict] = None,
+                     index: Optional[dict] = None,
+                     doc: Optional[dict] = None,
+                     layer: str = "F.Cu",
+                     sketch_id: str = "") -> dict:
+    """Compile high-level ASCII edits into engine ops (pure; does not apply).
+
+    Edit object shapes (all fields optional except ``op``)::
+
+        {"op": "move", "ref"|"id": "...", "to_cell": [col,row] | "to": [x,y]}
+        {"op": "swap", "a": "R1", "b": "R2"}          # swap positions (and angles)
+        {"op": "delete", "ref"|"id": "..." | "cell": [c,r], "kinds": ["track"]}
+        {"op": "place_symbol", "libid": "Device:R", "cell": [c,r], "ref": "R3", "value": "10k"}
+        {"op": "place_label", "text": "MID", "cell": [c,r], "scope": "local"}
+        {"op": "place_power", "net": "GND", "cell": [c,r]}
+        {"op": "add_track", "net": "A", "from_cell": [c,r], "to_cell": [c2,r2], "layer": "F.Cu"}
+        {"op": "add_wire", "from_cell": [c,r], "to_cell": [c2,r2]}
+        {"op": "add_via", "net": "A", "cell": [c,r]}
+        {"op": "set_value", "ref": "R1", "value": "4.7k"}
+        {"op": "replace_section", "cell_min": [c0,r0], "cell_max": [c1,r1],
+         "clear": ["track","via"], "place": [ ... nested edits ... ]}
+        {"op": "sketch_add_line", "from_cell":[c,r], "to_cell":[c2,r2]}
+        {"op": "sketch_delete", "id": "e1" | "cell": [c,r]}
+
+    Returns ``{ok, ops, planned, errors, kind}``.
+    """
+    kind = (kind or "").lower().strip()
+    if kind in ("sch", "sheet"):
+        kind = "schematic"
+    if kind in ("board", "pcb_layout"):
+        kind = "pcb"
+    if kind not in ("schematic", "pcb", "sketch"):
+        return {"ok": False, "error": f"unknown kind {kind!r}",
+                "hint": "kind must be schematic|pcb|sketch",
+                "ops": [], "planned": [], "errors": []}
+
+    grid = dict(grid or {})
+    index = dict(index or {})
+    doc = doc or {}
+    ops: list[dict] = []
+    planned: list[dict] = []
+    errors: list[str] = []
+
+    def world_of(edit: dict, cell_key: str = "cell",
+                 world_key: str = "to") -> Optional[list[float]]:
+        if world_key in edit and edit[world_key] is not None:
+            p = edit[world_key]
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                return [float(p[0]), float(p[1])]
+        cell = _parse_cell(edit.get(cell_key) or edit.get("to_cell")
+                           or edit.get("from_cell"))
+        # for to_cell specifically
+        if cell is None and cell_key != "to_cell":
+            cell = _parse_cell(edit.get("to_cell"))
+        if cell is None:
+            return None
+        if not grid:
+            errors.append("grid metadata required to resolve cell coordinates")
+            return None
+        x, y = cell_to_world(cell[0], cell[1], grid)
+        return [x, y]
+
+    def find_symbol(token: str) -> Optional[dict]:
+        for s in doc.get("symbols") or []:
+            if s.get("ref") == token or s.get("id") == token:
+                return s
+        # index fallback
+        for hits in index.values():
+            for h in hits:
+                if h.get("kind") == "symbol" and (
+                        h.get("ref") == token or h.get("id") == token):
+                    return h
+        return None
+
+    def find_footprint(token: str) -> Optional[dict]:
+        for fp in doc.get("footprints") or []:
+            if fp.get("ref") == token or fp.get("id") == token:
+                return fp
+        for hits in index.values():
+            for h in hits:
+                if h.get("kind") == "footprint" and (
+                        h.get("ref") == token or h.get("id") == token):
+                    return h
+        return None
+
+    for i, raw in enumerate(edits or []):
+        if not isinstance(raw, dict):
+            errors.append(f"edit[{i}]: not an object")
+            continue
+        eop = (raw.get("op") or raw.get("action") or "").lower().strip()
+        if not eop:
+            errors.append(f"edit[{i}]: missing op")
+            continue
+
+        # -------- replace_section: clear kinds in AABB then nested place ----
+        if eop in ("replace_section", "section_replace", "clear_section"):
+            cmin = _parse_cell(raw.get("cell_min") or raw.get("min") or raw.get("from_cell"))
+            cmax = _parse_cell(raw.get("cell_max") or raw.get("max") or raw.get("to_cell"))
+            if not cmin or not cmax:
+                errors.append(f"edit[{i}]: replace_section needs cell_min + cell_max")
+                continue
+            col0, row0 = min(cmin[0], cmax[0]), min(cmin[1], cmax[1])
+            col1, row1 = max(cmin[0], cmax[0]), max(cmin[1], cmax[1])
+            clear_kinds = set(raw.get("clear") or raw.get("kinds")
+                              or (["track", "via"] if kind == "pcb"
+                                  else ["wire", "label"] if kind == "schematic"
+                                  else ["entity"]))
+            seen_ids: set[str] = set()
+            for r in range(row0, row1 + 1):
+                for c in range(col0, col1 + 1):
+                    for h in _index_hits(index, c, r):
+                        hk = h.get("kind")
+                        if hk not in clear_kinds and not (
+                                hk == "pad" and "footprint" in clear_kinds):
+                            # map pad→footprint clear
+                            if hk == "footprint" and "footprint" in clear_kinds:
+                                pass
+                            else:
+                                if hk not in clear_kinds:
+                                    continue
+                        hid = h.get("id") or h.get("footprint_id")
+                        if not hid or hid in seen_ids:
+                            continue
+                        seen_ids.add(str(hid))
+                        if kind == "pcb":
+                            if hk == "track":
+                                ops.append({"op": "pcb_delete_track", "id": hid})
+                            elif hk == "via":
+                                ops.append({"op": "pcb_delete_via", "id": hid})
+                            elif hk in ("footprint", "pad"):
+                                fid = h.get("footprint_id") or h.get("id")
+                                if fid and fid not in seen_ids:
+                                    ops.append({"op": "pcb_delete_footprint", "id": fid})
+                                    seen_ids.add(str(fid))
+                        elif kind == "schematic":
+                            if hk == "wire":
+                                ops.append({"op": "sch_delete_wire", "id": hid})
+                            elif hk == "symbol":
+                                ops.append({"op": "sch_delete_symbol", "id": hid})
+                            elif hk == "label":
+                                ops.append({"op": "sch_delete_label", "id": hid})
+                            elif hk == "junction":
+                                ops.append({"op": "sch_delete_junction", "id": hid})
+                        elif kind == "sketch":
+                            ops.append({
+                                "op": "sketch_delete_entity",
+                                "sketch": sketch_id or raw.get("sketch") or "",
+                                "id": hid,
+                            })
+            planned.append({"edit": i, "op": eop, "cleared_ids": sorted(seen_ids),
+                            "cells": [[col0, row0], [col1, row1]]})
+            # nested place edits
+            for j, nested in enumerate(raw.get("place") or raw.get("edits") or []):
+                if isinstance(nested, dict):
+                    # recurse single by appending to a synthetic list handled below via re-entry
+                    sub = plan_ascii_edits(kind, [nested], grid=grid, index=index,
+                                           doc=doc, layer=layer, sketch_id=sketch_id)
+                    ops.extend(sub.get("ops") or [])
+                    planned.extend(sub.get("planned") or [])
+                    errors.extend(sub.get("errors") or [])
+            continue
+
+        if eop == "swap":
+            a = raw.get("a") or raw.get("ref_a") or raw.get("left")
+            b = raw.get("b") or raw.get("ref_b") or raw.get("right")
+            if not a or not b:
+                errors.append(f"edit[{i}]: swap needs a + b refs")
+                continue
+            if kind == "schematic":
+                sa, sb = find_symbol(str(a)), find_symbol(str(b))
+                if not sa or not sb:
+                    errors.append(f"edit[{i}]: swap cannot find {a!r} and/or {b!r}")
+                    continue
+                pa = list(sa.get("pos") or [0, 0])
+                pb = list(sb.get("pos") or [0, 0])
+                aa = sa.get("angle", 0.0); ab = sb.get("angle", 0.0)
+                ops.append({"op": "sch_edit_symbol", "id": sa.get("id"),
+                            "pos": pb, "angle": ab})
+                ops.append({"op": "sch_edit_symbol", "id": sb.get("id"),
+                            "pos": pa, "angle": aa})
+                planned.append({"edit": i, "op": "swap", "a": a, "b": b,
+                                "ids": [sa.get("id"), sb.get("id")]})
+            elif kind == "pcb":
+                fa, fb = find_footprint(str(a)), find_footprint(str(b))
+                if not fa or not fb:
+                    errors.append(f"edit[{i}]: swap cannot find {a!r} and/or {b!r}")
+                    continue
+                pa = list(fa.get("pos") or [0, 0])
+                pb = list(fb.get("pos") or [0, 0])
+                aa = fa.get("angle", 0.0); ab = fb.get("angle", 0.0)
+                ops.append({"op": "pcb_edit_footprint", "id": fa.get("id"),
+                            "pos": pb, "angle": ab})
+                ops.append({"op": "pcb_edit_footprint", "id": fb.get("id"),
+                            "pos": pa, "angle": aa})
+                planned.append({"edit": i, "op": "swap", "a": a, "b": b,
+                                "ids": [fa.get("id"), fb.get("id")]})
+            else:
+                errors.append(f"edit[{i}]: swap not supported for kind={kind}")
+            continue
+
+        if eop in ("move", "move_to", "relocate"):
+            token = raw.get("ref") or raw.get("id") or raw.get("target")
+            pos = world_of(raw, "to_cell", "to")
+            if pos is None and raw.get("to") is None:
+                # allow cell key
+                pos = world_of(raw, "cell", "pos")
+            if not token:
+                # move whatever is at from_cell
+                cell = _parse_cell(raw.get("from_cell") or raw.get("cell"))
+                if cell:
+                    hits = _index_hits(index, cell[0], cell[1],
+                                       ["symbol", "footprint", "entity"])
+                    if hits:
+                        token = hits[0].get("ref") or hits[0].get("id")
+            if not token or pos is None:
+                errors.append(f"edit[{i}]: move needs ref/id + to_cell/to")
+                continue
+            if kind == "schematic":
+                s = find_symbol(str(token))
+                if not s:
+                    errors.append(f"edit[{i}]: no symbol {token!r}")
+                    continue
+                op = {"op": "sch_edit_symbol", "id": s.get("id"), "pos": pos}
+                if "angle" in raw:
+                    op["angle"] = float(raw["angle"])
+                ops.append(op)
+            elif kind == "pcb":
+                fp = find_footprint(str(token))
+                if not fp:
+                    errors.append(f"edit[{i}]: no footprint {token!r}")
+                    continue
+                op = {"op": "pcb_edit_footprint", "id": fp.get("id"), "pos": pos}
+                if "angle" in raw:
+                    op["angle"] = float(raw["angle"])
+                if "side" in raw:
+                    op["side"] = raw["side"]
+                ops.append(op)
+            else:
+                errors.append(f"edit[{i}]: move not supported for sketch entities "
+                              "(delete+add, or sketch_edit_entity via add_features)")
+                continue
+            planned.append({"edit": i, "op": "move", "target": token, "pos": pos})
+            continue
+
+        if eop in ("delete", "remove", "del"):
+            token = raw.get("ref") or raw.get("id") or raw.get("target")
+            kinds = raw.get("kinds")
+            cell = _parse_cell(raw.get("cell") or raw.get("at_cell"))
+            targets: list[dict] = []
+            if token:
+                if kind == "schematic":
+                    s = find_symbol(str(token))
+                    if s:
+                        targets.append({"kind": "symbol", "id": s.get("id")})
+                    # also allow wire/label id
+                    for coll, kname in (("wires", "wire"), ("labels", "label"),
+                                        ("junctions", "junction")):
+                        for obj in doc.get(coll) or []:
+                            if obj.get("id") == token:
+                                targets.append({"kind": kname, "id": token})
+                elif kind == "pcb":
+                    fp = find_footprint(str(token))
+                    if fp:
+                        targets.append({"kind": "footprint", "id": fp.get("id")})
+                    for coll, kname in (("tracks", "track"), ("vias", "via")):
+                        for obj in doc.get(coll) or []:
+                            if obj.get("id") == token:
+                                targets.append({"kind": kname, "id": token})
+                else:
+                    targets.append({"kind": "entity", "id": token})
+            elif cell:
+                targets = _index_hits(index, cell[0], cell[1], kinds)
+            if not targets:
+                errors.append(f"edit[{i}]: delete found nothing")
+                continue
+            for t in targets:
+                hid = t.get("id") or t.get("footprint_id")
+                if not hid:
+                    continue
+                hk = t.get("kind")
+                if kind == "schematic":
+                    if hk == "symbol":
+                        ops.append({"op": "sch_delete_symbol", "id": hid})
+                    elif hk == "wire":
+                        ops.append({"op": "sch_delete_wire", "id": hid})
+                    elif hk == "label":
+                        ops.append({"op": "sch_delete_label", "id": hid})
+                    elif hk == "junction":
+                        ops.append({"op": "sch_delete_junction", "id": hid})
+                elif kind == "pcb":
+                    if hk in ("footprint", "pad"):
+                        ops.append({"op": "pcb_delete_footprint",
+                                    "id": t.get("footprint_id") or hid})
+                    elif hk == "track":
+                        ops.append({"op": "pcb_delete_track", "id": hid})
+                    elif hk == "via":
+                        ops.append({"op": "pcb_delete_via", "id": hid})
+                else:
+                    ops.append({
+                        "op": "sketch_delete_entity",
+                        "sketch": sketch_id or raw.get("sketch") or "",
+                        "id": hid,
+                    })
+            planned.append({"edit": i, "op": "delete",
+                            "targets": [t.get("id") for t in targets]})
+            continue
+
+        if eop in ("set_value", "set_ref", "edit_symbol", "edit_footprint"):
+            token = raw.get("ref") or raw.get("id")
+            if not token:
+                errors.append(f"edit[{i}]: set_value needs ref/id")
+                continue
+            if kind == "schematic":
+                s = find_symbol(str(token))
+                if not s:
+                    errors.append(f"edit[{i}]: no symbol {token!r}")
+                    continue
+                op = {"op": "sch_edit_symbol", "id": s.get("id")}
+                for k in ("value", "ref", "footprint", "angle", "libid"):
+                    if k in raw and k != "libid":
+                        op[k] = raw[k]
+                if "value" in raw:
+                    op["value"] = raw["value"]
+                ops.append(op)
+            elif kind == "pcb":
+                fp = find_footprint(str(token))
+                if not fp:
+                    errors.append(f"edit[{i}]: no footprint {token!r}")
+                    continue
+                op = {"op": "pcb_edit_footprint", "id": fp.get("id")}
+                for k in ("value", "ref", "angle", "side", "pos"):
+                    if k in raw:
+                        op[k] = raw[k]
+                ops.append(op)
+            else:
+                errors.append(f"edit[{i}]: set_value not for sketch")
+                continue
+            planned.append({"edit": i, "op": eop, "target": token})
+            continue
+
+        if eop in ("place_symbol", "add_symbol"):
+            if kind != "schematic":
+                errors.append(f"edit[{i}]: place_symbol only for schematic")
+                continue
+            pos = world_of(raw, "cell", "pos")
+            libid = raw.get("libid")
+            if not libid or pos is None:
+                errors.append(f"edit[{i}]: place_symbol needs libid + cell/pos")
+                continue
+            op = {"op": "sch_add_symbol", "libid": libid, "pos": pos}
+            for k in ("ref", "value", "angle", "footprint"):
+                if raw.get(k) not in (None, ""):
+                    op[k] = raw[k]
+            ops.append(op)
+            planned.append({"edit": i, "op": eop, "libid": libid, "pos": pos})
+            continue
+
+        if eop in ("place_label", "add_label"):
+            if kind != "schematic":
+                errors.append(f"edit[{i}]: place_label only for schematic")
+                continue
+            pos = world_of(raw, "cell", "pos")
+            text = raw.get("text") or raw.get("label") or raw.get("net")
+            if not text or pos is None:
+                errors.append(f"edit[{i}]: place_label needs text + cell/pos")
+                continue
+            ops.append({"op": "sch_add_label", "text": str(text), "pos": pos,
+                        "scope": raw.get("scope", "local")})
+            planned.append({"edit": i, "op": eop, "text": text, "pos": pos})
+            continue
+
+        if eop in ("place_power", "add_power"):
+            if kind != "schematic":
+                errors.append(f"edit[{i}]: place_power only for schematic")
+                continue
+            pos = world_of(raw, "cell", "pos")
+            net = raw.get("net") or raw.get("text")
+            if not net or pos is None:
+                errors.append(f"edit[{i}]: place_power needs net + cell/pos")
+                continue
+            ops.append({"op": "sch_add_power", "net": str(net), "pos": pos})
+            planned.append({"edit": i, "op": eop, "net": net, "pos": pos})
+            continue
+
+        if eop in ("add_wire", "place_wire"):
+            if kind != "schematic":
+                errors.append(f"edit[{i}]: add_wire only for schematic")
+                continue
+            # support from_cell/to_cell or pts
+            if raw.get("pts"):
+                pts = raw["pts"]
+            else:
+                p1 = world_of({"to_cell": raw.get("from_cell"),
+                               "to": raw.get("from")}, "to_cell", "to")
+                p2 = world_of({"to_cell": raw.get("to_cell"),
+                               "to": raw.get("to")}, "to_cell", "to")
+                if p1 is None or p2 is None:
+                    errors.append(f"edit[{i}]: add_wire needs from_cell+to_cell or pts")
+                    continue
+                pts = [p1, p2]
+            ops.append({"op": "sch_add_wire", "pts": pts})
+            planned.append({"edit": i, "op": eop, "pts": pts})
+            continue
+
+        if eop in ("add_track", "place_track"):
+            if kind != "pcb":
+                errors.append(f"edit[{i}]: add_track only for pcb")
+                continue
+            p1 = world_of({"to_cell": raw.get("from_cell"),
+                           "to": raw.get("from") or raw.get("p1")}, "to_cell", "to")
+            p2 = world_of({"to_cell": raw.get("to_cell"),
+                           "to": raw.get("to") or raw.get("p2")}, "to_cell", "to")
+            net = raw.get("net")
+            if p1 is None or p2 is None or not net:
+                errors.append(f"edit[{i}]: add_track needs net + from_cell + to_cell")
+                continue
+            op = {"op": "pcb_add_track", "net": net, "layer": raw.get("layer") or layer,
+                  "p1": p1, "p2": p2, "kind": raw.get("kind", "segment")}
+            if raw.get("width") is not None:
+                op["width"] = float(raw["width"])
+            ops.append(op)
+            planned.append({"edit": i, "op": eop, "net": net, "p1": p1, "p2": p2})
+            continue
+
+        if eop in ("add_via", "place_via"):
+            if kind != "pcb":
+                errors.append(f"edit[{i}]: add_via only for pcb")
+                continue
+            pos = world_of(raw, "cell", "at") or world_of(raw, "cell", "pos")
+            net = raw.get("net")
+            if pos is None or not net:
+                errors.append(f"edit[{i}]: add_via needs net + cell")
+                continue
+            ops.append({"op": "pcb_add_via", "net": net, "at": pos})
+            planned.append({"edit": i, "op": eop, "net": net, "at": pos})
+            continue
+
+        if eop in ("sketch_add_line", "add_line"):
+            if kind != "sketch":
+                errors.append(f"edit[{i}]: sketch_add_line only for sketch")
+                continue
+            p1 = world_of({"to_cell": raw.get("from_cell"),
+                           "to": raw.get("from") or raw.get("p1")}, "to_cell", "to")
+            p2 = world_of({"to_cell": raw.get("to_cell"),
+                           "to": raw.get("to") or raw.get("p2")}, "to_cell", "to")
+            if p1 is None or p2 is None:
+                errors.append(f"edit[{i}]: sketch_add_line needs from_cell+to_cell")
+                continue
+            sid = sketch_id or raw.get("sketch") or ""
+            ops.append({
+                "op": "sketch_add_entity",
+                "sketch": sid,
+                "entity": {"type": "line", "p1": p1, "p2": p2},
+            })
+            planned.append({"edit": i, "op": eop, "p1": p1, "p2": p2})
+            continue
+
+        if eop in ("sketch_delete", "delete_entity"):
+            if kind != "sketch":
+                errors.append(f"edit[{i}]: sketch_delete only for sketch")
+                continue
+            token = raw.get("id") or raw.get("entity")
+            if not token:
+                cell = _parse_cell(raw.get("cell"))
+                if cell:
+                    hits = _index_hits(index, cell[0], cell[1], ["entity"])
+                    if hits:
+                        token = hits[0].get("id")
+            if not token:
+                errors.append(f"edit[{i}]: sketch_delete needs id or cell")
+                continue
+            ops.append({
+                "op": "sketch_delete_entity",
+                "sketch": sketch_id or raw.get("sketch") or "",
+                "id": token,
+            })
+            planned.append({"edit": i, "op": eop, "id": token})
+            continue
+
+        errors.append(f"edit[{i}]: unsupported op {eop!r} for kind={kind}")
+
+    return {
+        "ok": not errors,
+        "kind": kind,
+        "ops": ops,
+        "planned": planned,
+        "errors": errors,
+        "n_ops": len(ops),
+        "n_edits": len(list(edits or [])),
+    }
+
+
+def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
+                      grid: Optional[dict] = None,
+                      index: Optional[dict] = None,
+                      doc: Optional[dict] = None,
+                      doc_id: str = "",
+                      layer: str = "F.Cu",
+                      sketch_id: str = "",
+                      dry_run: bool = False,
+                      apply_live: bool = True) -> dict:
+    """Plan (+ optionally apply) cell-addressed edits against a live/offline doc.
+
+    When ``apply_live`` and not ``dry_run``:
+      - schematic/pcb → engine.ecad.session.apply_ops on the open session
+      - sketch → mcp_server.cad_tools add_features path via core bridge
+
+    Offline: pass ``doc`` + ``grid`` + ``index`` from a prior render; with
+    ``dry_run=True`` only the op list is returned (no session required).
+    """
+    kind_n = (kind or "").lower().strip()
+    if kind_n in ("sch", "sheet"):
+        kind_n = "schematic"
+    if kind_n in ("board", "pcb_layout"):
+        kind_n = "pcb"
+
+    # Auto-fill grid/index/doc from a render when missing and doc provided
+    if doc is not None and (not grid or not index):
+        if kind_n == "schematic":
+            rep = schematic_ascii_report(doc)
+            grid = grid or rep.get("grid")
+            index = index or rep.get("index")
+        elif kind_n == "pcb":
+            rep = board_ascii_report(doc, layer=layer or None)
+            # primary layer block
+            layers = rep.get("layers") or []
+            primary = layers[0] if layers else {}
+            grid = grid or rep.get("grid") or primary.get("grid")
+            index = index or rep.get("index") or primary.get("index")
+        elif kind_n == "sketch":
+            rep = sketch_ascii_report(doc)
+            grid = grid or rep.get("grid")
+            index = index or rep.get("index")
+
+    # Live load if needed
+    session = None
+    live_doc = doc
+    if live_doc is None and apply_live and not dry_run:
+        try:
+            if kind_n in ("schematic", "pcb"):
+                from engine.ecad import session as ecad_session  # noqa: PLC0415
+                if doc_id:
+                    session = ecad_session.get_session(doc_id)
+                else:
+                    from mcp_server.ecad_tools import _ECAD  # noqa: PLC0415
+                    did = (_ECAD.get("current_sch") if kind_n == "schematic"
+                           else _ECAD.get("current_pcb")) or _ECAD.get("current")
+                    if not did:
+                        return {"ok": False,
+                                "error": f"no active {kind_n} doc — pass doc_id",
+                                "ops": [], "planned": [], "errors": []}
+                    session = ecad_session.get_session(did)
+                live_doc = session.doc
+                doc_id = session.doc_id
+            # sketch live path fills later
+        except Exception as e:
+            return {"ok": False, "error": f"could not load live doc: {e}",
+                    "ops": [], "planned": [], "errors": []}
+
+    if live_doc is not None and (not grid or not index):
+        # re-render for contract
+        if kind_n == "schematic":
+            rep = schematic_ascii_report(live_doc)
+            grid = grid or rep.get("grid"); index = index or rep.get("index")
+        elif kind_n == "pcb":
+            rep = board_ascii_report(live_doc, layer=layer or None)
+            layers = rep.get("layers") or []
+            primary = layers[0] if layers else {}
+            grid = grid or rep.get("grid") or primary.get("grid")
+            index = index or rep.get("index") or primary.get("index")
+        elif kind_n == "sketch":
+            rep = sketch_ascii_report(live_doc)
+            grid = grid or rep.get("grid"); index = index or rep.get("index")
+
+    plan = plan_ascii_edits(kind_n, edits, grid=grid, index=index,
+                            doc=live_doc or doc or {}, layer=layer,
+                            sketch_id=sketch_id)
+    if dry_run or not apply_live:
+        plan["dry_run"] = True
+        plan["applied"] = False
+        return plan
+    if not plan.get("ops"):
+        plan["applied"] = False
+        plan["ok"] = bool(plan.get("ok")) and not plan.get("errors")
+        return plan
+
+    # Apply
+    try:
+        if kind_n in ("schematic", "pcb"):
+            from engine.ecad import session as ecad_session  # noqa: PLC0415
+            if session is None:
+                session = ecad_session.get_session(doc_id)
+            resp = ecad_session.apply_ops(session, session.revision, plan["ops"])
+            plan["applied"] = True
+            plan["revision"] = session.revision
+            plan["doc_id"] = session.doc_id
+            plan["apply_response"] = {
+                k: resp.get(k) for k in ("ok", "warnings", "id_map", "revision")
+                if isinstance(resp, dict) and k in resp
+            }
+            # attach readback
+            if kind_n == "schematic":
+                attach_schematic_readback(plan, session.doc)
+            else:
+                attach_board_readback(plan, session.doc, layer=layer or "")
+            plan["ok"] = True
+            return plan
+        if kind_n == "sketch":
+            # sketch ops go through add_features
+            from mcp_server.cad_tools import _doc  # noqa: PLC0415
+            import services.mcp.core_bridge as cb  # noqa: PLC0415
+            d = _doc(doc_id or None)
+            # ensure sketch field present
+            ops2 = []
+            for op in plan["ops"]:
+                op = dict(op)
+                if not op.get("sketch"):
+                    op["sketch"] = sketch_id
+                ops2.append(op)
+            result = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops2})
+            plan["applied"] = True
+            plan["doc_id"] = d
+            plan["apply_response"] = result if isinstance(result, dict) else {"raw": result}
+            plan["ok"] = True
+            if sketch_id:
+                try:
+                    data, health = _load_sketch(sketch_id, d)
+                    attach_sketch_readback(plan, data, health=health, sketch_id=sketch_id)
+                except Exception:
+                    pass
+            return plan
+    except Exception as e:
+        plan["applied"] = False
+        plan["ok"] = False
+        plan["error"] = f"apply failed: {e}"
+        plan["errors"] = list(plan.get("errors") or []) + [str(e)]
+        return plan
+
+    plan["applied"] = False
+    return plan
+
 
 
 # ============================================================== 3D experimental
@@ -1678,6 +3168,26 @@ def render_ascii_3d(polylines: Optional[list] = None,
 # ================================================================= MCP register
 
 
+
+def _load_schematic(doc_id: str = "") -> dict:
+    from engine.ecad import session as ecad_session  # noqa: PLC0415
+    if doc_id:
+        session = ecad_session.get_session(doc_id)
+    else:
+        try:
+            from mcp_server.ecad_tools import _ECAD  # noqa: PLC0415
+            did = _ECAD.get("current_sch") or _ECAD.get("current")
+            if not did:
+                raise ValueError("no current schematic — pass doc_id or call "
+                                 "ecad_new_schematic first")
+            session = ecad_session.get_session(did)
+        except Exception as e:
+            raise ValueError(f"no schematic session: {e}") from e
+    if session.kind != "sch":
+        raise ValueError(f"document {session.doc_id!r} is {session.kind}, not sch")
+    return session.doc
+
+
 def _load_board(doc_id: str = "") -> dict:
     from engine.ecad import session as ecad_session  # noqa: PLC0415
     if doc_id:
@@ -1716,7 +3226,10 @@ def _load_sketch(sketch: str, doc_id: Optional[str]) -> tuple[dict, Optional[dic
 
 
 def register_ascii2d_tools(mcp: FastMCP) -> None:
-    """Register render_board_ascii / render_sketch_ascii / render_ascii."""
+    """Register ASCII render + apply-edit tools for sketch/PCB/schematic/sim."""
+    # Capture module-level callables before nested @mcp.tool defs shadow the names.
+    _apply_ascii_edits_impl = globals()["apply_ascii_edits"]
+    _render_sim_ascii_impl = globals()["render_sim_ascii"]
 
     @mcp.tool()
     def render_board_ascii(doc_id: str = "", layer: str = "",
@@ -1753,7 +3266,125 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(str(e),
                         hint="Pass board_json=... or open a PCB with ecad_new_pcb / "
+
                              "board_from_schematic first.")
+
+    @mcp.tool()
+    def render_schematic_ascii(doc_id: str = "", pitch_mm: float = 2.54,
+                               sch_json: str = "") -> str:
+        """ASCII grid of an electrical schematic sheet + cell index + checks.
+
+        Symbols render as refdes boxes, wires as path characters, power ports as
+        'P'+net, labels as 'L'+text, junctions as '*'. Returns a stable ``grid``
+        contract (origin/pitch/y-flip) and per-cell ``index`` so models can target
+        edits via apply_ascii_edits(kind='schematic', ...).
+
+        Args:
+          doc_id: open schematic session id (default: current sch).
+          pitch_mm: world-mm per ASCII cell (default 2.54 = one pin grid).
+          sch_json: optional full schematic document JSON — offline / unit tests.
+
+        Returns JSON: {ok, ascii, ascii_ruled, summary, findings, grid, index}.
+        """
+        try:
+            if sch_json:
+                sch = json.loads(sch_json) if isinstance(sch_json, str) else sch_json
+            else:
+                sch = _load_schematic(doc_id)
+            return _dumps(schematic_ascii_report(sch, pitch_mm=float(pitch_mm) or 2.54))
+        except Exception as e:  # noqa: BLE001
+            return _err(str(e),
+                        hint="Pass sch_json=... or open a schematic with "
+                             "ecad_new_schematic first.")
+
+    @mcp.tool()
+    def render_sim_ascii(doc_id: str = "", spice_text: str = "",
+                         circuit_json: str = "", netlist_json: str = "",
+                         results_json: str = "") -> str:
+        """Deterministic plaintext of a SPICE circuit / deck / sim results.
+
+        Topological (not a 2D grid): device roster, optional SPICE deck text,
+        netlist components/nets, and probe results. Use after ecad_simulate or
+        pass offline JSON. For spatial schematic edits use render_schematic_ascii.
+
+        Args:
+          doc_id: open schematic — when set, builds netlist + SPICE circuit live.
+          spice_text: optional raw SPICE deck.
+          circuit_json / netlist_json / results_json: offline payloads.
+        """
+        try:
+            circuit = json.loads(circuit_json) if circuit_json else None
+            netlist = json.loads(netlist_json) if netlist_json else None
+            results = json.loads(results_json) if results_json else None
+            if doc_id or (not circuit and not spice_text and not netlist):
+                try:
+                    sch = _load_schematic(doc_id)
+                    from engine.ecad.netlist import build_netlist  # noqa: PLC0415
+                    netlist = netlist or build_netlist(sch)
+                    try:
+                        from engine.sim.spice import netlist_to_spice_circuit  # noqa: PLC0415
+                        circuit, _warns = netlist_to_spice_circuit(netlist)
+                    except Exception:
+                        pass
+                except Exception:
+                    if not (circuit or spice_text or netlist):
+                        raise
+            return _dumps(_render_sim_ascii_impl(circuit=circuit, spice_text=spice_text,
+                                           netlist=netlist, results=results))
+        except Exception as e:  # noqa: BLE001
+            return _err(str(e),
+                        hint="Pass circuit_json/spice_text or open a schematic.")
+
+    @mcp.tool()
+    def apply_ascii_edits(kind: str, edits_json: str,
+                          doc_id: str = "",
+                          layer: str = "F.Cu",
+                          sketch_id: str = "",
+                          grid_json: str = "",
+                          index_json: str = "",
+                          dry_run: bool = False) -> str:
+        """Apply cell-addressed / ref-targeted edits from an ASCII grid review.
+
+        ``kind``: schematic | pcb | sketch.
+
+        ``edits_json``: JSON list of edit objects, e.g.::
+
+            [
+              {"op": "move", "ref": "R1", "to_cell": [12, 4]},
+              {"op": "swap", "a": "R1", "b": "R2"},
+              {"op": "delete", "cell": [3, 5], "kinds": ["track"]},
+              {"op": "replace_section", "cell_min": [0,0], "cell_max": [8,6],
+               "clear": ["track", "via"],
+               "place": [{"op": "add_track", "net": "A",
+                          "from_cell": [0,0], "to_cell": [8,0]}]},
+              {"op": "place_symbol", "libid": "Device:R", "cell": [10, 2],
+               "ref": "R9", "value": "10k"},
+              {"op": "set_value", "ref": "R1", "value": "4.7k"}
+            ]
+
+        Prefer passing ``grid_json`` + ``index_json`` from the last
+        render_*_ascii response so cell coords resolve against the same raster.
+        When omitted, the live doc is re-rendered to rebuild the contract.
+
+        ``dry_run=true`` returns the planned engine ops without applying them.
+        On apply, a compact ASCII readback is attached (schematic/pcb/sketch).
+        """
+        try:
+            edits = json.loads(edits_json) if isinstance(edits_json, str) else edits_json
+            if not isinstance(edits, list):
+                return _err("edits_json must be a JSON list of edit objects")
+            grid = json.loads(grid_json) if grid_json else None
+            index = json.loads(index_json) if index_json else None
+            report = _apply_ascii_edits_impl(
+                kind, edits, doc_id=doc_id, layer=layer or "F.Cu",
+                sketch_id=sketch_id, grid=grid, index=index,
+                dry_run=bool(dry_run), apply_live=not bool(dry_run),
+            )
+            return _dumps(report)
+        except Exception as e:  # noqa: BLE001
+            return _err(str(e),
+                        hint="Pass kind=schematic|pcb|sketch and edits_json=[...]. "
+                             "Include grid_json/index_json from the last render.")
 
     @mcp.tool()
     def render_sketch_ascii(sketch: str = "", doc_id: Optional[str] = None,

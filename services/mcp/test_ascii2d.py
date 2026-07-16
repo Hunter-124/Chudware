@@ -1,4 +1,4 @@
-"""Deterministic ASCII 2D tools — PCB / sketch / experimental silhouette.
+"""Deterministic ASCII 2D tools — PCB / schematic / sketch / sim / edits.
 
 Acceptance (owner item 5):
   * PCB fixture with a known same-layer crossing is flagged.
@@ -16,20 +16,30 @@ import json
 from mcp_server.ascii2d import (
     READBACK_MAX_H,
     READBACK_MAX_W,
+    apply_ascii_edits,
     attach_board_readback,
+    attach_schematic_readback,
     attach_sketch_readback,
     board_ascii_report,
     board_mutation_readback,
+    cell_to_world,
     check_board,
+    check_schematic,
     check_sketch_geometry,
+    plan_ascii_edits,
     register_ascii2d_tools,
     render_ascii_3d,
     render_board_layer_ascii,
+    render_schematic_ascii,
+    render_sim_ascii,
+    schematic_ascii_report,
     segments_cross,
     sketch_ascii_report,
     sketch_ids_from_ops,
     sketch_mutation_readback,
+    world_to_cell,
 )
+
 
 
 class _StubMCP:
@@ -127,6 +137,47 @@ def _crossing_board() -> dict:
         ],
         "zones": [],
         "graphics": [],
+    }
+
+
+
+
+def _divider_schematic() -> dict:
+    """Minimal voltage-divider-like schematic for ASCII + edit tests."""
+    return {
+        "schema": "aicad.sch/1",
+        "name": "divider_ascii",
+        "sheets": [{"id": "sh1", "name": "root", "parent": None,
+                    "size": [297, 210], "ports": []}],
+        "symbols": [
+            {"id": "s1", "libid": "Device:R", "ref": "R1", "value": "10k",
+             "pos": [20.0, 10.0], "angle": 0.0, "sheet": "sh1"},
+            {"id": "s2", "libid": "Device:R", "ref": "R2", "value": "10k",
+             "pos": [40.0, 10.0], "angle": 0.0, "sheet": "sh1"},
+            {"id": "s3", "libid": "Simulation_SPICE:V_source", "ref": "V1",
+             "value": "5", "pos": [0.0, 10.0], "angle": 0.0, "sheet": "sh1"},
+        ],
+        "wires": [
+            {"id": "w1", "sheet": "sh1",
+             "pts": [[5.0, 10.0], [15.0, 10.0]], "bus": False},
+            {"id": "w2", "sheet": "sh1",
+             "pts": [[25.0, 10.0], [35.0, 10.0]], "bus": False},
+        ],
+        "junctions": [],
+        "labels": [
+            {"id": "l1", "text": "MID", "scope": "local",
+             "pos": [30.0, 10.0], "sheet": "sh1"},
+        ],
+        "power": [
+            {"id": "pw1", "net": "GND", "pos": [45.0, 5.0], "sheet": "sh1"},
+            {"id": "pw2", "net": "+5V", "pos": [0.0, 15.0], "sheet": "sh1"},
+        ],
+        "buses": [],
+        "no_connect": [],
+        "graphics": [],
+        "sheet_symbols": [],
+        "lib_cache": {},
+        "annotations": {},
     }
 
 
@@ -428,3 +479,188 @@ def test_summarize_sketch_nl_parity_fields():
     assert "OPEN" in s or "open" in s.lower() or "dangling" in s.lower()
     # entity id callouts
     assert "e1" in s and "e2" in s
+
+
+# --------------------------------------------------------------------------- schematic / sim / edits
+
+
+def test_schematic_ascii_deterministic_and_indexed():
+    sch = _divider_schematic()
+    a = schematic_ascii_report(sch, pitch_mm=2.54)
+    b = schematic_ascii_report(sch, pitch_mm=2.54)
+    assert a["ok"] and b["ok"]
+    assert a["ascii"] == b["ascii"]
+    assert a["summary"] == b["summary"]
+    assert a["grid"] and a["grid"]["kind"] == "schematic"
+    assert a["grid"]["y_flip"] is True
+    assert a["index"], "expected non-empty cell index"
+    # R1 should appear in the ascii or index
+    refs = []
+    for hits in a["index"].values():
+        for h in hits:
+            if h.get("kind") == "symbol":
+                refs.append(h.get("ref"))
+    assert "R1" in refs and "R2" in refs
+    assert "R1" in a["ascii"] or "R1" in a["ascii_ruled"]
+    assert "col" not in a["ascii_ruled"] or "|" in a["ascii_ruled"]
+
+
+def test_schematic_findings_duplicate_ref():
+    sch = _divider_schematic()
+    sch["symbols"].append({
+        "id": "s9", "libid": "Device:R", "ref": "R1", "value": "1k",
+        "pos": [60.0, 10.0], "angle": 0.0, "sheet": "sh1",
+    })
+    findings = check_schematic(sch)
+    assert any(f.get("code") == "duplicate_ref" for f in findings), findings
+
+
+def test_cell_world_roundtrip():
+    sch = _divider_schematic()
+    rep = schematic_ascii_report(sch, pitch_mm=2.54)
+    g = rep["grid"]
+    # pick a mid cell
+    col, row = g["width"] // 2, g["height"] // 2
+    x, y = cell_to_world(col, row, g)
+    c2, r2 = world_to_cell(x, y, g)
+    assert (c2, r2) == (col, row)
+
+
+def test_plan_swap_and_move_schematic():
+    sch = _divider_schematic()
+    rep = schematic_ascii_report(sch, pitch_mm=2.54)
+    plan = plan_ascii_edits(
+        "schematic",
+        [
+            {"op": "swap", "a": "R1", "b": "R2"},
+            {"op": "set_value", "ref": "R1", "value": "4.7k"},
+            {"op": "place_label", "text": "VCC", "cell": [1, 1], "scope": "global"},
+        ],
+        grid=rep["grid"], index=rep["index"], doc=sch,
+    )
+    assert plan["ops"], plan
+    kinds = [o["op"] for o in plan["ops"]]
+    assert kinds.count("sch_edit_symbol") >= 3  # 2 swap + 1 set_value
+    assert "sch_add_label" in kinds
+    assert plan["ok"] or not plan["errors"]
+
+
+def test_plan_pcb_section_replace_and_move():
+    board = _crossing_board()
+    rep = board_ascii_report(board, pitch_mm=2.0)
+    assert rep["grid"] and rep["index"]
+    # move R1 to a far cell
+    # find a free-ish cell
+    g = rep["grid"]
+    to_cell = [g["width"] - 2, 1]
+    plan = plan_ascii_edits(
+        "pcb",
+        [
+            {"op": "move", "ref": "R1", "to_cell": to_cell},
+            {"op": "swap", "a": "U1", "b": "U2"},
+            {"op": "replace_section",
+             "cell_min": [0, 0], "cell_max": [3, 3],
+             "clear": ["track"],
+             "place": []},
+        ],
+        grid=g, index=rep["index"], doc=board, layer="F.Cu",
+    )
+    kinds = [o["op"] for o in plan["ops"]]
+    assert "pcb_edit_footprint" in kinds
+    # section clear may or may not hit tracks in that corner
+    assert plan["n_ops"] >= 3, plan
+
+
+def test_plan_sketch_add_line():
+    sk = _open_sketch()
+    rep = sketch_ascii_report(sk, pitch=1.0)
+    assert rep.get("grid"), rep
+    plan = plan_ascii_edits(
+        "sketch",
+        [{"op": "sketch_add_line", "from_cell": [1, 1], "to_cell": [5, 1]}],
+        grid=rep["grid"], index=rep.get("index") or {}, doc=sk, sketch_id="s1",
+    )
+    assert plan["ops"] and plan["ops"][0]["op"] == "sketch_add_entity"
+    assert plan["ops"][0]["entity"]["type"] == "line"
+
+
+def test_apply_ascii_edits_dry_run():
+    sch = _divider_schematic()
+    rep = schematic_ascii_report(sch, pitch_mm=2.54)
+    out = apply_ascii_edits(
+        "schematic",
+        [{"op": "swap", "a": "R1", "b": "R2"}],
+        grid=rep["grid"], index=rep["index"], doc=sch, dry_run=True,
+    )
+    assert out.get("dry_run") is True
+    assert out.get("applied") is False
+    assert any(o["op"] == "sch_edit_symbol" for o in out["ops"])
+
+
+def test_sim_ascii_stable():
+    circuit = {
+        "devices": [
+            {"kind": "R", "name": "R1", "nodes": ["MID", "GND"],
+             "params": {"r": 10000}},
+            {"kind": "V", "name": "V1", "nodes": ["+5V", "GND"],
+             "params": {"dc": 5}},
+        ],
+        "nodes": ["MID", "GND", "+5V"],
+    }
+    r1 = render_sim_ascii(circuit=circuit, results={"V(MID)": 2.5})
+    r2 = render_sim_ascii(circuit=circuit, results={"V(MID)": 2.5})
+    assert r1["ascii"] == r2["ascii"]
+    assert "R1" in r1["ascii"] and "V(MID)" in r1["ascii"]
+    assert r1["grid"] is None
+
+
+def test_mcp_registration_includes_schematic_and_apply():
+    mcp = _StubMCP()
+    register_ascii2d_tools(mcp)
+    for name in ("render_board_ascii", "render_sketch_ascii", "render_ascii",
+                 "render_schematic_ascii", "render_sim_ascii", "apply_ascii_edits"):
+        assert name in mcp.tools, name
+    sch = _divider_schematic()
+    out = json.loads(mcp.tools["render_schematic_ascii"](
+        sch_json=json.dumps(sch), pitch_mm=2.54))
+    assert out["ok"], out
+    assert out.get("grid")
+    # dry-run apply via tool
+    out2 = json.loads(mcp.tools["apply_ascii_edits"](
+        kind="schematic",
+        edits_json=json.dumps([{"op": "swap", "a": "R1", "b": "R2"}]),
+        grid_json=json.dumps(out["grid"]),
+        index_json=json.dumps(out["index"]),
+        dry_run=True,
+    ))
+    # dry_run path may still need doc offline — plan-only works with grid/index
+    # When dry_run and no live doc, apply_ascii_edits still plans from grid/index
+    assert "ops" in out2, out2
+    sim = json.loads(mcp.tools["render_sim_ascii"](
+        circuit_json=json.dumps({
+            "devices": [{"kind": "R", "name": "R1", "nodes": ["a", "0"],
+                         "params": {"r": 1e3}}],
+            "nodes": ["a", "0"],
+        })))
+    assert sim["ok"] and "R1" in sim["ascii"]
+
+
+def test_board_report_exposes_grid_and_ruled():
+    board = _crossing_board()
+    r = board_ascii_report(board, pitch_mm=2.0)
+    assert r.get("grid") and r.get("index")
+    assert r.get("ascii_ruled")
+    # cell index should mention a footprint or track
+    flat = [h for hits in r["index"].values() for h in hits]
+    kinds = {h.get("kind") for h in flat}
+    assert "footprint" in kinds or "track" in kinds
+
+
+def test_attach_schematic_readback():
+    sch = _divider_schematic()
+    resp = {"ok": True}
+    attach_schematic_readback(resp, sch)
+    assert resp["ascii_readback"]["ok"] is True
+    assert resp["ascii"]
+
+

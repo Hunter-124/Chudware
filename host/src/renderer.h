@@ -468,6 +468,10 @@ private:
     mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)
     mutable std::vector<float> lumaRgbGrid_;     // mean-RGB grid, 3 floats/cell, same order/dims
     mutable std::vector<float> lumaRgbStaging_;  // staging twin, swapped in lockstep with lumaGrid_
+#ifdef __EMSCRIPTEN__
+    mutable std::vector<unsigned char> lumaCpuBuf_;  // web: synchronous glReadPixels scratch (no PBO map)
+    mutable unsigned int lumaWebCounter_ = 0;        // web: sync-read throttle cadence (decoupled from fallback)
+#endif
     mutable int lumaW_ = 0, lumaH_ = 0;
     mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
     bool backdropEnabled_ = true;

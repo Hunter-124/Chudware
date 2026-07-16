@@ -2439,6 +2439,49 @@ void Renderer::issueLumaReadback() const {
 // storage before issuing, dropping any outstanding fences from the old generation WITHOUT mapping
 // them first (their data no longer matches the new dimensions).
 void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
+#ifdef __EMSCRIPTEN__
+    // WebGL2 cannot map a PBO for read-back, so bypass the async PBO ring entirely: do a
+    // SYNCHRONOUS glReadPixels of the (small, quarter-res blur) source and reduce on the CPU.
+    // This feeds the liquid-glass backdrop luminance so panels pick DARK text over the bright
+    // studio backdrop — without it the grid stays at 0.5 (hysteresis dead-zone) and glass text
+    // washes out light-on-light. srcFbo is normally the quarter-res blur target, so this read
+    // is tiny; issueLumaReadback already throttles the full-res fallback to every 8th frame.
+    if (srcW <= 0 || srcH <= 0) return;
+    // A synchronous glReadPixels forces a GPU pipeline flush, so throttle to every 8th frame
+    // (the backdrop luma changes slowly and the tone hysteresis smooths it). Always read the
+    // FIRST time so glass text isn't washed for the first ~8 boot frames.
+    if (lumaEverRead_ && (++lumaWebCounter_ % 8) != 0) return;
+    const size_t need = (size_t)srcW * (size_t)srcH * 4;
+    if (lumaCpuBuf_.size() < need) lumaCpuBuf_.resize(need);
+    glBindFramebuffer(GL_FRAMEBUFFER, srcFbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, lumaCpuBuf_.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    const unsigned char* px = lumaCpuBuf_.data();
+    const int stepX = std::max(1, (srcW + kLumaGridMaxW - 1) / kLumaGridMaxW);
+    const int stepY = std::max(1, (srcH + kLumaGridMaxH - 1) / kLumaGridMaxH);
+    const int gw = std::min(kLumaGridMaxW, (srcW + stepX - 1) / stepX);
+    const int gh = std::min(kLumaGridMaxH, (srcH + stepY - 1) / stepY);
+    lumaStaging_.assign((size_t)gw * (size_t)gh, 0.5f);
+    lumaRgbStaging_.assign((size_t)gw * (size_t)gh * 3, 0.5f);
+    for (int gy = 0; gy < gh; ++gy) {
+        const int sy = std::max(0, srcH - 1 - gy * stepY);  // flip: grid row 0 = viewport top
+        for (int gx = 0; gx < gw; ++gx) {
+            const int sx = std::min(srcW - 1, gx * stepX);
+            const unsigned char* p = px + ((size_t)sy * (size_t)srcW + (size_t)sx) * 4;
+            const float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f;
+            const size_t cell = (size_t)gy * (size_t)gw + (size_t)gx;
+            lumaStaging_[cell] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            lumaRgbStaging_[cell * 3 + 0] = r;
+            lumaRgbStaging_[cell * 3 + 1] = g;
+            lumaRgbStaging_[cell * 3 + 2] = b;
+        }
+    }
+    lumaGrid_.swap(lumaStaging_);
+    lumaRgbGrid_.swap(lumaRgbStaging_);
+    lumaW_ = gw; lumaH_ = gh; lumaEverRead_ = true;
+    return;
+#endif
     if (srcW != lumaSrcW_ || srcH != lumaSrcH_) {
         for (int i = 0; i < kLumaPboCount; ++i) {
             if (lumaFence_[i]) {

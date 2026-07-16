@@ -119,6 +119,9 @@ class Settings:
     # defaults (instance key "billetweb" is verbatim => socket name is stable).
     webd_socket: Path = field(default_factory=Path)
     workspace_root: Path = field(default_factory=Path)
+    # WASM web client static root (served at /app) + client perf traces.
+    app_dir: Path = field(default_factory=Path)
+    perf_traces_dir: Path = field(default_factory=Path)
 
     def __post_init__(self) -> None:
         if not self.users_file or str(self.users_file) in {".", ""}:
@@ -141,6 +144,18 @@ class Settings:
                 or "~/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
             )
             self.workspace_root = _expand_path(raw)
+        if not self.app_dir or str(self.app_dir) in {".", ""}:
+            raw = _env("BILLET_WEB_APP_DIR") or "~/billet-web/app"
+            self.app_dir = _expand_path(raw)
+        if not self.perf_traces_dir or str(self.perf_traces_dir) in {".", ""}:
+            raw = _env("BILLET_WEB_PERF_TRACES_DIR")
+            if raw:
+                self.perf_traces_dir = _expand_path(raw)
+            else:
+                # Webservice/perf/traces next to the gateway package.
+                self.perf_traces_dir = (
+                    Path(__file__).resolve().parents[1] / "perf" / "traces"
+                )
 
     @property
     def homes_dir(self) -> Path:

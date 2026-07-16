@@ -11,7 +11,9 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+// Browser never maps POSIX shm — loadAicmFile fetches via /files/aicm.
+#elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -160,6 +162,21 @@ void unlink_shm_name(const std::string& name) {
         g_win_keepers.erase(it);
     }
 }
+#elif defined(__EMSCRIPTEN__)
+// Browser client: no POSIX shm. publish falls back to publish_file (MEMFS);
+// consumers fetch aicm-shm:// via GET /files/aicm?shm=… (see loadAicmFile).
+std::string shm_object_name(const std::string& key) { return "/aicad_" + sanitize(key); }
+
+std::string publish_shm(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*n*/) {
+    return {};
+}
+
+bool map_shm(const std::string& name, Mapping& /*out*/, std::string& err) {
+    err = "aicm-shm unavailable under emscripten (" + name + "); use HTTP /files/aicm";
+    return false;
+}
+
+void unlink_shm_name(const std::string& /*name*/) {}
 #else  // POSIX
 std::string shm_object_name(const std::string& key) { return "/aicad_" + sanitize(key); }
 
@@ -353,7 +370,7 @@ void unmap(Mapping& m) {
         if (impl->view) UnmapViewOfFile(impl->view);
         if (impl->map) CloseHandle(impl->map);
     }
-#else
+#elif !defined(__EMSCRIPTEN__)
     if (impl->kind == MapImpl::Shm && impl->view) munmap(impl->view, impl->map_size);
 #endif
     delete impl;

@@ -9,12 +9,15 @@
 //   (ipc_transport.cpp)
 // Windows: named pipe \\.\pipe\aicad-hostd-<SID>-<key>, byte mode, overlapped
 //   handles, same-user DACL (ipc_transport_win.cpp)
+// EMSCRIPTEN: WebSocket to the gateway `WS /engine` (ipc_transport_wasm.cpp);
+//   path arg ignored; dials ws(s)://location.host/engine. Requires -lwebsocket.js.
 //
 // This layer is transport only — no JSON parsing, no protocol. Both the daemon
 // (core/hostd) and every C++ client (GUI DaemonConn, tests) compile these sources.
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <string>
 
 namespace aicad_ipc {
@@ -28,6 +31,12 @@ public:
     // (both accept() and connectTo() produce those). void* to keep <windows.h>
     // out of this header.
     explicit IpcConn(void* pipeHandle);
+#elif defined(__EMSCRIPTEN__)
+    // Constructed only by connectTo() after the WebSocket handshake completes.
+    // WasmState is heap-shared so WS callbacks (foreign thread/context) can append
+    // to the line buffer under a mutex without pinning a moved-from IpcConn.
+    struct WasmState;
+    explicit IpcConn(std::shared_ptr<WasmState> ws);
 #else
     explicit IpcConn(int fd) : fd_(fd) {}
 #endif
@@ -39,6 +48,8 @@ public:
 
 #ifdef _WIN32
     bool valid() const { return h_ != nullptr; }
+#elif defined(__EMSCRIPTEN__)
+    bool valid() const;
 #else
     bool valid() const { return fd_ >= 0; }
 #endif
@@ -53,9 +64,13 @@ public:
     // lives in the protocol layer, where response writes and event pushes meet).
     bool writeLine(const std::string& line);
 
+#ifdef __EMSCRIPTEN__
+    bool eof() const;
+#else
     bool eof() const { return eof_.load(std::memory_order_acquire); }
+#endif
     void close();
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     int fd() const { return fd_; }
 #endif
 
@@ -63,14 +78,18 @@ private:
 #ifdef _WIN32
     void* h_ = nullptr;   // pipe HANDLE (nullptr = invalid; INVALID_HANDLE_VALUE normalized away)
     void* ev_ = nullptr;  // manual-reset event backing this conn's OVERLAPPED reads/writes
+#elif defined(__EMSCRIPTEN__)
+    std::shared_ptr<WasmState> ws_;
 #else
     int fd_ = -1;
 #endif
+#ifndef __EMSCRIPTEN__
     // Written by writeLine on a foreign thread (event fanout) when a bounded
     // write fails, read by readLine on the owning client-loop thread — atomic so
     // that cross-thread signal is a clean handoff rather than a data race.
     std::atomic<bool> eof_{false};
     std::string readBuf_;
+#endif
 };
 
 // Listening endpoint (daemon side).
@@ -111,6 +130,9 @@ public:
     std::string releasePath();
 #ifdef _WIN32
     bool valid() const { return pending_ != nullptr; }
+#elif defined(__EMSCRIPTEN__)
+    // Browser client never listens — always invalid (server-side stubs in wasm TU).
+    bool valid() const { return false; }
 #else
     bool valid() const { return fd_ >= 0; }
 #endif
@@ -123,7 +145,7 @@ private:
     bool connectPending_ = false;
     void* dacl_ = nullptr;       // PACL from SetEntriesInAclW (LocalFree'd on close)
     void* sd_ = nullptr;         // SECURITY_DESCRIPTOR*, references dacl_
-#else
+#elif !defined(__EMSCRIPTEN__)
     int fd_ = -1;
 #endif
     std::string path_;

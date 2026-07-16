@@ -113,12 +113,13 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
     if (!userId_.empty())
         params["user"] = {{"id", userId_}, {"display", userDisplay_}};
     json result;
-    // Engine may still be loading; hello is a daemon-level method and answers
-    // immediately with state=loading|ready — that's fine for the handshake.
-    // Control clients (--stop/--status) never spawn and must not hang forever
-    // on a wedged accept loop: bound their hello so --stop can escalate via
-    // the pidfile. Normal clients keep the unbounded wait.
+#ifdef __EMSCRIPTEN__
+    // Browser: never block first paint forever if the gateway is slow/silent.
+    // maintainConnection retries with backoff when hello fails.
+    const int timeoutMs = 5000;
+#else
     const int timeoutMs = (kind == "control") ? 2000 : -1;
+#endif
     if (!call("hello", params, result, err, timeoutMs)) return false;
     serverInfo_ = result;
     return true;

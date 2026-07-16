@@ -294,13 +294,20 @@ if(EMSCRIPTEN)
   target_link_libraries(Billet PRIVATE nlohmann_json::nlohmann_json aicad_host_miniz)
   # Assets preloaded at /assets (fonts + icon atlases the full app loads at boot).
   set(_WASM_ASSETS "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
+  # Main-thread ImGui with ASYNCIFY yield (emscripten_sleep(0) after swap) +
+  # pthread pool for engine/WS workers. No PROXY_TO_PTHREAD / OffscreenCanvas.
   target_link_options(Billet PRIVATE
     "SHELL:--use-port=contrib.glfw3"
     "SHELL:-lwebsocket.js"
     "SHELL:-sWASM=1"
     "SHELL:-pthread"
     "SHELL:-sPTHREAD_POOL_SIZE=8"
-    "SHELL:-sASSERTIONS=1"
+    "SHELL:-sASYNCIFY"
+    "SHELL:-sASYNCIFY_STACK_SIZE=67108864"
+    "SHELL:-sSTACK_SIZE=64MB"
+    "SHELL:-sTOTAL_STACK=64MB"
+    "SHELL:-sDEFAULT_PTHREAD_STACK_SIZE=2097152"
+    "SHELL:-sINITIAL_MEMORY=128MB"
     "SHELL:-sALLOW_MEMORY_GROWTH=1"
     "SHELL:-sMAXIMUM_MEMORY=4GB"
     "SHELL:-sMAX_WEBGL_VERSION=2"
@@ -308,7 +315,9 @@ if(EMSCRIPTEN)
     "SHELL:-sFETCH=1"
     "SHELL:-sFULL_ES3=1"
     "SHELL:-sUSE_WEBGL2=1"
-    "SHELL:-sOFFSCREEN_FRAMEBUFFER=1"
+    "SHELL:-sEXIT_RUNTIME=0"
+    "SHELL:-sASSERTIONS=1"
+    "SHELL:-sSTACK_OVERFLOW_CHECK=1"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
     "SHELL:--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
     "SHELL:--preload-file=${_WASM_ASSETS}/fonts@/assets/fonts"
@@ -319,7 +328,6 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark.png@/assets/logo_wordmark.png"
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark_dark.png@/assets/logo_wordmark_dark.png"
   )
-  # Also pass the port at compile time so GLFW headers resolve.
   target_compile_options(Billet PRIVATE
     "SHELL:--use-port=contrib.glfw3"
     "SHELL:-pthread")

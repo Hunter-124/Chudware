@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en-us">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Billet</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #12181c;
+      color: #e6edf3;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    #canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #0f1418;
+      outline: none;
+    }
+    #status {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.55);
+      font-size: 12px;
+      pointer-events: none;
+      z-index: 10;
+    }
+    #status.error { color: #ff8a8a; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="status">Loading Billet WASM…</div>
+  <script type="text/javascript">
+    window.__billetLogs = [];
+    function billetLog(kind, text) {
+      try {
+        window.__billetLogs.push(kind + ': ' + text);
+        if (window.__billetLogs.length > 400) window.__billetLogs.shift();
+      } catch (e) {}
+      if (kind === 'err') console.error(text); else console.log(text);
+    }
+    var statusEl = document.getElementById('status');
+    function setStatus(text, isError) {
+      if (!statusEl) return;
+      statusEl.textContent = text;
+      statusEl.className = isError ? 'error' : '';
+    }
+    var Module = {
+      canvas: (function() {
+        var c = document.getElementById('canvas');
+        // Size the drawing buffer to CSS × DPR before first GL frame.
+        try {
+          var r = c.getBoundingClientRect();
+          var dpr = window.devicePixelRatio || 1;
+          c.width = Math.max(64, Math.floor(r.width * dpr));
+          c.height = Math.max(64, Math.floor(r.height * dpr));
+        } catch (e) {}
+        c.addEventListener('webglcontextlost', function(e) {
+          e.preventDefault();
+          setStatus('WebGL context lost', true);
+        }, false);
+        return c;
+      })(),
+      print: function(text) {
+        if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+        billetLog('out', text);
+      },
+      printErr: function(text) {
+        if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+        billetLog('err', text);
+      },
+      setStatus: function(text) {
+        if (!text) { setStatus('Running'); return; }
+        setStatus(text);
+      },
+      monitorRunDependencies: function(left) {
+        if (left > 0) setStatus('Loading… (' + left + ' remaining)');
+      },
+      onAbort: function(what) {
+        setStatus('Aborted: ' + what, true);
+        billetLog('err', 'abort: ' + what);
+      },
+      preRun: [function() { billetLog('out', 'preRun'); }],
+      postRun: [function() { billetLog('out', 'postRun'); }],
+      onRuntimeInitialized: function() {
+        setStatus('Runtime ready');
+        billetLog('out', 'onRuntimeInitialized');
+        var c = document.getElementById('canvas');
+        if (c) c.focus();
+      }
+    };
+    window.onerror = function(msg) {
+      setStatus('Exception: ' + msg, true);
+      billetLog('err', String(msg));
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

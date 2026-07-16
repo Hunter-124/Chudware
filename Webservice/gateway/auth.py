@@ -253,9 +253,17 @@ class AuthMiddleware:
             for k, v in scope.get("headers") or []
         }
         cookies = _parse_cookies(headers.get("cookie", ""))
+        query: dict[str, str] = {}
+        raw_qs = scope.get("query_string") or b""
+        if raw_qs:
+            from urllib.parse import parse_qs
+            for k, vals in parse_qs(raw_qs.decode("latin-1"), keep_blank_values=False).items():
+                if vals:
+                    query[k.lower()] = vals[0]
 
+        set_dev_cookie: str | None = None
         try:
-            user = self._authenticate(headers, cookies)
+            user, set_dev_cookie = self._authenticate(headers, cookies, query)
         except AuthError as exc:
             if scope["type"] == "websocket":
                 await send(
@@ -290,11 +298,45 @@ class AuthMiddleware:
             except Exception:
                 scope["state"] = {"user": user, "user_email": user.email}
 
+        if set_dev_cookie and scope["type"] == "http":
+            cookie_val = (
+                f"dev_user={set_dev_cookie}; Path=/; HttpOnly; SameSite=Lax"
+            )
+            cookie_header = (b"set-cookie", cookie_val.encode("latin-1"))
+
+            async def send_with_cookie(message):
+                if message["type"] == "http.response.start":
+                    headers_list = list(message.get("headers") or [])
+                    headers_list.append(cookie_header)
+                    message = {**message, "headers": headers_list}
+                await send(message)
+
+            await self.app(scope, receive, send_with_cookie)
+            return
+
         await self.app(scope, receive, send)
 
-    def _authenticate(self, headers: dict[str, str], cookies: dict[str, str]) -> User | None:
+    def _authenticate(
+        self,
+        headers: dict[str, str],
+        cookies: dict[str, str],
+        query: dict[str, str] | None = None,
+    ) -> tuple[User | None, str | None]:
+        """Return (user, set_dev_cookie_email).
+
+        set_dev_cookie_email is non-None only when auth succeeded via the
+        ``?dev_user=`` / ``?x-dev-user=`` query param in dev mode — the caller
+        then Set-Cookies it so subresource requests stick without the query.
+        """
         if self.cfg.dev_mode:
+            # Header preferred; cookie for sticky browser sessions; query for
+            # one-shot local smoke (BILLET_WEB_DEV=1 only).
+            from_query = False
             email = headers.get("x-dev-user") or cookies.get("dev_user")
+            if not email:
+                email = (query or {}).get("dev_user") or (query or {}).get("x-dev-user")
+                if email:
+                    from_query = True
             if not email:
                 raise AuthError(
                     "dev mode requires X-Dev-User header",
@@ -305,7 +347,7 @@ class AuthMiddleware:
             user = self.directory.get(email)
             if user is None:
                 raise AuthError("not on the list", status=403, email=email)
-            return user
+            return user, (email if from_query else None)
 
         token = headers.get("cf-access-jwt-assertion")
         if not token:
@@ -342,7 +384,7 @@ class AuthMiddleware:
         user = self.directory.get(email)
         if user is None:
             raise AuthError("not on the list", status=403, email=email)
-        return user
+        return user, None
 
     def _deny_http(self, path: str, headers: dict[str, str], exc: AuthError):
         accept = headers.get("accept", "")

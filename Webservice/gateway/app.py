@@ -47,9 +47,13 @@ except ImportError:
 try:
     from .engine_bridge import router as engine_router
     from .workspace import router as workspace_router
+    from .appserve import router as appserve_router
+    from .perf_client import router as perf_router
 except ImportError:
     from engine_bridge import router as engine_router
     from workspace import router as workspace_router
+    from appserve import router as appserve_router
+    from perf_client import router as perf_router
 
 settings.ensure_data_dirs()  # users_file must exist before the directory loads
 user_directory = UserDirectory(settings.users_file)
@@ -670,6 +674,8 @@ app.include_router(chat_router)
 app.include_router(admin_router)
 app.include_router(engine_router)
 app.include_router(workspace_router)
+app.include_router(appserve_router)
+app.include_router(perf_router)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -136,6 +136,38 @@ def test_not_on_list_html(client):
     assert "not on the list" in r.text.lower()
 
 
+def test_dev_user_query_sets_cookie(client):
+    """?dev_user= authenticates and Set-Cookies for subsequent subresources."""
+    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    assert r.status_code == 200
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "dev_user=demo@example.com" in set_cookie
+    assert "Path=/" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=Lax" in set_cookie or "SameSite=lax" in set_cookie
+
+
+def test_dev_user_cookie_authenticates(client):
+    """Cookie set by ?dev_user= is enough for a follow-up request (no query/header)."""
+    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    assert r.status_code == 200
+    # Follow-up with only the sticky cookie — no X-Dev-User header, no query.
+    r2 = client.get("/api/sessions", cookies={"dev_user": "demo@example.com"})
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["status"] == "none"
+    # Cookie-only auth must NOT re-emit Set-Cookie (query-param path only).
+    assert "dev_user=" not in r2.headers.get("set-cookie", "")
+
+
+def test_dev_user_query_noop_when_not_dev(client, monkeypatch):
+    """Without BILLET_WEB_DEV / dev_mode, ?dev_user= is ignored (prod path)."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    assert r.status_code in {401, 500}
+    assert "dev_user=" not in r.headers.get("set-cookie", "")
+
+
 # ---------------------------------------------------------------------------
 # Sessions (podman mocked)
 # ---------------------------------------------------------------------------

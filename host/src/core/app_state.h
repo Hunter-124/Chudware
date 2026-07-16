@@ -1130,9 +1130,11 @@ struct AppState {
     // user toggles any axis eye in the FeatureManager; until then axes follow hasSolidContent.
     bool axesUserToggled = false;
     // W2-ref: ids of every reference-axis datum currently injected (default axis.x/y/z +
-    // GUI-derived plane-intersection axes). Seeded hidden on a fresh doc; consulted by the
-    // viewport to FORCE-SHOW every axis while a Revolve/axis PropertyManager well is active,
-    // and by the FeatureManager to list them under References. Recomputed each rebuild.
+    // GUI-derived plane-intersection axes). Seeded into axisDatumIds on a fresh doc and left
+    // OUT of hiddenFeatures so empty/sketch-only docs show OPEN FM eyes + draw axes; auto-hide
+    // (hiddenFeatures insert) kicks in with hasSolidContent unless axesUserToggled. Consulted
+    // by the viewport to FORCE-SHOW every axis while a Revolve/axis PropertyManager well is
+    // active, and by the FeatureManager to list them under References. Recomputed each rebuild.
     std::unordered_set<std::string> axisDatumIds;
     // Cached auto plane-intersection axes (USER planes only; reserved pairs map to axis.x/y/z).
     // Recomputed only when the user-plane set fingerprint changes — hitTest/route consume this

@@ -397,7 +397,7 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
         col = ui::Palette::toU32(ui::palette.statusWarn);
         tip = warnText; hasTip = true;
     } else if (ok && danglingRefs.empty()) {
-        col = ui::Palette::toU32(ui::palette.statusOk);    // healthy — teal dot
+        return;   // healthy rows: no green status dot (eye remains; errors/warns still badge)
     } else if (!ok) {
         col = ui::Palette::toU32(ui::palette.statusErr);   // error — red-orange dot
         if (!errText.empty()) { tip = errText; hasTip = true; }
@@ -3657,37 +3657,78 @@ void drawFeatureTreeBody(AppState& st,
             ImGui::Unindent(kSecIndent);
         }   // end filename section
 
-        // ---- References section (Origin + default planes) — its own collapse, independent of the
-        // filename above and the Features below. ----
+        // ---- References section (Origin / Planes / Axes folders) — its own collapse,
+        // independent of the filename above and the Features below. ----
         const bool refOpenBefore = s_refSecOpen;
         fmSectionDividerCollapse("Reference", &s_refSecOpen);
         if (s_refSecOpen != refOpenBefore) sec.refUserToggled = true;
         if (s_refSecOpen) {
             ImGui::Indent(kSecIndent);
 
-            // Origin — expandable; the three default planes nest underneath (no duplicate flat list).
-            // T-BL37: the Origin row body is now selectable (sets selectedFeatureId = "point.origin")
-            // while the chevron still expands/collapses the child planes.
+            // ---- Origin folder (holds the origin POINT only) --------------------------------
+            // Folder header mirrors Axes (body_folder + DefaultOpen + cascade eye). The origin
+            // point is a leaf child so selection / PM point-well routing stay on the point row.
             {
-                ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth |
-                                       ImGuiTreeNodeFlags_OpenOnArrow |
-                                       ImGuiTreeNodeFlags_FramePadding;   // pill-height node
-                bool originSelected = (st.selectedFeatureId == "point.origin");
-                // Eye ICON + dim state follow originVisEff (what the renderer actually draws this
-                // frame: auto-show on empty / auto-hide once a body exists / user force-show).
-                // Click still writes originUserToggled + hiddenFeatures (the sticky override).
                 const bool originShown = st.originVisEff;
-                FmRowRect originRect = fmRowPill(originSelected);
-                treeIcon("origin", "[O]", 16.0f);
+                FmRowRect originFldRect = fmRowPill();
+                treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
                 if (!originShown)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
-                bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
+                const bool originFldOpen = ImGui::TreeNodeEx(
+                    "Origin##ref_origin_folder",
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                    ImGuiTreeNodeFlags_FramePadding);
                 if (!originShown) ImGui::PopStyleColor();
-                // Eye toggle for the origin point glyph.
+                // Folder-level cascade eye: single child (point.origin) show/hide.
                 {
+                    ImVec2 oFldMin = ImGui::GetItemRectMin();
+                    ImVec2 oFldMax = ImGui::GetItemRectMax();
+                    float  oEyeSz = 14.0f * ui::uiScale, oEyePad = 6.0f * ui::uiScale;
+                    ImVec2 oEyeMin(oFldMax.x - oEyeSz - oEyePad,
+                                   oFldMin.y + (oFldMax.y - oFldMin.y - oEyeSz) * 0.5f);
+                    ImVec2 oEyeMax(oEyeMin.x + oEyeSz, oEyeMin.y + oEyeSz);
+                    bool   oOverEye = ImGui::IsMouseHoveringRect(oEyeMin, oEyeMax);
+                    drawEyeGlyph(ImGui::GetWindowDrawList(), oEyeMin, oEyeMax,
+                                 originShown, oOverEye, fmSurf());
+                    if (oOverEye) {
+                        ImGui::SetTooltip(originShown ? "Hide Origin" : "Show Origin");
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                            // Flip relative to EFFECTIVE visibility so auto-show empty parts
+                            // (drawn but still in hiddenFeatures) hide on the first click.
+                            if (originShown) {
+                                st.hiddenFeatures.insert("point.origin");
+                                if (st.selectedFeatureId == "point.origin")
+                                    st.selectedFeatureId.clear();
+                            } else {
+                                st.hiddenFeatures.erase("point.origin");
+                            }
+                            st.originUserToggled = true;   // issue #30: stick — stop auto-hide
+                            st.applyDatumVisibility();
+                        }
+                    }
+                }
+                fmRowPillEnd(originFldRect);
+                if (originFldOpen) {
+                    // Origin point leaf — selectable (selectedFeatureId = "point.origin");
+                    // per-row eye keeps sticky control in sync with the folder cascade eye.
+                    bool originSelected = (st.selectedFeatureId == "point.origin");
+                    ImGuiTreeNodeFlags of = ImGuiTreeNodeFlags_Leaf |
+                                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                            ImGuiTreeNodeFlags_SpanFullWidth |
+                                            ImGuiTreeNodeFlags_FramePadding;
+                    FmRowRect originRect = fmRowPill(originSelected);
+                    if (!originShown)
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                    ImVec2 originRowPos = ImGui::GetCursorScreenPos();
+                    ImGui::TreeNodeEx("Origin##origin_pt", of);
+                    treeIconInArrowSlot(originRowPos, "origin", "[O]",
+                                        originShown ? 1.0f : 0.45f);
+                    if (!originShown) ImGui::PopStyleColor();
+                    fmRowPillEnd(originRect, originSelected);
+
                     ImVec2 oNodeMin = ImGui::GetItemRectMin();
                     ImVec2 oNodeMax = ImGui::GetItemRectMax();
                     float  oEyeSz = 14.0f * ui::uiScale, oEyePad = 6.0f * ui::uiScale;
@@ -3701,21 +3742,18 @@ void drawFeatureTreeBody(AppState& st,
                         if (oOverEye) {
                             ImGui::SetTooltip(originShown ? "Hide Origin" : "Show Origin");
                             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                                // Flip relative to EFFECTIVE visibility so auto-show empty parts
-                                // (drawn but still in hiddenFeatures) hide on the first click.
                                 if (originShown) {
                                     st.hiddenFeatures.insert("point.origin");
                                     if (originSelected) st.selectedFeatureId.clear();
                                 } else {
                                     st.hiddenFeatures.erase("point.origin");
                                 }
-                                st.originUserToggled = true;   // issue #30: stick — stop auto-hide
+                                st.originUserToggled = true;
                                 st.applyDatumVisibility();
                             }
                         }
                     }
-                    // Body-click (not on eye, not on chevron) → select the origin point.
-                    // If a PM point-well is active, also route "point.origin" into it.
+                    // Body-click (not on eye) → select the origin point; route into PM point well.
                     if (!oOverEye && ImGui::IsItemClicked()) {
                         st.selection.clear();
                         st.selectedFeatureId = "point.origin";
@@ -3723,19 +3761,68 @@ void drawFeatureTreeBody(AppState& st,
                             st.propertyManager->activeWellWantsPoint())
                             st.propertyManager->routeDatumPoint("point.origin", "Origin");
                     }
+                    ImGui::TreePop();
                 }
-                fmRowPillEnd(originRect, originSelected);
-                if (originOpen) {
-                    // Labels are the axis-pair the plane spans (front=X/Z, top=X/Y, right=Y/Z),
-                    // indexed by the true plane index so showPlane[]/planeEmphasis/kPlane*Id below
-                    // keep their front/top/right meaning. kOrder puts Top (X/Y) first in the list.
-                    static const char* kPlanes[] = {"X/Z", "X/Y", "Y/Z"};
-                    static const int   kOrder[3] = {1, 0, 2};   // display slots -> plane index
-                    auto takePlaneControl = [&st]() {
-                        if (st.planesUserToggled) return;
-                        for (int i = 0; i < 3; ++i) st.showPlane[i] = st.planeVisEff[i];
-                        st.planesUserToggled = true;
-                    };
+            }
+
+            // ---- Planes folder (X/Y, X/Z, Y/Z) ----------------------------------------------
+            // Mirrors the Axes folder: body_folder + DefaultOpen + cascade eye. Per-row eyes,
+            // planeEmphasis selection, and sketch/PM pick routing are unchanged.
+            {
+                static const char* kPlanes[] = {"X/Z", "X/Y", "Y/Z"};
+                static const int   kOrder[3] = {1, 0, 2};   // display slots -> plane index
+                static const char* kPlaneId[] = {"plane.front", "plane.top", "plane.right"};
+                auto takePlaneControl = [&st]() {
+                    if (st.planesUserToggled) return;
+                    for (int i = 0; i < 3; ++i) st.showPlane[i] = st.planeVisEff[i];
+                    st.planesUserToggled = true;
+                };
+                // Folder eye glyph: shown when ALL children are shown; "any hidden" otherwise.
+                const bool allPlanesShown =
+                    st.planeVisEff[0] && st.planeVisEff[1] && st.planeVisEff[2];
+                const bool anyPlaneShown =
+                    st.planeVisEff[0] || st.planeVisEff[1] || st.planeVisEff[2];
+
+                FmRowRect planesFldRect = fmRowPill();
+                treeIcon("body_folder", "[F]", 16.0f);
+                ImGui::SameLine(0, 4 * ui::uiScale);
+                if (!anyPlaneShown)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                const bool planesOpen = ImGui::TreeNodeEx(
+                    "Planes##ref_planes_folder",
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                    ImGuiTreeNodeFlags_FramePadding);
+                if (!anyPlaneShown) ImGui::PopStyleColor();
+                // Folder cascade eye: any/all shown → hide all; all hidden → show all.
+                {
+                    ImVec2 pFldMin = ImGui::GetItemRectMin();
+                    ImVec2 pFldMax = ImGui::GetItemRectMax();
+                    float  pEyeSz = 14.0f * ui::uiScale, pEyePad = 6.0f * ui::uiScale;
+                    ImVec2 pEyeMin(pFldMax.x - pEyeSz - pEyePad,
+                                   pFldMin.y + (pFldMax.y - pFldMin.y - pEyeSz) * 0.5f);
+                    ImVec2 pEyeMax(pEyeMin.x + pEyeSz, pEyeMin.y + pEyeSz);
+                    bool   pOverEye = ImGui::IsMouseHoveringRect(pEyeMin, pEyeMax);
+                    drawEyeGlyph(ImGui::GetWindowDrawList(), pEyeMin, pEyeMax,
+                                 allPlanesShown, pOverEye, fmSurf());
+                    if (pOverEye) {
+                        ImGui::SetTooltip(anyPlaneShown ? "Hide Planes" : "Show Planes");
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                            takePlaneControl();
+                            const bool show = !anyPlaneShown;
+                            for (int i = 0; i < 3; ++i) st.showPlane[i] = show;
+                            if (!show) {
+                                st.planeEmphasis = -1;
+                                if (st.selectedFeatureId == "plane.front" ||
+                                    st.selectedFeatureId == "plane.top" ||
+                                    st.selectedFeatureId == "plane.right")
+                                    st.selectedFeatureId.clear();
+                            }
+                        }
+                    }
+                }
+                fmRowPillEnd(planesFldRect);
+                if (planesOpen) {
                     for (int slot = 0; slot < 3; ++slot) {
                         int pi = kOrder[slot];
                         ImGuiTreeNodeFlags pf = ImGuiTreeNodeFlags_Leaf |
@@ -3771,35 +3858,33 @@ void drawFeatureTreeBody(AppState& st,
                             if (pOverEye) {
                                 ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
                                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                                    static const char* kPlaneEyeId[] = {"plane.front","plane.top","plane.right"};
                                     takePlaneControl();
                                     st.showPlane[pi] = hidden;
                                     if (!st.showPlane[pi]) {
                                         if (st.planeEmphasis == pi) st.planeEmphasis = -1;
-                                        if (st.selectedFeatureId == kPlaneEyeId[pi]) st.selectedFeatureId.clear();
+                                        if (st.selectedFeatureId == kPlaneId[pi])
+                                            st.selectedFeatureId.clear();
                                     }
                                 }
                             }
                         }
                         if (!pOverEye && ImGui::IsItemClicked()) {
                             if (st.sketchPlanePickActive && st.sketchMode) {
-                                static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
                                 st.sketchPlanePickActive = false;
-                                st.sketchMode->consumePlanePick(st, kPlaneSel[pi]);
+                                st.sketchMode->consumePlanePick(st, kPlaneId[pi]);
                             } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
                                 st.sketchMode->addPlaneDimRef(st, pi);
                             } else {
-                                // Row click = SELECT only (toggle). Visibility is owned solely by the
-                                // eye toggle (Hunter): clicking the row must not hide/show the plane.
-                                static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
-                                bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
+                                // Row click = SELECT only (toggle). Visibility is owned solely by
+                                // the eye toggle (Hunter): row click must not hide/show the plane.
+                                bool wasSel = (st.selectedFeatureId == kPlaneId[pi]);
                                 if (wasSel) {
                                     st.planeEmphasis = -1;
                                     st.selectedFeatureId.clear();
                                 } else {
                                     st.planeEmphasis = pi;
                                     st.selection.clear();
-                                    st.selectedFeatureId = kPlaneSelId[pi];
+                                    st.selectedFeatureId = kPlaneId[pi];
                                 }
                             }
                         }
@@ -3813,8 +3898,7 @@ void drawFeatureTreeBody(AppState& st,
                 }
             }
 
-            // W2-ref: default X/Y/Z axes + every other axis in st.axisDatumIds (auto plane-
-            // intersection + user-created) under a collapsible Axes folder inside Reference.
+            // ---- Axes folder (default X/Y/Z + auto/user axes) -------------------------------
             // Eyes write hiddenFeatures; body click selects / routes into an active axis well.
             // Axes no longer appear in Features. Names come from st.axisDisplayNames (rebuilt
             // on inject when membership changes) — no per-frame tree.features scan.
@@ -3839,29 +3923,73 @@ void drawFeatureTreeBody(AppState& st,
                 std::stable_sort(axes.begin() + 3, axes.end(),
                     [](const AxisRow& a, const AxisRow& b) { return a.id < b.id; });
 
-                // Axes folder header — same body_folder + fmRowPill pattern as component
-                // Reference / Dress-up folders. DefaultOpen so X/Y/Z stay one click away.
+                // Build the listed set once so the folder cascade eye and the child loop agree.
+                std::vector<AxisRow> listedAxes;
+                listedAxes.reserve(axes.size());
+                for (const auto& ar : axes) {
+                    if (!st.axisDatumIds.count(ar.id) &&
+                        ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
+                        continue;
+                    const bool listed =
+                        st.axisDatumIds.empty()
+                            ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
+                            : (bool)st.axisDatumIds.count(ar.id);
+                    if (!listed) continue;
+                    listedAxes.push_back(ar);
+                }
+                bool anyAxisShown = false;
+                bool allAxesShown = !listedAxes.empty();
+                for (const auto& ar : listedAxes) {
+                    const bool shown = st.hiddenFeatures.count(ar.id) == 0;
+                    if (shown) anyAxisShown = true;
+                    else       allAxesShown = false;
+                }
+                if (listedAxes.empty()) { anyAxisShown = false; allAxesShown = false; }
+
+                // Axes folder header — same body_folder + fmRowPill pattern as Planes / Origin.
+                // DefaultOpen so X/Y/Z stay one click away. Cascade eye on the header.
                 FmRowRect axesFldRect = fmRowPill();
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
+                if (!anyAxisShown)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 const bool axesOpen = ImGui::TreeNodeEx(
                     "Axes##ref_axes_folder",
                     ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
                     ImGuiTreeNodeFlags_FramePadding);
+                if (!anyAxisShown) ImGui::PopStyleColor();
+                {
+                    ImVec2 aFldMin = ImGui::GetItemRectMin();
+                    ImVec2 aFldMax = ImGui::GetItemRectMax();
+                    float  aEyeSz = 14.0f * ui::uiScale, aEyePad = 6.0f * ui::uiScale;
+                    ImVec2 aEyeMin(aFldMax.x - aEyeSz - aEyePad,
+                                   aFldMin.y + (aFldMax.y - aFldMin.y - aEyeSz) * 0.5f);
+                    ImVec2 aEyeMax(aEyeMin.x + aEyeSz, aEyeMin.y + aEyeSz);
+                    bool   aOverEye = ImGui::IsMouseHoveringRect(aEyeMin, aEyeMax);
+                    drawEyeGlyph(ImGui::GetWindowDrawList(), aEyeMin, aEyeMax,
+                                 allAxesShown, aOverEye, fmSurf());
+                    if (aOverEye) {
+                        ImGui::SetTooltip(anyAxisShown ? "Hide Axes" : "Show Axes");
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                            const bool show = !anyAxisShown;
+                            for (const auto& ar : listedAxes) {
+                                if (show) {
+                                    st.hiddenFeatures.erase(ar.id);
+                                } else {
+                                    st.hiddenFeatures.insert(ar.id);
+                                    if (st.selectedFeatureId == ar.id)
+                                        st.selectedFeatureId.clear();
+                                }
+                            }
+                            st.axesUserToggled = true;
+                            st.applyDatumVisibility();
+                        }
+                    }
+                }
                 fmRowPillEnd(axesFldRect);
                 if (axesOpen) {
-                    for (const auto& ar : axes) {
-                        // Skip if this synthetic/default id is not currently injected (no doc yet).
-                        if (!st.axisDatumIds.count(ar.id) &&
-                            ar.id != "axis.x" && ar.id != "axis.y" && ar.id != "axis.z")
-                            continue;
-                        // Still list defaults even before first inject so an empty part shows them.
-                        const bool listed =
-                            st.axisDatumIds.empty()
-                                ? (ar.id == "axis.x" || ar.id == "axis.y" || ar.id == "axis.z")
-                                : (bool)st.axisDatumIds.count(ar.id);
-                        if (!listed) continue;
-
+                    for (const auto& ar : listedAxes) {
                         ImGuiTreeNodeFlags af = ImGuiTreeNodeFlags_Leaf |
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth |

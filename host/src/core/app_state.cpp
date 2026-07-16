@@ -1386,17 +1386,22 @@ void AppState::clearViewportForNewDoc() {
     autoHiddenPlanes.clear();
     datumPlanesUserToggled.clear();
     // W2-ref: axes start clean on tab/new-doc; refilled by inject path next rebuild.
-    // Seed default axes as hidden (and into axisDatumIds so force-show works pre-inject).
+    // Seed axisDatumIds so force-show / FM listing works pre-inject. Axes default VISIBLE
+    // on an empty doc (NOT in hiddenFeatures) — matching planes/origin auto-show. Auto-hide
+    // once hasSolidContent is applied by applyDocDrivenVisibility + viewport_panel (and only
+    // sticks after axesUserToggled). Explicitly erase residual axis ids after clear.
     axisDatumIds.clear();
     axisAutoCache.clear();
     axisInjectPlaneFp.clear();
     axisDisplayNames.clear();
     // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
-    // behavior). The FM eye toggle removes this entry to show it.
+    // behavior). The FM eye toggle removes this entry to show it. Origin auto-show on
+    // empty docs is applied per-frame in viewport_panel (erases this until hasSolidContent).
     hiddenFeatures.insert("point.origin");
-    hiddenFeatures.insert("axis.x");
-    hiddenFeatures.insert("axis.y");
-    hiddenFeatures.insert("axis.z");
+    // Default reference axes: visible on empty/sketch-only docs (FM eye OPEN).
+    hiddenFeatures.erase("axis.x");
+    hiddenFeatures.erase("axis.y");
+    hiddenFeatures.erase("axis.z");
     axisDatumIds.insert("axis.x");
     axisDatumIds.insert("axis.y");
     axisDatumIds.insert("axis.z");
@@ -1764,6 +1769,22 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
                 for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);
             }
         }
+        // Axis eye sync (same as the full-features path below).
+        if (!axesUserToggled) {
+            bool changed = false;
+            auto syncAxis = [&](const std::string& id) {
+                if (hasSolidContent) {
+                    if (hiddenFeatures.insert(id).second) changed = true;
+                } else {
+                    if (hiddenFeatures.erase(id) != 0) changed = true;
+                }
+            };
+            syncAxis("axis.x");
+            syncAxis("axis.y");
+            syncAxis("axis.z");
+            for (const auto& id : axisDatumIds) syncAxis(id);
+            if (changed) applyDatumVisibility();
+        }
         return;
     }
 
@@ -1849,6 +1870,25 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         } else {
             for (const char* p : kDefaultPlanes) autoHiddenPlanes.erase(p);
         }
+    }
+
+    // Keep hiddenFeatures in step with hasSolidContent for axes so the FeatureManager eye
+    // matches what the viewport draws. Viewport only mutates a per-frame effDatums set; the
+    // FM eye reads hiddenFeatures.count(id). When the user has not taken control (axesUserToggled),
+    // show axes on empty/sketch-only docs and hide them once solid content exists.
+    // Defaults axis.x/y/z always tracked even before first inject fills axisDatumIds.
+    if (!axesUserToggled) {
+        auto syncAxis = [&](const std::string& id) {
+            if (hasSolidContent) {
+                if (hiddenFeatures.insert(id).second) datumVisibilityChanged = true;
+            } else {
+                if (hiddenFeatures.erase(id) != 0) datumVisibilityChanged = true;
+            }
+        };
+        syncAxis("axis.x");
+        syncAxis("axis.y");
+        syncAxis("axis.z");
+        for (const auto& id : axisDatumIds) syncAxis(id);
     }
 
     if (datumVisibilityChanged) applyDatumVisibility();

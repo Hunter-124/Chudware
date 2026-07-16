@@ -2163,12 +2163,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Origin gizmo + axis auto-hide/force-show: one effective hidden-datums set per frame.
         // Origin auto-hide: show until hasSolidContent; hide once a solid exists (unless user-toggled).
         // Axis auto-hide: same hasSolidContent gate for every id in axisDatumIds (unless axesUserToggled
-        // or a PM axis well force-shows them). Does not mutate hiddenFeatures — only the renderer set.
+        // or a PM axis well force-shows them). ALSO keep st.hiddenFeatures in step for axes when
+        // !axesUserToggled — the FeatureManager eye reads hiddenFeatures.count(id) directly (unlike
+        // origin which uses originVisEff). Without this, empty docs can draw axes while the FM eye
+        // still shows "hidden" if applyDocDrivenVisibility never ran or left a stale entry.
         bool pmWantsAxis = !inSketch && st.propertyManager && st.propertyManager->active() &&
                            st.propertyManager->activeWellWantsAxis();
         const bool needEffDatums =
             !st.originUserToggled || !st.axesUserToggled || pmWantsAxis;
         if (needEffDatums) {
+            // Persist auto axis visibility into hiddenFeatures so FM eyes match the draw path.
+            // Only while the user has not taken sticky control (axesUserToggled).
+            if (!st.axesUserToggled) {
+                auto syncAxisHid = [&](const std::string& id) {
+                    if (id.empty()) return;
+                    if (hasSolidContent) st.hiddenFeatures.insert(id);
+                    else                 st.hiddenFeatures.erase(id);
+                };
+                // Defaults first (pre-inject / empty axisDatumIds still lists X/Y/Z in the tree).
+                syncAxisHid("axis.x");
+                syncAxisHid("axis.y");
+                syncAxisHid("axis.z");
+                for (const auto& id : st.axisDatumIds) syncAxisHid(id);
+            }
             std::unordered_set<std::string> effDatums = st.hiddenFeatures;
             if (!st.originUserToggled) {
                 if (hasSolidContent) effDatums.insert("point.origin");
@@ -2186,9 +2203,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         ++it;
                 }
             } else if (!st.axesUserToggled) {
-                // Auto-hide all injected axes once solid content exists; show them before that
-                // (even if clearViewport seeded them hidden). Individual user hides wait for
-                // axesUserToggled (FM eye).
+                // Mirror the just-synced hiddenFeatures (belt + braces with the sync above).
                 if (hasSolidContent) {
                     for (const auto& id : st.axisDatumIds) effDatums.insert(id);
                 } else {

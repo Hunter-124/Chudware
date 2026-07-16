@@ -1574,16 +1574,54 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                              Vec3(ent.dir[0], ent.dir[1], ent.dir[2]));
                 }
 
-                // Rebuild axisDatumIds. Visibility is driven per-frame by hasSolidContent
-                // (viewport_panel / applyDocDrivenVisibility) unless axesUserToggled. Do NOT
-                // permanently insert newly-seen synthetic axes into hiddenFeatures here — that
-                // made empty/sketch-only docs start with axes force-hidden and blocked the
-                // auto-show path. User-created axis features stay whatever the user left them.
+                // Rebuild axisDatumIds. Visibility is driven by hasSolidContent
+                // (viewport_panel / applyDocDrivenVisibility) unless axesUserToggled.
+                // Do NOT permanently hide newly-seen synthetic axes — empty/sketch-only
+                // docs must start with axes VISIBLE (FM eye open). When !axesUserToggled
+                // and the doc has no solid content, erase any residual hide so the FM eye
+                // matches. User-created axis features stay whatever the user left them
+                // only after axesUserToggled.
                 std::unordered_set<std::string> prevAxisIds = std::move(st.axisDatumIds);
                 st.axisDatumIds.clear();
                 for (const auto& rd : rds) {
                     if (rd.kind != Renderer::RefDatum::Kind::Axis || rd.id.empty()) continue;
                     st.axisDatumIds.insert(rd.id);
+                }
+                // Fresh empty inject: ensure default + synthetic axes are not force-hidden.
+                if (!st.axesUserToggled) {
+                    // treeHasSolidContent equivalent: any non-ref feature or assembly component.
+                    bool solid = false;
+                    if (st.docMirror.hasDoc()) {
+                        const auto& tree = st.docMirror.tree();
+                        if (tree.is_object()) {
+                            auto tci = tree.find("components");
+                            if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+                                solid = true;
+                            } else {
+                                auto tfi = tree.find("features");
+                                if (tfi != tree.end() && tfi->is_array()) {
+                                    for (const auto& f : *tfi) {
+                                        if (!f.is_object() || f.value("suppressed", false)) continue;
+                                        const std::string ty = f.value("type", std::string());
+                                        if (ty.empty()) continue;
+                                        // Reference-only types leave axes visible (sketch/plane/axis/…).
+                                        if (ty == "sketch" || ty == "sketch3d" ||
+                                            ty == "ref_plane" || ty == "ref_axis" ||
+                                            ty == "ref_point" || ty == "ref_csys" ||
+                                            ty == "plane" || ty == "axis" || ty == "point" ||
+                                            ty == "coordinate_system")
+                                            continue;
+                                        solid = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!solid) {
+                        for (const auto& id : st.axisDatumIds)
+                            st.hiddenFeatures.erase(id);
+                    }
                 }
                 // Rebuild display names when axis set membership changes (or first fill).
                 bool membershipChanged =

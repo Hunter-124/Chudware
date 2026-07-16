@@ -599,35 +599,18 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     const float H  = mx.y - mn.y;
     const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
 
-    // Full rounded base in the faint (right) colour — owns every corner.
+    // Full rounded base in the faint (right) colour — owns every corner. The left->right accent is
+    // a SUBTLE gradient band INSET by the corner radius: NO full-height bright left strip (that read
+    // as a thick light border/outline on every pill — regression), and the square-cornered
+    // MultiColor stays strictly inside the rounded outline so it never pokes as corner flecks.
     dl->AddRectFilled(mn, mx, dye(aR), rnd);
-
-    // Bright left strip. Width ≥ 2·rnd so ImGui does not clamp the corner radius into
-    // square corner pips (width==rnd was the artifact source).
-    const float leftW = ImMax(2.0f * rnd, 1.0f);
-    if (W > leftW + rnd) {
-        const float tJoin = leftW / W;
-        const ImU32 cLeft = dye(aL);
-        const ImU32 cJoin = dye(aL * (1.0f - tJoin) + aR * tJoin);
-        const ImU32 cRight = dye(aR);
-
-        dl->AddRectFilled(mn, ImVec2(mn.x + leftW, mx.y), cLeft, rnd,
-                          ImDrawFlags_RoundCornersLeft);
-
-        // Interior L→R fade. AddRectFilledMultiColor is SQUARE-cornered — keep it
-        // strictly inside the rounded outline (below the top arc, above the bottom
-        // arc, right of the left strip, left of the right radius).
-        const float x0 = mn.x + leftW;
-        const float x1 = mx.x - rnd;
-        const float y0 = mn.y + rnd;
-        const float y1 = mx.y - rnd;
-        if (x1 > x0 && y1 > y0) {
-            dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1),
-                                        cJoin, cRight, cRight, cJoin);
-        }
+    const float x0 = mn.x + rnd, x1 = mx.x - rnd;
+    const float y0 = mn.y + rnd, y1 = mx.y - rnd;
+    if (x1 > x0 && y1 > y0) {
+        dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1),
+                                    dye(aL), dye(aR), dye(aR), dye(aL));
     } else {
-        // Too narrow for strip+band: single bright rounded fill.
-        dl->AddRectFilled(mn, mx, dye(aL), rnd);
+        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too small for an inset band
     }
 
     if (selected) {

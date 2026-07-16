@@ -129,11 +129,17 @@ def _via_dims(board: dict, net: Any) -> tuple[float, float]:
 
 
 def _clearance(board: dict, net: Any) -> float:
-    """Clearance to honour for this net: net-class clearance if present, else global."""
+    """Clearance to honour for this net: net-class clearance if present, else global.
+
+    Floored by ``_CLEARANCE_FLOOR`` (from opts ``min_clearance`` / ``min_clearance_mm``)
+    so callers can force the DRC rule (e.g. 0.2mm) even when a net class is looser.
+    """
     nc = _net_class(board, net)
     if "clearance" in nc:
-        return float(nc["clearance"])
-    return float(board.get("rules", {}).get("clearance", 0.2))
+        base = float(nc["clearance"])
+    else:
+        base = float(board.get("rules", {}).get("clearance", 0.2))
+    return max(base, float(_CLEARANCE_FLOOR or 0.0))
 
 
 def _diff_gap(board: dict, net: Any, override: float | None = None) -> float:
@@ -487,15 +493,20 @@ def _path_to_geometry(grid: _Grid, path: list[tuple[int, int, int]], net: Any,
     return tracks, vias
 
 
-# Max 45-degree chamfer (mm) applied at an interior right-angle corner. The chamfer only
-# trims the INNER corner of an L the router already routed (clear space), and is capped at
-# half the shorter leg so adjacent chamfers never overlap — so it can't create a clearance
-# violation. Set AI_CAD_ROUTE_CHAMFER=0 to keep pure 90-degree corners.
-_CORNER_CHAMFER_MM = float(os.environ.get("AI_CAD_ROUTE_CHAMFER", "0.5") or 0.5)
+# Max 45-degree chamfer (mm) at interior right-angle corners. Default 0 keeps
+# routes DRC-clean: a non-zero chamfer cuts the INNER corner of an L toward any
+# obstacle the path just skirted, and was the mega-24..27 source of fixed
+# sub-clearance pad-track gaps (~0.13mm < 0.2mm). Re-enable with
+# AI_CAD_ROUTE_CHAMFER=0.5 only when DFM aesthetics trump hard clearance.
+_CORNER_CHAMFER_MM = float(os.environ.get("AI_CAD_ROUTE_CHAMFER", "0") or 0)
 
 # Runtime gate. Length-MATCHED routing (diff pairs / meanders) measures exact track lengths
 # to equalize skew, so a chamfer there would corrupt the match — those paths disable it.
 _CHAMFER_ON = True
+
+# Optional floor applied on top of net-class / rules clearance (opts min_clearance /
+# min_clearance_mm). Set for the duration of one autoroute() call.
+_CLEARANCE_FLOOR = 0.0
 
 
 def _corner_vertices(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -684,7 +695,9 @@ def autoroute(board: dict, opts: dict | None = None) -> dict:
     ``via_cost``/``bend_cost`` (A* tuning), ``ripup_passes`` (int, default 2 -- set 0 for the legacy
     single greedy pass), ``ripup_budget`` (int, default 2), ``diff_pairs`` (list of ``[net_p, net_n]``;
     omitted/empty -> auto-detect by ``*_P/*_N`` naming), ``diff_gap`` (mm intra-pair gap override),
-    ``length_tol`` (mm P/N skew tolerance), ``no_auto_diff`` (bool, skip naming auto-detect).
+    ``length_tol`` (mm P/N skew tolerance), ``no_auto_diff`` (bool, skip naming auto-detect),
+    ``min_clearance`` / ``min_clearance_mm`` (mm floor on the clearance halo, default 0 — uses
+    net-class / rules clearance alone).
 
     The report contains ``routed`` (net names with at least one airwire connected), ``failed`` (net
     names with an airwire that could not be routed), ``length_mm`` (total routed track length),
@@ -693,6 +706,21 @@ def autoroute(board: dict, opts: dict | None = None) -> dict:
     ``diff_pairs`` (per-pair coupling/length-match stats), and ``note``.
     """
     opts = opts or {}
+    global _CLEARANCE_FLOOR
+    _prev_floor = _CLEARANCE_FLOOR
+    floor_raw = opts.get("min_clearance", opts.get("min_clearance_mm", 0.0))
+    try:
+        _CLEARANCE_FLOOR = max(0.0, float(floor_raw or 0.0))
+    except (TypeError, ValueError):
+        _CLEARANCE_FLOOR = 0.0
+    try:
+        return _autoroute_body(board, opts)
+    finally:
+        _CLEARANCE_FLOOR = _prev_floor
+
+
+def _autoroute_body(board: dict, opts: dict) -> dict[str, Any]:
+    """Inner autoroute implementation (clearance floor already applied)."""
     report: dict[str, Any] = {
         "routed": [], "failed": [], "length_mm": 0.0,
         "airwires_before": 0, "airwires_after": 0, "vias": 0, "grid": {},
@@ -712,7 +740,6 @@ def autoroute(board: dict, opts: dict | None = None) -> dict:
     if not airwires:
         report["grid"] = {"pitch": float(opts.get("pitch", DEFAULT_PITCH)), "nx": 0, "ny": 0}
         return {"tracks": out_tracks, "vias": out_vias, "report": report}
-
     # choose a pitch that keeps the grid within the cell cap (coarsen for big boards)
     pitch = float(opts.get("pitch", DEFAULT_PITCH))
     max_cells = int(opts.get("max_grid_cells", MAX_GRID_CELLS))

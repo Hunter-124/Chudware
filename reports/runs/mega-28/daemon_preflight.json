@@ -1,0 +1,8 @@
+{
+  "running_git_rev": "night2-3084-g271aedac-dirty",
+  "disk_build_id": "night2-3084-g271aedac-dirty",
+  "disk_version_line": "aicad-hostd night2-3084-g271aedac-dirty",
+  "running_matches_disk_binary": true,
+  "daemon_pid": 2715835,
+  "state": "ready"
+}

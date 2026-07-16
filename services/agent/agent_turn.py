@@ -4423,8 +4423,14 @@ def _ecad_dispatch_forced_step(
     elif tool == "ecad_autoroute" and isinstance(call_args, dict):
         dispatch_args = {
             k: v for k, v in call_args.items()
-            if k in ("doc_id", "pitch", "diff_pairs", "ripup_passes")
+            if k in ("doc_id", "pitch", "diff_pairs", "ripup_passes",
+                     "min_clearance", "min_clearance_mm")
         }
+        # MCP kw is min_clearance; call records may use min_clearance_mm.
+        if "min_clearance" not in dispatch_args and "min_clearance_mm" in dispatch_args:
+            dispatch_args["min_clearance"] = dispatch_args.pop("min_clearance_mm")
+        else:
+            dispatch_args.pop("min_clearance_mm", None)
     elif tool in ("board_from_schematic", "ecad_make_board") and isinstance(call_args, dict):
         # mega-27: pass outline room knobs; strip pure diagnostics.
         _keep = (

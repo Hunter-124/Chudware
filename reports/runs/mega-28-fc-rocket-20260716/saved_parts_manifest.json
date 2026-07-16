@@ -1,0 +1,56 @@
+{
+  "schema": "aicad.saved_parts/1",
+  "run_id": "mega-28-fc-rocket-20260716",
+  "status": "blocked",
+  "stop_reason": "deliver_partial",
+  "saved": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "name": "boost_glide_airframe",
+      "origin_kind": "mcp",
+      "paths": [
+        "/home/hunter/Repositories/CAD/reports/runs/mega-28-fc-rocket-20260716/parts/boost_glide_airframe_-cpp00000001.step+",
+        "/home/hunter/Documents/AI-CAD/boost_glide_airframe_-cpp00000001.step+"
+      ],
+      "bytes": [
+        7233,
+        7233
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "doc_id": "doc-cpp00000001",
+      "closed": true,
+      "detached": false
+    }
+  ],
+  "skipped": [
+    {
+      "doc_id": "ec9ac68e326c",
+      "reason": "save_failed",
+      "name": "flight_computer",
+      "errors": [
+        "save artifact ec9ac68e326c: no such document: ec9ac68e326c",
+        "save workspace ec9ac68e326c: no such document: ec9ac68e326c"
+      ]
+    },
+    {
+      "doc_id": "b7c96affaaba",
+      "reason": "save_failed",
+      "name": null,
+      "errors": [
+        "save artifact b7c96affaaba: no such document: b7c96affaaba",
+        "save workspace b7c96affaaba: no such document: b7c96affaaba"
+      ]
+    }
+  ],
+  "errors": [
+    "save artifact ec9ac68e326c: no such document: ec9ac68e326c",
+    "save workspace ec9ac68e326c: no such document: ec9ac68e326c",
+    "save artifact b7c96affaaba: no such document: b7c96affaaba",
+    "save workspace b7c96affaaba: no such document: b7c96affaaba"
+  ],
+  "parts_dir": "/home/hunter/Repositories/CAD/reports/runs/mega-28-fc-rocket-20260716/parts",
+  "workspace_dir": "/home/hunter/Documents/AI-CAD"
+}

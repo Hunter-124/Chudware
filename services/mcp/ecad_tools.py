@@ -1747,7 +1747,9 @@ def register_ecad_tools(mcp) -> None:
     @mcp.tool()
     def ecad_autoroute(pitch: float = 0.0,
                        diff_pairs: Optional[Union[list, str]] = None,
-                       ripup_passes: int = 2, doc_id: str = "") -> str:
+                       ripup_passes: int = 2,
+                       min_clearance: float = 0.0,
+                       doc_id: str = "") -> str:
         """Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router.
 
         Connects the unrouted airwires with orthogonal tracks + through-vias, respecting clearance.
@@ -1764,6 +1766,10 @@ def register_ecad_tools(mcp) -> None:
         ``ripup_passes`` (default 2): how many rip-up-and-reroute sweeps to attempt after the
         greedy pass; 0 for the original single-pass behaviour.
 
+        ``min_clearance`` (mm, default 0): floor on the clearance halo. When >0 (e.g. 0.2), the
+        router never places track centres closer than clearance+half-width using at least this
+        floor — matching the DRC rule even if a net class is looser. mega-28: close AC4.
+
         Returns per-pair skew/coupling stats in ``diff_pair_stats`` when pairs are routed.
 
         AUTO-READBACK: response includes compact layer ASCII + net_delta (tracks/vias/crossings).
@@ -1779,6 +1785,8 @@ def register_ecad_tools(mcp) -> None:
         if pitch and pitch > 0:
             opts["pitch"] = float(pitch)
         opts["ripup_passes"] = max(0, int(ripup_passes))
+        if min_clearance and float(min_clearance) > 0:
+            opts["min_clearance"] = float(min_clearance)
         # diff_pairs: None/'auto'/'' -> let the router auto-detect; a list -> pass through
         # M3: diff_pairs may be the string 'auto' (documented alias for auto-detect);
         # treat any non-list value as "auto" so callers that pass 'auto' don't get a

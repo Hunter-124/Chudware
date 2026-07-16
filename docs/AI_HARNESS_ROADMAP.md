@@ -469,3 +469,20 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   V24/T23/Q22/G18 PASS; battery `doc-cpp00000005` PASS. Residual: AC4 still
   errors≠0 after room+grow (goal 9/9 open). Findings:
   `reports/runs/mega-27/findings.md`.
+
+
+- 2026-07-15/16 mega-28 (WS5): **★★★ 9/9 MILESTONE ★★★** — close AC4 at the
+  engine (C++/Python autorouter min-clearance) under `reports/runs/mega-28/`
+  (primary a1 `mega-28-fc-rocket-20260716`). Baseline `271aedac`. RouterFix
+  FatalGrouse: **E28** engine-side fix — Python chamfer default 0→0 +
+  `min_clearance` floor; C++ `clearance_of()` + opts; MCP/agent plumb; ctest
+  autoroute; deterministic mega-27-class board replay **DRC 6→0**; hostd
+  rebuild+drain stamp `night2-3084-g271aedac-dirty` (was
+  `night2-3077-g0f43d126-dirty`). MegaRun28 CleanJaguar: waited `router proven`
+  DM; preflight PASS mega28_bound; liveness held. **a1** wall **706s** terminal
+  `blocked`/`deliver_partial` live AC **9**/9 (AC1–AC9 **all PASS**) — **TARGET
+  9/9 MET (first full green)**. **E28 PASS** (live AC4 DRC errors==0 at 0.2mm
+  held + replay proof). **F28 PASS** (9/9). C27/D27/A26/B26/Y25/Z25/S23/P22/
+  U24/V24/T23/Q22/G18 PASS; battery `doc-cpp00000001` PASS. Soft note: openrouter
+  mid-fallback 402 once (no credits); xai-sub+ollama continued. Residuals: none
+  for live ACs. Findings: `reports/runs/mega-28/findings.md`.

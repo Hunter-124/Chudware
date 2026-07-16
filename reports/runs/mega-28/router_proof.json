@@ -1,0 +1,97 @@
+{
+  "baseline_commit": "271aedac",
+  "mega27_live_ac4_errors": 6,
+  "before": {
+    "chamfer": 0.5,
+    "opts": {
+      "pitch": 0.25
+    },
+    "n_tracks": 22,
+    "routed": [
+      "3V3",
+      "GND",
+      "N$2",
+      "N$9"
+    ],
+    "failed": [],
+    "clearance_errors": 6,
+    "messages": [
+      "clearance 0.1548mm < required 0.2mm between t10 (net 'GND') and u2b0 (net '3V3')",
+      "clearance 0.1548mm < required 0.2mm between t13 (net 'N$2') and u1t1 (net 'N$9')",
+      "clearance 0.1548mm < required 0.2mm between t19 (net 'N$9') and u2t0 (net 'N$2')",
+      "clearance 0.1548mm < required 0.2mm between t2 (net '3V3') and u1b1 (net 'GND')",
+      "clearance 0.1548mm < required 0.2mm between t21 (net 'N$9') and u2t0 (net 'N$2')",
+      "clearance 0.1548mm < required 0.2mm between t8 (net 'GND') and u2b0 (net '3V3')"
+    ],
+    "grid": {
+      "pitch": 0.25,
+      "nx": 321,
+      "ny": 241,
+      "layers": 2
+    }
+  },
+  "after": {
+    "chamfer": 0.0,
+    "opts": {
+      "pitch": 0.25,
+      "min_clearance": 0.2
+    },
+    "n_tracks": 14,
+    "routed": [
+      "3V3",
+      "GND",
+      "N$2",
+      "N$9"
+    ],
+    "failed": [],
+    "clearance_errors": 0,
+    "messages": [],
+    "grid": {
+      "pitch": 0.25,
+      "nx": 321,
+      "ny": 241,
+      "layers": 2
+    }
+  },
+  "after_pitch_0_3": {
+    "chamfer": 0.0,
+    "opts": {
+      "pitch": 0.3,
+      "min_clearance_mm": 0.2
+    },
+    "n_tracks": 22,
+    "routed": [
+      "3V3",
+      "GND",
+      "N$2",
+      "N$9"
+    ],
+    "failed": [],
+    "clearance_errors": 0,
+    "messages": [],
+    "grid": {
+      "pitch": 0.3,
+      "nx": 268,
+      "ny": 201,
+      "layers": 2
+    }
+  },
+  "cpp_after": {
+    "rc": 0,
+    "clearance_errors": 0,
+    "n_tracks": 14,
+    "routed": [
+      "3V3",
+      "GND",
+      "N$2",
+      "N$9"
+    ],
+    "messages": []
+  },
+  "hostd_stamp": {
+    "path": "/home/hunter/Repositories/CAD/services/dist/AI-CAD/aicad-hostd",
+    "mtime": 1784164154.6792681,
+    "size": 761744
+  },
+  "verdict": "PASS"
+}

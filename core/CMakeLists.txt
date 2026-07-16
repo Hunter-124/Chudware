@@ -333,6 +333,14 @@ target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # pure-JSON and does NOT depend on aicad_ecad, so this introduces no cycle.
 target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz aicad_sim)
 
+# mega-28 E28: autorouter min-clearance (pad/track spacing) — pure JSON, OCCT-free.
+add_executable(test_autoroute tests/test_autoroute.cpp)
+target_include_directories(test_autoroute PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_autoroute PRIVATE aicad_ecad)
+set_target_properties(test_autoroute PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME autoroute COMMAND test_autoroute)
+
 enable_testing()
 
 add_executable(test_sim tests/test_sim.cpp)

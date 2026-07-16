@@ -1,0 +1,14 @@
+{
+  "run_id": "mega-28-fc-rocket-20260716",
+  "parts": [],
+  "docs": [
+    "doc-cpp00000001"
+  ],
+  "source": "ledger_scan",
+  "paths_sample": [
+    "/home/hunter/Documents/AI-CAD/boost_glide_airframe_-cpp00000001.step+",
+    "/home/hunter/Repositories/CAD/reports/runs/mega-28-fc-rocket-20260716/parts/boost_glide_airframe_-cpp00000001.step+"
+  ],
+  "run_artifact_dir": "reports/runs/mega-28-fc-rocket-20260716",
+  "n_docs": 1
+}

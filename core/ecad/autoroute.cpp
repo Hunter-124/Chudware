@@ -40,6 +40,10 @@ constexpr double DEFAULT_DIFF_GAP = 0.2;
 constexpr double DEFAULT_LENGTH_TOL = 0.2;
 constexpr int MAX_MEANDER_TEETH = 200;
 
+// Floor applied on top of net-class / rules clearance (opts min_clearance /
+// min_clearance_mm). Scoped to one autoroute() / route_diff_pair() call.
+thread_local double g_clearance_floor = 0.0;
+
 constexpr double kEps = 1e-9;
 
 using Point = std::pair<double, double>;
@@ -164,12 +168,13 @@ std::pair<double, double> via_dims(const json& board, const json& net) {
 
 double clearance_of(const json& board, const json& net) {
     json nc = net_class(board, net);
-    if (nc.contains("clearance")) return getf(nc["clearance"]);
-    double dflt = 0.2;
-    if (board.contains("rules") && board["rules"].is_object() &&
-        board["rules"].contains("clearance"))
-        dflt = getf(board["rules"]["clearance"], 0.2);
-    return dflt;
+    double base = 0.2;
+    if (nc.contains("clearance"))
+        base = getf(nc["clearance"]);
+    else if (board.contains("rules") && board["rules"].is_object() &&
+             board["rules"].contains("clearance"))
+        base = getf(board["rules"]["clearance"], 0.2);
+    return std::max(base, g_clearance_floor);
 }
 
 double diff_gap_of(const json& board, const json& net, const json& override_) {
@@ -1548,6 +1553,19 @@ json autoroute(const json& board, const json& opts_in) {
     };
     json out = {{"tracks", json::array()}, {"vias", json::array()}, {"report", report}};
 
+    // min_clearance / min_clearance_mm floors the clearance halo for this call.
+    const double prev_floor = g_clearance_floor;
+    double floor = 0.0;
+    if (opts.contains("min_clearance") && opts["min_clearance"].is_number())
+        floor = getf(opts["min_clearance"]);
+    else if (opts.contains("min_clearance_mm") && opts["min_clearance_mm"].is_number())
+        floor = getf(opts["min_clearance_mm"]);
+    g_clearance_floor = std::max(0.0, floor);
+    struct FloorGuard {
+        double prev;
+        ~FloorGuard() { g_clearance_floor = prev; }
+    } floor_guard{prev_floor};
+
     if (!schema::is_board(board)) return out;
 
     json airwires = ratsnest(board);
@@ -1557,7 +1575,6 @@ json autoroute(const json& board, const json& opts_in) {
         out["report"]["grid"] = {{"pitch", pitch0}, {"nx", 0}, {"ny", 0}};
         return out;
     }
-
     double pitch = opts.contains("pitch") ? getf(opts["pitch"]) : DEFAULT_PITCH;
     long max_cells = opts.contains("max_grid_cells") ? (long)getf(opts["max_grid_cells"])
                                                       : MAX_GRID_CELLS;
@@ -1681,10 +1698,18 @@ json route_diff_pair(const json& board, const std::string& net_p, const std::str
                      const json& opts_in) {
     json opts = opts_in.is_object() ? opts_in : json::object();
     json out = {{"tracks", json::array()}, {"vias", json::array()}, {"report", json::object()}};
+    const double prev_floor = g_clearance_floor;
+    double floor = 0.0;
+    if (opts.contains("min_clearance") && opts["min_clearance"].is_number())
+        floor = getf(opts["min_clearance"]);
+    else if (opts.contains("min_clearance_mm") && opts["min_clearance_mm"].is_number())
+        floor = getf(opts["min_clearance_mm"]);
+    g_clearance_floor = std::max(0.0, floor);
+    struct FloorGuard {
+        double prev;
+        ~FloorGuard() { g_clearance_floor = prev; }
+    } floor_guard{prev_floor};
     if (!schema::is_board(board)) {
-        out["report"] = {{"nets", json::array({net_p, net_n})}, {"routed", false},
-                         {"length_p", 0.0},                      {"length_n", 0.0},
-                         {"skew_mm", 0.0},                       {"coupled_pct", 0.0}};
         return out;
     }
     double pitch = opts.contains("pitch") ? getf(opts["pitch"]) : DEFAULT_PITCH;

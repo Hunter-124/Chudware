@@ -1328,6 +1328,18 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a = &m.activity.back();
         }
         a->status = "running";
+        // Compact live "Saying" narration under the spinner (stage step text / role).
+        {
+            std::string say = jstr(data, "text");
+            if (say.empty()) say = jstr(data, "step_desc");
+            if (say.empty()) {
+                std::string role = jstr(data, "role");
+                std::string stg = jstr(data, "stage");
+                if (!role.empty() && !stg.empty()) say = stg + " \xc2\xb7 " + role;
+                else if (!stg.empty()) say = stg;
+            }
+            if (!say.empty() && m.running) m.liveStatus = say;
+        }
     } else if (kind == "agent_output") {
         ActivityItem* a = findStage(nsKey(jstr(data, "stage")));
         if (a) {
@@ -1340,12 +1352,37 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 a->tokensOut = jint(data["tokens"], "out");
             }
         }
+        // C++ path (batch 2a): provider reasoning rides on agent_output.thinking when a
+        // dedicated agent.thought event was not emitted — surface as rowKind 2 thought box.
+        {
+            std::string thinking = jstr(data, "thinking");
+            if (!thinking.empty()) {
+                std::string pid = jstr(data, "stage");
+                if (pid.empty()) pid = "out";
+                const std::string key = "thought:out:" + nsKey(pid);
+                ActivityItem* ta = nullptr;
+                for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+                    if (it->rowKind == 2 && it->stage == key) { ta = &*it; break; }
+                if (!ta) {
+                    ActivityItem ni;
+                    ni.rowKind = 2;
+                    ni.stage   = key;
+                    ni.title   = "Thinking";
+                    m.activity.push_back(std::move(ni));
+                    ta = &m.activity.back();
+                }
+                ta->detail = thinking;
+                ta->streaming = false;
+                ta->status = "done";
+            }
+        }
     } else if (kind == "stage_result") {
         ActivityItem* a = findStage(nsKey(jstr(data, "stage")));
         if (a) {
             std::string v = jstr(data, "verdict");
             a->status = v.empty() ? "done" : v;
             a->reason = jstr(data, "reason");
+            if (!a->reason.empty() && m.running) m.liveStatus = a->reason;
         }
     } else if (kind == "run_finished") {
         // A sub-run finished (one mission task) OR a single-run completed. Close only the rows
@@ -1390,7 +1427,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
     } else if (kind == "status") {
         // Live status/phase envelope: phase=done|error may carry the same additive fields.
+        // Non-terminal phases also refresh the compact "Saying" line under the spinner.
         const std::string phase = jstr(data, "phase");
+        const std::string statusText = jstr(data, "text");
+        if (!statusText.empty() && m.running &&
+            phase != "done" && phase != "error" && phase != "failed" && phase != "cancelled") {
+            m.liveStatus = statusText;
+        }
         if (phase == "done" || phase == "error" || phase == "failed" || phase == "cancelled") {
             std::string sr = jstr(data, "stop_reason");
             std::string ed = jstr(data, "error_detail");
@@ -1443,7 +1486,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ActivityItem ni;
             ni.rowKind = 2;
             ni.stage   = key;
-            ni.title   = "Thoughts";
+            ni.title   = "Thinking";
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
@@ -1466,6 +1509,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.title   = jstr(data, "tool_name");
         if (ni.title.empty()) ni.title = "tool";
         ni.reason     = jstr(data, "target");   // human "what it acts on" (may be "")
+        // Doing drawer: args_preview from batch 2a (capped JSON/text). Fall back to args dump.
+        ni.detail     = jstr(data, "args_preview");
+        if (ni.detail.empty() && data.contains("args")) {
+            if (data["args"].is_string()) ni.detail = data["args"].get<std::string>();
+            else if (data["args"].is_object() || data["args"].is_array())
+                ni.detail = data["args"].dump(2);
+        }
         ni.durationMs = jint(data, "latency_ms");
         const bool ok = !data.is_object() || data.value("ok", true);
         ni.status     = ok ? "done" : "fail";
@@ -2408,7 +2458,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     ImGui::Dummy(ImVec2(0, 2 * sc));
     if (!showThinking) {
         ImGui::PushFont(fonts.body);
-        ImGui::TextColored(surf.textSecondary, "Thoughts");
+        ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
         return;
     }
@@ -2417,7 +2467,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.body);
-    ImGui::TextColored(surf.textSecondary, "%s", a.streaming ? "Thinking\xe2\x80\xa6" : "Thoughts");
+    ImGui::TextColored(surf.textSecondary, "%s", a.streaming ? "Thinking\xe2\x80\xa6" : "Thinking");
     ImGui::PopFont();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) a.expanded = !open;
@@ -2446,9 +2496,8 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
 
 }
 
-// M14 — one inline row per tool call: ok/fail glyph + tool icon + tool name + latency, with the
-// human-readable target ("what it acts on") as a dim wrapped line beneath. Every tool the AI
-// touches shows in the chat; a long detail body (future args capture) expands on click.
+// M14 — one inline row per tool call ("Doing"): ok/fail glyph + tool icon + tool name + latency,
+// with the human-readable target as a dim wrapped line. Args preview expands on click when present.
 static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -2468,10 +2517,13 @@ static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
         ImGui::SameLine(0, 6 * sc);
     }
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(fail ? semanticOnGlass(pal.statusErr, surf) : surf.textPrimary,
-                       "%s", a.title.c_str());
+    {
+        std::string doingTitle = "Doing \xc2\xb7 " + a.title;
+        ImGui::TextColored(fail ? semanticOnGlass(pal.statusErr, surf) : surf.textPrimary,
+                           "%s", doingTitle.c_str());
+    }
     ImGui::PopFont();
-    if (!a.detail.empty()) {   // future args/detail capture — expandable drawer
+    if (!a.detail.empty()) {   // args_preview / detail — expandable Doing drawer
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
         ImGui::SameLine(0, 6 * sc);
@@ -3742,7 +3794,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::PopID();
     }
 
-    // (6) Live spinner + model-transparency line + thin progress bar (while running).
+    // (6) Live spinner + compact "Saying" narration + model line + progress (while running).
     if (m.running) {
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         static const char* kSpin[] = {"|", "/", "-", "\\"};
@@ -3750,9 +3802,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::TextColored(accentCol, "%s", kSpin[sp]);
         ImGui::SameLine();
         const ui::AdaptiveSurface& surf = chatSurf();
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("%s", m.liveStatus.empty() ? "working..." : m.liveStatus.c_str());
-        ImGui::PopStyleColor();
+        {
+            std::string say = m.liveStatus.empty() ? "working..." : m.liveStatus;
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextWrapped("Saying \xc2\xb7 %s", say.c_str());
+            ImGui::PopStyleColor();
+        }
         // Which model(s) are driving this turn — transparency about what's actually running.
         {
             std::string line = "Command model: " + shortModelName(st.settings.model);
@@ -3876,19 +3931,20 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
 }
 
-// ---- header: outline cube + "Billet" wordmark + Sessions + status dot ----
+// ---- header: collapse + [Chat|Sessions|Settings] + status; Billet logo centered above ----
 // Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
 // height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
 // strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
 // drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
 // restarts.
 static bool s_cpCollapsed = false;
-// In-column AI-settings overlay (header gear). Mutually exclusive with showSessionsPicker —
+// In-column AI-settings overlay (header Settings). Mutually exclusive with showSessionsPicker —
 // same swap pattern: hide chat log, fill the body with the compact settings form
-// (AppState::showAISettingsOverlay).
+// (AppState::showAISettingsOverlay). Chat / Sessions / Settings are three stable labels
+// (Sessions no longer renames to "< Chat") — Chat returns to the conversation.
 
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
-// defined below with the picker helpers, hosted by the header gear's popup.
+// defined below with the picker helpers, hosted by the header Settings button.
 static void drawAISettingsBody(AppState& st, bool busy);
 
 static void drawCopilotHeader(AppState& st, bool busy) {
@@ -3897,18 +3953,77 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
 
-    // One shared row height — the wordmark (heading font) is the tallest element; every fixed-size
-    // control centers on it, so the row stays aligned at any DPI without per-item pixel nudges.
     ImFont* wordF = st.fonts.h2 ? st.fonts.h2 : st.fonts.medium;
     float wordLh = lh;
     if (wordF) { ImGui::PushFont(wordF); wordLh = ImGui::GetTextLineHeight(); ImGui::PopFont(); }
-    const float rowH   = std::max(wordLh, lh);
+
+    const bool sessionsOpen = st.showSessionsPicker;
+    const bool settingsOpen = st.showAISettingsOverlay;
+    const bool chatOpen = !sessionsOpen && !settingsOpen;
+
+    // Button widths (stable labels — no "< Chat" rename that reflows the row).
+    const float chatW = ImGui::CalcTextSize("Chat").x + 16.0f * sc;
+    const float sessW = ImGui::CalcTextSize("Sessions").x + 16.0f * sc;
+    const float gearW = ImGui::CalcTextSize("Settings").x + 16.0f * sc;
+    const float dotW  = lh;
+    const float gap   = style.ItemSpacing.x;
+    const float threeW = chatW + gap + sessW + gap + gearW;
+    const float cluster = threeW + gap + dotW;
+    const float rightInset = ui::metrics::U(1);
+    const float collapseW = lh;
+    const float collapseGap = ui::metrics::asmHeaderIconGap();
+
+    // ---- Row 1: Billet cube + wordmark, horizontally centered over the three buttons ----
+    // Mirror Row 2's right-anchor math so the logo sits above Chat|Sessions|Settings, not
+    // left-aligned over a phantom left-side button cluster.
+    {
+        const float colW = ImGui::GetContentRegionAvail().x;
+        const float contentMaxX = ImGui::GetContentRegionMax().x;
+        // Same as Row 2: cluster = three buttons + status; buttons start at anchorX.
+        const float buttonsLeft = contentMaxX - cluster - rightInset;
+        const float buttonsCenterX = buttonsLeft + threeW * 0.5f;
+
+        const float logoGap = ui::metrics::asmHeaderIconGap();
+        if (wordF) ImGui::PushFont(wordF);
+        const float wmW = ImGui::CalcTextSize("Billet").x;
+        if (wordF) ImGui::PopFont();
+        const float logoW = lh + logoGap + wmW;
+
+        float logoLeft = buttonsCenterX - logoW * 0.5f;
+        // Keep logo on-screen; prefer not overlapping the collapse chevron column.
+        logoLeft = std::max(0.0f, logoLeft);
+        logoLeft = std::min(logoLeft, std::max(0.0f, colW - logoW));
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + logoLeft);
+        {
+            IconUV cube = ui::getIcon("context_cube", 20);
+            if (cube.valid) {
+                const ImVec4 tint = chatSurf().textPrimary;
+                // Vertically center cube against wordmark ascent.
+                const float dy = (wordLh - lh) * 0.5f;
+                if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dy);
+                ImGui::Image(cube.texId, ImVec2(lh, lh), cube.uv0, cube.uv1, tint);
+                if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() - dy);
+            } else {
+                ImGui::Dummy(ImVec2(lh, lh));
+            }
+            ImGui::SameLine(0, logoGap);
+        }
+        if (wordF) ImGui::PushFont(wordF);
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+        ImGui::TextUnformatted("Billet");
+        ImGui::PopStyleColor();
+        if (wordF) ImGui::PopFont();
+
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(0.5f)));
+    }
+
+    // ---- Row 2: collapse | Chat | Sessions | Settings | status ----
+    const float rowH   = std::max(lh, ImGui::GetFrameHeight());
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
 
-    // Collapse chevron LEADS the header row (in-flow, so it never overlaps the cube). "»" tucks
-    // the column's body away, rolling the column up to just this header row (T-G21); the same
-    // chevron toggles it back open.
+    // Collapse chevron LEADS the control row (in-flow). "»" tucks the column body away (T-G21).
     {
         const float cb = lh;
         centerY(cb);
@@ -3933,90 +4048,47 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             st.settings.copilotCollapsed = s_cpCollapsed;
             saveSettings(st.settings);
         }
-        ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
+        ImGui::SameLine(0, collapseGap);
     }
 
-    // Outline Billet cube (same glyph as the composer context picker) — theme-tinted line art
-    // over the adaptive header ink, not the multi-color app logo (reads better on glass).
-    {
-        centerY(lh);
-        IconUV cube = ui::getIcon("context_cube", 20);
-        if (cube.valid) {
-            const ImVec4 tint = chatSurf().textPrimary;
-            ImGui::Image(cube.texId, ImVec2(lh, lh), cube.uv0, cube.uv1, tint);
-        }
-        ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-    }
-    // Right-side control cluster: [Sessions|< Chat] [Settings] [status],
-    // hard-anchored to the column's right edge so every control is always on-screen (T-G17).
-    // Sessions and Settings are mutually exclusive in-column overlays over the chat log.
-    // Sessions / Settings share drawHeaderTextButton (rectangular less-rounded boxes).
-    // Checkpoints header button removed — AI-VC timeline stays available via per-message rewind.
-    const float gearW = ImGui::CalcTextSize("Settings").x + 16.0f * sc;  // text box like Sessions
-    const bool sessionsOpen = st.showSessionsPicker;
-    const bool settingsOpen = st.showAISettingsOverlay;
-    const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
-    // Widths for anchoring: text buttons stretch to fit label (+ padding from helper).
-    const float sessW = std::max(ImGui::CalcTextSize("Sessions").x,
-                                 ImGui::CalcTextSize("< Chat").x) + 16.0f * sc;
-    const float dotW  = lh;
-    const float rightInset = ui::metrics::U(1);
-    const float cluster = sessW + style.ItemSpacing.x + gearW +
-                          style.ItemSpacing.x + dotW;
+    // Hard-anchor the three buttons + status to the right so they stay on-screen (T-G17).
     const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
-
-    // Wordmark: "Billet" in the heading font, "Copilot" as a baseline-aligned secondary-ink
-    // suffix. Degrades whole-word (drop the suffix, then the wordmark) — never a mid-word clip.
-    {
-        const float titleAvail = anchorX - ImGui::GetCursorPosX() - style.ItemSpacing.x;
-        float wmW = 0.0f;
-        if (wordF) ImGui::PushFont(wordF);
-        wmW = ImGui::CalcTextSize("Billet").x;
-        if (wordF) ImGui::PopFont();
-        const float sufGap = ui::metrics::U(1.5f);
-        const float sufW   = sufGap + ImGui::CalcTextSize("Copilot").x;
-        if (titleAvail >= wmW) {
-            centerY(wordLh);
-            if (wordF) ImGui::PushFont(wordF);
-            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-            ImGui::TextUnformatted("Billet");
-            ImGui::PopStyleColor();
-            if (wordF) ImGui::PopFont();
-            if (titleAvail >= wmW + sufW) {
-                ImGui::SameLine(0, sufGap);
-                const float dy = (wordF && wordF != ImGui::GetFont())
-                                     ? wordF->Ascent - ImGui::GetFont()->Ascent : 0.0f;
-                ImGui::SetCursorPosY(rowTop + (rowH - wordLh) * 0.5f + dy);
-                ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
-                ImGui::TextUnformatted("Copilot");
-                ImGui::PopStyleColor();
-            }
-        }
-        ImGui::SameLine();
-    }
-
     if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
+
     centerY(lh);
     if (busy) ImGui::BeginDisabled();
-    if (drawHeaderTextButton("##hdr_sess", sessLabel, sessionsOpen, sessW)) {
-        st.showSessionsPicker = !st.showSessionsPicker;
-        if (st.showSessionsPicker) st.showAISettingsOverlay = false;
+    // Chat — always "Chat"; active when no overlay is open. Closes Sessions/Settings.
+    if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW)) {
+        st.showSessionsPicker = false;
+        st.showAISettingsOverlay = false;
     }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
+        ImGui::SetTooltip("Chat — conversation with the agent.");
+
+    ImGui::SameLine();
+    centerY(lh);
+    if (busy) ImGui::BeginDisabled();
+    // Sessions — stable label (never renames to "< Chat").
+    if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW)) {
+        const bool open = !st.showSessionsPicker;
+        st.showSessionsPicker = open;
+        if (open) st.showAISettingsOverlay = false;
+    }
+    if (busy) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
                                        : "Sessions — switch between chats.");
 
     ImGui::SameLine();
     centerY(lh);
-    // Settings as the same stretched rectangular text box as Sessions (owner ask:
-    // identical style, horizontally sized to the label — no icon-only square).
     if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW)) {
-        st.showAISettingsOverlay = !st.showAISettingsOverlay;
-        if (st.showAISettingsOverlay) st.showSessionsPicker = false;
+        const bool open = !st.showAISettingsOverlay;
+        st.showAISettingsOverlay = open;
+        if (open) st.showSessionsPicker = false;
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(settingsOpen ? "Back to the chat."
+        ImGui::SetTooltip(settingsOpen ? "Settings is open."
                                        : "AI settings — provider, model, privacy.");
 
     ImGui::SameLine();
@@ -4044,12 +4116,14 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     ensureConversations(st);
 
-    // New-session button spans the full tab width. Sessions <-> Chat toggle lives in the header.
+    // New-session button spans the full tab width. Return to chat via the header Chat button
+    // (Sessions stays labeled "Sessions" — no "< Chat" rename that reflows the header).
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("+ New session", ImVec2(-1, 0))) {
         newConversation(st);
         st.prompt[0] = 0;
         st.showAISettingsOverlay = false;
+        st.showSessionsPicker = false;  // land in the new chat, not stuck on the list
     }
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
@@ -5625,13 +5699,14 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
     ovEnsureDefaultRoles();
     refreshModelAvailability(st, false);
 
-    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - 8.0f * S);
-    ui::InterwebzTwoColumnBegin(12.0f);
-    if (ui::InterwebzGroupBegin("##ov_roles", "Role models", ImVec2(0, colH))) {
+    // Tighter columns so more roles fit; Model Roles + Compaction share left stack.
+    const float colH = ImMax(220.0f * S, ImGui::GetContentRegionAvail().y - 4.0f * S);
+    ui::InterwebzTwoColumnBegin(8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * S, 3.0f * S));
+    if (ui::InterwebzGroupBegin("##ov_roles", "Model Roles", ImVec2(0, colH * 0.62f))) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-        ImGui::TextWrapped("Per-role model + thinking. Auto model from rankings; "
-                           "Thinking Auto = classifier/dispatcher.");
+        ImGui::TextWrapped("Model + Thinking per role. Auto model from rankings.");
         ImGui::PopStyleColor();
         if (s_ovRoles.rpcMissing) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -5653,6 +5728,9 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
         for (const auto& p : allPicks) allLabels.push_back(p.label.c_str());
         for (const auto& p : localPicks) localLabels.push_back(p.label.c_str());
 
+        static const char* kThinkLabels[] = {"Auto", "Low", "Med", "High"};
+        static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
+
         for (int i = 0; i < kOvRoleCount; ++i) {
             const char* key = kOvRoleKeys[i];
             const bool isRedaction = (std::strcmp(key, "redaction") == 0);
@@ -5661,10 +5739,11 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             const auto& labels = isRedaction ? localLabels : allLabels;
 
             ImGui::PushID(key);
+            // Compact single row: Role label | model combo | Thinking combo.
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(kOvRoleLabels[i]);
             if (a.isAuto) {
-                ImGui::SameLine();
+                ImGui::SameLine(0, 4.0f * S);
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.accent));
                 ImGui::TextUnformatted("auto");
                 ImGui::PopStyleColor();
@@ -5672,7 +5751,7 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
                     ImGui::SetTooltip("Auto-picked from model rankings.");
             }
             if (isRedaction) {
-                ImGui::SameLine();
+                ImGui::SameLine(0, 4.0f * S);
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
                 ImGui::TextUnformatted("[local]");
                 ImGui::PopStyleColor();
@@ -5692,7 +5771,14 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             }
             const bool ro = s_ovRoles.rpcMissing || s_ovRoles.saveInFlight;
             if (ro) ImGui::BeginDisabled();
+
+            // Model + Thinking on ONE row (inline) so more roles fit on screen.
+            const float rowW = ImGui::GetContentRegionAvail().x;
+            const float thinkW = ImMax(64.0f * S, rowW * 0.28f);
+            const float modelW = ImMax(80.0f * S, rowW - thinkW - 8.0f * S);
+
             int comboSel = sel;
+            ImGui::SetNextItemWidth(modelW);
             if (ui::InterwebzCombo("##role_model", &comboSel, labels.data(), (int)labels.size()) &&
                 comboSel >= 0 && comboSel < (int)picks.size()) {
                 OvRoleAssign next = a;  // preserve thinking
@@ -5712,15 +5798,14 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
                     ovSetRole(st, key, next);
                 }
             }
-            // Thinking effort: Auto / Low / Medium / High (same ai_roles.<role>.thinking).
-            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High"};
-            static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
+
             int thinkSel = 0;
             for (int ti = 0; ti < 4; ++ti) {
                 if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
             }
-            ImGui::SetNextItemWidth(ImMax(72.0f * S, ImGui::GetContentRegionAvail().x * 0.42f));
-            if (ui::InterwebzCombo("Thinking", &thinkSel, kThinkLabels, 4) &&
+            ImGui::SameLine(0, 4.0f * S);
+            ImGui::SetNextItemWidth(thinkW);
+            if (ui::InterwebzCombo("##role_think", &thinkSel, kThinkLabels, 4) &&
                 thinkSel >= 0 && thinkSel < 4) {
                 OvRoleAssign next = a;
                 next.thinking = kThinkValues[thinkSel];
@@ -5729,20 +5814,132 @@ static void drawOvAgentsTab(AppState& st, float S, bool& changed) {
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 if (std::strcmp(key, "default") == 0) {
                     ImGui::SetTooltip(
-                        "Auto: chat classifier assigns effort per prompt.\n"
-                        "Low/Medium/High: force that level for Default-role calls.");
+                        "Thinking: Auto = classifier assigns effort per prompt.\n"
+                        "Low/Med/High: force that level for Default-role calls.");
                 } else {
                     ImGui::SetTooltip(
-                        "Auto: dispatcher assigns effort by task complexity.\n"
-                        "Low/Medium/High: force that level for this role's calls.");
+                        "Thinking: Auto = dispatcher by task complexity.\n"
+                        "Low/Med/High: force that level for this role.");
                 }
             }
             if (ro) ImGui::EndDisabled();
             ImGui::PopID();
-            ImGui::Dummy(ImVec2(0, 1.0f * S));
         }
     }
     ui::InterwebzGroupEnd();
+
+    // Session compaction + prewalk (agent.* config keys — load-modify-write like corporate).
+    if (ui::InterwebzGroupBegin("##ov_compaction", "Session context", ImVec2(0, 0))) {
+        static bool s_compLoaded = false;
+        static int s_compStrategy = 0;  // 0 off, 1 snapcompact, 2 shake, 3 summary
+        static bool s_compSupersede = true;
+        static bool s_compDropUseless = true;
+        static bool s_compPrewalk = false;
+        static char s_compPrewalkTarget[64] = "@smol";
+        if (!s_compLoaded) {
+            try {
+                std::ifstream in(configPath());
+                if (in) {
+                    nlohmann::json j;
+                    in >> j;
+                    if (j.is_object()) {
+                        auto agent = j.value("agent", nlohmann::json::object());
+                        if (agent.is_object()) {
+                            std::string strat = agent.value("compaction_strategy",
+                                                           std::string("off"));
+                            if (strat == "snapcompact") s_compStrategy = 1;
+                            else if (strat == "shake") s_compStrategy = 2;
+                            else if (strat == "summary") s_compStrategy = 3;
+                            else s_compStrategy = 0;
+                            auto comp = agent.value("compaction", nlohmann::json::object());
+                            if (comp.is_object()) {
+                                if (comp.contains("supersede_reads") &&
+                                    comp["supersede_reads"].is_boolean())
+                                    s_compSupersede = comp["supersede_reads"].get<bool>();
+                                if (comp.contains("drop_useless") &&
+                                    comp["drop_useless"].is_boolean())
+                                    s_compDropUseless = comp["drop_useless"].get<bool>();
+                            }
+                            if (agent.contains("prewalk") && agent["prewalk"].is_boolean())
+                                s_compPrewalk = agent["prewalk"].get<bool>();
+                            if (agent.contains("prewalk_target") &&
+                                agent["prewalk_target"].is_string()) {
+                                std::string t = agent["prewalk_target"].get<std::string>();
+                                std::strncpy(s_compPrewalkTarget, t.c_str(),
+                                             sizeof(s_compPrewalkTarget) - 1);
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            s_compLoaded = true;
+        }
+        auto saveComp = [&]() {
+            try {
+                nlohmann::json j = nlohmann::json::object();
+                {
+                    std::ifstream in(configPath());
+                    if (in) {
+                        nlohmann::json old;
+                        in >> old;
+                        if (old.is_object()) j = std::move(old);
+                    }
+                }
+                if (!j.contains("agent") || !j["agent"].is_object())
+                    j["agent"] = nlohmann::json::object();
+                static const char* kStrat[] = {"off", "snapcompact", "shake", "summary"};
+                int si = s_compStrategy;
+                if (si < 0 || si > 3) si = 0;
+                j["agent"]["compaction_strategy"] = kStrat[si];
+                nlohmann::json comp = nlohmann::json::object();
+                if (j["agent"].contains("compaction") && j["agent"]["compaction"].is_object())
+                    comp = j["agent"]["compaction"];
+                comp["supersede_reads"] = s_compSupersede;
+                comp["drop_useless"] = s_compDropUseless;
+                j["agent"]["compaction"] = std::move(comp);
+                j["agent"]["prewalk"] = s_compPrewalk;
+                j["agent"]["prewalk_target"] = s_compPrewalkTarget;
+                const std::string path = configPath();
+                const std::string tmp = path + ".tmp";
+                std::ofstream(tmp) << j.dump(2);
+                std::filesystem::rename(tmp, path);
+            } catch (...) {}
+        };
+
+        static const char* kStratLabels[] = {"Off", "Snapcompact", "Shake", "Summary"};
+        ImGui::SetNextItemWidth(ImMax(100.0f * S, ImGui::GetContentRegionAvail().x * 0.85f));
+        if (ui::InterwebzCombo("Compaction", &s_compStrategy, kStratLabels, 4)) {
+            if (s_compStrategy < 0) s_compStrategy = 0;
+            if (s_compStrategy > 3) s_compStrategy = 3;
+            saveComp();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "agent.compaction_strategy\n"
+                "Off = no auto compact. Snapcompact archives old turns.\n"
+                "Shake elides heavy tool/code. Summary = LLM summary.");
+
+        if (ui::InterwebzCheckbox("Supersede reads", &s_compSupersede)) saveComp();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("agent.compaction.supersede_reads (default on)");
+        if (ui::InterwebzCheckbox("Drop useless tools", &s_compDropUseless)) saveComp();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("agent.compaction.drop_useless (default on)");
+        if (ui::InterwebzCheckbox("Prewalk", &s_compPrewalk)) saveComp();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "agent.prewalk — strong model plans, then hand off to cheap target.\n"
+                "Also armable mid-session via /prewalk.");
+        if (s_compPrewalk) {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputTextWithHint("##prewalk_tgt", "target (e.g. @smol)",
+                                        s_compPrewalkTarget, sizeof(s_compPrewalkTarget)))
+                saveComp();
+        }
+    }
+    ui::InterwebzGroupEnd();
+
+    ImGui::PopStyleVar();  // ItemSpacing from Model Roles column
 
     ui::InterwebzTwoColumnNext();
     if (ui::InterwebzGroupBegin("##ov_default_prov", "Default provider", ImVec2(0, colH))) {
@@ -6956,10 +7153,10 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     bool changed = false;
     (void)busy;
-
-    // Esc returns to chat (same as gear toggle / Sessions "< Chat").
+    // Esc returns to chat (same as the header Chat button).
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ImGui::IsAnyItemActive()) {
         st.showAISettingsOverlay = false;
+        st.showSessionsPicker = false;
         return;
     }
 
@@ -7404,11 +7601,394 @@ static void drawModelDropdown(AppState& st, bool busy) {
     }
 }
 
+// ============================ session slash commands (/compact /shake /handoff /btw /prewalk) ===
+// Host owns the ChatMsg store; session_* RPCs are pure transforms (PySessionCmds). We convert
+// ChatMsg → OpenAI-style role+content messages[], call the RPC, then apply the result.
+
+struct BtwPanelState {
+    bool open = false;
+    bool loading = false;
+    std::string question;
+    std::string answer;
+    std::string error;
+};
+static BtwPanelState s_btw;
+
+static nlohmann::json chatMsgsToWireMessages(const std::vector<ChatMsg>& msgs) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& m : msgs) {
+        if (m.text.empty() && m.running) continue;
+        if (m.text.empty()) continue;
+        nlohmann::json j;
+        j["role"] = m.fromUser ? "user" : "assistant";
+        j["content"] = m.text;
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages) {
+    if (!messages.is_array()) return;
+    freeChatTextures(st.chat);
+    st.chat.clear();
+    for (const auto& jm : messages) {
+        if (!jm.is_object()) continue;
+        ChatMsg cm;
+        std::string role = jm.value("role", std::string("assistant"));
+        cm.fromUser = (role == "user");
+        if (jm.contains("content")) {
+            if (jm["content"].is_string()) cm.text = jm["content"].get<std::string>();
+            else if (jm["content"].is_array()) {
+                // Concatenate text parts if multi-part content.
+                std::string acc;
+                for (const auto& p : jm["content"]) {
+                    if (!p.is_object()) continue;
+                    if (p.contains("text") && p["text"].is_string())
+                        acc += p["text"].get<std::string>();
+                    else if (p.contains("type") && p["type"] == "text" &&
+                             p.contains("text") && p["text"].is_string())
+                        acc += p["text"].get<std::string>();
+                }
+                cm.text = acc;
+            }
+        }
+        if (cm.text.empty()) continue;
+        st.chat.push_back(std::move(cm));
+    }
+    for (auto& m : st.chat) m.uiCachedH = -1.0f;
+    persistChatHistory(st);
+}
+
+static void pushSessionNotice(AppState& st, const std::string& text) {
+    ChatMsg n;
+    n.fromUser = false;
+    n.text = text;
+    n.model = "system";
+    st.chat.push_back(std::move(n));
+    persistChatHistory(st);
+    st.toast(ui::ToastLevel::Info, text.size() > 80 ? text.substr(0, 77) + "..." : text);
+}
+
+static void ovSetAgentBool(const char* key, bool v) {
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json old;
+                in >> old;
+                if (old.is_object()) j = std::move(old);
+            }
+        }
+        if (!j.contains("agent") || !j["agent"].is_object())
+            j["agent"] = nlohmann::json::object();
+        j["agent"][key] = v;
+        const std::string path = configPath();
+        const std::string tmp = path + ".tmp";
+        std::ofstream(tmp) << j.dump(2);
+        std::filesystem::rename(tmp, path);
+    } catch (...) {}
+}
+
+// Returns true if `text` was a slash command (handled; do not run a normal turn).
+static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
+    if (text.empty() || text[0] != '/') return false;
+    // Split command + rest.
+    std::string cmd, rest;
+    {
+        size_t sp = text.find_first_of(" \t\n");
+        if (sp == std::string::npos) {
+            cmd = text;
+        } else {
+            cmd = text.substr(0, sp);
+            rest = text.substr(sp);
+            while (!rest.empty() && (rest[0] == ' ' || rest[0] == '\t')) rest.erase(rest.begin());
+        }
+        for (char& c : cmd) c = (char)std::tolower((unsigned char)c);
+    }
+
+    auto needIdle = [&]() -> bool {
+        if (aiTurnActive(st) || st.job.running.load()) {
+            st.toast(ui::ToastLevel::Warn, "Wait for the current turn to finish.");
+            return false;
+        }
+        return true;
+    };
+
+    if (cmd == "/prewalk") {
+        ovSetAgentBool("prewalk", true);
+        st.toast(ui::ToastLevel::Success, "Prewalk armed (agent.prewalk = true)");
+        st.addLog("[..] /prewalk: agent.prewalk enabled");
+        return true;
+    }
+
+    if (cmd == "/btw") {
+        if (rest.empty()) {
+            st.toast(ui::ToastLevel::Warn, "Usage: /btw <question>");
+            return true;
+        }
+        s_btw.open = true;
+        s_btw.loading = true;
+        s_btw.question = rest;
+        s_btw.answer.clear();
+        s_btw.error.clear();
+        nlohmann::json params = nlohmann::json::object();
+        params["messages"] = chatMsgsToWireMessages(st.chat);
+        params["question"] = rest;
+        nlohmann::json pov = agentProviderOverride(st.settings);
+        if (pov.contains("provider")) params["provider"] = pov["provider"];
+        if (pov.contains("model")) params["model"] = pov["model"];
+        else if (st.settings.model[0]) params["model"] = st.settings.model;
+        st.rpc.call("session_btw", params, [](const core::RpcResult& r) {
+            s_btw.loading = false;
+            if (!r.ok) {
+                s_btw.error = r.err.empty() ? "session_btw failed" : r.err;
+                return;
+            }
+            if (r.result.is_object()) {
+                if (r.result.contains("answer") && r.result["answer"].is_string())
+                    s_btw.answer = r.result["answer"].get<std::string>();
+                else if (r.result.contains("text") && r.result["text"].is_string())
+                    s_btw.answer = r.result["text"].get<std::string>();
+                else
+                    s_btw.answer = r.result.dump(2);
+            } else if (r.result.is_string()) {
+                s_btw.answer = r.result.get<std::string>();
+            } else {
+                s_btw.error = "empty answer";
+            }
+        }, 180000);
+        st.toast(ui::ToastLevel::Info, "Asking (side channel)...");
+        return true;
+    }
+
+    if (cmd == "/compact") {
+        if (!needIdle()) return true;
+        std::string strategy = "snapcompact";
+        if (!rest.empty()) {
+            std::string arg = rest;
+            for (char& c : arg) c = (char)std::tolower((unsigned char)c);
+            if (arg == "shake" || arg == "snapcompact" || arg == "summary" || arg == "off")
+                strategy = arg;
+        }
+        if (strategy == "off") {
+            st.toast(ui::ToastLevel::Info, "Compaction strategy is Off — nothing to do.");
+            return true;
+        }
+        nlohmann::json params = nlohmann::json::object();
+        params["messages"] = chatMsgsToWireMessages(st.chat);
+        params["strategy"] = strategy;
+        // Honor Agents-tab agent.compaction.* (defaults match shared contract).
+        int keepRecent = 20000;
+        bool supersedeReads = true;
+        bool dropUseless = true;
+        try {
+            std::ifstream in(configPath());
+            if (in) {
+                nlohmann::json j;
+                in >> j;
+                if (j.is_object()) {
+                    auto agent = j.value("agent", nlohmann::json::object());
+                    if (agent.is_object()) {
+                        auto comp = agent.value("compaction", nlohmann::json::object());
+                        if (comp.is_object()) {
+                            if (comp.contains("keep_recent_tokens") &&
+                                comp["keep_recent_tokens"].is_number_integer())
+                                keepRecent = comp["keep_recent_tokens"].get<int>();
+                            if (comp.contains("supersede_reads") &&
+                                comp["supersede_reads"].is_boolean())
+                                supersedeReads = comp["supersede_reads"].get<bool>();
+                            if (comp.contains("drop_useless") &&
+                                comp["drop_useless"].is_boolean())
+                                dropUseless = comp["drop_useless"].get<bool>();
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+        params["keep_recent_tokens"] = keepRecent;
+        params["supersede_reads"] = supersedeReads;
+        params["drop_useless"] = dropUseless;
+        st.rpc.call("session_compact", params, [&st, strategy](const core::RpcResult& r) {
+            if (!r.ok) {
+                st.toast(ui::ToastLevel::Error,
+                         r.err.empty() ? "session_compact failed" : r.err);
+                return;
+            }
+            if (!r.result.is_object()) {
+                st.toast(ui::ToastLevel::Error, "session_compact: bad result");
+                return;
+            }
+            if (r.result.contains("kept_messages") && r.result["kept_messages"].is_array())
+                applyWireMessagesToChat(st, r.result["kept_messages"]);
+            std::string notice;
+            if (r.result.contains("short_summary") && r.result["short_summary"].is_string())
+                notice = r.result["short_summary"].get<std::string>();
+            else if (r.result.contains("summary") && r.result["summary"].is_string())
+                notice = r.result["summary"].get<std::string>();
+            if (notice.empty()) notice = "Compacted (" + strategy + ").";
+            pushSessionNotice(st, notice);
+            st.addLog("[..] /compact " + strategy + " ok");
+        }, 180000);
+        st.toast(ui::ToastLevel::Info, "Compacting...");
+        return true;
+    }
+
+    if (cmd == "/shake") {
+        if (!needIdle()) return true;
+        std::string mode = "elide";
+        bool aggressive = true;
+        if (!rest.empty()) {
+            std::string arg = rest;
+            for (char& c : arg) c = (char)std::tolower((unsigned char)c);
+            if (arg == "images") mode = "images";
+            else if (arg == "elide") mode = "elide";
+        }
+        nlohmann::json params = nlohmann::json::object();
+        params["messages"] = chatMsgsToWireMessages(st.chat);
+        params["mode"] = mode;
+        params["aggressive"] = aggressive;
+        st.rpc.call("session_shake", params, [&st, mode](const core::RpcResult& r) {
+            if (!r.ok) {
+                st.toast(ui::ToastLevel::Error,
+                         r.err.empty() ? "session_shake failed" : r.err);
+                return;
+            }
+            if (!r.result.is_object()) {
+                st.toast(ui::ToastLevel::Error, "session_shake: bad result");
+                return;
+            }
+            if (r.result.contains("messages") && r.result["messages"].is_array())
+                applyWireMessagesToChat(st, r.result["messages"]);
+            std::string notice;
+            if (r.result.contains("notice") && r.result["notice"].is_string())
+                notice = r.result["notice"].get<std::string>();
+            int saved = 0;
+            if (r.result.contains("saved_tokens") && r.result["saved_tokens"].is_number_integer())
+                saved = r.result["saved_tokens"].get<int>();
+            if (notice.empty()) {
+                notice = "Shook (" + mode + ")";
+                if (saved > 0) notice += " ~" + std::to_string(saved) + " tokens";
+                notice += ".";
+            }
+            pushSessionNotice(st, notice);
+            st.addLog("[..] /shake " + mode + " ok");
+        }, 120000);
+        st.toast(ui::ToastLevel::Info, "Shaking...");
+        return true;
+    }
+
+    if (cmd == "/handoff") {
+        if (!needIdle()) return true;
+        if (st.chat.size() < 2) {
+            st.toast(ui::ToastLevel::Warn, "Need at least two messages to hand off.");
+            return true;
+        }
+        nlohmann::json params = nlohmann::json::object();
+        params["messages"] = chatMsgsToWireMessages(st.chat);
+        if (!rest.empty()) params["focus"] = rest;
+        nlohmann::json pov = agentProviderOverride(st.settings);
+        if (pov.contains("provider")) params["provider"] = pov["provider"];
+        if (pov.contains("model")) params["model"] = pov["model"];
+        else if (st.settings.model[0]) params["model"] = st.settings.model;
+        st.rpc.call("session_handoff", params, [&st](const core::RpcResult& r) {
+            if (!r.ok) {
+                st.toast(ui::ToastLevel::Error,
+                         r.err.empty() ? "session_handoff failed" : r.err);
+                return;
+            }
+            std::string doc;
+            if (r.result.is_object()) {
+                if (r.result.contains("document") && r.result["document"].is_string())
+                    doc = r.result["document"].get<std::string>();
+                else if (r.result.contains("text") && r.result["text"].is_string())
+                    doc = r.result["text"].get<std::string>();
+            } else if (r.result.is_string()) {
+                doc = r.result.get<std::string>();
+            }
+            if (doc.empty()) {
+                st.toast(ui::ToastLevel::Error, "Handoff returned empty document.");
+                return;
+            }
+            // New session/tab; old tab transcript left intact.
+            ensureConversations(st);
+            parkActiveConversation(st);
+            Conversation c;
+            c.id = newConvId(st);
+            c.title = "Handoff";
+            st.conversations.push_back(std::move(c));
+            st.activeConv = (int)st.conversations.size() - 1;
+            st.chat.clear();
+            st.lastContextTokens = 0;
+            st.queuedPrompts.clear();
+            // Visible handoff seed wrapping the document.
+            ChatMsg seed;
+            seed.fromUser = false;
+            seed.model = "handoff";
+            seed.text =
+                "<handoff-context>\n" + doc +
+                "\n</handoff-context>\n\n"
+                "The above is a handoff document from a previous session. "
+                "Use this context to continue the work seamlessly.";
+            st.chat.push_back(std::move(seed));
+            persistChatHistory(st);
+            st.toast(ui::ToastLevel::Success, "New session started with handoff context");
+            st.addLog("[..] /handoff: new session seeded");
+        }, 300000);
+        st.toast(ui::ToastLevel::Info, "Generating handoff...");
+        return true;
+    }
+
+    // Unknown /command — fall through so the user can still send "/something" as plain text
+    // only when it is not one of our known commands. Known-prefix typos get a usage hint.
+    if (cmd == "/help") {
+        st.toast(ui::ToastLevel::Info,
+                 "/compact [snapcompact|shake|summary]  /shake [elide|images]  "
+                 "/handoff [focus]  /btw <q>  /prewalk");
+        return true;
+    }
+    return false;  // unknown slash — send as normal text
+}
+
+static void drawBtwPanel(AppState& st) {
+    if (!s_btw.open) return;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::SetNextWindowSize(ImVec2(360.0f * sc, 280.0f * sc), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.94f);
+    bool open = s_btw.open;
+    if (ImGui::Begin("By the way", &open,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("Q: %s", s_btw.question.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        if (s_btw.loading) {
+            ImGui::TextUnformatted("Thinking...");
+        } else if (!s_btw.error.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", s_btw.error.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::TextWrapped("%s",
+                s_btw.answer.empty() ? "(no answer)" : s_btw.answer.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::Button("Close", ImVec2(-1, 0))) open = false;
+        (void)st;
+    }
+    ImGui::End();
+    s_btw.open = open;
+}
+
 // Launch the active turn for `text` according to the current mode (Design/Edit/Ask). Pushes
 // the user + live-assistant ChatMsgs. Centralizes the three old launch paths so the top input
 // and the per-turn follow-up input share one code path.
 static void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
+    // Slash commands: /compact /shake /handoff /btw /prewalk — pure host+RPC, no agent turn.
+    if (tryHandleSlashCommand(st, text)) return;
     // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
     // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
     // run uses exactly what the picker shows — closing the window where a freshly-picked local
@@ -9082,6 +9662,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::Dummy(ImVec2(0, bottomClearance));
         }
     }  // s_cpAnim.bodyVisible()
+
+    // Side-channel /btw answer panel (not part of chat history).
+    drawBtwPanel(st);
 
     ImGui::End();
 }

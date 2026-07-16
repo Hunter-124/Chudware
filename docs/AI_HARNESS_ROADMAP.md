@@ -438,3 +438,19 @@ graduate only on ablation evidence; C-freedom regressions are harness bugs.
   fired). U24/V24/T23/Q22/M21/R22/G18/Y/Z1 PASS; battery `doc-cpp00000007`
   PASS. Residuals: AC5 rail drive (P22); AC4 autoroute clearance-retry fire.
   Findings: `reports/runs/mega-25/findings.md`.
+
+- 2026-07-15/16 mega-26 (WS5): close mega-25 AC4/AC5 residuals under
+  `reports/runs/mega-26/` (primary a1 `mega-26-fc-rocket-20260716`).
+  Baseline `6ab362fb`. Fixer26 DeadOpossum: **A26** forced V value `"3.3"`
+  (not `"DC 3.3"`) on N21-resolved **3V3** measure net +
+  `u1_stubbed_ideal_regulator`; **B26** truncated-DRC errors scrape +
+  reopt_allowed → autoroute(pitch=0.3)+re-opt+re-DRC (`retry_n>=1`); offline
+  FINAL_OFFLINE_OK + gate **228p**. Preflight PASS: account `06dc3359`,
+  hard→xai-sub grok-4.5, mid deepseek, leaf ollama, mega26_bound. **a1** wall
+  **567s** terminal `needs_correction`/`verify_failed:[AC4]` live AC **8**/9
+  (AC1–3,5–9) — **target ≥8/9 MET**. **A26 PASS** (V(3V3)=3.3 in-band; U1
+  stub). **B26 PASS** (retry fired; honest DRC clearance×23 FAIL). Y25/Z25/
+  S23/P22/U24/V24/T23/Q22/M21/R22/G18 PASS; battery `doc-cpp00000005` PASS.
+  Residual: AC4 layout still sub-0.2mm after bounded retry (goal 9/9 open).
+  Findings: `reports/runs/mega-26/findings.md`.
+

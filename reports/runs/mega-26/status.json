@@ -1,0 +1,23 @@
+{
+  "state": "finished",
+  "run_id": "mega-26-fc-rocket-20260716",
+  "tier": "openrouter:deepseek/deepseek-chat-v3.1",
+  "pid": 2445108,
+  "started_wall": 1784161192.4171433,
+  "cycle": "mega-26",
+  "conservation": true,
+  "baseline_commit": "6ab362fb",
+  "spend_before_usd": 0.22370784,
+  "spend_guard_usd": 8.0,
+  "finished_wall": 1784161759.5726852,
+  "wall_s": 566.94,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "result": {
+    "status": "needs_correction",
+    "phase": "correct",
+    "stop_reason": "verify_failed: ['AC4']",
+    "error": null,
+    "spend_guard_abort": null
+  }
+}

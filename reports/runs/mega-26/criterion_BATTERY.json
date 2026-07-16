@@ -1,0 +1,40 @@
+{
+  "id": "BATTERY",
+  "result": "PASS",
+  "check_tool": "verify_battery",
+  "pass_rule": "PASS",
+  "detail": "no failing findings/critical zeros",
+  "evidence": {
+    "findings": [
+      {
+        "name": "check_sketch",
+        "severity": null,
+        "message": "no sketches on document"
+      },
+      {
+        "name": "dim_coverage",
+        "severity": null,
+        "message": "no drawing in mission scope"
+      },
+      {
+        "name": "ecad_check_diff_impedance",
+        "severity": null,
+        "message": "no differential pair nets on board (need net_p/net_n)"
+      }
+    ],
+    "scores": {
+      "ecad_check_impedance": 1.0,
+      "ecad_run_erc": 1.0,
+      "eval_check": 1.0,
+      "groundedness": 1.0,
+      "is_manifold": 1.0,
+      "layout_coverage": 1.0,
+      "measure_between": 1.0,
+      "measure_part": 1.0,
+      "power_budget": 1.0,
+      "query_geometry": 1.0,
+      "req_join": 1.0,
+      "unit_sanity": 1.0
+    }
+  }
+}

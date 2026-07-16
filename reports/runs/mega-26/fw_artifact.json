@@ -1,0 +1,22 @@
+{
+  "id": "AC7",
+  "result": "PASS",
+  "check_tool": "fw_build",
+  "pass_rule": "returncode==0",
+  "detail": "returncode==0 elf_path=/tmp/AI-CAD/firmware/ee82771f60d1/build/firmware.elf",
+  "evidence": {
+    "success": true,
+    "elf_path": "/tmp/AI-CAD/firmware/ee82771f60d1/build/firmware.elf",
+    "map_path": "/tmp/AI-CAD/firmware/ee82771f60d1/build/firmware.map",
+    "stderr": "-- Configuring done (0.0s)\n-- Generating done (0.0s)\n-- Build files have been written to: /tmp/AI-CAD/firmware/ee82771f60d1/build\nninja: no work to do.\n",
+    "warnings": [],
+    "returncode": 0,
+    "cmd": [
+      "cmake",
+      "--build",
+      "/tmp/AI-CAD/firmware/ee82771f60d1/build"
+    ],
+    "ms": 23.68,
+    "source": "live"
+  }
+}

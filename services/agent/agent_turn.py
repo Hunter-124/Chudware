@@ -2469,11 +2469,20 @@ def _ecad_chain_need(
             return "ecad_optimize_traces"
         return "ecad_run_drc"
     # Re-optimize once when DRC after optimize is still dirty, then re-DRC.
+    # mega-26 B26: BUILD allow often omits ecad_optimize_traces (only drc/board
+    # present). First opt already uses opt_allowed expansion; re-opt must too
+    # or chain_need jumps to ERC and the clearance-retry branch never fires.
+    reopt_allowed = (
+        "ecad_optimize_traces" in allow_set
+        or "ecad_run_drc" in allow_set
+        or "ecad_autoroute" in allow_set
+        or "board_from_schematic" in allow_set
+    )
     if (
         has_board
         and has_opt
         and has_drc
-        and "ecad_optimize_traces" in allow_set
+        and reopt_allowed
         and int(_ecad_last_drc_errors(calls) or 0) > 0
         and _ecad_drc_after_optimize(calls)
         and _ecad_optimize_retry_count(calls) < 1
@@ -2883,11 +2892,18 @@ def _ecad_has_sim_source(calls: list) -> bool:
 
 
 def _ecad_last_drc_errors(calls: list) -> int | None:
-    """Return error count from the most recent successful ecad_run_drc, or None."""
+    """Return error count from the most recent successful ecad_run_drc, or None.
+
+    mega-26 B26: live ledger tool_call results are often _truncate()'d mid-JSON
+    so json.loads fails and the in-memory cascade must still recover a count
+    from the truncated blob (errors key or 'N error(s)' verdict). Without this
+    chain_need never sees dirty DRC → clearance retry_n stays 0.
+    """
     for c in reversed(calls or []):
         if not (c.get("ok") and c.get("tool") == "ecad_run_drc"):
             continue
-        res = _ecad_parse_result(c.get("result"))
+        raw = c.get("result")
+        res = _ecad_parse_result(raw)
         if "errors" in res:
             try:
                 return int(res.get("errors") or 0)
@@ -2897,6 +2913,23 @@ def _ecad_last_drc_errors(calls: list) -> int | None:
         residual = res.get("residual_drc") or res.get("violations")
         if isinstance(residual, list):
             return len(residual)
+        # Truncated JSON / verdict scrape (mega-26 B26).
+        if isinstance(raw, str) and raw.strip():
+            m = re.search(r'["\']errors["\']\s*:\s*(\d+)', raw)
+            if m:
+                try:
+                    return int(m.group(1))
+                except (TypeError, ValueError):
+                    pass
+            m = re.search(r"(\d+)\s*error", raw.lower())
+            if m:
+                try:
+                    return int(m.group(1))
+                except (TypeError, ValueError):
+                    pass
+            # Presence of violation text with no count → at least 1 dirty.
+            if "clearance" in raw.lower() and "error" in raw.lower():
+                return 1
     return None
 
 
@@ -3347,7 +3380,15 @@ def _ecad_ensure_driven_rail(
     """
     allow_set = allow or set()
     topo = _ecad_sim_topology(calls=calls)
-    rail = topo.get("rail") or "3V3"
+    # mega-26 A26: always bind source/load to the N21-resolved MEASURE net
+    # (preferred 3V3). Prior residual landed V on VIN while AC5 probes 3V3
+    # behind U1 with no sim model → topological disconnect, V(3V3)=0.
+    resolved = resolve_measure_net(calls=calls, preferred="3V3")
+    rail = (
+        (resolved.get("net") if isinstance(resolved, dict) else None)
+        or topo.get("rail")
+        or "3V3"
+    )
     # mega-23: even when source+load appear present (device_count>=2), still
     # enforce V- → GND return. a2 residual shorted V- onto the rail → singular
     # matrix / V(3V3)=null. Only skip place when fully driven AND GND return
@@ -3366,8 +3407,11 @@ def _ecad_ensure_driven_rail(
         and steps < max_steps
     ):
         v_args = {
+            # mega-26 A26: schematic path uses _parse_value on the whole value
+            # string — "DC 3.3" raises and stamps V with value=None → OP 0.0 V.
+            # Bare "3.3" parses to 3.3 and drives the measured rail in-band.
             "libid": "Simulation_SPICE:V_source",
-            "value": "DC 3.3",
+            "value": "3.3",
             "ref": "V1",
             "x": 40.0,
             "y": 0.0,
@@ -3583,6 +3627,29 @@ def _ecad_ensure_driven_rail(
         )
         steps += 1
 
+    # mega-26 A26: forced V+R on the resolved measure net is an ideal-regulator
+    # stub when U1 (buck/MCU) has no sim model. Record honesty on forced
+    # place/wire records so AC5 evidence can note u1_stubbed_ideal_regulator.
+    try:
+        for c in reversed(calls or []):
+            if not c.get("forced"):
+                continue
+            fr = str(c.get("force_reason") or "")
+            if any(
+                tag in fr
+                for tag in (
+                    "inject_v_source", "inject_load_r", "wire_v_to_rail",
+                    "wire_load_to_v", "wire_load_to_rail", "wire_v_gnd",
+                    "wire_load_gnd", "wire_v_to_load",
+                )
+            ):
+                c["u1_stubbed_ideal_regulator"] = True
+                if isinstance(c.get("args"), dict):
+                    c["args"] = dict(c["args"])
+                    c["args"]["u1_stubbed_ideal_regulator"] = True
+    except Exception:  # noqa: BLE001
+        pass
+
     return calls, tool_calls_made, steps, tool_calls_made >= budget
 
 
@@ -3763,8 +3830,9 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         ):
             sch = _ecad_sch_doc_id(calls)
             args = {
+                # mega-26 A26: bare "3.3" (not "DC 3.3") — see ensure_driven_rail.
                 "libid": "Simulation_SPICE:V_source",
-                "value": "DC 3.3",
+                "value": "3.3",
                 "ref": "V1",
                 "x": 40.0,
                 "y": 0.0,
@@ -3966,6 +4034,8 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
         # mega-17 Z3: OP analysis on 3V3 for AC5.
         # mega-21 N21: resolve probe from live netlist / source net when 3V3
         # is absent (VIN path → N$2 etc.).
+        # mega-26 A26: force completion always drives THIS resolved net
+        # (measured rail), never a pre-regulator VIN island.
         resolved = resolve_measure_net(calls=calls, preferred="3V3")
         probe = resolved.get("probe") or "V(3V3)"
         out = {
@@ -3973,6 +4043,8 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
             "probes": [probe],
             "resolved_net": resolved.get("net"),
             "resolved_net_source": resolved.get("source"),
+            # Honest evidence: U1/buck has no SPICE model; V+R is the stub.
+            "u1_stubbed_ideal_regulator": True,
         }
         if sch_id:
             out["doc_id"] = sch_id
@@ -4225,6 +4297,7 @@ def _ecad_dispatch_forced_step(
     _strip_meta = (
         "resolved_net", "resolved_net_source", "source_net",
         "min_clearance_mm", "clearance_retry", "skip_teardrops",
+        "u1_stubbed_ideal_regulator",
     )
     if tool == "ecad_simulate" and isinstance(call_args, dict):
         dispatch_args = {

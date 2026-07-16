@@ -1,0 +1,22 @@
+{
+  "status": "needs_correction",
+  "phase": "correct",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "plan",
+    "build"
+  ],
+  "stop_reason": "verify_failed: ['AC4']",
+  "findings": [],
+  "ledger_path": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-26-fc-rocket-20260716/ledger.json",
+  "run_id": "mega-26-fc-rocket-20260716",
+  "mode": "real",
+  "wall_s": 566.94,
+  "conservation": true,
+  "baseline_commit": "6ab362fb",
+  "spend_before_usd": 0.22370784,
+  "spend_after_usd": 0.22370784,
+  "spend_delta_usd": 0.0,
+  "mission_ledger_src": "/home/hunter/.local/share/AI-CAD/cache/runs/mega-26-fc-rocket-20260716/ledger.json"
+}

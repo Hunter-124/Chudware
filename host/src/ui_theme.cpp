@@ -528,11 +528,6 @@ void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bo
     // Frosted row wash — strong enough for legible text over bright viewport bleed-through.
     float wash[4]; Palette::withAlpha(p.glassBg, wash, washAlpha);
     dl->AddRectFilled(pillMin, pillMax, Palette::toU32(wash), r);
-    // Faint border helps row pills read on a light canvas without a full panel wash.
-    if (washAlpha > 0.08f) {
-        float edge[4]; Palette::withAlpha(p.glassBorder, edge, washAlpha * 0.55f);
-        dl->AddRect(pillMin, pillMax, Palette::toU32(edge), r, 0, std::max(0.5f, 0.75f * s));
-    }
     if (stripe) {
         float stripeCol[4]; Palette::withAlpha(p.glassHighlight, stripeCol, 0.35f);
         dl->AddRectFilled(pillMin, pillMax, Palette::toU32(stripeCol), r);

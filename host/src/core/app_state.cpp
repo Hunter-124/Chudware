@@ -140,6 +140,7 @@ void loadSettings(Settings& s) {
         else if (prov == "anthropic") s.provider = 0;
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
         else if (prov == "xai" || prov == "xai-sub") s.provider = 6;  // PROV_XAI
+        else if (prov == "cursor" || prov == "cursor-sub") s.provider = 7;  // PROV_CURSOR
         else if (hasBase) s.provider = baseLoopback ? 2 : 5;  // 2=Local, 5=Cloud OpenAI-compatible
         else s.provider = 1;                                   // 1=OpenAI cloud (api.openai.com)
         std::string model = j.value("model", "");

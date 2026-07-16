@@ -1180,6 +1180,68 @@ static bool ppProject(const Renderer& renderer, const ImVec2& vr0, const ImVec2&
     return true;
 }
 
+// Screen-space hit-test for reference datum axes (model mode). Matches Renderer::drawRefDatums
+// half-length L = effectiveSceneRadius and prefers the closest line within a beefed pick band
+// (~10 px * uiScale) so hairline axes stay clickable even when a translucent plane sits in front.
+// Does not re-solve plane pairs — consumes the same refDatums the renderer draws.
+static bool hitTestRefAxis(const Renderer& renderer, AppState& st, ImVec2 mouse,
+                           const ImVec2& vr0, const ImVec2& vr1, int vw, int vh,
+                           ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
+    (void)vr1;
+    const float L = renderer.effectiveSceneRadius();
+    auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
+        float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
+        float len2 = vx * vx + vy * vy;
+        float t = len2 > 1e-6f ? (wx * vx + wy * vy) / len2 : 0.0f;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        float dx = a.x + t * vx - p.x, dy = a.y + t * vy - p.y;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+
+    struct Cand { std::string id, name; float ox, oy, oz, dx, dy, dz; };
+    std::vector<Cand> cands;
+    std::unordered_set<std::string> seen;
+    auto add = [&](const std::string& id, const std::string& name,
+                   float ox, float oy, float oz, float dx, float dy, float dz) {
+        if (id.empty() || seen.count(id) || st.hiddenFeatures.count(id)) return;
+        const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1e-9f) return;
+        dx /= len; dy /= len; dz /= len;
+        cands.push_back({id, name.empty() ? id : name, ox, oy, oz, dx, dy, dz});
+        seen.insert(id);
+    };
+
+    bool any = false;
+    for (const auto& d : renderer.refDatums()) {
+        if (d.kind != Renderer::RefDatum::Kind::Axis) continue;
+        any = true;
+        add(d.id, d.name, d.origin.x, d.origin.y, d.origin.z, d.dir.x, d.dir.y, d.dir.z);
+    }
+    // Pre-inject fallback: predefined X/Y/Z always listed in the FM tree.
+    if (!any) {
+        add("axis.x", "X Axis", 0, 0, 0, 1, 0, 0);
+        add("axis.y", "Y Axis", 0, 0, 0, 0, 1, 0);
+        add("axis.z", "Z Axis", 0, 0, 0, 0, 0, 1);
+    }
+
+    // Beefed pick band: ~10 px * uiScale (hairline axes over translucent planes).
+    float best = 10.0f * ui::uiScale;
+    bool found = false;
+    for (const auto& c : cands) {
+        float aW[3] = {c.ox - c.dx * L, c.oy - c.dy * L, c.oz - c.dz * L};
+        float bW[3] = {c.ox + c.dx * L, c.oy + c.dy * L, c.oz + c.dz * L};
+        ImVec2 sa, sb;
+        if (!ppProject(renderer, vr0, vr1, vw, vh, aW, sa)) continue;
+        if (!ppProject(renderer, vr0, vr1, vw, vh, bW, sb)) continue;
+        float dist = distToSeg(mouse, sa, sb);
+        if (dist < best) {
+            best = dist; found = true; outA = sa; outB = sb;
+            outFid = c.id; outName = c.name;
+        }
+    }
+    return found;
+}
+
 // Stroke a dashed screen-space segment a..b (dash/gap in px). A degenerate segment (a curved edge
 // we can't reconstruct) draws a small ring at `a` instead so it's still a visible deselect target.
 static void ppDashedLine(ImDrawList* dl, const ImVec2& a, const ImVec2& b, ImU32 col, float thick,
@@ -3182,21 +3244,59 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot)
             curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
-        // ---- general datum selection: click a displayed reference axis to select it ----
-        // Runs in the normal (non-sketch, no-PM-picker) flow so a datum axis is clickable like any
-        // other geometry. Returns true while the cursor is over a datum axis, suppressing the model
-        // pick below (a click off the axis still falls through to the id-buffer).
-        // Wave4: origin already claimed above (same grab radius); drawDatumSelect still handles
-        // axes + planes + user point-datums when the origin is not hot.
+        // ---- general model-mode reference-axis pick (viewport owns this path) ----
+        // Left-click within the beefed axis pick band selects the axis (st.selectedFeatureId)
+        // and keeps it until the user clicks elsewhere. Prefer axis over plane occlusion — hit
+        // test ignores depth. PM axis/plane wells still own their pickers above; sketch entity
+        // picks and origin grab win first. Face/edge model pick is suppressed while axis-hot so
+        // a bare line click doesn't lose to the body under the cursor.
+        bool axisSelectHot = false;
+        {
+            auto* pm = st.propertyManager;
+            const bool pmOwnsDatumPick = pm && pm->active() &&
+                (pm->activeWellWantsAxis() || pm->activeWellWantsPlane());
+            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
+                !s_viewSelector.active() && !s_lmbDragActive && !originPickHot &&
+                !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot &&
+                !pmOwnsDatumPick && !s_pp.active && !s_dim.active) {
+                ImVec2 a, b;
+                std::string fid, name;
+                if (hitTestRefAxis(renderer, st, io.MousePos, vr0, vr1, vw, vh, a, b, fid, name)) {
+                    axisSelectHot = true;
+                    // Hover affordance only when not already selected (selected uses renderer bold).
+                    if (st.selectedFeatureId != fid) {
+                        ImDrawList* wdl = ImGui::GetWindowDrawList();
+                        wdl->PushClipRect(vr0, vr1, true);
+                        float accA[4];
+                        ui::Palette::withAlpha(ui::palette.accent, accA, 0.90f);
+                        wdl->AddLine(a, b, ui::Palette::toU32(accA), 4.0f * ui::uiScale);
+                        wdl->PopClipRect();
+                    }
+                    st.requestCursor(ui::CursorKind::Hand);
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        if (!io.KeyCtrl) st.selection.clear();
+                        st.selectedFeatureId = fid;   // FM row + renderer.setSelectedDatumId
+                        st.planeEmphasis = -1;
+                        st.treeScrollToSelection = true;
+                    }
+                }
+            }
+        }
+
+        // ---- general datum selection: planes / user points (axes handled above) ----
+        // Runs in the normal (non-sketch, no-PM-picker) flow. Skipped while an axis is hot so
+        // plane hit-tests never steal the click from a coincident reference axis.
+        // Wave4: origin already claimed above (same grab radius).
         bool datumSelectHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot)
+            !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot &&
+            !curvePickerHot && !axisSelectHot)
             datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
         bool blendDeselectHot = false;
         if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && !originPickHot &&
-            !planePickerHot && !axisPickerHot && !pointPickerHot && !datumSelectHot)
+            !planePickerHot && !axisPickerHot && !pointPickerHot && !axisSelectHot && !datumSelectHot)
             blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
@@ -3217,7 +3317,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // the click so the press that grabbed the handle doesn't also re-select / clear. (Both
             // are non-sketch features, so their guards are always false while in a sketch.)
             if (imgHovered && !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
-                !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
+                !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
+                !datumSelectHot && !blendDeselectHot &&
                 !s_pp.active && !s_dim.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
@@ -3249,7 +3350,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Instant3D: a click that started a push-pull / dimension drag is NOT a selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
-                !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot &&
+                !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
+                !datumSelectHot &&
                 !blendDeselectHot && !s_pp.active && !s_dim.active) {
                 // Wave4 context cube: arm → append/toggle pendingContextRefs (chips via composer).
                 // Still update normal selection so the face/edge highlight stays readable.
@@ -3304,7 +3406,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             !s_viewSelector.active() && imgHovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_lmbDragActive &&
             !originPickHot && !regionPickerHot && !planePickerHot && !axisPickerHot &&
-            !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
+            !pointPickerHot && !curvePickerHot && !axisSelectHot && !datumSelectHot &&
+            !blendDeselectHot &&
             !s_pp.active && !s_dim.active) {
             st.clearSelection();
         }

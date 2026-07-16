@@ -26,7 +26,8 @@ enum ProviderIndex {
                           // DeepSeek API / etc.). Resolves as provider "openai" + a cloud base_url,
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
-    PROV_COUNT = 7,
+    PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
+    PROV_COUNT = 8,
 };
 
 struct ModelInfo {
@@ -54,13 +55,14 @@ inline const char* providerLabel(int provider) {
         case PROV_GEMINI: return "Google Gemini";
         case PROV_CLOUDCOMPAT: return "OpenRouter / Cloud API";
         case PROV_XAI: return "xAI (Grok)";
+        case PROV_CURSOR: return "Cursor";
         default: return "?";
     }
 }
 
 inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
-           provider == PROV_CLOUDCOMPAT || provider == PROV_XAI;
+           provider == PROV_CLOUDCOMPAT || provider == PROV_XAI || provider == PROV_CURSOR;
 }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
@@ -76,6 +78,7 @@ inline const char* providerCatKey(int provider) {
         case PROV_LLAMACPP: return "local";
         case PROV_CLOUDCOMPAT: return "cloud";  // refine with cloudServiceKey(base_url)
         case PROV_XAI: return "xai";
+        case PROV_CURSOR: return "cursor";
         default: return "other";
     }
 }
@@ -97,6 +100,7 @@ inline const char* categoryLabel(const std::string& key) {
     if (key == "alibaba") return "Alibaba Cloud (Qwen)";
     if (key == "deepseek") return "DeepSeek";
     if (key == "xai") return "xAI (Grok)";
+    if (key == "cursor") return "Cursor";
     return "Cloud API";
 }
 
@@ -110,9 +114,17 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_GEMINI, "gemini-2.0-flash", "Gemini 2.0 Flash", true, false},
         // Anthropic.
         {PROV_ANTHROPIC, "claude-opus-4-8", "Claude Opus 4.8", true, true},
+        {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
+        {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
+        {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
         // OpenAI cloud.
-        {PROV_OPENAI, "gpt-4o", "GPT-4o", true, false},
+        {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},
         {PROV_OPENAI, "o3", "OpenAI o3", false, true},
+        // Cursor — Composer + proxied Anthropic/OpenAI flagships.
+        {PROV_CURSOR, "composer-2.5", "Cursor Composer 2.5", true, true},
+        {PROV_CURSOR, "cursor/claude-opus-4-8", "Claude Opus 4.8 (Cursor)", true, true},
+        {PROV_CURSOR, "cursor/claude-sonnet-5", "Claude Sonnet 5 (Cursor)", true, true},
+        {PROV_CURSOR, "cursor/gpt-5.6-sol", "GPT-5.6 Sol (Cursor)", true, true},
         // xAI Grok — multimodal on 4.x; reasoning variants expose effort.
         // Model ids from hermes-agent catalog / console.x.ai (2026).
         // grok-4.5 is the current default (500k context; ~$2/$6 per Mtok).
@@ -254,7 +266,8 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
         case PROV_ANTHROPIC: return 200000;
         case PROV_OPENAI:
         case PROV_CLOUDCOMPAT:
-        case PROV_XAI: return 128000;
+        case PROV_XAI:
+        case PROV_CURSOR: return 128000;
         default: return 8192;
     }
 }

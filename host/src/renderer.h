@@ -394,8 +394,9 @@ private:
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
     void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
     void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
-    // Feature datum overlays. axesOnly=true draws only Kind::Axis (call BEFORE planes so plane
-    // fill composites over axes); axesOnly=false draws every non-axis datum (planes/points/csys/curves).
+    // Feature datum overlays. axesOnly=false draws non-axis datums (planes/points/csys/curves);
+    // axesOnly=true draws only Kind::Axis. Call axes LAST (after origin planes) so dashed axes
+    // composite over translucent plane fills. selectedDatumId_ emphasizes the selected axis.
     void drawRefDatums(const Mat4& mvp, bool axesOnly);
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad

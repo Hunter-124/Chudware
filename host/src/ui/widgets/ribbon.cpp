@@ -878,12 +878,9 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
                             bool inset = false, bool hovered = false) {
     const float* t = ui::palette.text;
     const float* a = ui::palette.accent;   // colored-glass tint (goes with the app color scheme)
-    // Keep a clearly-visible border at rest (not just on hover) so every button reads as a discrete
-    // key, and keep the top shine restrained so the gradient never blows out to near-white.
-    float lineA    = !enabled ? 0.24f : (hovered ? 0.72f : 0.55f);
+    // Resting outline removed — frosted fill + accent wash alone define the button.
+    // Hover still brightens the wash; active tools use ribbon_btnActive's accent outline.
     float shineMul = !enabled ? 0.35f : (hovered ? 0.95f : 0.55f);
-    ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
-                             (int)(lineA * 255));
     if (inset) {
         // Scale-aware 1px vertical inset so stacked rows don't share an edge pixel at any DPI.
         // (Was hard-coded 1.0f — under-inset at 125%/150% and left a fractional mismatch vs
@@ -921,7 +918,6 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
             ribbon_vGradRounded(dl, g0, g1, rIn, top, btm);
         }
     }
-    dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
 }
 
 // Fwd decl: procedural Finish check badge, drawn over the big button icon (defined below).
@@ -1730,14 +1726,6 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                                    isAct ? 0.42f : (tabHov ? 0.34f : 0.20f));
             const float strength = isAct ? 0.30f : (tabHov ? 0.20f : 0.12f);
             ui::coloredRowWash(dl, tp0, tp1, 4.0f, palette.accent, strength, /*selected*/isAct);
-            if (!isAct) {
-                // Resting border on every non-active tab so each tool tab reads as a discrete
-                // button even when not selected/highlighted. A thin hairline, clearly lighter and
-                // thinner than the active tab's colored glow frame (coloredRowWash selected=true).
-                float bc[4];
-                Palette::withAlpha(palette.border, bc, tabHov ? 0.60f : 0.42f);
-                dl->AddRect(tp0, tp1, Palette::toU32(bc), 4.0f, 0, ui::metrics::stroke(1.0f));
-            }
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])

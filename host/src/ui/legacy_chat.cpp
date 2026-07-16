@@ -5,8 +5,8 @@
 // the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
 // + status + Sessions + settings gear), the conversation log with a per-turn transparent activity
 // timeline (what the AI is doing / thinking, expandable), and a bottom composer (compact Design/
-// Edit/Ask dropdown + context meter; transparent prompt with in-box send; equal-width segmented
-// model/thinking/paperclip/cube/New toolbar).
+// Edit/Ask dropdown + context meter; transparent prompt with in-box send; graduated-width segmented
+// model/thinking/paperclip/cube/New toolbar — model biggest, icons smallest).
 // Header gear swaps the chat area for a compact AI-settings overlay (horizontal top tabs for
 // Agents/Prompts/Skills/Permissions/Accounts). The full form lives in the Settings modal AI tab.
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
@@ -819,6 +819,7 @@ static const char* providerWireName(int provider) {
         case ui::PROV_LLAMACPP:    return "llamacpp";
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
+        case ui::PROV_CURSOR:      return "cursor";
     }
     return "";
 }
@@ -2972,7 +2973,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         else if (s.provider == ui::PROV_ANTHROPIC)
             std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
         else if (s.provider == ui::PROV_OPENAI)
-            std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
+            std::strncpy(s.model, "gpt-5.6-sol", sizeof(s.model) - 1);
         else if (s.provider == ui::PROV_LOCAL) {
             std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
             if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
@@ -2995,6 +2996,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             }
         } else if (s.provider == ui::PROV_XAI) {
             std::strncpy(s.model, "grok-4", sizeof(s.model) - 1);
+            s.vision = true;
+        } else if (s.provider == ui::PROV_CURSOR) {
+            std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
             s.vision = true;
         }
     }
@@ -3450,8 +3454,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             return st.settings.disabledProviders.count(key) == 0;
         };
 
-        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI).
-        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI}) {
+        // Built-in cloud providers (Gemini / Anthropic / OpenAI / xAI / Cursor).
+        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI, ui::PROV_XAI,
+                       ui::PROV_CURSOR}) {
             std::string key = ui::providerCatKey(pv);
             int n = 0;
             for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
@@ -3628,6 +3633,7 @@ static const char* ovRoleProviderWire(int prov) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_CLOUDCOMPAT: return "openrouter";
         case ui::PROV_XAI:         return "xai";
+        case ui::PROV_CURSOR:      return "cursor";
         default: return "local";
     }
 }
@@ -3639,6 +3645,7 @@ static int ovRoleProviderFromWire(const std::string& w) {
     if (w == "gemini") return ui::PROV_GEMINI;
     if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
+    if (w == "cursor") return ui::PROV_CURSOR;
     return -1;
 }
 static bool ovProviderIsLoopback(int prov) {
@@ -3971,7 +3978,7 @@ static void ovApplyProviderDefaults(Settings& s) {
     else if (s.provider == ui::PROV_ANTHROPIC)
         std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
     else if (s.provider == ui::PROV_OPENAI)
-        std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
+        std::strncpy(s.model, "gpt-5.6-sol", sizeof(s.model) - 1);
     else if (s.provider == ui::PROV_LOCAL) {
         std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
         if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
@@ -3992,6 +3999,9 @@ static void ovApplyProviderDefaults(Settings& s) {
         }
     } else if (s.provider == ui::PROV_XAI) {
         std::strncpy(s.model, "grok-4.5", sizeof(s.model) - 1);
+        s.vision = true;
+    } else if (s.provider == ui::PROV_CURSOR) {
+        std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
         s.vision = true;
     }
 }
@@ -4719,6 +4729,7 @@ static const char* providerShort(int provider) {
         case ui::PROV_GEMINI:    return "Gemini";
         case ui::PROV_XAI:       return "xAI";
         case ui::PROV_CLOUDCOMPAT: return "Cloud";
+        case ui::PROV_CURSOR:    return "Cursor";
     }
     return "";
 }
@@ -4775,7 +4786,6 @@ static void pollSubConnected(AppState& st) {
 // so its models can be selected?
 static bool providerUsable(AppState& st, int provider) {
     pollSubConnected(st);
-    (void)s_subConn.cursor;  // reserved: no dedicated PROV_ yet; status still polled
     switch (provider) {
         case ui::PROV_GEMINI:      return st.settings.geminiKey[0] != 0;
         case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
@@ -4784,6 +4794,7 @@ static bool providerUsable(AppState& st, int provider) {
         case ui::PROV_XAI:         return st.settings.xaiKey[0] != 0 || s_subConn.xai;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
+        case ui::PROV_CURSOR:      return s_subConn.cursor;
     }
     return false;
 }
@@ -4832,9 +4843,9 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     return clicked && usable;
 }
 
-// The model dropdown body (hosted in a popup): a search box, the usable models with a checkmark
-// on the current one, an "Other Models" group for unkeyed providers, and a gear that opens the
-// Settings tab. Picking a model sets provider+model and closes the popup.
+// The model dropdown body (hosted in a popup): a search box with a compact glass gear on the
+// same row (opens Settings), the usable models with a checkmark on the current one, and a muted
+// hint for unkeyed providers. Picking a model sets provider+model and closes the popup.
 static void drawModelDropdown(AppState& st, bool busy) {
     (void)busy;
     const auto& pal = ui::palette;
@@ -4843,8 +4854,47 @@ static void drawModelDropdown(AppState& st, bool busy) {
     refreshModelAvailability(st, false);
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
-    ImGui::SetNextItemWidth(-1);
+
+    // Search + glass gear on one row: gear is smaller and sits to the right of a compressed field.
+    const float gearSz = ImGui::GetFrameHeight() * 0.82f;
+    const float gearGap = 4.0f * sc;
+    const float searchW = std::max(40.0f * sc,
+                                   ImGui::GetContentRegionAvail().x - gearSz - gearGap);
+    ImGui::SetNextItemWidth(searchW);
     ImGui::InputTextWithHint("##modelsearch", "Search models", s_modelSearch, sizeof(s_modelSearch));
+    ImGui::SameLine(0.0f, gearGap);
+    {
+        IconUV gear = ui::getIcon("settings", 20);
+        const ImVec2 keep = ImGui::GetCursorScreenPos();
+        // Align gear vertically with the search field.
+        const float fieldH = ImGui::GetFrameHeight();
+        if (gearSz < fieldH)
+            ImGui::SetCursorScreenPos(ImVec2(keep.x, keep.y + (fieldH - gearSz) * 0.5f));
+        const bool openSet = ImGui::InvisibleButton("##mdlgear", ImVec2(gearSz, gearSz));
+        const bool gHov = ImGui::IsItemHovered();
+        ImDrawList* gdl = ImGui::GetWindowDrawList();
+        const ImVec2 gmn = ImGui::GetItemRectMin(), gmx = ImGui::GetItemRectMax();
+        // Compact glass pill (theme helper — not a raw button chrome).
+        ui::glassRowBackground(gdl, gmn, gmx, ui::metrics::rounding(4.0f),
+                               /*stripe=*/false, /*selected=*/gHov, /*washAlpha=*/0.38f);
+        const ImU32 ink = ui::Palette::toU32(gHov ? pal.text : pal.textDim);
+        if (gear.valid) {
+            const float isz = gearSz * 0.58f;
+            const ImVec2 gc((gmn.x + gmx.x) * 0.5f, (gmn.y + gmx.y) * 0.5f);
+            gdl->AddImage(gear.texId,
+                          ImVec2(gc.x - isz * 0.5f, gc.y - isz * 0.5f),
+                          ImVec2(gc.x + isz * 0.5f, gc.y + isz * 0.5f),
+                          gear.uv0, gear.uv1, ink);
+        } else {
+            // Fallback: simple gear-ish cog via text when the atlas cell is missing.
+            const char* gl = "\xE2\x9A\x99";  // ⚙
+            const ImVec2 ts = ImGui::CalcTextSize(gl);
+            gdl->AddText(ImVec2((gmn.x + gmx.x - ts.x) * 0.5f, (gmn.y + gmx.y - ts.y) * 0.5f),
+                         ink, gl);
+        }
+        if (gHov) ImGui::SetTooltip("AI settings");
+        if (openSet) { st.openSettings = true; st.openSettingsTab = 2; ImGui::CloseCurrentPopup(); }
+    }
     ImGui::Separator();
 
     auto lc = [](std::string s) {
@@ -4972,16 +5022,6 @@ static void drawModelDropdown(AppState& st, bool busy) {
         ImGui::PopStyleColor();
     }
 
-    ImGui::Separator();
-    IconUV gear = ui::getIcon("settings", 20);
-    float gsz = ImGui::GetFrameHeight();
-    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - gsz);
-    bool openSet = gear.valid
-        ? ImGui::ImageButton("##mdlgear", gear.texId, ImVec2(gsz - 8 * sc, gsz - 8 * sc),
-                             gear.uv0, gear.uv1)
-        : ImGui::SmallButton("settings");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
-    if (openSet) { st.openSettings = true; st.openSettingsTab = 2; ImGui::CloseCurrentPopup(); }
     if (picked) {
         // CRITICAL: persist the pick to config.json NOW. The in-app run (agent_run_v2) resolves its
         // provider from config.json in the C++ core — NOT from in-memory st.settings — so a pick that
@@ -5351,7 +5391,12 @@ static void drawRuntimeBanner(AppState& st) {
 
 // Build a compact "Provider · model" label for the composer's model chip.
 static void composerModelLabel(const Settings& s, char* out, size_t n) {
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI"};
+    // Keep in lockstep with ui::ProviderIndex (Anthropic..Cursor).
+    const char* provNames[] = {
+        "Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API", "xAI", "Cursor"
+    };
+    static_assert(sizeof(provNames) / sizeof(provNames[0]) == ui::PROV_COUNT,
+                  "composerModelLabel provNames must match PROV_COUNT");
     const char* prov = provNames[(s.provider >= 0 && s.provider < ui::PROV_COUNT)
                                      ? s.provider : ui::PROV_GEMINI];
     std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
@@ -5521,7 +5566,7 @@ static std::string usageFriendlyProvider(int provider) {
         case ui::PROV_ANTHROPIC: return "claude";
         case ui::PROV_OPENAI:    return "codex";  // ChatGPT/Codex sub
         case ui::PROV_XAI:       return "xai";
-        // Cursor has no dedicated PROV_ yet in the picker; omit.
+        case ui::PROV_CURSOR:    return "cursor";
         default: return {};
     }
 }
@@ -5696,7 +5741,8 @@ static void drawCopilotUsageBox(AppState& st) {
 
 }  // namespace
 // Toolbar row below the prompt: [model | thinking | paperclip | context-cube | New]
-// Even end-to-end distribution with overlapping rounded corners (connected segmented look).
+// Graduated widths with overlapping rounded corners (connected segmented look).
+// Model picker is the largest share; paperclip/cube are icon-only minimums.
 // The send/stop control lives inside the input box (drawComposerSendStop).
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
     const auto& pal = ui::palette;
@@ -5753,20 +5799,27 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
     const char* effBtn = effIdx >= 0 ? effLabels[effIdx] : "Default";
 
-    // Five segments fill the row edge-to-edge with equal widths.
-    // Overlapping corners: each segment is slightly wider so rounded ends stack.
+    // Graduated segment widths (left→right: model, thinking, paperclip, cube, New).
+    // Icon chips stay near-square; New < thinking < model share the remaining row.
     const int nSeg = 5;
     const float segH = ImGui::GetFrameHeight();
     const float iconSz = segH;
-    // Total overlap across (nSeg-1) joins is absorbed into equal segment widths.
     const float join = -overlap;  // positive join thickness per boundary
-    const float segW = (availW + join * (float)(nSeg - 1)) / (float)nSeg;
+    const float totalW = availW + join * (float)(nSeg - 1);
+    const float iconW = segH;     // minimal — just an icon
+    const float restW = std::max(0.0f, totalW - iconW * 2.0f);
+    // Relative shares of the non-icon remainder.
+    const float kNew = 1.25f, kThink = 1.75f, kModel = 3.40f;
+    const float kSum = kNew + kThink + kModel;
+    const float newW   = restW * (kNew   / kSum);
+    const float thinkW = restW * (kThink / kSum);
+    const float modelW = restW * (kModel / kSum);
 
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
     {
-        // Ellipsize model text to fit inside its equal segment.
-        const float maxModelW = segW - ImGui::GetStyle().FramePadding.x * 2.0f;
+        // Ellipsize model text to fit inside its (largest) segment. No caret/arrow.
+        const float maxModelW = modelW - ImGui::GetStyle().FramePadding.x * 2.0f;
         if (maxModelW > 0.0f && ImGui::CalcTextSize(modelLabel).x > maxModelW) {
             const float dotsW = ImGui::CalcTextSize("...").x;
             size_t len = std::strlen(modelLabel);
@@ -5779,16 +5832,19 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 1/5 model ----
+    // ---- 1/5 model (biggest, no caret) ----
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(modelLabel, ImVec2(segW, segH))) ImGui::OpenPopup("##modeldropdown");
+    if (ImGui::Button(modelLabel, ImVec2(modelW, segH))) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
+    // Capture the model chip rect so the drop-up popup can anchor fixed above it.
+    const ImVec2 modelBtnMin = ImGui::GetItemRectMin();
+    const ImVec2 modelBtnMax = ImGui::GetItemRectMax();
 
-    // ---- 2/5 thinking effort (level only) ----
+    // ---- 2/5 thinking effort (level only; bigger than New) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(effBtn, ImVec2(segW, segH))) ImGui::OpenPopup("##cmpeffort");
+    if (ImGui::Button(effBtn, ImVec2(thinkW, segH))) ImGui::OpenPopup("##cmpeffort");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Thinking effort for the selected model.");
@@ -5802,10 +5858,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::EndPopup();
     }
 
-    // ---- 3/5 paperclip ----
+    // ---- 3/5 paperclip (icon-only, smallest) ----
     ImGui::SameLine();
     {
-        if (ImGui::Button("##attach", ImVec2(segW, segH))) {
+        if (ImGui::Button("##attach", ImVec2(iconW, segH))) {
             if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
                 st.toast(ui::ToastLevel::Info,
                          "File dialogs are disabled (AI_CAD_NO_FILE_DIALOGS).");
@@ -5852,7 +5908,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 4/5 context-cube ----
+    // ---- 4/5 context-cube (icon-only, smallest) ----
     ImGui::SameLine();
     {
         const bool armed = st.contextPickActive;
@@ -5865,7 +5921,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                 ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.50f));
         }
-        if (ImGui::Button("##ctxcube", ImVec2(segW, segH))) {
+        if (ImGui::Button("##ctxcube", ImVec2(iconW, segH))) {
             st.contextPickActive = !st.contextPickActive;
         }
         if (armed) ImGui::PopStyleColor(3);
@@ -5913,12 +5969,12 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 5/5 New session — same height as the other segments ----
+    // ---- 5/5 New session (slightly bigger than icon chips) ----
     ImGui::SameLine();
     {
         if (busy) ImGui::BeginDisabled();
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        if (ImGui::Button("New", ImVec2(segW, segH))) {
+        if (ImGui::Button("New", ImVec2(newW, segH))) {
             newConversation(st);
             st.prompt[0] = 0;
             st.pendingAttachments.clear();
@@ -5935,14 +5991,23 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     ImGui::PopStyleColor(3);   // button base / hovered / active
     ImGui::PopStyleVar(3);     // FramePadding + ItemSpacing + FrameRounding
 
-    // Clamp the dropdown to the Copilot column's width (minus a small inset) so a narrow column
-    // never overhangs the pinned bubble; 300dp stays the cap for wide columns.
+    // Fixed drop-UP model picker: anchor the popup's BOTTOM-LEFT just above the model chip so
+    // options propagate upward (composer sits at the bottom). ImGuiCond_Always + NoMove keep it
+    // fixed to the chip rather than jumping with default below-item placement.
     {
         const float popW = std::max(180.0f * sc,
                                     std::min(300.0f * sc, ImGui::GetWindowWidth() - 16.0f * sc));
+        const float gap = 4.0f * sc;
         ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
+        ImGui::SetNextWindowPos(ImVec2(modelBtnMin.x, modelBtnMin.y - gap),
+                               ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+        (void)modelBtnMax;
     }
-    if (ImGui::BeginPopup("##modeldropdown")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
+    if (ImGui::BeginPopup("##modeldropdown",
+                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
+        drawModelDropdown(st, busy);
+        ImGui::EndPopup();
+    }
 }
 
 // Is the assistant currently working a turn? Covers every run path: job-based design/edit, the
@@ -5995,11 +6060,11 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
     const float sc = ui::uiScale;
     const float sz = ImGui::GetFrameHeight();
     const float inset = 6.0f * sc;   // clear of the composer's rounded border
-    // Bottom-right anchor, nudged slightly lower so the control sits deeper in the box.
-    // A short (one-row) input still centers the button vertically.
-    const float drop = 3.0f * sc;
-    float y0 = inMax.y - sz + drop;
-    if (y0 < inMin.y) y0 = (inMin.y + inMax.y - sz) * 0.5f;
+    // Sit fully inside the input: keep a bottom inset so the button never intersects the
+    // toolbar's New chip below the box. Short (one-row) inputs still center vertically.
+    const float bottomClear = 6.0f * sc;
+    float y0 = inMax.y - sz - bottomClear;
+    if (y0 < inMin.y + inset) y0 = (inMin.y + inMax.y - sz) * 0.5f;
     const ImVec2 bMin(rightEdgeX - inset - sz, y0);
     const ImVec2 bMax(bMin.x + sz, bMin.y + sz);
 

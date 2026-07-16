@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "vec_math.h"
+#include "ui_theme.h"
 
 namespace {
 const char* kVert = R"(#version 330 core
@@ -1223,13 +1224,13 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     }
 
     // ---- reference overlays (translucent; depthMask off so they never occlude solids) ----
-    // Axes first, then default planes, then other datums. Planes write no depth, so draw order
-    // alone decides compositing: plane fill must land ON TOP of axes or axes paint solidly
-    // through the translucent quads. Non-axis datums (feature planes / points / csys / curves)
-    // stay after so they remain readable over the origin planes.
-    drawRefDatums(mvp, /*axesOnly=*/true);
+    // Origin planes first, then non-axis datums, then axes LAST. Planes write no depth, so
+    // draw order alone decides compositing: axes must land ON TOP of translucent plane fills
+    // or they wash out to near-invisible grey under the quads. Axes still depth-test against
+    // solid faces (depthMask stays off so they never occlude the mesh).
     drawReferencePlanes(mvp);
     drawRefDatums(mvp, /*axesOnly=*/false);
+    drawRefDatums(mvp, /*axesOnly=*/true);
 
     endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1620,14 +1621,14 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
 // systems (3 axes). These build no body, so the engine ships their geometry out-of-band (setRefDatums
-// from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums depth-TEST against
+// from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums depth-test against
 // the solid (depthMask off so they never occlude it) — same contract as the origin planes. Polygon
 // offset matches the shaded-pass offset so we don't always win GL_LESS against pushed solid depths
 // (origin triad bleed-through when force-shown over a body).
 //
-// Two-pass draw from drawCurrent: axesOnly=true BEFORE the translucent origin planes (so plane fill
-// composites over the dashed axes — planes write no depth), axesOnly=false AFTER for feature
-// planes/points/csys/curves. Soft grey axes stay distinct from the light-blue origin planes.
+// Two-pass draw from drawCurrent: non-axis datums after origin planes, then axesOnly=true LAST so
+// dashed axes composite OVER translucent plane fills (planes write no depth). Axes use per-axis
+// RGB colors at high opacity; selectedDatumId_ draws bold/bright (set each frame from selection).
 void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     if (refDatums_.empty() || planeProg_ == 0) return;
     const float e = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
@@ -1663,14 +1664,15 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     for (const auto& d : refDatums_) {
         if (!d.id.empty() && hiddenDatums_.count(d.id)) continue;  // FeatureManager eye hid this datum
         const bool isAxis = (d.kind == RefDatum::Kind::Axis);
-        if (axesOnly != isAxis) continue;  // split pass: axes before planes, rest after
+        if (axesOnly != isAxis) continue;  // split pass: non-axes then axes (drawn last over planes)
         const bool selected = !selectedDatumId_.empty() && d.id == selectedDatumId_;
         switch (d.kind) {
             case RefDatum::Kind::Axis: {
-                // Soft grey DASHED line (slightly brighter + thicker when selected). The dashes are
-                // split on the CPU into cells and every other cell drawn, since core-profile GL has
-                // no line stipple. Endpoints match the axis picker's hit-test (L = e = radius or
-                // kEmptySceneRadius).
+                // Dashed reference axis. Drawn AFTER origin planes (axesOnly pass last) so
+                // translucent plane fills never wash the line out. CPU-side dashes (core GL has
+                // no stipple). Endpoints match the axis picker's hit-test (L = e = radius or
+                // kEmptySceneRadius). Unselected = per-principal RGB at high opacity; selected
+                // (selectedDatumId_ from st.selectedFeatureId) = bold full-opacity accent blue.
                 // Normalize dir so a non-unit inject never collapses the segment; skip only true
                 // zero-length directions (all three axes inject as unit vectors).
                 Vec3 dir = d.dir;
@@ -1680,9 +1682,26 @@ void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
                 Vec3 A = d.origin - dir * L, B = d.origin + dir * L;
                 Vec3 AB = B - A;
                 const int cells = 40;   // 20 visible dashes
-                glLineWidth(selected ? 3.5f : 2.25f);
-                if (selected) setCol(0.72f, 0.74f, 0.78f, 0.70f);
-                else          setCol(0.58f, 0.60f, 0.64f, 0.42f);
+                // Principal-axis tint from palette.axisX/Y/Z. Arbitrary user axes (not near a
+                // cardinal) get palette.accent-dim cyan so they still read over planes.
+                const float* px = ui::palette.axisX;
+                const float* py = ui::palette.axisY;
+                const float* pz = ui::palette.axisZ;
+                const float* pac = ui::palette.accent;
+                float ar = pac[0], ag = pac[1], ab = pac[2];  // accent fallback for free axes
+                const float ax = std::fabs(dir.x), ay = std::fabs(dir.y), az = std::fabs(dir.z);
+                if (ax >= ay && ax >= az && ax > 0.85f) { ar = px[0]; ag = px[1]; ab = px[2]; }
+                else if (ay >= ax && ay >= az && ay > 0.85f) { ar = py[0]; ag = py[1]; ab = py[2]; }
+                else if (az >= ax && az >= ay && az > 0.85f) { ar = pz[0]; ag = pz[1]; ab = pz[2]; }
+                // Selected: thicker + full-opacity accent (picked reference look).
+                // Unselected: axis RGB at high opacity so it stays legible over plane fills.
+                if (selected) {
+                    glLineWidth(4.5f);
+                    setCol(pac[0], pac[1], pac[2], 1.0f);
+                } else {
+                    glLineWidth(2.75f);
+                    setCol(ar, ag, ab, 0.92f);
+                }
                 for (int i = 0; i < cells; i += 2) {
                     float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
                     Vec3 p0 = A + AB * t0, p1 = A + AB * t1;

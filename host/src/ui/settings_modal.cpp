@@ -1044,6 +1044,7 @@ static const char* roleProviderWire(int prov) {
         case ui::PROV_GEMINI:      return "gemini";
         case ui::PROV_CLOUDCOMPAT: return "openrouter";
         case ui::PROV_XAI:         return "xai";
+        case ui::PROV_CURSOR:      return "cursor";
         default: return "local";
     }
 }
@@ -1056,6 +1057,7 @@ static int roleProviderFromWire(const std::string& w) {
     if (w == "gemini") return ui::PROV_GEMINI;
     if (w == "openrouter" || w == "cloud" || w == "cloudcompat") return ui::PROV_CLOUDCOMPAT;
     if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
+    if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;
     return -1;
 }
 

@@ -4,8 +4,8 @@
 // (what the AI is doing / thinking, expandable) whose cards are translucent adaptive glass
 // bubbles over the live viewport backdrop (GlassGroup::Copilot, host contract H5), and a bottom
 // composer (prelude: compact Design/Edit/Ask dropdown + context meter; transparent prompt with
-// in-box send; segmented toolbar: model + thinking | paperclip + context-cube + New, equal-width
-// overlapping chips) painted over the same glass surface. The AI
+// in-box send; graduated segmented toolbar: model biggest, thinking, New, paperclip+cube icons
+// smallest — overlapping chips, drop-up model picker) painted over the same glass surface. The AI
 // settings live in an inline view inside the column (opened by the header Settings control).
 #pragma once
 

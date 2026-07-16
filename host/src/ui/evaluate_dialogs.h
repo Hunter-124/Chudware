@@ -6,7 +6,8 @@
 //
 // Measure is live (re-evals on selection change). Mass Properties seeds density from the document
 // material key, exposes COM / section I / polar J / axial k, and drives viewport markers + body
-// translucency via the overlay accessors below.
+// translucency via the overlay accessors below. Interference view tints bodies + overlap meshes;
+// Measure color-codes refs with viewport highlights + callouts.
 #pragma once
 
 #include <array>
@@ -19,6 +20,38 @@
 struct AppState;
 
 namespace ui {
+
+// Per-ref viewport highlight for Measure (face wash / edge polyline / vertex point).
+// kind matches render::PickKind: 1=Face, 2=Edge, 3=Vertex.
+struct EvalHighlight {
+    uint64_t faceKey = 0;              // (body_id<<32)|face_id when kind==Face
+    int bodyId = 0;
+    int kind = 0;
+    std::array<float, 3> point{};      // vertex position (or face/edge anchor fallback)
+    std::vector<float> polyline;       // flat world xyz for edges (consecutive samples)
+    float rgba[4] = {1, 1, 1, 1};
+};
+
+// In-viewport reading chip (world pos + unit-aware text + matching palette color).
+struct EvalCallout {
+    std::array<float, 3> pos{};
+    std::string text;
+    float rgba[4] = {1, 1, 1, 1};
+};
+
+// Interference Detection viewport state: translucent bodies, per-pair body washes + overlap mesh.
+struct InterferenceView {
+    bool active = false;
+    struct Pair {
+        int bodyA = 0;                 // 0 = unresolved (skip body wash)
+        int bodyB = 0;
+        float rgbaA[4] = {1, 1, 1, 1};
+        float rgbaB[4] = {1, 1, 1, 1};
+        std::vector<float> overlapTris;  // flat xyz triples for Overlays::drawTriangles
+        float overlapRgba[4] = {0.90f, 0.20f, 0.18f, 0.60f};
+    };
+    std::vector<Pair> pairs;
+};
 
 class EvaluateDialogs {
 public:
@@ -41,7 +74,10 @@ public:
     const std::vector<std::pair<std::array<float, 3>, std::string>>& overlayLabels() const {
         return overlayLabels_;
     }
-    // Whole-body alpha to apply while mass markers are visible (1.0 = leave alone).
+    const std::vector<EvalHighlight>& overlayHighlights() const { return overlayHighlights_; }
+    const std::vector<EvalCallout>& overlayCallouts() const { return overlayCallouts_; }
+    const InterferenceView& interferenceView() const { return interferenceView_; }
+    // Whole-body alpha to apply while mass markers / interference view are visible (1.0 = leave alone).
     float requestedBodyAlpha() const { return massBodyAlpha_; }
 
 private:
@@ -51,6 +87,8 @@ private:
     void clearOverlays();
     void rebuildMeasureOverlays(AppState& st);
     void rebuildMassOverlays(AppState& st);
+    void rebuildInterferenceView(AppState& st);
+    void clearFieldColormap(AppState& st);
     void tickLiveMeasure(AppState& st);
     void tickMassDesignSections(AppState& st);
     void seedMassFromDoc(AppState& st);
@@ -88,6 +126,8 @@ private:
     int   measureLoggedGen_ = -1;
     std::string lastMeasureRefs_;
     double lastMeasureFireT_ = -1e9;
+    // Stable palette colors for the last measured refs (same order as selectionRefs).
+    std::vector<std::array<float, 4>> measureRefColors_;
 
     // Section props plane: 0 top, 1 front, 2 right, 3 selected face.
     int sectionPlane_ = 0;
@@ -95,9 +135,16 @@ private:
     // Symmetry plane: 0 front, 1 top, 2 right.
     int symmetryPlane_ = 0;
 
-    // Viewport overlays (world XYZ segments + labels).
+    // Interference member subset (names from last result parts[]; empty = all).
+    std::vector<std::string> interferencePartNames_;
+    std::vector<char> interferencePartChecked_;  // parallel to names; 1 = included
+
+    // Viewport overlays (world XYZ segments + labels + highlights + callouts).
     std::vector<float> overlaySegs_;
     std::vector<std::pair<std::array<float, 3>, std::string>> overlayLabels_;
+    std::vector<EvalHighlight> overlayHighlights_;
+    std::vector<EvalCallout> overlayCallouts_;
+    InterferenceView interferenceView_;
 };
 
 }  // namespace ui

@@ -2662,6 +2662,54 @@ TEST_CASE("boolean: common of two merge:false boxes intersects to the true overl
     CHECK(total_shape_volume(r) == doctest::Approx(32000.0).epsilon(1e-3));
 }
 
+// Wave-2 evaluate: doc_eval_measure on a face ref must carry anchor [x,y,z] (surface
+// centroid) and a non-empty outer-wire polyline (world mm, <=128 pts).
+TEST_CASE("eval_measure: face ref carries anchor and polyline") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    using aicad::doc::doc_eval_measure;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json nr = doc_new("part", "MeasureFace");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"},
+             {"feature",
+              {{"type", "box"},
+               {"name", "Block"},
+               {"params",
+                {{"length", dimv(40)},
+                 {"width", dimv(20)},
+                 {"height", dimv(10)},
+                 {"centered", false},
+                 {"at", json::array({0.0, 0.0, 0.0})}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    for (const auto& fst : resp["rebuild"]["feature_status"])
+        REQUIRE_MESSAGE(fst.value("ok", false),
+                        "feature " << fst.value("id", std::string())
+                                  << " failed: " << fst.value("error", json(nullptr)).dump());
+
+    // Top face of a box at z=10, centroid ~(20,10,10).
+    json m = doc_eval_measure(id, json::array({json{{"of", "face"}, {"side", "top"}}}));
+    REQUIRE_MESSAGE(m.value("kind", std::string()) == "area",
+                    "expected kind=area, got: " << m.dump());
+    REQUIRE(m.contains("anchor"));
+    REQUIRE(m["anchor"].is_array());
+    REQUIRE(m["anchor"].size() == 3);
+    CHECK(m["anchor"][0].get<double>() == doctest::Approx(20.0).epsilon(1e-3));
+    CHECK(m["anchor"][1].get<double>() == doctest::Approx(10.0).epsilon(1e-3));
+    CHECK(m["anchor"][2].get<double>() == doctest::Approx(10.0).epsilon(1e-3));
+    REQUIRE(m.contains("polyline"));
+    REQUIRE(m["polyline"].is_array());
+    CHECK_MESSAGE(m["polyline"].size() >= 4,
+                  "outer wire polyline should have at least 4 pts, got: " << m.dump());
+    CHECK(m["polyline"].size() <= 128);
+    for (const auto& p : m["polyline"]) {
+        REQUIRE(p.is_array());
+        REQUIRE(p.size() == 3);
+    }
+}
+
 // P3: a boolean fuse / boss-merge of two DISJOINT solids (two cylinders placed far apart)
 // leaves a single TopoDS_Compound holding TWO TopAbs_SOLIDs — OCCT does not weld bodies that
 // do not touch. doc_eval_mass must report the PHYSICAL body count (2) by exploding the

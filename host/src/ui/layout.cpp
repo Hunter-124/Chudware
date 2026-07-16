@@ -99,6 +99,22 @@ float overlayColumnEdge(int slot) {
     return g_overlayColEdge[slot];
 }
 
+// ---- Evaluate-tab ribbon inspector dock (see layout.h) -----------------------------------------
+// Frame-stamped so the dock invalidates one frame after the ribbon stops publishing it (tab switch).
+static EvalRibbonDock g_evalDock;
+static int            g_evalDockFrame = -1;
+
+void setEvalRibbonDock(float minX, float minY, float maxX, float maxY) {
+    g_evalDock.minX = minX; g_evalDock.minY = minY;
+    g_evalDock.maxX = maxX; g_evalDock.maxY = maxY;
+    g_evalDock.valid = (maxX > minX && maxY > minY);
+    g_evalDockFrame = ImGui::GetFrameCount();
+}
+EvalRibbonDock evalRibbonDock() {
+    if (g_evalDockFrame < ImGui::GetFrameCount() - 1) { EvalRibbonDock d; return d; }
+    return g_evalDock;
+}
+
 // ---- pinned-column rendered height (see layout.h) -----------------------------------------------
 // Mirrors publishOverlayColumnEdge: each column publishes its actual rendered height in pixels
 // once per frame so the orientation triad can decide whether the column reaches down to the triad

@@ -13,6 +13,7 @@
 #include "../ribbon_def.h"    // RibbonCmd, getRibbonCmds
 #include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
+#include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
 
 #include <cmath>
 #include <cstdio>
@@ -2139,6 +2140,19 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         }
 
         curX += grpW;
+    }
+
+    // Evaluate-tab inspector dock: publish the dead space to the RIGHT of the last group so the
+    // Zebra / Symmetry windows pin INSIDE the ribbon strip (Hunter red-pen: dock, don't float).
+    // curX is the last group's right edge (child-local); the child spans vp->Size.x - 8*s.
+    if (std::strcmp(actTabName, "Evaluate") == 0) {
+        const ImVec2 cwp = ImGui::GetWindowPos();
+        const float gpad = kGroupPadX * s * 0.5f;
+        const float dockL = cwp.x + curX + gpad + (anyHidden ? 26.0f * s : 0.0f);
+        const float dockT = cwp.y + ribbon_groupPadY();
+        const float dockR = cwp.x + (vp->Size.x - 8.0f * s) - 6.0f * s;
+        const float dockB = cwp.y + bodyH2 - ribbon_groupPadY();
+        ui::setEvalRibbonDock(dockL, dockT, dockR, dockB);
     }
 
     // --- C25-W3G: overflow chevron ---

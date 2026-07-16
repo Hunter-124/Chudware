@@ -7293,20 +7293,27 @@ gp_Pln eval_resolve_plane(const json& plane_ref) {
                           {{"reason", "degenerate normal"}});
         gp_Pnt origin(o[0].get<double>(), o[1].get<double>(), o[2].get<double>());
         gp_Dir normal(nx / nlen, ny / nlen, nz / nlen);
-        if (plane_ref.contains("xdir") && plane_ref["xdir"].is_array() &&
-            plane_ref["xdir"].size() == 3 && plane_ref["xdir"][0].is_number() &&
-            plane_ref["xdir"][1].is_number() && plane_ref["xdir"][2].is_number()) {
-            const json& xd = plane_ref["xdir"];
-            const double xx = xd[0].get<double>(), xy = xd[1].get<double>(),
-                         xz = xd[2].get<double>();
-            const double xlen = std::sqrt(xx * xx + xy * xy + xz * xz);
-            if (xlen < 1e-12)
-                throw OpError("invalid_op", "plane xdir is near-zero",
-                              {{"reason", "degenerate xdir"}});
-            gp_Dir xdir(xx / xlen, xy / xlen, xz / xlen);
-            return gp_Pln(gp_Ax3(origin, normal, xdir));
+        try {
+            if (plane_ref.contains("xdir") && plane_ref["xdir"].is_array() &&
+                plane_ref["xdir"].size() == 3 && plane_ref["xdir"][0].is_number() &&
+                plane_ref["xdir"][1].is_number() && plane_ref["xdir"][2].is_number()) {
+                const json& xd = plane_ref["xdir"];
+                const double xx = xd[0].get<double>(), xy = xd[1].get<double>(),
+                             xz = xd[2].get<double>();
+                const double xlen = std::sqrt(xx * xx + xy * xy + xz * xz);
+                if (xlen < 1e-12)
+                    throw OpError("invalid_op", "plane xdir is near-zero",
+                                  {{"reason", "degenerate xdir"}});
+                gp_Dir xdir(xx / xlen, xy / xlen, xz / xlen);
+                // gp_Ax3 throws when xdir is parallel to normal.
+                return gp_Pln(gp_Ax3(origin, normal, xdir));
+            }
+            return gp_Pln(gp_Ax3(origin, normal));
+        } catch (const Standard_Failure& e) {
+            throw OpError("invalid_op",
+                          std::string("plane frame invalid: ") + e.GetMessageString(),
+                          {{"reason", "bad plane frame"}});
         }
-        return gp_Pln(gp_Ax3(origin, normal));
     }
 
     std::string name;
@@ -7417,10 +7424,118 @@ bool eval_try_angle(const TopoDS_Shape& a, const TopoDS_Shape& b, double& out) {
     return false;
 }
 
+// Sample an edge as a world-mm polyline, capped at max_pts (inclusive of endpoints).
+json eval_sample_edge_polyline(const TopoDS_Edge& edge, int max_pts = 128) {
+    json pts = json::array();
+    try {
+        BRepAdaptor_Curve ca(edge);
+        const double t0 = ca.FirstParameter();
+        const double t1 = ca.LastParameter();
+        const int n = std::max(2, std::min(max_pts, 128));
+        pts.get_ptr<json::array_t*>()->reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            const double t = (n == 1) ? t0
+                                     : t0 + (t1 - t0) * (static_cast<double>(i) / (n - 1));
+            gp_Pnt p = ca.Value(t);
+            pts.push_back(json::array({p.X(), p.Y(), p.Z()}));
+        }
+    } catch (const Standard_Failure&) {
+        pts = json::array();
+    }
+    return pts;
+}
+
+// Outer-wire polyline for a face: walk edges of BRepTools::OuterWire, sample, cap at 128.
+json eval_sample_face_polyline(const TopoDS_Face& face, int max_pts = 128) {
+    json pts = json::array();
+    try {
+        const TopoDS_Wire outer = BRepTools::OuterWire(face);
+        if (outer.IsNull()) return pts;
+        std::vector<json> raw;
+        raw.reserve(static_cast<std::size_t>(max_pts));
+        // First count edges so each gets a fair sample budget.
+        int n_edges = 0;
+        for (TopExp_Explorer cx(outer, TopAbs_EDGE); cx.More(); cx.Next()) ++n_edges;
+        if (n_edges <= 0) return pts;
+        const int per_edge = std::max(2, std::min(16, max_pts / n_edges));
+        for (TopExp_Explorer ex(outer, TopAbs_EDGE); ex.More(); ex.Next()) {
+            if (static_cast<int>(raw.size()) >= max_pts) break;
+            const TopoDS_Edge e = TopoDS::Edge(ex.Current());
+            const int remain = max_pts - static_cast<int>(raw.size());
+            const int edge_budget = std::max(2, std::min(remain, per_edge));
+            json ep = eval_sample_edge_polyline(e, edge_budget);
+            for (const auto& p : ep) {
+                if (static_cast<int>(raw.size()) >= max_pts) break;
+                // Drop near-duplicate joints between consecutive edges.
+                if (!raw.empty()) {
+                    const json& prev = raw.back();
+                    const double dx = p[0].get<double>() - prev[0].get<double>();
+                    const double dy = p[1].get<double>() - prev[1].get<double>();
+                    const double dz = p[2].get<double>() - prev[2].get<double>();
+                    if (dx * dx + dy * dy + dz * dz < 1e-12) continue;
+                }
+                raw.push_back(p);
+            }
+        }
+        if (static_cast<int>(raw.size()) > max_pts && max_pts > 1) {
+            std::vector<json> ds;
+            ds.reserve(static_cast<std::size_t>(max_pts));
+            for (int i = 0; i < max_pts; ++i) {
+                const std::size_t idx = static_cast<std::size_t>(
+                    (static_cast<double>(i) / (max_pts - 1)) * (raw.size() - 1));
+                ds.push_back(raw[idx]);
+            }
+            raw.swap(ds);
+        }
+        for (auto& p : raw) pts.push_back(std::move(p));
+    } catch (const Standard_Failure&) {
+        pts = json::array();
+    }
+    return pts;
+}
+
+// Centroid + optional polyline enrichment shared by single/pair measure paths.
+void eval_measure_enrich(json& out, const TopoDS_Shape& raw) {
+    try {
+        const TopAbs_ShapeEnum st = raw.ShapeType();
+        if (st == TopAbs_EDGE) {
+            const TopoDS_Edge edge = TopoDS::Edge(raw);
+            GProp_GProps gp;
+            BRepGProp::LinearProperties(edge, gp);
+            gp_Pnt c = gp.CentreOfMass();
+            out["anchor"] = json::array({c.X(), c.Y(), c.Z()});
+            json pl = eval_sample_edge_polyline(edge, 128);
+            if (!pl.empty()) out["polyline"] = std::move(pl);
+        } else if (st == TopAbs_FACE) {
+            const TopoDS_Face face = TopoDS::Face(raw);
+            GProp_GProps gp;
+            BRepGProp::SurfaceProperties(face, gp);
+            gp_Pnt c = gp.CentreOfMass();
+            out["anchor"] = json::array({c.X(), c.Y(), c.Z()});
+            json pl = eval_sample_face_polyline(face, 128);
+            if (!pl.empty()) out["polyline"] = std::move(pl);
+        } else if (st == TopAbs_VERTEX) {
+            gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(raw));
+            out["anchor"] = json::array({p.X(), p.Y(), p.Z()});
+            // no polyline for vertices
+        } else {
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(raw, gp);
+            gp_Pnt c = gp.CentreOfMass();
+            out["anchor"] = json::array({c.X(), c.Y(), c.Z()});
+        }
+    } catch (const Standard_Failure&) {
+        // leave without enrichment on failure
+    } catch (...) {
+    }
+}
+
+
 // engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius+diameter+length (circle)
 // or length; FACE -> area+perimeter; VERTEX -> point; else volume.
 json eval_measure_single(const TopoDS_Shape& raw) {
     const TopAbs_ShapeEnum st = raw.ShapeType();
+    json result;
     if (st == TopAbs_EDGE) {
         TopoDS_Edge edge = TopoDS::Edge(raw);
         const double len = eval_edge_length(edge);
@@ -7428,16 +7543,15 @@ json eval_measure_single(const TopoDS_Shape& raw) {
             BRepAdaptor_Curve ca(edge);
             if (ca.GetType() == GeomAbs_Circle) {
                 const double r = ca.Circle().Radius();
-                return json{{"kind", "radius"},
-                            {"radius", r},
-                            {"diameter", 2.0 * r},
-                            {"length", len}};
+                result = json{{"kind", "radius"},
+                              {"radius", r},
+                              {"diameter", 2.0 * r},
+                              {"length", len}};
             }
         } catch (const Standard_Failure&) {
         }
-        return json{{"kind", "length"}, {"length", len}};
-    }
-    if (st == TopAbs_FACE) {
+        if (result.empty()) result = json{{"kind", "length"}, {"length", len}};
+    } else if (st == TopAbs_FACE) {
         GProp_GProps gp;
         BRepGProp::SurfaceProperties(raw, gp);
         double perimeter = 0.0;
@@ -7454,15 +7568,18 @@ json eval_measure_single(const TopoDS_Shape& raw) {
         } catch (const Standard_Failure&) {
             perimeter = 0.0;
         }
-        return json{{"kind", "area"}, {"area", gp.Mass()}, {"perimeter", perimeter}};
-    }
-    if (st == TopAbs_VERTEX) {
+        result = json{{"kind", "area"}, {"area", gp.Mass()}, {"perimeter", perimeter}};
+    } else if (st == TopAbs_VERTEX) {
         gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(raw));
-        return json{{"kind", "point"}, {"points", json::array({json::array({p.X(), p.Y(), p.Z()})})}};
+        result = json{{"kind", "point"},
+                      {"points", json::array({json::array({p.X(), p.Y(), p.Z()})})}};
+    } else {
+        GProp_GProps gp;
+        BRepGProp::VolumeProperties(raw, gp);
+        result = json{{"kind", "volume"}, {"volume", gp.Mass()}};
     }
-    GProp_GProps gp;
-    BRepGProp::VolumeProperties(raw, gp);
-    return json{{"kind", "volume"}, {"volume", gp.Mass()}};
+    eval_measure_enrich(result, raw);
+    return result;
 }
 
 // engine/doc/evaluate.py::_measure_pair — distance (BRepExtrema) + optional angle.
@@ -7520,6 +7637,13 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
         if (!result.contains("kind")) result["kind"] = "angle";
     }
     if (result.empty()) result["kind"] = "unknown";
+    // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
+    json ea = json::object();
+    eval_measure_enrich(ea, a);
+    json eb = json::object();
+    eval_measure_enrich(eb, b);
+    if (!ea.empty()) result["a"] = std::move(ea);
+    if (!eb.empty()) result["b"] = std::move(eb);
     return result;
 }
 
@@ -8031,6 +8155,115 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
     }
 }
 
+// Explode a compound/compsolid into SOLID children; fall back to the shape as-is when
+// no solid is present (imported shells / face soups). Used so BRepAlgoAPI_Common sees
+// real solids on STEP imports that arrive as TopoDS_Compound.
+TopoDS_Shape eval_interference_member_shape(const TopoDS_Shape& raw) {
+    if (raw.IsNull()) return raw;
+    try {
+        const TopAbs_ShapeEnum st = raw.ShapeType();
+        if (st == TopAbs_SOLID || st == TopAbs_COMPSOLID) return raw;
+        TopTools_IndexedMapOfShape smap;
+        TopExp::MapShapes(raw, TopAbs_SOLID, smap);
+        if (smap.Extent() == 0) return raw;  // shell / face soup — use as-is
+        if (smap.Extent() == 1) return smap.FindKey(1);
+        BRep_Builder bb;
+        TopoDS_Compound comp;
+        bb.MakeCompound(comp);
+        for (int i = 1; i <= smap.Extent(); ++i) bb.Add(comp, smap.FindKey(i));
+        return comp;
+    } catch (const Standard_Failure&) {
+        return raw;
+    } catch (...) {
+        return raw;
+    }
+}
+
+// Tessellate a Common-overlap shape into positions[]/indices[] (world mm). Coarse
+// deflection; cap ~50k tris; never throws — empty arrays on any failure.
+json eval_overlap_mesh(const TopoDS_Shape& common_shape) {
+    json empty = json{{"positions", json::array()}, {"indices", json::array()}};
+    if (common_shape.IsNull()) return empty;
+    try {
+        Bnd_Box box;
+        BRepBndLib::Add(common_shape, box);
+        double diag = 1.0;
+        if (!box.IsVoid()) {
+            double xmn, ymn, zmn, xmx, ymx, zmx;
+            box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+            const double dx = xmx - xmn, dy = ymx - ymn, dz = zmx - zmn;
+            diag = std::max(1e-6, std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        auto mesh_at = [&](double defl) -> json {
+            BRepTools::Clean(common_shape);
+            BRepMesh_IncrementalMesh mesher(common_shape, defl, Standard_False, 0.5,
+                                            Standard_True);
+            mesher.Perform();
+            json positions = json::array();
+            json indices = json::array();
+            std::size_t n_tris = 0;
+            constexpr std::size_t kMaxTris = 50000;
+            for (TopExp_Explorer ex(common_shape, TopAbs_FACE); ex.More(); ex.Next()) {
+                if (n_tris >= kMaxTris) break;
+                const TopoDS_Face face = TopoDS::Face(ex.Current());
+                TopLoc_Location loc;
+                Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+                if (tri.IsNull() || tri->NbTriangles() == 0) continue;
+                const gp_Trsf trsf = loc.Transformation();
+                const bool reversed = (face.Orientation() == TopAbs_REVERSED);
+                const int base = static_cast<int>(positions.size() / 3);
+                for (int ni = 1; ni <= tri->NbNodes(); ++ni) {
+                    gp_Pnt p = tri->Node(ni).Transformed(trsf);
+                    positions.push_back(p.X());
+                    positions.push_back(p.Y());
+                    positions.push_back(p.Z());
+                }
+                for (int ti = 1; ti <= tri->NbTriangles(); ++ti) {
+                    if (n_tris >= kMaxTris) break;
+                    Standard_Integer n1, n2, n3;
+                    tri->Triangle(ti).Get(n1, n2, n3);
+                    if (reversed) std::swap(n2, n3);
+                    indices.push_back(base + (n1 - 1));
+                    indices.push_back(base + (n2 - 1));
+                    indices.push_back(base + (n3 - 1));
+                    ++n_tris;
+                }
+            }
+            return json{{"positions", std::move(positions)}, {"indices", std::move(indices)},
+                        {"_n_tris", n_tris}};
+        };
+
+        double defl = std::max(0.5, diag / 80.0);
+        json mesh = mesh_at(defl);
+        // Coarsen once if over the triangle cap (still return what fits).
+        if (mesh.value("_n_tris", 0ull) >= 50000ull) {
+            mesh = mesh_at(defl * 2.0);
+        }
+        mesh.erase("_n_tris");
+        return mesh;
+    } catch (const Standard_Failure&) {
+        return empty;
+    } catch (...) {
+        return empty;
+    }
+}
+
+// Build overlap_bbox [[min],[max]] from BRepBndLib::Add of the Common shape.
+json eval_overlap_bbox(const TopoDS_Shape& common_shape) {
+    try {
+        Bnd_Box box;
+        BRepBndLib::Add(common_shape, box);
+        if (box.IsVoid()) return json::array();
+        double xmn, ymn, zmn, xmx, ymx, zmx;
+        box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+        return json::array({json::array({xmn, ymn, zmn}), json::array({xmx, ymx, zmx})});
+    } catch (const Standard_Failure&) {
+        return json::array();
+    } catch (...) {
+        return json::array();
+    }
+}
+
 // Pairwise interference report over a list of named (name, shape) members — the shared core
 // of engine/doc/evaluate.py::interference (kernel.py::_fit_report). Pairwise overlap
 // (BRepAlgoAPI_Common volume) + clearance (BRepExtrema min distance), per-part bbox.
@@ -8100,6 +8333,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
             // the boolean, the result is identical (lossless prefilter, all callers).
             bool ov_ok = false;
             double ov = 0.0;
+            TopoDS_Shape common_shape;
             if (gap_lb > 0.0) {
                 ov_ok = true;
             } else {
@@ -8107,7 +8341,8 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                     BRepAlgoAPI_Common common(members[i].second, members[j].second);
                     common.Build();
                     if (common.IsDone()) {
-                        ov = eval_vol_or_zero(common.Shape());
+                        common_shape = common.Shape();
+                        ov = eval_vol_or_zero(common_shape);
                         ov_ok = true;
                     }
                 } catch (const Standard_Failure&) {
@@ -8115,7 +8350,25 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
             }
             if (!ov_ok) continue;  // matches the warnings-sink "interference check failed" path
             if (ov > INTERFERENCE_EPS) {
-                interferences.push_back(json{{"a", name_i}, {"b", name_j}, {"volume", ov}});
+                json item = {{"a", name_i},
+                             {"b", name_j},
+                             {"volume", ov},
+                             {"overlap_volume_mm3", ov}};
+                // Bbox + mesh of the Common shape (never throws; empty mesh on failure).
+                try {
+                    if (!common_shape.IsNull()) {
+                        json bb = eval_overlap_bbox(common_shape);
+                        if (bb.is_array() && bb.size() == 2) item["overlap_bbox"] = std::move(bb);
+                        item["overlap_mesh"] = eval_overlap_mesh(common_shape);
+                    } else {
+                        item["overlap_mesh"] =
+                            json{{"positions", json::array()}, {"indices", json::array()}};
+                    }
+                } catch (...) {
+                    item["overlap_mesh"] =
+                        json{{"positions", json::array()}, {"indices", json::array()}};
+                }
+                interferences.push_back(std::move(item));
             } else if (quick && gap_lb > quick_window_mm) {
                 // Far pair in quick mode: the bbox gap stands in for the exact distance.
                 clearances.push_back(json{{"a", name_i}, {"b", name_j},
@@ -8196,12 +8449,31 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
             for (const AsmBodyOut& body : ares->bodies) {
                 // interference measures the REAL assembly: no explode offset (explode=False).
                 TopoDS_Shape world = placed_world_shape(body, std::nullopt);
-                members.emplace_back(body.name, world);
+                // Imported STEP bodies may arrive as compounds — explode to SOLID(s).
+                members.emplace_back(body.name, eval_interference_member_shape(world));
             }
     } else {
         CompileResult r = compile_session(s);
         for (std::size_t i = 0; i < r.shapes.size(); ++i)
-            members.emplace_back("b" + std::to_string(i + 1), r.shapes[i]);
+            members.emplace_back("b" + std::to_string(i + 1),
+                                eval_interference_member_shape(r.shapes[i]));
+    }
+    // Optional `members` filter: case-sensitive exact match on the same names emitted in
+    // parts[]/interferences[]. Absent or empty preserves all-members behaviour.
+    if (params.contains("members") && params["members"].is_array() &&
+        !params["members"].empty()) {
+        std::unordered_set<std::string> keep;
+        for (const auto& m : params["members"]) {
+            if (m.is_string()) keep.insert(m.get<std::string>());
+        }
+        if (!keep.empty()) {
+            std::vector<std::pair<std::string, TopoDS_Shape>> filtered;
+            filtered.reserve(members.size());
+            for (auto& mem : members) {
+                if (keep.count(mem.first)) filtered.push_back(std::move(mem));
+            }
+            members.swap(filtered);
+        }
     }
     const bool include_coincident = params.contains("include_coincident") &&
                                     params["include_coincident"].is_boolean() &&
@@ -8515,6 +8787,14 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
                     {"distances", distances},
                     {"total_distance", total}};
     if (!points.empty()) out["points"] = points;
+    // Per-ref enrichment for multi path (anchor/polyline per resolved element).
+    json elements = json::array();
+    for (const TopoDS_Shape& sh : shapes) {
+        json el = json::object();
+        eval_measure_enrich(el, sh);
+        elements.push_back(std::move(el));
+    }
+    out["elements"] = std::move(elements);
     return out;
 }
 

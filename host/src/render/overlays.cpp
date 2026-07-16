@@ -304,6 +304,28 @@ void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
     glBindVertexArray(0);
 }
 
+// Wash every face of one body with an explicit RGBA (interference-view body tint). Same GL state
+// as drawFaceWash but keyed on the body high-word so callers needn't enumerate face ids.
+void Overlays::drawBodyWash(const Renderer::CameraXform& cam, uint32_t bodyId, const float rgba[4]) {
+    if (faces_.empty() || !prog_) return;
+    bindCommon(cam);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -1.0f);
+    glUniform4fv(uColor_, 1, rgba);
+    for (const auto& kv : faces_) {
+        if ((uint32_t)(kv.first >> 32) != bodyId) continue;
+        glBindVertexArray(kv.second.vao);
+        glDrawElements(GL_TRIANGLES, kv.second.idxCount, GL_UNSIGNED_INT, 0);
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
 void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
                             const float rgba[4], float lineWidth, bool overSurface) {
     if (xyz.size() < 6 || !prog_) return;

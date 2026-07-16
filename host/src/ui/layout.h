@@ -107,4 +107,13 @@ void drawConfigurationsBody(AppState& st);
 // Call immediately before ImGui::Begin(); no-op fallback (ImGui default cascade) pre-band-publish.
 void setNextCommandDialogPlacement();
 
+// Evaluate-tab ribbon "dead space" (screen px) to the RIGHT of the last Evaluate group. The
+// Zebra / Symmetry inspector windows dock INTO this strip while the Evaluate tab is active
+// (Hunter red-pen: they must pin inside the ribbon bar, not float over the viewport). The ribbon
+// publishes it every frame it draws the Evaluate tab; evalRibbonDock().valid is false otherwise
+// (frame-stamped, like the overlay-column edges) so a tab switch drops the dock next frame.
+struct EvalRibbonDock { float minX = 0, minY = 0, maxX = 0, maxY = 0; bool valid = false; };
+void setEvalRibbonDock(float minX, float minY, float maxX, float maxY);
+EvalRibbonDock evalRibbonDock();
+
 }  // namespace ui

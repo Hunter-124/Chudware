@@ -2476,7 +2476,73 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const float accent[4] = {pal.accent[0], pal.accent[1], pal.accent[2], 0.95f};
                     st.overlays->drawSegments(renderer.camera(), es, accent, 2.2f, true);
                 }
-                // Whole-body translucency while mass markers are active.
+                // Per-ref Measure highlights: face wash / edge polyline / vertex cross.
+                for (const auto& hl : st.evaluateDialogs->overlayHighlights()) {
+                    if (hl.kind == 1 /*Face*/ && hl.faceKey != 0) {
+                        std::vector<uint64_t> keys = {hl.faceKey};
+                        st.overlays->drawFaceWash(renderer.camera(), keys, hl.rgba);
+                    } else if (hl.kind == 2 /*Edge*/ && hl.polyline.size() >= 6) {
+                        // Consecutive polyline samples -> segment list.
+                        std::vector<float> segs;
+                        const size_t nPts = hl.polyline.size() / 3;
+                        segs.reserve((nPts > 1 ? nPts - 1 : 0) * 6);
+                        for (size_t i = 0; i + 1 < nPts; ++i) {
+                            segs.push_back(hl.polyline[i * 3 + 0]);
+                            segs.push_back(hl.polyline[i * 3 + 1]);
+                            segs.push_back(hl.polyline[i * 3 + 2]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 0]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 1]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 2]);
+                        }
+                        if (!segs.empty())
+                            st.overlays->drawSegments(renderer.camera(), segs, hl.rgba, 2.4f, true);
+                    } else if (hl.kind == 3 /*Vertex*/ ||
+                               (hl.kind != 1 && hl.kind != 2 &&
+                                (hl.point[0] != 0.f || hl.point[1] != 0.f || hl.point[2] != 0.f))) {
+                        // Small cross at the vertex / anchor point.
+                        const float s = 1.5f;
+                        std::vector<float> cross = {
+                            hl.point[0] - s, hl.point[1], hl.point[2],
+                            hl.point[0] + s, hl.point[1], hl.point[2],
+                            hl.point[0], hl.point[1] - s, hl.point[2],
+                            hl.point[0], hl.point[1] + s, hl.point[2],
+                            hl.point[0], hl.point[1], hl.point[2] - s,
+                            hl.point[0], hl.point[1], hl.point[2] + s,
+                        };
+                        st.overlays->drawSegments(renderer.camera(), cross, hl.rgba, 2.4f, true);
+                    } else if (!hl.polyline.empty() && hl.polyline.size() >= 6) {
+                        // Enrich-only edge without kind.
+                        std::vector<float> segs;
+                        const size_t nPts = hl.polyline.size() / 3;
+                        segs.reserve((nPts > 1 ? nPts - 1 : 0) * 6);
+                        for (size_t i = 0; i + 1 < nPts; ++i) {
+                            segs.push_back(hl.polyline[i * 3 + 0]);
+                            segs.push_back(hl.polyline[i * 3 + 1]);
+                            segs.push_back(hl.polyline[i * 3 + 2]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 0]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 1]);
+                            segs.push_back(hl.polyline[(i + 1) * 3 + 2]);
+                        }
+                        if (!segs.empty())
+                            st.overlays->drawSegments(renderer.camera(), segs, hl.rgba, 2.4f, true);
+                    }
+                }
+                // Interference view: body washes + overlap triangle meshes.
+                const auto& iv = st.evaluateDialogs->interferenceView();
+                if (iv.active) {
+                    for (const auto& pr : iv.pairs) {
+                        if (pr.bodyA > 0)
+                            st.overlays->drawBodyWash(renderer.camera(), (uint32_t)pr.bodyA,
+                                                     pr.rgbaA);
+                        if (pr.bodyB > 0)
+                            st.overlays->drawBodyWash(renderer.camera(), (uint32_t)pr.bodyB,
+                                                     pr.rgbaB);
+                        if (pr.overlapTris.size() >= 9)
+                            st.overlays->drawTriangles(renderer.camera(), pr.overlapTris,
+                                                      pr.overlapRgba, true);
+                    }
+                }
+                // Whole-body translucency while mass markers / interference view are active.
                 if (st.renderer)
                     st.renderer->setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
             }
@@ -4242,6 +4308,42 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                               ImVec2(q0.x + 6.0f * ui::uiScale, q0.y + 3.0f * ui::uiScale), ls,
                               lab.second.c_str());
                 (void)vpal2;
+            }
+        }
+        // Evaluate Measure colored callouts (world → screen glass chips in ref color).
+        if (st.evaluateDialogs && !st.evaluateDialogs->overlayCallouts().empty()) {
+            const float* m = renderer.camera().mvp.m;
+            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
+                float x = m[0] * wx + m[4] * wy + m[8] * wz + m[12];
+                float y = m[1] * wx + m[5] * wy + m[9] * wz + m[13];
+                float wc = m[3] * wx + m[7] * wy + m[11] * wz + m[15];
+                if (wc <= 1e-4f) return false;
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            for (const auto& co : st.evaluateDialogs->overlayCallouts()) {
+                if (co.text.empty()) continue;
+                ImVec2 sp;
+                if (!project(co.pos[0], co.pos[1], co.pos[2], sp)) continue;
+                ImVec2 ts = ImGui::CalcTextSize(co.text.c_str());
+                ImVec2 q0(sp.x - ts.x * 0.5f - 6.0f * ui::uiScale,
+                          sp.y - ts.y - 8.0f * ui::uiScale);
+                ImVec2 q1(q0.x + ts.x + 12.0f * ui::uiScale, q0.y + ts.y + 6.0f * ui::uiScale);
+                const ui::AdaptiveSurface& ls =
+                    ui::adaptivePanel(ui::panelId("vp_eval_callout"), ImRect(q0, q1),
+                                      ui::GlassGroup::Hud);
+                ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ls);
+                // Colored border matching the measure ref palette.
+                ImU32 bord = IM_COL32((int)(co.rgba[0] * 255), (int)(co.rgba[1] * 255),
+                                     (int)(co.rgba[2] * 255), (int)(0.95f * 255));
+                ImU32 fill = IM_COL32((int)(co.rgba[0] * 255), (int)(co.rgba[1] * 255),
+                                     (int)(co.rgba[2] * 255), (int)(0.28f * 255));
+                vdl->AddRectFilled(q0, q1, fill, 4.0f * ui::uiScale);
+                vdl->AddRect(q0, q1, bord, 4.0f * ui::uiScale, 0, 1.5f * ui::uiScale);
+                ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                              ImVec2(q0.x + 6.0f * ui::uiScale, q0.y + 3.0f * ui::uiScale), ls,
+                              co.text.c_str());
             }
         }
 

@@ -1928,9 +1928,12 @@ def _build_emphasis_palette(matches: list, mode: str = "emphasis") -> dict:
         if not entries:
             entries.append({"key": "target", "sid": None, "rgb": list(rgb), "role": "emphasis"})
     else:
+        # Sequential palette slots guarantee DISTINCT colours across a small set of
+        # measured/emphasized elements (hash-by-sid can collide within 10 slots).
+        n = len(_EMPHASIS_PALETTE)
         for i, m in enumerate(matches or []):
             key = _match_color_key(m, i)
-            rgb = _stable_color_for_key(key)
+            rgb = _EMPHASIS_PALETTE[i % n]
             entries.append({
                 "key": key,
                 "sid": m.get("sid"),
@@ -1978,11 +1981,17 @@ def _project_match_pixels(doc_id: str, match: dict, part_bbox: dict, view_dir: t
 def _apply_emphasis_overlay(src_png: str, doc_id: str, matches: list, part_bbox: dict,
                             view_dir: tuple, mode: str = "emphasis",
                             out_png: Optional[str] = None,
-                            W: int = _RENDER_W, H: int = _RENDER_H) -> tuple:
-    """Desaturate context, paint emphasized faces, glow outline. Returns (path, palette)."""
+                            W: int = _RENDER_W, H: int = _RENDER_H,
+                            palette: Optional[dict] = None) -> tuple:
+    """Desaturate context, paint emphasized faces, glow outline. Returns (path, palette).
+
+    palette: optional pre-built emphasis palette (from _build_emphasis_palette). When
+    omitted, built from matches + mode. Callers that need index-stable distinct colours
+    (measure) pass their own palette so caption colours match the painted overlay.
+    """
     from PIL import Image as PILImage, ImageDraw, ImageFilter, ImageEnhance  # noqa: PLC0415
 
-    palette = _build_emphasis_palette(matches, mode=mode)
+    palette = palette or _build_emphasis_palette(matches, mode=mode)
     out_png = out_png or _tmp(".png")
     with PILImage.open(src_png) as im0:
         im = im0.convert("RGB")
@@ -1993,14 +2002,17 @@ def _apply_emphasis_overlay(src_png: str, doc_id: str, matches: list, part_bbox:
         base = grey.convert("RGBA")
         overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
-
         color_by_key = {e["key"]: tuple(e["rgb"]) for e in palette["entries"]}
         default_rgb = tuple(palette["entries"][0]["rgb"]) if palette["entries"] else _EMPHASIS_PALETTE[0]
 
         all_pixels: list = []
         for i, m in enumerate(matches or []):
-            key = _match_color_key(m, i)
-            rgb = color_by_key.get(key, default_rgb)
+            # Prefer index-aligned palette entry (distinct sequential colours for measure).
+            if i < len(palette["entries"]):
+                rgb = tuple(palette["entries"][i]["rgb"])
+            else:
+                key = _match_color_key(m, i)
+                rgb = color_by_key.get(key, default_rgb)
             pixels = _project_match_pixels(doc_id, m, part_bbox, view_dir, W, H)
             all_pixels.extend(pixels)
             for (ix, iy) in pixels:
@@ -2163,6 +2175,160 @@ def _palette_caption_block(palette: Optional[dict]) -> str:
         return ""
     return (f" Emphasis palette ({palette.get('mode')}): {palette.get('legend')}. "
             f"[palette_json={json.dumps({'mode': palette.get('mode'), 'entries': palette.get('entries'), 'glow_rgb': palette.get('glow_rgb')}, separators=(',', ':'))}]")
+
+
+_EMPHASIS_COLOR_NAMES = {
+    (255, 64, 64): "red",
+    (64, 180, 255): "cyan",
+    (255, 200, 40): "amber",
+    (80, 220, 120): "green",
+    (220, 100, 255): "magenta",
+    (255, 140, 60): "orange",
+    (100, 160, 255): "sky",
+    (255, 100, 160): "pink",
+    (180, 255, 80): "lime",
+    (120, 220, 220): "teal",
+}
+
+
+def _emphasis_color_name(rgb) -> str:
+    """Map an emphasis palette RGB triple to a short colour name for captions."""
+    try:
+        t = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except (TypeError, ValueError, IndexError):
+        return "red"
+    return _EMPHASIS_COLOR_NAMES.get(t, f"#{t[0]:02X}{t[1]:02X}{t[2]:02X}")
+
+
+def _resolve_measure_target(doc_id: str, target: Union[str, dict]) -> tuple:
+    """Resolve one measure target → (ref_dict, label).
+
+    Prefer the single-selector path (measure_between / eval_measure). Fall back to the
+    inspect_part resolver for feature ids / multi-match queries, taking the first match.
+    """
+    # Already-resolved selector (sid / kind+centroid) — pass straight to eval_measure.
+    if isinstance(target, dict):
+        has_geom_pred = any(k in target for k in (
+            "of", "side", "surf", "pick", "parallel", "near", "index", "count",
+            "concave", "convex", "owner_feature"))
+        if not has_geom_pred and (
+                target.get("sid") or target.get("kind") in ("face", "edge", "vertex")):
+            label = str(target.get("sid") or target.get("kind") or "ref")
+            return target, label
+
+    try:
+        ref = _resolve_one_selector(doc_id, target)
+        if isinstance(target, str):
+            label = target.strip()
+        else:
+            label = str(ref.get("sid") or (target.get("side") if isinstance(target, dict)
+                                           else None) or ref.get("kind") or "ref")
+        return ref, label
+    except ValueError:
+        resolved = _resolve_inspect_target(doc_id, target)
+        ms = list(resolved.get("matches") or [])
+        if not ms:
+            raise ValueError(
+                f"No geometry matched measure target {target!r}. "
+                f"Use query_geometry(...) to explore, or narrow with pick/side/near.")
+        ref = ms[0]
+        label = resolved.get("label") or (
+            target.strip() if isinstance(target, str) else str(ref.get("sid") or "ref"))
+        return ref, label
+
+
+def _reading_from_measure(mres: dict, label: str, color_name: str, rgb,
+                          sid: Optional[str] = None) -> dict:
+    """Pack one eval_measure result into a structured reading for the measure caption."""
+    kind = (mres or {}).get("kind") or "unknown"
+    value: Any = None
+    unit: Optional[str] = None
+    # Prefer diameter over radius when both present (circle edges).
+    if kind == "radius" and mres.get("diameter") is not None:
+        kind, value, unit = "diameter", mres.get("diameter"), "mm"
+    elif kind == "radius":
+        value, unit = mres.get("radius"), "mm"
+    elif kind == "length":
+        value, unit = mres.get("length"), "mm"
+    elif kind == "area":
+        value, unit = mres.get("area"), "mm^2"
+    elif kind == "volume":
+        value, unit = mres.get("volume"), "mm^3"
+    elif kind == "point":
+        pts = mres.get("points")
+        value, unit = (pts[0] if isinstance(pts, list) and pts else pts), "mm"
+    elif kind == "distance":
+        value, unit = mres.get("distance"), "mm"
+    elif kind == "connected_edges":
+        value, unit = mres.get("total_length"), "mm"
+    elif kind == "multi_distance":
+        value, unit = mres.get("total_distance"), "mm"
+    elif kind == "angle":
+        value, unit = mres.get("angle"), "deg"
+    elif kind == "error":
+        value, unit = mres.get("error"), None
+    else:
+        # Fall through: first numeric field that looks like a reading.
+        for k, u in (("diameter", "mm"), ("radius", "mm"), ("length", "mm"),
+                     ("area", "mm^2"), ("distance", "mm"), ("volume", "mm^3"),
+                     ("angle", "deg"), ("perimeter", "mm")):
+            if mres.get(k) is not None:
+                kind, value, unit = k, mres.get(k), u
+                break
+
+    out = {
+        "label": label,
+        "kind": kind,
+        "value": value,
+        "unit": unit,
+        "color": color_name,
+        "rgb": list(rgb) if rgb is not None else None,
+    }
+    if sid:
+        out["sid"] = sid
+    if mres.get("anchor") is not None:
+        out["anchor"] = mres.get("anchor")
+    if mres.get("polyline") is not None:
+        out["polyline"] = mres.get("polyline")
+    return out
+
+
+def _between_from_batch(batch: dict) -> Optional[dict]:
+    """Extract a pair/multi distance summary from a multi-ref eval_measure result."""
+    if not isinstance(batch, dict):
+        return None
+    kind = batch.get("kind")
+    if batch.get("distance") is not None:
+        out = {
+            "kind": kind or "distance",
+            "value": batch.get("distance"),
+            "unit": "mm",
+            "distance": batch.get("distance"),
+        }
+        if batch.get("angle") is not None:
+            out["angle"] = batch.get("angle")
+        if batch.get("points") is not None:
+            out["points"] = batch.get("points")
+        if kind == "connected_edges":
+            out["total_length"] = batch.get("total_length")
+            out["segment_lengths"] = batch.get("segment_lengths")
+            if out.get("value") is None and batch.get("total_length") is not None:
+                out["value"] = batch.get("total_length")
+        return out
+    if kind == "multi_distance" or batch.get("total_distance") is not None:
+        return {
+            "kind": "multi_distance",
+            "value": batch.get("total_distance"),
+            "unit": "mm",
+            "total_distance": batch.get("total_distance"),
+            "distances": batch.get("distances"),
+            "points": batch.get("points"),
+        }
+    if kind == "angle" and batch.get("angle") is not None:
+        return {"kind": "angle", "value": batch.get("angle"), "unit": "deg",
+                "angle": batch.get("angle")}
+    return None
+
 
 
 
@@ -2923,7 +3089,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     if topic in ("assembly", "assemblies", "asm", "mate", "mates", "component",
                  "components"):
         return _ASSEMBLY_GUIDE
-    if topic in ("intake", "fit", "fits", "iso286", "tolerance", "measure",
+    if topic in ("intake", "fit", "fits", "iso286", "tolerance",
                  "manufacturing", "dfm", "photos"):
         return _INTAKE_GUIDE
     if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
@@ -3750,6 +3916,34 @@ def cad_guide_text(topic: str = "overview") -> str:
             "See also: cad_guide('reverse') for the engine import path, "
             "cad_guide('parts') for the Parts Hub integration.\n"
         )
+    if topic in ("evaluate", "measure", "measurement", "interference", "fitment",
+                 "eval", "check_interference"):
+        return (
+            "EVALUATE / MEASURE — colour-coded measurement + interference fitment\n\n"
+            "measure(targets=[...], doc_id?, view='auto', annotate=True)\n"
+            "  Resolve each plain-English selector (same vocabulary as inspect_part /\n"
+            "  measure_between), call eval_measure on all refs at once, paint each\n"
+            "  element a DISTINCT colour from the shared 10-colour emphasis palette\n"
+            "  (per_face mode), and return [image, caption]. Caption lists colour +\n"
+            "  reading (length/area/diameter/distance) and embeds measure_json with\n"
+            "  structured {kind,value,unit,color} per element; 2+ refs also report\n"
+            "  the between distance/angle. Prefer this when you want the same\n"
+            "  colour-coded highlight view the Evaluate ribbon shows.\n\n"
+            "INTERFERENCE / FITMENT LOOP\n"
+            "  1. check_interference(doc_id?)  — pairwise clash/clearance over bodies\n"
+            "     (assemblies: world-placed components). Response includes\n"
+            "     interferences[{a,b,volume,overlap_volume_mm3,overlap_bbox,overlap_mesh}],\n"
+            "     clearances[{a,b,distance}], contacts, parts[{name,bbox,volume}].\n"
+            "  2. Subset: engine eval_interference accepts optional members:[name,...]\n"
+            "     to pairwise-check only selected components (absent/empty = all).\n"
+            "  3. Read overlap_volume_mm3 + overlap_bbox (world mm) → fix fitment\n"
+            "     (edit mates / geometry / offsets) → re-check until interferences=[].\n"
+            "  4. Intra-part feature collisions (boss swallowed by cut, etc.):\n"
+            "     check_feature_overlap — not the body-level interference tool.\n\n"
+            "Related: measure_between (text-only single/pair probe), measure_part\n"
+            "(mass props), inspect_feature (emphasis close-up + dims), verify_battery.\n"
+        )
+
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -3760,7 +3954,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             f"cam, narration, parts, reverse, reveng, deliverables, requirements, dag, verify, "
             f"interaction, sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, "
             f"regen, code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, "
-            f"sketch3d; or a feature cheatsheet: {avail}")
+            f"evaluate, measure, sketch3d; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register
@@ -4776,6 +4970,153 @@ def register_cad_tools(mcp: FastMCP) -> None:
             caption += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
         caption += _palette_caption_block(palette)
         return [Image(path=png_out), caption]
+
+    @mcp.tool()
+    def measure(targets: list,
+                doc_id: Optional[str] = None,
+                view: Optional[Union[str, dict]] = "auto",
+                annotate: bool = True) -> list:
+        """Color-coded multi-element measurement with an annotated render.
+
+        Resolves each plain-English target (or resolved selector dict — same vocabulary as
+        inspect_part / measure_between / query_geometry), measures via the engine's
+        `eval_measure`, paints every measured element a DISTINCT colour from the shared
+        10-colour emphasis palette (per_face mode), and returns [image, caption] so vision
+        and non-vision models both get the reading.
+
+        targets: non-empty list of face/edge/vertex selectors — e.g. ["top",
+          {"of":"edge","surf":"circle","pick":"largest"}, {"of":"face","side":"front"}].
+          One target → that element's intrinsic measure (length / area / diameter / …).
+          Two targets → also the distance (+ angle when applicable) between them.
+          Three+ → chain multi-distance across the ordered refs.
+        view: "auto" (default — frame along the measured elements' normals) or a named /
+          custom camera like render_part / inspect_part.
+        annotate: pass face labels / triad through to the underlying render (default True).
+
+        Caption carries structured readings as JSON: each element gets
+        {label, kind, value, unit, color, rgb, sid?, anchor?} plus an optional `between`
+        block when 2+ refs yield a distance/angle. Prefer this over measure_between when
+        you want the same colour-coded highlight view the Evaluate ribbon shows.
+
+        Returns [image, caption].
+        """
+        d = _doc(doc_id)
+        if not isinstance(targets, list) or not targets:
+            raise ValueError(
+                "measure(targets=[...]) needs a non-empty list of plain-English selectors "
+                "(e.g. ['top', {'of':'edge','parallel':'z','pick':'largest'}]).")
+
+        refs: list = []
+        matches: list = []
+        labels: list = []
+        for t in targets:
+            ref, label = _resolve_measure_target(d, t)
+            refs.append(ref)
+            matches.append(ref if isinstance(ref, dict) else {"kind": "face"})
+            # Prefer the resolved selector dict for emphasis projection when available.
+            if isinstance(ref, dict):
+                matches[-1] = ref
+            labels.append(label)
+
+        # Batch measure (all refs at once) — single / pair / multi-distance.
+        try:
+            batch = cb.call("eval_measure", {"doc_id": d, "refs": refs})
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"eval_measure failed: {e}") from e
+
+        # Per-element intrinsic readings with index-distinct palette colours.
+        palette = _build_emphasis_palette(matches, mode="per_face")
+        readings: list = []
+        for i, (ref, label) in enumerate(zip(refs, labels)):
+            entry = palette["entries"][i] if i < len(palette["entries"]) else {}
+            rgb = tuple(entry.get("rgb") or _EMPHASIS_PALETTE[i % len(_EMPHASIS_PALETTE)])
+            color_name = _emphasis_color_name(rgb)
+            if len(refs) == 1:
+                mres = batch if isinstance(batch, dict) else {}
+            else:
+                try:
+                    mres = cb.call("eval_measure", {"doc_id": d, "refs": [ref]})
+                except Exception as e:  # noqa: BLE001
+                    mres = {"kind": "error", "error": str(e)}
+            readings.append(_reading_from_measure(
+                mres if isinstance(mres, dict) else {},
+                label=label, color_name=color_name, rgb=rgb,
+                sid=(ref.get("sid") if isinstance(ref, dict) else None)))
+
+        between = None
+        if len(refs) >= 2 and isinstance(batch, dict):
+            between = _between_from_batch(batch)
+
+        # Render + per_face emphasis so each measured element is colour-coded.
+        try:
+            part_bb = cb.call("doc_bbox", {"doc_id": d})
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"doc_bbox failed: {e}") from e
+        if not part_bb or not part_bb.get("size"):
+            raise ValueError("no part bounding box — build geometry first")
+
+        target_bb = _target_bbox(d, matches)
+        view_dir = _camera_dir_for_target(matches, view)
+        png_full = _tmp(".png")
+        r = cb.call("doc_render_view", {
+            "doc_id": d, "out_path": png_full,
+            "view": {"dir": list(view_dir)}, "annotate": bool(annotate),
+        })
+        if not r.get("ok") or not os.path.exists(png_full):
+            r2 = cb.call("doc_render_png",
+                         {"doc_id": d, "out_path": png_full, "annotate": bool(annotate)})
+            if not r2.get("ok") or not os.path.exists(png_full):
+                raise ValueError(
+                    f"measure render failed: {r.get('reason', r.get('error', 'no bodies'))}")
+            view_dir = _vnorm((1.0, 1.0, 0.8))
+
+        rect = _crop_rect_for_target(part_bb, target_bb, view_dir,
+                                    margin=0.18, zoom_factor=1.35)
+        png_crop = _tmp(".png")
+        _crop_png_to_rect(png_full, rect, png_crop)
+        png_out, palette = _apply_emphasis_overlay(
+            png_crop, d, matches, part_bb, view_dir, mode="per_face",
+            palette=palette)
+
+
+        # Human caption + structured block (non-vision models read the JSON).
+        lines = []
+        for rd in readings:
+            val = rd.get("value")
+            if isinstance(val, float):
+                val_s = f"{val:.6g}"
+            else:
+                val_s = str(val) if val is not None else "?"
+            unit = rd.get("unit") or ""
+            lines.append(
+                f"  [{rd.get('color')}] {rd.get('label')}: "
+                f"{rd.get('kind')} = {val_s}{' ' + unit if unit else ''}")
+        if between:
+            bval = between.get("value")
+            bval_s = f"{bval:.6g}" if isinstance(bval, float) else str(bval)
+            extra = ""
+            if between.get("angle") is not None:
+                extra = f", angle={between['angle']:.4g} deg"
+            lines.append(
+                f"  between: {between.get('kind')} = {bval_s}"
+                f"{' ' + (between.get('unit') or '') if between.get('unit') else ''}"
+                f"{extra}")
+        structured = {
+            "ok": True,
+            "doc_id": d,
+            "readings": readings,
+            "between": between,
+            "n_targets": len(refs),
+            "palette_mode": "per_face",
+        }
+        caption = (
+            f"MEASURE ({len(refs)} target{'s' if len(refs) != 1 else ''}):\n"
+            + "\n".join(lines)
+            + _palette_caption_block(palette)
+            + f" [measure_json={json.dumps(structured, separators=(',', ':'), default=str)}]"
+        )
+        return [Image(path=png_out), caption]
+
 
 
 

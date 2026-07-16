@@ -55,6 +55,10 @@ public:
     void drawFaceWash(const Renderer::CameraXform& cam,
                       const std::vector<uint64_t>& faceKeys, const float rgba[4]);
 
+    // Wash EVERY face of one body with an explicit RGBA (interference view body tints). Iterates
+    // the face buffers whose packed key high-word == bodyId; no-op if the body isn't tessellated.
+    void drawBodyWash(const Renderer::CameraXform& cam, uint32_t bodyId, const float rgba[4]);
+
     // Draw a flat batch of world-space line segments (flat [x0,y0,z0, x1,y1,z1, …] — every 2 verts is
     // one GL_LINES segment), biased slightly over the shaded surface. Used by the simulation module to
     // draw the mesh-preview wireframe and the fixture/load/pressure indicator arrows. No-op when empty.

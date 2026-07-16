@@ -113,9 +113,80 @@ TEST_CASE("eval_interference: transform-copied overlapping boxes report the exac
     REQUIRE(ir.contains("interferences"));
     REQUIRE_MESSAGE(ir["interferences"].size() == 1,
                     "expected exactly one interfering pair, got: " << ir.dump());
-    CHECK(ir["interferences"][0]["volume"].get<double>() ==
+    const json& hit = ir["interferences"][0];
+    CHECK(hit["volume"].get<double>() ==
           doctest::Approx(4000.0).epsilon(1e-6));
+    // Wave-2: explicit overlap volume + world bbox + coarse Common mesh.
+    REQUIRE(hit.contains("overlap_volume_mm3"));
+    CHECK(hit["overlap_volume_mm3"].get<double>() ==
+          doctest::Approx(4000.0).epsilon(1e-2));
+    REQUIRE(hit.contains("overlap_bbox"));
+    REQUIRE(hit["overlap_bbox"].is_array());
+    REQUIRE(hit["overlap_bbox"].size() == 2);
+    REQUIRE(hit["overlap_bbox"][0].size() == 3);
+    REQUIRE(hit["overlap_bbox"][1].size() == 3);
+    // Overlap of [0,20]^3 and [10,30]x[0,20]x[0,20] is [10,20]x[0,20]x[0,20].
+    CHECK(hit["overlap_bbox"][0][0].get<double>() == doctest::Approx(10.0).epsilon(1e-3));
+    CHECK(hit["overlap_bbox"][1][0].get<double>() == doctest::Approx(20.0).epsilon(1e-3));
+    REQUIRE(hit.contains("overlap_mesh"));
+    REQUIRE(hit["overlap_mesh"].contains("positions"));
+    REQUIRE(hit["overlap_mesh"].contains("indices"));
+    CHECK_MESSAGE(!hit["overlap_mesh"]["positions"].empty(),
+                  "overlap_mesh.positions should be non-empty for a solid common: "
+                      << hit["overlap_mesh"].dump());
+    CHECK_MESSAGE(!hit["overlap_mesh"]["indices"].empty(),
+                  "overlap_mesh.indices should be non-empty for a solid common: "
+                      << hit["overlap_mesh"].dump());
+    CHECK(hit["overlap_mesh"]["positions"].size() % 3 == 0);
+    CHECK(hit["overlap_mesh"]["indices"].size() % 3 == 0);
     CHECK(ir.value("ok", true) == false);  // an interference exists -> ok:false
+}
+
+// members filter: with only one body name selected the pairwise set shrinks to empty
+// (a single member has no pairs) while parts[] still reflects the filtered set.
+TEST_CASE("eval_interference: members filter shrinks the pairwise set") {
+    // Three independent bodies: A/B overlap, C is far away. Unfiltered -> 1 interference
+    // (A∩B). members=["b1"] -> parts size 1, zero pairs. members=[b1,b2] keeps the pair.
+    json ops = json::array({
+        box("A", 20, 20, 20, {0, 0, 0}, json{{"merge", false}}),
+        box("B", 20, 20, 20, {10, 0, 0}, json{{"merge", false}}),
+        box("C", 10, 10, 10, {100, 0, 0}, json{{"merge", false}}),
+    });
+    Built b = build("MembersFilter", ops);
+
+    json all = doc_eval_interference(b.id);
+    REQUIRE(all.contains("parts"));
+    REQUIRE_MESSAGE(all["parts"].size() == 3,
+                    "expected 3 bodies, got: " << all.dump());
+    REQUIRE_MESSAGE(all["interferences"].size() == 1,
+                    "expected exactly one A∩B interference: " << all.dump());
+    const std::string n0 = all["parts"][0]["name"].get<std::string>();
+    const std::string n1 = all["parts"][1]["name"].get<std::string>();
+    const std::string n2 = all["parts"][2]["name"].get<std::string>();
+
+    // One name -> no pairs.
+    json one = doc_eval_interference(b.id, json{{"members", json::array({n0})}});
+    REQUIRE(one.contains("parts"));
+    CHECK_MESSAGE(one["parts"].size() == 1,
+                  "members filter should leave one part, got: " << one.dump());
+    CHECK(one["parts"][0]["name"].get<std::string>() == n0);
+    CHECK_MESSAGE(one["interferences"].empty(),
+                  "one member cannot form a pair: " << one.dump());
+
+    // Two overlapping names (exclude far C) -> still one interference.
+    // A is b1, B is b2 for merge:false boxes in order.
+    json two = doc_eval_interference(b.id, json{{"members", json::array({n0, n1})}});
+    REQUIRE_MESSAGE(two["parts"].size() == 2,
+                    "two-name filter should leave two parts: " << two.dump());
+    REQUIRE_MESSAGE(two["interferences"].size() == 1,
+                    "A∩B must survive a members filter that includes both: " << two.dump());
+    CHECK(two["interferences"][0]["overlap_volume_mm3"].get<double>() ==
+          doctest::Approx(4000.0).epsilon(1e-2));
+
+    // Far body alone with one overlap partner is not needed; filtering to C alone is empty.
+    json far = doc_eval_interference(b.id, json{{"members", json::array({n2})}});
+    CHECK(far["parts"].size() == 1);
+    CHECK(far["interferences"].empty());
 }
 
 // (2) box + boss + engulfing cut -> doc_eval_feature_overlap must report a boss_swallowed

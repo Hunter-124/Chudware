@@ -313,14 +313,19 @@ nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
 
 // Evaluate — pairwise interference + clearance across ALL surviving bodies (port of
 // evaluate.py::interference via worker.py::_eval_interference, part-doc branch). Returns
-// {ok, summary, parts:[{name,volume,bbox}], interferences:[{a,b,volume}], clearances:
-// [{a,b,distance}], contacts:[{a,b,distance}]}. Body names are "b1".."bN" in AICM order
-// (matching the oracle's body_id). A single-body part yields an empty interference/
-// clearance report. `params` (B4, all optional): `include_coincident` (bool, default
-// false) additionally classifies a near-zero-clearance pair (distance <= 1e-6) as a
-// `contacts` entry instead of a `clearances` one (SW-parity "coincident faces" gap);
-// `min_clearance_mm` (default 0) tags any clearance entry below it with
-// `"warning":"below min clearance"`.
+// {ok, summary, parts:[{name,volume,bbox}], interferences:[{a,b,volume,overlap_volume_mm3,
+// overlap_bbox,overlap_mesh}], clearances:[{a,b,distance}], contacts:[{a,b,distance}]}.
+// Body names are "b1".."bN" in AICM order (matching the oracle's body_id); assembly docs
+// use component names. A single-body part yields an empty interference/clearance report.
+// `params` (all optional): `include_coincident` (bool, default false) additionally
+// classifies a near-zero-clearance pair (distance <= 1e-6) as a `contacts` entry instead
+// of a `clearances` one (SW-parity "coincident faces" gap); `min_clearance_mm` (default 0)
+// tags any clearance entry below it with `"warning":"below min clearance"`; `members`
+// (array of part-name strings) restricts pairwise checks to those names (case-sensitive
+// exact match; absent/empty = all). Each interferences[] item also carries
+// `overlap_volume_mm3` (same as volume), `overlap_bbox` [[min],[max]] world mm, and
+// `overlap_mesh` {positions:[x,y,z,...], indices:[i0,i1,i2,...]} (empty arrays on mesh fail).
+// Imported compound members are exploded to SOLID(s) before the Common op.
 nlohmann::json doc_eval_interference(const std::string& doc_id,
                                      const nlohmann::json& params = nlohmann::json::object());
 
@@ -362,10 +367,12 @@ nlohmann::json doc_eval_compare(const nlohmann::json& params);
 // params.face, or a resolved-but-non-planar face.
 nlohmann::json doc_face_wires(const std::string& doc_id, const nlohmann::json& params);
 
-// Evaluate — measure 1-2 resolved refs against the LAST body (port of evaluate.py::measure
+// Evaluate — measure 1-8 resolved refs against the LAST body (port of evaluate.py::measure
 // via worker.py::_eval_measure). Each ref is a face/edge/vertex selector. 1 ref ->
-// single-entity measure (length/radius/area/point/volume); 2 refs -> pair measure
-// (distance + optional angle). Throws OpError on no bodies / a dangling ref / a bad count.
+// single-entity measure (length/radius/area/point/volume) plus `anchor` [x,y,z] centroid
+// and (for edge/face) `polyline` [[x,y,z],...] <=128 pts; 2 refs -> pair measure
+// (distance + optional angle) with per-ref enrichment under `a`/`b`; 3+ -> multi_distance
+// with per-ref `elements[]`. Throws OpError on no bodies / a dangling ref / a bad count.
 nlohmann::json doc_eval_measure(const std::string& doc_id, const nlohmann::json& refs);
 
 // Evaluate FIELD — per-vertex DRAFT-ANGLE field of the active body (port of evaluate.py::

@@ -712,98 +712,634 @@ static std::string chatActivityCopyText(const ActivityItem& a) {
 
 
 
-// The build-plan card: a glass panel listing each planned part with its purpose, committed
-// dimensions (mono) and feature bullets — plus a live status tick per part (spins while the
-// matching orchestrator stage runs, checks when it passes), so it doubles as the todo checklist.
-void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
-                  const ui::Fonts& fonts) {
-    const auto& pal = ui::palette;
-    const ImVec4 accent = semanticOnGlass(pal.accent, chatSurf());
+// ============================ Plan / Objectives section ============================
+// Multi-shape plan display (build_plan | checklist | phased_todo | objectives | dag).
+// Tiles show brief titles; full purpose/dims/assignment lives in ImGui hover tooltips.
+// Todos tree uses omp-like status glyphs; subagents list is omitted when empty.
+
+PlanState parsePlanState(const nlohmann::json& p) {
+    PlanState ps;
+    if (!p.is_object()) return ps;
+    ps.present = true;
+    ps.fromEvent = true;
+    ps.shape = jstr(p, "shape");
+    if (ps.shape.empty()) ps.shape = "checklist";
+    ps.title = jstr(p, "title");
+    if (ps.title.empty()) ps.title = jstr(p, "name");
+    ps.summary = jstr(p, "summary");
+    if (p.contains("revision") && p["revision"].is_number())
+        ps.revision = (int)p["revision"].get<double>();
+    else
+        ps.revision = jint(p, "revision");
+    auto parseItems = [&](const nlohmann::json& arr) {
+        if (!arr.is_array()) return;
+        for (const auto& q : arr) {
+            if (!q.is_object()) continue;
+            PlanItem it;
+            it.id = jstr(q, "id");
+            it.title = jstr(q, "title");
+            if (it.title.empty()) it.title = jstr(q, "name");
+            it.desc = jstr(q, "desc");
+            if (it.desc.empty()) it.desc = jstr(q, "description");
+            it.status = jstr(q, "status");
+            if (it.status.empty()) it.status = "pending";
+            it.kind = jstr(q, "kind");
+            if (it.kind.empty()) it.kind = "step";
+            it.phase = jstr(q, "phase");
+            it.parent_id = jstr(q, "parent_id");
+            if (it.id.empty())
+                it.id = it.kind + ":" + std::to_string(ps.items.size()) + ":" + it.title;
+            // Optional meta: fold purpose/dims/features into tooltip desc.
+            if (q.contains("meta") && q["meta"].is_object()) {
+                const auto& meta = q["meta"];
+                std::string extra;
+                std::string purpose = jstr(meta, "purpose");
+                std::string dims = jstr(meta, "dims");
+                if (dims.empty()) dims = jstr(meta, "dimensions");
+                if (!purpose.empty() && it.desc.find(purpose) == std::string::npos) {
+                    if (!extra.empty()) extra += "\n";
+                    extra += purpose;
+                }
+                if (!dims.empty()) {
+                    if (!extra.empty()) extra += "\n";
+                    extra += dims;
+                    if (dims.find("mm") == std::string::npos) extra += " mm";
+                }
+                if (meta.contains("features") && meta["features"].is_array()) {
+                    for (const auto& f : meta["features"]) {
+                        if (!f.is_string()) continue;
+                        if (!extra.empty()) extra += "\n• ";
+                        else extra += "• ";
+                        extra += f.get<std::string>();
+                    }
+                }
+                if (!extra.empty()) {
+                    if (it.desc.empty()) it.desc = extra;
+                    else if (it.desc.find(extra) == std::string::npos) {
+                        it.desc += "\n";
+                        it.desc += extra;
+                    }
+                }
+            }
+            ps.items.push_back(std::move(it));
+        }
+    };
+    if (auto it = p.find("items"); it != p.end()) parseItems(*it);
+    if (ps.items.empty()) {
+        if (auto it = p.find("tiles"); it != p.end()) parseItems(*it);
+        if (auto it = p.find("todos"); it != p.end()) parseItems(*it);
+    }
+    if (auto it = p.find("edges"); it != p.end() && it->is_array()) {
+        for (const auto& e : *it) {
+            if (!e.is_object()) continue;
+            PlanEdge edge;
+            edge.from = jstr(e, "from");
+            edge.to = jstr(e, "to");
+            if (!edge.from.empty() || !edge.to.empty())
+                ps.edges.push_back(std::move(edge));
+        }
+    }
+    if (ps.title.empty()) {
+        if (ps.shape == "objectives") ps.title = "Objectives";
+        else if (ps.shape == "dag") ps.title = "Plan graph";
+        else if (ps.shape == "build_plan") ps.title = "Build plan";
+        else ps.title = "Plan";
+    }
+    return ps;
+}
+
+PlanState planStateFromPlanInfo(const PlanInfo& plan) {
+    PlanState ps;
+    if (!plan.present) return ps;
+    ps.present = true;
+    ps.fromEvent = false;
+    ps.shape = "build_plan";
+    ps.title = plan.name.empty() ? "Build plan" : plan.name;
+    ps.summary = plan.summary;
+    ps.revision = 0;
+    for (size_t i = 0; i < plan.parts.size(); ++i) {
+        const PlanPart& p = plan.parts[i];
+        PlanItem it;
+        it.id = "part:" + std::to_string(i) + ":" + p.name;
+        it.title = p.name.empty() ? ("Part " + std::to_string(i + 1)) : p.name;
+        it.kind = "part";
+        it.status = "pending";
+        it.phase = "Parts";
+        std::string desc;
+        if (!p.purpose.empty()) desc = p.purpose;
+        if (!p.dims.empty()) {
+            if (!desc.empty()) desc += "\n";
+            desc += p.dims;
+            if (p.dims.find("mm") == std::string::npos) desc += " mm";
+        }
+        for (const auto& f : p.features) {
+            if (!desc.empty()) desc += "\n• ";
+            else desc += "• ";
+            desc += f;
+        }
+        it.desc = std::move(desc);
+        ps.items.push_back(std::move(it));
+    }
+    if (!plan.fit.empty()) {
+        if (!ps.summary.empty()) ps.summary += "  ·  ";
+        ps.summary += "Fit: " + plan.fit;
+    }
+    return ps;
+}
+
+// Match plan item status against activity stages by title/stage substring (legacy heuristic).
+static std::string planItemStatusFromActivity(const PlanItem& it,
+                                              const std::vector<ActivityItem>& activity) {
+    if (!it.status.empty() && it.status != "pending") return it.status;
     auto lower = [](std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
     };
-    // Match a part to an activity stage by name (substring of title or stage key) for its tick.
-    auto partStatus = [&](const std::string& name) -> std::string {
-        std::string ln = lower(name);
-        if (ln.empty()) return "";
-        for (const auto& a : activity)
-            if (lower(a.title).find(ln) != std::string::npos ||
-                lower(a.stage).find(ln) != std::string::npos)
-                return a.status;
-        return "";
-    };
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::BeginChild("##plancard", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 w0 = ImGui::GetWindowPos();
-    // Left accent bar: the accent color at the planAccentBar alpha.
-    dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
-                      (ui::Palette::toU32(pal.accent) & 0x00FFFFFFu) |
-                      ((uint32_t)(unsigned char)pal.planAccentBar << 24));
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accent, "Build plan");
-    if (!plan.name.empty()) {
-        ImGui::SameLine();
-        ImGui::TextUnformatted(plan.name.c_str());
+    std::string ln = lower(it.title);
+    if (ln.empty()) return it.status.empty() ? "pending" : it.status;
+    for (const auto& a : activity) {
+        if (a.rowKind != 0) continue;
+        if (lower(a.title).find(ln) != std::string::npos ||
+            lower(a.stage).find(ln) != std::string::npos) {
+            if (!a.status.empty()) return a.status;
+        }
     }
-    ImGui::PopFont();
-    if (!plan.summary.empty()) dimText(plan.summary.c_str());
-    for (size_t i = 0; i < plan.parts.size(); ++i) {
-        const PlanPart& p = plan.parts[i];
+    return it.status.empty() ? "pending" : it.status;
+}
+
+static const char* planShapeChipLabel(const std::string& shape) {
+    if (shape == "build_plan") return "build";
+    if (shape == "checklist") return "checklist";
+    if (shape == "phased_todo") return "todos";
+    if (shape == "objectives") return "goals";
+    if (shape == "dag") return "dag";
+    return shape.empty() ? "plan" : shape.c_str();
+}
+
+static const char* planRomanNumeral(int n) {
+    static const char* kR[] = {
+        "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
+        "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX"
+    };
+    if (n >= 1 && n <= 20) return kR[n - 1];
+    return nullptr;
+}
+
+// Compact omp-like status glyph as a single UTF-8 codepoint string.
+static const char* planTodoGlyph(const std::string& status) {
+    if (status == "running") return "\xe2\x86\x92";          // →
+    if (status == "pass" || status == "done") return "\xe2\x9c\x93";  // ✓
+    if (status == "fail") return "\xe2\x9c\x97";             // ✗
+    if (status == "abandoned") return "\xe2\x80\x93";        // –
+    return "\xe2\x97\x8b";                                   // ○
+}
+
+static void planDrawShapeChip(const char* label, const ImVec4& accent) {
+    if (!label || !*label) return;
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    ImVec2 pad(5.0f * sc, 1.5f * sc);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + ts.x + pad.x * 2.0f, p0.y + ts.y + pad.y * 2.0f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(accent.x, accent.y, accent.z, 0.18f));
+    ImU32 edge = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(accent.x, accent.y, accent.z, 0.45f));
+    float rnd = ui::metrics::rounding(3.0f);
+    dl->AddRectFilled(p0, p1, bg, rnd);
+    dl->AddRect(p0, p1, edge, rnd, 0, ui::metrics::stroke(1.0f));
+    dl->AddText(ImVec2(p0.x + pad.x, p0.y + pad.y),
+                ImGui::ColorConvertFloat4ToU32(accent), label);
+    ImGui::Dummy(ImVec2(p1.x - p0.x, p1.y - p0.y));
+}
+
+// One compact tile: status glyph + brief title; full desc on hover tooltip.
+static void planDrawTile(const PlanItem& it, const std::string& status, const ui::Fonts& fonts) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float glyph = ImGui::GetTextLineHeight();
+    const char* title = it.title.empty() ? "(untitled)" : it.title.c_str();
+    ImVec2 tsz = ImGui::CalcTextSize(title);
+    float padX = 6.0f * sc;
+    float padY = 3.0f * sc;
+    float gap = 4.0f * sc;
+    float w = glyph + gap + tsz.x + padX * 2.0f;
+    float h = std::max(glyph, tsz.y) + padY * 2.0f;
+    // Cap very long titles so the row stays dense.
+    const float maxW = 140.0f * sc;
+    if (w > maxW) w = maxW;
+
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##tile", ImVec2(w, h));
+    const bool hov = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z,
+               hov ? 0.12f : 0.06f));
+    ImU32 edge = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textSecondary.x, surf.textSecondary.y, surf.textSecondary.z,
+               hov ? 0.35f : 0.18f));
+    float rnd = ui::metrics::rounding(4.0f);
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), bg, rnd);
+    dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), edge, rnd, 0, ui::metrics::stroke(1.0f));
+
+    // Glyph inside the tile (restore cursor for drawStatusGlyph, then restore after).
+    ImVec2 saved = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX, p0.y + (h - glyph) * 0.5f));
+    drawStatusGlyph(status, glyph);
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + padX + glyph + gap, p0.y + (h - tsz.y) * 0.5f));
+    ImFont* f = fonts.medium ? fonts.medium : ImGui::GetFont();
+    ImU32 tcol = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+    // Clip title to tile width.
+    dl->PushClipRect(p0, ImVec2(p0.x + w - padX, p0.y + h), true);
+    dl->AddText(f, ImGui::GetFontSize(), ImGui::GetCursorScreenPos(), tcol, title);
+    dl->PopClipRect();
+    ImGui::SetCursorScreenPos(saved);
+
+    if (hov && !it.desc.empty())
+        ImGui::SetTooltip("%s", it.desc.c_str());
+    else if (hov && it.desc.empty() && !it.title.empty())
+        ImGui::SetTooltip("%s", it.title.c_str());
+}
+
+static void planDrawTilesRow(const std::vector<PlanItem>& items,
+                             const std::vector<ActivityItem>& activity,
+                             const ui::Fonts& fonts,
+                             const char* kindFilter /* nullable: only these kinds */) {
+    if (items.empty()) return;
+    const float sc = ui::uiScale;
+    const float gap = 4.0f * sc;
+    float avail = ImGui::GetContentRegionAvail().x;
+    if (avail < 40.0f * sc) avail = 40.0f * sc;
+    float x = 0.0f;
+    int drawn = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const PlanItem& it = items[i];
+        if (kindFilter && *kindFilter) {
+            if (it.kind != kindFilter) continue;
+        } else {
+            // Default tile strip: parts/objectives/nodes/steps/tasks — not subagents.
+            if (it.kind == "subagent") continue;
+        }
+        const std::string st = planItemStatusFromActivity(it, activity);
+        const char* title = it.title.empty() ? "(untitled)" : it.title.c_str();
+        float glyph = ImGui::GetTextLineHeight();
+        float tw = glyph + 4.0f * sc + ImGui::CalcTextSize(title).x + 12.0f * sc;
+        if (tw > 140.0f * sc) tw = 140.0f * sc;
+        if (drawn > 0) {
+            if (x + gap + tw > avail) {
+                // wrap to next line
+                x = 0.0f;
+            } else {
+                ImGui::SameLine(0, gap);
+                x += gap;
+            }
+        }
         ImGui::PushID((int)i);
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        drawStatusGlyph(partStatus(p.name), ImGui::GetTextLineHeight());
-        ImGui::SameLine(0, 7 * ui::uiScale);
-        ImGui::PushFont(fonts.medium);
-        ImGui::TextUnformatted(p.name.c_str());
-        ImGui::PopFont();
-        if (!p.purpose.empty()) dimText(p.purpose.c_str());
-        if (!p.dims.empty()) {
-            // Adaptive secondary ink, not the theme's planDims grey — the theme tone is picked
-            // for the theme panel bg and washes out over the live frost.
-            ImGui::PushFont(fonts.mono);
-            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
-            ImGui::TextWrapped("%s  (mm)", p.dims.c_str());
-            ImGui::PopStyleColor();
+        planDrawTile(it, st, fonts);
+        ImGui::PopID();
+        x += tw;
+        ++drawn;
+    }
+}
+
+// Todos tree: phase headers + compact status rows. Collapses untouched phases.
+static void planDrawTodosTree(const PlanState& plan,
+                              const std::vector<ActivityItem>& activity,
+                              const ui::Fonts& fonts) {
+    // Collect phases in order of first appearance; empty phase → "Tasks".
+    std::vector<std::string> phases;
+    std::map<std::string, std::vector<size_t>> byPhase;
+    for (size_t i = 0; i < plan.items.size(); ++i) {
+        const PlanItem& it = plan.items[i];
+        if (it.kind == "subagent") continue;
+        if (it.kind == "objective" && plan.shape == "objectives") continue;
+        std::string ph = it.phase.empty() ? "Tasks" : it.phase;
+        if (byPhase.find(ph) == byPhase.end()) phases.push_back(ph);
+        byPhase[ph].push_back(i);
+    }
+    if (phases.empty()) return;
+
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float sc = ui::uiScale;
+    const bool multi = phases.size() > 1 ||
+                       plan.shape == "phased_todo" ||
+                       (phases.size() == 1 && phases[0] != "Tasks");
+
+    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::PushFont(fonts.medium);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Todos");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+
+    for (size_t pi = 0; pi < phases.size(); ++pi) {
+        const std::string& ph = phases[pi];
+        const auto& idxs = byPhase[ph];
+        // Phase "touched" if any item is non-pending.
+        bool touched = false;
+        for (size_t ii : idxs) {
+            std::string st = planItemStatusFromActivity(plan.items[ii], activity);
+            if (st != "pending" && !st.empty()) touched = true;
+        }
+        // Always expand the first phase and any touched phase; collapse pure-pending tails.
+        bool expand = (pi == 0) || touched || phases.size() == 1;
+
+        ImGui::PushID((int)pi);
+        if (multi) {
+            char hdr[96];
+            const char* rom = planRomanNumeral((int)pi + 1);
+            if (rom)
+                std::snprintf(hdr, sizeof(hdr), "%s. %s", rom, ph.c_str());
+            else
+                std::snprintf(hdr, sizeof(hdr), "%s", ph.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::PushFont(fonts.medium);
+            if (!expand) {
+                // One-line collapsible summary for untouched phases.
+                // NoTreePushOnOpen: we never TreePop — avoids ID/indent stack imbalance.
+                char sum[128];
+                std::snprintf(sum, sizeof(sum), "%s  ·  %d task%s",
+                              hdr, (int)idxs.size(), idxs.size() == 1 ? "" : "s");
+                const ImGuiTreeNodeFlags flags =
+                    ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                if (ImGui::TreeNodeEx("##ph", flags, "%s", sum))
+                    expand = true;
+                else {
+                    ImGui::PopFont();
+                    ImGui::PopStyleColor();
+                    ImGui::PopID();
+                    continue;
+                }
+            } else {
+                ImGui::TextUnformatted(hdr);
+            }
             ImGui::PopFont();
+            ImGui::PopStyleColor();
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
-        for (const auto& f : p.features) {
-            ImGui::Bullet();
-            ImGui::SameLine();
-            ImGui::TextWrapped("%s", f.c_str());
+
+        for (size_t ii : idxs) {
+            const PlanItem& it = plan.items[ii];
+            std::string st = planItemStatusFromActivity(it, activity);
+            ImGui::PushID((int)ii);
+            // Indent tree rows slightly under multi-phase headers.
+            if (multi) {
+                ImGui::Dummy(ImVec2(8.0f * sc, 0));
+                ImGui::SameLine(0, 0);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                (st == "running" || st == "pass" || st == "done")
+                    ? semanticOnGlass(ui::palette.accent, surf)
+                    : (st == "fail")
+                        ? semanticOnGlass(ui::palette.statusErr, surf)
+                        : surf.textSecondary);
+            ImGui::TextUnformatted(planTodoGlyph(st));
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 6.0f * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            ImGui::TextUnformatted(it.title.empty() ? "(untitled)" : it.title.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered() && !it.desc.empty())
+                ImGui::SetTooltip("%s", it.desc.c_str());
+            ImGui::PopID();
         }
+        ImGui::PopID();
+    }
+}
+
+// Objectives rows: objective text as primary label + status badge.
+static void planDrawObjectives(const PlanState& plan,
+                               const std::vector<ActivityItem>& activity,
+                               const ui::Fonts& fonts) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float sc = ui::uiScale;
+    int n = 0;
+    for (const auto& it : plan.items)
+        if (it.kind == "objective" || plan.shape == "objectives") ++n;
+    if (n == 0) return;
+
+    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::PushFont(fonts.medium);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Objectives");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+
+    for (size_t i = 0; i < plan.items.size(); ++i) {
+        const PlanItem& it = plan.items[i];
+        if (plan.shape != "objectives" && it.kind != "objective") continue;
+        std::string st = planItemStatusFromActivity(it, activity);
+        ImGui::PushID((int)i);
+        drawStatusGlyph(st, ImGui::GetTextLineHeight());
+        ImGui::SameLine(0, 6.0f * sc);
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextUnformatted(it.title.empty() ? "(objective)" : it.title.c_str());
+        ImGui::PopFont();
+        if (ImGui::IsItemHovered() && !it.desc.empty())
+            ImGui::SetTooltip("%s", it.desc.c_str());
+        ImGui::SameLine(0, 8.0f * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(st.c_str());
         ImGui::PopStyleColor();
         ImGui::PopID();
     }
-    if (!plan.fit.empty()) {
-        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        dimText(("Fit: " + plan.fit).c_str());
+}
+
+// Subagents list: name + status; hover = brief. Empty → omit.
+static void planDrawSubagents(const PlanState& plan,
+                              const std::vector<ActivityItem>& activity,
+                              const ui::Fonts& fonts) {
+    (void)fonts;
+    struct AgRow { std::string name, status, brief; };
+    std::vector<AgRow> rows;
+    for (const auto& it : plan.items) {
+        if (it.kind != "subagent") continue;
+        AgRow r;
+        r.name = it.title;
+        r.status = planItemStatusFromActivity(it, activity);
+        r.brief = it.desc;
+        rows.push_back(std::move(r));
     }
+    // Also surface mission headers + corporate worker rows when plan has no subagent items.
+    if (rows.empty()) {
+        for (const auto& a : activity) {
+            if (a.missionHeader) {
+                AgRow r;
+                r.name = a.title.empty() ? a.stage : a.title;
+                r.status = a.status.empty() ? "pending" : a.status;
+                r.brief = a.reason.empty() ? a.detail : a.reason;
+                rows.push_back(std::move(r));
+            } else if (a.rowKind >= 4 && a.rowKind <= 8) {
+                AgRow r;
+                r.name = a.title.empty() ? "agent" : a.title;
+                r.status = a.status.empty() ? "done" : a.status;
+                r.brief = a.reason.empty() ? a.detail : a.reason;
+                rows.push_back(std::move(r));
+            }
+        }
+    }
+    if (rows.empty()) return;
+
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float sc = ui::uiScale;
+    ImGui::Dummy(ImVec2(0, 3.0f * sc));
+    ImGui::PushFont(fonts.medium);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted("Subagents");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const AgRow& r = rows[i];
+        ImGui::PushID((int)i);
+        drawStatusGlyph(r.status, ImGui::GetTextLineHeight());
+        ImGui::SameLine(0, 6.0f * sc);
+        ImGui::TextUnformatted(r.name.c_str());
+        const bool nameHov = ImGui::IsItemHovered();
+        ImGui::SameLine(0, 8.0f * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(r.status.c_str());
+        ImGui::PopStyleColor();
+        const bool stHov = ImGui::IsItemHovered();
+        if ((nameHov || stHov) && !r.brief.empty())
+            ImGui::SetTooltip("%s", r.brief.c_str());
+        ImGui::PopID();
+    }
+}
+
+void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
+                     const ui::Fonts& fonts) {
+    if (!plan.present) return;
+    // Nothing to show if we have no items and no summary/title-only noise.
+    if (plan.items.empty() && plan.summary.empty() && plan.title.empty()) return;
+
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const ImVec4 accent = semanticOnGlass(pal.accent, surf);
+    const float sc = ui::uiScale;
+
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##plansec", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 w0 = ImGui::GetWindowPos();
+    // Left accent bar (planAccentBar alpha).
+    dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
+                      (ui::Palette::toU32(pal.accent) & 0x00FFFFFFu) |
+                      ((uint32_t)(unsigned char)pal.planAccentBar << 24));
+
+    // Header: title + optional shape chip.
+    ImGui::PushFont(fonts.medium);
+    const char* hdr = plan.title.empty() ? "Plan" : plan.title.c_str();
+    // Prefer "Plan / Objectives" chrome when title is generic.
+    if (plan.title.empty() || plan.title == "Build plan" || plan.title == "Plan") {
+        if (plan.shape == "objectives")
+            ImGui::TextColored(accent, "Objectives");
+        else if (plan.shape == "build_plan")
+            ImGui::TextColored(accent, "Build plan");
+        else
+            ImGui::TextColored(accent, "Plan");
+    } else {
+        ImGui::TextColored(accent, "%s", hdr);
+    }
+    ImGui::PopFont();
+    if (!plan.shape.empty()) {
+        ImGui::SameLine(0, 8.0f * sc);
+        // Vertically center chip with title line.
+        float y = ImGui::GetCursorPosY();
+        ImGui::SetCursorPosY(y + 1.0f * sc);
+        planDrawShapeChip(planShapeChipLabel(plan.shape), accent);
+    }
+    if (!plan.summary.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", plan.summary.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // TILES row — compact status+title chips with hover tooltips.
+    if (!plan.items.empty() && plan.shape != "objectives") {
+        ImGui::Dummy(ImVec2(0, 2.0f * sc));
+        if (plan.shape == "dag") {
+            planDrawTilesRow(plan.items, activity, fonts, "node");
+            // If no kind=node, fall back to all non-subagent items.
+            bool anyNode = false;
+            for (const auto& it : plan.items)
+                if (it.kind == "node") { anyNode = true; break; }
+            if (!anyNode) planDrawTilesRow(plan.items, activity, fonts, nullptr);
+            if ((int)plan.items.size() > 8 || !plan.edges.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextUnformatted("Open in AI workspace for the full graph");
+                ImGui::PopStyleColor();
+            }
+        } else if (plan.shape == "build_plan") {
+            planDrawTilesRow(plan.items, activity, fonts, "part");
+            bool anyPart = false;
+            for (const auto& it : plan.items)
+                if (it.kind == "part") { anyPart = true; break; }
+            if (!anyPart) planDrawTilesRow(plan.items, activity, fonts, nullptr);
+        } else {
+            // checklist / phased_todo: still show a dense tile strip of steps/tasks.
+            planDrawTilesRow(plan.items, activity, fonts, nullptr);
+        }
+    }
+
+    // Shape-specific subsections.
+    if (plan.shape == "objectives") {
+        planDrawObjectives(plan, activity, fonts);
+    } else if (plan.shape == "checklist" || plan.shape == "phased_todo" ||
+               plan.shape == "build_plan") {
+        // Todos tree for ordered work; build_plan also benefits from a compact checklist.
+        bool hasTodoish = false;
+        for (const auto& it : plan.items) {
+            if (it.kind == "step" || it.kind == "task" || it.kind == "part") {
+                hasTodoish = true; break;
+            }
+        }
+        if (hasTodoish || plan.shape == "checklist" || plan.shape == "phased_todo")
+            planDrawTodosTree(plan, activity, fonts);
+    } else if (plan.shape == "dag") {
+        // Compact tiles already drawn; optional tiny todo of nodes if few.
+        if ((int)plan.items.size() <= 12)
+            planDrawTodosTree(plan, activity, fonts);
+    }
+
+    // Always try subagents subsection (omits itself when empty).
+    planDrawSubagents(plan, activity, fonts);
+
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImRect planRect = endGlassBubble(gb);
-    // Flat copy string of the whole plan checklist.
+
+    // Flat copy string for the whole section.
     {
-        std::string copyTxt = "Build plan";
-        if (!plan.name.empty()) { copyTxt += ": "; copyTxt += plan.name; }
+        std::string copyTxt = plan.title.empty() ? "Plan" : plan.title;
+        if (!plan.shape.empty()) { copyTxt += " ["; copyTxt += plan.shape; copyTxt += "]"; }
         if (!plan.summary.empty()) { copyTxt += "\n"; copyTxt += plan.summary; }
-        for (const auto& p : plan.parts) {
+        for (const auto& it : plan.items) {
             copyTxt += "\n- ";
-            copyTxt += p.name;
-            if (!p.purpose.empty()) { copyTxt += " — "; copyTxt += p.purpose; }
-            if (!p.dims.empty()) { copyTxt += "  ["; copyTxt += p.dims; copyTxt += " mm]"; }
-            for (const auto& f : p.features) {
-                copyTxt += "\n  • ";
-                copyTxt += f;
-            }
+            if (!it.status.empty()) { copyTxt += "["; copyTxt += it.status; copyTxt += "] "; }
+            copyTxt += it.title.empty() ? it.id : it.title;
+            if (!it.phase.empty()) { copyTxt += "  ("; copyTxt += it.phase; copyTxt += ")"; }
+            if (!it.desc.empty()) { copyTxt += " — "; copyTxt += it.desc; }
         }
-        if (!plan.fit.empty()) { copyTxt += "\nFit: "; copyTxt += plan.fit; }
         chatCopyContext(planRect, "##plan_copy", copyTxt);
     }
+}
+
+// Back-compat: legacy PlanInfo card → normalize to PlanState and draw the section.
+void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
+                  const ui::Fonts& fonts) {
+    if (!plan.present) return;
+    PlanState ps = planStateFromPlanInfo(plan);
+    // Enrich part statuses from activity (same heuristic as the old card).
+    for (auto& it : ps.items) {
+        if (it.status.empty() || it.status == "pending")
+            it.status = planItemStatusFromActivity(it, activity);
+    }
+    drawPlanSection(ps, activity, fonts);
 }
 
 
@@ -1288,8 +1824,244 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (it->stage == s) return &*it;
         return nullptr;
     };
+    // ---- Plan / Objectives: multi-shape plan_state + derived normalizers ----
+    // Explicit plan_state wins (by revision). Weaker sources fill only when no event plan,
+    // or when they refine statuses on an already-derived checklist.
+    auto applyPlanStateEvent = [&](const nlohmann::json& src) {
+        PlanState ps = parsePlanState(src);
+        if (!ps.present) return;
+        if (m.planState.present && m.planState.fromEvent && ps.revision < m.planState.revision)
+            return;  // ignore stale
+        m.planState = std::move(ps);
+        // Mirror build_plan into legacy PlanInfo so old callers of m.plan still see it.
+        if (m.planState.shape == "build_plan" && !m.plan.present) {
+            m.plan.present = true;
+            m.plan.name = m.planState.title;
+            m.plan.summary = m.planState.summary;
+            for (const auto& it : m.planState.items) {
+                if (it.kind != "part" && it.kind != "step" && !it.kind.empty()) continue;
+                PlanPart pp;
+                pp.name = it.title;
+                // Split desc: first line purpose, rest features-ish.
+                if (!it.desc.empty()) {
+                    size_t nl = it.desc.find('\n');
+                    if (nl == std::string::npos) pp.purpose = it.desc;
+                    else {
+                        pp.purpose = it.desc.substr(0, nl);
+                        // crude dims line detection
+                        std::string rest = it.desc.substr(nl + 1);
+                        size_t nl2 = rest.find('\n');
+                        std::string line2 = (nl2 == std::string::npos) ? rest : rest.substr(0, nl2);
+                        if (line2.find("mm") != std::string::npos ||
+                            line2.find_first_of("0123456789") != std::string::npos)
+                            pp.dims = line2;
+                    }
+                }
+                m.plan.parts.push_back(std::move(pp));
+            }
+        }
+    };
+    auto ensureDerivedPlan = [&]() -> PlanState& {
+        // Only create/mutate derived plan when no authoritative plan_state event owns it.
+        if (!m.planState.present) {
+            m.planState.present = true;
+            m.planState.fromEvent = false;
+            m.planState.shape = "checklist";
+            m.planState.title = "Plan";
+            m.planState.revision = 0;
+        }
+        return m.planState;
+    };
+    auto findPlanItem = [&](const std::string& id) -> PlanItem* {
+        for (auto& it : m.planState.items)
+            if (it.id == id) return &it;
+        return nullptr;
+    };
+
+    if (kind == "plan_state") {
+        // SHARED CONTRACT: full multi-shape snapshot.
+        nlohmann::json src = data;
+        // Tolerate nested {plan_state:{...}} or top-level fields.
+        if (data.contains("plan_state") && data["plan_state"].is_object())
+            src = data["plan_state"];
+        else if (data.contains("plan") && data["plan"].is_object() &&
+                 (data["plan"].contains("items") || data["plan"].contains("shape")))
+            src = data["plan"];
+        applyPlanStateEvent(src);
+    } else if (kind == "plan") {
+        // Legacy kind:plan — may carry PlanInfo under "plan" or top-level, OR a full plan_state.
+        if (data.contains("shape") || data.contains("items")) {
+            applyPlanStateEvent(data);
+        } else {
+            nlohmann::json planObj = data;
+            if (data.contains("plan") && data["plan"].is_object()) planObj = data["plan"];
+            // Prefer parsePlan (reuse existing) → planStateFromPlanInfo.
+            PlanInfo pi = parsePlan(planObj);
+            if (pi.present) {
+                m.plan = pi;
+                if (!m.planState.fromEvent) {
+                    m.planState = planStateFromPlanInfo(pi);
+                    m.planState.fromEvent = false;
+                }
+            }
+        }
+    } else if (kind == "plan_steps") {
+        // C++ model checklist: {steps: string[], total}. Skip when plan_state owns the section.
+        if (!m.planState.fromEvent) {
+            PlanState& ps = ensureDerivedPlan();
+            if (ps.shape != "build_plan" || ps.items.empty()) {
+                ps.shape = "checklist";
+                if (ps.title.empty() || ps.title == "Plan") ps.title = "Build checklist";
+            }
+            const nlohmann::json* steps = nullptr;
+            if (data.contains("steps") && data["steps"].is_array()) steps = &data["steps"];
+            if (steps) {
+                // Rebuild step items (preserve non-step kinds like subagent).
+                std::vector<PlanItem> keep;
+                for (auto& it : ps.items)
+                    if (it.kind != "step") keep.push_back(std::move(it));
+                ps.items = std::move(keep);
+                int i = 0;
+                for (const auto& s : *steps) {
+                    PlanItem it;
+                    it.kind = "step";
+                    it.status = "pending";
+                    it.phase = "Model";
+                    if (s.is_string()) {
+                        it.title = s.get<std::string>();
+                    } else if (s.is_object()) {
+                        it.title = jstr(s, "title");
+                        if (it.title.empty()) it.title = jstr(s, "step");
+                        if (it.title.empty()) it.title = jstr(s, "name");
+                        it.desc = jstr(s, "desc");
+                        it.status = jstr(s, "status");
+                        if (it.status.empty()) it.status = "pending";
+                        it.id = jstr(s, "id");
+                    }
+                    if (it.title.empty()) it.title = "Step " + std::to_string(i + 1);
+                    if (it.id.empty()) it.id = "step:" + std::to_string(i);
+                    // Truncate title to ~10 words for tile density.
+                    {
+                        int words = 0;
+                        size_t cut = it.title.size();
+                        for (size_t c = 0; c < it.title.size(); ++c) {
+                            if (it.title[c] == ' ') {
+                                ++words;
+                                if (words >= 10) { cut = c; break; }
+                            }
+                        }
+                        if (cut < it.title.size()) {
+                            if (it.desc.empty()) it.desc = it.title;
+                            it.title = it.title.substr(0, cut);
+                        }
+                    }
+                    ps.items.push_back(std::move(it));
+                    ++i;
+                }
+                ps.present = true;
+                ++ps.revision;
+            }
+        }
+    } else if (kind == "model_step") {
+        // Live step progress: {index, total, step}. Derived path only (plan_state owns statuses).
+        if (!m.planState.fromEvent) {
+            int idx = jint(data, "index");
+            std::string stepTxt = jstr(data, "step");
+            int stepOrd = 0;
+            if (m.planState.present) {
+                for (auto& it : m.planState.items) {
+                    if (it.kind != "step" && it.kind != "task" && it.kind != "part") continue;
+                    if (stepOrd < idx) {
+                        if (it.status == "pending" || it.status == "running" || it.status.empty())
+                            it.status = "done";
+                    } else if (stepOrd == idx) {
+                        it.status = "running";
+                        if (!stepTxt.empty() && it.title.empty()) it.title = stepTxt;
+                    }
+                    ++stepOrd;
+                }
+            }
+            // Seed a single running step when checklist was empty.
+            if (stepOrd == 0 && !stepTxt.empty()) {
+                PlanState& ps = ensureDerivedPlan();
+                if (ps.shape.empty() || !ps.fromEvent)
+                    ps.shape = "checklist";
+                PlanItem it;
+                it.id = "step:" + std::to_string(idx);
+                it.title = stepTxt;
+                it.kind = "step";
+                it.status = "running";
+                it.phase = "Model";
+                ps.items.push_back(std::move(it));
+                ps.present = true;
+            }
+        }
+    } else if (kind == "agent.spawn") {
+        // Subagent row for the Plan section Subagents list.
+        PlanState& ps = ensureDerivedPlan();
+        PlanItem it;
+        it.id = jstr(data, "subagent_id");
+        if (it.id.empty()) it.id = jstr(data, "id");
+        if (it.id.empty()) it.id = "spawn:" + std::to_string(ps.items.size());
+        it.title = jstr(data, "name");
+        if (it.title.empty()) it.title = jstr(data, "role");
+        if (it.title.empty()) it.title = jstr(data, "agent");
+        if (it.title.empty()) it.title = "subagent";
+        it.desc = jstr(data, "brief");
+        if (it.desc.empty()) it.desc = jstr(data, "task");
+        if (it.desc.empty()) it.desc = jstr(data, "assignment");
+        it.kind = "subagent";
+        it.status = "running";
+        // Upsert by id.
+        if (PlanItem* existing = findPlanItem(it.id)) {
+            if (!it.title.empty()) existing->title = it.title;
+            if (!it.desc.empty()) existing->desc = it.desc;
+            existing->status = "running";
+        } else {
+            ps.items.push_back(std::move(it));
+        }
+        ps.present = true;
+    }
+
     if (kind == "mission_started") {
         m.curMissionTask = -1;  // task rows arrive via mission_task_started
+        // Normalize mission task list into a checklist/phased PlanState when no plan_state yet.
+        if (!m.planState.fromEvent) {
+            PlanState& ps = ensureDerivedPlan();
+            ps.shape = "phased_todo";
+            ps.title = "Mission";
+            std::string req = jstr(data, "request");
+            if (!req.empty()) ps.summary = req;
+            // Clear previous mission tasks only (keep subagents).
+            std::vector<PlanItem> keep;
+            for (auto& it : ps.items)
+                if (it.kind == "subagent") keep.push_back(std::move(it));
+            ps.items = std::move(keep);
+            if (data.contains("tasks") && data["tasks"].is_array()) {
+                int i = 0;
+                for (const auto& t : data["tasks"]) {
+                    PlanItem it;
+                    it.id = "mission:" + std::to_string(i);
+                    it.kind = "task";
+                    it.phase = "Mission";
+                    it.status = "pending";
+                    if (t.is_object()) {
+                        it.title = jstr(t, "title");
+                        if (it.title.empty()) it.title = jstr(t, "capability");
+                        it.desc = jstr(t, "req");
+                        if (it.desc.empty()) it.desc = jstr(t, "target");
+                        if (it.desc.empty()) it.desc = jstr(t, "capability");
+                    } else if (t.is_string()) {
+                        it.title = t.get<std::string>();
+                    }
+                    if (it.title.empty()) it.title = "Task " + std::to_string(i + 1);
+                    ps.items.push_back(std::move(it));
+                    ++i;
+                }
+            }
+            ps.present = true;
+            ++ps.revision;
+        }
     } else if (kind == "mission_task_started") {
         int idx = jint(data, "index");
         m.curMissionTask = idx;
@@ -1305,18 +2077,51 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             a = &m.activity.back();
         }
         a->status = "running";
+        // Mirror into planState mission checklist.
+        if (m.planState.present && !m.planState.fromEvent) {
+            std::string id = "mission:" + std::to_string(idx);
+            if (PlanItem* it = findPlanItem(id)) {
+                it->status = "running";
+                if (!a->title.empty()) it->title = a->title;
+            } else {
+                PlanItem ni;
+                ni.id = id;
+                ni.title = a->title;
+                ni.kind = "task";
+                ni.phase = "Mission";
+                ni.status = "running";
+                m.planState.items.push_back(std::move(ni));
+                m.planState.present = true;
+            }
+        }
     } else if (kind == "mission_task_result") {
-        ActivityItem* a = findStage("task" + std::to_string(jint(data, "index")));
+        int midx = jint(data, "index");
+        ActivityItem* a = findStage("task" + std::to_string(midx));
         if (a) {
             std::string s = jstr(data, "status");
             a->status = (s == "done") ? "done" : (s.empty() ? "done" : s);
             std::string summary = jstr(data, "summary");
             if (!summary.empty()) a->reason = summary;
         }
+        // Live status mirror (safe even when plan_state owns items — id-matched only).
+        if (m.planState.present) {
+            std::string id = "mission:" + std::to_string(midx);
+            if (PlanItem* it = findPlanItem(id)) {
+                std::string s = jstr(data, "status");
+                it->status = (s == "done" || s.empty()) ? "done" : s;
+                std::string summary = jstr(data, "summary");
+                if (!summary.empty()) it->desc = summary;
+            }
+        }
     } else if (kind == "mission_finished") {
         m.curMissionTask = -1;
         for (auto& a : m.activity)
             if (a.status == "running" || a.status.empty()) { a.status = "done"; a.streaming = false; }
+        if (m.planState.present) {
+            for (auto& it : m.planState.items)
+                if (it.status == "running" || it.status == "pending" || it.status.empty())
+                    if (it.kind == "task" || it.kind == "step") it.status = "done";
+        }
     } else if (kind == "stage_started") {
         std::string s = nsKey(jstr(data, "stage"));
         ActivityItem* a = findStage(s);
@@ -3295,17 +4100,23 @@ static void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, 
     dl->AddQuadFilled(e0, e3, e2, e1, col);
 }
 
-// Shared rectangular less-rounded header button style for Sessions / Checkpoints / gear-as-box.
+// Shared rectangular less-rounded header button (optional leading icon).
 // Returns true on click. `active` highlights like an open overlay.
-static bool drawHeaderTextButton(const char* id, const char* label, bool active, float minW = 0.0f) {
+static bool drawHeaderTextButton(const char* id, const char* label, bool active,
+                                 float minW = 0.0f, const char* iconName = nullptr) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 txt = surf.textPrimary;
     const float round = ui::metrics::rounding(4.0f);  // less-rounded rectangular box
+    const float iconSz = ImGui::GetTextLineHeight() * 0.92f;
+    const float iconGap = 4.0f * sc;
+    IconUV icon = (iconName && iconName[0]) ? ui::getIcon(iconName, 20) : IconUV{};
+    const bool haveIcon = icon.valid;
+
     ImGui::PushID(id);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, round);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(8.0f * sc, 2.0f * sc));
+                        ImVec2(haveIcon ? 6.0f * sc : 8.0f * sc, 2.0f * sc));
     ImGui::PushStyleColor(ImGuiCol_Button, active
         ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
                  ui::palette.chipBg[3])
@@ -3313,13 +4124,47 @@ static bool drawHeaderTextButton(const char* id, const char* label, bool active,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
     ImGui::PushStyleColor(ImGuiCol_Text, active ? surf.textPrimary : surf.textSecondary);
-    const float tw = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
-    const float bw = std::max(minW, tw);
-    const bool clicked = ImGui::Button(label, ImVec2(bw, 0));
-    ImGui::GetWindowDrawList()->AddRect(
-        ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-        ImGui::ColorConvertFloat4ToU32(ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
-        round, 0, ui::metrics::stroke(1.0f));
+
+    const float padX = ImGui::GetStyle().FramePadding.x;
+    const float tw = ImGui::CalcTextSize(label).x;
+    const float contentW = (haveIcon ? iconSz + iconGap : 0.0f) + tw;
+    const float bw = std::max(minW, contentW + padX * 2.0f);
+    const float bh = ImGui::GetFrameHeight();
+
+    // Invisible button for hit + style colors; draw icon+label ourselves so the icon tints correctly.
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##hit", ImVec2(bw, bh));
+    const bool hov = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec4 bg = active
+        ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
+                 ui::palette.chipBg[3])
+        : ImVec4(txt.x, txt.y, txt.z, held ? 0.22f : (hov ? 0.14f : 0.06f));
+    dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh),
+                      ImGui::ColorConvertFloat4ToU32(bg), round);
+    dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
+                ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
+                round, 0, ui::metrics::stroke(1.0f));
+
+    float x = p0.x + padX;
+    const float midY = p0.y + bh * 0.5f;
+    if (haveIcon) {
+        const ImVec4 tint = active ? surf.textPrimary
+                                   : ImVec4(surf.textSecondary.x, surf.textSecondary.y,
+                                            surf.textSecondary.z, 0.95f);
+        dl->AddImage(icon.texId,
+                     ImVec2(x, midY - iconSz * 0.5f),
+                     ImVec2(x + iconSz, midY + iconSz * 0.5f),
+                     icon.uv0, icon.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+        x += iconSz + iconGap;
+    }
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
+        active ? surf.textPrimary : surf.textSecondary);
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(x, midY - ts.y * 0.5f), ink, label);
+
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(2);
     ImGui::PopID();
@@ -3759,8 +4604,16 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::PopStyleVar();
     }
 
-    // (1) Plan / todo block — a live checklist that ticks off as stages complete (DESIGN §5).
-    if (m.plan.present) drawPlanCard(m.plan, m.activity, fonts);
+    // (1) Plan / Objectives — multi-shape section (tiles + todos + subagents).
+    // Prefer planState; back-compat: legacy PlanInfo (Python kind:plan via app.cpp) normalizes
+    // on the fly when planState was never filled.
+    if (m.planState.present) {
+        drawPlanSection(m.planState, m.activity, fonts);
+    } else if (m.plan.present) {
+        // Lazy normalize so the old AgentEvent plan path still lights the section.
+        m.planState = planStateFromPlanInfo(m.plan);
+        drawPlanSection(m.planState, m.activity, fonts);
+    }
 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
     drawAgentTimeline(m, fonts, logW, gShowThinking);
@@ -3931,7 +4784,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
 }
 
-// ---- header: collapse + [Chat|Sessions|Settings] + status; Billet logo centered above ----
+// ---- header: logo row + collapse + [Chat L | Sessions C | Settings R] + status ----
 // Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
 // height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
 // strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
@@ -3953,7 +4806,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
 
-    ImFont* wordF = st.fonts.h2 ? st.fonts.h2 : st.fonts.medium;
+    // Prefer medium over h2 so the logo row stays short (less dead air under the ribbon).
+    ImFont* wordF = st.fonts.medium ? st.fonts.medium : nullptr;
     float wordLh = lh;
     if (wordF) { ImGui::PushFont(wordF); wordLh = ImGui::GetTextLineHeight(); ImGui::PopFont(); }
 
@@ -3961,51 +4815,48 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const bool settingsOpen = st.showAISettingsOverlay;
     const bool chatOpen = !sessionsOpen && !settingsOpen;
 
-    // Button widths (stable labels — no "< Chat" rename that reflows the row).
-    const float chatW = ImGui::CalcTextSize("Chat").x + 16.0f * sc;
-    const float sessW = ImGui::CalcTextSize("Sessions").x + 16.0f * sc;
-    const float gearW = ImGui::CalcTextSize("Settings").x + 16.0f * sc;
-    const float dotW  = lh;
+    // Measure icon+label button widths (must match drawHeaderTextButton math).
+    auto measureBtn = [&](const char* label, const char* iconName) -> float {
+        const float iconSz = lh * 0.92f;
+        const float iconGap = 4.0f * sc;
+        IconUV icon = (iconName && iconName[0]) ? ui::getIcon(iconName, 20) : IconUV{};
+        const float padX = 6.0f * sc;
+        const float tw = ImGui::CalcTextSize(label).x;
+        const float contentW = (icon.valid ? iconSz + iconGap : 0.0f) + tw;
+        return contentW + padX * 2.0f;
+    };
+    const float chatW = measureBtn("Chat", "ai_panel");
+    const float sessW = measureBtn("Sessions", "history");
+    const float gearW = measureBtn("Settings", "settings");
     const float gap   = style.ItemSpacing.x;
-    const float threeW = chatW + gap + sessW + gap + gearW;
-    const float cluster = threeW + gap + dotW;
-    const float rightInset = ui::metrics::U(1);
+    const float dotW  = lh;
+    const float rightInset = ui::metrics::U(0.5f);
     const float collapseW = lh;
     const float collapseGap = ui::metrics::asmHeaderIconGap();
 
-    // ---- Row 1: Billet cube + wordmark, horizontally centered over the three buttons ----
-    // Mirror Row 2's right-anchor math so the logo sits above Chat|Sessions|Settings, not
-    // left-aligned over a phantom left-side button cluster.
+    // ---- Row 1: Billet cube + wordmark, horizontally centered in the column ----
     {
         const float colW = ImGui::GetContentRegionAvail().x;
-        const float contentMaxX = ImGui::GetContentRegionMax().x;
-        // Same as Row 2: cluster = three buttons + status; buttons start at anchorX.
-        const float buttonsLeft = contentMaxX - cluster - rightInset;
-        const float buttonsCenterX = buttonsLeft + threeW * 0.5f;
-
-        const float logoGap = ui::metrics::asmHeaderIconGap();
+        const float logoGap = 3.0f * sc;
+        const float cubeSz = std::min(lh, wordLh) * 0.95f;
         if (wordF) ImGui::PushFont(wordF);
         const float wmW = ImGui::CalcTextSize("Billet").x;
         if (wordF) ImGui::PopFont();
-        const float logoW = lh + logoGap + wmW;
-
-        float logoLeft = buttonsCenterX - logoW * 0.5f;
-        // Keep logo on-screen; prefer not overlapping the collapse chevron column.
+        const float logoW = cubeSz + logoGap + wmW;
+        float logoLeft = (colW - logoW) * 0.5f;
         logoLeft = std::max(0.0f, logoLeft);
-        logoLeft = std::min(logoLeft, std::max(0.0f, colW - logoW));
 
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + logoLeft);
         {
             IconUV cube = ui::getIcon("context_cube", 20);
             if (cube.valid) {
                 const ImVec4 tint = chatSurf().textPrimary;
-                // Vertically center cube against wordmark ascent.
-                const float dy = (wordLh - lh) * 0.5f;
+                const float dy = (wordLh - cubeSz) * 0.5f;
                 if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dy);
-                ImGui::Image(cube.texId, ImVec2(lh, lh), cube.uv0, cube.uv1, tint);
+                ImGui::Image(cube.texId, ImVec2(cubeSz, cubeSz), cube.uv0, cube.uv1, tint);
                 if (dy > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() - dy);
             } else {
-                ImGui::Dummy(ImVec2(lh, lh));
+                ImGui::Dummy(ImVec2(cubeSz, cubeSz));
             }
             ImGui::SameLine(0, logoGap);
         }
@@ -4015,14 +4866,16 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::PopStyleColor();
         if (wordF) ImGui::PopFont();
 
-        // Tight gap logo → buttons (default ItemSpacing.y is ~8px and wastes header height).
-        ImGui::Dummy(ImVec2(0, 1.0f * sc));
+        // Minimal logo → controls gap.
+        ImGui::Dummy(ImVec2(0, 0.0f));
     }
 
-    // ---- Row 2: collapse | Chat | Sessions | Settings | status ----
+    // ---- Row 2: collapse | Chat (left) | Sessions (center) | Settings (right) | status ----
     const float rowH   = std::max(lh, ImGui::GetFrameHeight());
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
+    const float contentMaxX = ImGui::GetContentRegionMax().x;
+    const float rightEdge = contentMaxX - rightInset;
 
     // Collapse chevron LEADS the control row (in-flow). "»" tucks the column body away (T-G21).
     {
@@ -4052,14 +4905,19 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, collapseGap);
     }
 
-    // Hard-anchor the three buttons + status to the right so they stay on-screen (T-G17).
-    const float anchorX = ImGui::GetContentRegionMax().x - cluster - rightInset;
-    if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
+    // Left edge for Chat (after collapse). Right cluster = Settings + status.
+    const float leftX = ImGui::GetCursorPosX();
+    const float settingsX = rightEdge - gearW - gap - dotW;
+    float sessionsX = (leftX + rightEdge) * 0.5f - sessW * 0.5f;
+    // Keep Sessions from overlapping Chat/Settings.
+    sessionsX = std::max(sessionsX, leftX + chatW + gap);
+    sessionsX = std::min(sessionsX, settingsX - sessW - gap);
 
+    // Chat — LEFT aligned.
     centerY(lh);
+    ImGui::SetCursorPosX(leftX);
     if (busy) ImGui::BeginDisabled();
-    // Chat — always "Chat"; active when no overlay is open. Closes Sessions/Settings.
-    if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW)) {
+    if (drawHeaderTextButton("##hdr_chat", "Chat", chatOpen, chatW, "ai_panel")) {
         st.showSessionsPicker = false;
         st.showAISettingsOverlay = false;
     }
@@ -4067,11 +4925,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Chat — conversation with the agent.");
 
-    ImGui::SameLine();
+    // Sessions — CENTER of the row (between chat and settings).
     centerY(lh);
+    ImGui::SetCursorPosX(sessionsX);
     if (busy) ImGui::BeginDisabled();
-    // Sessions — stable label (never renames to "< Chat").
-    if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW)) {
+    if (drawHeaderTextButton("##hdr_sess", "Sessions", sessionsOpen, sessW, "history")) {
         const bool open = !st.showSessionsPicker;
         st.showSessionsPicker = open;
         if (open) st.showAISettingsOverlay = false;
@@ -4081,9 +4939,10 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(sessionsOpen ? "Sessions list is open."
                                        : "Sessions — switch between chats.");
 
-    ImGui::SameLine();
+    // Settings — RIGHT aligned (status dot follows).
     centerY(lh);
-    if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW)) {
+    ImGui::SetCursorPosX(settingsX);
+    if (drawHeaderTextButton("##hdr_gear", "Settings", settingsOpen, gearW, "settings")) {
         const bool open = !st.showAISettingsOverlay;
         st.showAISettingsOverlay = open;
         if (open) st.showSessionsPicker = false;
@@ -4092,7 +4951,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip(settingsOpen ? "Settings is open."
                                        : "AI settings — provider, model, privacy.");
 
-    ImGui::SameLine();
+    ImGui::SameLine(0, gap);
     centerY(lh);
     const float* dot = pal.accentMid;  const char* tip = "Idle";
     if (st.statusKind == 2) { dot = pal.statusErr; tip = "Error"; }
@@ -9587,12 +10446,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
     }
 
-    // Tight top: hug the ribbon/glass edge — was U(1.5) (~6dp) of dead air above the logo.
-    ImGui::Dummy(ImVec2(0, 1.0f * ui::uiScale));
+    // Pull the header flush to the window content top (column already +4 under ribbon).
     {
-        // Collapse ItemSpacing.y for the header stack so logo↔buttons don't pick up the theme gap.
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+        ImGui::SetCursorPosY(0.0f);
         drawCopilotHeader(st, busy);
         ImGui::PopStyleVar();
     }

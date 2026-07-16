@@ -66,8 +66,10 @@ def _media_type(path: Path) -> str:
 
 
 def _cache_control(path: Path) -> str:
-    # Entry HTML must revalidate; hashed/static assets may be cached briefly.
-    if path.suffix.lower() in {".html", ".htm"}:
+    # The Emscripten bundle files are UNHASHED (fixed names Billet.js/.wasm/.data) and MUST
+    # update in lockstep — a cached old Billet.js against a new Billet.wasm is a fatal
+    # LinkError (mismatched imports). Force revalidation so js/wasm never skew across deploys.
+    if path.suffix.lower() in {".html", ".htm", ".js", ".wasm", ".data", ".mjs"}:
         return "no-cache"
     return "max-age=3600"
 

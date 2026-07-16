@@ -19,21 +19,30 @@ const char* kClarifySystem =
     "if not, ask the FEWEST possible targeted questions to obtain them.\n"
     "Units are millimeters; angles degrees. Do NOT design geometry, suggest features, or write "
     "code — only surface missing CRITICAL numbers (overall size, bore/thread, hole spacing, "
-    "fits/clearances, wall thickness) that materially change the part. If a value is implied or "
-    "has a strong standard default (e.g. an M3 standoff -> 3mm thread), PREFER assuming it "
-    "(record it under \"assumptions\") over asking.\n"
+    "fits/clearances, wall thickness) that materially change the part, OR a design decision "
+    "with discrete options, OR a geometry pick when the user must point at the model. If a "
+    "value is implied or has a strong standard default (e.g. an M3 standoff -> 3mm thread), "
+    "PREFER assuming it (record it under \"assumptions\") over asking. Do NOT ask when a "
+    "sensible default exists.\n"
     "Reply with EXACTLY one ```json block and no prose outside it, shaped:\n"
     "{\n"
     "  \"ready\": <true if the request is specific enough to build well with NO questions>,\n"
     "  \"questions\": [\n"
     "    {\"key\": \"<short_snake_case>\", \"ask\": \"<one concise question>\", "
-    "\"unit\": \"<mm|deg|count or empty>\", \"suggested\": \"<your best default as a string>\"}\n"
+    "\"unit\": \"<mm|deg|count or empty>\", \"suggested\": \"<your best default as a string>\",\n"
+    "     \"kind\": \"<optional: dimension|text|choice|approval|geometry_select>\",\n"
+    "     \"options\": [{\"value\":\"…\",\"label\":\"…\"}],  // choice only\n"
+    "     \"multi\": false,  // choice or geometry_select multi-select\n"
+    "     \"targets\": [\"face\",\"edge\",\"feature\"]  // geometry_select only\n"
+    "    }\n"
     "  ],\n"
     "  \"assumptions\": [\"<assumption you made, one per entry>\"]\n"
     "}\n"
     "Ask AT MOST 4 questions, ordered by importance. When \"ready\" is true, \"questions\" MUST "
-    "be an empty list. EVERY question MUST have a non-empty \"suggested\" default so the user "
-    "can accept it with one click.";
+    "be an empty list. EVERY non-geometry question MUST have a non-empty \"suggested\" default "
+    "so the user can accept it with one click. Design decisions use kind=choice with options "
+    "(multi=true when several may apply). Geometry the user must point at uses "
+    "kind=geometry_select with targets; suggested may be empty (never invent face/edge ids).";
 
 namespace {
 
@@ -117,22 +126,101 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
     if (parsed.is_null() || !parsed.is_object()) return ready_now();
 
     // Normalize the questions: keep only well-shaped entries, cap at 4, coerce fields to
-    // strings, and require a non-empty `ask`. A question without a suggested default still
-    // passes (the host falls back to an empty field) — only `ask` is mandatory.
+    // strings, and require a non-empty `ask`. Optional interaction fields (kind/options/
+    // multi/targets) are preserved additively for the interaction mirror + host card.
     ojson questions = ojson::array();
     if (parsed.contains("questions") && parsed["questions"].is_array()) {
         for (const auto& q : parsed["questions"]) {
             if (questions.size() >= 4) break;
             if (!q.is_object()) continue;
-            std::string ask = q.contains("ask") ? scalar_str(q["ask"]) : "";
+            std::string ask = q.contains("ask") ? scalar_str(q["ask"])
+                              : (q.contains("prompt") ? scalar_str(q["prompt"]) : "");
             if (strip(ask).empty()) continue;
-            std::string key = q.contains("key") ? scalar_str(q["key"]) : "";
+            std::string key = q.contains("key") ? scalar_str(q["key"])
+                              : (q.contains("id") ? scalar_str(q["id"]) : "");
             std::string unit = q.contains("unit") ? scalar_str(q["unit"]) : "";
             std::string suggested = q.contains("suggested") ? scalar_str(q["suggested"]) : "";
-            questions.push_back(ojson{{"key", key},
-                                      {"ask", ask},
-                                      {"unit", unit},
-                                      {"suggested", suggested}});
+            // kind: model-authored, else infer from unit.
+            std::string kind;
+            if (q.contains("kind")) kind = strip(scalar_str(q["kind"]));
+            if (kind.empty() && q.contains("type")) kind = strip(scalar_str(q["type"]));
+            // Alias map (keep small — full alias set lives in Python normalizer).
+            if (kind == "select" || kind == "design" || kind == "design_choice" ||
+                kind == "decision" || kind == "multiple_choice" || kind == "mc")
+                kind = "choice";
+            if (kind == "geometry" || kind == "pick" || kind == "select_geometry" ||
+                kind == "face" || kind == "feature")
+                kind = "geometry_select";
+            if (kind == "number" || kind == "dim") kind = "dimension";
+            if (kind == "confirm" || kind == "approve" || kind == "yes_no") kind = "approval";
+            if (kind.empty()) kind = (!unit.empty()) ? "dimension" : "text";
+
+            bool multi = false;
+            if (q.contains("multi") && q["multi"].is_boolean()) multi = q["multi"].get<bool>();
+            else if (q.contains("multiple") && q["multiple"].is_boolean())
+                multi = q["multiple"].get<bool>();
+
+            ojson options = ojson::array();
+            if (q.contains("options") && q["options"].is_array()) {
+                for (const auto& o : q["options"]) {
+                    if (o.is_object() && o.contains("value")) {
+                        std::string val = scalar_str(o["value"]);
+                        std::string lab = o.contains("label") ? scalar_str(o["label"]) : val;
+                        if (!val.empty())
+                            options.push_back(ojson{{"value", val}, {"label", lab}});
+                    } else if (o.is_string()) {
+                        std::string val = o.get<std::string>();
+                        if (!val.empty())
+                            options.push_back(ojson{{"value", val}, {"label", val}});
+                    }
+                }
+            } else if (q.contains("choices") && q["choices"].is_array()) {
+                for (const auto& c : q["choices"]) {
+                    if (c.is_string()) {
+                        std::string val = c.get<std::string>();
+                        if (!val.empty())
+                            options.push_back(ojson{{"value", val}, {"label", val}});
+                    }
+                }
+            }
+            if (!options.empty() && kind != "geometry_select") kind = "choice";
+
+            ojson targets = ojson::array();
+            if (q.contains("targets") && q["targets"].is_array()) {
+                for (const auto& t : q["targets"]) {
+                    if (t.is_string() && !t.get<std::string>().empty())
+                        targets.push_back(t.get<std::string>());
+                }
+            } else if (q.contains("target") && q["target"].is_string()) {
+                targets.push_back(q["target"].get<std::string>());
+            }
+            if (!targets.empty()) kind = "geometry_select";
+
+            // choice suggested may be an array (multi); keep a string for legacy.
+            if (suggested.empty() && q.contains("suggested") && q["suggested"].is_array()) {
+                std::string joined;
+                for (const auto& v : q["suggested"]) {
+                    if (!joined.empty()) joined += ", ";
+                    joined += scalar_str(v);
+                }
+                suggested = joined;
+            }
+            if (suggested.empty() && kind == "choice" && !options.empty())
+                suggested = options[0].value("value", std::string());
+            if (suggested.empty() && kind == "approval") suggested = "false";
+
+            ojson entry = ojson{{"key", key},
+                                {"ask", ask},
+                                {"unit", unit},
+                                {"suggested", suggested},
+                                {"kind", kind},
+                                {"multi", multi}};
+            if (!options.empty()) entry["options"] = options;
+            if (!targets.empty()) entry["targets"] = targets;
+            // Preserve multi suggested list for the interaction mirror when present.
+            if (q.contains("suggested") && q["suggested"].is_array())
+                entry["suggested_list"] = q["suggested"];
+            questions.push_back(std::move(entry));
         }
     }
 
@@ -147,31 +235,65 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
     // ready = explicit truthy `ready`, OR there are no questions to ask.
     bool ready = (parsed.contains("ready") && truthy(parsed["ready"])) || questions.empty();
 
-    // T-F4: additive aicad.interaction/1 mirror (contracts/interaction.md §1, §3).
-    // Emits the same questions reshaped as interaction/1 "dimension"/"text" questions
-    // alongside the legacy {key, ask, unit, suggested} fields — existing callers
-    // (drawClarifyCard, ClarifyState) are unaffected; new callers use "interaction".
-    // The batch is non-blocking with suggested defaults, capped at 4 (the proven cap).
+    // T-F4 + v1.1: additive aicad.interaction/1 mirror (contracts/interaction.md §1, §3, §12).
+    // Emits interaction kinds (dimension/text/choice/approval/geometry_select) alongside
+    // the legacy {key, ask, unit, suggested} fields — existing callers (drawClarifyCard,
+    // ClarifyState) keep working; the host prefers the interaction envelope when present.
     ojson interaction_questions = ojson::array();
     for (const auto& q : questions) {
-        std::string key = q.contains("key") ? q["key"].get<std::string>() : "";
-        std::string ask = q.contains("ask") ? q["ask"].get<std::string>() : "";
-        std::string unit = q.contains("unit") ? q["unit"].get<std::string>() : "";
-        std::string suggested_str = q.contains("suggested") ? q["suggested"].get<std::string>() : "";
-        // Decide kind: non-empty unit → dimension, else → text.
-        std::string kind = (!unit.empty()) ? "dimension" : "text";
+        std::string key = q.value("key", std::string());
+        std::string ask = q.value("ask", std::string());
+        std::string unit = q.value("unit", std::string());
+        std::string suggested_str = q.value("suggested", std::string());
+        std::string kind = q.value("kind", std::string("text"));
+        bool multi = q.value("multi", false);
+
         ojson iq = ojson::object();
-        iq["id"]      = key.empty() ? ask.substr(0, 32) : key;  // stable ledger key
-        iq["kind"]    = kind;
-        iq["prompt"]  = ask;
+        iq["id"]       = key.empty() ? ask.substr(0, 32) : key;
+        iq["kind"]     = kind;
+        iq["prompt"]   = ask;
         iq["required"] = false;
+
         if (kind == "dimension") {
-            iq["family"]   = "length";  // default; angle/count not in clarify vocab
-            iq["suggested"] = ojson{{"value", 0.0}, {"unit", unit}};
-            // If suggested_str parses as a number, embed it.
+            iq["family"] = (unit == "deg" || unit == "degree" || unit == "degrees")
+                               ? "angle"
+                               : (unit == "count" ? "count" : "length");
+            iq["suggested"] = ojson{{"value", 0.0}, {"unit", unit.empty() ? "mm" : unit}};
             try { iq["suggested"]["value"] = std::stod(suggested_str); }
             catch (...) {}
+        } else if (kind == "choice") {
+            iq["multi"] = multi;
+            iq["options"] = q.contains("options") ? q["options"] : ojson::array();
+            if (multi) {
+                if (q.contains("suggested_list") && q["suggested_list"].is_array()) {
+                    ojson arr = ojson::array();
+                    for (const auto& v : q["suggested_list"]) arr.push_back(scalar_str(v));
+                    iq["suggested"] = arr;
+                } else if (!suggested_str.empty()) {
+                    iq["suggested"] = ojson::array({suggested_str});
+                } else {
+                    iq["suggested"] = ojson::array();
+                }
+            } else {
+                iq["suggested"] = suggested_str;
+            }
+        } else if (kind == "approval") {
+            bool yes = (suggested_str == "true" || suggested_str == "1" ||
+                        suggested_str == "yes" || suggested_str == "approve");
+            iq["suggested"] = yes;
+            iq["proposal"] = ask;
+        } else if (kind == "geometry_select") {
+            iq["multi"] = multi;
+            iq["targets"] = q.contains("targets") && q["targets"].is_array() &&
+                                    !q["targets"].empty()
+                                ? q["targets"]
+                                : ojson::array({"face", "edge", "feature"});
+            // Honest empty pick — never invent sids (contract §12).
+            iq["suggested"] = multi ? ojson::array() : ojson::object();
+            iq["required"] = true;  // a real pick is needed when we ask this
         } else {
+            // text / unknown
+            iq["kind"] = "text";
             iq["suggested"] = suggested_str;
         }
         interaction_questions.push_back(iq);

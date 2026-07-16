@@ -464,3 +464,48 @@ TEST_CASE("clarify: interaction fields additive — existing callers unaffected"
     CHECK(result.contains("interaction"));
     CHECK(result["interaction"]["questions"].size() == 2);
 }
+
+TEST_CASE("clarify: choice kind with options mirrors multi and single") {
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"({"ready": false, "questions": [
+          {"key": "mat", "ask": "Material?", "unit": "", "suggested": "aluminum",
+           "kind": "choice",
+           "options": [{"value":"aluminum","label":"6061"},{"value":"steel","label":"1018"}]},
+          {"key": "keep", "ask": "Keep which?", "unit": "",
+           "kind": "choice", "multi": true,
+           "options": [{"value":"rib"},{"value":"fillet"}],
+           "suggested": ["rib","fillet"]}
+        ], "assumptions": []})";
+    };
+    ojson result = clarify("bracket", ojson(nullptr), "d", 1, ojson::array(), complete);
+    CHECK(result["interaction"]["questions"].size() == 2);
+    const auto& mat = result["interaction"]["questions"][0];
+    CHECK(mat["kind"] == "choice");
+    CHECK(mat["multi"] == false);
+    CHECK(mat["options"].size() == 2);
+    CHECK(mat["suggested"] == "aluminum");
+    const auto& keep = result["interaction"]["questions"][1];
+    CHECK(keep["kind"] == "choice");
+    CHECK(keep["multi"] == true);
+    CHECK(keep["suggested"].is_array());
+    CHECK(keep["suggested"].size() == 2);
+}
+
+TEST_CASE("clarify: geometry_select kind emits empty suggested + targets") {
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"({"ready": false, "questions": [
+          {"key": "edit_face", "ask": "Which face for the pocket?",
+           "kind": "geometry_select", "targets": ["face"], "suggested": ""}
+        ], "assumptions": []})";
+    };
+    ojson result = clarify("pocket the top", ojson(nullptr), "d", 1, ojson::array(), complete);
+    const auto& iq = result["interaction"]["questions"][0];
+    CHECK(iq["kind"] == "geometry_select");
+    CHECK(iq["targets"][0] == "face");
+    CHECK(iq["suggested"].is_object());
+    CHECK(iq["suggested"].empty());
+    CHECK(iq["required"] == true);
+    // Legacy list still has key/ask for old consumers.
+    CHECK(result["questions"][0]["key"] == "edit_face");
+    CHECK(result["questions"][0]["kind"] == "geometry_select");
+}
